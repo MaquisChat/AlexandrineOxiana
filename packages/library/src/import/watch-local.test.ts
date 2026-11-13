@@ -16,6 +16,9 @@ import {
   POINTER_REASON,
   PROVIDER_NAMES,
   SF_DATALESS,
+  UF_COMPRESSED,
+  contentState,
+  WATCH_LOCAL_LSTAT_CONCURRENCY,
   WATCH_LOCAL_BATCH,
   WATCH_LOCAL_ARG_BYTES,
   type StatRunner,
@@ -36,72 +39,132 @@ const file = (size: number, blocks: number, ino = 1): FakeStats => ({ size, bloc
 /** A recorded output of `/usr/bin/stat -f "%i %Xf" -- <paths>`: one line per path that exists, in argument order. */
 const lines = (rows: Array<[bigint | number, string]>) => rows.map(([i, f]) => `${i} ${f}\n`).join("");
 
-describe("contentPresence", () => {
-  it("a file with all its blocks is local without starting a process", async () => {
-    const datalessFlags = vi.fn(async () => new Map<string, boolean | null>());
-    const lstat = async () => file(4096, 8);
-    const r = await contentPresence(["/a", "/b"], { platform: "darwin", lstat, datalessFlags });
-    expect(r.get("/a")).toBe("local");
-    expect(r.get("/b")).toBe("local");
-    expect(datalessFlags).not.toHaveBeenCalled();
-  });
+/** Fake files and a fake tool: each path has size, blocks and the st_flags the tool prints for it. */
+type Spec = Record<string, { size: number; blocks: number; flags?: number }>;
+function fake(spec: Spec) {
+  const paths = Object.keys(spec);
+  const inoOf = (p: string) => BigInt(paths.indexOf(p) + 10);
+  const calls: string[][] = [];
+  const statTool: StatRunner = async (args) => {
+    calls.push(args);
+    const rows = args.slice(3).filter((p) => spec[p]).map((p) => `${inoOf(p)} ${(spec[p]!.flags ?? 0).toString(16)}\n`);
+    return { stdout: rows.join(""), completed: true };
+  };
+  const lstat = async (p: string) => {
+    const f = spec[p];
+    if (!f) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return { size: f.size, blocks: f.blocks, ino: inoOf(p), mtimeMs: 1234, isFile: () => true };
+  };
+  return { paths, calls, statTool, lstat, inoOf };
+}
 
-  it("an empty file is local", async () => {
-    const datalessFlags = vi.fn(async () => new Map<string, boolean | null>());
-    const r = await contentPresence(["/a"], { platform: "darwin", lstat: async () => file(0, 0), datalessFlags });
-    expect(r.get("/a")).toBe("local");
-    expect(datalessFlags).not.toHaveBeenCalled();
-  });
-
-  it("a dataless file on darwin is not-downloaded (flag set)", async () => {
-    const datalessFlags = vi.fn(async (ps: string[]) => new Map<string, boolean | null>(ps.map((p) => [p, true])));
-    const r = await contentPresence(["/a"], { platform: "darwin", lstat: async () => file(5000, 0), datalessFlags });
+describe("contentPresence on darwin: local rests only on the flags", () => {
+  it("the flag set with all the blocks present is not-downloaded", async () => {
+    const f = fake({ "/a": { size: 4096, blocks: 8, flags: SF_DATALESS } });
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
     expect(r.get("/a")).toBe("not-downloaded");
-    expect(datalessFlags).toHaveBeenCalledWith(["/a"]);
   });
 
-  it("a compressed file on darwin is local (flag clear)", async () => {
-    const datalessFlags = async (ps: string[]) => new Map<string, boolean | null>(ps.map((p) => [p, false]));
-    const r = await contentPresence(["/a"], { platform: "darwin", lstat: async () => file(5000, 0), datalessFlags });
-    expect(r.get("/a")).toBe("local");
+  it("the flag set on an empty file is not-downloaded", async () => {
+    const f = fake({ "/a": { size: 0, blocks: 0, flags: SF_DATALESS } });
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
+    expect(r.get("/a")).toBe("not-downloaded");
   });
 
-  it("stat failing on darwin gives unknown", async () => {
-    const lstat = async () => file(5000, 0);
-    const failing = await contentPresence(["/a", "/b"], {
-      platform: "darwin",
-      lstat,
-      datalessFlags: async () => {
-        throw new Error("boom");
-      },
-    });
-    expect(failing.get("/a")).toBe("unknown");
-    expect(failing.get("/b")).toBe("unknown");
-    const nulls = await contentPresence(["/a", "/b"], { platform: "darwin", lstat, datalessFlags: async (ps) => new Map<string, boolean | null>([[ps[0]!, null]]) });
-    expect(nulls.get("/a")).toBe("unknown");
-    expect(nulls.get("/b")).toBe("unknown"); // absent from the answer: unknown, never local
-  });
-
-  it("the tool timing out gives unknown", async () => {
-    const run: StatRunner = async () => ({ stdout: "", completed: false });
-    const r = await contentPresence(["/a"], { platform: "darwin", lstat: async () => file(5000, 0), statTool: run });
+  it("flags clear and blocks 0 on a 5000-byte file is unknown (a placeholder made another way looks the same)", async () => {
+    const f = fake({ "/a": { size: 5000, blocks: 0, flags: 0 } });
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
     expect(r.get("/a")).toBe("unknown");
   });
 
+  it("a compressed file (UF_COMPRESSED, flag clear, blocks short) is local", async () => {
+    expect(UF_COMPRESSED).toBe(0x20);
+    const f = fake({ "/a": { size: 5000, blocks: 0, flags: 0x20 } });
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
+    expect(r.get("/a")).toBe("local");
+  });
+
+  it("flags clear with all the blocks is local, and an empty file is asked too", async () => {
+    const f = fake({ "/a": { size: 4096, blocks: 8, flags: 0 }, "/e": { size: 0, blocks: 0, flags: 0 } });
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
+    expect(r.get("/a")).toBe("local");
+    expect(r.get("/e")).toBe("local");
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]!.slice(3)).toEqual(["/a", "/e"]); // both were asked
+  });
+
+  it("the number of processes is ceil(regular files / 200), whatever their blocks", async () => {
+    const spec: Spec = {};
+    for (let i = 0; i < 450; i++) spec[`/f/${i}`] = { size: i % 3 === 0 ? 0 : 100, blocks: i % 2 === 0 ? 0 : 8, flags: 0x20 };
+    const f = fake(spec);
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
+    expect(f.calls).toHaveLength(Math.ceil(450 / WATCH_LOCAL_BATCH));
+    expect([...r.values()].every((v) => v === "local")).toBe(true);
+  });
+
+  it("no answer for the inode is unknown, even with all the blocks", async () => {
+    const f = fake({ "/a": { size: 4096, blocks: 8 } });
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: async () => ({ stdout: "", completed: true }) });
+    expect(r.get("/a")).toBe("unknown");
+  });
+
+  it("the tool timing out gives unknown, even with all the blocks", async () => {
+    const f = fake({ "/a": { size: 4096, blocks: 8 } });
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: async () => ({ stdout: "", completed: false }) });
+    expect(r.get("/a")).toBe("unknown");
+  });
+
+  it("stat failing gives unknown for every path of the batch", async () => {
+    const f = fake({ "/a": { size: 5000, blocks: 0 }, "/b": { size: 5000, blocks: 0 } });
+    const r = await contentPresence(f.paths, {
+      platform: "darwin",
+      lstat: f.lstat,
+      statTool: async () => {
+        throw new Error("boom");
+      },
+    });
+    expect([r.get("/a"), r.get("/b")]).toEqual(["unknown", "unknown"]);
+  });
+
+  it("an injected datalessFlags still decides (true is not-downloaded; false counts as no flag and no compression)", async () => {
+    const f = fake({ "/a": { size: 100, blocks: 8 }, "/b": { size: 100, blocks: 8 }, "/c": { size: 100, blocks: 0 } });
+    const datalessFlags = vi.fn(async () => new Map<string, boolean | null>([["/a", true], ["/b", false], ["/c", false]]));
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, datalessFlags });
+    expect([r.get("/a"), r.get("/b"), r.get("/c")]).toEqual(["not-downloaded", "local", "unknown"]);
+    expect(datalessFlags).toHaveBeenCalledWith(["/a", "/b", "/c"]);
+  });
+});
+
+describe("contentState", () => {
+  it("returns what it judged: inode, size, blocks, mtime; unknown for the rest", async () => {
+    const f = fake({ "/a": { size: 4096, blocks: 8, flags: 0 } });
+    const st = await contentState(["/a", "/missing"], { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
+    expect(st.get("/a")).toEqual({ presence: "local", ino: f.inoOf("/a"), size: 4096, blocks: 8, mtimeMs: 1234 });
+    expect(st.get("/missing")).toEqual({ presence: "unknown" });
+  });
+  it("answers the same presence as contentPresence", async () => {
+    const f = fake({ "/a": { size: 100, blocks: 8, flags: SF_DATALESS }, "/b": { size: 5000, blocks: 0 } });
+    const st = await contentState(f.paths, { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
+    const pr = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
+    for (const p of f.paths) expect(pr.get(p)).toBe(st.get(p)!.presence);
+  });
+});
+
+describe("contentPresence on linux, win32 and links", () => {
   it("a sparse file on linux is not-downloaded", async () => {
+    const r2 = await contentPresence(["/x", "/y", "/z"], {
+      platform: "linux",
+      lstat: async (q) => (q === "/x" ? file(10, 0) : q === "/y" ? file(10, 8) : file(0, 0)),
+    });
+    expect(r2.get("/x")).toBe("not-downloaded");
+    expect(r2.get("/y")).toBe("local");
+    expect(r2.get("/z")).toBe("local");
     const p = join(tmp, "sparse.pdf");
     await writeFile(p, "");
     await truncate(p, 10_000_000);
     const real = await fsp.lstat(p);
-    // Only meaningful where the file system really keeps holes; otherwise the stand-in below still checks the rule.
     const r = await contentPresence([p], { platform: "linux" });
     if (real.blocks === 0) expect(r.get(p)).toBe("not-downloaded");
-    const r2 = await contentPresence(["/x", "/y"], {
-      platform: "linux",
-      lstat: async (q) => (q === "/x" ? file(10, 0) : file(10, 8)),
-    });
-    expect(r2.get("/x")).toBe("not-downloaded");
-    expect(r2.get("/y")).toBe("local");
   });
 
   it("a file on win32 is local", async () => {
@@ -119,11 +182,13 @@ describe("contentPresence", () => {
     expect(r.get(link)).toBe("unknown");
     expect(r.get(target)).toBe("local");
     expect(statSpy).not.toHaveBeenCalled();
-    // On darwin the link never reaches the tool either.
-    const datalessFlags = vi.fn(async () => new Map<string, boolean | null>());
-    const d = await contentPresence([link], { platform: "darwin", datalessFlags });
+    const calls: string[][] = [];
+    const d = await contentPresence([link], {
+      platform: "darwin",
+      statTool: async (a) => (calls.push(a), { stdout: "", completed: true }),
+    });
     expect(d.get(link)).toBe("unknown");
-    expect(datalessFlags).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
   });
 
   it("a path that vanished, a folder and a NUL are unknown", async () => {
@@ -132,40 +197,119 @@ describe("contentPresence", () => {
     const r = await contentPresence([join(tmp, "missing.pdf"), dir, "bad\0name"], { platform: "linux" });
     expect([...r.values()]).toEqual(["unknown", "unknown", "unknown"]);
   });
+});
 
-  it("no file is opened for 1,000 paths", async () => {
+describe("no file is opened", () => {
+  it("1,000 real temporary files with the real lstat: nothing is opened or read", async () => {
+    const paths: string[] = [];
+    for (let i = 0; i < 1000; i++) paths.push(join(tmp, `f${i}.pdf`));
+    for (const p of paths) fs.closeSync(fs.openSync(p, "w"));
+    const inodes = new Map<string, bigint>();
+    for (const p of paths) inodes.set(p, fs.lstatSync(p, { bigint: true }).ino);
     const spies = [
       vi.spyOn(fsp, "open"),
       vi.spyOn(fsp, "readFile"),
       vi.spyOn(fsp, "copyFile"),
       vi.spyOn(fsp, "access"),
       vi.spyOn(fsp, "stat"),
+      vi.spyOn(fsp, "readdir"),
+      vi.spyOn(fsp, "opendir"),
+      vi.spyOn(fsp, "realpath"),
+      vi.spyOn(fsp, "readlink"),
       vi.spyOn(fs, "openSync"),
       vi.spyOn(fs, "readFileSync"),
       vi.spyOn(fs, "createReadStream"),
+      vi.spyOn(fs, "open"),
+      vi.spyOn(fs, "read"),
+      vi.spyOn(fs, "readFile"),
+      vi.spyOn(fs, "stat"),
+      vi.spyOn(fs, "readdir"),
     ];
-    const paths: string[] = [];
-    for (let i = 0; i < 1000; i++) paths.push(join(tmp, `f${i}.pdf`));
-    for (let i = 0; i < 1000; i += 50) await writeFile(paths[i]!, "hello");
-    const lstat = vi.spyOn(fsp, "lstat");
+    const lst = vi.spyOn(fsp, "lstat");
     const calls: string[][] = [];
-    const run: StatRunner = async (args) => {
+    // Only the tool's runner is injected; it prints the inodes read above, outside the module under test.
+    const statTool: StatRunner = async (args) => {
       calls.push(args);
-      return { stdout: "", completed: true };
+      return { stdout: args.slice(3).map((p) => `${inodes.get(p)} 0\n`).join(""), completed: true };
     };
-    const suspects = new Set(paths.slice(0, 700));
-    // Make 700 of them look like suspects through the injected lstat; the other 300 have all their blocks.
+    const r = await contentPresence(paths, { platform: "darwin", statTool });
+    expect(r.size).toBe(1000);
+    expect([...r.values()].every((v) => v === "local")).toBe(true);
+    expect(lst.mock.calls.length).toBe(1000); // one lstat per path
+    expect(calls.length).toBe(Math.ceil(1000 / WATCH_LOCAL_BATCH));
+    for (const s of spies) expect(s).not.toHaveBeenCalled();
+  });
+});
+
+describe("lstat that never answers", () => {
+  it("at most WATCH_LOCAL_LSTAT_CONCURRENCY lstat calls are outstanding, and each path is lstat-ed once", async () => {
+    expect(WATCH_LOCAL_LSTAT_CONCURRENCY).toBe(2);
+    let out = 0;
+    let max = 0;
+    const seen: string[] = [];
+    const lstat = async (p: string) => {
+      seen.push(p);
+      out++;
+      max = Math.max(max, out);
+      await new Promise((r) => setTimeout(r, 1));
+      out--;
+      return file(100, 8, seen.length);
+    };
+    const paths = Array.from({ length: 40 }, (_, i) => `/f/${i}`);
+    await contentPresence(paths, { platform: "linux", lstat });
+    expect(max).toBe(2);
+    expect([...seen].sort()).toEqual([...paths].sort());
+    // On darwin too: one lstat per path, the tool's inode comes from the same lstat.
+    seen.length = 0;
     const r = await contentPresence(paths, {
       platform: "darwin",
-      lstat: async (p) => (suspects.has(p) ? file(100, 0, paths.indexOf(p) + 10) : file(100, 8, paths.indexOf(p) + 10)),
-      statTool: run,
-      lstatIno: async (p) => BigInt(paths.indexOf(p) + 10),
+      lstat,
+      statTool: async (a) => ({ stdout: a.slice(3).map((_, i) => `${i + 1} 0\n`).join(""), completed: true }),
     });
-    expect(r.size).toBe(1000);
-    for (const s of spies) expect(s).not.toHaveBeenCalled();
-    expect(lstat).not.toHaveBeenCalled(); // the injected one was used
-    expect(calls.length).toBeLessThanOrEqual(Math.ceil(700 / WATCH_LOCAL_BATCH));
-    expect(calls.length).toBeGreaterThan(0);
+    expect(seen).toHaveLength(40);
+    expect(r.size).toBe(40);
+    expect(max).toBe(2);
+  });
+
+  it("an aborted signal frees a stuck lstat: earlier paths are answered, the stuck one and the rest unknown, nothing started afterwards", async () => {
+    const ac = new AbortController();
+    const started: string[] = [];
+    let afterAbort = 0;
+    const lstat = async (p: string) => {
+      if (ac.signal.aborted) afterAbort++;
+      started.push(p);
+      if (p === "/f/2") {
+        ac.abort();
+        return new Promise<never>(() => {}); // never answers
+      }
+      return file(100, 8);
+    };
+    const paths = Array.from({ length: 10 }, (_, i) => `/f/${i}`);
+    const r = await contentPresence(paths, { platform: "linux", lstat, signal: ac.signal });
+    expect(r.get("/f/0")).toBe("local");
+    expect(r.get("/f/1")).toBe("local");
+    expect(r.get("/f/2")).toBe("unknown");
+    expect(afterAbort).toBe(0);
+    for (const p of paths.filter((q) => !started.includes(q))) expect(r.get(p)).toBe("unknown");
+    expect(r.size).toBe(10);
+  });
+
+  it("an aborted signal starts no process, and the signal reaches the process start that kills it", async () => {
+    const ac = new AbortController();
+    const f = fake({ "/a": { size: 100, blocks: 8 } });
+    let seenSignal: AbortSignal | undefined;
+    const statTool: StatRunner = async (_a, o) => {
+      seenSignal = o.signal;
+      ac.abort();
+      return { stdout: "", completed: false };
+    };
+    const r = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool, signal: ac.signal });
+    expect(seenSignal).toBe(ac.signal);
+    expect(r.get("/a")).toBe("unknown");
+    const calls2: string[][] = [];
+    const r2 = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: async (a) => (calls2.push(a), { stdout: "", completed: true }), signal: ac.signal });
+    expect(calls2).toHaveLength(0);
+    expect(r2.get("/a")).toBe("unknown");
   });
 });
 
@@ -276,6 +420,16 @@ describe("datalessFlagsDarwin", () => {
     expect(r.get("/c")).toBeNull();
   });
 
+  it("stand-alone, an aborted signal gives unknown and starts nothing", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    let n = 0;
+    const run: StatRunner = async () => (n++, { stdout: lines([[1, "0"]]), completed: true });
+    const r = await datalessFlagsDarwin(["/a"], { run, lstatIno: ino({ "/a": 1n }), signal: ac.signal });
+    expect(r.get("/a")).toBeNull();
+    expect(n).toBe(0);
+  });
+
   it("the tool timing out gives unknown", async () => {
     const run: StatRunner = async () => ({ stdout: lines([[1, "40000000"]]), completed: false });
     const r = await datalessFlagsDarwin(["/a"], { run, lstatIno: ino({ "/a": 1n }) });
@@ -375,6 +529,13 @@ describe("nameRule", () => {
         expect(nameRule(n), n).toEqual({ skip: "report", kind: "online-only-document", reason: POINTER_REASON });
       }
     }
+  });
+
+  it("trims trailing spaces and dots before the pointer-file test", () => {
+    for (const n of ["Notes.gdoc ", "Notes.gdoc.", "Notes.GSHEET. . ", "Notes.gslides  "]) {
+      expect(nameRule(n), n).toEqual({ skip: "report", kind: "online-only-document", reason: POINTER_REASON });
+    }
+    expect(nameRule("Notes.pdf. ")).toBeNull();
   });
 
   it("treats conflict-copy names and lookalikes as ordinary files", () => {
