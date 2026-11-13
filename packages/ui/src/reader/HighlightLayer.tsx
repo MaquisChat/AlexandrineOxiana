@@ -16,9 +16,12 @@
  *    is drawn dashed; the chosen one has a ring.
  *  - Hidden from assistive technology (`aria-hidden`), with no text in it: the list of annotations
  *    (Task R9) is the accessible route, and says what the shapes show.
- *  - A click on the page that lands on a highlight selects it (the topmost where several lie); a
- *    click that ends a text selection does not. The marks take no pointer events, so text under a
- *    highlight can still be selected.
+ *  - A click on the page that lands on a highlight selects it; where several lie (Task R10) and the
+ *    page offers it (`onOverlap`), the click offers each of them instead, topmost first, so that every
+ *    one stays reachable (without it, the topmost is chosen). A click that ends a text selection
+ *    does not. The marks take no pointer events, so text under a highlight can still be selected.
+ *  - A draft (Task R10: a highlight on its way to the service, `drafts`) is drawn with its own mark
+ *    and is never chosen or offered: it is not the service's yet.
  *
  * `annotations` are the open file's only (the caller filters by file, A4); an annotation with no
  * place (A5) or a place on another page is not drawn here.
@@ -41,6 +44,13 @@ export interface HighlightLayerProps {
   onSelect(id: string): void;
   /** Annotations whose quote no longer matches the text under them. */
   changed: ReadonlySet<string>;
+  /**
+   * Task R10: called instead of `onSelect` when a click lands where several highlights lie, with
+   * their ids (topmost first) and the click's place on the page (CSS pixels from its top left).
+   */
+  onOverlap?(ids: string[], at: { left: number; top: number }): void;
+  /** Task R10: drafts on their way to the service (drawn marked; never chosen). */
+  drafts?: ReadonlySet<string>;
 }
 
 type Shape = "fill" | "underline" | "note" | "box";
@@ -51,11 +61,14 @@ interface Mark {
   id: string;
   box: Box;
   className: string;
+  draft: boolean;
 }
 
 const finite = (r: { x: number; y: number; w: number; h: number }) => [r.x, r.y, r.w, r.h].every(Number.isFinite);
 
-function HighlightLayerImpl({ pageIndex, viewport, annotations, selectedId, onSelect, changed }: HighlightLayerProps) {
+const NO_DRAFTS: ReadonlySet<string> = new Set();
+
+function HighlightLayerImpl({ pageIndex, viewport, annotations, selectedId, onSelect, changed, onOverlap, drafts = NO_DRAFTS }: HighlightLayerProps) {
   const root = useRef<HTMLDivElement>(null);
   const page = pageIndex + 1;
   const marks = useMemo(() => {
@@ -67,19 +80,20 @@ function HighlightLayerImpl({ pageIndex, viewport, annotations, selectedId, onSe
       if (shape === "underline") classes.push(`ao-hl--edge-${edge}`);
       if (changed.has(a.id)) classes.push("ao-hl--changed");
       if (a.id === selectedId) classes.push("ao-hl--selected");
+      if (drafts.has(a.id)) classes.push("ao-hl--draft");
       const className = classes.join(" ");
       for (const anchor of a.pdfAnchors) {
         if (anchor.page !== page) continue;
         anchor.rects.forEach((r, i) => {
-          if (finite(r)) out.push({ key: `${anchor.id}:${i}`, id: a.id, box: pdfRectToBox(r, viewport), className });
+          if (finite(r)) out.push({ key: `${anchor.id}:${i}`, id: a.id, box: pdfRectToBox(r, viewport), className, draft: drafts.has(a.id) });
         });
       }
     }
     return out;
-  }, [annotations, viewport, page, changed, selectedId]);
+  }, [annotations, viewport, page, changed, selectedId, drafts]);
 
-  const latest = useRef({ marks, onSelect });
-  latest.current = { marks, onSelect };
+  const latest = useRef({ marks, onSelect, onOverlap });
+  latest.current = { marks, onSelect, onOverlap };
 
   // A click on the page that lands on a highlight selects it (the marks themselves take no pointer events).
   useEffect(() => {
@@ -93,14 +107,16 @@ function HighlightLayerImpl({ pageIndex, viewport, annotations, selectedId, onSe
       const at = el.getBoundingClientRect();
       const x = e.clientX - at.left;
       const y = e.clientY - at.top;
-      const { marks: list, onSelect: select } = latest.current;
+      const { marks: list, onSelect: select, onOverlap: offer } = latest.current;
+      // Every highlight under the point, topmost (drawn last) first, each once; drafts are not chosen.
+      const here: string[] = [];
       for (let i = list.length - 1; i >= 0; i--) {
-        const b = list[i]!.box;
-        if (x >= b.left && x <= b.left + b.width && y >= b.top && y <= b.top + b.height) {
-          select(list[i]!.id);
-          return;
-        }
+        const m = list[i]!;
+        const b = m.box;
+        if (!m.draft && !here.includes(m.id) && x >= b.left && x <= b.left + b.width && y >= b.top && y <= b.top + b.height) here.push(m.id);
       }
+      if (here.length > 1 && offer) offer(here, { left: x, top: y });
+      else if (here.length > 0) select(here[0]!);
     };
     target.addEventListener("click", onClick);
     return () => target.removeEventListener("click", onClick);
