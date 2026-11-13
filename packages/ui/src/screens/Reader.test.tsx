@@ -274,7 +274,20 @@ describe("ReaderScreen (Task R7)", () => {
     // No making control anywhere while the document is not open again.
     expect(screen.queryAllByRole("button", { name: /highlight|note/i })).toEqual([]);
 
-    // "Open again" opens it from the start: a new first range and a new handle; the dead one is never reused.
+    // Locked: the way is to the library (A9), not "Open again".
+    expect(screen.getByRole("link", { name: "Go to the library" }).getAttribute("href")).toBe("/?project=p1");
+    expect(screen.queryByRole("button", { name: "Open again" })).toBeNull();
+  });
+
+  it("after a failure in mid-read, Open again opens the file from the start with a new transport and handle", async () => {
+    serveDocument();
+    const f = fakeHandle(10);
+    openPdf.mockResolvedValueOnce(f.handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 10" });
+    act(() => f.fail(new PdfOpenError("other", "The file changed while it was being read. Open it again to read it as it is now.")));
+    await expectState("PDF not shown", "The file changed while it was being read. Open it again to read it as it is now.");
+    expect(f.destroy).toHaveBeenCalled();
     const before = requests.filter((r) => r.url.includes("/document")).length;
     const again = fakeHandle(10);
     openPdf.mockResolvedValueOnce(again.handle);

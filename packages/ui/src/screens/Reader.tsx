@@ -24,18 +24,19 @@
  * making controls come with Tasks R9 to R11 and read `readOnly`).
  */
 import { READER_PDF_MAX_BYTES } from "@ao/shared";
-import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import { ApiClientError } from "../api/client";
 import type { SourceAvailability } from "../api/library";
 import type { ReaderApi } from "../api/reader";
 import { AvailabilityMark } from "../components/AvailabilityMark";
 import { UserText } from "../components/UserText";
+import { inAppLink, libraryHref } from "../navigation";
 import { PdfPages, type ViewRotation } from "../reader/PdfPages";
 import { openPdf, toPdfOpenError, type PdfHandle, type PdfOpenError } from "../reader/pdfjs";
 import { createRangeTransport } from "../reader/rangeTransport";
 import "../reader/Reader.css";
 
-export type ReaderStateKind = "locked" | "missing" | "damaged" | "too-large" | "password-needed" | "password-wrong" | "unreachable" | "other";
+export type ReaderStateKind = "locked" | "missing" | "damaged" | "too-large" | "not-a-pdf" | "password-needed" | "password-wrong" | "unreachable" | "other";
 
 /** Each state's heading and sentence (the sentences are the plan's, exactly). */
 export const READER_STATES: Record<ReaderStateKind, { heading: string; sentence: string }> = {
@@ -43,11 +44,33 @@ export const READER_STATES: Record<ReaderStateKind, { heading: string; sentence:
   missing: { heading: "File not found", sentence: "The file of this source is not where it was recorded, so it cannot be shown." },
   damaged: { heading: "Damaged PDF", sentence: "This PDF is damaged and cannot be shown. The file itself has not been changed." },
   "too-large": { heading: "PDF too large", sentence: "This PDF is larger than 512 MB, too large to open in the app." },
+  "not-a-pdf": { heading: "Not a PDF", sentence: "This file cannot be shown here." },
   "password-needed": { heading: "Password needed", sentence: "This PDF is protected by a password. Enter it to read it here." },
   "password-wrong": { heading: "Password needed", sentence: "That password did not open this PDF." },
   unreachable: { heading: "Library service not reachable", sentence: "The library service could not be reached, so this PDF cannot be shown. Try again in a moment." },
   other: { heading: "PDF not shown", sentence: "This PDF could not be opened." },
 };
+
+/**
+ * What a state offers (A9, Ruling R203): "Open again" where trying again can help (the file missing
+ * or moved, the service out of reach, the file changed while read, a damaged file, any failure in
+ * mid-read); nothing for a file too large or not a PDF (the recorded file decides that); a locked
+ * project points to the library, where it is unlocked.
+ */
+export type ReaderStateOffer = "open-again" | "library" | "none";
+export const offerFor = (state: ReaderStateKind): ReaderStateOffer =>
+  state === "locked" ? "library" : state === "too-large" || state === "not-a-pdf" ? "none" : "open-again";
+
+/** The way to the library for a locked project or a closed library: its address names the project. */
+export function LibraryLink({ projectId }: { projectId?: string }) {
+  return (
+    <p>
+      <a href={libraryHref(projectId)} onClick={inAppLink}>
+        Go to the library
+      </a>
+    </p>
+  );
+}
 
 export const READ_ONLY_NOTICE = "This library is open read-only: you can read and see annotations, but not change them.";
 
@@ -57,6 +80,11 @@ const ZOOM_MIN = ZOOM_STEPS[0];
 const ZOOM_MAX = ZOOM_STEPS[ZOOM_STEPS.length - 1]!;
 /** The first range read: pdf.js's chunk (rangeChunkSize), from the file's first byte. */
 const FIRST_RANGE_END = 1048575;
+/**
+ * CSS pixels per PDF point at 100%: 96 to the inch, 72 points to the inch, so that "100%" is the
+ * printed size, as in pdf.js's own viewer and Zotero.
+ */
+export const CSS_PX_PER_POINT = 96 / 72;
 /** What the page area keeps around a page at "Fit width": the gaps either side and its border. */
 const FIT_MARGIN = 34;
 
@@ -106,7 +134,8 @@ function stateOf(err: unknown, lastRangeError: unknown): { state: ReaderStateKin
   if (unreachable(err)) return { state: "unreachable", sentence: READER_STATES.unreachable.sentence };
   const e: PdfOpenError = toPdfOpenError(err);
   if (e.kind === "other" && unreachable(lastRangeError)) return { state: "unreachable", sentence: READER_STATES.unreachable.sentence };
-  // "other" carries its own sentence (a file that changed while it was read, one that is not a PDF…).
+  if (e.kind === "other" && e.message === READER_STATES["not-a-pdf"].sentence) return { state: "not-a-pdf", sentence: e.message };
+  // "other" carries its own sentence (a file that changed while it was read, a worker that did not start…).
   return { state: e.kind, sentence: e.kind === "other" ? e.message : READER_STATES[e.kind].sentence };
 }
 
@@ -129,6 +158,15 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
   /** Where focus goes once the screen has drawn: the page area, or a page. */
   const focusTo = useRef<"area" | number | undefined>(undefined);
   const attempts = useRef(0);
+  const prevButton = useRef<HTMLButtonElement>(null);
+  const nextButton = useRef<HTMLButtonElement>(null);
+  const zoomOutButton = useRef<HTMLButtonElement>(null);
+  const zoomInButton = useRef<HTMLButtonElement>(null);
+  /**
+   * A press that may disable the pressed control: once drawn, if it is disabled and had focus, focus
+   * goes to its stated neighbour (Previous <-> Next, Zoom out <-> Zoom in), never to the body (R145, A9).
+   */
+  const handoff = useRef<[RefObject<HTMLButtonElement | null>, RefObject<HTMLButtonElement | null>] | undefined>(undefined);
   const apiRef = useRef(api);
   apiRef.current = api;
 
@@ -200,6 +238,15 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     };
   }, [open, close]);
 
+  useLayoutEffect(() => {
+    const h = handoff.current;
+    if (!h) return;
+    handoff.current = undefined;
+    const [from, to] = h;
+    const a = document.activeElement;
+    if (from.current?.disabled && (a === from.current || a === document.body || a === null)) to.current?.focus();
+  });
+
   // The field follows the page shown (unless being typed in).
   useEffect(() => {
     if (document.activeElement?.id !== `${id}-page`) setDraft(String(page));
@@ -246,7 +293,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
       if (g !== gen.current || current.current !== h) return;
       const width = p.getViewport({ scale: 1, rotation: (p.rotate + rotation) % 360 }).width;
       const available = scroller.clientWidth - FIT_MARGIN;
-      if (width > 0 && available > 0) setScale(clampZoom(available / width));
+      if (width > 0 && available > 0) setScale(clampZoom(available / (width * CSS_PX_PER_POINT)));
     } catch {
       // The document failed meanwhile: its sentence is shown.
     }
@@ -312,11 +359,13 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
               </label>
               <button type="submit">Open</button>
             </form>
-          ) : (
+          ) : offerFor(phase.state) === "library" ? (
+            <LibraryLink projectId={projectId} />
+          ) : offerFor(phase.state) === "open-again" ? (
             <button type="button" onClick={() => void open()}>
               Open again
             </button>
-          )}
+          ) : null}
         </ReaderStateView>
       </div>
     );
@@ -341,10 +390,26 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
       )}
       <div role="toolbar" aria-label="Reader" className="ao-reader-toolbar" onKeyDown={onToolbarKey}>
         <span className="ao-reader-toolbar__group">
-          <button type="button" disabled={page <= 1} onClick={() => goTo(page - 1, false)}>
+          <button
+            type="button"
+            ref={prevButton}
+            disabled={page <= 1}
+            onClick={() => {
+              handoff.current = [prevButton, nextButton];
+              goTo(page - 1, false);
+            }}
+          >
             Previous page
           </button>
-          <button type="button" disabled={page >= count} onClick={() => goTo(page + 1, false)}>
+          <button
+            type="button"
+            ref={nextButton}
+            disabled={page >= count}
+            onClick={() => {
+              handoff.current = [nextButton, prevButton];
+              goTo(page + 1, false);
+            }}
+          >
             Next page
           </button>
         </span>
@@ -375,13 +440,29 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
           </span>
         </form>
         <span className="ao-reader-toolbar__group">
-          <button type="button" disabled={scale <= ZOOM_MIN + 1e-9} onClick={() => zoomBy(-1)}>
+          <button
+            type="button"
+            ref={zoomOutButton}
+            disabled={scale <= ZOOM_MIN + 1e-9}
+            onClick={() => {
+              handoff.current = [zoomOutButton, zoomInButton];
+              zoomBy(-1);
+            }}
+          >
             Zoom out
           </button>
           <output role="status" aria-label="Zoom" className="ao-reader-zoom">
             {pct}
           </output>
-          <button type="button" disabled={scale >= ZOOM_MAX - 1e-9} onClick={() => zoomBy(1)}>
+          <button
+            type="button"
+            ref={zoomInButton}
+            disabled={scale >= ZOOM_MAX - 1e-9}
+            onClick={() => {
+              handoff.current = [zoomInButton, zoomOutButton];
+              zoomBy(1);
+            }}
+          >
             Zoom in
           </button>
           <button type="button" onClick={() => void fitWidth()}>
@@ -393,7 +474,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
         </span>
       </div>
       <div className="ao-reader-area" ref={area} onKeyDown={onAreaKey}>
-        <PdfPages handle={handle} scale={scale} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={() => null} />
+        <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={() => null} />
       </div>
     </div>
   );
