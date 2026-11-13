@@ -5,6 +5,7 @@
  * `pnpm test`: run with `pnpm test:scale` (its own Vitest config and process, old space capped).
  * `AO_ZOTERO_SCALE_N` changes the size for a quick local check (the suspend point stays at 5/12 of it).
  */
+import { appendFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +34,16 @@ processing:
 `;
 const U = "user:42";
 const MB = 1024 * 1024;
+
+/**
+ * Progress lines, written at once to the file `AO_SCALE_LOG` names (none: nothing). Synchronous on purpose: the
+ * stand-in answers synchronously and can hold the worker's event loop for seconds, and a run stopped from outside
+ * would lose console output still queued for the test runner.
+ */
+const progress = (line: string): void => {
+  const to = process.env.AO_SCALE_LOG;
+  if (to) appendFileSync(to, `${new Date().toISOString()} ${line}\n`);
+};
 
 afterAll(async () => {
   await shutdownExtractors();
@@ -75,18 +86,29 @@ describe("Zotero Web files at scale (Z4)", () => {
       parents.push(parent);
     }
 
+    progress(`stand-in holds ${2 * N} items (${N} files); the first sync starts`);
     let peakRss = process.memoryUsage().rss;
     let peakHeap = process.memoryUsage().heapUsed;
+    let lastShown = Date.now();
     const timer = setInterval(() => {
       const m = process.memoryUsage();
       peakRss = Math.max(peakRss, m.rss);
       peakHeap = Math.max(peakHeap, m.heapUsed);
+      if (Date.now() - lastShown >= 30_000) {
+        lastShown = Date.now();
+        progress(`after ${Math.round((lastShown - started) / 1000)} s: ${z.requests.length} requests to the stand-in, heap ${Math.round(m.heapUsed / MB)} MB, RSS ${Math.round(m.rss / MB)} MB`);
+      }
     }, 100);
     const started = Date.now();
     try {
       // Part one: the app closes after SUSPEND_AT items.
       const h = await startZoteroWebImport(deps(), p.id, { libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} });
+      let shown = 0;
       for await (const e of h.progress) {
+        if (e.done >= shown + 250) {
+          shown = e.done;
+          progress(`part one: ${e.done} items after ${Math.round((Date.now() - started) / 1000)} s, ${z.requests.length} requests, heap ${Math.round(process.memoryUsage().heapUsed / MB)} MB`);
+        }
         if (e.done >= SUSPEND_AT) {
           await h.suspend();
           break;
