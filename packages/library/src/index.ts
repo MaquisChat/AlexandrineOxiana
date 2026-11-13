@@ -364,3 +364,6 @@ export type { AnnotationDraft, AnnotationPatch } from "./repo/annotations.js";
 
 // The speech models the app accepts and its default (R158), for the apps that do not import @ao/shared.
 export { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, isSpeechModel, type SpeechModel } from "@ao/shared";
+
+// Find and acquire (Task F4): the queue, the runner and their types.
+export * from "./find/index.js";

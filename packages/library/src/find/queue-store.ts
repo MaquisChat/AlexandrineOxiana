@@ -56,7 +56,7 @@ import { CHANGE_LOG_MODE, runMutation } from "../repo/mutate.js";
 import { PURPOSE_FIND_QUEUE } from "../repo/sealed-purposes.js";
 import type { ProjectState, RepoCore } from "../repo/state.js";
 import type { WorkCandidate } from "./candidates.js";
-import { FIND_LINE_MAX_BYTES, FIND_QUEUE_MAX, FIND_QUEUE_OPS, FIND_STATES, FIND_TYPED_MAX, type FindEntry, type FindState, type OfferLink, type PersonCandidate } from "./types.js";
+import { FIND_DOI_MAX, FIND_LINE_MAX_BYTES, FIND_QUEUE_MAX, FIND_QUEUE_OPS, FIND_STATES, FIND_TYPED_MAX, type FindEntry, type FindState, type OfferLink, type PersonCandidate } from "./types.js";
 
 const PURPOSE = PURPOSE_FIND_QUEUE;
 const DIR = "find";
@@ -158,7 +158,7 @@ function workOf(x: unknown): WorkCandidate {
   const type = str(w.type, 40);
   if (!TYPES.includes(type)) throw new Bad();
   let identifiers: Record<string, unknown> = {};
-  identifiers = put(identifiers, "doi", opt(ids.doi, (v) => str(v, 200)));
+  identifiers = put(identifiers, "doi", opt(ids.doi, (v) => str(v, FIND_DOI_MAX)));
   identifiers = put(identifiers, "isbn", opt(ids.isbn, (v) => list(v, 20, (i) => str(i, 20))));
   let out: Record<string, unknown> = { id: str(w.id, 200, 1), title: str(w.title, TITLE_MAX), creators: list(w.creators, CREATORS_MAX, creatorOf) };
   out = put(out, "issued", opt(w.issued, (v) => str(v, 40)));
@@ -222,6 +222,18 @@ export function sanitizeEntry(x: unknown): FindEntry | null {
         const by = r.by;
         if (by !== undefined && by !== "rules" && by !== "settings") throw new Bad();
         return { code: str(r.code, 40, 1), ...(by !== undefined ? { by } : {}) };
+      }),
+    );
+    out = put(
+      out,
+      "match",
+      opt(e.match, (v) => {
+        const m = obj(v);
+        const method = str(m.method, 40);
+        if (method !== "find-match" && method !== "find-chosen") throw new Bad();
+        const c = m.confidence;
+        if (typeof c !== "number" || !Number.isFinite(c) || c < 0 || c > 1) throw new Bad();
+        return { method, confidence: c };
       }),
     );
     out.attempts = attempts;
