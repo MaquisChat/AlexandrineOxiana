@@ -34,7 +34,7 @@ import { libraryApi, type Asset, type LibraryState, type ProjectSummary, type So
 import { readerApi, type AnnotationRecord } from "../api/reader";
 import { isReadablePdf } from "../components/ReaderLink";
 import { UserText } from "../components/UserText";
-import { takePendingFind } from "../reader/readerHandoff";
+import { takeFindDropped, takePendingFind } from "../reader/readerHandoff";
 import { navigate, normalisePath, PATHS, type AppLocation } from "../navigation";
 import { LibraryLink, offerFor, READER_STATES, ReaderScreen, ReaderStateView, type ReaderStateKind } from "../screens/Reader";
 
@@ -89,6 +89,9 @@ export function fileOfFind(list: readonly AnnotationRecord[], files: readonly { 
   return undefined;
 }
 
+/** Said once when a search's words were dropped on the way (expired, a lock, a change of state). */
+export const FIND_NOT_CARRIED = "Your search was not carried over, so all annotations are shown.";
+
 const fileName = (a: Asset): string => a.path.split(/[\\/]/).pop() || a.path;
 
 function failureOf(err: unknown): ReaderStateKind | "no-source" {
@@ -114,7 +117,9 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
   /** Task R12: the words of a search hit, held until the screen has them. */
   const [find, setFind] = useState<{ key: string; words: string } | undefined>(undefined);
   /** Task R12: the file that holds the first match or the annotation asked for, once asked (none: the first file). */
-  const [located, setLocated] = useState<{ key: string; assetId: string | undefined } | undefined>(undefined);
+  const [located, setLocated] = useState<{ key: string; assetId: string | undefined; annotations?: AnnotationRecord[] } | undefined>(undefined);
+  /** The reader was reached by "Show in the reader" but its words were dropped on the way: said once. */
+  const [notCarried, setNotCarried] = useState<string | undefined>(undefined);
   const words = find?.key === key ? find.words : undefined;
   /** Moves on with "Open again" on the route's own failure: the source is read again. */
   const [attempt, setAttempt] = useState(0);
@@ -124,7 +129,11 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
   // Task R12: taken once (an idempotent take: a second run of the effect keeps what the first took).
   useEffect(() => {
     const taken = takePendingFind(projectId, sourceId);
-    setFind((cur) => (taken !== undefined ? { key: `${projectId}\n${sourceId}`, words: taken } : cur?.key === `${projectId}\n${sourceId}` ? cur : undefined));
+    const k = `${projectId}\n${sourceId}`;
+    setFind((cur) => (taken !== undefined ? { key: k, words: taken } : cur?.key === k ? cur : undefined));
+    // Idempotent like the take: a second run of the effect must not forget what the first found.
+    const dropped = taken === undefined && takeFindDropped(projectId, sourceId);
+    setNotCarried((cur) => (dropped ? k : cur === k ? cur : undefined));
   }, [projectId, sourceId]);
 
   // Nothing of the words outlives the reader ending or failing.
@@ -139,8 +148,8 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
   useEffect(() => {
     if (!wantsLocating || !files) return;
     const ac = new AbortController();
-    const done = (assetId: string | undefined) => {
-      if (!ac.signal.aborted) setLocated({ key, assetId });
+    const done = (assetId: string | undefined, annotations?: AnnotationRecord[]) => {
+      if (!ac.signal.aborted) setLocated({ key, assetId, ...(annotations ? { annotations } : {}) });
     };
     const timer = setTimeout(() => {
       ac.abort();
@@ -148,7 +157,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
     }, LOCATE_TIMEOUT_MS);
     api
       .listAnnotations(projectId, sourceId, ac.signal)
-      .then((r) => done(fileOfFind(r.annotations, files, { ...(words !== undefined ? { words } : {}), ...(annotationId !== undefined ? { annotationId } : {}) })))
+      .then((r) => done(fileOfFind(r.annotations, files, { ...(words !== undefined ? { words } : {}), ...(annotationId !== undefined ? { annotationId } : {}) }), r.annotations))
       .catch(() => done(undefined));
     return () => {
       clearTimeout(timer);
@@ -360,6 +369,8 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
                 onChange={() => {
                   // A file chosen by hand: the search's words were for the file that opened.
                   setFind(undefined);
+                  setNotCarried(undefined);
+                  setLocated((l) => (l && l.annotations ? { key: l.key, assetId: l.assetId } : l));
                   navigate(readerHref(projectId, sourceId, { assetId: f.id }), { replace: true });
                 }}
               />
@@ -367,6 +378,11 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
             </label>
           ))}
         </fieldset>
+      )}
+      {notCarried === key && (
+        <p role="status" className="ao-reader-notice">
+          {FIND_NOT_CARRIED}
+        </p>
       )}
       {assetId ? (
         <ReaderScreen
@@ -377,6 +393,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
           assetId={assetId}
           {...(annotationId ? { annotationId } : {})}
           {...(words !== undefined ? { findWords: words, onFindDone: () => setFind(undefined) } : {})}
+          {...(located?.key === key && located.annotations && assetId === (located.assetId ?? pdfs[0]?.id) ? { preloadedAnnotations: located.annotations } : {})}
           readOnly={readOnly}
           {...(availability ? { availability } : {})}
           onProjectInDoubt={() => askNow.current?.()}

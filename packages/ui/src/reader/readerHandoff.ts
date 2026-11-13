@@ -23,8 +23,18 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** How long the fact that words were dropped is remembered (the reader opens within moments of the press). */
+export const FIND_DROPPED_TTL_MS = 10_000;
+
 let pending: Pending | undefined;
 let watch: AbortController | undefined;
+/** Words for this source were dropped before the reader took them (the words themselves are gone). */
+let dropped: { projectId: string; sourceId: string; timer: ReturnType<typeof setTimeout> } | undefined;
+
+function forgetDropped(): void {
+  if (dropped) clearTimeout(dropped.timer);
+  dropped = undefined;
+}
 
 function stopWatching(): void {
   watch?.abort();
@@ -33,9 +43,29 @@ function stopWatching(): void {
 
 /** Drops the words, if any: a lock, a close, a switch, the end of the reader. */
 export function clearPendingFind(): void {
+  const p = pending;
+  release();
+  if (p) {
+    forgetDropped();
+    dropped = { projectId: p.projectId, sourceId: p.sourceId, timer: setTimeout(forgetDropped, FIND_DROPPED_TTL_MS) };
+  }
+}
+
+/** Lets go of the words without noting a drop (they were taken, or are being replaced). */
+function release(): void {
   if (pending) clearTimeout(pending.timer);
   pending = undefined;
   stopWatching();
+}
+
+/**
+ * Whether words handed over for this source were dropped (expired, a lock, a close, a change of state)
+ * before the reader took them: true once, so that the reader says "Your search was not carried over".
+ */
+export function takeFindDropped(projectId: string, sourceId: string): boolean {
+  if (!dropped || dropped.projectId !== projectId || dropped.sourceId !== sourceId) return false;
+  forgetDropped();
+  return true;
 }
 
 /** Whether words wait (for tests and for screens that must not hold a second copy). */
@@ -45,7 +75,8 @@ export function hasPendingFind(): boolean {
 
 /** Hands the words of a search over for the reader of this source; replaces any words still waiting. */
 export function setPendingFind(projectId: string, sourceId: string, words: string): void {
-  clearPendingFind();
+  release();
+  forgetDropped();
   const timer = setTimeout(clearPendingFind, FIND_TTL_MS);
   pending = { projectId, sourceId, words, timer };
 }
@@ -56,7 +87,7 @@ export function setPendingFind(projectId: string, sourceId: string, words: strin
  */
 export function takePendingFind(projectId: string, sourceId: string): string | undefined {
   const p = pending;
-  clearPendingFind();
+  release();
   return p && p.projectId === projectId && p.sourceId === sourceId ? p.words : undefined;
 }
 

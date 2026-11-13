@@ -151,6 +151,11 @@ export interface ReaderScreenProps {
    * shown, stored or put in an address.
    */
   findWords?: string;
+  /**
+   * The source's annotations as the route already asked for them to choose the file (Task R12): used
+   * for the first opening instead of asking the same list again.
+   */
+  preloadedAnnotations?: AnnotationRecord[];
   /** Called once when the words are no longer needed (matched, or the document ended), so that whoever held them lets go. */
   onFindDone?(): void;
   readOnly: boolean;
@@ -193,7 +198,7 @@ export const FIND_NO_EXACT_MATCH = "None of this source's annotations contains a
 /** Said when the annotation the address names is not in the source (Task R12). */
 export const ANNOTATION_GONE = "That highlight or note is no longer there.";
 
-export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, findWords, onFindDone, readOnly, availability, onProjectInDoubt }: ReaderScreenProps) {
+export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, findWords, onFindDone, preloadedAnnotations, readOnly, availability, onProjectInDoubt }: ReaderScreenProps) {
   const [phase, setPhase] = useState<Phase>({ kind: "opening" });
   const [page, setPage] = useState(1);
   const [scale, setScale] = useState(1);
@@ -255,6 +260,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   const findDone = useRef(onFindDone);
   findDone.current = onFindDone;
   const findHandedBack = useRef(false);
+  const preloaded = useRef(preloadedAnnotations);
   /** The words are no longer held here: whoever handed them over is told, once. */
   const releaseFind = useCallback(() => {
     setFinding(undefined);
@@ -391,6 +397,13 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
     let on = true;
     const ac = new AbortController();
     const alive = () => on && current.current === handle && !handle.dead;
+    // Handed over by the route, once: the same list is not asked for twice (Task R12).
+    if (preloaded.current) {
+      const list = preloaded.current;
+      preloaded.current = undefined;
+      setAnnotations(list);
+      return;
+    }
     apiRef.current
       .listAnnotations(projectId, sourceId, ac.signal)
       .then((r) => {
@@ -600,15 +613,33 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   const openAt = (id: string, ordered: AnnotationRecord[]) => {
     const pages = ordered.find((a) => a.id === id)?.pdfAnchors.map((x) => x.page).filter((p) => p >= 1 && p <= count) ?? [];
     setSelectedId(id);
-    // The page area's own first focus (on opening) must not take the focus from the entry.
-    focusTo.current = undefined;
-    setFocusRequest({ id, seq: ++focusSeq.current });
+    // The entry takes the focus only if the researcher has not put it elsewhere meanwhile (the page area
+    // or nowhere is where the reader left it); the page area's own first focus must not then take it back.
+    const now = document.activeElement;
+    if (!now || now === document.body || area.current?.contains(now)) {
+      focusTo.current = undefined;
+      setFocusRequest({ id, seq: ++focusSeq.current });
+    }
     if (pages.length === 0) return;
     jumpTo.current = { id, page: Math.min(...pages) };
     goTo(Math.min(...pages), false);
   };
   const openAtNow = useRef(openAt);
   openAtNow.current = openAt;
+
+  // Task R12: a document or a list that could not be had lets go of the words and of the place asked for.
+  useEffect(() => {
+    if (phase.kind !== "failed" && annotationsError === undefined) return;
+    releaseFind();
+    setWantId(undefined);
+  }, [phase.kind, annotationsError, releaseFind]);
+  // A different annotation named while the reader stays open (a link within the app) is opened at.
+  const lastWanted = useRef(annotationId);
+  useEffect(() => {
+    if (lastWanted.current === annotationId) return;
+    lastWanted.current = annotationId;
+    setWantId(annotationId);
+  }, [annotationId]);
 
   // Task R12: once the list is in (after the reader has opened and drawn: a macrotask later, never on the
   // path that opens the document, A4) the words are matched among this file's annotations, in the list's
@@ -621,7 +652,10 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
       if (current.current !== handle || handle.dead) return;
       const ordered = annotationsInReadingOrder(fileAnnotations, assetId);
       if (finding !== undefined) {
-        const ids = matchAnnotations(ordered, finding);
+        // Every group of the list is searched: this file's annotations first (the first match is the first of
+        // these), then the source's others (another file's, an EPUB's, those with no place).
+        const here = new Set(ordered.map((a) => a.id));
+        const ids = matchAnnotations([...ordered, ...annotations.filter((a) => !here.has(a.id))], finding);
         releaseFind();
         setWantId(undefined);
         if (ids.length === 0) setSearchNote(FIND_NO_EXACT_MATCH);

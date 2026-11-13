@@ -3,7 +3,7 @@
  * taken once, gone after 60 seconds, on a change of the library's state, and on a failed watch.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearPendingFind, FIND_TTL_MS, guardPendingFind, setPendingFind, takePendingFind } from "./readerHandoff";
+import { clearPendingFind, FIND_DROPPED_TTL_MS, FIND_TTL_MS, guardPendingFind, setPendingFind, takeFindDropped, takePendingFind } from "./readerHandoff";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -146,5 +146,41 @@ describe("guardPendingFind", () => {
     const signal = s.events.mock.calls[0]![0]!.signal!;
     expect(takePendingFind("p1", "s1")).toBe("habitus");
     expect(signal.aborted).toBe(true);
+  });
+});
+
+describe("takeFindDropped: telling the researcher the words were not carried over", () => {
+  it("is true once for the source whose words were dropped before the reader took them", () => {
+    setPendingFind("p1", "s1", "habitus");
+    clearPendingFind();
+    expect(takeFindDropped("p1", "s2")).toBe(false);
+    expect(takeFindDropped("p1", "s1")).toBe(true);
+    expect(takeFindDropped("p1", "s1")).toBe(false);
+  });
+
+  it("is false when the words were taken, or when nothing was handed over", () => {
+    expect(takeFindDropped("p1", "s1")).toBe(false);
+    setPendingFind("p1", "s1", "habitus");
+    expect(takePendingFind("p1", "s1")).toBe("habitus");
+    expect(takeFindDropped("p1", "s1")).toBe(false);
+  });
+
+  it("is true when the words expired, and only for a short while", () => {
+    setPendingFind("p1", "s1", "habitus");
+    vi.advanceTimersByTime(FIND_TTL_MS);
+    vi.advanceTimersByTime(FIND_DROPPED_TTL_MS - 1);
+    expect(takeFindDropped("p1", "s1")).toBe(true);
+    setPendingFind("p1", "s1", "habitus");
+    clearPendingFind();
+    vi.advanceTimersByTime(FIND_DROPPED_TTL_MS);
+    expect(takeFindDropped("p1", "s1")).toBe(false);
+  });
+
+  it("a new hand-over forgets an old drop", () => {
+    setPendingFind("p1", "s1", "habitus");
+    clearPendingFind();
+    setPendingFind("p1", "s1", "again");
+    expect(takePendingFind("p1", "s1")).toBe("again");
+    expect(takeFindDropped("p1", "s1")).toBe(false);
   });
 });

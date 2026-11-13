@@ -92,7 +92,7 @@ afterEach(() => {
   window.history.replaceState(null, "", "/");
 });
 
-function reader(props: { findWords?: string; annotationId?: string; onFindDone?: () => void; assetId?: string } = {}) {
+function reader(props: { findWords?: string; annotationId?: string; onFindDone?: () => void; assetId?: string; preloadedAnnotations?: AnnotationRecord[] } = {}) {
   return render(<ReaderScreen api={readerApi(testClient())} projectId="p1" sourceId="s1" assetId="a1" readOnly={false} {...props} />);
 }
 
@@ -146,14 +146,6 @@ describe("the reader opened from a search hit (Task R12)", () => {
     reader({ findWords: "hysteresis" });
     await screen.findByRole("region", { name: "Annotations matching your search (1)" });
     expect(shown()).toEqual(["q"]);
-  });
-
-  it("looks only at this file's annotations (A4): a match on another file is not a match here", async () => {
-    serveList([rec("other", "habitus", { assetId: "a2", page: 2 }), rec("here", "no match", { page: 1 })]);
-    const done = vi.fn();
-    reader({ findWords: "habitus", onFindDone: done });
-    await waitFor(() => expect(screen.getByText(NONE)).toBeTruthy());
-    expect(done).toHaveBeenCalledTimes(1);
   });
 
   it("when nothing matches exactly says so plainly and keeps the full list", async () => {
@@ -239,5 +231,97 @@ describe("the reader opened at an annotation (readerHref with annotationId, Task
       await new Promise((r) => setTimeout(r, 30));
     });
     expect(screen.queryByText(GONE)).toBeNull();
+  });
+});
+
+describe("matches in every group of the list, not only on the open file (I2)", () => {
+  const epub = (id: string, quote: string): AnnotationRecord => ({ ...rec(id, quote), pdfAnchors: [], otherAnchorKinds: ["epub"] });
+  const unplaced = (id: string, quote: string): AnnotationRecord => ({ ...rec(id, quote), pdfAnchors: [] });
+
+  it("the only match is not placed on a page: it is listed and counted, and no 'none matches' sentence is said", async () => {
+    serveList([rec("a", "alpha", { page: 1 }), unplaced("u", "the habitus unplaced")]);
+    reader({ findWords: "habitus" });
+    await screen.findByRole("region", { name: "Annotations matching your search (1)" });
+    expect(shown()).toEqual(["u"]);
+    expect(screen.getByRole("heading", { level: 3, name: "Not placed on a page (1)" })).toBeTruthy();
+    expect(screen.queryByText(NONE)).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(entry("u")));
+  });
+
+  it("the only match is an EPUB annotation: listed under another file, counted, no sentence", async () => {
+    serveList([rec("a", "alpha", { page: 1 }), epub("e", "habitus in epub")]);
+    reader({ findWords: "habitus" });
+    await screen.findByRole("region", { name: "Annotations matching your search (1)" });
+    expect(shown()).toEqual(["e"]);
+    expect(screen.getByRole("heading", { level: 3, name: "On another file of this source (1)" })).toBeTruthy();
+    expect(screen.queryByText(NONE)).toBeNull();
+  });
+
+  it("the only match is on another PDF of the source (the route could not choose the file): listed read-only, counted, no sentence", async () => {
+    serveList([rec("a", "alpha", { page: 1 }), rec("o", "habitus there", { assetId: "a2", page: 2 })]);
+    reader({ findWords: "habitus" });
+    await screen.findByRole("region", { name: "Annotations matching your search (1)" });
+    expect(shown()).toEqual(["o"]);
+    expect(screen.queryByText(NONE)).toBeNull();
+    expect(pageField()).toBe("1");
+  });
+
+  it("the count covers every group, and the first match on this file is the one opened", async () => {
+    serveList([rec("here", "habitus here", { page: 4 }), unplaced("u", "habitus unplaced"), epub("e", "habitus epub"), rec("no", "nothing", { page: 1 })]);
+    reader({ findWords: "habitus" });
+    await screen.findByRole("region", { name: "Annotations matching your search (3)" });
+    expect(new Set(shown())).toEqual(new Set(["here", "u", "e"]));
+    await waitFor(() => expect(document.activeElement).toBe(entry("here")));
+    expect(pageField()).toBe("4");
+  });
+});
+
+describe("the list handed over by the route, the researcher's focus, a failed document, a changed annotation id", () => {
+  it("annotations handed over by the route are used: the screen does not ask for the list again", async () => {
+    let asked = 0;
+    server.use(http.get(url("/projects/:id/sources/:sid/annotations"), () => (asked++, HttpResponse.json({ annotations: [], count: 0, textChars: 0 }))));
+    reader({ findWords: "habitus", preloadedAnnotations: [rec("m", "habitus", { page: 2 }), rec("z", "zeta", { page: 3 })] });
+    await screen.findByRole("region", { name: "Annotations matching your search (1)" });
+    await waitFor(() => expect(document.activeElement).toBe(entry("m")));
+    expect(asked).toBe(0);
+  });
+
+  it("a late list does not take the focus from where the researcher put it", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/annotations"), async () => {
+        await gate;
+        return HttpResponse.json({ annotations: [rec("m", "habitus", { page: 2 })], count: 1, textChars: 0 });
+      }),
+    );
+    reader({ findWords: "habitus" });
+    const field = await screen.findByLabelText("Page");
+    field.focus();
+    release();
+    await screen.findByRole("region", { name: "Annotations matching your search (1)" });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(document.activeElement).toBe(field);
+    expect(pageField()).toBe("2");
+  });
+
+  it("a document that cannot be opened lets go of the words at once", async () => {
+    openPdf.mockReset();
+    openPdf.mockRejectedValue(new Error("no"));
+    const done = vi.fn();
+    reader({ findWords: "habitus", onFindDone: done });
+    await screen.findByRole("button", { name: "Open again" });
+    expect(done).toHaveBeenCalledTimes(1);
+  });
+
+  it("an annotation id that changes while the reader is open is opened at", async () => {
+    serveList([rec("a", "alpha", { page: 1 }), rec("t", "target", { page: 6 })]);
+    const view = reader();
+    await screen.findByRole("heading", { level: 2, name: "Annotations (2)" });
+    view.rerender(<ReaderScreen api={readerApi(testClient())} projectId="p1" sourceId="s1" assetId="a1" readOnly={false} annotationId="t" />);
+    await waitFor(() => expect(document.activeElement).toBe(entry("t")));
+    expect(pageField()).toBe("6");
   });
 });

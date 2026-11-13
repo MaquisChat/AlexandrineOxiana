@@ -15,12 +15,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { routeFor } from "../App";
 import type { AnnotationRecord } from "../api/reader";
 import { clearPendingFind, setPendingFind, takePendingFind } from "../reader/readerHandoff";
+const DROPPED = "Your search was not carried over, so all annotations are shown.";
 import { CURRENT_RW, LIBRARIES, PROJECTS, server, SOURCE_FILE, sse, testClient, url, useMockService } from "../test/service";
 
 vi.mock("../screens/Reader", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../screens/Reader")>()),
-  ReaderScreen: (p: { assetId?: string; annotationId?: string; findWords?: string; onFindDone?: () => void }) => (
+  ReaderScreen: (p: { assetId?: string; annotationId?: string; findWords?: string; onFindDone?: () => void; preloadedAnnotations?: unknown[] }) => (
     <div>
+      <p data-testid="preloaded">{p.preloadedAnnotations ? String(p.preloadedAnnotations.length) : "-"}</p>
       <p data-testid="reader-screen">{`${p.assetId ?? "-"}|${p.annotationId ?? "-"}|${p.findWords ?? "-"}`}</p>
       <button type="button" onClick={() => p.onFindDone?.()}>
         hand back
@@ -192,6 +194,68 @@ describe("the reader route with a search hit's words (Task R12)", () => {
     expect(await shownScreen()).toBe("a1|-|habitus");
     await user.click(screen.getByRole("button", { name: "hand back" }));
     await waitFor(() => expect(screen.getByTestId("reader-screen").textContent).toBe("a1|-|-"));
+  });
+});
+
+describe("what the route hands on (R12 fix round 1)", () => {
+  it("hands the screen the list it asked for, so that the screen does not ask again", async () => {
+    serve(TWO, list([rec("n1", "a1", "unrelated"), rec("n2", "a2", "habitus")]));
+    setPendingFind("p1", "s1", "habitus");
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    expect(await shownScreen()).toBe("a2|-|habitus");
+    expect(screen.getByTestId("preloaded").textContent).toBe("2");
+  });
+
+  it("hands nothing when the question failed (the screen asks for itself)", async () => {
+    serve(TWO, () => HttpResponse.error() as unknown as Response);
+    setPendingFind("p1", "s1", "habitus");
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    await shownScreen();
+    expect(screen.getByTestId("preloaded").textContent).toBe("-");
+  });
+
+  it("tells the researcher once, politely, that words dropped on the way were not carried over", async () => {
+    serve(TWO, list([]));
+    setPendingFind("p1", "s1", "habitus");
+    clearPendingFind();
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    expect(await shownScreen()).toBe("a1|-|-");
+    expect(screen.getByText(DROPPED).getAttribute("role")).toBe("status");
+    cleanup();
+    render(<Host />);
+    await shownScreen();
+    expect(screen.queryByText(DROPPED)).toBeNull();
+  });
+
+  it("says nothing when the reader was opened in the ordinary way", async () => {
+    serve(TWO, list([]));
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    await shownScreen();
+    expect(screen.queryByText(DROPPED)).toBeNull();
+  });
+
+  it("a project locked while the route is still asking which file holds the words ends the reader: the screen is never given them", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    serve(TWO, async () => {
+      await gate;
+      return list([rec("n2", "a2", "habitus")])();
+    });
+    server.use(
+      http.get(url("/events"), () => sse([{ type: "library.state", data: { open: true, ...CURRENT_RW } }])),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === "p1" ? { ...p, unlocked: false } : p)) })),
+    );
+    setPendingFind("p1", "s1", "habitus");
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    expect(await screen.findByText("This project is locked. Unlock it in the library to read its files.")).toBeTruthy();
+    release();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByTestId("reader-screen")).toBeNull();
   });
 });
 

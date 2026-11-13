@@ -1061,8 +1061,9 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     );
   };
 
-  const n = groups.here.length;
   const filtered = filterIds !== undefined;
+  // Filtered, the count covers every group (this file's, another file's, not placed): all are matches.
+  const n = filtered ? flat.length : groups.here.length;
   /** "Show all": the focus goes to the entry that is current, which the full list still holds. */
   const showAll = () => {
     if (activeId !== undefined) focusLater({ id: activeId, what: "entry" });
