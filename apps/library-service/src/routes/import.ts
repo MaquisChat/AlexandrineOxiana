@@ -12,6 +12,7 @@ import {
   removeWatchedFolder,
   researcherName,
   researcherNameOk,
+  resumeZoteroWebImport,
   startZoteroWebImport,
   watchFolder,
   zoteroWebAdapter,
@@ -116,10 +117,15 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
         running.handle[action]();
         return { batchId, action };
       }
-      const shown = (await s.bulk.listBatches(projectId)).find((b) => b.batchId === batchId)?.state;
+      const listed = (await s.bulk.listBatches(projectId)).find((b) => b.batchId === batchId);
+      const shown = listed?.state;
       if (action !== "resume") throw new ApiError(409, "CONFLICT", "This import is not running.", shown);
       if (shown === "finished" || shown === "undone") throw new ApiError(409, "CONFLICT", "This import has already finished.", shown);
-      const h = await s.bulk.resumeBatch(projectId, batchId);
+      // A Zotero Web batch resumes with the version it started from and records the new one when done (Z2).
+      const h =
+        listed?.kind === "zotero-web"
+          ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, batchId)
+          : await s.bulk.resumeBatch(projectId, batchId);
       state.followBatch(s, projectId, h);
       return { batchId, action };
     });

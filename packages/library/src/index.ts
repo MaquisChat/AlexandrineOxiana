@@ -185,7 +185,10 @@ export {
   ZOTERO_STORAGE_HOSTS,
   ZOTERO_WEB_FILE_NOTES,
   ZOTERO_WEB_REASONS,
+  finishZoteroWebRun,
+  resumeZoteroWebImport,
   startZoteroWebImport,
+  zoteroFileHostAllowed,
   zoteroWebAdapter,
   zoteroWebSince,
 } from "./import/zotero-web.js";

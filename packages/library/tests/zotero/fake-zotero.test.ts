@@ -465,7 +465,7 @@ describe("the existing client against the stand-in", () => {
     z.remove(U, a);
     const gone = await scan({ since: v2 });
     expect(gone.items).toEqual([]);
-    expect(gone.notes.join(" ")).toMatch(/1 item was deleted in Zotero/u);
+    expect(gone.notes.filter((t) => /deleted in Zotero/u.test(t))).toEqual([]); // A5: a key never imported here is not counted
   });
 });
 
