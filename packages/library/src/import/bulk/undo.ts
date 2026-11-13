@@ -97,7 +97,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
         for (const path of r.kept) kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: "changed after the import; kept" });
         for (const id of r.keptAnnotations) kept.push({ kind: "annotation", id, sourceId: e.mergedInto!, reason: "edited after the import; kept" });
         // Z5: an availability changed since this batch wrote it (a later batch, or the researcher) is left as it is.
-        if (r.keptAvailability) kept.push({ kind: "availability", id: "/availability", sourceId: e.mergedInto!, reason: "changed after the import; kept" });
+        if (r.keptAvailability) kept.push({ kind: "availability", id: "/availability", sourceId: e.mergedInto!, reason: "its availability changed after the import; kept" });
         if (r.changed) await ops.writeSource(now, r.next);
         return r.changed;
       },

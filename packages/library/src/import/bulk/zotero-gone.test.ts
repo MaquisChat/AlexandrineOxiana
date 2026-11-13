@@ -398,6 +398,22 @@ describe("gone from Zotero, and back (Z5)", () => {
     expect((await sourceOf(p, key)).source.availability.zotero).toBe("deleted");
   });
 
+  it("undo of the batch that brought it back puts the mark back, byte for byte", async () => {
+    const p = await project();
+    const { p: key } = await highlighted("Back, then undone");
+    await run(p);
+    const sf = await sourceOf(p, key);
+    z.trash(U, key);
+    await run(p);
+    const marked = await folderBytes(sf.source.folder);
+    z.restore(U, key);
+    const back = await run(p);
+    expect((await sourceOf(p, key)).source.availability).toEqual({ status: "available" });
+    const res = await bulk().undoBatch(p.id, back.batchId);
+    expect(res).toMatchObject({ kept: [], libraryVersionReset: true });
+    expect(await folderBytes(sf.source.folder)).toEqual(marked);
+  });
+
   it("undo after a later change leaves the later value and says so", async () => {
     const p = await project();
     const { p: key } = await highlighted("Back before the undo");
@@ -409,7 +425,7 @@ describe("gone from Zotero, and back (Z5)", () => {
     await run(p); // back: the availability is the earlier one again
     expect((await repo.getSource(p.id, id)).source.availability).toEqual({ status: "available" });
     const res = await bulk().undoBatch(p.id, marked.batchId);
-    expect(res.kept).toEqual([{ kind: "availability", id: "/availability", sourceId: id, reason: "changed after the import; kept" }]);
+    expect(res.kept).toEqual([{ kind: "availability", id: "/availability", sourceId: id, reason: "its availability changed after the import; kept" }]);
     expect((await repo.getSource(p.id, id)).source.availability).toEqual({ status: "available" });
     // The researcher's own change after a mark is kept too.
     z.trash(U, key);
