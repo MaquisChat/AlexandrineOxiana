@@ -19,7 +19,25 @@ import { execFile } from "node:child_process";
 import type { Stats } from "node:fs";
 import fsp from "node:fs/promises";
 import { classifyLocation, type LocationEnv } from "../location.js";
-import { ignoredName } from "./watch.js";
+
+/**
+ * Names never imported: partial downloads, temporary files, Office lock files and dotfiles (incl. .DS_Store).
+ * It lives here so that watch.ts can import this module without the two importing each other; watch.ts
+ * re-exports it under the same name.
+ */
+export function ignoredName(name: string): boolean {
+  const n = name.toLowerCase();
+  return (
+    n.startsWith(".") ||
+    n.startsWith("~$") ||
+    n.endsWith(".part") ||
+    n.endsWith(".crdownload") ||
+    n.endsWith(".download") ||
+    n.endsWith(".tmp") ||
+    n === "thumbs.db" ||
+    n === "desktop.ini"
+  );
+}
 
 /** Where the file's content is: on this machine, not, or it cannot be told (handled as not downloaded). */
 export type ContentPresence = "local" | "not-downloaded" | "unknown";

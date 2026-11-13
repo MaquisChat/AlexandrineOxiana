@@ -95,20 +95,9 @@ export interface FolderWatch {
   stop(): Promise<void>;
 }
 
-/** Names never imported: partial downloads, temporary files, Office lock files and dotfiles (incl. .DS_Store). */
-export function ignoredName(name: string): boolean {
-  const n = name.toLowerCase();
-  return (
-    n.startsWith(".") ||
-    n.startsWith("~$") ||
-    n.endsWith(".part") ||
-    n.endsWith(".crdownload") ||
-    n.endsWith(".download") ||
-    n.endsWith(".tmp") ||
-    n === "thumbs.db" ||
-    n === "desktop.ini"
-  );
-}
+/** Names never imported (moved to watch-local.ts so the two modules do not import each other; A2). */
+export { ignoredName } from "./watch-local.js";
+import { ignoredName } from "./watch-local.js";
 
 const within = (folder: string, p: string) => {
   const rel = relative(folder, p);

@@ -1,8 +1,11 @@
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MockAgent } from "undici";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Project } from "@ao/core";
 import { ExifTool } from "exiftool-vendored";
 import { buildCameraTiff, buildPdf } from "../../../../tests/fixtures/generate.mjs";
@@ -17,18 +20,63 @@ import { createLibrary, type Library } from "../library.js";
 import { HttpClient } from "../lookup/index.js";
 import type { Repo } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
+import type { Attach } from "./attach.js";
+import { POINTER_REASON, contentState, ignoredName as ignoredNameLocal } from "./watch-local.js";
 import {
+  WATCH_FS_TIMEOUT_MS,
+  WATCH_PROBLEMS_MAX,
   WATCH_REASONS,
+  WATCH_RESCAN_MS,
   WATCH_STABILITY_MS,
+  WATCH_STATUS_INTERVAL_MS,
   addWatchedFolder,
   ignoredName,
   listWatchedFolders,
   removeWatchedFolder,
   setWatchFolder,
   watchFolder,
+  withProvider,
   type FolderWatch,
+  type WatchDeps,
   type WatchEvent,
+  type WatchStatus,
 } from "./watch.js";
+
+// Every change the test itself makes in a watched folder goes through these, which note the time of the
+// last one: after each test, nothing in any watched folder may have changed after it (W2 Accept 8: the
+// engine never writes, renames, deletes or touches anything there — any such change moves a ctime).
+let lastWrite = 0;
+const tracked =
+  <A extends unknown[], R>(fn: (...a: A) => Promise<R>) =>
+  async (...a: A): Promise<R> => {
+    try {
+      return await fn(...a);
+    } finally {
+      lastWrite = Date.now();
+    }
+  };
+const writeFile = tracked(fsp.writeFile);
+const appendFile = tracked(fsp.appendFile);
+const mkdir = tracked(fsp.mkdir);
+const rename = tracked(fsp.rename);
+const rm = tracked(fsp.rm);
+const symlink = tracked(fsp.symlink);
+const truncate = tracked(fsp.truncate);
+const watchedDirs = new Set<string>();
+
+/** Every entry under `dir` (dot entries included) with its change time; null when `dir` is gone. */
+async function ctimes(dir: string): Promise<Array<[string, number]> | null> {
+  const st = await fsp.lstat(dir).catch(() => null);
+  if (!st) return null;
+  const out: Array<[string, number]> = [[dir, st.ctimeMs]];
+  if (!st.isDirectory()) return out;
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...((await ctimes(p)) ?? []));
+    else out.push([p, (await fsp.lstat(p)).ctimeMs]);
+  }
+  return out;
+}
 
 const FAST = 2 ** 10;
 const GOV = `identifiability:
@@ -75,6 +123,14 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await Promise.all(watches.splice(0).map((w) => w.stop()));
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  // Nothing in a watched folder changed after the test's own last change (W2 Accept 8).
+  for (const d of watchedDirs) {
+    const changed = ((await ctimes(d)) ?? []).filter(([, c]) => c > lastWrite + 1).map(([p]) => p);
+    expect(changed).toEqual([]);
+  }
+  watchedDirs.clear();
   await agent.close();
   await lib.close();
   ring.clear();
@@ -94,13 +150,57 @@ const project = async (encrypted = false): Promise<Project> =>
     })
   ).project;
 
-function start(p: Project, opts: { stabilityMs?: number; pollMs?: number; dir?: string; recursive?: boolean } = {}): { w: FolderWatch; events: WatchEvent[] } {
+type Seams = Partial<Omit<WatchDeps, "repo" | "http" | "lib" | "onEvent" | "onStatus">>;
+function start(p: Project, opts: Seams & { dir?: string; recursive?: boolean } = {}): { w: FolderWatch; events: WatchEvent[]; statuses: Array<WatchStatus & { at: number }> } {
   const events: WatchEvent[] = [];
+  const statuses: Array<WatchStatus & { at: number }> = [];
   const { dir, recursive, ...seams } = opts;
-  const w = watchFolder({ repo, http, lib, onEvent: (e) => events.push(e), ...seams }, p.id, dir ?? inbox, recursive ? { recursive: true } : {});
+  // (A folder holding the library, or inside it, is refused; the library itself changes, so it is not checked.)
+  const d = dir ?? inbox;
+  if (!lib.root.startsWith(d) && !d.startsWith(lib.root)) watchedDirs.add(d);
+  const w = watchFolder(
+    { repo, http, lib, onEvent: (e) => events.push(e), onStatus: (s) => statuses.push({ ...structuredClone(s), at: Date.now() }), ...seams },
+    p.id,
+    dir ?? inbox,
+    recursive ? { recursive: true } : {},
+  );
   watches.push(w);
-  return { w, events };
+  return { w, events, statuses };
 }
+
+/** Spies on every call that opens or reads a file's bytes (through each module's own binding); returns the calls for one path. */
+function readSpies(): (path: string) => unknown[][] {
+  const spies = [
+    vi.spyOn(fsp, "open"),
+    vi.spyOn(fsp, "readFile"),
+    vi.spyOn(fsp, "copyFile"),
+    vi.spyOn(fsp, "cp"),
+    vi.spyOn(fs, "createReadStream"),
+    vi.spyOn(fs, "open"),
+    vi.spyOn(fs, "readFile"),
+    vi.spyOn(fs, "openSync"),
+    vi.spyOn(fs, "readFileSync"),
+    vi.spyOn(fs, "copyFile"),
+    vi.spyOn(fs, "copyFileSync"),
+  ];
+  syncBuiltinESMExports();
+  return (path) => spies.flatMap((s) => s.mock.calls as unknown[][]).filter((args) => String(args[0]) === path);
+}
+
+/** A file whose size is `size` bytes and which has no blocks: Linux's stand-in for a file that is not downloaded (W1). */
+async function sparse(path: string, size: number): Promise<void> {
+  await writeFile(path, "");
+  await truncate(path, size);
+}
+
+/** An attach that stores nothing and reads nothing: every file "comes in" at once (tests of the engine alone). */
+const quickAttach = (): Attach & { paths: string[] } => {
+  const paths: string[] = [];
+  return {
+    paths,
+    attachFiles: async (_p, ps) => ps.map((path) => (paths.push(path), { path, outcome: "created" as const, sourceId: `s${paths.length}` })),
+  };
+};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function until(cond: () => boolean, ms = 15_000): Promise<void> {
@@ -208,8 +308,11 @@ describe("watchFolder (review round 1, R81)", () => {
     await w.ready;
     await rm(inbox, { recursive: true });
     await until(() => events.some((e) => e.kind === "stopped"));
-    expect(events.find((e) => e.kind === "stopped")).toMatchObject({ reason: WATCH_REASONS.removed });
-    expect(WATCH_REASONS.removed).toMatch(/the watched folder was removed/iu);
+    // W2 Accept 5: "Cannot be reached" with the `missing` sentence, replacing "the watched folder was removed".
+    const missing = withProvider(WATCH_REASONS.missing, null);
+    expect(missing).toBe("The folder cannot be found. If the system is signed out or still starting, watching resumes when the folder is back.");
+    expect(events.find((e) => e.kind === "stopped")).toMatchObject({ reason: missing });
+    expect(w.status()).toMatchObject({ state: "unreachable", reason: missing });
     expect(w.stopped).toBe(false); // waiting for it, not finished
     await mkdir(inbox);
     await until(() => events.some((e) => e.kind === "resumed"));
@@ -374,6 +477,332 @@ describe("watched-folder settings (R69)", () => {
     expect(aside).toHaveLength(1);
     expect(await readFile(join(tmp, "config", aside[0]!), "utf8")).toBe("{ not json");
     expect(await readFile(join(tmp, "config", "watched-folders.json"), "utf8")).toContain(wf.id);
+  });
+});
+
+describe("cloud-drive folders: the engine reads nothing it may not (Task W2)", () => {
+  const eperm = () => Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+  const page = (n: number) => ({ offset: 0, limit: n });
+
+  it("ignoredName is the same function from both modules", () => {
+    expect(ignoredName).toBe(ignoredNameLocal);
+  });
+
+  it("a not-downloaded file is counted, listed and never opened", async () => {
+    expect([WATCH_PROBLEMS_MAX, WATCH_STATUS_INTERVAL_MS]).toEqual([5000, 1000]);
+    const p = await project();
+    const real = await realpath(inbox);
+    await sparse(join(inbox, "online.pdf"), 100_000);
+    const opened = readSpies();
+    const { w, statuses } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(w.status()).toMatchObject({ state: "watching", provider: null, counts: { notDownloaded: 1, notDownloadedBytes: 100_000, cameIn: 0, didNotComeIn: 0 } });
+    expect(w.problems(page(10))).toEqual({ total: 1, items: [{ file: "online.pdf", kind: "not-downloaded", reason: WATCH_REASONS.notDownloaded, bytes: 100_000 }] });
+    expect(w.problems({ kind: "not-supported", offset: 0, limit: 10 })).toEqual({ total: 0, items: [] });
+    await sleep(800); // several polls, each re-checking it
+    expect(opened(join(real, "online.pdf"))).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    expect(statuses.at(-1)!.counts.notDownloaded).toBe(1);
+    // A file that goes away leaves the list and the counts.
+    await rm(join(inbox, "online.pdf"));
+    await until(() => w.problems(page(10)).total === 0);
+    expect(w.status().counts).toMatchObject({ notDownloaded: 0, notDownloadedBytes: 0 });
+  });
+
+  it("a not-downloaded sidecar is not read", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "paper.pdf"), await buildPdf({ lines: ["Some page text without a title that we could use."], extra: "sidecar" }));
+    await sparse(join(inbox, "paper.bib"), 4096);
+    const opened = readSpies();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await until(() => events.some((e) => e.file === "paper.pdf" && e.kind === "imported"));
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(opened(join(real, "paper.pdf")).length).toBeGreaterThan(0); // the spies see the engine's reads
+    expect(opened(join(real, "paper.bib"))).toEqual([]);
+    expect(w.problems(page(10)).items).toEqual([expect.objectContaining({ file: "paper.bib", kind: "not-downloaded" })]);
+  });
+
+  it("a scanned file still being written waits for 2 seconds of no change", async () => {
+    const p = await project();
+    const pdf = await buildPdf({ title: "Slow copy", extra: "slow" });
+    const half = Math.ceil(pdf.length / 2);
+    await writeFile(join(inbox, "slow.pdf"), pdf.subarray(0, half));
+    const { w, events } = start(p, { watchEvents: false }); // found by the scan alone, never by an event
+    await w.ready;
+    await sleep(700);
+    await appendFile(join(inbox, "slow.pdf"), pdf.subarray(half));
+    const last = Date.now();
+    await until(() => events.some((e) => e.file === "slow.pdf"));
+    expect(Date.now() - last).toBeGreaterThanOrEqual(1900);
+    expect(events.filter((e) => e.file === "slow.pdf")).toEqual([expect.objectContaining({ kind: "imported" })]);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  }, 30_000);
+
+  it("a file that becomes downloaded comes in without an event", async () => {
+    const p = await project();
+    let online = true;
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) {
+        const s = m.get(q);
+        if (online && q.endsWith("later.pdf") && s?.presence === "local") m.set(q, { ...s, presence: "not-downloaded" });
+      }
+      return m;
+    };
+    await writeFile(join(inbox, "later.pdf"), await buildPdf({ title: "Later", extra: "later" }));
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 100, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(events.filter((e) => e.file === "later.pdf")).toEqual([]);
+    const before = lastWrite;
+    online = false; // downloaded: nothing in the folder changes, so no file-system event comes
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "later.pdf"));
+    expect(lastWrite).toBe(before);
+    expect(w.status().counts).toMatchObject({ notDownloaded: 0, notDownloadedBytes: 0, cameIn: 1 });
+    expect(w.problems(page(10)).total).toBe(0); // removed when the file came in
+  });
+
+  it("a missed event is caught by the rescan", async () => {
+    expect(WATCH_RESCAN_MS).toBe(300_000);
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 100, rescanMs: 600, watchEvents: false });
+    await w.ready;
+    await sleep(300);
+    await writeFile(join(inbox, "missed.pdf"), await buildPdf({ title: "Missed", extra: "missed" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "missed.pdf"));
+  });
+
+  it('an EPERM on the folder says the privacy sentence, not "cannot be found"', async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let denied = true;
+    const readdirS = async (d: string) => {
+      if (denied && d === real) throw eperm();
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, fs: { readdir: readdirS } });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    const sentence = withProvider(WATCH_REASONS.notPermitted, null);
+    expect(sentence).toBe("macOS did not allow the app to read files managed by the system, so this folder is not watched. Press “Try again” and choose Allow if macOS asks.");
+    expect(w.status().reason).toBe(sentence);
+    expect(w.status().reason).not.toMatch(/cannot be found/u);
+    await writeFile(join(inbox, "allowed.pdf"), await buildPdf({ title: "Allowed", extra: "allowed" }));
+    denied = false; // allowed now: watching resumes by itself
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "allowed.pdf"));
+    expect(w.status().state).toBe("watching");
+  });
+
+  it('EPERM on the root gives state "unreachable" with the privacy reason naming the provider', async () => {
+    const p = await project();
+    const home = join(tmp, "home");
+    const drive = join(home, "Library", "CloudStorage", "GoogleDrive-a@b.c", "My Drive");
+    await mkdir(drive, { recursive: true });
+    const real = await realpath(drive);
+    const { w } = start(p, {
+      dir: drive,
+      pollMs: 50,
+      locationEnv: { homeDir: await realpath(home), platform: "darwin", mounts: [] },
+      fs: { readdir: async (d: string) => (d === real ? Promise.reject(eperm()) : fsp.readdir(d, { withFileTypes: true })) },
+    });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    expect(w.status()).toMatchObject({
+      provider: "google-drive",
+      reason: "macOS did not allow the app to read files managed by Google Drive, so this folder is not watched. Press “Try again” and choose Allow if macOS asks.",
+    });
+  });
+
+  it('a folder operation that never answers marks the folder "Cannot be reached" after 30 s and other requests still answer', async () => {
+    expect(WATCH_FS_TIMEOUT_MS).toBe(30_000);
+    const p = await project();
+    const real = await realpath(inbox);
+    const other = join(tmp, "Inbox2");
+    await mkdir(other);
+    const inStuck = (q: string) => q === real || q.startsWith(`${real}/`);
+    let outstanding = 0;
+    let most = 0;
+    let calls = 0;
+    const never = new Promise<never>(() => {});
+    const count =
+      <A extends [string, ...unknown[]], R>(fn: (...a: A) => Promise<R>) =>
+      async (...a: A): Promise<R> => {
+        if (!inStuck(a[0])) return fn(...a);
+        calls++;
+        most = Math.max(most, ++outstanding);
+        try {
+          return await fn(...a);
+        } finally {
+          outstanding--;
+        }
+      };
+    const stuckFs = {
+      readdir: count(async (d: string) => (inStuck(d) ? never : fsp.readdir(d, { withFileTypes: true }))),
+      lstat: count(async (q: string) => (inStuck(q) ? never : fsp.lstat(q, { bigint: true }))),
+    };
+    const a = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: stuckFs });
+    const b = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: stuckFs, dir: other });
+    await Promise.all([a.w.ready, b.w.ready]);
+    await until(() => a.w.status().state === "unreachable");
+    const sentence = withProvider(WATCH_REASONS.notResponding, null);
+    expect(sentence).toBe("The folder did not answer for 30 seconds (the system may be starting, signed out or offline). Watching goes on when it answers.");
+    expect(a.w.status().reason).toBe(sentence);
+    // The other folder is still watched, and an ordinary file call elsewhere still answers.
+    await writeFile(join(other, "elsewhere.pdf"), await buildPdf({ title: "Elsewhere", extra: "elsewhere" }));
+    await until(() => b.events.some((e) => e.kind === "imported" && e.file === "elsewhere.pdf"));
+    expect((await stat(tmp)).isDirectory()).toBe(true);
+    // Nothing further is asked of the stuck folder, even when files arrive in it.
+    const n = calls;
+    await writeFile(join(inbox, "meanwhile.pdf"), "x");
+    await sleep(1000);
+    expect(calls).toBe(n);
+    expect(most).toBe(1);
+  });
+
+  it("after a call that never answers, no further call is issued on that folder until it settles", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "stuck.pdf"), await buildPdf({ title: "Stuck", extra: "stuck" }));
+    await writeFile(join(inbox, "fine.pdf"), await buildPdf({ title: "Fine", extra: "fine" }));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let hold = true;
+    let calls = 0;
+    let outstanding = 0;
+    let most = 0;
+    const lstatS = async (q: string) => {
+      if (q.startsWith(real)) {
+        calls++;
+        most = Math.max(most, ++outstanding);
+      }
+      try {
+        if (hold && q === join(real, "stuck.pdf")) await held;
+        return await fsp.lstat(q, { bigint: true });
+      } finally {
+        if (q.startsWith(real)) outstanding--;
+      }
+    };
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: { lstat: lstatS } });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    const n = calls;
+    await sleep(1000);
+    expect(calls).toBe(n);
+    hold = false;
+    release(); // the stuck call answers at last: watching goes on, and both files come in
+    await until(() => ["stuck.pdf", "fine.pdf"].every((f) => events.some((e) => e.kind === "imported" && e.file === f)));
+    expect(w.status().state).toBe("watching");
+    expect(most).toBe(1);
+  });
+
+  it("status is coalesced to one per second during a burst of 2,000 files", async () => {
+    const p = await project();
+    const { w, statuses } = start(p, { stabilityMs: 200, pollMs: 100, attach: quickAttach() });
+    await w.ready;
+    await Promise.all(Array.from({ length: 2000 }, (_, i) => writeFile(join(inbox, `f${String(i).padStart(4, "0")}.txt`), `file ${i}`)));
+    await until(() => w.status().counts.cameIn === 2000, 60_000);
+    await sleep(WATCH_STATUS_INTERVAL_MS + 300);
+    expect(statuses.at(-1)!.counts.cameIn).toBe(2000); // the last change is pushed too
+    for (let i = 1; i < statuses.length; i++) {
+      if (statuses[i]!.state === statuses[i - 1]!.state) expect(statuses[i]!.at - statuses[i - 1]!.at).toBeGreaterThanOrEqual(WATCH_STATUS_INTERVAL_MS - 5);
+    }
+  }, 90_000);
+
+  it("the watched folder is unchanged after a run", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "paper.pdf"), await buildPdf({ title: "Unchanged", extra: "unchanged" }));
+    await writeFile(join(inbox, "notes.txt"), "plain text");
+    await writeFile(join(inbox, "Notes.gdoc"), '{"url": "https://docs.google.com/document/d/x"}');
+    await writeFile(join(inbox, ".hidden"), "dot");
+    await sparse(join(inbox, "online.pdf"), 50_000);
+    await mkdir(join(inbox, "Sub"));
+    await writeFile(join(inbox, "Sub", "inner.pdf"), await buildPdf({ title: "Inner", extra: "inner" }));
+    await symlink(join(inbox, "paper.pdf"), join(inbox, "link.pdf"));
+    const snapshot = async (d: string, base = d): Promise<Record<string, string>> => {
+      const out: Record<string, string> = {};
+      for (const e of await readdir(d, { withFileTypes: true })) {
+        const q = join(d, e.name);
+        const s = await fsp.lstat(q, { bigint: true });
+        out[q.slice(base.length)] = [s.mode, s.size, s.blocks, s.ino, s.nlink, s.mtimeNs, s.ctimeNs].join(" ");
+        if (e.isDirectory()) Object.assign(out, await snapshot(q, base));
+      }
+      return out;
+    };
+    const before = await snapshot(inbox);
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, rescanMs: 400, recursive: true });
+    await w.ready;
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "Sub/inner.pdf") && repo.listSourceIds(p.id).length === 2);
+    await sleep(1000);
+    await w.stop();
+    expect(await snapshot(inbox)).toEqual(before);
+  });
+
+  it("a Google pointer file is listed with its sentence", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "Notes.gdoc"), '{"url": "https://docs.google.com/document/d/x"}');
+    await writeFile(join(inbox, "Budget.GSHEET"), '{"url": "https://docs.google.com/spreadsheets/d/y"}');
+    const opened = readSpies();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await until(() => w.status().counts.didNotComeIn === 2);
+    expect(w.problems({ kind: "online-only-document", offset: 0, limit: 10 }).items.map((i) => [i.file, i.reason]).sort()).toEqual([
+      ["Budget.GSHEET", POINTER_REASON],
+      ["Notes.gdoc", POINTER_REASON],
+    ]);
+    expect(opened(join(real, "Notes.gdoc"))).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("the state judged by the check is compared with the stability reading before the hash; a file that changed in between is not read", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let judged = 0;
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) {
+        const s = m.get(q);
+        if (q.endsWith("moved.pdf") && s?.presence === "local") {
+          judged++;
+          m.set(q, { ...s, mtimeNs: s.mtimeNs + 1n }); // changed between the stability reading and the check
+        }
+      }
+      return m;
+    };
+    await writeFile(join(inbox, "moved.pdf"), await buildPdf({ title: "Moved", extra: "moved" }));
+    await writeFile(join(inbox, "ok.pdf"), await buildPdf({ title: "Ok", extra: "ok" }));
+    const opened = readSpies();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, presence });
+    await w.ready;
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "ok.pdf"));
+    await sleep(1500);
+    expect(judged).toBeGreaterThan(0);
+    expect(opened(join(real, "moved.pdf"))).toEqual([]);
+    expect(events.filter((e) => e.file === "moved.pdf")).toEqual([]);
+    expect(w.status().counts.waiting).toBe(1);
+  });
+
+  it("an unknown file is listed with its own sentence and never opened", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) if (q.endsWith("mystery.pdf")) m.set(q, { presence: "unknown" });
+      return m;
+    };
+    await writeFile(join(inbox, "mystery.pdf"), "%PDF-1.7 twelve");
+    const opened = readSpies();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(WATCH_REASONS.unknownPresence).toBe("The app could not tell whether this file is on this Mac, so it has left it alone.");
+    expect(w.status().counts.notDownloadedBytes).toBe(15);
+    expect(w.problems(page(10)).items).toEqual([{ file: "mystery.pdf", kind: "not-downloaded", reason: WATCH_REASONS.unknownPresence, bytes: 15 }]);
+    await sleep(500);
+    expect(opened(join(real, "mystery.pdf"))).toEqual([]);
   });
 });
 
