@@ -6,6 +6,7 @@
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
 import type { ResettableSetting, ServiceErrorBody, ServiceErrorCode } from "@ao/shared";
 import {
+  AnnotationLimitError,
   AppSettingReadableError,
   AppSettingUnreadableError,
   AcknowledgementRequiredError,
@@ -111,6 +112,8 @@ export function toApiError(err: unknown): ApiError {
     if (err.kind === "locked") return new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.", err.reason);
     return new ApiError(400, "VALIDATION", err.reason);
   }
+  // A source's annotations at a cap (R74 I4): nothing was written (Task R4).
+  if (err instanceof AnnotationLimitError) return err.kind === "count" ? new ApiError(409, "CONFLICT", err.message) : new ApiError(413, "PAYLOAD_TOO_LARGE", err.message);
   if (err instanceof ReadOnlyLibraryError) return new ApiError(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.");
   if (err instanceof WrongPassphraseError) return new ApiError(401, "WRONG_PASSPHRASE", "That passphrase is not correct.");
   if (err instanceof InvalidRecoveryCodeError) return new ApiError(401, "WRONG_PASSPHRASE", "That recovery code is not valid.");
