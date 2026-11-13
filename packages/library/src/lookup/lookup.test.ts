@@ -305,6 +305,27 @@ describe("cache and transport hardening", () => {
     expect(rs).toEqual([{}, {}, {}, {}]);
   });
 
+  it("R247 (c): once told to stop writing to disk, a late answer writes nothing; told again, it writes", async () => {
+    await mkdir(join(tmp, "Lib"));
+    const http = client();
+    crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(2);
+    http.setDiskCache(false);
+    expect((await lookupDoi(DOI, ctx(http)))?.provider).toBe("crossref");
+    expect(existsSync(join(tmp, "Lib", ".cache"))).toBe(false);
+    http.setDiskCache(true);
+    expect((await lookupDoi(DOI, ctx(client())))?.provider).toBe("crossref");
+    expect(existsSync(join(tmp, "Lib", ".cache", "lookups"))).toBe(true);
+  });
+
+  it("R247 (c): a library folder removed after the client was made is never created again by a cache write", async () => {
+    await mkdir(join(tmp, "Lib"));
+    const http = client();
+    await rm(join(tmp, "Lib"), { recursive: true });
+    crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS);
+    expect((await lookupDoi(DOI, ctx(http)))?.provider).toBe("crossref");
+    expect(existsSync(join(tmp, "Lib"))).toBe(false);
+  });
+
   it("refuses to write through a symlinked cache directory", async () => {
     if (process.platform === "win32") return;
     const elsewhere = join(tmp, "elsewhere");

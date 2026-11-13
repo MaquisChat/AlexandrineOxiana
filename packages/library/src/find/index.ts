@@ -13,6 +13,7 @@ export {
   FIND_TOOL,
   FindEntryStateError,
   FindIndexNotReadyError,
+  FindProjectStoppedError,
   FindRunnerClosedError,
   createFindRunner,
   readFindQueueOf,
