@@ -1432,3 +1432,107 @@ describe("Task 72 (R190): an import decision that puts a field newly in conflict
     expect((await readProjectFile(p, "review/pending.jsonl")).split("\n").filter((l) => l.includes(queued[0]!.id))).toHaveLength(linesBefore);
   });
 });
+
+describe("Task 72 fix round 2 (R194): every import decision that leaves the source in place keeps its conflicts listed", () => {
+  /**
+   * A batch, and an item of it as a run leaves one: its stored report has /issued in conflict (the
+   * file says 2014, the platform 2018), listed only by its pending import entry (reviewFor's shape).
+   * `conflict: false`: the same item with no conflict.
+   */
+  async function importedItem(o: { conflict?: boolean } = {}) {
+    const { recheckSourceFile } = await import("@ao/core");
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(await folderWith("r194", { "a.pdf": await workPdf("r194") })));
+    const at = new Date().toISOString();
+    const evidence = [
+      { field: "/issued", value: "2014", source: { kind: "page-dom" as const }, at },
+      ...(o.conflict === false ? [] : [{ field: "/issued", value: "2018", source: { kind: "platform-json" as const }, at }]),
+    ];
+    const draft = plainDraft("An imported item", { issued: "2014" });
+    const sf0 = { source: { ...draft, id: "x", provenance: plainProvenance() }, fieldEvidence: evidence, verification: {}, assets: [], annotations: [] };
+    const verification = recheckSourceFile(sf0 as unknown as Parameters<typeof recheckSourceFile>[0], {}).verification;
+    expect(verification["/issued"]?.status === "conflict").toBe(o.conflict !== false);
+    const fields = Object.fromEntries(Object.entries(verification).filter(([, v]) => v.status === "conflict" || v.status === "unverified").map(([k, v]) => [k, v.status]));
+    const sf = await repo.createSource(p.id, draft, [], {
+      provenance: { ...plainProvenance(), importBatchId: h.batchId },
+      fieldEvidence: evidence,
+      verification,
+      reviewItem: { kind: "import", batchId: h.batchId, fields, reasons: ["The file and the platform disagree."] },
+    });
+    const sid = sf.source.id;
+    const entries = async () => (await projectReviewEntries(repo, p.id)).filter((e) => e.sourceId === sid);
+    const importEntry = (await entries()).find((e) => e.kind === "import")!;
+    return { p, sid, batchId: h.batchId, importEntry, entries, pending: async () => (await entries()).filter((e) => e.status === "pending") };
+  }
+
+  /** The source's pending entries are exactly one capture-conflict entry listing /issued as in conflict (the row needs review). */
+  const expectListed = (pending: Array<{ kind: string; fields: Record<string, string>; cause?: unknown }>) =>
+    expect(pending).toEqual([expect.objectContaining({ kind: "verification", fields: expect.objectContaining({ "/issued": "conflict" }), cause: { kind: "capture-conflict", foundBy: "later-check" } })]);
+
+  it("a plain accept (no draft): the conflict gets its capture entry in the decision's change", async () => {
+    const { p, sid, importEntry, pending } = await importedItem();
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept" });
+    expect((await repo.getSource(p.id, sid)).verification["/issued"]?.status).toBe("conflict");
+    expectListed(await pending());
+    const decide = (await auditEvents(p)).filter((e) => (e.details as { op?: string } | undefined)?.op === "review.decide");
+    expect(decide.at(-1)!.details).toMatchObject({ reviewQueued: [{ fields: ["/issued"] }] });
+  });
+
+  it("an accept whose draft leaves the report as it was: the same", async () => {
+    const { p, sid, importEntry, pending } = await importedItem();
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept", draft: {} });
+    expect((await repo.getSource(p.id, sid)).verification["/issued"]?.status).toBe("conflict");
+    expectListed(await pending());
+  });
+
+  it("a merge whose target keeps a conflict with no entry: the target's conflict is listed", async () => {
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const { recheckSourceFile } = await import("@ao/core");
+    const { p, importEntry } = await importedItem({ conflict: false });
+    const at = new Date().toISOString();
+    const evidence = [
+      { field: "/issued", value: "2010", source: { kind: "page-dom" as const }, at },
+      { field: "/issued", value: "2016", source: { kind: "platform-json" as const }, at },
+    ];
+    const tdraft = plainDraft("The target", { issued: "2010" });
+    const verification = recheckSourceFile({ source: { ...tdraft, id: "t", provenance: plainProvenance() }, fieldEvidence: evidence, verification: {}, assets: [], annotations: [] } as unknown as Parameters<typeof recheckSourceFile>[0], {}).verification;
+    expect(verification["/issued"]?.status).toBe("conflict");
+    // A target as D19 left it: the conflict stored, no entry.
+    const target = await repo.createSource(p.id, tdraft, [], { provenance: plainProvenance(), fieldEvidence: evidence, verification });
+    await bulk.decideReview(p.id, importEntry.id, { action: "merge", sourceId: target.source.id });
+    expect((await repo.getSource(p.id, target.source.id)).verification["/issued"]?.status).toBe("conflict");
+    expectListed((await projectReviewEntries(repo, p.id)).filter((e) => e.sourceId === target.source.id && e.status === "pending"));
+  });
+
+  it("a plain accept of an item with no conflict writes no entry and audits no reviewQueued", async () => {
+    const { p, importEntry, pending } = await importedItem({ conflict: false });
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept" });
+    expect(await pending()).toEqual([]);
+    const decide = (await auditEvents(p)).filter((e) => (e.details as { op?: string } | undefined)?.op === "review.decide");
+    expect(decide.at(-1)!.details).not.toHaveProperty("reviewQueued");
+  });
+
+  it("the batch's undo takes back the entry a plain accept wrote, crash-safe", async () => {
+    const { SimulatedCrash, seams } = await import("../../repo/testing.js");
+    const { p, sid, batchId, importEntry, entries, pending } = await importedItem();
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept" });
+    const [capture] = await pending();
+    expect(capture).toBeDefined();
+    // A crash before the removal's commit point: the source and its entry are both still there.
+    seams.crashAt = "before-audit";
+    await expect(bulk.undoBatch(p.id, batchId)).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.crashAt = undefined;
+    handle.close();
+    await lib.close();
+    lib = await openLibrary(join(tmp, "Lib"), deps());
+    handle = new IndexHandle(lib.root);
+    repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+    bulk = createBulkImport({ repo, http, index: handle });
+    expect(repo.listSourceIds(p.id)).toContain(sid);
+    expect((await pending()).map((e) => e.id)).toEqual([capture!.id]);
+    await bulk.undoBatch(p.id, batchId);
+    expect(repo.listSourceIds(p.id)).not.toContain(sid);
+    expect((await entries()).find((e) => e.id === capture!.id)).toMatchObject({ status: "resolved", decision: "undone" });
+  });
+});
