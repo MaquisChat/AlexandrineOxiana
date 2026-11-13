@@ -249,6 +249,35 @@ describe("the register of a watched folder (Task W3)", () => {
     });
   }
 
+  it("N2: a last line complete but for its newline is skipped by the reader as the writer cuts it", async () => {
+    const p = await project();
+    const watchId = newId();
+    const a = entry("a.pdf");
+    await repo.recordWatchedFiles(p.id, watchId, [a]);
+    await appendFile(registerFile(p, watchId), JSON.stringify(entry("x.pdf"))); // whole, without its newline
+    expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf"]);
+    const b = entry("b.pdf");
+    await repo.recordWatchedFiles(p.id, watchId, [b]);
+    expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf", "b.pdf"]);
+    expect((await readFile(registerFile(p, watchId), "utf8")).trim().split("\n")).toHaveLength(2);
+  });
+
+  it("N3: a write to an intact register does not read the whole file", async () => {
+    const p = await project();
+    const watchId = newId();
+    await repo.recordWatchedFiles(p.id, watchId, [entry("a.pdf")]);
+    const reads = vi.spyOn(fsp, "readFile");
+    syncBuiltinESMExports();
+    try {
+      await repo.recordWatchedFiles(p.id, watchId, [entry("b.pdf")]);
+      expect(reads.mock.calls.filter((c) => String(c[0]) === registerFile(p, watchId))).toEqual([]);
+    } finally {
+      vi.restoreAllMocks();
+      syncBuiltinESMExports();
+    }
+    expect((await repo.watchRegister(p.id, watchId)).size).toBe(2);
+  });
+
   it("a register that cannot be read or written says so in plain words, never with a path", async () => {
     const p = await project();
     const watchId = newId();
@@ -277,9 +306,9 @@ describe("the register of a watched folder (Task W3)", () => {
       for (let i = 0; i < 3; i++) expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf"]);
       for (let i = 0; i < 2; i++) expect(await repo.watchOrigins(p.id, a.sourceId)).toEqual([{ watchId, entry: a }]);
       expect(reads()).toBeLessThanOrEqual(1);
-      const n = reads();
       const b = entry("b.pdf");
-      await repo.recordWatchedFiles(p.id, watchId, [b]);
+      await repo.recordWatchedFiles(p.id, watchId, [b]); // (the write opens the file to look at its last byte, N3)
+      const n = reads();
       expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf", "b.pdf"]);
       expect(await repo.watchOrigins(p.id, b.sourceId)).toEqual([{ watchId, entry: b }]);
       expect(reads()).toBe(n);

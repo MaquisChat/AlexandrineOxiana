@@ -135,6 +135,15 @@ function fold(map: Map<string, WatchRegisterEntry>, line: string, projectId: str
   }
 }
 
+/** Whether an open file is empty or ends with a newline (one byte read). */
+async function lastByteIsNewline(fh: fsp.FileHandle): Promise<boolean> {
+  const { size } = await fh.stat();
+  if (size === 0) return true;
+  const b = Buffer.alloc(1);
+  await fh.read(b, 0, 1, size - 1);
+  return b[0] === 0x0a;
+}
+
 /** The register could not be read (A8, review I4). The message carries no path. */
 export class WatchRegisterUnreadableError extends Error {
   constructor() {
@@ -195,10 +204,23 @@ export async function readWatchRegister(core: RepoCore, projectId: string, watch
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return map;
     throw new WatchRegisterUnreadableError();
   }
+  // A last line without its newline is skipped, whole or torn, just as the next governed write cuts it away (N2).
+  let endsWithNewline: boolean;
+  try {
+    endsWithNewline = await lastByteIsNewline(fh);
+  } catch {
+    await fh.close().catch(() => {});
+    throw new WatchRegisterUnreadableError();
+  }
   const stream = fh.createReadStream({ encoding: "utf8" });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   try {
-    for await (const line of lines) if (line.trim()) fold(map, line, st.project.id, key);
+    let held: string | null = null; // each line is folded once the next one shows it was finished
+    for await (const line of lines) {
+      if (held !== null && held.trim()) fold(map, held, st.project.id, key);
+      held = line;
+    }
+    if (held !== null && held.trim() && endsWithNewline) fold(map, held, st.project.id, key);
   } catch {
     throw new WatchRegisterUnreadableError();
   } finally {
@@ -248,7 +270,19 @@ function write(core: RepoCore, projectId: string, watchId: string, lines: WatchR
       const abs = core.abs(rel);
       // A last line torn by an unclean stop (not by this app's own writes, which the marker takes back) is removed
       // in this change, so that the register can be appended to again (A8, review I4).
-      const raw = await readMaybe(abs);
+      // Only the last byte is read to tell (N3); the whole file only when it is torn (rare).
+      let torn = false;
+      try {
+        const fh = await fsp.open(abs, "r");
+        try {
+          torn = !(await lastByteIsNewline(fh));
+        } finally {
+          await fh.close();
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+      const raw = torn ? await readMaybe(abs) : null;
       if (raw && raw.length > 0 && raw[raw.length - 1] !== 0x0a) {
         const end = raw.lastIndexOf(0x0a) + 1;
         await tx.writeFile(rel, raw.subarray(0, end), { mode: CHANGE_LOG_MODE });
