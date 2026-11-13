@@ -1178,3 +1178,59 @@ describe("cloud-drive folders: attach reads only what `readable` allows (Task W2
     expect(sf.source.provenance.identification!.method).toBe("sidecar");
   });
 });
+
+describe("cloud-drive folders: attach's collection and origin (Task W3)", () => {
+  it("attach without the new options behaves as before: drag-and-drop provenance, no external key, no collection", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("plain.pdf", await buildPdf({ title: "Dropped as before", extra: "w3-plain" }));
+    const [r] = await attach.attachFiles(p.id, [path]);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.provenance.tool.name).toBe("drag-and-drop");
+    expect(sf.source.provenance.externalKeys).toBeUndefined();
+    expect(sf.source.collectionIds).toEqual([]);
+    expect(r).not.toHaveProperty("noCollection");
+  });
+
+  it("origin names the watch in the provenance, set when the source is created; the collection comes in the same change", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const c = await repo.createCollection(p.id, "From the drive");
+    const watchId = "01900000-0000-7000-8000-000000000001";
+    const path = await put("watched.pdf", await buildPdf({ title: "From a watched folder", extra: "w3-origin" }));
+    const before = (await auditEvents(p.folder)).length;
+    const [r] = await attach.attachFiles(p.id, [path], { collectionId: c.id, origin: { watchId } });
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.provenance.tool).toEqual({ name: "watched-folder", version: expect.any(String) });
+    expect(sf.source.provenance.externalKeys).toEqual({ "watched-folder": watchId });
+    expect(sf.source.provenance.captureMethod).toBe("manual_upload");
+    expect(sf.source.collectionIds).toEqual([c.id]);
+    // One change: the source's creation (no separate membership change).
+    const after = (await auditEvents(p.folder)).slice(before);
+    expect(after.map((e) => e.details?.op).filter((o) => o !== "source.create")).toEqual([]);
+    expect(new Set(after.map((e) => e.details?.txn)).size).toBe(1);
+  });
+
+  it("a collection that no longer exists: the source comes in without one and the outcome says so", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const c = await repo.createCollection(p.id, "Soon gone");
+    await repo.deleteCollection(p.id, c.id);
+    const path = await put("nocoll.pdf", await buildPdf({ title: "No collection", extra: "w3-nocoll" }));
+    const [r] = await attach.attachFiles(p.id, [path], { collectionId: c.id });
+    expect(r).toMatchObject({ outcome: expect.stringMatching(/created|needs-review/u), noCollection: true });
+    expect((await repo.getSource(p.id, r!.sourceId!)).source.collectionIds).toEqual([]);
+  });
+
+  it("onto a source (a further file), origin and collection change nothing about the source's record", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const watchId = "01900000-0000-7000-8000-000000000002";
+    const first = await put("v1.pdf", await buildPdf({ title: "Version one", extra: "w3-v1" }));
+    const [r] = await attach.attachFiles(p.id, [first], { origin: { watchId } });
+    const before = await repo.getSource(p.id, r!.sourceId!);
+    const second = await put("v2.pdf", await buildPdf({ title: "Version two", extra: "w3-v2" }));
+    const [r2] = await attach.attachFiles(p.id, [second], { toSourceId: r!.sourceId!, origin: { watchId } });
+    expect(r2).toMatchObject({ outcome: "attached", sourceId: r!.sourceId });
+    const after = await repo.getSource(p.id, r!.sourceId!);
+    expect(after.assets.filter((a) => a.role === "original")).toHaveLength(2);
+    expect(after.source.provenance).toEqual(before.source.provenance);
+    expect(after.source.collectionIds).toEqual(before.source.collectionIds);
+  });
+});
