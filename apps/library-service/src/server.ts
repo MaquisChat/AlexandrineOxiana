@@ -9,7 +9,7 @@
  * whole edited transcript).
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { appConfigDir, deviceDeps, deviceNoticesIdle, type Deps, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
+import { appConfigDir, deviceDeps, deviceNoticesIdle, type Deps, type LocationEnv, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
 import { Pairing, SHELL_ORIGINS, bearerOf, hostAllowed, isExtensionOrigin, queryCarriesToken, sameSecret, type PairingOptions } from "./auth.js";
 import { ApiError, errorBody, toApiError } from "./errors.js";
 import { FolderGrants } from "./folder-grants.js";
@@ -31,6 +31,7 @@ import { registerProjects } from "./routes/projects.js";
 import { registerReview } from "./routes/review.js";
 import { registerSources } from "./routes/sources.js";
 import { registerTools } from "./routes/tools.js";
+import { registerWatchedFolders } from "./routes/watched-folders.js";
 
 export type { ServiceWorker, WorkerProvider } from "./state.js";
 
@@ -75,6 +76,8 @@ export interface ServiceOptions {
   documentBeforeRead?: () => Promise<void>;
   /** The grants read from standard input after the token (main.ts; R207). Default: a new, empty store. */
   folderGrants?: FolderGrants;
+  /** Test seam (honoured only under NODE_ENV=test or VITEST, R47): where the cloud drives are, for the watched-folder routes. */
+  watchLocationEnv?: LocationEnv;
 }
 
 export interface LibraryService {
@@ -291,7 +294,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   });
   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
 
-  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}), ...(opts.readerPdfMaxBytes !== undefined ? { readerPdfMaxBytes: opts.readerPdfMaxBytes } : {}), ...(opts.documentBeforeRead ? { documentBeforeRead: opts.documentBeforeRead } : {}) };
+  const ctx = { state, pairing, token: opts.token, folderGrants, ...(opts.watchLocationEnv ? { watchLocationEnv: opts.watchLocationEnv } : {}), ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}), ...(opts.readerPdfMaxBytes !== undefined ? { readerPdfMaxBytes: opts.readerPdfMaxBytes } : {}), ...(opts.documentBeforeRead ? { documentBeforeRead: opts.documentBeforeRead } : {}) };
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
@@ -309,6 +312,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerTools(app, ctx);
   registerMedia(app, ctx);
   registerDocuments(app, ctx);
+  registerWatchedFolders(app, ctx);
 
   let closing: Promise<void> | undefined;
   return {
@@ -349,7 +353,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 }
 
-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void>; readerPdfMaxBytes?: number; documentBeforeRead?: () => Promise<void> };
+export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; folderGrants: FolderGrants; watchLocationEnv?: LocationEnv; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void>; readerPdfMaxBytes?: number; documentBeforeRead?: () => Promise<void> };
 
 /** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
 function decodedPath(path: string): string {

@@ -36,6 +36,7 @@ import {
   type FolderWatch,
   type BatchResult,
   type WatchDeps,
+  type WatchStatus,
   type Library,
   type Repo,
   type ToolsUpdate,
@@ -845,7 +846,10 @@ export class ServiceState {
     }
   }
 
-  /** What every watched folder of the open library is started with (events included, R99). */
+  /** Receives each watched folder's status (set by routes/watched-folders.ts, which coalesces and publishes it; Task W7). */
+  onWatchStatus?: (s: Session, projectId: string, st: WatchStatus) => void;
+
+  /** What every watched folder of the open library is started with (its status included, R99, W7). */
   watchDeps(s: Session, projectId: string): WatchDeps & { onWarning: (w: string) => void } {
     return {
       repo: s.repo,
@@ -853,7 +857,8 @@ export class ServiceState {
       lib: s.lib,
       proxies: proxyQueueFor(s.repo),
       ...(this.opts.watchStabilityMs !== undefined ? { stabilityMs: this.opts.watchStabilityMs, pollMs: Math.max(50, this.opts.watchStabilityMs) } : {}),
-      onEvent: (e) => this.events.publish("job.progress", { kind: "watch", projectId, event: JSON.parse(scrubPaths(JSON.stringify(e), this.roots)) as unknown }),
+      // Task W7: per-file events are no longer published; the folder's status is, as `watch.status` (routes/watched-folders.ts).
+      onStatus: (st) => this.onWatchStatus?.(s, projectId, st),
       onWarning: (w) => this.opts.log.warn({ warning: scrubPaths(w, this.roots) }, "watched folders"),
     };
   }
