@@ -326,11 +326,13 @@ describe("caps (R74 I4): refused whole, nothing written", () => {
 
   it("an update of a source already past the text cap may shorten but not lengthen", async () => {
     const f = await fixture();
-    const n = seedNote(f.sid, "x".repeat(MAX_SOURCE_ANNOTATION_TEXT + 10));
-    await seed(f.pid, f.sid, () => [n]);
-    await expect(repo.updateAnnotation(f.pid, f.sid, n.id, { body: "x".repeat(MAX_SOURCE_ANNOTATION_TEXT + 11) })).rejects.toBeInstanceOf(AnnotationLimitError);
+    const big = seedNote(f.sid, "x".repeat(MAX_SOURCE_ANNOTATION_TEXT + 10));
+    const n = seedNote(f.sid, "two words");
+    await seed(f.pid, f.sid, () => [big, n]);
+    await expect(repo.updateAnnotation(f.pid, f.sid, n.id, { body: "two words!" })).rejects.toBeInstanceOf(AnnotationLimitError);
     await expect(repo.updateAnnotation(f.pid, f.sid, n.id, { colorName: "red" })).resolves.toMatchObject({ colorName: "red" });
-    await expect(repo.updateAnnotation(f.pid, f.sid, n.id, { body: "short" })).resolves.toMatchObject({ body: "short" });
+    await expect(repo.updateAnnotation(f.pid, f.sid, n.id, { body: "two" })).resolves.toMatchObject({ body: "two" });
+    await expect(repo.updateAnnotation(f.pid, f.sid, n.id, { body: "six" })).resolves.toMatchObject({ body: "six" });
   });
 });
 
@@ -606,9 +608,10 @@ describe("governance, locks and read-only", () => {
   it("the store request carries the source's provenance", async () => {
     // A project that requires a legal basis for identifiable data refuses storing an annotation on
     // an identifiable source without one, as it would refuse storing the source itself.
-    const project = (await repo.createProject({ name: "Strict", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project;
+    const gov = OPEN_GOV.replace("containsIdentifiable: false", "containsIdentifiable: true\n  pseudonymizeFileNames: false");
+    const project = (await repo.createProject({ name: "Strict", governanceYaml: gov, encryption: { enabled: false } })).project;
     const sf = await repo.createSource(project.id, draft("Identifiable"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: { ...provenance(), identifiable: true } });
-    await writeFile(join(lib.root, project.folder, "governance.yaml"), OPEN_GOV.replace("requireLegalBasis: false", "requireLegalBasis: true"));
+    await writeFile(join(lib.root, project.folder, "governance.yaml"), gov.replace("requireLegalBasis: false", "requireLegalBasis: true"));
     const err = await repo.createAnnotation(project.id, sf.source.id, { kind: "highlight", assetId: sf.assets[0]!.id, anchors: [{ page: 1, rects: [{ x: 1, y: 1, w: 1, h: 1 }] }], colorName: "yellow" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PolicyDeniedError);
     expect((err as PolicyDeniedError).reason).toMatch(/legal basis/);

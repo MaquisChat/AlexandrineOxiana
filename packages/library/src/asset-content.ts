@@ -31,6 +31,8 @@ const PICTURE_MIMES: ReadonlySet<string> = new Set(["image/png", "image/jpeg", "
 
 export const isMediaMime = (mime: string): boolean => MEDIA_MIME.test(mime);
 export const isPictureMime = (mime: string): boolean => PICTURE_MIMES.has(mime);
+/** A stored PDF (the reader, Task R3): `application/pdf` exactly, nothing else. */
+export const isPdfMime = (mime: string): boolean => mime === "application/pdf";
 
 /** How much is read (and decrypted) per step of a stream. */
 const SLICE = 64 * 1024;
