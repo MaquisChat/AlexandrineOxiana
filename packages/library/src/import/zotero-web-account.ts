@@ -56,13 +56,14 @@ const GROUPS_PAGE = 100;
 const MAX_GROUP_PAGES = 50;
 const MAX_REPORTED_BACKOFF_MS = 24 * 3_600_000;
 
-export type ZoteroAccountReason = "no-key" | "no-store" | "key-refused" | "offline" | "backing-off";
+export type ZoteroAccountReason = "no-key" | "no-store" | "key-refused" | "library-gone" | "offline" | "backing-off";
 
 /** Plain sentences, one per reason: never the server's words, the key, a host's path or a file path. */
 export const ZOTERO_ACCOUNT_MESSAGES: Readonly<Record<ZoteroAccountReason, string>> = {
   "no-key": "No Zotero API key is saved on this computer.",
   "no-store": "This computer's password store cannot be used, so the Zotero API key cannot be read.",
   "key-refused": "Zotero refused the API key (it may be wrong, revoked, or not allowed to read this library).",
+  "library-gone": "Zotero has no such library for this key (a group that was deleted, or one this account has left).",
   offline: "Zotero could not be reached, or gave an answer that could not be understood.",
   "backing-off": "Zotero asked for a longer wait before the next request.",
 };
@@ -285,8 +286,7 @@ export async function checkZoteroKey(o: CallOptions = {}): Promise<ZoteroKeyAcce
  * `GET <prefix>/items/top?limit=1&format=keys` with `If-Modified-Since-Version: <since>`. 304 is
  * `{ unchanged: true }` and nothing else is fetched; 200 is `{ unchanged: false }`. A `Backoff` or
  * `Retry-After` Zotero sent with it is reported as `backoffUntil` beside the answer. A key Zotero refuses,
- * a library that is not found (a group that is gone: also reported as `key-refused`, as the key can no
- * longer read it), an unreachable server and the like throw ZoteroAccountError. See the header for what
+ * a library that is not found (a group that was deleted or left: `library-gone`), an unreachable server and the like throw ZoteroAccountError. See the header for what
  * this does not notice, and for the rule that doubt means "changed".
  * @throws TypeError when `ref` or `since` is not valid (a mistake in the caller, before any request).
  */
@@ -298,7 +298,7 @@ export async function zoteroLibraryUnchanged(o: CallOptions & { ref: string; sin
   let backoff: number | undefined;
   const unchanged = await withApi(
     o,
-    "key-refused",
+    "library-gone",
     async (api) => {
       const url = new URL(`${prefix}/items/top?limit=1&format=keys`, ZOTERO_API_ORIGIN);
       const res = await api.get(url, true, (s) => s === 200 || s === 304, { "if-modified-since-version": String(o.since) });

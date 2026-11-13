@@ -196,6 +196,13 @@ describe("checkZoteroKey", () => {
     expect(g102!.name).toBe("short");
   });
 
+  it("a group removed since the key was made is left out, not an error", async () => {
+    z.addGroup(100, "Lab");
+    z.addGroup(101, "Gone soon");
+    z.removeGroup(101);
+    expect((await check()).groups.map((g) => g.ref)).toEqual(["group:100"]);
+  });
+
   it("more groups than one page are all read", async () => {
     for (let i = 1; i <= 120; i++) z.addGroup(1000 + i, `Group ${i}`);
     const got = await check();
@@ -403,7 +410,7 @@ describe("zoteroLibraryUnchanged", () => {
 
   it("refusals are the same reasons, with no server text", async () => {
     const z2 = new FakeZotero({ key: KEY, userId: 42 });
-    expect((await caught(zoteroLibraryUnchanged({ ref: "group:999", since: 1, dispatcher: z2.agent, sleep }))).reason).toBe("key-refused");
+    expect((await caught(zoteroLibraryUnchanged({ ref: "group:999", since: 1, dispatcher: z2.agent, sleep }))).reason).toBe("library-gone");
     z2.failNext(50, 500);
     expect((await caught(zoteroLibraryUnchanged({ ref: "user:42", since: 1, dispatcher: z2.agent, sleep }))).reason).toBe("offline");
     z2.failNext(1, 429, 7200);
@@ -417,6 +424,18 @@ describe("zoteroLibraryUnchanged", () => {
     expect(refused.message).not.toMatch(/forbidden/i);
     secrets.values.clear();
     expect((await caught(unchanged("user:42", 1))).reason).toBe("no-key");
+  });
+
+  it("a removed group is library-gone, and a 403 stays key-refused", async () => {
+    z.addGroup(100, "Lab");
+    const v = z.libraryVersion("group:100");
+    z.removeGroup(100);
+    const e = await caught(unchanged("group:100", v));
+    expect(e.reason).toBe("library-gone");
+    expect(e.message).not.toMatch(/not found/i);
+    z.setKeyAccess({ groups: {} });
+    z.addGroup(101, "Other");
+    expect((await caught(unchanged("group:101", 1))).reason).toBe("key-refused");
   });
 
   it("a ref or a version that is not valid is refused before any request", async () => {
