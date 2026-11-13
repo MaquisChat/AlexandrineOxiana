@@ -15,7 +15,7 @@ import type { WatchedFolderSummary } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { FolderGrants } from "./folder-grants.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
-import { WatchStatusCoalescer, fileItemOf, placeOf } from "./routes/watched-folders.js";
+import { WatchStatusCoalescer, coalescerOf, fileItemOf, placeOf } from "./routes/watched-folders.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const PASS = "correct horse battery staple";
@@ -411,20 +411,72 @@ describe("choices: pause and download (W4, R219, R221)", () => {
     await until(async () => (await sourceIds(pid)).length === 1, 30_000, "the file after resume");
   }, 60_000);
 
-  it("label and collection cannot be changed here yet; a request that mixes them with a choice changes nothing", async () => {
+  it("label and collection are changed in project.json; null clears; a collection not in the project is refused; bad values change nothing", async () => {
     await openNewLibrary();
     const pid = await newProject();
+    const c = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Interviews" } });
+    const cid = (c.json.id ?? c.json.collection?.id) as string;
     const wid = (await add(pid, await folder("Opts"), { label: "First" })).json.id as string;
-    for (const body of [{ label: "Second" }, { collectionId: null }, { label: null, paused: true }]) {
-      const r = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body });
-      expect(r.status, r.body).toBe(400);
+    const r = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: "Second", collectionId: cid } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toMatchObject({ label: "Second", collectionId: cid, collectionName: "Interviews" });
+    const audit = (await call({ url: `/projects/${pid}/audit?limit=1000` })).json;
+    const ev = (audit.events ?? audit.items ?? []).filter((e: any) => e.details?.op === "project.watched-folder.options");
+    expect(ev.map((e: any) => e.details.fields)).toEqual([["label", "collectionId"]]);
+    const cleared = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: null, collectionId: null } });
+    expect(cleared.status, cleared.body).toBe(200);
+    expect(cleared.json.label).toBeUndefined();
+    expect(cleared.json.collectionId).toBeUndefined();
+    const bad = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { collectionId: "01ZZZZZZZZZZZZZZZZZZZZZZZZ", paused: true } });
+    expect([bad.status, bad.json.error.message]).toEqual([400, "That collection is not in this project."]);
+    for (const body of [{ paused: "yes" }, { notDownloaded: "all" }, { confirmBytes: -1, notDownloaded: "download" }, { extra: 1 }, { label: "" }, { label: 5, paused: true }]) {
+      expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body })).status, JSON.stringify(body)).toBe(400);
     }
-    expect(await summary(pid, wid)).toMatchObject({ label: "First", choices: { paused: false } });
-    for (const body of [{ paused: "yes" }, { notDownloaded: "all" }, { confirmBytes: -1, notDownloaded: "download" }, { extra: 1 }]) {
-      expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body })).status).toBe(400);
-    }
+    expect(await summary(pid, wid)).toMatchObject({ choices: { paused: false } });
+    expect((await summary(pid, wid)).label).toBeUndefined();
     expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/0193a1f2-7c4e-7b11-9d2a-5e6f7a8b9c0d`, body: { paused: true } })).status).toBe(404);
   });
+
+  it("a request that mixes a governed change and a choice does both; when the choice cannot be written the answer says what was changed", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const wid = (await add(pid, await folder("Mixed"), { label: "First" })).json.id as string;
+    const both = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: "Second", paused: true } });
+    expect(both.status, both.body).toBe(200);
+    expect(both.json).toMatchObject({ label: "Second", choices: { paused: true }, state: "paused" });
+    // This computer's choices cannot be read: the governed change is made, the choice is not, and the answer says so.
+    const file = join(deps.appConfigDir, "watched-folder-choices.json");
+    await rm(file, { force: true });
+    await mkdir(file);
+    const half = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: "Third", paused: false } });
+    expect(half.status, half.body).toBe(503);
+    expect(half.json.error.message).toBe("The name or collection of the folder was changed, but this computer's choice (pause, or files not downloaded) was not: this computer's choices for watched folders could not be read. Try again.");
+    await rm(file, { recursive: true, force: true });
+    expect((await summary(pid, wid)).label).toBe("Third");
+  });
+
+  it("a new collection reaches the running watch: that one watch restarts and new files land in it", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const c = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Arrivals" } });
+    const cid = (c.json.id ?? c.json.collection?.id) as string;
+    const dir = await folder("Coll");
+    const wid = (await add(pid, dir)).json.id as string;
+    const other = (await add(pid, await folder("Other"))).json.id as string;
+    const watches = () => svc!.state.session!.watches.get(pid)!;
+    const old = watches().find((w) => w.status().watchId === wid)!;
+    const keep = watches().find((w) => w.status().watchId === other)!;
+    const label = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: "Only a name" } });
+    expect(label.status).toBe(200);
+    expect(old.stopped).toBe(false); // a label alone is not the engine's business
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { collectionId: cid } })).status).toBe(200);
+    expect(old.stopped).toBe(true);
+    expect(keep.stopped).toBe(false);
+    expect(watches().filter((w) => !w.stopped).map((w) => w.status().watchId).sort()).toEqual([wid, other].sort());
+    await pdf(join(dir, "arrival.pdf"), "A File For The New Collection");
+    const sid = await until(async () => (await sourceIds(pid))[0], 30_000, "the source");
+    expect((await svc!.state.session!.repo.getSource(pid, sid)).source.collectionIds).toEqual([cid]);
+  }, 60_000);
 });
 
 describe("set again, retry, remove", () => {
@@ -513,6 +565,8 @@ describe("set again, retry, remove", () => {
     expect(JSON.stringify(choices)).not.toContain(wid);
     expect(await readFile(join(deps.appConfigDir, "watched-folders.json"), "utf8")).not.toContain(wid);
     expect((await call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${wid}` })).status).toBe(404);
+    // The coalescer keeps nothing for a removed folder.
+    expect(coalescerOf(svc!.state)!.has(`${pid}\u0000${wid}`)).toBe(false);
     // R221's refusal no longer applies: the folder is free for this project or another.
     const again = await add(other, dir);
     expect(again.status, again.body).toBe(201);
@@ -734,6 +788,10 @@ describe("watch.status (Accept 6)", () => {
     expect(ev.data.folder).toMatchObject({ id: wid, label: "Live", place: { display: await realpath(dir) } });
     expect(events.some((e) => e.type === "job.progress" && e.data.kind === "watch")).toBe(false);
     for (const e of events.filter((x) => x.type === "watch.status")) answers.push(JSON.stringify(e.data.folder));
+    // Closing the library leaves nothing in the coalescer.
+    expect(coalescerOf(svc!.state)!.size).toBeGreaterThan(0);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect(coalescerOf(svc!.state)!.size).toBe(0);
   }, 60_000);
 
   it("is coalesced to one per folder per second; the last state of a burst is delivered; nothing after close", () => {

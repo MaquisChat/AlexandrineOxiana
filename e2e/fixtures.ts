@@ -373,6 +373,7 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
     AO_TOOLS_DIR: join(root, "tools"),
     AO_MODELS_DIR: join(root, "models"),
     AO_LOOKUP_FIXTURES: LOOKUP_FIXTURES,
+    UV_THREADPOOL_SIZE: String(Math.max(16, Number(process.env.UV_THREADPOOL_SIZE) || 0)), // as the product runs (R227, A3 d)
     ...opts.env,
   });
   const [cmd, ...args] = opts.command ?? [process.execPath, "--max-old-space-size=512", "--import", "tsx", "src/main.ts"];

@@ -25,6 +25,7 @@ import path from "node:path";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import {
   WATCH_REASONS,
+  WatchedFoldersUnreadableError,
   addWatchedFolder,
   bringInNewVersion,
   classifyLocation,
@@ -36,6 +37,7 @@ import {
   setWatchChoices,
   setWatchFolder,
   settleWatchedFile,
+  updateWatchedFolderEntry,
   watchFolder,
   withProvider,
   withService,
@@ -90,7 +92,7 @@ export const WATCH_ROUTE_TEXT = {
   sizeChanged: "The number of files not downloaded has changed. Look at the new size and choose again.",
   nothing: "There is nothing to download in this folder at the moment.",
   noCollection: "That collection is not in this project.",
-  optionsNotYet: "The name and the collection of a watched folder cannot be changed yet. To change them, remove the folder and add it again.",
+  halfDone: "The name or collection of the folder was changed, but this computer's choice (pause, or files not downloaded) was not: ",
   confirmAlone: "A size to agree to goes only with “Download and import them”.",
   nothingToChange: "There is nothing to change.",
   notSetUp: "This folder has not been chosen on this computer. Choose it again.",
@@ -403,11 +405,27 @@ export class WatchStatusCoalescer<T> {
     e.last = Date.now();
     this.send(key, p.v);
   }
+  /** Drops one key and whatever waits for it (a removed folder). */
+  forget(key: string): void {
+    const e = this.m.get(key);
+    if (e?.timer) clearTimeout(e.timer);
+    this.m.delete(key);
+  }
+  has(key: string): boolean {
+    return this.m.has(key);
+  }
+  get size(): number {
+    return this.m.size;
+  }
   clear(): void {
     for (const e of this.m.values()) if (e.timer) clearTimeout(e.timer);
     this.m.clear();
   }
 }
+
+const coalescers = new WeakMap<object, WatchStatusCoalescer<unknown>>();
+/** The service's `watch.status` coalescer (for tests: that it keeps nothing for a removed folder or a closed library). */
+export const coalescerOf = (state: object): WatchStatusCoalescer<unknown> | undefined => coalescers.get(state);
 
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -449,8 +467,15 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
       () => {},
     );
   });
+  coalescers.set(state, coalescer as WatchStatusCoalescer<unknown>);
   state.onWatchStatus = (s, projectId, st) => {
-    if (!st.watchId || state.session !== s) return;
+    // A status from a library that is no longer open (its watches stop as it closes): nothing is kept for it.
+    if (state.session !== s) {
+      coalescer.clear();
+      seq.clear();
+      return;
+    }
+    if (!st.watchId) return;
     coalescer.push(`${projectId}\u0000${st.watchId}`, { s, projectId, st });
   };
 
@@ -517,10 +542,13 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     if (b.notDownloaded !== undefined && b.notDownloaded !== "leave" && b.notDownloaded !== "download") throw badRequest('"notDownloaded" must be "leave" or "download".');
     if (b.confirmBytes !== undefined && (typeof b.confirmBytes !== "number" || !Number.isSafeInteger(b.confirmBytes) || b.confirmBytes < 0)) throw badRequest('"confirmBytes" must be a whole number of bytes.');
     if (b.confirmBytes !== undefined && b.notDownloaded !== "download") throw badRequest(WATCH_ROUTE_TEXT.confirmAlone);
+    if (b.label !== undefined && b.label !== null && (typeof b.label !== "string" || b.label.trim() === "" || b.label.length > 200)) throw badRequest('"label" must be 1 to 200 characters, or null.');
+    if (b.collectionId !== undefined && b.collectionId !== null && (typeof b.collectionId !== "string" || !(await collectionsOf(s, projectId)).has(b.collectionId))) throw badRequest(WATCH_ROUTE_TEXT.noCollection);
     const rec = await folderParam(s, projectId, req);
-    // The governed changes of project.json (label, collection) need a library function that does not exist yet
-    // (reported to the coordinator): refused whole, before anything is changed — a mixed request changes nothing.
-    if (Object.hasOwn(b, "label") || Object.hasOwn(b, "collectionId")) throw badRequest(WATCH_ROUTE_TEXT.optionsNotYet);
+    const options: { label?: string | null; collectionId?: string | null } = {
+      ...(b.label !== undefined ? { label: b.label as string | null } : {}),
+      ...(b.collectionId !== undefined ? { collectionId: b.collectionId as string | null } : {}),
+    };
     const patch: Partial<WatchChoices> = {};
     if (b.paused !== undefined) patch.paused = b.paused as boolean;
     if (b.notDownloaded === "leave") patch.notDownloaded = "leave";
@@ -532,10 +560,33 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
       patch.notDownloaded = "download";
       patch.confirmedBytes = current;
     }
-    if (Object.keys(patch).length === 0) throw badRequest(WATCH_ROUTE_TEXT.nothingToChange);
-    await setWatchChoices(settingsDeps(s), projectId, rec.id, patch);
-    // The change holds at once (W4: otherwise a running watch reads its choices only every 10 s).
-    await watchOf(s, projectId, rec.id)?.refreshChoices();
+    if (Object.keys(patch).length === 0 && Object.keys(options).length === 0) throw badRequest(WATCH_ROUTE_TEXT.nothingToChange);
+    // Everything is checked above; then the governed change of project.json, then this computer's choices.
+    if (Object.keys(options).length > 0) {
+      const before = rec.options.collectionId;
+      await serial(state, async () => {
+        const u = await updateWatchedFolderEntry(s.repo, projectId, rec.id, options);
+        // The engine takes a folder's collection when its watch starts (it has no way to change it while running):
+        // a new collection restarts that one watch; a label alone is not the engine's business.
+        const running = watchOf(s, projectId, rec.id);
+        if (u.options.collectionId !== before && rec.dir && running && !running.stopped && !stuck(running.status())) {
+          await stopOne(s, projectId, rec.id);
+          startOne(ctx, s, projectId, u, rec.dir);
+        }
+      });
+    }
+    if (Object.keys(patch).length > 0) {
+      try {
+        await setWatchChoices(settingsDeps(s), projectId, rec.id, patch);
+      } catch (err) {
+        if (Object.keys(options).length === 0) throw err;
+        // The governed change was made; the device choice was not: said in plain words (R227).
+        const why = err instanceof WatchedFoldersUnreadableError ? "this computer's choices for watched folders could not be read. Try again." : "it could not be saved. Try again.";
+        throw new ApiError(503, "UNAVAILABLE", WATCH_ROUTE_TEXT.halfDone + why);
+      }
+      // The change holds at once (W4: otherwise a running watch reads its choices only every 10 s).
+      await watchOf(s, projectId, rec.id)?.refreshChoices();
+    }
     return summaryById(ctx, s, projectId, rec.id);
   });
 
@@ -572,6 +623,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
       await stopOne(s, projectId, wid);
       await removeWatchedFolder(settingsDeps(s), projectId, wid);
       await removeWatchChoices(settingsDeps(s), projectId, wid);
+      coalescer.forget(`${projectId}\u0000${wid}`);
     });
     return { removed: true };
   });
