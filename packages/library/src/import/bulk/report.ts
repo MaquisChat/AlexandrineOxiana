@@ -30,6 +30,8 @@ export interface ImportReport {
   pendingReview: Array<{ reviewId: string; sourceId?: string; reasons: string[] }>;
   /** Re-imports (R72): fields not updated because they were changed after the last import (JSON pointers). */
   keptFields: Array<{ item: string; fields: string[] }>;
+  /** Annotations the researcher deleted here that Zotero still has: not imported again (counted over the newest line of each item). */
+  annotationsDeletedHere: number;
   governance: GovernanceNote[];
   notes: string[];
   /**
@@ -85,6 +87,7 @@ function markdown(r: ImportReport): string {
     `- Merged into existing sources: ${r.counts.merged}`,
     ...(r.counts.updated || r.counts.unchanged ? [`- Updated from a newer version: ${r.counts.updated}`, `- Unchanged since the last import: ${r.counts.unchanged}`] : []),
     ...(r.counts.deletedHere ? [`- Deleted here — not re-imported: ${r.counts.deletedHere}`] : []),
+    ...(r.annotationsDeletedHere ? [`- Annotations deleted here — not re-imported: ${r.annotationsDeletedHere}`] : []),
     `- Failed: ${r.counts.failed}`,
     `- Files copied into the library: ${r.files.copied}`,
     `- Files left as links: ${r.files.linked}`,
@@ -158,6 +161,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: reportLabel(key, rec.secret), note }))),
     pendingReview: pending.map((e) => ({ reviewId: e.id, ...(e.sourceId ? { sourceId: e.sourceId } : {}), reasons: e.reasons })),
     keptFields: [...latest.values()].filter((e) => e.merge?.kept?.length).map((e) => ({ item: reportLabel(e.key, rec.secret), fields: e.merge!.kept! })),
+    annotationsDeletedHere: [...latest.values()].reduce((n, e) => n + (e.annotationsDeletedHere ?? 0), 0),
     governance: rec.governance,
     notes: [...rec.notes, ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
     created: { collectionIds: [...rec.createdCollectionIds], tagIds: [...rec.createdTagIds] },

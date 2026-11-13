@@ -105,6 +105,8 @@ export interface ImportReport {
   fileNotes: Array<{ item: string; note: string }>;
   pendingReview: Array<{ reviewId: string; sourceId?: string; reasons: string[] }>;
   keptFields: Array<{ item: string; fields: string[] }>;
+  /** Highlights you deleted here that the reference manager still has: not added again; absent from an older service. */
+  annotationsDeletedHere?: number;
   governance: GovernanceNote[];
   notes: string[];
   created?: CreatedByBatch;

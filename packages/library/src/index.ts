@@ -295,6 +295,13 @@ export type { BrowserCaptureInput, BrowserCaptureResult, ExtractedPage } from ".
 export { startMediaWorker } from "./media-worker.js";
 export type { MediaWorker, ToolsUpdate } from "./media-worker.js";
 export { LinkedContentChangedError } from "./repo/sources.js";
+export {
+  ANNOTATION_CREATE_OP,
+  ANNOTATION_DELETE_OP,
+  ANNOTATION_UPDATE_OP,
+  AnnotationLimitError,
+} from "./repo/annotations.js";
+export type { AnnotationDraft, AnnotationPatch } from "./repo/annotations.js";
 
 // The speech models the app accepts and its default (R158), for the apps that do not import @ao/shared.
 export { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, isSpeechModel, type SpeechModel } from "@ao/shared";

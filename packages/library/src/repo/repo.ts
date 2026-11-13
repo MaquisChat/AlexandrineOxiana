@@ -3,10 +3,11 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import type { Asset, Collection, DateRule, ConsentRecord, EntityType, GovernanceConfig, PolicyDecision, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, Source, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import type { Annotation, Asset, Collection, DateRule, ConsentRecord, EntityType, GovernanceConfig, PolicyDecision, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, Source, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
+import { createAnnotation, deleteAnnotation, listAnnotations, updateAnnotation, type AnnotationDraft, type AnnotationPatch } from "./annotations.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingOcrMany, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
@@ -272,6 +273,22 @@ export class Repo {
   }
   deleteSource(projectId: string, id: string): Promise<void> {
     return deleteSource(this.core, projectId, id);
+  }
+  /** One source's annotations, as stored (the full read: source.json and its annotations file). */
+  listAnnotations(projectId: string, sourceId: string): Promise<Annotation[]> {
+    return listAnnotations(this.core, projectId, sourceId);
+  }
+  /** Adds a highlight or a page note on a PDF of the source: one governed, audited change (Task R3). */
+  createAnnotation(projectId: string, sourceId: string, draft: AnnotationDraft): Promise<Annotation> {
+    return createAnnotation(this.core, projectId, sourceId, draft);
+  }
+  /** Recolours an annotation, or sets or removes its note: one governed, audited change. */
+  updateAnnotation(projectId: string, sourceId: string, annotationId: string, patch: AnnotationPatch): Promise<Annotation> {
+    return updateAnnotation(this.core, projectId, sourceId, annotationId, patch);
+  }
+  /** Deletes an annotation (an imported one's key is remembered, so a re-import does not bring it back). */
+  deleteAnnotation(projectId: string, sourceId: string, annotationId: string): Promise<{ id: string; external: boolean }> {
+    return deleteAnnotation(this.core, projectId, sourceId, annotationId);
   }
   addDerivedAsset(projectId: string, sourceId: string, input: DerivedAssetInput): Promise<Asset> {
     return addDerivedAsset(this.core, projectId, sourceId, input);

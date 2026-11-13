@@ -67,6 +67,8 @@ export interface JournalEntry {
   tombstoned?: string[];
   /** Annotations of the item left out over the per-source limit (R74 I4). */
   annotationsDropped?: number;
+  /** Annotations of the item the researcher deleted here that the source still has: not imported again. */
+  annotationsDeletedHere?: number;
   /** The files this line stored: copied into the library, or left as links (R136; for the report). */
   files?: { copied: number; linked: number };
 }

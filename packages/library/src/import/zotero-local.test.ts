@@ -23,7 +23,8 @@ import { importChange, projectCollectionsAndTags, projectWarnings } from "../rep
 import { encryptBytes } from "../repo/io.js";
 import { ImmutableProvenanceError } from "../repo/errors.js";
 import { applyMerge } from "./bulk/merge.js";
-import { openTestRepo } from "../repo/testing.js";
+import { readJournal } from "./bulk/batch.js";
+import { openTestRepo, seams } from "../repo/testing.js";
 import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
 import type { ScanAnnotation } from "./bulk/scan.js";
 import { OUTSIDE_NOTE } from "./bulk/outside.js";
@@ -208,6 +209,16 @@ describe("zoteroAnnotation", () => {
     expect(zoteroAnnotation(row(1, rects), "/f.pdf")?.createdAt).toBe("2024-05-03T09:00:00.000Z");
   });
 
+  it("carries a well-formed sort index and drops a malformed one silently", () => {
+    const rects = JSON.stringify({ pageIndex: 4, rects: [[10, 20, 30, 50]] });
+    expect(zoteroAnnotation(row(1, rects, { sortIndex: "00004|000120|00300" }), "/f.pdf")?.anchor).toMatchObject({ kind: "pdf", sortIndex: "00004|000120|00300" });
+    for (const bad of ["4|1|3", "00004|000120", "x".repeat(40), "", null, undefined]) {
+      const a = zoteroAnnotation(row(1, rects, { sortIndex: bad }), "/f.pdf");
+      expect(a?.anchor, String(bad)).toMatchObject({ kind: "pdf", page: 5 });
+      expect(a?.anchor).not.toHaveProperty("sortIndex");
+    }
+  });
+
   it("reads the position defensively: bad JSON, huge or odd values give an annotation without an anchor", () => {
     for (const p of ["{", "[]", "null", JSON.stringify({ pageIndex: -1, rects: [[1, 2, 3, 4]] }), JSON.stringify({ pageIndex: 1e12, rects: [[1, 2, 3, 4]] }), JSON.stringify({ pageIndex: 0, rects: [["a", 2, 3, 4]] }), JSON.stringify({ pageIndex: 0, rects: [] }), "x".repeat(70_000), JSON.stringify({ pageIndex: 0, rects: Array.from({ length: 5000 }, () => [1, 2, 3, 4]) })]) {
       const a = zoteroAnnotation(row(1, p), "/f.pdf");
@@ -294,6 +305,13 @@ describe("zoteroLocalAdapter scan", () => {
     // Stable keys; resume finds the adapter.
     expect((await collect(zoteroLocalAdapter(dataDir))).map((i) => i.key)).toEqual(items.map((i) => i.key));
     expect(adapterFor("zotero-local", dataDir)?.kind).toBe("zotero-local");
+  });
+
+  it("the fixture's highlight keeps sort index 00000|000100|00200", async () => {
+    const items = await collect(zoteroLocalAdapter(dataDir));
+    const anns = byKey(items, "AAAA1111")!.annotations ?? [];
+    expect(anns.find((x) => x.key === "zotero:ANNO0001")?.anchor).toEqual({ kind: "pdf", page: 1, rects: [{ x: 100.5, y: 200, w: 199.5, h: 15.25 }], sortIndex: "00000|000100|00200" });
+    expect(anns.find((x) => x.key === "zotero:ANNO0002")?.anchor).toMatchObject({ page: 3, sortIndex: "00002|000050|00060" });
   });
 
   it("without Better BibTeX, a Citation Key line in Extra still wins; another library can be chosen", async () => {
@@ -793,6 +811,167 @@ processing:
     expect(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "report.md"), "utf8")).toMatch(/zotero:AAAA1111: \/title/u);
   });
 
+  /** One governed change to the source's annotations, the way the reader's operations will make it. */
+  const changeAnnotations = async (p: Project, sourceId: string, fn: (sf: SourceFile) => SourceFile) =>
+    importChange(repo, p.id, { action: "store", store: { identifiable: true, hasLocation: false, legalBasis: "legitimate interest; Zotero library" } }, async (ops) => {
+      const cur = await ops.readSource(sourceId);
+      await ops.writeSource(cur, fn(cur));
+    }, { op: "test.change-annotations" });
+  const bumpZotero = (version: number) =>
+    zoteroEdit((db) => db.prepare("UPDATE items SET version = ?, clientDateModified = '2024-06-01 08:00:00' WHERE itemID = 1").run(version));
+
+  it("a re-import back-fills the sort index of an unchanged imported annotation and reports no change", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a0 = byZoteroKey(await sources(p), "AAAA1111");
+    const hl0 = a0.annotations.find((x) => x.externalKey === "zotero:ANNO0001")!;
+    expect(hl0.anchors[0]).toMatchObject({ sortIndex: "00000|000100|00200" }); // a fresh import keeps it
+    // As stored before this plan: no sort index on the anchor (the hash was computed without it).
+    await changeAnnotations(p, a0.source.id, (sf) => ({
+      ...sf,
+      annotations: sf.annotations.map((a) => ({ ...a, anchors: a.anchors.map((x) => (x.kind === "pdf" ? { id: x.id, kind: x.kind, assetId: x.assetId, page: x.page, rects: x.rects } : x)) })),
+    }));
+    const old = byZoteroKey(await sources(p), "AAAA1111").annotations.find((x) => x.externalKey === "zotero:ANNO0001")!;
+    expect(old.anchors[0]).not.toHaveProperty("sortIndex");
+    bumpZotero(6);
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    const r = await h.done;
+    expect(r.counts).toMatchObject({ updated: 0, created: 0, failed: 0 });
+    const a1 = byZoteroKey(await sources(p), "AAAA1111");
+    const hl1 = a1.annotations.find((x) => x.externalKey === "zotero:ANNO0001")!;
+    expect(hl1.anchors[0]).toMatchObject({ sortIndex: "00000|000100|00200" });
+    expect(a1.annotations.find((x) => x.externalKey === "zotero:ANNO0002")!.anchors[0]).toMatchObject({ sortIndex: "00002|000050|00060" });
+    expect(hl1.externalHash).toBe(old.externalHash);
+    expect(hl1.modifiedAt).toBeUndefined();
+    expect(hl1.id).toBe(old.id);
+    expect((await bulk.batchReport(p.id, h.batchId)).keptFields).toEqual([]);
+    // The import's own undo takes back exactly what this run wrote.
+    await bulk.undoBatch(p.id, h.batchId);
+    const a2 = byZoteroKey(await sources(p), "AAAA1111");
+    expect(a2.annotations.find((x) => x.externalKey === "zotero:ANNO0001")!.anchors[0]).not.toHaveProperty("sortIndex");
+    expect(a2.annotations).toHaveLength(a0.annotations.length);
+  });
+
+  /** The stored annotations as an older import left them: no sort index on any anchor (their hashes are unchanged by that). */
+  const stripSortIndexes = (p: Project, sourceId: string) =>
+    changeAnnotations(p, sourceId, (sf) => ({
+      ...sf,
+      annotations: sf.annotations.map((a) => ({ ...a, anchors: a.anchors.map((x) => (x.kind === "pdf" ? { id: x.id, kind: x.kind, assetId: x.assetId, page: x.page, rects: x.rects } : x)) })),
+    }));
+  const withIndex = (sf: SourceFile) => sf.annotations.filter((a) => a.anchors.some((x) => x.kind === "pdf" && x.sortIndex)).length;
+  const fileStamps = async (sf: SourceFile) => {
+    const folder = join(lib.root, sf.source.folder);
+    return [(await stat(join(folder, "source.json"))).mtimeMs, (await stat(join(folder, "annotations.json"))).mtimeMs];
+  };
+
+  it("R196 (a): a re-import with Zotero untouched back-fills the sort index once, without marking the source modified; undo restores it", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a0 = byZoteroKey(await sources(p), "AAAA1111");
+    await stripSortIndexes(p, a0.source.id);
+    const before = byZoteroKey(await sources(p), "AAAA1111");
+    expect(withIndex(before)).toBe(0);
+
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve()); // Zotero untouched
+    const r = await h.done;
+    expect(r.counts).toMatchObject({ updated: 0, created: 0, failed: 0, unchanged: 5 });
+    const a1 = byZoteroKey(await sources(p), "AAAA1111");
+    expect(withIndex(a1)).toBe(2);
+    expect(a1.source.modifiedAt).toBe(before.source.modifiedAt);
+    expect(a1.source.modifiedBy).toBe(before.source.modifiedBy);
+    expect(a1.annotations.map((a) => a.externalHash)).toEqual(before.annotations.map((a) => a.externalHash));
+    expect((await bulk.batchReport(p.id, h.batchId)).keptFields).toEqual([]);
+
+    // A second re-import writes nothing for it.
+    const stamps = await fileStamps(a1);
+    await new Promise((res) => setTimeout(res, 30));
+    const r2 = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(r2.counts).toMatchObject({ updated: 0, unchanged: 5 });
+    expect(await fileStamps(a1)).toEqual(stamps);
+
+    // The run's own undo puts the earlier state back exactly, and does not stamp the source either.
+    await bulk.undoBatch(p.id, h.batchId);
+    const a2 = byZoteroKey(await sources(p), "AAAA1111");
+    expect(withIndex(a2)).toBe(0);
+    expect(a2.source.modifiedAt).toBe(before.source.modifiedAt);
+    expect(a2.annotations).toEqual(before.annotations);
+  });
+
+  // The crash is armed from inside the back-fill's own governed change (when it makes its snapshot folder), so
+  // it only passes if the annotations, the journal line and the audit event are all written by that one change.
+  for (const point of ["before-changes", "before-audit", "before-marker-delete"] as const) {
+    it(`R196 (a): a crash inside the back-fill's change (${point}) leaves file, audit and journal in agreement; the next run completes it`, async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+      const a0 = byZoteroKey(await sources(p), "AAAA1111");
+      await stripSortIndexes(p, a0.source.id);
+      const sourceEvents = async () => (await auditEvents(p)).filter((e) => e.entity?.id === a0.source.id).length;
+      const eventsBefore = await sourceEvents();
+      let fired = false;
+      seams.beforeMkdir = async (abs) => {
+        if (fired || !abs.includes("snapshots")) return;
+        fired = true;
+        seams.crashAt = point;
+        seams.failAuditAppendFor = p.id; // the run cannot carry on in-process after the "crash"
+      };
+      try {
+        await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+      } catch {
+        // the process "died" at the crash point
+      } finally {
+        seams.beforeMkdir = undefined;
+        seams.crashAt = undefined;
+        seams.failAuditAppendFor = undefined;
+      }
+      expect(fired).toBe(true);
+      repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+      const after = byZoteroKey(await sources(p), "AAAA1111");
+      expect(after.annotations).toHaveLength(3); // whole
+      const filled = withIndex(after);
+      expect([0, 2]).toContain(filled); // all of it or none of it
+      const journal = (await readJournal(repo, p.id, "imports/batch-0002")).filter((e) => e.mergedInto === a0.source.id && e.merge?.updatedAnnotations?.length);
+      expect(journal).toHaveLength(filled ? 1 : 0);
+      expect(await sourceEvents()).toBe(eventsBefore + (filled ? 1 : 0));
+      if (point !== "before-marker-delete") expect(filled).toBe(0); // before the commit point: rolled back
+      const r = await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+      expect(r.counts.failed).toBe(0);
+      expect(withIndex(byZoteroKey(await sources(p), "AAAA1111"))).toBe(2);
+    });
+  }
+
+  it("a re-import keeps what the researcher changed (even when Zotero changed it too) and does not bring back what was deleted", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a0 = byZoteroKey(await sources(p), "AAAA1111");
+    const when = "2026-11-13T09:00:00.000Z";
+    await changeAnnotations(p, a0.source.id, (sf) => ({
+      ...sf,
+      annotations: sf.annotations
+        .filter((a) => a.externalKey !== "zotero:ANNO0002")
+        .map((a) => (a.externalKey === "zotero:ANNO0001" ? { ...a, colorName: "green" as const, modifiedAt: when, modifiedBy: "tester" } : a)),
+      deletedAnnotationKeys: ["zotero:ANNO0002"],
+    }));
+    zoteroEdit((db) => {
+      db.prepare("UPDATE itemAnnotations SET comment = 'key claim, revised in Zotero' WHERE itemID = 9").run();
+      db.prepare("UPDATE items SET version = 6, clientDateModified = '2024-06-01 08:00:00' WHERE itemID = 1").run();
+    });
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await h.done;
+    const a1 = byZoteroKey(await sources(p), "AAAA1111");
+    const hl = a1.annotations.find((x) => x.externalKey === "zotero:ANNO0001")!;
+    expect(hl).toMatchObject({ colorName: "green", body: "key claim", modifiedAt: when });
+    expect(a1.annotations.some((x) => x.externalKey === "zotero:ANNO0002")).toBe(false);
+    expect(a1.deletedAnnotationKeys).toEqual(["zotero:ANNO0002"]);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.keptFields).toEqual([{ item: "zotero:AAAA1111", fields: ["highlight on page 1 (changed here, kept)"] }]);
+    expect(report.annotationsDeletedHere).toBe(1);
+    expect(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "report.md"), "utf8")).toMatch(/- Annotations deleted here — not re-imported: 1/u);
+  });
+
   const DELETED_NOTE = /^1 item you deleted here was not re-imported/u;
   const DEFERRED_NOTE =
     "Not imported from Zotero: 1 standalone note, 1 attachment note, 1 linked URL, 1 image embedded in a note, 1 linked file relative to Zotero's base folder (not given).";
@@ -1105,7 +1284,7 @@ processing:
     const a = byZoteroKey(await sources(p), "AAAA1111");
     expect(a.annotations.find((x) => x.externalKey === "zotero:NOTE0001")?.body).toBe("Revised reading notes");
     expect(a.annotations.find((x) => x.externalKey === "zotero:ANNO0001")?.body).toBe("my own comment");
-    expect((await bulk.batchReport(p.id, h.batchId)).keptFields).toEqual([{ item: "zotero:AAAA1111", fields: ["annotation zotero:ANNO0001"] }]);
+    expect((await bulk.batchReport(p.id, h.batchId)).keptFields).toEqual([{ item: "zotero:AAAA1111", fields: ["highlight on page 1 (changed here, kept)"] }]);
     // Undo puts the note back as it was.
     await bulk.undoBatch(p.id, h.batchId);
     expect(byZoteroKey(await sources(p), "AAAA1111").annotations.find((x) => x.externalKey === "zotero:NOTE0001")?.body).toContain("Reading notes");
