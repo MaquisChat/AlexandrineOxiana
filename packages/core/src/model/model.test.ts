@@ -235,6 +235,7 @@ describe("Anchor / Annotation", () => {
       modifiedBy: "me",
     });
     expect(Annotation.safeParse({ ...a, colorName: "teal" }).success).toBe(false);
+    expect(Annotation.safeParse({ ...a, modifiedAt: "yesterday" }).success).toBe(false);
     const f = fixture();
     expect(SourceFile.parse(f)).not.toHaveProperty("deletedAnnotationKeys");
     expect(SourceFile.parse({ ...f, deletedAnnotationKeys: ["zotero:ABCD2345"] }).deletedAnnotationKeys).toEqual(["zotero:ABCD2345"]);
