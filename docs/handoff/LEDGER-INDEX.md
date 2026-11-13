@@ -137,3 +137,4 @@ R212 (2026-11-13): Zotero Z2 after review — a resumed batch records the lowest
 R213 (2026-11-13): cloud folders W2 after review — fs.watch accepted, chokidar removed; sidecars like any file; every open guarded; one watcher per tree on macOS; stuck folders stay stuck; the re-check once a minute.
 R214 (2026-11-13): Zotero Z2 — the key list whole by its own evidence, at any version; a full run without it is not finished and records no version.
 R215 (2026-11-13): Zotero sync — the key list is taken before the downloads; a full run not finished for lack of it says so (carried by Z4).
+R216 (2026-11-13): reader R9 after review — "Discard this note?" stands (R192 e); nothing pressed dropped; annotation groups; the list sorts itself; measured heights; no author for now. D22 opened (importer writes the OS user name as author).
