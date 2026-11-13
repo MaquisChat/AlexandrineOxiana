@@ -400,6 +400,10 @@ test("an imported highlight is recoloured, noted and kept after a reload, by key
   });
 
   await test.step("the other one deleted, after its question", async () => {
+    // The entries in the list's order (the source's other annotations, if any, come in the further groups).
+    const ids = await list.locator("[data-entry]").evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.entry!));
+    const at = ids.indexOf(note.id);
+    const nextId = ids[at + 1] ?? ids[at - 1]!;
     await page.keyboard.press("ArrowDown");
     await expect(noteEntry).toBeFocused();
     await tabTo(page, noteEntry.getByRole("button", { name: /^Delete / }));
@@ -411,8 +415,8 @@ test("an imported highlight is recoloured, noted and kept after a reload, by key
     await page.keyboard.press("Enter");
     await expect(live).toHaveText("Note deleted.");
     await expect(noteEntry).toHaveCount(0);
-    // It was the last: the focus goes to the one before it.
-    await expect(hlEntry).toBeFocused();
+    // The focus goes to the next entry (the one before it when it was the last).
+    await expect(list.locator(`[data-entry="${nextId}"]`)).toBeFocused();
     await expect(list.getByRole("heading", { level: 2 })).toHaveText("Annotations (1)");
   });
 
@@ -425,7 +429,10 @@ test("an imported highlight is recoloured, noted and kept after a reload, by key
     await expect(noteEntry).toHaveCount(0);
     await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${highlight.id}"]`)).toHaveClass(/ao-hl--green/);
     const after = await app.api<{ annotations: Array<{ id: string; colorName: string; body?: string; imported: boolean }> }>("GET", `/projects/${projectId}/sources/${sid}/annotations`);
-    expect(after.body.annotations.map((a) => [a.id, a.colorName, a.body, a.imported])).toEqual([[highlight.id, "green", "key claim, checked twice", true]]);
+    expect(after.body.annotations.find((a) => a.id === note.id)).toBeUndefined();
+    const kept = after.body.annotations.find((a) => a.id === highlight.id)!;
+    expect([kept.colorName, kept.body, kept.imported]).toEqual(["green", "key claim, checked twice", true]);
+    expect(after.body.annotations).toHaveLength(listed.annotations.length - 1);
   });
   expect(errors).toEqual([]);
 });
