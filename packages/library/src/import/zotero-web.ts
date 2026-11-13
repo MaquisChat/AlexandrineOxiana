@@ -185,6 +185,8 @@ export const ZOTERO_WEB_NOTES = {
   /** Counts top-level items known here only (A5); Z5 adds what it marked. */
   deleted: (n: number) => `${plural(n, "item you have here was", "items you have here were")} deleted in Zotero since the last sync; nothing was deleted here.`,
   filesOff: (n: number) => `${plural(n, "attached file was", "attached files were")} not fetched: the Zotero key may not read files.`,
+  /** A full run not finished for lack of a whole key list (A7, R215): once in the run's notes. */
+  notConfirmed: "This sync could not confirm which items were deleted in Zotero, so the next sync will read the whole library again.",
 } as const;
 
 class ZoteroWebError extends Error {
@@ -873,16 +875,31 @@ async function* scanWeb(
   let colors: Map<string, string>;
   /** Keys `/deleted?since=` lists (items; children among them). */
   let deletedKeys: string[] = [];
+  /** Top-level items of this library known here (an item never imported is neither content nor gone). */
+  const knownHere = knownOf(ctx, ref);
+  /** Full runs (A6, A7): the complete key list, asked for when known items went unseen; undefined when it could not be had whole. */
+  let keyList: Set<string> | undefined;
+  let keyListAsked = false;
   try {
     // Read everything at one library version: a change under the scan restarts it (R80 I2).
     for (let attempt = 0; ; attempt++) {
       api.scanVersion = undefined;
       api.lossy = false;
       delete result.libraryVersion;
+      keyList = undefined;
+      keyListAsked = false;
       try {
         if (since === undefined) tree = await fullTree(api, prefix, result);
         else ({ tree, tops } = await changedTree(api, prefix, since, result, (k) => skip(`zotero:${k}`)));
         pathsOf = await collectionPaths(api, prefix);
+        // A7 (R215): the key list that decides "gone by absence" is taken here, at the version the scan is pinned
+        // to and again after every restart, BEFORE any file is downloaded (hours of downloads, during which the
+        // researcher goes on using Zotero, no longer lie between the read and the list). Pinned: a library that
+        // changed meanwhile restarts the read (R80). Only when something known here went unseen (A6's rules).
+        if (since === undefined && !api.lossy && [...knownHere].some((k) => !tree.has(k))) {
+          keyListAsked = true;
+          keyList = await completeKeyList(api, prefix, tree);
+        }
         break;
       } catch (err) {
         if (!(err instanceof LibraryChanged)) throw err;
@@ -940,15 +957,26 @@ async function* scanWeb(
       const downloaded: ScanFile[] = [];
       const fileNotes: string[] = [];
       const anns: ScanAnnotation[] = [];
+      /** Stored files by attachment key: its version and the file's hash (Z4; a failed download has none). */
+      const parts: Record<string, { v: number; sha256: string }> = {};
       for (const a of atts) {
         if (a !== it) stamp.push(`${a.key}:${a.version}`);
         const ad = a.data;
         const mode = str(ad.linkMode);
         if (a !== it && str(ad.note).trim()) counts.attachmentNotes++;
         let file: string | undefined;
+        /** Z4: the hash of the stored file this attachment's annotations are anchored in, when it was not downloaded again. */
+        let storedSha: string | undefined;
         if (mode === "imported_file" || mode === "imported_url") {
-          if (/^text\//iu.test(str(ad.contentType))) snapshots++;
-          else if (!wantFiles) {
+          const snapshot = /^text\//iu.test(str(ad.contentType));
+          // Stored by an earlier import at this very version (the engine's journal): nothing is asked for, not even
+          // the redirect. Counts as brought in: the version token is the one a successful download gives.
+          const known = snapshot ? undefined : knownFile(ctx, `${ref}/${it.key}`, a.key, a.version);
+          if (snapshot) snapshots++;
+          else if (known) {
+            storedSha = known;
+            parts[a.key] = { v: a.version, sha256: known };
+          } else if (!wantFiles) {
             // A key that may not read files: none is asked for; one scan note counts them, and the token is marked.
             filesOff++;
             stamp.push(`download-failed:${a.key}`);
@@ -969,6 +997,8 @@ async function* scanWeb(
               const t = await fileTypeFromFile(got.path).catch(() => undefined);
               downloaded.push({ path: got.path, mime: t?.mime ?? "application/octet-stream", bytes: st.size });
               file = got.path;
+              // The engine journals this part only if the source then holds a file with this hash (Z4).
+              parts[a.key] = { v: a.version, sha256: await sha256Of(got.path) };
             }
           }
         } else if (mode === "linked_file") {
@@ -987,6 +1017,7 @@ async function* scanWeb(
           if (an.data.itemType !== "annotation") continue;
           stamp.push(`${an.key}:${an.version}`);
           const x = annotationOf(an, file);
+          if (x && storedSha && x.anchor) x.assetSha256 = storedSha;
           if (x) anns.push(x);
         }
       }
@@ -1020,7 +1051,8 @@ async function* scanWeb(
       const files: ScanFile[] = [...downloaded, ...checked.files.map((f) => (linked.has(f.path) ? { ...f, link: true } : f))];
       const attached = new Set(files.map((f) => f.path));
       const annotations = anns.map((a) => (a.file && !attached.has(a.file) ? (({ file: _f, anchor: _a, ...rest }) => rest)(a) : a));
-      if (!fields.title && !files.length && !annotations.length && !fileNotes.length && !(isAtt && ctx.dryRun)) continue;
+      const hasParts = Object.keys(parts).length > 0;
+      if (!fields.title && !files.length && !annotations.length && !fileNotes.length && !hasParts && !(isAtt && ctx.dryRun)) continue;
 
       const tagColors: Record<string, string> = {};
       for (const t of fields.tags ?? []) {
@@ -1053,7 +1085,7 @@ async function* scanWeb(
         ...(Object.keys(tagColors).length ? { tagColors } : {}),
         ...(annotations.length ? { annotations } : {}),
         externalKeys,
-        version: { id: `${ref}/${it.key}`, version: token },
+        version: { id: `${ref}/${it.key}`, version: token, ...(hasParts ? { parts } : {}) },
         ...(notesOut.length ? { fileNotes: notesOut } : {}),
       };
     }
@@ -1066,8 +1098,9 @@ async function* scanWeb(
 
   // Gone from Zotero: only items known here (an item never imported is neither content nor gone), and
   // only after every page was read (a failure has returned above).
-  const knownHere = knownOf(ctx, ref);
   const gone = new Map<string, { gone: "deleted" | "bin"; version: string }>();
+  /** A full run not finished for lack of a whole key list (A7): said once in the run's notes. */
+  let notConfirmed = false;
   for (const t of tree.trashed.values()) if (!tree.parentOf(t) && knownHere.has(t.key)) gone.set(t.key, { gone: "bin", version: `bin:${t.version}` });
   /** Top-level items known here that Zotero says it deleted (the note counts these, A5). */
   let deletedHere = 0;
@@ -1080,27 +1113,17 @@ async function* scanWeb(
     }
   } else if (!api.lossy) {
     // Full: absence alone never makes an item gone (A5). A known item not seen is gone only when its key is
-    // also missing from the library's complete key list, read in one listing at the version the scan read at.
+    // also missing from the library's complete key list, whole by its own evidence (A6), taken before the
+    // downloads at the scan's version (A7).
     const unseen = [...knownHere].filter((k) => !tree.has(k));
     if (unseen.length) {
-      let keys: Set<string> | undefined;
-      try {
-        keys = await completeKeyList(api, prefix, tree);
-      } catch (err) {
-        if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
-        // The key may no longer read the library: the run says so. Any other failure: none gone by absence this run.
-        if (err instanceof ZoteroWebError && (err.reason === ZOTERO_WEB_REASONS.keyRefused || err.reason === ZOTERO_WEB_REASONS.notFound)) {
-          yield fail(err.reason);
-          return;
-        }
-        keys = undefined;
-      }
-      if (keys) {
-        for (const k of unseen) if (!keys.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
+      if (keyListAsked && keyList) {
+        for (const k of unseen) if (!keyList.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
       } else {
         // No whole key list: this full run is not finished (A6). Nobody is gone by absence and the version is not
-        // recorded, so the next run is full again and makes the check again.
+        // recorded, so the next run is full again and makes the check again; the run says so (A7).
         api.lossy = true;
+        notConfirmed = keyListAsked;
       }
     }
   }
@@ -1128,6 +1151,7 @@ async function* scanWeb(
   if (pendingDownloads) ctx.note?.(ZOTERO_WEB_NOTES.pendingDownloads(pendingDownloads));
   if (filesOff) ctx.note?.(ZOTERO_WEB_NOTES.filesOff(filesOff));
   if (deletedHere) ctx.note?.(ZOTERO_WEB_NOTES.deleted(deletedHere));
+  if (notConfirmed) ctx.note?.(ZOTERO_WEB_NOTES.notConfirmed);
   result.completed = !api.lossy;
 }
 
@@ -1137,16 +1161,18 @@ const KEY_LIST_TRIES = 3;
 /**
  * The library's complete key list, bin included, in one listing (`format=versions`, no limit), whole
  * by its own evidence (A6): it carries Total-Results, holds exactly that many valid keys, and holds
- * every key this scan saw (live or in the bin). It need not be at the version the scan read at: a key
- * absent from a whole list is deleted as of that list. Asked up to KEY_LIST_TRIES times with the usual
- * waits; undefined when it cannot be had whole. A refusal (403) or a library gone (404) is thrown.
+ * every key this scan saw (live or in the bin). A key absent from a whole list is deleted as of that list
+ * (A6). It is asked for right after the read, pinned to the scan's version (A7): a library that changed
+ * meanwhile (412, another Last-Modified-Version) throws LibraryChanged and the read restarts (R80). Asked
+ * up to KEY_LIST_TRIES times with the usual waits; undefined when it cannot be had whole. A refusal (403)
+ * or a library gone (404) is thrown.
  */
 async function completeKeyList(api: ZoteroApi, prefix: string, seen: Tree): Promise<Set<string> | undefined> {
   for (let attempt = 0; attempt < KEY_LIST_TRIES; attempt++) {
     if (attempt) await api.pause(attempt - 1);
     let got: { body: unknown; headers: Headers };
     try {
-      got = await api.json(`${prefix}/items`, { format: "versions", ...WITH_BIN });
+      got = await api.json(`${prefix}/items`, { format: "versions", ...WITH_BIN }, true);
     } catch (err) {
       if (err instanceof ZoteroWebError && (err.reason === ZOTERO_WEB_REASONS.keyRefused || err.reason === ZOTERO_WEB_REASONS.notFound)) throw err;
       if (!(err instanceof ZoteroWebError)) throw err;
@@ -1168,6 +1194,25 @@ function wholeKeys(body: unknown, headers: Headers, seen: Tree): Set<string> | u
   for (const k of seen.byKey.keys()) if (!set.has(k)) return undefined;
   for (const k of seen.trashed.keys()) if (!set.has(k)) return undefined;
   return set;
+}
+
+const SHA256 = /^[0-9a-f]{64}$/u;
+
+/** Z4: the hash of a file the engine says it stored for this attachment at this version (ScanContext.fileKnown), if any. */
+function knownFile(ctx: ScanContext, versionId: string, attKey: string, attVersion: number): string | undefined {
+  let got: { sha256: string } | undefined;
+  try {
+    got = ctx.fileKnown?.(versionId, attKey, attVersion);
+  } catch {
+    got = undefined; // the file is downloaded, as before
+  }
+  return typeof got?.sha256 === "string" && SHA256.test(got.sha256) ? got.sha256 : undefined;
+}
+
+async function sha256Of(path: string): Promise<string> {
+  const h = createHash("sha256");
+  for await (const c of createReadStream(path) as AsyncIterable<Buffer>) h.update(c);
+  return h.digest("hex");
 }
 
 /** The item keys of this library (`<ref>/<key>`) among the ids the engine knows; ids of any other library are left out. */
