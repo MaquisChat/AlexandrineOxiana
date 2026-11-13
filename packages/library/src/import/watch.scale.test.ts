@@ -111,7 +111,12 @@ describe("watched folders at scale", () => {
     const t0 = Date.now();
     // A real watch id: the register is written as in the service (A8; review M9).
     const watchId = newId();
-    const w = watchFolder({ repo, http, lib, attach, onStatus: (s) => statuses.push({ ...structuredClone(s), at: Date.now() }) }, p.id, drive, {}, watchId);
+    // Under "leave" (the default, Task W4) not one of the 40,000 is fetched.
+    const fetched: string[] = [];
+    const fetchContent = async (q: string) => {
+      fetched.push(q);
+    };
+    const w = watchFolder({ repo, http, lib, attach, fetchContent, onStatus: (s) => statuses.push({ ...structuredClone(s), at: Date.now() }) }, p.id, drive, {}, watchId);
     cleanups.push(() => w.stop());
     await w.ready;
     const done = () => {
@@ -132,6 +137,7 @@ describe("watched folders at scale", () => {
     expect(new Set(opened).size).toBe(N_LOCAL);
     expect(opened).toHaveLength(N_LOCAL);
     expect(stored).toHaveLength(N_LOCAL);
+    expect(fetched).toEqual([]);
 
     // The counts and their bytes; the list is capped, newest first.
     expect(w.status()).toMatchObject({ watchId, state: "watching", provider: null, counts: { notDownloaded: N_ONLINE, notDownloadedBytes: expectedBytes, cameIn: N_LOCAL, didNotComeIn: 0 } });
