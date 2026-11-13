@@ -1992,6 +1992,36 @@ processing:
       expect(sf.annotations[0]!.anchors[0]).toMatchObject({ assetId: sf0.assets[0]!.id });
     });
 
+    it("a run suspended and resumed fetches no file twice, the one in hand at the suspend included", async () => {
+      const p = await project();
+      const atts: string[] = [];
+      for (let i = 0; i < 6; i++) atts.push((await withHighlightedFile(`Item ${i}`)).att);
+      const h = await startZoteroWebImport(bulkDeps(), p.id, zweb);
+      for await (const e of h.progress) {
+        if (e.done >= 2) {
+          await h.suspend();
+          break;
+        }
+      }
+      expect((await h.done).state).toBe("paused");
+      // The resume rebuilds the adapter from the batch record (no test seams): the stand-in serves as the global dispatcher.
+      const { getGlobalDispatcher, setGlobalDispatcher } = await import("undici");
+      const previous = getGlobalDispatcher();
+      setGlobalDispatcher(z.agent);
+      let r;
+      try {
+        const { resumeZoteroWebImport } = await import("./zotero-web.js");
+        r = await (await resumeZoteroWebImport(bulkDeps(), p.id, h.batchId)).done;
+      } finally {
+        setGlobalDispatcher(previous);
+      }
+      expect(r.state).toBe("finished");
+      expect(r.counts.created + r.counts.needsReview).toBe(6);
+      expect(atts.map((a) => fileRequests(a))).toEqual(atts.map(() => 1));
+      expect(storageRequests()).toBe(6);
+      expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
+    });
+
     it("a key list that cannot be had: the run's notes say so once, and no version is recorded (A7)", async () => {
       const p = await project();
       z.addItem(U, { itemType: "journalArticle", title: "Stays" });
