@@ -355,6 +355,7 @@ test.describe("in the desktop app", () => {
       const item = page.getByRole("tree", { name: "Collections" }).getByRole("treeitem", { name: COLLECTION });
       await item.focus();
       await page.keyboard.press("Enter");
+      await expect(item).toHaveAttribute("aria-selected", "true");
       await expect(page.getByText("1 source", { exact: true })).toBeVisible();
       await expect(page.getByRole("table", { name: "Sources" }).getByRole("button", { name: "Tidal Commons and the Village Ledger", exact: true })).toBeVisible();
       const listed = await sources(app, s.projectId);
@@ -477,11 +478,12 @@ test.describe("in the desktop app", () => {
     writeFileSync(file, first);
     await expect(countLine(page, "Marsh drive", "1 file came in")).toHaveText("1 file came in", { timeout: 30_000 });
 
+    let made: TreeEntry[] = [];
     await test.step("a colleague replaces the PDF with another, complete on disk: the folder says a file in the library changed", async () => {
       const aside = join(app.root, "aside.pdf");
       writeFileSync(aside, second);
       renameSync(aside, file);
-      const made = tree(s.dir);
+      made = tree(s.dir);
       await expect(countLine(page, "Marsh drive", "1 file in the library has changed in the folder")).toHaveText("1 file in the library has changed in the folder", { timeout: 30_000 });
       expect((await sources(app, s.projectId)).total, "a changed file is never imported by itself").toBe(1);
       expect(tree(s.dir)).toEqual(made);
@@ -510,6 +512,7 @@ test.describe("in the desktop app", () => {
       expect(hashes.sort()).toEqual([sha256(first), sha256(second)].sort());
       // On the screen: the Files list holds two originals.
       await expect(details.locator("h3:text-is('Files') + ul > li")).toHaveCount(2);
+      expect(tree(s.dir), "bringing the new version in wrote nothing into the folder").toEqual(made);
     });
   });
 
@@ -601,6 +604,7 @@ test.describe("in the desktop app", () => {
     await addFolder(page, app, s.dir, "Interviews", COLLECTION);
     writeFileSync(join(s.dir, "Lock keepers.pdf"), pdf);
     sparse(join(s.dir, "Not here.pdf"), 50_000);
+    const made = tree(s.dir);
     await expect(countLine(page, "Interviews", "1 file came in")).toHaveText("1 file came in", { timeout: 30_000 });
     await expect(countLine(page, "Interviews", notDownloadedLine(50_000))).toHaveText(notDownloadedLine(50_000), { timeout: 30_000 });
     const region = folderRegion(page, "Interviews");
@@ -622,6 +626,7 @@ test.describe("in the desktop app", () => {
     expect(adds.map((r) => JSON.parse(r.body ?? "null"))).toEqual([{ grantId: app.chooser!.grants[0], recursive: false, label: "Interviews", collectionId: s.collectionId }]);
     expect(seen.filter((r) => new URL(r.url).host === new URL(app.baseUrl).host).length, "the page's requests were recorded").toBeGreaterThan(10);
     expect(pathProblems(seen, folders)).toEqual([]);
+    expect(tree(s.dir), "the app wrote nothing into the folder").toEqual(made);
   });
 
   test("the app wrote nothing into the folder", async ({ page, app, folders }) => {
