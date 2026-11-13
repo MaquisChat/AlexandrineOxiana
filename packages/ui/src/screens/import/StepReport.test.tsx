@@ -58,3 +58,12 @@ describe("the undo question", () => {
     expect(undoQuestion(report({}, { updated: 1 }))).toBe("Remove 0 imported sources and revert 1 updated source?");
   });
 });
+
+describe("kept edits", () => {
+  it("shows the kept line as text, whatever the page label holds", async () => {
+    show(report({ keptFields: [{ item: "zotero:AAAA1111", fields: ["highlight on page <b>iv</b> (changed here, kept)"] }] }));
+    await screen.findByText(/Import \d+\./);
+    expect(screen.getByText(/highlight on page <b>iv<\/b>/)).toBeTruthy();
+    expect(document.querySelector("li b")).toBeNull();
+  });
+});
