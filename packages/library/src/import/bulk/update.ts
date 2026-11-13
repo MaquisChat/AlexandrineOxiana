@@ -120,9 +120,19 @@ export function planUpdate(cur: SourceFile, ref: Partial<SourceDraft>, source: F
   return plan;
 }
 
-/** A scanned annotation as stored: its anchor points into the asset its file became (none: no anchor). */
-export function toAnnotation(a: ScanAnnotation, sourceId: string, actor: string, assetFor: (file: string) => Asset | undefined): Annotation {
-  const asset = a.file ? assetFor(a.file) : undefined;
+/**
+ * A scanned annotation as stored: its anchor points into the asset its file became, or, for a file that was
+ * not downloaded again (Z4: `assetSha256`), into the asset `assetBySha` finds by that hash (none: no anchor;
+ * never a guess).
+ */
+export function toAnnotation(
+  a: ScanAnnotation,
+  sourceId: string,
+  actor: string,
+  assetFor: (file: string) => Asset | undefined,
+  assetBySha?: (sha256: string) => Asset | undefined,
+): Annotation {
+  const asset = a.file ? assetFor(a.file) : a.assetSha256 && assetBySha ? assetBySha(a.assetSha256) : undefined;
   const anchors =
     asset && a.anchor
       ? [a.anchor.kind === "pdf" ? { kind: "pdf" as const, id: newId(), assetId: asset.id, page: a.anchor.page, rects: a.anchor.rects, ...(a.anchor.sortIndex ? { sortIndex: a.anchor.sortIndex } : {}) } : { kind: "epub-cfi" as const, id: newId(), assetId: asset.id, cfi: a.anchor.cfi }]
@@ -219,7 +229,17 @@ export function planAnnotations(sf: SourceFile, scanned: ScanAnnotation[], make:
       plan.deletedHere++; // the researcher deleted it here: not brought back
       continue;
     }
-    const next = make(s);
+    let next = make(s);
+    if (ex && s.assetSha256 && s.anchor && !next.anchors.length && ex.anchors.length) {
+      // Z4: the stored file it is anchored in is not among the source's assets (removed here, or a hash that
+      // matches none). No asset is guessed: the one stored here keeps the anchors it has, and only what Zotero
+      // says of its content is compared.
+      // (The page is a label only when there is no anchor: with the anchors kept, only Zotero's own label stays.)
+      const { pageLabel: _page, ...rest } = next;
+      const base: Annotation = s.pageLabel ? { ...rest, pageLabel: s.pageLabel.slice(0, 64) } : rest;
+      const anchors = ex.anchors;
+      next = { ...base, anchors, externalHash: annotationHash({ ...base, anchors }) };
+    }
     if (!ex) {
       fresh.push(next);
       continue;
@@ -276,7 +296,8 @@ export function planBackfill(sf: SourceFile, scanned: ScanAnnotation[]): Array<{
     seen.add(s.key);
     const home = ex.anchors.find((x) => x.kind === "pdf");
     if (!home || !unedited(ex)) continue;
-    const next = toAnnotation(s, sf.source.id, "", () => ({ id: home.assetId }) as Asset);
+    const inHome = () => ({ id: home.assetId }) as Asset;
+    const next = toAnnotation(s, sf.source.id, "", inHome, inHome);
     if (next.externalHash !== ex.externalHash) continue;
     const after = withSortIndex(ex, next);
     if (after) out.push({ before: ex, after });

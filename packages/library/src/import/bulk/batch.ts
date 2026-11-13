@@ -62,7 +62,17 @@ export interface JournalEntry {
    * brought the source to (created, merged, updated or unchanged). The newest such line of a batch
    * that was not undone is what a re-import compares with.
    */
-  ext?: { id: string; version: string };
+  ext?: {
+    id: string;
+    version: string;
+    /**
+     * Zotero Web (Task Z4): the attachments whose file this line's source holds, by key: the attachment's
+     * version and the SHA-256 of the asset it became (ScanItem.version.parts, kept only for files actually
+     * stored, or known and carried forward). Absent in lines written before Z4: their files are downloaded
+     * once more and dropped by their hash, after which the line has parts.
+     */
+    parts?: Record<string, { v: number; sha256?: string }>;
+  };
   /** Zotero item keys this line's deletion recorded as deleted here (review skip/merge); undo takes them back (R74 I3). */
   tombstoned?: string[];
   /** Annotations of the item left out over the per-source limit (R74 I4). */
@@ -220,6 +230,27 @@ export async function readJournal(repo: Repo, projectId: string, dir: string): P
     }
   }
   return out;
+}
+
+const SHA256 = /^[0-9a-f]{64}$/u;
+
+/**
+ * A journal line's `ext.parts` as it may be trusted (Task Z4): an own-keyed record of attachment keys, each
+ * with a non-negative integer version and a lower-case SHA-256. Anything else in it is left out; undefined
+ * when nothing is left (the file is then downloaded, as for a line written before Z4).
+ */
+export function readParts(raw: unknown): Record<string, { v: number; sha256: string }> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, { v: number; sha256: string }> = Object.create(null) as Record<string, { v: number; sha256: string }>;
+  let any = false;
+  for (const [k, p] of Object.entries(raw as Record<string, unknown>)) {
+    if (!/^[A-Za-z0-9]{1,32}$/u.test(k) || !p || typeof p !== "object") continue;
+    const { v, sha256 } = p as { v?: unknown; sha256?: unknown };
+    if (!Number.isInteger(v) || (v as number) < 0 || typeof sha256 !== "string" || !SHA256.test(sha256)) continue;
+    out[k] = { v: v as number, sha256 };
+    any = true;
+  }
+  return any ? out : undefined;
 }
 
 /** The newest journal line per key (a later review decision supersedes the run's outcome). */

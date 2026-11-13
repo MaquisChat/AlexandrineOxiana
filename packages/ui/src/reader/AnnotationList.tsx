@@ -43,7 +43,15 @@
  *    measured yet count ENTRY_ESTIMATE_PX. `offsetsOf` and `windowOf` are the arithmetic.
  *    `aria-setsize` and `aria-posinset` keep each entry's place in the whole list.
  *
- * `filterWords` is Task R12's (the list filtered to a search's words); it is accepted and not used yet.
+ * A library search's words (Task R12): the list never holds them to match; the reader matches them with
+ * R1's `matchAnnotations` and hands the list the ids (`filterIds`). Filtered, the heading reads
+ * "Annotations matching your search (N)" with "Show all", the list keeps its groups (another file's and
+ * unplaced annotations are not matches), its own sort, windowing and roving focus, and every count
+ * (`aria-setsize` is the filtered count); "Show all" gives the full list back with the focus kept on the
+ * same entry; a change made while filtered behaves as unfiltered. While the reader is still looking
+ * (`filterWords` is set, no ids yet) the list says "Looking for the words…" (the words are not shown) and
+ * lists everything; `searchNote` is a sentence from the reader (nothing matched exactly; the highlight
+ * asked for is gone) shown above the full list; `focusRequest` puts the focus on an entry, once.
  */
 import { sortAnnotations } from "@ao/core/annotations/sortIndex";
 import { HIGHLIGHT_COLOUR_NAMES } from "@ao/shared";
@@ -55,6 +63,11 @@ import { blockNavigation, navigate } from "../navigation";
 
 /** R1's annotation shape, as `sortAnnotations` takes it (the root of @ao/core stays out of the interface). */
 type Annotation = Parameters<typeof sortAnnotations>[0][number];
+
+/** Said while the reader looks for a search's words among the annotations (A4). */
+export const SEARCH_LOOKING = "Looking for the words…";
+/** Said when every annotation matching a search has been deleted. */
+export const SEARCH_NONE_LEFT = "No annotation matching your search is left.";
 
 /** Said of a highlight whose quote no longer matches the text under its rectangles (R8, A11). */
 export const HIGHLIGHT_CHANGED_SENTENCE = "The text here has changed since this highlight was made.";
@@ -140,8 +153,16 @@ export interface AnnotationListProps {
   assetId: string;
   selectedId?: string;
   readOnly: boolean;
-  /** Task R12. */
+  /** Task R12: the words of a search that the reader is still looking for among the annotations (set until it has the ids). */
   filterWords?: string;
+  /** Task R12: the ids the reader matched; the list shows only these, under "Annotations matching your search (N)". */
+  filterIds?: ReadonlySet<string>;
+  /** Task R12: a sentence from the reader, said above the list. */
+  searchNote?: string;
+  /** Task R12: put the focus on this entry; a new `seq` asks again. */
+  focusRequest?: { id: string; seq: number };
+  /** Task R12: "Show all" was pressed. */
+  onShowAll?(): void;
   onJump(id: string): void;
   onSaveNote(id: string, body: string | null): Promise<void>;
   onRecolour(id: string, colour: HighlightColourName): Promise<void>;
@@ -247,6 +268,9 @@ function entriesOf(list: AnnotationRecord[], assetId: string, pageCount: number 
   }
   return { groups, flat };
 }
+
+/** The annotations lying on `assetId`, in the order the list shows them (R1's reading order): what a search's first match is taken from (Task R12). */
+export const annotationsInReadingOrder = (list: AnnotationRecord[], assetId: string): AnnotationRecord[] => entriesOf(list, assetId, undefined).groups.here.map((e) => e.a);
 
 const messageOf = (e: unknown) => (e instanceof Error && e.message ? e.message : "The library service did not answer.");
 
@@ -524,9 +548,11 @@ function Question({ title, yes, no, onYes, onNo }: { title: string; yes: string;
 const GROUP_TITLES: Record<Exclude<Group, "here">, string> = { elsewhere: "On another file of this source", unplaced: "Not placed on a page" };
 const count = (n: number) => n.toLocaleString("en-GB");
 
-export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJump, onSaveNote, onRecolour, onDelete, changed, pageCount, loadError, onRetry, announcement }: AnnotationListProps) {
+export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJump, onSaveNote, onRecolour, onDelete, changed, pageCount, loadError, onRetry, announcement, filterWords, filterIds, searchNote, focusRequest, onShowAll }: AnnotationListProps) {
   const hid = useId();
-  const { groups, flat } = useMemo(() => entriesOf(annotations, assetId, pageCount), [annotations, assetId, pageCount]);
+  // Filtered: only the matched annotations are entries at all, so groups, positions and set sizes are the filtered list's own.
+  const shown = useMemo(() => (filterIds ? annotations.filter((a) => filterIds.has(a.id)) : annotations), [annotations, filterIds]);
+  const { groups, flat } = useMemo(() => entriesOf(shown, assetId, pageCount), [shown, assetId, pageCount]);
   const byId = useMemo(() => new Map(flat.map((e) => [e.a.id, e])), [flat]);
   const [activeChoice, setActiveId] = useState<string | undefined>(undefined);
   const activeId = activeChoice !== undefined && byId.has(activeChoice) ? activeChoice : flat[0]?.a.id;
@@ -628,6 +654,17 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     want.current = w;
     setTick((n) => n + 1);
   };
+
+  // The reader asks for an entry to take the focus (a search's first match): once per request.
+  const lastFocusSeq = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (!focusRequest || lastFocusSeq.current === focusRequest.seq || !byId.has(focusRequest.id)) return;
+    lastFocusSeq.current = focusRequest.seq;
+    setActiveId(focusRequest.id);
+    focusLater({ id: focusRequest.id, what: "entry" });
+    // `focusLater` only sets state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest, byId]);
 
   // Focus placed where it was asked for, once the entry is in the page (revealing it first in a
   // windowed list). A passive effect: it runs after a closing dialog has given the focus back.
@@ -1039,13 +1076,29 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     );
   };
 
-  const n = groups.here.length;
+  const filtered = filterIds !== undefined;
+  // Filtered, the count covers every group (this file's, another file's, not placed): all are matches.
+  const n = filtered ? flat.length : groups.here.length;
+  /** "Show all": the focus goes to the entry that is current, which the full list still holds. */
+  const showAll = () => {
+    if (activeId !== undefined) focusLater({ id: activeId, what: "entry" });
+    onShowAll?.();
+  };
   const deleting = confirmFor !== undefined ? byId.get(confirmFor) : undefined;
   return (
     <section className="ao-ann" aria-labelledby={hid}>
       <h2 id={hid} ref={heading} tabIndex={-1}>
-        Annotations ({count(n)})
+        {filtered ? "Annotations matching your search" : "Annotations"} ({count(n)})
       </h2>
+      {filtered && (
+        <p>
+          <button type="button" onClick={showAll}>
+            Show all
+          </button>
+        </p>
+      )}
+      {!filtered && filterWords !== undefined && <p role="status" className="ao-ann-find">{SEARCH_LOOKING}</p>}
+      {searchNote !== undefined && <p role="status" className="ao-ann-find">{searchNote}</p>}
       {readOnly && <p className="ao-ann-readonly">{ANNOTATIONS_READ_ONLY}</p>}
       {loadError !== undefined && (
         <div className="ao-ann-load-error">
@@ -1066,7 +1119,7 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
         {said && <span key={said.n}>{said.text}</span>}
       </p>
       <div className="ao-ann-scroll" ref={scroller} onScroll={onScroll} onKeyDown={onKey} onFocus={onFocusIn}>
-        {n === 0 && loadError === undefined && <p className="ao-ann-empty">This file has no highlights or notes yet.</p>}
+        {n === 0 && loadError === undefined && <p className="ao-ann-empty">{filtered ? SEARCH_NONE_LEFT : "This file has no highlights or notes yet."}</p>}
         {renderGroup("here", hid)}
         {(["elsewhere", "unplaced"] as const).map((g) =>
           groups[g].length === 0 ? null : (

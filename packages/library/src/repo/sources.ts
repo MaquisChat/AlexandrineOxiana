@@ -612,6 +612,14 @@ export async function getSource(core: RepoCore, projectId: string, id: string): 
  * row while annotations are being written. For anything that needs the annotations, use getSource.
  */
 export async function getSourceRecord(core: RepoCore, projectId: string, id: string): Promise<Source> {
+  return (await getSourceRecordWithAssets(core, projectId, id)).source;
+}
+
+/**
+ * The same light read (R186), keeping the assets that `source.json` holds and that the read already
+ * parses: a list row can say what kind of files its source has without reading anything more (R222).
+ */
+export async function getSourceRecordWithAssets(core: RepoCore, projectId: string, id: string): Promise<{ source: Source; assets: Asset[] }> {
   const st = core.state(projectId);
   core.assertUnlocked(st);
   const folder = sourceFolderOf(st, id);
@@ -623,7 +631,8 @@ export async function getSourceRecord(core: RepoCore, projectId: string, id: str
     const { key, keyId } = core.key(st);
     text = (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
   } else text = raw.toString("utf8");
-  return SourceFile.parse(JSON.parse(text)).source;
+  const sf = SourceFile.parse(JSON.parse(text));
+  return { source: sf.source, assets: sf.assets };
 }
 
 export function listSourceIds(core: RepoCore, projectId: string): string[] {
