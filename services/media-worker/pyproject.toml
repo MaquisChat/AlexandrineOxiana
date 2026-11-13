@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ao-worker"
 version = "0.1.0"
 description = "AlexandrineOxiana media worker: transcription, capture download, proxies, OCR"
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.12"
 # Pinned: the worker ships with the app; gallery-dl updates with app releases (ADR 0009).
 dependencies = [
