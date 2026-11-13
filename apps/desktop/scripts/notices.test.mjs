@@ -1,11 +1,15 @@
 // The build-time licence lists of what the shell ships (R159 c): the shell's Rust crates (from
 // `cargo metadata`) and the npm packages bundled into the interface (from `pnpm list`).
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { crateLicenceTexts, crateNotices, nodeLicenceText, npmLicenceTexts, npmNotices, shippedCrates } from "./notices.mjs";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 // A small `cargo metadata` answer: the app, a normal dependency chain, a build-only and a dev-only
 // dependency (neither shipped), and an MPL-2.0 crate.
@@ -106,6 +110,67 @@ describe("npmNotices", () => {
   it("reads the old `licenses` form and fails on a package with no licence", () => {
     assert.deepEqual(npmNotices([{ dependencies: { a: { version: "1.0.0", path: "/a" } } }], () => ({ licenses: [{ type: "MIT" }, { type: "ISC" }] })), [{ name: "a", version: "1.0.0", licence: "MIT OR ISC" }]);
     assert.throws(() => npmNotices([{ dependencies: { b: { version: "1.0.0", path: "/b" } } }], () => ({ name: "b" })), /b 1\.0\.0 has no licence/);
+  });
+
+  // `pnpm list` names every optional dependency, also the ones for other platforms that are not
+  // installed here (Task R6, round 4: @napi-rs/canvas's per-platform packages).
+  const OPTIONAL_LIST = [
+    {
+      name: "@ao/ui",
+      path: "/repo/packages/ui",
+      dependencies: {
+        tool: {
+          version: "1.0.0",
+          path: "/n/tool",
+          dependencies: {
+            "tool-linux-x64": { version: "1.0.0", path: "/n/tool-linux-x64" },
+            "tool-darwin-arm64": { version: "1.0.0", path: "/n/tool-darwin-arm64" },
+          },
+        },
+      },
+    },
+  ];
+  const OPTIONAL_PKGS = {
+    "/repo/packages/ui": { name: "@ao/ui" },
+    "/n/tool": { name: "tool", license: "MIT", optionalDependencies: { "tool-linux-x64": "1.0.0", "tool-darwin-arm64": "1.0.0" } },
+    "/n/tool-linux-x64": { name: "tool-linux-x64", license: "MIT" },
+  };
+
+  it("skips an optional dependency that is not installed on this platform: it is not shipped", () => {
+    assert.deepEqual(npmNotices(OPTIONAL_LIST, (p) => OPTIONAL_PKGS[p]), [
+      { name: "tool", version: "1.0.0", licence: "MIT" },
+      { name: "tool-linux-x64", version: "1.0.0", licence: "MIT" },
+    ]);
+  });
+
+  it("fails, naming it, when a required dependency is not installed", () => {
+    const pkgs = { ...OPTIONAL_PKGS, "/n/tool": { name: "tool", license: "MIT", dependencies: { "tool-linux-x64": "1.0.0", "tool-darwin-arm64": "1.0.0" } } };
+    assert.throws(() => npmNotices(OPTIONAL_LIST, (p) => pkgs[p]), /tool-darwin-arm64 1\.0\.0, a required dependency of tool 1\.0\.0, is not installed/);
+  });
+
+  it("leaves out pdf.js's Node-only canvas (never in the browser bundle), on every platform alike", () => {
+    const pdfjs = dirname(createRequire(join(REPO_ROOT, "packages", "ui", "package.json")).resolve("pdfjs-dist/package.json"));
+    const list = (platformPackage) => [
+      {
+        name: "@ao/ui",
+        path: "/repo/packages/ui",
+        dependencies: {
+          "pdfjs-dist": {
+            version: "6.4.299",
+            path: pdfjs,
+            dependencies: { "@napi-rs/canvas": { version: "1.1.0", path: "/n/canvas", dependencies: { [platformPackage]: { version: "1.1.0", path: `/n/${platformPackage}` } } } },
+          },
+        },
+      },
+    ];
+    const read = (p) => (p === pdfjs ? JSON.parse(readFileSync(join(pdfjs, "package.json"), "utf8")) : p === "/repo/packages/ui" ? { name: "@ao/ui" } : assert.fail(`${p} must not be read`));
+    const linux = npmNotices(list("@napi-rs/canvas-linux-x64-gnu"), read);
+    const mac = npmNotices(list("@napi-rs/canvas-darwin-arm64"), read);
+    assert.deepEqual(linux, mac);
+    assert.deepEqual(
+      linux.map((e) => e.name),
+      ["core-js", "pdfjs-dist"],
+    );
   });
 });
 
