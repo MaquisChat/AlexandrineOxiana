@@ -941,6 +941,33 @@ describe("WatchedFolders", () => {
     expect(screen.getByRole("region", { name: "B" })).toBeTruthy();
   });
 
+  it("N3: when the library closes the screen drops its folders and numbers; when one opens it reads the list again", async () => {
+    let gets = 0;
+    useService(() => {
+      gets++;
+      return gets === 1 ? { folders: [folder({ seq: 500 })] } : gets === 2 ? { folders: [folder({ seq: 1, label: "Reopened" })] } : { folders: [folder({ seq: 2, id: "w9", label: "Other library" })] };
+    });
+    show();
+    await screen.findByRole("region", { name: "Fieldwork scans" });
+    await waitFor(() => expect(events.open()).toBe(true));
+    await act(async () => events.push("library.state", { open: false }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Fieldwork scans" })).toBeNull());
+    expect(screen.getByText("No library is open. Open one from the library to see its watched folders.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add a folder…" })).toBeNull();
+    // Opened again (its numbers start below what was shown): read afresh, and shown.
+    await act(async () => events.push("library.state", { open: true, libraryId: "lib-1", name: "Thesis library", mode: "read-write" }));
+    expect(await screen.findByRole("region", { name: "Reopened" })).toBeTruthy();
+    expect(gets).toBe(2);
+    // Another library opened in its place: the same.
+    await act(async () => events.push("library.state", { open: true, libraryId: "lib-2", name: "Grant 2025", mode: "read-write" }));
+    expect(await screen.findByRole("region", { name: "Other library" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Reopened" })).toBeNull();
+    // A state of the same open library reads nothing again.
+    await act(async () => events.push("library.state", { open: true, libraryId: "lib-2", name: "Grant 2025", mode: "read-write" }));
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(gets).toBe(3);
+  });
+
   it("R241 (b): an event that takes away the busy Try again moves focus to the folder's heading, not the page", async () => {
     useService([folder({ state: "unreachable", reason: "The folder cannot be found." })]);
     const user = userEvent.setup();

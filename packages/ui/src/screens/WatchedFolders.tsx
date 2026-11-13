@@ -68,6 +68,7 @@ export const WATCH_TEXT = {
   nothingToDownload: "There is nothing to download in this folder at the moment.",
   /** R221 b: files of unknown size are never fetched under an agreement. */
   sizesUnknown: "The size of these files is not known until they are downloaded, so they are left for you to download yourself.",
+  noLibrary: "No library is open. Open one from the library to see its watched folders.",
   listChanged: "The list changed while it was being read, so files may have moved between pages. Hide the list and show it again to read it afresh.",
 } as const;
 
@@ -197,6 +198,15 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   const [live, setLive] = useState<Said>({ text: "", n: 0 });
   const [dialogLive, setDialogLive] = useState<Said>({ text: "", n: 0 });
   const [focusFolders, setFocusFolders] = useState(0);
+  /** The library was closed while the screen was shown (N3). */
+  const [noLibrary, setNoLibraryState] = useState(false);
+  const noLibraryRef = useRef(false);
+  const setNoLibrary = (v: boolean) => {
+    noLibraryRef.current = v;
+    setNoLibraryState(v);
+  };
+  /** The open library, as the service last named it: another one opening in its place is a fresh start. */
+  const libraryId = useRef<string | undefined>(undefined);
 
   const foldersRef = useRef<WatchedFolderSummary[]>([]);
   const alive = useRef(true);
@@ -289,6 +299,28 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     setFolders(undefined);
   }, [setDialog, setLists]);
 
+  /**
+   * The library closed or another one opened (N3): what was shown, the numbers remembered and every answer still out
+   * belong to the library that went, so all are dropped.
+   */
+  const forgetLibrary = useCallback(() => {
+    gen.current++;
+    relisting.current = null;
+    gone.current.clear();
+    acting.current.clear();
+    busyRef.current = {};
+    setBusy({});
+    setErrors({});
+    setChooseAgain({});
+    setDialog(null);
+    setOpenSource(null);
+    setLists(() => ({}));
+    setLoadError(undefined);
+    setLocked(false);
+    foldersRef.current = [];
+    setFolders(undefined);
+  }, [setDialog, setLists]);
+
   /** The list (at load, after a lost stream, an unlock, a 409 or a 404); one at a time, a second ask joins it. */
   const relist = useCallback(async (): Promise<void> => {
     if (relisting.current) {
@@ -337,7 +369,11 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       () => {},
     );
     lib.libraries.list().then(
-      (r) => alive.current && r.current && setReadOnly(r.current.mode !== "read-write"),
+      (r) => {
+        if (!alive.current || !r.current) return;
+        libraryId.current ??= r.current.libraryId;
+        setReadOnly(r.current.mode !== "read-write");
+      },
       () => {},
     );
     refreshCollections();
@@ -359,7 +395,25 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
           if (!alive.current) return;
           if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
             const d = ev.data as LibraryState;
+            if (d.open === false) {
+              // Closed (N3): nothing of it stays on screen.
+              libraryId.current = undefined;
+              forgetLibrary();
+              setNoLibrary(true);
+              continue;
+            }
             if (d.mode) setReadOnly(d.mode !== "read-write");
+            if (d.libraryId && d.libraryId !== libraryId.current) {
+              // Opened again, or another library in its place: read afresh (its numbers may start below ours).
+              const fresh = libraryId.current !== undefined || noLibraryRef.current;
+              libraryId.current = d.libraryId;
+              if (fresh) {
+                forgetLibrary();
+                setNoLibrary(false);
+                void relist();
+                refreshCollections();
+              }
+            }
             continue;
           }
           const e = watchStatusOf(ev, projectId);
@@ -375,7 +429,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       ac.abort();
       clearTimeout(retry);
     };
-  }, [client, projectId, take, relist]);
+  }, [client, projectId, take, relist, forgetLibrary, refreshCollections]);
 
   useEffect(() => {
     if (focusFolders > 0) foldersHeading.current?.focus();
@@ -684,6 +738,15 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       )}
     </>
   );
+
+  if (noLibrary) {
+    return (
+      <main className="ao-page ao-watch" aria-labelledby={`${ids}-h`}>
+        <h1 id={`${ids}-h`}>Watched folders</h1>
+        <p role="status">{WATCH_TEXT.noLibrary}</p>
+      </main>
+    );
+  }
 
   if (locked) {
     return (

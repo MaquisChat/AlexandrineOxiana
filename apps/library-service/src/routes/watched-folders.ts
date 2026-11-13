@@ -385,16 +385,15 @@ async function choicesOf(s: Session, projectId: string, wid: string): Promise<Wa
 }
 
 /**
- * The order of readings (R241): one counter per open library (its session), drawn when a summary or a list is built,
- * BEFORE anything is read for it. A change of a folder is followed by a reading drawn after it (the act's answer, or
- * the `watch.status` its push causes, which reads the folder when it is sent), so the highest number a reader holds
- * for a folder is never an older reading than any it has seen.
+ * The order of readings (R241): one counter for the life of the service process (N1: a library closed and opened again
+ * goes on from it, so a page that outlives a reopen never holds a higher number than what comes next), drawn when a
+ * summary or a list is built, BEFORE anything is read for it. A change of a folder is followed by a reading drawn after
+ * it (the act's answer, or the `watch.status` its push causes, which reads the folder when it is sent), so the highest
+ * number a reader holds for a folder is never an older reading than any it has seen.
  */
-const seqs = new WeakMap<Session, { n: number }>();
-export function nextSeq(s: Session): number {
-  let c = seqs.get(s);
-  if (!c) seqs.set(s, (c = { n: 0 }));
-  return ++c.n;
+let seqCounter = 0;
+export function nextSeq(_s: Session): number {
+  return ++seqCounter;
 }
 
 /** A folder's summary under the number `seq` (drawn before `rec` and `collections` were read), from the engine's status (`st`: given, or the watch's now). */

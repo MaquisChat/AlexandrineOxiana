@@ -1161,6 +1161,22 @@ describe("R241 (a): one order for summaries, from the service", () => {
     for (const e of events.filter((x) => x.type === "watch.status")) answers.push(JSON.stringify(e.data.folder));
   }, 60_000);
 
+  it("N1: the number only grows for the life of the service: a library closed and opened again goes on from it", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const dir = await folder("Again");
+    const added = await add(pid, dir);
+    const list1 = await call({ url: `/projects/${pid}/watched-folders` });
+    const highest = Math.max(added.json.seq, list1.json.seq);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const list2 = await call({ url: `/projects/${pid}/watched-folders` });
+    expect(list2.status, list2.body).toBe(200);
+    expect(list2.json.seq).toBeGreaterThan(highest);
+    for (const f of list2.json.folders as WatchedFolderSummary[]) expect(f.seq).toBeGreaterThan(highest);
+  }, 30_000);
+
   it("an event is a reading of the folder when it is sent, never of an earlier push: after a pause, every later event says paused", async () => {
     await start();
     await openNewLibrary();
