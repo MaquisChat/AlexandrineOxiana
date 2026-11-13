@@ -574,9 +574,9 @@ Update after every task; commit and push.
 | 73 The audit says which field was confirmed (D20) | complete | 0e890cd (merge) | R191; reviewed with 18 probes; D20 closed |
 | R1 Reader: anchor, annotation and colour model | complete (on the reader branch) | e188c3c (merge) | reviewed with probes over one fix round (R195; plan Amendments A1–A4); verification clean |
 | R5 Reader: ranged PDF route and the client's range reader | complete (on the reader branch) | 4f4c7c6 (merge) | reviewed with probes over one fix round; end-to-end in both browsers; for the owner's Mac check: the Range preflight in the macOS web view |
-| R2 Reader: the Zotero import keeps the sort index; re-import respects changes | approved and verified with R3; merge waits for GitHub's run on R5 | f784336 (worktree branch) | reviewed with probes over two rounds (R196, R197) |
-| R3 Reader: governed annotation operations in the library | approved and verified with R2; merge waits for GitHub's run on R5 | 7295e2b (worktree branch) | reviewed with twelve probes; a recolour to the same colour is no change (A5) |
-| R4 Reader: annotation routes in the service | approved; verification after R2 and R3 are merged | cd0edc6 (worktree branch) | reviewed with probes over one fix round and a last round read by the controller (R198) |
+| R2 Reader: the Zotero import keeps the sort index; re-import respects changes | complete (on the reader branch) | cd2af4d (merge) | reviewed with probes over two rounds (R196, R197); verified with R3 |
+| R3 Reader: governed annotation operations in the library | complete (on the reader branch) | 0062c5b (merge) | reviewed with twelve probes; verified with R2 |
+| R4 Reader: annotation routes in the service | approved; verification running | cd0edc6 (worktree branch) | reviewed with probes over one fix round and a last round read by the controller (R198) |
 | R6 Reader: pdf.js in the interface, bundled, under the policy | fix round 1 | 6f64f07 (worktree branch) | review: the worker must be created by the app (the shell's origin reads as "null"); a failure channel; no GPL fonts; notices per asset (R199, R200; plan Amendment A6) |
 | R7–R13 Reader: the remaining tasks | not started | | order: R7 after R6, then R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
