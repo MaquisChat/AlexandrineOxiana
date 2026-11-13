@@ -24,7 +24,9 @@ import { StatusBanner, bannersFor, useNoticeDismiss, volumeOf } from "../compone
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
-import { PATHS } from "../navigation";
+import { navigate as goTo, PATHS } from "../navigation";
+import { clearPendingFind, guardPendingFind, setPendingFind } from "../reader/readerHandoff";
+import { readerHref } from "../routes/reader";
 import { madeSince, NewProject, type UnresolvedCreate } from "./NewProject";
 import { NewRecoveryCode } from "./NewRecoveryCode";
 import { SourceDetail } from "./SourceDetail";
@@ -163,6 +165,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
    * sources, open source and attach outcomes; UnlockProject shows in their place.
    */
   const forgetDecrypted = useCallback(() => {
+    // A search's words waiting for the reader are not kept past a lock (Task R12).
+    clearPendingFind();
     staleMore();
     setCollections([]);
     setTags({ tags: [], workspaceTags: [] });
@@ -216,6 +220,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           if (e.type === "library.state" && e.data && typeof e.data === "object") {
             const d = e.data as LibraryState;
             if (d.open === false) {
+              clearPendingFind();
               // A new project's recovery code on screen is never taken away (R134 I2): the dialog
               // says the library closed, and the library is left once the code is confirmed.
               if (holdClose.current) setClosedUnder(true);
@@ -331,11 +336,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     staleMore();
     if (!projectId || locked) return;
     const ac = new AbortController();
+    const asked = filter.text;
     api.sources
       .search(projectId, { ...query(), limit: SOURCE_PAGE_SIZE }, { signal: ac.signal })
       .then((r) => {
         if (ac.signal.aborted) return;
         setSources(r);
+        setSearched(asked);
         setSourcesError(undefined); // only the sources' own error: other errors stay until dismissed or replaced
       })
       .catch((err: unknown) => {
@@ -344,6 +351,18 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     return () => ac.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, projectId, locked, filter, reload]);
+
+  // ---- Task R12: "Show in the reader" for a hit in an annotation (no request per row: a row does not say whether it has a PDF) ----
+  /** The text of the search whose answer is shown (what the reader is handed). */
+  const [searched, setSearched] = useState("");
+  /** "Show in the reader": the words searched for go to the reader in memory; the address carries ids only. */
+  const showInReader = (sourceId: string) => {
+    if (!projectId) return;
+    setPendingFind(projectId, sourceId, searched);
+    // Watched while the reader opens: a lock, a close or a switch on the way drops them.
+    guardPendingFind((o) => api.events(o));
+    (navigate ?? goTo)(readerHref(projectId, sourceId));
+  };
 
   // ---- how many entries wait in the project's review queue (Task 67): read with the list, never for a locked project ----
   const [waiting, setWaiting] = useState<{ projectId: string; total: number } | undefined>();
@@ -424,6 +443,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       }
       if (id === projectIdRef.current) return;
       projectIdRef.current = id;
+      clearPendingFind();
       staleMore();
       setProjectId(id);
       setCollections([]);
@@ -821,6 +841,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                   rebuilding={!!index && index.done < index.total}
                   reviewHref={readOnly ? undefined : (sid) => reviewQueueHref(project.id, sid)}
                   onFollow={follow}
+                  onShowInReader={showInReader}
                 />
                 {sources.items.length < sources.total && (
                   <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>

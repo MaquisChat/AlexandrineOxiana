@@ -4,7 +4,11 @@
  * sources have no title until it is unlocked. A text search that found a source only through its
  * annotations says so ("Found in an annotation", Task 58). "Needs review" leads to the project's
  * review queue at that source's entries (Task 67) when the screen gives the way there. A source a
- * later capture found gone from its platform says so (Task 69, AvailabilityMark).
+ * later capture found gone from its platform says so (Task 69, AvailabilityMark). A hit in an
+ * annotation also offers "Show in the reader" (Task R12): a button named for its row. The row says
+ * whether its source has a readable PDF (`hasReadablePdf`, from the light read, R222); the button is
+ * offered unless it says there is none (an older answer without the field: cannot tell, offered; the
+ * reader says "No PDF" for such a source).
  */
 import type { MouseEvent } from "react";
 import type { SourceRow } from "../api/library";
@@ -49,9 +53,11 @@ export interface SourceTableProps {
   reviewHref?: ((sourceId: string) => string) | undefined;
   /** Follows that link in the app. */
   onFollow?: ((e: MouseEvent, href: string) => void) | undefined;
+  /** Task R12: "Show in the reader" was pressed for this source. */
+  onShowInReader?: ((sourceId: string) => void) | undefined;
 }
 
-export function SourceTable({ items, total, onOpen, selectedId, incomplete, limited, rebuilding, reviewHref, onFollow }: SourceTableProps) {
+export function SourceTable({ items, total, onOpen, selectedId, incomplete, limited, rebuilding, reviewHref, onFollow, onShowInReader }: SourceTableProps) {
   return (
     <div className="ao-sources">
       <p className="ao-muted" aria-live="polite">
@@ -107,6 +113,14 @@ export function SourceTable({ items, total, onOpen, selectedId, incomplete, limi
                   </>
                 )}
                 {s.matchedIn === "annotation" && <span className="ao-muted"> Found in an annotation</span>}
+                {s.matchedIn === "annotation" && !s.locked && s.hasReadablePdf !== false && onShowInReader && (
+                  <>
+                    {" "}
+                    <button type="button" aria-label={`Show in the reader: ${s.title || "Untitled"}`} onClick={() => onShowInReader(s.id)}>
+                      Show in the reader
+                    </button>
+                  </>
+                )}
                 {s.annotationsPartial && <span className="ao-muted"> (Only part of its annotations is searchable)</span>}
               </td>
               <td>

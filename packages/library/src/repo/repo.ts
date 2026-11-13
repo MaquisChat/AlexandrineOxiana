@@ -66,6 +66,7 @@ import {
   deleteSource,
   getSource,
   getSourceRecord,
+  getSourceRecordWithAssets,
   listSourceIds,
   relinkLinkedAsset as relinkLinkedAssetIn,
   updateSource,
@@ -250,6 +251,10 @@ export class Repo {
   /** The source's own record (source.json alone; no annotations, no integrity check: R186). */
   getSourceRecord(projectId: string, id: string): Promise<Source> {
     return getSourceRecord(this.core, projectId, id);
+  }
+  /** The light read with the assets `source.json` holds (no annotations, no integrity check: R186, R222). */
+  getSourceRecordWithAssets(projectId: string, id: string): Promise<{ source: Source; assets: Asset[] }> {
+    return getSourceRecordWithAssets(this.core, projectId, id);
   }
   listSourceIds(projectId: string): string[] {
     return listSourceIds(this.core, projectId);
