@@ -55,18 +55,57 @@ describe("the undo question", () => {
 
   it("is unchanged when sources were created, merged or updated", () => {
     expect(undoQuestion(report({}, { created: 1284, merged: 3 }))).toBe("Remove 1,284 imported sources and restore 3 merged sources?");
-    expect(undoQuestion(report({}, { updated: 1 }))).toBe("Remove 0 imported sources and revert 1 updated source?");
+    expect(undoQuestion(report({}, { updated: 1 }))).toBe("Revert 1 updated source?");
   });
 });
 
 describe("gone from Zotero, and back (Z5, R224)", () => {
   it("the undo question counts marked and returned sources as sources it will change", () => {
-    expect(undoQuestion(report({}, { goneInZotero: 1, goneInZoteroBin: 1 }))).toBe("Remove 0 imported sources and take the Zotero mark off 1 source?");
-    expect(undoQuestion(report({}, { goneInZotero: 3 }))).toBe("Remove 0 imported sources and take the Zotero mark off 3 sources?");
+    expect(undoQuestion(report({}, { goneInZotero: 1, goneInZoteroBin: 1 }))).toBe("Take the Zotero mark off 1 source?");
+    expect(undoQuestion(report({}, { goneInZotero: 3 }))).toBe("Take the Zotero mark off 3 sources?");
     // A bare back: undo puts the mark back. A back that also changed the item is an updated source (counted once).
-    expect(undoQuestion(report({}, { backInZotero: 2, backInZoteroUpdated: 1, updated: 1 }))).toBe("Remove 0 imported sources, revert 1 updated source and mark 1 source as gone from Zotero again?");
+    expect(undoQuestion(report({}, { backInZotero: 2, backInZoteroUpdated: 1, updated: 1 }))).toBe("Revert 1 updated source and mark 1 source as gone from Zotero again?");
     // Already marked earlier, or gone with no source of its own here: nothing to undo for those.
     expect(undoQuestion(report({}, { goneAlready: 4, goneNotMarked: 2 }))).toBe("This import added and changed no sources. Undo it anyway?");
+  });
+
+  it("the undo question never names a zero, and reads as a sentence for every combination (R224, last round)", () => {
+    const combos: Array<[Partial<ImportReport["counts"]>, string]> = [
+      [{ created: 2, goneInZotero: 1 }, "Remove 2 imported sources and take the Zotero mark off 1 source?"],
+      [{ merged: 1, backInZotero: 3 }, "Restore 1 merged source and mark 3 sources as gone from Zotero again?"],
+      [{ created: 1, merged: 2, updated: 3, goneInZotero: 4, backInZotero: 5 }, "Remove 1 imported source, restore 2 merged sources, revert 3 updated sources, take the Zotero mark off 4 sources and mark 5 sources as gone from Zotero again?"],
+      [{ backInZotero: 1, backInZoteroUpdated: 1, updated: 1 }, "Revert 1 updated source?"],
+    ];
+    for (const [counts, q] of combos) {
+      const text = undoQuestion(report({}, counts));
+      expect(text).toBe(q);
+      expect(text).not.toMatch(/\b0 /u);
+    }
+  });
+
+  it("the undo's result line says what was done in the question's terms, leaving out zeros", async () => {
+    const r = report({}, { goneInZotero: 1, backInZotero: 1 });
+    const api = { report: async () => r, undo: async () => ({ removedSources: 0, revertedMerges: 2, reverted: { merged: 0, updated: 0, unmarked: 1, remarked: 1 }, kept: [] }) } as unknown as ImportApi;
+    render(<StepReport api={api} projectId="p" batchId="b" />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Undo import" }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Undo import" }));
+    expect(await screen.findByText("Took the Zotero mark off 1 source and marked 1 source as gone from Zotero again.")).toBeTruthy();
+    expect(screen.queryByText(/merged or updated/)).toBeNull();
+  });
+
+  it("the undo's result line: removed and reverted, and nothing to change", async () => {
+    const { undoneText } = await import("./StepReport");
+    expect(undoneText({ removedSources: 5, revertedMerges: 1, reverted: { merged: 0, updated: 1, unmarked: 0, remarked: 0 }, kept: [] })).toBe("Removed 5 imported sources and reverted 1 updated source.");
+    expect(undoneText({ removedSources: 0, revertedMerges: 0, reverted: { merged: 0, updated: 0, unmarked: 0, remarked: 0 }, kept: [] })).toBe("No source needed to be changed.");
+    // An older service, without the detail: the sentence as before.
+    expect(undoneText({ removedSources: 1284, revertedMerges: 3, kept: [] })).toBe("Removed 1,284 sources and restored 3 sources that had been merged or updated.");
+  });
+
+  it("the table has the row for sources still gone from Zotero, only when not zero", async () => {
+    show(report({}, { goneAlready: 2 }));
+    const table = await screen.findByRole("table", { name: "Items by outcome" });
+    expect(within(table).getByRole("rowheader", { name: "Still gone from Zotero (marked earlier)" }).closest("tr")!.textContent).toContain("2");
   });
 
   it("the report table has the three rows, only when not zero", async () => {

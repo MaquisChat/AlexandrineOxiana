@@ -4,7 +4,7 @@
  * library's list rows and the source view carry that availability so the interface can show it.
  * The source is marked here the way profile capture marks it (the same repo call and values).
  */
-import { appendFile, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -112,6 +112,13 @@ describe("availability in the list rows and the source view (Task 69, D17)", () 
     const binned = await call({ url: `/projects/${pid}/sources?text=Gone` });
     expect(binned.json.items[0].availability).toEqual({ status: "unavailable-on-platform", zotero: "bin", firstNoticedAt: NOTICED });
     expect(repo.integrityWarnings).toEqual([]);
+    // The read-only library's path (rows from the files, R12) carries it too.
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const now = new Date().toISOString();
+    await writeFile(join(tmp, "Lib", ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).json.mode).toBe("read-only");
+    const ro = await call({ url: `/projects/${pid}/sources` });
+    expect(ro.json.items.find((i: { id: string }) => i.id === gone).availability).toEqual({ status: "unavailable-on-platform", zotero: "bin", firstNoticedAt: NOTICED });
   });
 
   it("a text search's rows carry it too", async () => {

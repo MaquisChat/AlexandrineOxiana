@@ -394,6 +394,7 @@ describe("gone from Zotero, and back (Z5)", () => {
     expect((await sourceOf(p, key)).source.availability.zotero).toBe("deleted");
     const undone = await bulk().undoBatch(p.id, batchId);
     expect(undone.kept).toEqual([]);
+    expect(undone.reverted).toEqual({ merged: 0, updated: 0, unmarked: 1, remarked: 0 });
     expect(await folderBytes(sf.source.folder)).toEqual(before);
     expect(zoteroWebSince(repo, p.id, U)).toBeUndefined();
     expect((await auditEvents(p)).some((e) => (e.details as { op?: string } | undefined)?.op === "project.import-settings.zotero-web.reset")).toBe(true);
@@ -416,7 +417,7 @@ describe("gone from Zotero, and back (Z5)", () => {
     const back = await run(p);
     expect((await sourceOf(p, key)).source.availability).toEqual({ status: "available" });
     const res = await bulk().undoBatch(p.id, back.batchId);
-    expect(res).toMatchObject({ kept: [], libraryVersionReset: true });
+    expect(res).toMatchObject({ kept: [], libraryVersionReset: true, reverted: { merged: 0, updated: 0, unmarked: 0, remarked: 1 } });
     expect(await folderBytes(sf.source.folder)).toEqual(marked);
   });
 
