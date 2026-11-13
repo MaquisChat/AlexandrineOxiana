@@ -7,7 +7,9 @@
  *
  * A path from a picker or a drop is only ever handed to the component's own callback, which sends
  * it to the service; the service decides what may be read. The page has no file-system access of
- * its own: the shell grants it only "open a picker" and "listen for drag-and-drop events".
+ * its own: the shell grants it only "open a picker", "listen for drag-and-drop events" and "choose a
+ * folder to watch" (`pickWatchFolder`, R207), which gives the page a grant id and a folder name,
+ * never a path.
  *
  * Drops: the shell's web view reports drops for the whole window, with absolute paths and the
  * pointer position in physical pixels. The bridge finds the registered drop target under that
@@ -30,6 +32,39 @@ export interface DesktopShell {
   pickFiles(title: string, multiple: boolean): Promise<string[]>;
   /** Makes `el` receive the paths of files dropped on it. Returns the function that undoes it. */
   dropTarget(el: HTMLElement, handlers: DropHandlers): () => void;
+  /**
+   * The native folder chooser for a watched folder (Task W6, R207): the shell hands the chosen
+   * folder to the service as a single-use grant and gives the page only the grant's id and the
+   * folder's last name. Null when cancelled or when the folder could not be handed over. The name is
+   * outside text: it is shown only through `UserText`.
+   */
+  pickWatchFolder(title: string): Promise<{ grantId: string; name: string } | null>;
+}
+
+/** The longest title the page sends with a folder chooser, in characters (the shell bounds it too). */
+const TITLE_MAX = 200;
+const GRANT_ID = /^[0-9a-f]{32}$/;
+
+async function invokePickWatchFolder(title: string): Promise<{ grantId: string; name: string } | null> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    // Cut by characters (code points), never inside one: half an emoji cannot be sent to the shell.
+    const r: unknown = await invoke("pick_watch_folder", { title: Array.from(String(title)).slice(0, TITLE_MAX).join("") });
+    if (typeof r !== "object" || r === null || Array.isArray(r)) return null;
+    const { grantId, name } = r as { grantId?: unknown; name?: unknown };
+    if (typeof grantId !== "string" || !GRANT_ID.test(grantId) || typeof name !== "string" || name === "") return null;
+    return { grantId, name };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The watched-folder chooser, or null without throwing outside the shell (a plain browser has no
+ * chooser that can hand a folder to the service; the screen says so, Task W8).
+ */
+export async function pickWatchFolder(title: string): Promise<{ grantId: string; name: string } | null> {
+  return inDesktopShell() ? invokePickWatchFolder(title) : null;
 }
 
 type DragDropPayload =
@@ -116,6 +151,7 @@ function createShell(): DesktopShell {
         targets.delete(el);
       };
     },
+    pickWatchFolder: invokePickWatchFolder,
   };
 }
 

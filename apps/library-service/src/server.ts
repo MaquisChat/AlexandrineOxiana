@@ -12,6 +12,7 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { appConfigDir, deviceDeps, deviceNoticesIdle, type Deps, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
 import { Pairing, SHELL_ORIGINS, bearerOf, hostAllowed, isExtensionOrigin, queryCarriesToken, sameSecret, type PairingOptions } from "./auth.js";
 import { ApiError, errorBody, toApiError } from "./errors.js";
+import { FolderGrants } from "./folder-grants.js";
 import { ServiceState, defaultWorkerProvider, type WorkerProvider } from "./state.js";
 import { registerAnnotations } from "./routes/annotations.js";
 import { registerAppearance } from "./routes/appearance.js";
@@ -72,12 +73,16 @@ export interface ServiceOptions {
   readerPdfMaxBytes?: number;
   /** Test seam: runs on the document route after the file is opened, right before its first read. */
   documentBeforeRead?: () => Promise<void>;
+  /** The grants read from standard input after the token (main.ts; R207). Default: a new, empty store. */
+  folderGrants?: FolderGrants;
 }
 
 export interface LibraryService {
   app: FastifyInstance;
   state: ServiceState;
   pairing: Pairing;
+  /** Folders handed over by the shell's folder chooser, not yet used (R207; folder-grants.ts). */
+  folderGrants: FolderGrants;
   /** Listens on 127.0.0.1 (only); returns the port. */
   listen(port?: number): Promise<number>;
   /** Graceful shutdown: batches cancelled, library closed (lock released), worker and watchers stopped. */
@@ -149,6 +154,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);
+  const folderGrants = opts.folderGrants ?? new FolderGrants();
   await pairing.load();
   let port: number | undefined;
   /** Set when shutdown starts: new requests are refused before the library is closed (R98). */
@@ -309,6 +315,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     app,
     state,
     pairing,
+    folderGrants,
     async listen(p = 0) {
       await app.listen({ host: "127.0.0.1", port: p });
       const addr = app.server.address();
@@ -321,6 +328,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
       state.shuttingDown = true;
       // Every media ticket ends as the service stops (R135 2), and with them their streams.
       state.media.revokeAll();
+      // So do the folder choices not yet used (R207): their paths are forgotten.
+      folderGrants.clear();
       closing ??= (async () => {
         // Requests are refused from here on; those already in progress finish (a library being
         // opened is then refused and released); then running work is paused and the library closed.
