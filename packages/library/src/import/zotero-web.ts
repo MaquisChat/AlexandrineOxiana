@@ -26,8 +26,10 @@
  * `{ gone: "bin" }`. An incremental run yields each key of `/deleted?since=` that is known here
  * (ScanContext.knownIds, this library only) as `{ gone: "deleted" }`; child keys are counted only. A
  * full run yields a known item as `{ gone: "deleted" }` by absence only when the scan was complete
- * AND the key is missing from the library's complete key list, read in one listing at the version
- * the scan read at. Gone items are yielded last, after a check that the key may still read the
+ * AND the key is missing from the library's complete key list, whole by its own evidence (A6:
+ * Total-Results, exactly that many keys, every key the scan saw), at whatever version. If that list
+ * cannot be had whole in 3 tries, the full run is not finished: nobody is gone by absence and the
+ * version is not recorded. Gone items are yielded last, after a check that the key may still read the
  * library; any failure first yields none. ScanContext.skip lets the engine pass an item by before
  * anything under it is fetched.
  *
@@ -57,7 +59,8 @@
  *
  * What holds `since` back (the next run asks for the same changes again; A4): a failed item (the scan's
  * own failure included: unreachable, a 429 or 5xx outlasting its retries, a page cut for good, refused
- * key, library gone, the restart limit), a scan that was not complete (above), a download that failed
+ * key, library gone, the restart limit), a scan that was not complete (above; on a full run with known
+ * items unseen, a key list that could not be had whole), a download that failed
  * in a way a later run may fix (5xx, a connection cut, no disk space; also in a part before a resume).
  * What does not: a Backoff or Retry-After waited out, a refused redirect host, a file Zotero says it
  * does not have (404), a checksum that never matched in 3 tries, a key that may not read files, a file
@@ -292,6 +295,12 @@ class ZoteroApi {
   private async waitTurn(): Promise<void> {
     const wait = this.nextAt - Date.now();
     if (wait > 0) await this.sleep(wait);
+    this.signal.throwIfAborted();
+  }
+
+  /** Waits as a retry does after `attempt` failures (1 s, 2 s, 4 s …, capped). */
+  async pause(attempt: number): Promise<void> {
+    await this.sleep(this.retryWait(attempt, undefined));
     this.signal.throwIfAborted();
   }
 
@@ -1076,7 +1085,7 @@ async function* scanWeb(
     if (unseen.length) {
       let keys: Set<string> | undefined;
       try {
-        keys = await completeKeyList(api, prefix);
+        keys = await completeKeyList(api, prefix, tree);
       } catch (err) {
         if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
         // The key may no longer read the library: the run says so. Any other failure: none gone by absence this run.
@@ -1086,7 +1095,13 @@ async function* scanWeb(
         }
         keys = undefined;
       }
-      if (keys) for (const k of unseen) if (!keys.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
+      if (keys) {
+        for (const k of unseen) if (!keys.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
+      } else {
+        // No whole key list: this full run is not finished (A6). Nobody is gone by absence and the version is not
+        // recorded, so the next run is full again and makes the check again.
+        api.lossy = true;
+      }
     }
   }
   for (const k of [...gone.keys()]) if (skip(`zotero:${k}`)) gone.delete(k);
@@ -1116,21 +1131,43 @@ async function* scanWeb(
   result.completed = !api.lossy;
 }
 
+/** Tries of the key list before a full run gives up on gone-by-absence (A6). */
+const KEY_LIST_TRIES = 3;
+
 /**
- * The library's complete key list, bin included, in ONE listing (`format=versions`, no limit), read at
- * the version the scan read at (A5). Throws when it cannot be had whole: an error, another version, a
- * body that is not the object it should be, or a count that does not match Total-Results.
+ * The library's complete key list, bin included, in one listing (`format=versions`, no limit), whole
+ * by its own evidence (A6): it carries Total-Results, holds exactly that many valid keys, and holds
+ * every key this scan saw (live or in the bin). It need not be at the version the scan read at: a key
+ * absent from a whole list is deleted as of that list. Asked up to KEY_LIST_TRIES times with the usual
+ * waits; undefined when it cannot be had whole. A refusal (403) or a library gone (404) is thrown.
  */
-async function completeKeyList(api: ZoteroApi, prefix: string): Promise<Set<string> | undefined> {
-  const { body, headers } = await api.json(`${prefix}/items`, { format: "versions", ...WITH_BIN });
-  const v = libraryVersionOf(headers);
-  if (api.scanVersion === undefined || v !== api.scanVersion) return undefined;
+async function completeKeyList(api: ZoteroApi, prefix: string, seen: Tree): Promise<Set<string> | undefined> {
+  for (let attempt = 0; attempt < KEY_LIST_TRIES; attempt++) {
+    if (attempt) await api.pause(attempt - 1);
+    let got: { body: unknown; headers: Headers };
+    try {
+      got = await api.json(`${prefix}/items`, { format: "versions", ...WITH_BIN });
+    } catch (err) {
+      if (err instanceof ZoteroWebError && (err.reason === ZOTERO_WEB_REASONS.keyRefused || err.reason === ZOTERO_WEB_REASONS.notFound)) throw err;
+      if (!(err instanceof ZoteroWebError)) throw err;
+      continue;
+    }
+    const keys = wholeKeys(got.body, got.headers, seen);
+    if (keys) return keys;
+  }
+  return undefined;
+}
+
+function wholeKeys(body: unknown, headers: Headers, seen: Tree): Set<string> | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  const keys = Object.keys(body as Record<string, unknown>);
   const total = header(headers, "total-results");
-  if (total !== undefined && Number(total) !== keys.length) return undefined;
-  if (keys.some((k) => !KEY.test(k))) return undefined;
-  return new Set(keys);
+  if (total === undefined || !/^\d{1,9}$/u.test(total.trim())) return undefined;
+  const keys = Object.keys(body as Record<string, unknown>);
+  if (Number(total) !== keys.length || keys.some((k) => !KEY.test(k))) return undefined;
+  const set = new Set(keys);
+  for (const k of seen.byKey.keys()) if (!set.has(k)) return undefined;
+  for (const k of seen.trashed.keys()) if (!set.has(k)) return undefined;
+  return set;
 }
 
 /** The item keys of this library (`<ref>/<key>`) among the ids the engine knows; ids of any other library are left out. */

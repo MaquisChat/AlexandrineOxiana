@@ -991,15 +991,17 @@ export class ServiceState {
   resumeBatches(list: Array<{ projectId: string; batchId: string }>): void {
     const s = this.session;
     const bulk = s?.bulk;
-    if (!s || !bulk) return;
+    const index = s?.index;
+    // Bulk Import exists only with an index (activate), so a Web batch never falls back to the generic resume (M10).
+    if (!s || !bulk || !index) return;
     for (const b of list) {
       if (!s.repo.listProjects().some((p) => p.id === b.projectId)) continue;
       this.startWork("resume-import", async () => {
         // A Zotero Web batch finishes as every Web resume does: it records the library version (Z2, A5).
         const kind = (await bulk.listBatches(b.projectId)).find((x) => x.batchId === b.batchId)?.kind;
         const h =
-          kind === "zotero-web" && s.index
-            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, b.projectId, b.batchId)
+          kind === "zotero-web"
+            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index, proxies: proxyQueueFor(s.repo) }, b.projectId, b.batchId)
             : await bulk.resumeBatch(b.projectId, b.batchId);
         this.followBatch(s, b.projectId, h);
       });
