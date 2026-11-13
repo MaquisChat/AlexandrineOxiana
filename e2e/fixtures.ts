@@ -375,7 +375,7 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
     AO_LOOKUP_FIXTURES: LOOKUP_FIXTURES,
     ...opts.env,
   });
-  const [cmd, ...args] = opts.command ?? [process.execPath, "--max-old-space-size=512", "--import", "tsx", "src/main.ts"];
+  const [cmd, ...args] = opts.command ?? [process.execPath, "--max-old-space-size=512", "scripts/dev.mjs"]; // 16 file threads, as the product runs (R233 M10)
   const child = spawn(cmd!, args, { cwd: SERVICE_DIR, env, stdio: ["pipe", "pipe", "pipe"] });
   opts.onSpawn?.(child);
   // The token is handed over on standard input, as the desktop shell will (R98). The pipe stays open;

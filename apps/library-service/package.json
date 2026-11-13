@@ -9,7 +9,7 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "start": "node --max-old-space-size=512 --import tsx src/main.ts",
+    "start": "node --max-old-space-size=512 scripts/dev.mjs",
     "build": "node scripts/build.mjs",
     "smoke": "node scripts/smoke.mjs"
   },

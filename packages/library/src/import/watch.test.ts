@@ -40,8 +40,10 @@ import {
   WATCH_RESCAN_MS,
   WATCH_STABILITY_MS,
   WATCH_STATUS_INTERVAL_MS,
+  FolderNotAnsweringError,
   WatchFileNotLocalError,
   addWatchedFolder,
+  folderCallOutstanding,
   bringInNewVersion,
   ignoredName,
   settleWatchedFile,
@@ -3080,4 +3082,260 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     expect(dl.calls).toEqual([]);
     expect(w.status().reason).toBe("Nothing is downloaded until you agree to a size. 1 file (10 bytes) are waiting for your word.");
   });
+});
+
+describe("W7 fix round (R233): stopping during a start, a collection learnt while running, containment", () => {
+  const FAST7 = { stabilityMs: 200, pollMs: 50, registerFlushMs: 100 } as const;
+  /** An attach that stores nothing and notes the collection each file was given. */
+  const collAttach = () => {
+    const seen = new Map<string, string | undefined>();
+    const a: Attach = { attachFiles: async (_p, ps, o) => ps.map((path) => (seen.set(path.split("/").at(-1)!, o?.collectionId), { path, outcome: "created" as const, sourceId: newId() })) };
+    return { seen, a };
+  };
+  const settles = (p: Promise<unknown>, ms = 3000) => Promise.race([p.then(() => "settled"), sleep(ms).then(() => "hangs")]);
+
+  for (const point of ["before the folder is claimed", "between the two claims", "after the start"] as const) {
+    it(`I1: a watch stopped ${point} holds no claim: the folder can be watched again at once`, async () => {
+      const p = await project();
+      const dir = join(tmp, `F${point.length}`);
+      await mkdir(dir);
+      let release: () => void = () => {};
+      const held = new Promise<void>((r) => (release = r));
+      let calls = 0;
+      const a = start(p, {
+        ...FAST7,
+        dir,
+        attach: quickAttach(),
+        ...(point === "between the two claims"
+          ? {
+              fs: {
+                realpath: async (q: string) => {
+                  if (calls++ === 0) await held;
+                  return realpath(q);
+                },
+              },
+            }
+          : {}),
+      });
+      if (point === "between the two claims") await until(() => calls > 0);
+      if (point === "after the start") await a.w.ready;
+      const stopping = a.w.stop();
+      release();
+      expect(await settles(stopping)).toBe("settled");
+      await a.w.ready;
+      const b = start(p, { ...FAST7, dir, attach: quickAttach() });
+      await b.w.ready;
+      // R234 I-A: a call the stop gave up is adopted until it settles (here at once, it was released): then watching.
+      await until(() => b.w.status().state === "watching", 5000);
+      expect(b.w.status()).toMatchObject({ state: "watching" });
+      expect(b.w.status().reason).toBeUndefined();
+    });
+  }
+
+  it("I1: a stop from outside while the start refuses itself settles (no stop waits for itself)", async () => {
+    const p = await project();
+    const dir = join(tmp, "Twice");
+    await mkdir(dir);
+    const a = start(p, { ...FAST7, dir, attach: quickAttach() });
+    await a.w.ready;
+    const b = start(p, { ...FAST7, dir, attach: quickAttach() });
+    expect(await settles(b.w.stop())).toBe("settled");
+    expect(await settles(b.w.ready)).toBe("settled");
+    expect(a.w.status().state).toBe("watching");
+  });
+
+  it("I3: a stuck watch learns a new collection and uses it once its call answers", async () => {
+    const p = await project();
+    const c1 = await repo.createCollection(p.id, "Old");
+    const c2 = await repo.createCollection(p.id, "New");
+    let holding = true;
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    const { seen, a } = collAttach();
+    const { w } = start(p, {
+      ...FAST7,
+      fsTimeoutMs: 300,
+      collectionId: c1.id,
+      attach: a,
+      fs: {
+        lstat: async (q: string) => {
+          if (holding && q.endsWith("hold.pdf")) await held;
+          return fsp.lstat(q, { bigint: true });
+        },
+      },
+    });
+    await w.ready;
+    await writeFile(join(inbox, "hold.pdf"), await buildPdf({ title: "Held", extra: "r233-i3a" }));
+    await until(() => w.status().state === "unreachable");
+    w.setCollection(c2.id);
+    holding = false;
+    release();
+    await until(() => seen.has("hold.pdf"), 20_000);
+    expect(seen.get("hold.pdf")).toBe(c2.id);
+  }, 40_000);
+
+  it("I3: during a download the status still says downloading; the file lands in the new collection", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = (await addWatchedFolder({ repo, lib }, p.id, inbox)).id;
+    const c1 = await repo.createCollection(p.id, "Old");
+    const c2 = await repo.createCollection(p.id, "New");
+    await sparse(join(inbox, "far.pdf"), 100);
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    const { seen, a } = collAttach();
+    const { w } = start(p, {
+      ...FAST7,
+      watchId: wid,
+      collectionId: c1.id,
+      attach: a,
+      fetchContent: async (q: string) => {
+        await held;
+        await writeFile(q, Buffer.alloc(100, 120));
+      },
+    });
+    await w.ready;
+    await until(() => w.status().counts.notDownloadedBytes === 100);
+    await setWatchChoices({ repo, lib }, p.id, wid, { notDownloaded: "download", confirmedBytes: 100 });
+    await w.refreshChoices();
+    await until(() => w.status().downloading !== undefined);
+    w.setCollection(c2.id);
+    expect(w.status()).toMatchObject({ state: "watching", downloading: { file: "far.pdf" } });
+    release();
+    await until(() => seen.has("far.pdf"), 20_000);
+    expect(seen.get("far.pdf")).toBe(c2.id);
+  }, 40_000);
+
+  it('I3: a new collection deleted meanwhile: the engine\'s own "no collection" behaviour', async () => {
+    const p = await project();
+    const c1 = await repo.createCollection(p.id, "Old");
+    const c3 = await repo.createCollection(p.id, "Gone soon");
+    const { w } = start(p, { ...FAST7, collectionId: c1.id });
+    await w.ready;
+    await repo.deleteCollection(p.id, c3.id);
+    w.setCollection(c3.id);
+    await until(() => w.status().reason === WATCH_REASONS.noCollection);
+    await writeFile(join(inbox, "late.pdf"), await buildPdf({ title: "After the collection went", extra: "r233-i3c" }));
+    await until(() => repo.listSourceIds(p.id).length === 1, 20_000);
+    expect((await repo.getSource(p.id, repo.listSourceIds(p.id)[0]!)).source.collectionIds).toEqual([]);
+    w.setCollection(undefined);
+    await until(() => w.status().reason === undefined);
+  }, 40_000);
+
+  it('M2: a name that starts with ".." is inside, not outside (the library check fails closed)', async () => {
+    const p = await project();
+    const inner = join(lib.root, "..inner");
+    await fsp.mkdir(inner);
+    await expect(addWatchedFolder({ repo, lib }, p.id, inner)).rejects.toThrow(WATCH_REASONS.library);
+    const w = start(p, { ...FAST7, dir: inner, attach: quickAttach() }).w;
+    await w.ready;
+    expect(w.status()).toMatchObject({ state: "stopped" });
+  });
+
+  it("M3: a stored folder that now leads elsewhere (replaced by a link) is not followed", async () => {
+    const p = await project();
+    const chosen = join(tmp, "Chosen");
+    const elsewhere = join(tmp, "Elsewhere");
+    await mkdir(elsewhere);
+    await writeFile(join(elsewhere, "x.pdf"), await buildPdf({ title: "Elsewhere", extra: "r233-m3" }));
+    await symlink(elsewhere, chosen);
+    const q = quickAttach();
+    const { w } = start(p, { ...FAST7, dir: chosen, attach: q });
+    await w.ready;
+    expect(w.status()).toMatchObject({ state: "stopped", reason: WATCH_REASONS.notWhereChosen });
+    expect(WATCH_REASONS.notWhereChosen).toBe("This folder is not where it was when you chose it. Choose it again.");
+    await sleep(500);
+    expect(q.paths).toEqual([]);
+  });
+});
+
+describe("W7 fix round 2 (R234): one call per folder however often it is restarted; the folder's checks under a limit", () => {
+  const FAST8 = { stabilityMs: 200, pollMs: 50, registerFlushMs: 100 } as const;
+
+  it("I-A: a stop gives up the call in flight at once: the next watch adopts it, issues nothing, and watches when it settles", async () => {
+    const p = await project();
+    const dir = join(tmp, "Hung");
+    await mkdir(dir);
+    let holding = false;
+    let inFlight = 0;
+    let most = 0;
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    const fsSeam = {
+      realpath: async (q: string) => {
+        if (holding) {
+          most = Math.max(most, ++inFlight);
+          try {
+            await held;
+          } finally {
+            inFlight--;
+          }
+        }
+        return realpath(q);
+      },
+    };
+    const first = start(p, { ...FAST8, dir, attach: quickAttach() });
+    await first.w.ready;
+    holding = true;
+    // A restart whose start then hangs on the folder.
+    await first.w.stop();
+    const second = start(p, { ...FAST8, dir, attach: quickAttach(), fs: fsSeam });
+    await until(() => inFlight === 1);
+    // Stopped well before the engine's own 30 s: the stop returns at once and the folder counts as not answering.
+    const t0 = Date.now();
+    await second.w.stop();
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(folderCallOutstanding(dir)).toBe(true);
+    for (let i = 0; i < 5; i++) {
+      const next = start(p, { ...FAST8, dir, attach: quickAttach(), fs: fsSeam });
+      await next.w.ready;
+      // Given up early (by the stop), not after the engine's full limit: said without "30 seconds" (R234 M-b).
+      expect(next.w.status()).toMatchObject({ state: "unreachable", reason: withProvider(WATCH_REASONS.notAnswering, null) });
+      expect(next.w.status().reason).not.toContain("30 seconds");
+      if (i < 4) await next.w.stop();
+    }
+    expect(most).toBe(1);
+    holding = false;
+    release();
+    const last = watches.at(-1)!;
+    await until(() => last.status().state === "watching", 10_000);
+    expect(folderCallOutstanding(dir)).toBe(false);
+    expect(most).toBe(1);
+  }, 30_000);
+
+  it("I-B: the folder's checks in an add run under a limit and write nothing; the governed write itself is awaited", async () => {
+    const p = await project();
+    const dir = join(tmp, "Slow");
+    await mkdir(dir);
+    const real = vi.spyOn(fsp, "realpath");
+    syncBuiltinESMExports();
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    real.mockImplementation((async (q: string) => {
+      if (q === dir) await held;
+      return (await import("node:fs")).realpathSync(q);
+    }) as never);
+    syncBuiltinESMExports();
+    await expect(addWatchedFolder({ repo, lib }, p.id, dir, {}, { timeoutMs: 200 })).rejects.toBeInstanceOf(FolderNotAnsweringError);
+    expect(folderCallOutstanding(dir)).toBe(true);
+    // Asked again while the call is out: refused at once, no second call.
+    const calls = real.mock.calls.filter((c) => c[0] === dir).length;
+    await expect(addWatchedFolder({ repo, lib }, p.id, dir, {}, { timeoutMs: 200 })).rejects.toBeInstanceOf(FolderNotAnsweringError);
+    expect(real.mock.calls.filter((c) => c[0] === dir).length).toBe(calls);
+    release();
+    await until(() => !folderCallOutstanding(dir));
+    await sleep(100);
+    expect(repo.getProject(p.id).watchedFolders ?? []).toEqual([]);
+    real.mockRestore();
+    syncBuiltinESMExports();
+    // A governed write held back behind another change for longer than the limit is awaited, not raced.
+    let free: () => void = () => {};
+    const busy = repo.mutate(p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, () => new Promise<void>((r) => (free = r)));
+    const adding = addWatchedFolder({ repo, lib }, p.id, dir, {}, { timeoutMs: 200 });
+    await sleep(600);
+    free();
+    await busy;
+    const w = await adding;
+    expect(repo.getProject(p.id).watchedFolders?.map((x) => x.id)).toEqual([w.id]);
+  }, 30_000);
 });

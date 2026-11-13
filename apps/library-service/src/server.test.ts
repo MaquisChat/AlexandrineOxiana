@@ -1383,42 +1383,8 @@ describe("review round 1: smaller route fixes (R99 minors)", () => {
     expect((await finished).data).toMatchObject({ jobId: r.json.jobId, done: 1, total: 1 });
   });
 
-  it("a folder added through the route registers what it brings in (A8: no watch without its register)", async () => {
-    await svc.close();
-    await start({ watchStabilityMs: 50 });
-    await openNewLibrary();
-    const pid = await newProject();
-    const { mkdir } = await import("node:fs/promises");
-    const folder = join(tmp, "watch-registered");
-    await mkdir(folder);
-    const w = (await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { dir: folder } })).json as { id: string };
-    const seen = nextEvent((e) => e.type === "job.progress" && e.data.kind === "watch" && e.data.event?.kind === "imported");
-    await writeFile(join(folder, "registered.pdf"), await buildPdf({ title: "Registered Through The Route" }));
-    const sid = (await seen).data.event.sourceId as string;
-    const repo = svc.state.session!.repo;
-    const deadline = Date.now() + 20_000;
-    while ((await repo.watchRegister(pid, w.id)).size === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
-    expect((await repo.watchRegister(pid, w.id)).get("registered.pdf")).toMatchObject({ sourceId: sid, state: "in-library" });
-    expect((await repo.getSource(pid, sid)).source.provenance.externalKeys).toEqual({ "watched-folder": w.id });
-  }, 60_000);
-
-  it("watches restarted after removing one keep reporting events", async () => {
-    await svc.close();
-    await start({ watchStabilityMs: 50 });
-    await openNewLibrary();
-    const pid = await newProject();
-    const { mkdir } = await import("node:fs/promises");
-    const keep = join(tmp, "watch-keep");
-    const drop = join(tmp, "watch-drop");
-    await mkdir(keep);
-    await mkdir(drop);
-    expect((await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { dir: keep } })).status).toBe(200);
-    const w2 = (await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { dir: drop } })).json;
-    expect((await call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${w2.id}` })).status).toBe(200);
-    const seen = nextEvent((e) => e.type === "job.progress" && e.data.kind === "watch" && e.data.event?.kind === "imported");
-    await writeFile(join(keep, "dropped.pdf"), await buildPdf({ title: "Dropped Later Into The Folder" }));
-    expect((await seen).data.projectId).toBe(pid);
-  }, 60_000);
+  // The watched-folder routes (adding by grant, what comes in is registered, a remove leaves the other watches
+  // running) are tested in watched-folders-routes.test.ts (Task W7).
 
   it("library errors map to their codes; a TypeError is 500 INTERNAL without its message", async () => {
     const { toApiError } = await import("./errors.js");
