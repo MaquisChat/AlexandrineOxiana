@@ -16,7 +16,7 @@
  * Typed methods exist for what the UI uses so far (appearance); later screens add theirs on top of
  * `request()` (Tasks 33+).
  */
-import { isCredentialQueryKey, isMediaTicketPath, type ServiceErrorCode } from "@ao/shared";
+import { DOCUMENT_RANGE_MAX_BYTES, isCredentialQueryKey, isMediaTicketPath, type ServiceErrorCode } from "@ao/shared";
 import type { AppearancePatch, AppearanceSettings } from "../theme/appearance";
 
 /** The codes the service answers with: its own list, declared once in @ao/shared (Task 47). */
@@ -87,6 +87,18 @@ export interface ApiClient {
    * request(); a bad path throws before anything is sent.
    */
   bytes(path: string, opts?: { signal?: AbortSignal; maxBytes?: number }): Promise<Blob>;
+  /**
+   * Bytes `start` to `end` (inclusive) of a stored file, e.g. a PDF for the reader (Task R5): one
+   * GET with `Range: bytes=start-end` and the token in the Authorization header (never a media
+   * ticket, never anything in the URL). The answer must be 206 with `Content-Range` starting at
+   * `start` and ending at `end`, or earlier only where the service may cut it (the file's last byte,
+   * or DOCUMENT_RANGE_MAX_BYTES), and a body of exactly that length; anything else is refused
+   * (status 502, INTERNAL) and never handed on. The service's own refusals (404, 413, 423…) are
+   * thrown as they are; a 416 (no body) as VALIDATION with the file's length as `reason`. An answer
+   * whose signal was aborted meanwhile is never returned (AbortError). Same path rules as
+   * request(); bad arguments throw before anything is sent.
+   */
+  byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
 }
 
 /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
@@ -462,9 +474,73 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     })();
   }
 
+  async function byteRange(path: string, start: number, end: number, o: { signal?: AbortSignal } = {}): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }> {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
+      throw new Error("A byte range needs whole numbers with 0 ≤ start ≤ end.");
+    }
+    const url = urlFor(path); // throws on a bad path or a credential in the URL
+    const mismatch = () => new ApiClientError(502, { code: "INTERNAL", message: "The library service answered with another part of the file than was asked for." });
+    const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "*/*", Range: `bytes=${start}-${end}` }, cache: "no-store" };
+    if (o.signal) init.signal = o.signal;
+    let res: Response;
+    try {
+      res = await doFetch(url, init);
+    } catch (err) {
+      if (o.signal?.aborted) throw err;
+      throw unreachable();
+    }
+    if (res.status === 416) {
+      // No error body: said in plain words, with the file's length (`bytes */<total>`) as the reason.
+      res.body?.cancel().catch(() => {});
+      const total = /^bytes \*\/(\d{1,16})$/.exec(res.headers.get("content-range") ?? "")?.[1];
+      throw new ApiClientError(416, { code: "VALIDATION", message: "The part of the file asked for is past its end.", ...(total !== undefined ? { reason: total } : {}) });
+    }
+    if (!res.ok) throw await errorFrom(res);
+    const refuse = (): never => {
+      res.body?.cancel().catch(() => {});
+      throw mismatch();
+    };
+    if (res.status !== 206) refuse();
+    const m = /^bytes (\d{1,16})-(\d{1,16})\/(\d{1,16})$/.exec(res.headers.get("content-range") ?? "");
+    if (!m) return refuse();
+    const [a, b, total] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    // The start asked; an end no later than asked and inside the file; cut short only where the service may cut.
+    if (a !== start || b < a || b > end || b >= total || !Number.isSafeInteger(total)) refuse();
+    const length = b - a + 1;
+    if (b < end && b !== total - 1 && length !== DOCUMENT_RANGE_MAX_BYTES) refuse();
+    const declared = res.headers.get("content-length");
+    if (declared !== null && Number(declared) !== length) refuse();
+    // Read into exactly `length` bytes; a body longer or shorter than that is refused.
+    const bytes = new Uint8Array(length);
+    let got = 0;
+    if (res.body) {
+      const reader = res.body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (got + value.byteLength > length) {
+            reader.cancel().catch(() => {});
+            throw mismatch();
+          }
+          bytes.set(value, got);
+          got += value.byteLength;
+        }
+      } catch (err) {
+        if (err instanceof ApiClientError || o.signal?.aborted) throw err;
+        throw unreachable();
+      }
+    }
+    if (got !== length) throw mismatch();
+    // Aborted while the body was being read: the answer is stale, never handed back.
+    if (o.signal?.aborted) throw o.signal.reason instanceof Error ? o.signal.reason : new DOMException("The range was no longer wanted.", "AbortError");
+    return { bytes, start: a, end: b, total };
+  }
+
   return {
     request,
     bytes,
+    byteRange,
     appearance: {
       get: () => request<AppearanceSettings>("GET", "/settings/appearance"),
       put: (patch) => request<AppearanceSettings>("PUT", "/settings/appearance", { body: patch }),

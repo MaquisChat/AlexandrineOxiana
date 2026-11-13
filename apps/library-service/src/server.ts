@@ -19,6 +19,7 @@ import { registerAudit } from "./routes/audit.js";
 import { registerLibraryAudit } from "./routes/library-audit.js";
 import { registerCapture } from "./routes/capture.js";
 import { registerCitations } from "./routes/citations.js";
+import { isDocumentPreflight, registerDocuments } from "./routes/documents.js";
 import { registerFieldwork } from "./routes/fieldwork.js";
 import { registerGovernance } from "./routes/governance.js";
 import { registerImport } from "./routes/import.js";
@@ -67,6 +68,10 @@ export interface ServiceOptions {
   pictureMaxBytes?: number;
   /** Test seam: runs on the media route after the first slice is read, right before the response starts. */
   mediaBeforeSend?: () => Promise<void>;
+  /** Largest PDF the document route serves (default READER_PDF_MAX_BYTES; test seam). */
+  readerPdfMaxBytes?: number;
+  /** Test seam: runs on the document route after the file is opened, right before its first read. */
+  documentBeforeRead?: () => Promise<void>;
 }
 
 export interface LibraryService {
@@ -210,7 +215,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
         return reply
           .status(204)
           .header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE")
-          .header("Access-Control-Allow-Headers", "authorization, content-type")
+          // `range` only for the shell's preflight of the document route (Task R5 review I1).
+          .header("Access-Control-Allow-Headers", SHELL_ORIGINS.has(origin) && isDocumentPreflight(req) ? "authorization, content-type, range" : "authorization, content-type")
           .header("Access-Control-Max-Age", "600")
           .send();
       }
@@ -279,7 +285,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   });
   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
 
-  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}) };
+  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}), ...(opts.readerPdfMaxBytes !== undefined ? { readerPdfMaxBytes: opts.readerPdfMaxBytes } : {}), ...(opts.documentBeforeRead ? { documentBeforeRead: opts.documentBeforeRead } : {}) };
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
@@ -296,6 +302,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerJobs(app, ctx);
   registerTools(app, ctx);
   registerMedia(app, ctx);
+  registerDocuments(app, ctx);
 
   let closing: Promise<void> | undefined;
   return {
@@ -333,7 +340,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 }
 
-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void> };
+export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void>; readerPdfMaxBytes?: number; documentBeforeRead?: () => Promise<void> };
 
 /** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
 function decodedPath(path: string): string {
