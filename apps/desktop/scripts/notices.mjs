@@ -173,6 +173,16 @@ export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts(
 /** Licence files inside a package's sub-folders that the interface ships with files copied from those folders. */
 const bundledLicenceFiles = (name, path) => (name === "pdfjs-dist" ? pdfjsLicenceFiles(path) : []);
 
+/**
+ * Dependencies a package carries only for Node, which the interface's browser bundle never contains,
+ * left out of the interface's list with everything they bring (Task R6, round 4). pdf.js loads
+ * @napi-rs/canvas (a native canvas, with one optional package per platform) only when it runs under
+ * Node (`process.getBuiltinModule("module").createRequire(...)("@napi-rs/canvas")` behind
+ * `isNodeJS`): no code of it is bundled for the web view. The library service, which runs pdf.js in
+ * Node, ships and lists its own installed canvas package in its own notices (its build, not this).
+ */
+export const NODE_ONLY_DEPENDENCIES = { "pdfjs-dist": ["@napi-rs/canvas"] };
+
 /** Components a package bundles without shipping their licence texts (core-js inside pdf.js's legacy build). */
 const bundledComponents = (name, path) => (name === "pdfjs-dist" ? pdfjsBundledComponents(path) : []);
 
@@ -199,23 +209,40 @@ export function nodeLicenceText(exe, version) {
 /** The production npm packages of `pnpm list --json` output, once each: { name, version, licence, path, pkg }. */
 function npmPackages(list, readPackage) {
   const found = new Map();
-  const walk = (deps) => {
+  // `readPackage` answers undefined (or throws ENOENT) for a package that is not installed here.
+  const read = (path) => {
+    try {
+      return readPackage(path);
+    } catch (e) {
+      if (e?.code === "ENOENT") return undefined;
+      throw e;
+    }
+  };
+  const walk = (deps, parent) => {
     for (const [name, d] of Object.entries(deps ?? {})) {
+      // A dependency the interface's browser bundle never contains (Node-only helpers): left out with all it brings.
+      if (parent && (NODE_ONLY_DEPENDENCIES[parent.name] ?? []).includes(name)) continue;
       const workspace = String(d.version).startsWith("link:");
+      const pkg = read(d.path) ?? (workspace ? {} : undefined);
+      if (pkg === undefined) {
+        // `pnpm list` names every optional dependency, also those for other platforms, which are
+        // not installed here and so not shipped: skipped. A required one that is missing is an error.
+        if (parent?.pkg?.optionalDependencies?.[name] !== undefined) continue;
+        throw new Error(`${name} ${d.version}, a required dependency of ${parent ? `${parent.name} ${parent.version}` : "the interface"}, is not installed (no package.json at ${d.path})`);
+      }
       if (!workspace) {
         const key = `${name}@${d.version}`;
         if (!found.has(key)) {
-          const pkg = readPackage(d.path) ?? {};
           const licence =
             typeof pkg.license === "string" ? pkg.license : typeof pkg.license?.type === "string" ? pkg.license.type : Array.isArray(pkg.licenses) ? pkg.licenses.map((l) => l?.type).filter(Boolean).join(" OR ") : "";
           if (!licence) throw new Error(`${name} ${d.version} has no licence entry in its package.json`);
           found.set(key, { name, version: d.version, licence, path: d.path, pkg });
         }
       }
-      walk(d.dependencies);
+      walk(d.dependencies, { name, version: d.version, pkg });
     }
   };
-  for (const root of list) walk(root.dependencies);
+  for (const root of list) walk(root.dependencies, root.path ? { name: root.name, version: root.version ?? "", pkg: read(root.path) } : undefined);
   // What a package bundles without shipping its licence text, as the bundle records it (Task R6, A6).
   for (const p of [...found.values()]) {
     for (const c of bundledComponents(p.name, p.path)) {
