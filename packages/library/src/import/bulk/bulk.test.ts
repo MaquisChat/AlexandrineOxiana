@@ -4,7 +4,7 @@ import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MockAgent } from "undici";
+import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ExifTool } from "exiftool-vendored";
 import { primary, type AuditEvent, type Project, type SourceDraft } from "@ao/core";
@@ -26,6 +26,11 @@ import type { Repo } from "../../repo/repo.js";
 import { importChange, projectCollectionsAndTags, projectDataKey } from "../../repo/repo.js";
 import { openTestRepo } from "../../repo/testing.js";
 import { BatchRefusedError, createBulkImport, folderAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
+import { useMemorySecrets } from "../../secrets-testing.js";
+import { setSecret } from "../../secrets.js";
+import { ZOTERO_WEB_FILE_NOTES, resumeZoteroWebImport, startZoteroWebImport, zoteroWebSince, type ZoteroWebOptions } from "../zotero-web.js";
+import { FakeZotero, guardNetwork } from "../../../tests/zotero/fake-zotero.js";
+import { referenceMetadata } from "../refman.js";
 
 const FAST = 2 ** 10;
 const LOOKUP_FIX = join(dirname(fileURLToPath(import.meta.url)), "../../../tests/fixtures/lookup");
@@ -151,7 +156,14 @@ afterEach(async () => {
   await rm(tmp, { recursive: true, force: true });
 });
 
+// Guard (the Zotero stand-in is used below): a request made without a mock agent fails instead of reaching the network.
+let unguard: () => void;
+beforeAll(() => {
+  unguard = guardNetwork();
+});
+
 afterAll(async () => {
+  unguard();
   await shutdownExtractors();
 });
 
@@ -1535,5 +1547,232 @@ describe("Task 72 fix round 2 (R194): every import decision that leaves the sour
     await bulk.undoBatch(p.id, batchId);
     expect(repo.listSourceIds(p.id)).not.toContain(sid);
     expect((await entries()).find((e) => e.id === capture!.id)).toMatchObject({ status: "resolved", decision: "undone" });
+  });
+});
+
+describe("context hooks and gone items (Z2)", () => {
+  /** An incremental adapter that knows nothing of `skip`, `knownIds` or `gone`; it records the context it was given. */
+  const plain = (items: ScanItem[], seen: Array<Record<string, unknown>> = []): ImportSourceAdapter => ({
+    kind: "bibtex",
+    location: "plain.bib",
+    incremental: true,
+    scan: async function* (_signal, ctx) {
+      seen.push({ skip: typeof ctx?.skip, knownIds: ctx?.knownIds ? [...ctx.knownIds()] : undefined });
+      yield* items;
+    },
+  });
+  const ref = (key: string, title: string, version = "v1"): ScanItem => ({
+    key,
+    files: [],
+    referenceMetadata: referenceMetadata({ type: "book", title }),
+    version: { id: `lib/${key}`, version },
+  });
+
+  it("an adapter that knows nothing of skip and knownIds runs unchanged", async () => {
+    const p = await project();
+    const seen: Array<Record<string, unknown>> = [];
+    const first = await run(p, plain([ref("A", "Alpha"), ref("B", "Beta")], seen));
+    expect(first.result.state).toBe("finished");
+    expect(first.result.counts.created + first.result.counts.needsReview).toBe(2);
+    const again = await run(p, plain([ref("A", "Alpha"), ref("B", "Beta")], seen));
+    expect(again.result.counts).toMatchObject({ unchanged: 2, created: 0, failed: 0 });
+    // The engine offers the hooks; ignoring them changes nothing.
+    expect(seen[0]).toEqual({ skip: "function", knownIds: [] });
+    expect(seen[1]).toEqual({ skip: "function", knownIds: ["lib/A", "lib/B"] });
+    // A non-incremental adapter is offered no knownIds.
+    const nonInc: Array<Record<string, unknown>> = [];
+    await run(p, { ...plain([], nonInc), incremental: false });
+    expect(nonInc[0]).toEqual({ skip: "function", knownIds: undefined });
+  });
+
+  it("a gone item changes nothing here and is not journaled (Z5 marks it); a dry run does not count it", async () => {
+    const p = await project();
+    await run(p, plain([ref("A", "Alpha")]));
+    const [id] = repo.listSourceIds(p.id);
+    const folderOf = async () => join(lib.root, (await repo.getSource(p.id, id!)).source.folder);
+    const before = await tree(await folderOf());
+    expect(before.size).toBeGreaterThan(0);
+    const { result, handle: h } = await run(p, plain([{ key: "A", files: [], gone: "deleted", version: { id: "lib/A", version: "deleted" } }]));
+    expect(result.state).toBe("finished");
+    expect(result.counts.items).toBe(0);
+    expect(await tree(await folderOf())).toEqual(before);
+    expect(existsSync(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"))).toBe(false);
+    expect(h.batchId).toBeTruthy();
+    const dry = await bulk.dryRun(p.id, plain([{ key: "B", files: [], gone: "bin", version: { id: "lib/B", version: "bin:3" } }]));
+    expect(dry.items).toBe(0);
+  });
+
+  it("skip: an item already in a resumed batch's journal is passed by before the adapter fetches it", async () => {
+    const p = await project();
+    const asked: string[] = [];
+    const items = [ref("A", "Alpha"), ref("B", "Beta"), ref("C", "Gamma")];
+    const adapter: ImportSourceAdapter = {
+      kind: "bibtex",
+      location: "skip.bib",
+      incremental: true,
+      scan: async function* (_signal, ctx) {
+        for (const i of items) {
+          if (ctx?.skip?.(i.key)) continue;
+          asked.push(i.key);
+          yield i;
+        }
+      },
+    };
+    const h = await bulk.startBatch(p.id, adapter);
+    for await (const e of h.progress) {
+      if (e.done >= 1) {
+        h.cancel();
+        break;
+      }
+    }
+    const stopped = await h.done;
+    const done = stopped.counts.items;
+    expect(done).toBeGreaterThanOrEqual(1);
+    asked.length = 0;
+    const r = await (await bulk.resumeBatch(p.id, h.batchId, adapter)).done;
+    expect(r.state).toBe("finished");
+    expect(asked).toHaveLength(3 - done);
+    expect(repo.listSourceIds(p.id)).toHaveLength(3);
+  });
+});
+
+describe("Zotero Web batches resumed (Z2)", () => {
+  const ZGOV = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: optional
+captureMethods: [zotero_import]
+processing:
+  metadata_lookup: []
+`;
+  const U = "user:42";
+  let z: FakeZotero;
+  let secrets: ReturnType<typeof useMemorySecrets>;
+  let restoreDispatcher: () => void;
+  beforeEach(async () => {
+    z = new FakeZotero();
+    secrets = useMemorySecrets();
+    await setSecret("zotero-api-key", z.key);
+    // resumeZoteroWebImport takes no dispatcher (as in the service): the stand-in is the global one here.
+    const previous = getGlobalDispatcher();
+    setGlobalDispatcher(z.agent);
+    restoreDispatcher = () => setGlobalDispatcher(previous);
+  });
+  afterEach(async () => {
+    // One way only: nothing but GET reached the stand-in.
+    expect(z.requests.filter((r) => r.method !== "GET")).toEqual([]);
+    restoreDispatcher();
+    secrets.restore();
+    await z.agent.close();
+  });
+
+  const deps = () => ({ repo, http, index: handle });
+  const web = (): ZoteroWebOptions => ({ libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} });
+  const addWithFile = async (title: string) => {
+    const p = z.addItem(U, { itemType: "journalArticle", title });
+    const att = z.addItem(U, { itemType: "attachment", contentType: "application/pdf", filename: "f.pdf" }, { parent: p, file: { bytes: await buildPdf({ extra: title }) } });
+    return { p, att };
+  };
+  const listings = () => z.requests.filter((r) => r.path.startsWith("/users/42/items?")).map((r) => new URL(r.path, "https://x.invalid").searchParams);
+  const fileRequests = () => z.requests.filter((r) => r.path.endsWith("/file")).map((r) => r.path);
+
+  /** A first full run, then an incremental batch cancelled after its first item. */
+  async function cancelledIncremental(): Promise<{ p: Project; batchId: string; v1: number; journaled: number }> {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three"]) await addWithFile(t);
+    await (await startZoteroWebImport(deps(), p.id, web())).done;
+    const v1 = z.libraryVersion(U);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+    for (const t of ["Four", "Five", "Six", "Seven"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, web());
+    for await (const e of h.progress) {
+      if (e.done >= 1) {
+        h.cancel();
+        break;
+      }
+    }
+    const stopped = await h.done;
+    expect(stopped.state).toBe("cancelled");
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+    return { p, batchId: h.batchId, v1, journaled: stopped.counts.items };
+  }
+
+  const batchJson = (p: Project, n: number) => join(lib.root, p.folder, "imports", `batch-${String(n).padStart(4, "0")}`, "batch.json");
+
+  it("a resumed Web batch asks since its recorded version and records the new one", async () => {
+    const { p, batchId, v1, journaled } = await cancelledIncremental();
+    const rec = JSON.parse(await readFile(batchJson(p, 2), "utf8"));
+    expect(rec.adapterOptions).toEqual({ zoteroSince: v1, zoteroFiles: true });
+    z.requests.length = 0;
+    const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
+    expect(r.state).toBe("finished");
+    expect(listings().length).toBeGreaterThan(0);
+    expect(listings().every((q) => q.get("since") === String(v1))).toBe(true);
+    // Items already journaled are passed by: their files are not fetched again.
+    expect(fileRequests()).toHaveLength(4 - journaled);
+    expect(repo.listSourceIds(p.id)).toHaveLength(7);
+    const now = z.libraryVersion(U);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(now);
+    expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).recordedLibraryVersion).toBe(now);
+    const events = (await auditEvents(p)).map((e) => e.details?.op);
+    expect(events).toContain("project.import-settings.zotero-web");
+  });
+
+  it("a batch record without the new fields resumes as before (a full scan)", async () => {
+    const { p, batchId } = await cancelledIncremental();
+    const path = batchJson(p, 2);
+    const { adapterOptions: _gone, ...old } = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify(old, null, 2));
+    z.requests.length = 0;
+    const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
+    expect(r.state).toBe("finished");
+    expect(listings().length).toBeGreaterThan(0);
+    expect(listings().every((q) => !q.has("since"))).toBe(true);
+    expect(repo.listSourceIds(p.id)).toHaveLength(7);
+    const titles = await Promise.all(repo.listSourceIds(p.id).map(async (id) => (await repo.getSource(p.id, id)).source.title.variants[0]!.value));
+    expect(new Set(titles).size).toBe(7);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
+  });
+
+  it("a download that failed before the resume holds since back at the end of the resumed run", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two"]) await addWithFile(t);
+    await (await startZoteroWebImport(deps(), p.id, web())).done;
+    const v1 = z.libraryVersion(U);
+    const { att } = await addWithFile("Fails first");
+    z.failFile(U, att, { api: 500 });
+    for (const t of ["Four", "Five"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, { ...web(), maxRetries: 0 });
+    // Hold the batch until the failing file's item is journaled, then stop it.
+    for await (const e of h.progress) {
+      if (e.done >= 3) {
+        h.cancel();
+        break;
+      }
+    }
+    await h.done;
+    z.failFile(U, att, null);
+    const r = await (await resumeZoteroWebImport(deps(), p.id, h.batchId)).done;
+    expect(r.state).toBe("finished");
+    const journal = (await readFile(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    // The failing item (third, newest first) was journaled before the stop; the resumed part had no failure of its own.
+    expect(journal.some((e: { notes?: string[] }) => e.notes?.includes(ZOTERO_WEB_FILE_NOTES.failed))).toBe(true);
+    expect(fileRequests().filter((f) => f.includes(att))).toHaveLength(1);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+  });
+
+  it("the service-free resume of another kind is resumeBatch's", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, folderAdapter(folder));
+    for await (const e of h.progress) {
+      if (e.done >= 2) {
+        h.cancel();
+        break;
+      }
+    }
+    await h.done;
+    const r = await (await resumeZoteroWebImport(deps(), p.id, h.batchId)).done;
+    expect(r.state).toBe("finished");
+    expect(sum(r.counts)).toBe(fx.items);
   });
 });
