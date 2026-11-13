@@ -586,7 +586,7 @@ Update after every task; commit and push.
 | Z3–Z12 Zotero sync: the remaining tasks | planned | — | order: Z3 and Z4 (after Z2); Z5; Z6; Z7; Z8; Z9; Z10 (the scheduler, only after the screen); Z11; Z12 after reader R12. Owner's questions in the ledger under R206 |
 | W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | done (GitHub's run not made, R202) | add12e3 (reader branch) | reviewed over two fix rounds; a Critical in the plan's own rule closed (R208); the real `/usr/bin/stat` never run here — owner's Mac check |
 | W2 Cloud folders: the engine reads nothing it may not | dispatched | — | Opus implementer; brief `task-W2-brief.md` |
-| W6 Cloud folders: a folder approved only through the system's chooser | dispatched | — | Opus implementer; brief `task-W6-brief.md`; changes R98/R155 for one line shape (R207) |
+| W6 Cloud folders: a folder approved only through the system's chooser | in review | 6149404 (worktree branch `worktree-agent-ac0137759caa3dd73`) | 17 files; desktop build and launch check pass; four points put to the reviewer as questions |
 | W3, W4, W7–W10 Cloud folders: the remaining tasks | planned | — | order: W3 (after W2); W4; W7 (after W4 and W6; also sets the service's thread pool to 16, A3 d); W8 and W9; W10. Owner's questions in the ledger under R207 |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
