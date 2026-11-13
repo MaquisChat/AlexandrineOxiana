@@ -141,3 +141,4 @@ R216 (2026-11-13): reader R9 after review — "Discard this note?" stands (R192 
 R217 (2026-11-13): cloud folders W3 after review — the register covers every file the library holds; deleted stays deleted (undo included); watchId required; links never followed; torn line survived; time-only changes write nothing.
 R218 (2026-11-13): the project's licence is AGPL-3.0-or-later (the owner's choice; the repository to be made public); the dependency rule becomes "nothing incompatible with AGPL-3.0-or-later is shipped".
 R219 (2026-11-13): cloud folders W4 after review — the fetch never follows a link; the agreed size reserved in the device record; a pause never loses a register line; nothing confirmed, nothing fetched; wording.
+R220 (2026-11-13): reader R12 after review — the list row says whether a source has a readable PDF (no request per row); the filter covers every group; the route asks the annotations once; a dropped search is said.
