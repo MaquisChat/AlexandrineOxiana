@@ -38,6 +38,11 @@ export function clearPendingFind(): void {
   stopWatching();
 }
 
+/** Whether words wait (for tests and for screens that must not hold a second copy). */
+export function hasPendingFind(): boolean {
+  return pending !== undefined;
+}
+
 /** Hands the words of a search over for the reader of this source; replaces any words still waiting. */
 export function setPendingFind(projectId: string, sourceId: string, words: string): void {
   clearPendingFind();

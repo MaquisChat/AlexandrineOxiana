@@ -8,8 +8,8 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearPendingFind, takePendingFind } from "../reader/readerHandoff";
-import { CURRENT_RW, libraryHandlers, SOURCE_FILE, SOURCES, server, testApi, url, useMockService } from "../test/service";
+import { clearPendingFind, hasPendingFind, takePendingFind } from "../reader/readerHandoff";
+import { CURRENT_RW, libraryHandlers, serviceError, SOURCE_FILE, SOURCES, server, testApi, url, useMockService } from "../test/service";
 import { Library } from "./Library";
 
 useMockService();
@@ -117,5 +117,66 @@ describe("Library: a search hit found in an annotation (Task R12)", () => {
     const button = await screen.findByRole("button", { name: 'Show in the reader: <b>Bold</b> & "quoted"' });
     expect(within(button.closest("tr")!).queryByRole("strong")).toBeNull();
     expect(button.closest("tr")!.querySelector("b")).toBeNull();
+  });
+
+  describe("the words are not kept past a change of the library's state", () => {
+    /** An event stream the test feeds: every connection gets each event pushed. */
+    function liveEvents() {
+      const open: ReadableStreamDefaultController<Uint8Array>[] = [];
+      const enc = new TextEncoder();
+      const send = (c: ReadableStreamDefaultController<Uint8Array>, type: string, data: unknown) => c.enqueue(enc.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`));
+      server.use(
+        http.get(url("/events"), () => {
+          const stream = new ReadableStream<Uint8Array>({
+            start(c) {
+              open.push(c);
+              send(c, "library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+            },
+          });
+          return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
+        }),
+      );
+      return { push: (type: string, data: unknown) => open.forEach((c) => send(c, type, data)), connections: () => open.length };
+    }
+
+    it("a lock or a switch announced after Show in the reader was pressed drops them (the guard)", async () => {
+      const user = userEvent.setup();
+      serve({ hits: [hit("s1", "Ethnography at Work")] });
+      const events = liveEvents();
+      renderLibrary();
+      await user.type(await screen.findByRole("searchbox", { name: "Search sources" }), "habitus");
+      await user.click(await screen.findByRole("button", { name: "Show in the reader: Ethnography at Work" }));
+      expect(hasPendingFind()).toBe(true);
+      // The guard's own stream is open besides the library's, and has seen the state it opened with.
+      await waitFor(() => expect(events.connections()).toBe(2));
+      events.push("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+      await waitFor(() => expect(hasPendingFind()).toBe(false));
+    });
+
+    it("the library closing while the words wait drops them", async () => {
+      const user = userEvent.setup();
+      serve({ hits: [hit("s1", "Ethnography at Work")] });
+      const events = liveEvents();
+      renderLibrary();
+      await user.type(await screen.findByRole("searchbox", { name: "Search sources" }), "habitus");
+      await user.click(await screen.findByRole("button", { name: "Show in the reader: Ethnography at Work" }));
+      expect(hasPendingFind()).toBe(true);
+      events.push("library.state", { open: false });
+      await waitFor(() => expect(hasPendingFind()).toBe(false));
+    });
+
+    it("a project found locked on this screen drops them", async () => {
+      const user = userEvent.setup();
+      serve({ hits: [hit("s1", "Ethnography at Work")] });
+      renderLibrary();
+      await user.type(await screen.findByRole("searchbox", { name: "Search sources" }), "habitus");
+      await screen.findByRole("button", { name: "Show in the reader: Ethnography at Work" });
+      // The words wait (handed over from an earlier press, say); the next search finds the project locked.
+      const { setPendingFind } = await import("../reader/readerHandoff");
+      setPendingFind("p1", "s1", "habitus");
+      server.use(http.get(url("/projects/:id/sources"), () => serviceError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.")));
+      await user.type(screen.getByRole("searchbox", { name: "Search sources" }), " field");
+      await waitFor(() => expect(hasPendingFind()).toBe(false));
+    });
   });
 });
