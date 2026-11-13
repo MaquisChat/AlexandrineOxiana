@@ -1481,7 +1481,8 @@ describe("Task 72 fix round 2 (R194): every import decision that leaves the sour
 
   it("an accept whose draft leaves the report as it was: the same", async () => {
     const { p, sid, importEntry, pending } = await importedItem();
-    await bulk.decideReview(p.id, importEntry.id, { action: "accept", draft: {} });
+    // A draft that sets nothing (the reviewer's probe; the service passes the draft it is given).
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept", draft: {} as SourceDraft });
     expect((await repo.getSource(p.id, sid)).verification["/issued"]?.status).toBe("conflict");
     expectListed(await pending());
   });
