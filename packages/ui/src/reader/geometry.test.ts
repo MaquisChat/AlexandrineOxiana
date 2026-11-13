@@ -169,7 +169,7 @@ interface Built {
 }
 
 /** Text layers for the pages given, each laid out at its viewport and placed on the screen at `at`; a range's rectangles worked out from the items' places. */
-function buildLayers(src: Array<{ text: TextContent; items: Item[] }>, viewports: PageViewport[], at: DOMRectLike[]): Built {
+function buildLayers(src: Array<{ text: TextContent; items: Item[] }>, viewports: PageViewport[], at: DOMRectLike[], overshoot = 0): Built {
   const dom = new JSDOM(`<!doctype html><div id="area"></div><section id="list"><p>A note in the list</p></section>`);
   const doc = dom.window.document;
   const area = doc.getElementById("area")!;
@@ -203,7 +203,11 @@ function buildLayers(src: Array<{ text: TextContent; items: Item[] }>, viewports
   dom.window.Range.prototype.getClientRects = function (this: Range) {
     const o = this.startContainer === this.endContainer ? owner.get(this.startContainer) : undefined;
     if (!o || this.collapsed) return [] as unknown as DOMRectList;
-    return [toClient(pdfRectToBox(glyphBox(o.text, o.item, this.startOffset, this.endOffset), o.viewport), o.at)] as unknown as DOMRectList;
+    const r = toClient(pdfRectToBox(glyphBox(o.text, o.item, this.startOffset, this.endOffset), o.viewport), o.at);
+    // WebKit gives a piece of a scaled span the unscaled width of its last character: `overshoot` pixels
+    // too wide, except at the span's end, which it gives exactly (seen in WebKit, Task R10).
+    const end = this.endOffset >= (this.startContainer as Text).data.length;
+    return [{ ...r, width: r.width + (end ? 0 : overshoot) }] as unknown as DOMRectList;
   };
   return { doc, pages, node: (n, i) => nodes[n - 1]![i]!, outside: doc.querySelector<HTMLElement>("#list p")! };
 }
@@ -328,6 +332,20 @@ describe("selectionToAnchors (Task R10)", () => {
     expect(canJudge(a.quote)).toBe(true);
     expect(quoteStillUnder(a.quote, two[0]!.text, a.rects)).toBe(true);
     for (const r of a.rects) expect(r.x + r.w <= 280 + 1e-6 || r.x >= 315 - 1e-6).toBe(true);
+  });
+
+  it("a piece of a line measured too wide (as WebKit measures a piece of a scaled span) is cut where the next character starts", () => {
+    const a = two[0]!.page.getViewport({ scale: 4 / 3, rotation: 0 });
+    const exact = buildLayers([two[0]!], [a], [atFor(a)]);
+    const wide = buildLayers([two[0]!], [a], [atFor(a)], 1.2);
+    const foot = itemIndex(1, "At the foot");
+    const want = selectionToAnchors(rangeIn(exact, [1, foot, 3], [1, foot, 11]), exact.pages)[0]!;
+    const got = selectionToAnchors(rangeIn(wide, [1, foot, 3], [1, foot, 11]), wide.pages)[0]!;
+    expect(got.rects).toHaveLength(1);
+    for (const k of ["x", "y", "w", "h"] as const) expect(Math.abs(got.rects[0]![k] - want.rects[0]![k])).toBeLessThan(1e-6);
+    // At a line's end there is no next character, and the measure is exact.
+    const lineEnd = selectionToAnchors(rangeIn(wide, [1, foot, 30], [1, foot, two[0]!.items[foot]!.str.length]), wide.pages)[0]!;
+    expect(lineEnd.rects[0]!.x + lineEnd.rects[0]!.w).toBeCloseTo(50 + two[0]!.items[foot]!.width, 6);
   });
 
   it("a selection's sort index orders it after an earlier one on the page", () => {

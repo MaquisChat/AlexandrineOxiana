@@ -197,7 +197,16 @@ export function selectionToAnchors(range: Range, pages: PageGeometry[]): Selecti
       const sub = doc.createRange();
       sub.setStart(n, from);
       sub.setEnd(n, to);
-      const rects = typeof sub.getClientRects === "function" ? [...(sub.getClientRects() as unknown as Iterable<DOMRectLike>)].filter((r) => r.width > 0 && r.height > 0) : [];
+      const rects = rectsOf(sub);
+      // WebKit measures a piece of a span scaled by pdf.js (`scaleX`) with its last character at its
+      // unscaled width: the piece is cut where the next character starts, so it is never widened.
+      if (to < data.length && rects.length > 0) {
+        const after = doc.createRange();
+        after.setStart(n, to);
+        after.setEnd(n, to + 1);
+        const next = rectsOf(after)[0];
+        if (next) rects[rects.length - 1] = cutAt(rects[rects.length - 1]!, next);
+      }
       const placed = selectionToPdfRects(rects, box, g.viewport);
       // A piece on another line than the last with no line break between them: a line break in the quote.
       if (!pendingBreak && lastLine && placed[0] && !acrossOverlap(lastLine, placed[0]) && text !== "" && !/\s$/u.test(text)) text += "\n";
@@ -226,6 +235,34 @@ function sliceOf(range: Range, layer: Element): Range | undefined {
   if (range.compareBoundaryPoints(START_TO_START, r) > 0) r.setStart(range.startContainer, range.startOffset);
   if (range.compareBoundaryPoints(END_TO_END, r) < 0) r.setEnd(range.endContainer, range.endOffset);
   return r.collapsed ? undefined : r;
+}
+
+/** The rectangles of a range, those with an area only (none where the browser offers no measure). */
+function rectsOf(r: Range): DOMRectLike[] {
+  if (typeof r.getClientRects !== "function") return [];
+  return [...(r.getClientRects() as unknown as Iterable<DOMRectLike>)].filter((b) => b.width > 0 && b.height > 0).map((b) => ({ left: b.left, top: b.top, width: b.width, height: b.height }));
+}
+
+/**
+ * `r` cut, along its line, where the next character `next` starts (only ever shortened): the line's
+ * direction on the screen is the way from `r` to `next`, whichever way the page is turned.
+ */
+function cutAt(r: DOMRectLike, next: DOMRectLike): DOMRectLike {
+  const dx = next.left + next.width / 2 - (r.left + r.width / 2);
+  const dy = next.top + next.height / 2 - (r.top + r.height / 2);
+  const right = r.left + r.width;
+  const bottom = r.top + r.height;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    // The same line: they overlap across it.
+    if (Math.min(bottom, next.top + next.height) - Math.max(r.top, next.top) <= 0.5 * Math.min(r.height, next.height)) return r;
+    if (dx > 0) return { ...r, width: Math.max(0, Math.min(right, Math.max(r.left, next.left)) - r.left) };
+    const left = Math.max(r.left, Math.min(right, next.left + next.width));
+    return { ...r, left, width: right - left };
+  }
+  if (Math.min(right, next.left + next.width) - Math.max(r.left, next.left) <= 0.5 * Math.min(r.width, next.width)) return r;
+  if (dy > 0) return { ...r, height: Math.max(0, Math.min(bottom, Math.max(r.top, next.top)) - r.top) };
+  const top = Math.max(r.top, Math.min(bottom, next.top + next.height));
+  return { ...r, top, height: bottom - top };
 }
 
 /** Whether two PDF rectangles share a line (they overlap across it by half the lower one). */
