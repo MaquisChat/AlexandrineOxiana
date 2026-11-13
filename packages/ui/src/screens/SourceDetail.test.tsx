@@ -61,6 +61,29 @@ describe("SourceDetail", () => {
     expect(origin.textContent).toContain("Came from the watched folder “Fieldwork” as “smith-2019.pdf”.");
   });
 
+  it("after \"Bring in the new version\" the source's files are read again and the new file is in the list (R239 a)", async () => {
+    let added = false;
+    const withNew = { ...SOURCE_FILE, assets: [...SOURCE_FILE.assets, { ...SOURCE_FILE.assets[0]!, id: "a2", path: "Dissertation/Sources/s1/smith-2019-v2.pdf" }] };
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(added ? withNew : SOURCE_FILE)),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () =>
+        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: added ? "in-library" : "changed", local: true }] }),
+      ),
+      http.post(url("/projects/:id/sources/:sid/watch-origin/action"), () => {
+        added = true;
+        return HttpResponse.json({ done: "attached", sourceId: "s1" });
+      }),
+    );
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    const files = async () => (await within(region).findByRole("heading", { name: "Files" })).nextElementSibling as HTMLElement;
+    expect(within(await files()).getAllByRole("listitem")).toHaveLength(1);
+    await userEvent.click(await within(region).findByRole("button", { name: /^Bring in the new version/ }));
+    await waitFor(async () => expect(within(await files()).getAllByRole("listitem")).toHaveLength(2));
+    expect(within(region).getByText("smith-2019-v2.pdf")).toBeTruthy();
+  });
+
   it("says in words that the source is no longer available at its source, with the date noticed; nothing while it is available (Task 69, D17)", async () => {
     const gone = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, availability: { status: "unavailable-on-platform", firstNoticedAt: NOTICED_AT } } };
     server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(gone)), http.get(url("/styles"), () => HttpResponse.json(STYLES)));

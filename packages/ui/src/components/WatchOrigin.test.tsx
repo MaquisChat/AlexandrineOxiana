@@ -1,7 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { SourceWatchOriginResponse, WatchedFileActionRequest, WatchedSourceOrigin } from "@ao/shared";
 import { server, serviceError, testApi, url, useMockService } from "../test/service";
 import { WatchOrigin } from "./WatchOrigin";
@@ -55,7 +55,9 @@ function service(first: WatchedSourceOrigin[] | (() => WatchedSourceOrigin[])) {
   };
 }
 
-const ui = (props: { sourceId?: string; readOnly?: boolean } = {}) => <WatchOrigin api={testApi().watchedFolders} projectId="p1" sourceId={props.sourceId ?? "s1"} readOnly={props.readOnly ?? false} />;
+const ui = (props: { sourceId?: string; readOnly?: boolean; onChanged?: () => void } = {}) => (
+  <WatchOrigin api={testApi().watchedFolders} projectId="p1" sourceId={props.sourceId ?? "s1"} readOnly={props.readOnly ?? false} {...(props.onChanged ? { onChanged: props.onChanged } : {})} />
+);
 
 describe("WatchOrigin", () => {
   it("a source from no folder shows nothing at all and makes one read", async () => {
@@ -109,6 +111,100 @@ describe("WatchOrigin", () => {
     expect(keep.isConnected).toBe(false);
   });
 
+  it("onChanged is called once after a file was added, and not after a keep, a refusal or an already-there answer (R239 a)", async () => {
+    const onChanged = vi.fn();
+    const svc = service([origin()]);
+    svc.acting(() => {
+      svc.set([origin({ state: "in-library" })]);
+      return HttpResponse.json({ done: "attached", sourceId: "s1" });
+    });
+    const user = userEvent.setup();
+    const { unmount } = render(ui({ onChanged }));
+    await user.click(await screen.findByRole("button", { name: new RegExp(`^${BRING}`) }));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("The new version was added to this source."));
+    expect(onChanged).toHaveBeenCalledTimes(1);
+    unmount();
+
+    const other = vi.fn();
+    const svc2 = service([origin()]);
+    svc2.acting(() => HttpResponse.json({ done: "settled", sourceId: "s1" }));
+    const r2 = render(ui({ onChanged: other }));
+    await user.click(await screen.findByRole("button", { name: new RegExp(`^${KEEP}`) }));
+    await waitFor(() => expect(svc2.seen.reads).toBe(2));
+    r2.unmount();
+
+    const svc3 = service([origin()]);
+    svc3.acting(() => HttpResponse.json({ done: "already-there", sourceId: "s1" }));
+    render(ui({ onChanged: other }));
+    await user.click(await screen.findByRole("button", { name: new RegExp(`^${BRING}`) }));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("The library already has this version of the file. Nothing was added."));
+    expect(other).not.toHaveBeenCalled();
+  });
+
+  it("after an act whose buttons go away, focus is on the region's heading; after a refusal it stays on the button pressed (R145)", async () => {
+    const svc = service([origin()]);
+    svc.acting(() => {
+      svc.set([origin({ state: "settled" })]);
+      return HttpResponse.json({ done: "settled", sourceId: "s1" });
+    });
+    const user = userEvent.setup();
+    const { unmount } = render(ui());
+    await user.click(await screen.findByRole("button", { name: new RegExp(`^${KEEP}`) }));
+    const heading = await screen.findByRole("heading", { name: "Watched folder" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    expect(heading.getAttribute("tabindex")).toBe("-1");
+    unmount();
+
+    const svc2 = service([origin()]);
+    svc2.acting(() => serviceError(503, "UNAVAILABLE", "The folder did not answer. Try again when it is reachable."));
+    render(ui());
+    const keep = await screen.findByRole("button", { name: new RegExp(`^${KEEP}`) });
+    await user.click(keep);
+    await screen.findByRole("alert");
+    expect(document.activeElement).toBe(keep);
+  });
+
+  it("a removed folder offers no bring-in and no download advice, only keeping", async () => {
+    service([origin({ folderRemoved: true, folderLabel: "", local: false })]);
+    render(ui());
+    const region = await screen.findByRole("region", { name: "Watched folder" });
+    expect(within(region).queryByRole("button", { name: new RegExp(`^${BRING}`) })).toBeNull();
+    expect(region.textContent).not.toContain("Download it with your cloud drive's app");
+    expect(within(region).getByRole("button", { name: new RegExp(`^${KEEP}`) })).toBeTruthy();
+  });
+
+  it("the locked sentence is visible once", async () => {
+    const svc = service([origin()]);
+    svc.acting(() => serviceError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed."));
+    const user = userEvent.setup();
+    render(ui());
+    await user.click(await screen.findByRole("button", { name: new RegExp(`^${KEEP}`) }));
+    await screen.findByRole("alert");
+    expect(screen.getAllByText("This project is locked. Its passphrase is needed.")).toHaveLength(1);
+  });
+
+  it("Try again is off while it reads: a double click makes one read", async () => {
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    server.use(
+      http.get(url(ORIGIN), async () => {
+        reads++;
+        if (reads === 1) return serviceError(500, "INTERNAL", "boom");
+        await gate;
+        return HttpResponse.json({ origins: [] });
+      }),
+    );
+    const user = userEvent.setup();
+    render(ui());
+    const again = await screen.findByRole("button", { name: "Try again" });
+    await user.click(again);
+    await user.click(again);
+    release();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Try again" })).toBeNull());
+    expect(reads).toBe(2);
+  });
+
   it("\"Keep the library's copy as it is\" sends keep-as-it-is and says so", async () => {
     const svc = service([origin()]);
     svc.acting(() => {
@@ -123,14 +219,14 @@ describe("WatchOrigin", () => {
     await waitFor(() => expect(svc.seen.reads).toBe(2));
   });
 
-  it("may-have-changed offers no reading: the sentence, no bring-in button", async () => {
+  it("may-have-changed offers no reading: the sentence and no button at all", async () => {
     service([origin({ state: "may-have-changed", local: false })]);
     render(ui());
     const region = await screen.findByRole("region", { name: "Watched folder" });
     expect(region.textContent).toContain(
       "The file in the folder was replaced or edited, but it is not downloaded to this Mac, so the app cannot yet tell what changed. The library's copy is unchanged.",
     );
-    expect(within(region).queryByRole("button", { name: new RegExp(`^${BRING}`) })).toBeNull();
+    expect(within(region).queryByRole("button")).toBeNull();
   });
 
   it("gone says the library's copy is unchanged and offers only to keep it", async () => {

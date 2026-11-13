@@ -143,6 +143,8 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   const [recheckNote, setRecheckNote] = useState<string | undefined>();
   const [pictures, setPictures] = useState<Record<string, Picture>>({});
   const [retry, setRetry] = useState<RetryState>({ state: "idle" });
+  /** Bumped when a file was added to this source from its watched folder: the record is read again (R239 a). */
+  const [reloads, setReloads] = useState(0);
   const id = useId();
 
   // Read again only when the source changes (not when the parent re-renders with a new api object).
@@ -202,7 +204,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     return () => {
       live = false;
     };
-  }, [projectId, sourceId, refreshKey, failed]);
+  }, [projectId, sourceId, refreshKey, reloads, failed]);
 
   const src = file?.source;
   const variants = src?.title?.variants ?? [];
@@ -424,7 +426,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
         {file && src && <TranscriptLink projectId={projectId} assets={file.assets} sourceId={sourceId} />}
         {file && src && <ReaderLink projectId={projectId} sourceId={sourceId} assets={file.assets} />}
       </div>
-      {file && src && <WatchOrigin api={api.watchedFolders} projectId={projectId} sourceId={sourceId} readOnly={readOnly} />}
+      {file && src && <WatchOrigin api={api.watchedFolders} projectId={projectId} sourceId={sourceId} readOnly={readOnly} onChanged={() => { setReloads((n) => n + 1); changedRef.current?.(); }} />}
       {error && (
         <p role="alert" className="ao-error">
           {error}
