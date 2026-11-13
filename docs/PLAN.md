@@ -575,8 +575,10 @@ Update after every task; commit and push.
 | R1 Reader: anchor, annotation and colour model | complete (on the reader branch) | e188c3c (merge) | reviewed with probes over one fix round (R195; plan Amendments A1–A4); verification clean |
 | R5 Reader: ranged PDF route and the client's range reader | approved; verification running | 6181d6c (worktree branch) | reviewed with probes over one fix round; end-to-end in both browsers |
 | R2 Reader: the Zotero import keeps the sort index; re-import respects changes | fix round 1 | 629b8d0 (worktree branch) | review: the hash unchanged on 5,000 annotations; the back-fill must also reach items Zotero did not change (R196) |
-| R3 Reader: governed annotation operations in the library | approved; a small round (one ruling, two tests) | 3f58c53 (worktree branch) | reviewed with twelve probes; plan Amendment A5 |
-| R4, R6–R13 Reader: the remaining tasks | not started | | order: R6 after R5, R4 after R3, R7 after R6, then R8, R9, R10 and R12, R11, R13 (optional) |
+| R3 Reader: governed annotation operations in the library | approved; waits for verification | df35cf3 (worktree branch) | reviewed with twelve probes; a recolour to the same colour is no change (A5) |
+| R4 Reader: annotation routes in the service | in progress | | dispatched 2026-11-13 on top of R3's approved branch |
+| R6 Reader: pdf.js in the interface, bundled, under the policy | in progress | | dispatched 2026-11-13 on top of R5's approved branch |
+| R7–R13 Reader: the remaining tasks | not started | | order: R7 after R6, then R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
