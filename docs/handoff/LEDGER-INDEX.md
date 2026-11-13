@@ -135,3 +135,4 @@ R210 (2026-11-13): Zotero sync — the remembered version is held back only by p
 R211 (2026-11-13): reader R8 — the "changed" rule gathers text rectangle by rectangle (columns, footnote marks); item boxes at least the font size; rectangles on blank paper of a text page are changed.
 R212 (2026-11-13): Zotero Z2 after review — a resumed batch records the lowest version read; what a complete scan is; absence alone never makes an item gone (a second, complete key list at the same version); honest notes.
 R213 (2026-11-13): cloud folders W2 after review — fs.watch accepted, chokidar removed; sidecars like any file; every open guarded; one watcher per tree on macOS; stuck folders stay stuck; the re-check once a minute.
+R214 (2026-11-13): Zotero Z2 — the key list whole by its own evidence, at any version; a full run without it is not finished and records no version.
