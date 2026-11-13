@@ -574,9 +574,9 @@ Update after every task; commit and push.
 | 73 The audit says which field was confirmed (D20) | complete | 0e890cd (merge) | R191; reviewed with 18 probes; D20 closed |
 | R1 Reader: anchor, annotation and colour model | complete (on the reader branch) | e188c3c (merge) | reviewed with probes over one fix round (R195; plan Amendments A1–A4); verification clean |
 | R5 Reader: ranged PDF route and the client's range reader | complete (on the reader branch) | 4f4c7c6 (merge) | reviewed with probes over one fix round; end-to-end in both browsers; for the owner's Mac check: the Range preflight in the macOS web view |
-| R2 Reader: the Zotero import keeps the sort index; re-import respects changes | approved; verification running | f784336 (worktree branch) | reviewed with probes over two rounds (R196, R197) |
-| R3 Reader: governed annotation operations in the library | approved; taking the reader branch (one conflict with R5) | df35cf3 (worktree branch) | reviewed with twelve probes; a recolour to the same colour is no change (A5) |
-| R4 Reader: annotation routes in the service | in review | da3829c (worktree branch, on R3's) | four routes; shared request and response types |
+| R2 Reader: the Zotero import keeps the sort index; re-import respects changes | approved; verification with R3 running | f784336 (worktree branch) | reviewed with probes over two rounds (R196, R197) |
+| R3 Reader: governed annotation operations in the library | approved; verification with R2 running | 7295e2b (worktree branch) | reviewed with twelve probes; a recolour to the same colour is no change (A5) |
+| R4 Reader: annotation routes in the service | fix round 1 | da3829c (worktree branch, on R3's) | review: optional answer fields must break the build when renamed; grouping by document to test; note rules (R198) |
 | R6 Reader: pdf.js in the interface, bundled, under the policy | in progress | | dispatched 2026-11-13 on top of R5's approved branch |
 | R7–R13 Reader: the remaining tasks | not started | | order: R7 after R6, then R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
