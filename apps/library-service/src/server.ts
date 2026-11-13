@@ -78,6 +78,8 @@ export interface ServiceOptions {
   folderGrants?: FolderGrants;
   /** Test seam (honoured only under NODE_ENV=test or VITEST, R47): where the cloud drives are, for the watched-folder routes. */
   watchLocationEnv?: LocationEnv;
+  /** Test seam (NODE_ENV=test or VITEST only, R47): the watched-folder routes' time limit for a folder's file calls. */
+  watchFsTimeoutMs?: number;
 }
 
 export interface LibraryService {
@@ -294,7 +296,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   });
   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
 
-  const ctx = { state, pairing, token: opts.token, folderGrants, ...(opts.watchLocationEnv ? { watchLocationEnv: opts.watchLocationEnv } : {}), ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}), ...(opts.readerPdfMaxBytes !== undefined ? { readerPdfMaxBytes: opts.readerPdfMaxBytes } : {}), ...(opts.documentBeforeRead ? { documentBeforeRead: opts.documentBeforeRead } : {}) };
+  const ctx = { state, pairing, token: opts.token, folderGrants, ...(opts.watchLocationEnv ? { watchLocationEnv: opts.watchLocationEnv } : {}), ...(opts.watchFsTimeoutMs !== undefined ? { watchFsTimeoutMs: opts.watchFsTimeoutMs } : {}), ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}), ...(opts.readerPdfMaxBytes !== undefined ? { readerPdfMaxBytes: opts.readerPdfMaxBytes } : {}), ...(opts.documentBeforeRead ? { documentBeforeRead: opts.documentBeforeRead } : {}) };
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
@@ -353,7 +355,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 }
 
-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; folderGrants: FolderGrants; watchLocationEnv?: LocationEnv; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void>; readerPdfMaxBytes?: number; documentBeforeRead?: () => Promise<void> };
+export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; folderGrants: FolderGrants; watchLocationEnv?: LocationEnv; watchFsTimeoutMs?: number; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void>; readerPdfMaxBytes?: number; documentBeforeRead?: () => Promise<void> };
 
 /** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
 function decodedPath(path: string): string {

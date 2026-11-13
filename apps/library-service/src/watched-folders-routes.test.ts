@@ -5,6 +5,17 @@
  * and checked for absolute paths (only `place.display` may hold one, R96).
  */
 import { randomBytes } from "node:crypto";
+
+// R233 I2: `realpath` can be made never to answer for one folder (from its n-th call on), until released.
+const holdFs = vi.hoisted(() => ({ path: "", from: 1, calls: 0, held: null as Promise<void> | null }));
+vi.mock("node:fs/promises", async (orig) => {
+  const real = await orig<typeof import("node:fs/promises")>();
+  const realpath = (async (p: unknown, ...rest: unknown[]) => {
+    if (holdFs.path && String(p) === holdFs.path && ++holdFs.calls >= holdFs.from && holdFs.held) await holdFs.held;
+    return (real.realpath as (...a: unknown[]) => unknown)(p, ...rest);
+  }) as typeof real.realpath;
+  return { ...real, default: { ...real, realpath }, realpath };
+});
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +27,7 @@ import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { FolderGrants } from "./folder-grants.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 import { WatchStatusCoalescer, coalescerOf, fileItemOf, placeOf } from "./routes/watched-folders.js";
+import type { Session } from "./state.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const PASS = "correct horse battery staple";
@@ -139,6 +151,7 @@ async function sourceIds(pid: string): Promise<string[]> {
 }
 
 beforeEach(async () => {
+  Object.assign(holdFs, { path: "", from: 1, calls: 0, held: null });
   tmp = await mkdtemp(join(tmpdir(), "ao-wf-routes-"));
   deps = testDeps(tmp);
   answers.length = 0;
@@ -450,12 +463,12 @@ describe("choices: pause and download (W4, R219, R221)", () => {
     await mkdir(file);
     const half = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: "Third", paused: false } });
     expect(half.status, half.body).toBe(503);
-    expect(half.json.error.message).toBe("The name or collection of the folder was changed, but this computer's choice (pause, or files not downloaded) was not: this computer's choices for watched folders could not be read. Try again.");
+    expect(half.json.error.message).toBe("The folder's name or collection was changed. Its pause or download choice was not saved, because this computer's settings for watched folders could not be read. Try again.");
     await rm(file, { recursive: true, force: true });
     expect((await summary(pid, wid)).label).toBe("Third");
   });
 
-  it("a new collection reaches the running watch: that one watch restarts and new files land in it", async () => {
+  it("a new collection reaches the running watch without a restart, and new files land in it (R233 I3)", async () => {
     await openNewLibrary();
     const pid = await newProject();
     const c = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Arrivals" } });
@@ -468,11 +481,10 @@ describe("choices: pause and download (W4, R219, R221)", () => {
     const keep = watches().find((w) => w.status().watchId === other)!;
     const label = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: "Only a name" } });
     expect(label.status).toBe(200);
-    expect(old.stopped).toBe(false); // a label alone is not the engine's business
     expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { collectionId: cid } })).status).toBe(200);
-    expect(old.stopped).toBe(true);
+    expect(old.stopped).toBe(false);
     expect(keep.stopped).toBe(false);
-    expect(watches().filter((w) => !w.stopped).map((w) => w.status().watchId).sort()).toEqual([wid, other].sort());
+    expect(watches().filter((w) => w.status().watchId === wid)).toEqual([old]);
     await pdf(join(dir, "arrival.pdf"), "A File For The New Collection");
     const sid = await until(async () => (await sourceIds(pid))[0], 30_000, "the source");
     expect((await svc!.state.session!.repo.getSource(pid, sid)).source.collectionIds).toEqual([cid]);
@@ -532,7 +544,7 @@ describe("set again, retry, remove", () => {
     const reason = WATCH_REASONS.notResponding.replace("{provider}", "the system");
     const stuckStatus: WatchStatus = { watchId: wid, state: "unreachable", reason, provider: null, scanning: false, counts: { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 } };
     const stop = vi.fn(async () => {});
-    const stuck: FolderWatch = { ready: Promise.resolve(), stopped: false, stop, status: () => stuckStatus, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {} };
+    const stuck: FolderWatch = { ready: Promise.resolve(), stopped: false, stop, status: () => stuckStatus, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {} };
     s.watches.set(pid, [stuck]);
     const r = await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` });
     expect(r.status, r.body).toBe(200);
@@ -837,5 +849,190 @@ describe("watch.status (Accept 6)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("fix round 1 (R233)", () => {
+  const states = async (pid: string) => ((await call({ url: `/projects/${pid}/watched-folders` })).json.folders as WatchedFolderSummary[]).map((f) => [f.state, f.reason]);
+  const answersWithin = async (p: Promise<{ status: number }>, ms: number) => Promise.race([p.then((r) => r.status), new Promise((r) => setTimeout(() => r("no answer"), ms))]);
+
+  it("I1: retry, remove-then-add elsewhere, set-folder and a collection change IMMEDIATELY after an add: the next watch runs; a close then answers", async () => {
+    await start();
+    await openNewLibrary();
+    const a = await newProject(false, "A");
+    const b = await newProject(false, "B");
+    const c = await call({ method: "POST", url: `/projects/${a}/collections`, body: { name: "C" } });
+    const cid = (c.json.id ?? c.json.collection?.id) as string;
+    // Retry at once.
+    const d1 = await folder("Retry");
+    const w1 = (await add(a, d1)).json.id as string;
+    expect((await call({ method: "POST", url: `/projects/${a}/watched-folders/${w1}/retry` })).status).toBe(200);
+    // Remove at once, then add the same folder to another project.
+    const d2 = await folder("Moved");
+    const w2 = (await add(a, d2)).json.id as string;
+    expect((await call({ method: "DELETE", url: `/projects/${a}/watched-folders/${w2}` })).status).toBe(200);
+    const w2b = (await add(b, d2)).json.id as string;
+    // Set-folder at once.
+    const d3 = await folder("Set");
+    const w3 = (await add(a, d3)).json.id as string;
+    expect((await call({ method: "PUT", url: `/projects/${a}/watched-folders/${w3}/folder`, body: { grantId: grant(d3) } })).status).toBe(200);
+    // A collection change at once.
+    const d4 = await folder("Coll");
+    const w4 = (await add(a, d4)).json.id as string;
+    expect((await call({ method: "PATCH", url: `/projects/${a}/watched-folders/${w4}`, body: { collectionId: cid } })).status).toBe(200);
+    await until(async () => {
+      const all = [...(await states(a)), ...(await states(b))];
+      return all.length === 4 && all.every(([st]) => st === "watching");
+    }, 10_000, "every folder watching");
+    for (const [pid, wid] of [[a, w1], [b, w2b], [a, w3], [a, w4]] as const) expect((await summary(pid, wid)).reason).toBeUndefined();
+    const t0 = Date.now();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  }, 60_000);
+
+  it("I2: an add whose folder never answers is refused after the limit; other projects' changes and reads answer meanwhile; nothing happens twice", async () => {
+    await start({ watchFsTimeoutMs: 400 });
+    await openNewLibrary();
+    const a = await newProject(false, "A");
+    const b = await newProject(false, "B");
+    const wa = (await add(a, await folder("Fine"))).json.id as string;
+    const wa2 = (await add(a, await folder("Fine2"))).json.id as string;
+    const stuck = await folder("Stuck");
+    let release: () => void = () => {};
+    Object.assign(holdFs, { path: stuck, from: 1, calls: 0, held: new Promise<void>((r) => (release = r)) });
+    const pending = add(b, stuck);
+    await until(async () => holdFs.calls > 0, 5000, "the stuck call");
+    expect(await answersWithin(call({ method: "POST", url: `/projects/${a}/watched-folders/${wa2}/retry` }), 1000)).toBe(200);
+    expect(await answersWithin(call({ method: "DELETE", url: `/projects/${a}/watched-folders/${wa}` }), 1000)).toBe(200);
+    expect(await answersWithin(call({ url: `/projects/${b}/watched-folders` }), 1000)).toBe(200);
+    const r = await pending;
+    expect([r.status, r.json.error.message]).toEqual([400, "That folder did not answer. Choose it again when it can be reached."]);
+    release();
+    await new Promise((res) => setTimeout(res, 500));
+    expect((await call({ url: `/projects/${b}/watched-folders` })).json.folders).toEqual([]);
+    expect(grants.size).toBe(0);
+  }, 30_000);
+
+  it("I2: the library's own check of the folder under the same limit: nothing is stored when it answers late", async () => {
+    await start({ watchFsTimeoutMs: 400 });
+    await openNewLibrary();
+    const b = await newProject();
+    const stuck = await folder("Late");
+    let release: () => void = () => {};
+    // The route's own realpath answers; the library's check (the next call) does not.
+    Object.assign(holdFs, { path: stuck, from: 2, calls: 0, held: new Promise<void>((r) => (release = r)) });
+    const r = await add(b, stuck);
+    expect([r.status, r.json.error.message]).toEqual([400, "That folder did not answer. Choose it again when it can be reached."]);
+    holdFs.path = "";
+    release();
+    await new Promise((res) => setTimeout(res, 500));
+    expect((await call({ url: `/projects/${b}/watched-folders` })).json.folders).toEqual([]);
+    expect(await readFile(join(deps.appConfigDir, "watched-folders.json"), "utf8").catch(() => "")).not.toContain(b);
+    // The queue moved on: the folder can be added now.
+    expect((await add(b, stuck)).status).toBe(201);
+  }, 30_000);
+
+  it("I2: a stop that never settles is not waited for: the remove answers and the folder is gone", async () => {
+    await start({ watchFsTimeoutMs: 400 });
+    await openNewLibrary();
+    const pid = await newProject();
+    const wid = (await add(pid, await folder("Hang"))).json.id as string;
+    const s = svc!.state.session!;
+    await s.watches.get(pid)![0]!.stop();
+    const st: WatchStatus = { watchId: wid, state: "watching", provider: null, scanning: false, counts: { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 } };
+    const hung: FolderWatch = { ready: Promise.resolve(), stopped: false, stop: () => new Promise(() => {}), status: () => st, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {} };
+    s.watches.set(pid, [hung]);
+    expect(await answersWithin(call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${wid}` }), 2000)).toBe(200);
+    expect((await call({ url: `/projects/${pid}/watched-folders` })).json.folders).toEqual([]);
+  });
+
+  it("M1: a grant named in a request is spent whatever else is wrong with it", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const dir = await folder("Spent");
+    await add(pid, dir);
+    const cases: Array<[string, (g: string) => Promise<{ status: number }>]> = [
+      ["a path key", (g) => call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { grantId: g, dir } })],
+      ["an unknown key", (g) => call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { grantId: g, colour: "red" } })],
+      ["a collection not in the project", (g) => call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { grantId: g, collectionId: "01ZZZZZZZZZZZZZZZZZZZZZZZZ" } })],
+      ["a bad label", (g) => call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { grantId: g, label: "" } })],
+      ["an unknown watch", (g) => call({ method: "PUT", url: `/projects/${pid}/watched-folders/0193a1f2-7c4e-7b11-9d2a-5e6f7a8b9c0d/folder`, body: { grantId: g } })],
+    ];
+    for (const [what, req] of cases) {
+      const g = grant(await folder(`S${what.length}`));
+      expect((await req(g)).status, what).toBeGreaterThanOrEqual(400);
+      expect(grants.size, what).toBe(0);
+    }
+    // A read-only library spends it too.
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const now = new Date().toISOString();
+    await writeFile(join(path, ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).json.mode).toBe("read-only");
+    grant(dir); // never named by a request: kept
+    const g2 = grant(dir);
+    expect((await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { grantId: g2 } })).status).toBe(409);
+    expect(grants.size).toBe(1); // the first, never named, is still held; the named one is spent
+  });
+
+  it("M2: a folder whose name starts with \"..\" is inside, and a parent of a library named \"..Lib\" holds it", async () => {
+    await start();
+    const lib = await openNewLibrary("..Lib");
+    const pid = await newProject();
+    await mkdir(join(lib, "..inner"));
+    for (const dir of [join(lib, "..inner"), tmp]) {
+      const r = await add(pid, dir);
+      expect([r.status, r.json.error.message], dir).toEqual([400, WATCH_REASONS.library]);
+    }
+  });
+
+  it("M4/M5: a late status from a closed library leaves the open library's coalescer alone; a removed folder leaves nothing", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const wid = (await add(pid, await folder("Keep"))).json.id as string;
+    const co = coalescerOf(svc!.state)!;
+    await until(async () => co.size > 0, 5000, "a status");
+    const before = co.size;
+    const st: WatchStatus = { watchId: "x", state: "stopped", provider: null, scanning: false, counts: { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 } };
+    svc!.state.onWatchStatus!({} as Session, pid, st);
+    expect(co.size).toBe(before);
+    expect((await call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${wid}` })).status).toBe(200);
+    expect(co.size).toBe(0);
+  });
+
+  it("M8: a remove whose device list cannot be read leaves the folder watched; a remove whose choices cannot be cleaned up says removed", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const wid = (await add(pid, await folder("Half"))).json.id as string;
+    const watch = svc!.state.session!.watches.get(pid)!.find((w) => w.status().watchId === wid)!;
+    const list = join(deps.appConfigDir, "watched-folders.json");
+    const saved = await readFile(list, "utf8");
+    await rm(list);
+    await mkdir(list);
+    const r = await call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${wid}` });
+    expect(r.status).toBe(503);
+    expect(watch.stopped).toBe(false);
+    await rm(list, { recursive: true });
+    await writeFile(list, saved);
+    expect((await summary(pid, wid)).state).toBe("watching");
+    const choices = join(deps.appConfigDir, "watched-folder-choices.json");
+    await rm(choices, { force: true });
+    await mkdir(choices);
+    const ok = await call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${wid}` });
+    expect([ok.status, ok.json]).toEqual([200, { removed: true }]);
+    expect((await call({ url: `/projects/${pid}/watched-folders` })).json.folders).toEqual([]);
+    await rm(choices, { recursive: true });
+  });
+
+  it("M11 and the reviewer's sentences", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const wid = (await add(pid, await folder("Words"))).json.id as string;
+    expect((await call({ url: `/projects/${pid}/watched-folders/${wid}/files?offset=-1` })).json.error.message).toBe('"offset" must be a whole number, 0 or more.');
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: "" } })).json.error.message).toBe("The name must be 1 to 200 characters.");
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { confirmBytes: 1 } })).json.error.message).toBe("A size can be given only with “Download and import them”.");
   });
 });

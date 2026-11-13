@@ -27,6 +27,7 @@ import {
   WATCH_REASONS,
   WatchedFoldersUnreadableError,
   addWatchedFolder,
+  folderRuleRefusal,
   bringInNewVersion,
   classifyLocation,
   getWatchChoices,
@@ -78,6 +79,14 @@ true satisfies Same<WatchStatus["counts"], WatchedFolderSummary["counts"]>;
 
 /** At most one `watch.status` per folder in this time (the plan's WATCH_STATUS_INTERVAL_MS). */
 export const WATCH_STATUS_INTERVAL_MS = 1000;
+/**
+ * R233 I2: how long the file calls made while a grant is redeemed (and the library's own checks of the folder in its
+ * add and set-folder) may take. Past it the request answers `notAnswering`, nothing is stored, and the queue moves on;
+ * the stuck call's thread stays held until the call settles (A3 d), but nothing waits for it.
+ */
+export const WATCH_ROUTE_FS_LIMIT_MS = 10_000;
+/** R233 I2: how long a route waits for a watch to stop before it goes on (the engine finishes the stop by itself, A6). */
+export const WATCH_ROUTE_STOP_LIMIT_MS = 3000;
 /** As many problems as the engine keeps (its WATCH_PROBLEMS_MAX): `…/files` sorts them all. */
 const PROBLEMS_ALL = 5000;
 
@@ -92,10 +101,15 @@ export const WATCH_ROUTE_TEXT = {
   sizeChanged: "The number of files not downloaded has changed. Look at the new size and choose again.",
   nothing: "There is nothing to download in this folder at the moment.",
   noCollection: "That collection is not in this project.",
-  halfDone: "The name or collection of the folder was changed, but this computer's choice (pause, or files not downloaded) was not: ",
-  confirmAlone: "A size to agree to goes only with “Download and import them”.",
+  halfDoneUnreadable: "The folder's name or collection was changed. Its pause or download choice was not saved, because this computer's settings for watched folders could not be read. Try again.",
+  halfDone: "The folder's name or collection was changed. Its pause or download choice was not saved. Try again.",
+  confirmAlone: "A size can be given only with “Download and import them”.",
   nothingToChange: "There is nothing to change.",
-  notSetUp: "This folder has not been chosen on this computer. Choose it again.",
+  notSetUp: "This folder has not been chosen on this computer yet. Choose it with “Choose the folder…”.",
+  notAnswering: "That folder did not answer. Choose it again when it can be reached.",
+  notUsable: "That folder could not be used. Choose it again.",
+  label: "The name must be 1 to 200 characters.",
+  offset: '"offset" must be a whole number, 0 or more.',
   readOnly: "This library is open read-only, so no folder is watched.",
   changed: "The file in the folder has changed since it was brought in. The library's copy is unchanged.",
   mayHaveChanged: "The file in the folder was replaced or edited, but it is not downloaded to this Mac, so the app cannot yet tell what changed. The library's copy is unchanged.",
@@ -121,7 +135,8 @@ function below(child: string, parent: string, env: LocationEnv): string[] | null
   const c = P.normalize(child);
   const rel = P.relative(fold(P.normalize(parent)), fold(c));
   if (rel === "") return [];
-  if (rel.startsWith("..") || P.isAbsolute(rel)) return null;
+  // A name that merely starts with ".." (`..inner`) is inside (R233 M2): only ".." itself or "../…" is outside.
+  if (rel === ".." || rel.startsWith(`..${P.sep}`) || P.isAbsolute(rel)) return null;
   const n = rel.split(P.sep).length;
   const parts = c.split(P.sep).filter((s) => s !== "");
   return parts.slice(parts.length - n);
@@ -202,42 +217,84 @@ function onlyKeys(b: Obj, keys: readonly string[]): void {
 }
 
 /**
- * The real path of a grant, checked (A5, A3, Accept 2). The grant is taken first, once: whatever is refused after,
- * it is spent. No sentence names the path or the folder.
+ * Takes the grant a request names, FIRST (R233 M1: a request that names a grant spends it, whatever else is wrong with
+ * it). Null when the body names none, or nothing that could be one. Never logs or answers the path.
  */
-async function redeem(ctx: Ctx, s: Session, grantId: unknown): Promise<string> {
-  const expired = () => badRequest(WATCH_ROUTE_TEXT.expired);
-  if (typeof grantId !== "string" || !GRANT_ID.test(grantId)) throw expired();
-  const given = ctx.folderGrants.take(grantId);
-  if (given === null) throw expired();
+function takeGrant(ctx: Ctx, body: unknown): string | null {
+  const id = body && typeof body === "object" && !Array.isArray(body) ? (body as Obj).grantId : undefined;
+  if (typeof id !== "string" || !GRANT_ID.test(id)) return null;
+  return ctx.folderGrants.take(id);
+}
+
+/** The folder did not answer within the route's limit (R233 I2). */
+class NotAnswering extends Error {}
+
+/** `p`, or NotAnswering after `ms` (and `ac` aborted); a late answer or failure of `p` is dropped. */
+function withLimit<T>(p: Promise<T>, ms: number, ac?: AbortController): Promise<T> {
+  p.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_r, reject) => {
+    timer = setTimeout(() => {
+      ac?.abort();
+      reject(new NotAnswering());
+    }, ms);
+    timer.unref?.();
+  });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
+const fsLimit = (ctx: Ctx) => {
+  const testing = process.env.NODE_ENV === "test" || process.env.VITEST !== undefined;
+  return testing && ctx.watchFsTimeoutMs !== undefined ? ctx.watchFsTimeoutMs : WATCH_ROUTE_FS_LIMIT_MS;
+};
+const stopLimit = (ctx: Ctx) => Math.min(WATCH_ROUTE_STOP_LIMIT_MS, fsLimit(ctx));
+
+/**
+ * The real path of a grant's folder, checked (A5, A3, Accept 2), each file call under the route's limit (R233 I2). The
+ * grant was taken already: whatever is refused here, it is spent. No sentence names the path or the folder.
+ */
+async function checkGranted(ctx: Ctx, s: Session, given: string): Promise<string> {
+  const ms = fsLimit(ctx);
   let real: string;
   try {
-    real = await realpath(given);
-  } catch {
-    throw badRequest(WATCH_ROUTE_TEXT.notFound);
+    real = await withLimit(realpath(given), ms);
+  } catch (err) {
+    throw badRequest(err instanceof NotAnswering ? WATCH_ROUTE_TEXT.notAnswering : WATCH_ROUTE_TEXT.notFound);
   }
   let isDir: boolean;
   try {
-    isDir = (await stat(real)).isDirectory();
-  } catch {
-    throw badRequest(WATCH_ROUTE_TEXT.notFound);
+    isDir = (await withLimit(stat(real), ms)).isDirectory();
+  } catch (err) {
+    throw badRequest(err instanceof NotAnswering ? WATCH_ROUTE_TEXT.notAnswering : WATCH_ROUTE_TEXT.notFound);
   }
   if (!isDir) throw badRequest(WATCH_ROUTE_TEXT.notFolder);
   const env = locationEnv(ctx);
-  const P = pathFor(env.platform);
   // The library: not it, not inside it, not holding it (both as real paths).
   const libRoot = await realpath(s.lib.root).catch(() => path.resolve(s.lib.root));
   if (below(real, libRoot, env) !== null || below(libRoot, real, env) !== null) throw badRequest(WATCH_REASONS.library);
-  // The whole cloud-storage area (A3): neither is it nor holds it (the home folder and ~/Library hold it).
-  const homes = [env.homeDir, await realpath(env.homeDir).catch(() => env.homeDir)];
-  for (const home of homes) {
-    for (const area of [P.join(home, "Library", "CloudStorage"), P.join(home, "Library", "Mobile Documents")]) {
-      if (below(area, real, env) !== null) throw badRequest(WATCH_ROUTE_TEXT.wholeDrive);
-    }
-  }
-  // Windows has no check of "on this computer" yet (R207 6).
-  if (env.platform === "win32" && providerOf(real, env) !== null) throw badRequest(WATCH_ROUTE_TEXT.windows);
+  // The one rule on where a folder may be, shared with the engine (R233 M3): the whole cloud-storage area (A3) and,
+  // on Windows, a cloud-drive folder (R207 6).
+  const homeReal = await withLimit(realpath(env.homeDir), ms).catch(() => env.homeDir);
+  const rule = folderRuleRefusal(real, env, [env.homeDir, homeReal]);
+  if (rule) throw badRequest(rule);
   return real;
+}
+
+/** The library's add or set-folder under the route's limit: a folder that stopped answering stores nothing (R233 I2). */
+async function governedFolderStep<T>(ctx: Ctx, step: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const ac = new AbortController();
+  try {
+    return await withLimit(step(ac.signal), fsLimit(ctx), ac);
+  } catch (err) {
+    if (err instanceof NotAnswering) throw badRequest(WATCH_ROUTE_TEXT.notAnswering);
+    // The library's own checks of the folder (R233 M9): plain refusals, never a 500.
+    if (err instanceof TypeError) {
+      if (err.message === WATCH_REASONS.library) throw badRequest(WATCH_REASONS.library);
+      if (err.message === "This project has no such watched folder.") throw notFound("That watched folder");
+      throw badRequest(WATCH_ROUTE_TEXT.notUsable);
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -264,10 +321,12 @@ export function watchOf(s: Session, projectId: string, wid: string): FolderWatch
 }
 
 /** Stops the watch(es) of `wid` (only that folder: the project's other watches keep running). */
-async function stopOne(s: Session, projectId: string, wid: string): Promise<void> {
+async function stopOne(ctx: Ctx, s: Session, projectId: string, wid: string): Promise<void> {
   const all = s.watches.get(projectId) ?? [];
   const mine = all.filter((w) => w.status().watchId === wid);
-  await Promise.allSettled(mine.map((w) => w.stop()));
+  // A stop that does not settle in time (a call on the folder is stuck) is not waited for: the watch has already
+  // stopped working and its settled call cleans up (A6); the queue moves on (R233 I2).
+  await Promise.race([Promise.allSettled(mine.map((w) => w.stop())), new Promise((r) => setTimeout(r, stopLimit(ctx)).unref?.())]);
   s.watches.set(
     projectId,
     (s.watches.get(projectId) ?? []).filter((w) => !mine.includes(w)),
@@ -375,18 +434,22 @@ export function fileItemOf(p: WatchFileProblem, roots: Iterable<string>): Watche
  * value of a burst is always sent (at most `intervalMs` late). `clear()` drops whatever waits.
  */
 export class WatchStatusCoalescer<T> {
-  private readonly m = new Map<string, { last: number; pending?: { v: T }; timer?: ReturnType<typeof setTimeout> }>();
+  private readonly m = new Map<string, { last: number; n: number; pending?: { v: T }; timer?: ReturnType<typeof setTimeout> }>();
   constructor(
     private readonly intervalMs: number,
-    private readonly send: (key: string, v: T) => void,
+    private readonly send: (key: string, v: T, n: number) => void,
   ) {}
+  /** Whether `n` is still the last value sent for `key` (a send overtaken, or a key forgotten, is not). */
+  latest(key: string, n: number): boolean {
+    return this.m.get(key)?.n === n;
+  }
   push(key: string, v: T): void {
     const now = Date.now();
     let e = this.m.get(key);
-    if (!e) this.m.set(key, (e = { last: Number.NEGATIVE_INFINITY }));
+    if (!e) this.m.set(key, (e = { last: Number.NEGATIVE_INFINITY, n: 0 }));
     if (!e.timer && now - e.last >= this.intervalMs) {
       e.last = now;
-      this.send(key, v);
+      this.send(key, v, ++e.n);
       return;
     }
     e.pending = { v };
@@ -403,13 +466,17 @@ export class WatchStatusCoalescer<T> {
     e.pending = undefined;
     if (!p) return;
     e.last = Date.now();
-    this.send(key, p.v);
+    this.send(key, p.v, ++e.n);
   }
   /** Drops one key and whatever waits for it (a removed folder). */
   forget(key: string): void {
     const e = this.m.get(key);
     if (e?.timer) clearTimeout(e.timer);
     this.m.delete(key);
+  }
+  /** Drops every key that starts with `prefix` (the keys of one library session, R233 M4). */
+  forgetPrefix(prefix: string): void {
+    for (const k of [...this.m.keys()]) if (k.startsWith(prefix)) this.forget(k);
   }
   has(key: string): boolean {
     return this.m.has(key);
@@ -453,15 +520,21 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
   // ---- watch.status ----
-  const seq = new Map<string, number>();
-  const coalescer = new WatchStatusCoalescer<{ s: Session; projectId: string; st: WatchStatus }>(WATCH_STATUS_INTERVAL_MS, (key, { s, projectId, st }) => {
-    const n = (seq.get(key) ?? 0) + 1;
-    seq.set(key, n);
-    const live = () => state.session === s && !state.shuttingDown && s.repo.isUnlocked(projectId) && seq.get(key) === n;
+  // Keys carry the library session's number, so a late status from a closed library touches only its own keys (M4).
+  const sessionNos = new WeakMap<Session, number>();
+  let nextNo = 0;
+  const noOf = (s: Session) => {
+    let n = sessionNos.get(s);
+    if (n === undefined) sessionNos.set(s, (n = ++nextNo));
+    return n;
+  };
+  const keyOf = (s: Session, projectId: string, wid: string) => `${noOf(s)}\u0000${projectId}\u0000${wid}`;
+  const coalescer = new WatchStatusCoalescer<{ s: Session; projectId: string; st: WatchStatus }>(WATCH_STATUS_INTERVAL_MS, (key, { s, projectId, st }, n) => {
+    const live = () => state.session === s && !state.shuttingDown && s.repo.isUnlocked(projectId) && coalescer.latest(key, n);
     if (!live()) return;
     void summaryById(ctx, s, projectId, st.watchId!, st).then(
       (folder) => {
-        // Built after awaits: published only if nothing closed, locked or overtook it meanwhile.
+        // Built after awaits: published only if nothing closed, locked, removed or overtook it meanwhile.
         if (live()) state.events.publish("watch.status", { projectId, folder } satisfies WatchStatusEvent as unknown as Record<string, unknown>);
       },
       () => {},
@@ -469,14 +542,14 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
   });
   coalescers.set(state, coalescer as WatchStatusCoalescer<unknown>);
   state.onWatchStatus = (s, projectId, st) => {
-    // A status from a library that is no longer open (its watches stop as it closes): nothing is kept for it.
+    // A status from a library that is no longer open (its watches stop as it closes): that library's keys go; the
+    // open library's are not touched.
     if (state.session !== s) {
-      coalescer.clear();
-      seq.clear();
+      coalescer.forgetPrefix(`${noOf(s)}\u0000`);
       return;
     }
     if (!st.watchId) return;
-    coalescer.push(`${projectId}\u0000${st.watchId}`, { s, projectId, st });
+    coalescer.push(keyOf(s, projectId, st.watchId), { s, projectId, st });
   };
 
   // ---- the list ----
@@ -491,6 +564,8 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
 
   // ---- add, by grant ----
   app.post("/projects/:id/watched-folders", async (req, reply): Promise<WatchedFolderSummary> => {
+    // The grant is taken first: whatever is refused below, it is spent (R233 M1).
+    const given = takeGrant(ctx, req.body);
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     requireUnlocked(s, projectId);
@@ -498,14 +573,15 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     refusePath(b);
     onlyKeys(b, ["grantId", "label", "recursive", "collectionId"]);
     const label = b.label === undefined ? undefined : typeof b.label === "string" && b.label.trim() !== "" && b.label.length <= 200 ? b.label : null;
-    if (label === null) throw badRequest('"label" must be 1 to 200 characters.');
+    if (label === null) throw badRequest(WATCH_ROUTE_TEXT.label);
     if (b.recursive !== undefined && typeof b.recursive !== "boolean") throw badRequest('"recursive" must be true or false.');
     const collectionId = b.collectionId;
     if (collectionId !== undefined && (typeof collectionId !== "string" || !(await collectionsOf(s, projectId)).has(collectionId))) throw badRequest(WATCH_ROUTE_TEXT.noCollection);
+    if (given === null) throw badRequest(WATCH_ROUTE_TEXT.expired);
     const options = { ...(label !== undefined ? { label } : {}), ...(b.recursive !== undefined ? { recursive: b.recursive as boolean } : {}), ...(collectionId !== undefined ? { collectionId: collectionId as string } : {}) };
     const w = await serial(state, async () => {
-      const real = await redeem(ctx, s, b.grantId);
-      const added = await addWatchedFolder(settingsDeps(s), projectId, real, options);
+      const real = await checkGranted(ctx, s, given);
+      const added = await governedFolderStep(ctx, (signal) => addWatchedFolder(settingsDeps(s), projectId, real, options, { signal }));
       startOne(ctx, s, projectId, added, real);
       return added;
     });
@@ -515,6 +591,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
 
   // ---- this computer's folder for a watch, by grant ----
   app.put("/projects/:id/watched-folders/:wid/folder", async (req): Promise<WatchedFolderSummary> => {
+    const given = takeGrant(ctx, req.body); // first: spent whatever is refused below (R233 M1)
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     requireUnlocked(s, projectId);
@@ -522,10 +599,13 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     refusePath(b);
     onlyKeys(b, ["grantId"]);
     const rec = await folderParam(s, projectId, req);
+    if (given === null) throw badRequest(WATCH_ROUTE_TEXT.expired);
     await serial(state, async () => {
-      const real = await redeem(ctx, s, b.grantId);
-      await setWatchFolder(settingsDeps(s), projectId, rec.id, real);
-      await stopOne(s, projectId, rec.id);
+      // Checked again inside the queue: a remove may have come first (R233 M9).
+      if (!(await listWatchedFolders(settingsDeps(s), projectId)).some((w) => w.id === rec.id)) throw notFound("That watched folder");
+      const real = await checkGranted(ctx, s, given);
+      await governedFolderStep(ctx, (signal) => setWatchFolder(settingsDeps(s), projectId, rec.id, real, { signal }));
+      await stopOne(ctx, s, projectId, rec.id);
       startOne(ctx, s, projectId, rec, real);
     });
     return summaryById(ctx, s, projectId, rec.id);
@@ -542,7 +622,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     if (b.notDownloaded !== undefined && b.notDownloaded !== "leave" && b.notDownloaded !== "download") throw badRequest('"notDownloaded" must be "leave" or "download".');
     if (b.confirmBytes !== undefined && (typeof b.confirmBytes !== "number" || !Number.isSafeInteger(b.confirmBytes) || b.confirmBytes < 0)) throw badRequest('"confirmBytes" must be a whole number of bytes.');
     if (b.confirmBytes !== undefined && b.notDownloaded !== "download") throw badRequest(WATCH_ROUTE_TEXT.confirmAlone);
-    if (b.label !== undefined && b.label !== null && (typeof b.label !== "string" || b.label.trim() === "" || b.label.length > 200)) throw badRequest('"label" must be 1 to 200 characters, or null.');
+    if (b.label !== undefined && b.label !== null && (typeof b.label !== "string" || b.label.trim() === "" || b.label.length > 200)) throw badRequest(WATCH_ROUTE_TEXT.label);
     if (b.collectionId !== undefined && b.collectionId !== null && (typeof b.collectionId !== "string" || !(await collectionsOf(s, projectId)).has(b.collectionId))) throw badRequest(WATCH_ROUTE_TEXT.noCollection);
     const rec = await folderParam(s, projectId, req);
     const options: { label?: string | null; collectionId?: string | null } = {
@@ -563,16 +643,11 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     if (Object.keys(patch).length === 0 && Object.keys(options).length === 0) throw badRequest(WATCH_ROUTE_TEXT.nothingToChange);
     // Everything is checked above; then the governed change of project.json, then this computer's choices.
     if (Object.keys(options).length > 0) {
-      const before = rec.options.collectionId;
       await serial(state, async () => {
         const u = await updateWatchedFolderEntry(s.repo, projectId, rec.id, options);
-        // The engine takes a folder's collection when its watch starts (it has no way to change it while running):
-        // a new collection restarts that one watch; a label alone is not the engine's business.
-        const running = watchOf(s, projectId, rec.id);
-        if (u.options.collectionId !== before && rec.dir && running && !running.stopped && !stuck(running.status())) {
-          await stopOne(s, projectId, rec.id);
-          startOne(ctx, s, projectId, u, rec.dir);
-        }
+        // The running watch learns its collection at once, whatever it is doing (stuck, downloading, paused): nothing
+        // restarts (R233 I3). A watch that is not running reads it from project.json when it next starts.
+        for (const w of s.watches.get(projectId) ?? []) if (!w.stopped && w.status().watchId === rec.id) w.setCollection(u.options.collectionId);
       });
     }
     if (Object.keys(patch).length > 0) {
@@ -581,8 +656,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
       } catch (err) {
         if (Object.keys(options).length === 0) throw err;
         // The governed change was made; the device choice was not: said in plain words (R227).
-        const why = err instanceof WatchedFoldersUnreadableError ? "this computer's choices for watched folders could not be read. Try again." : "it could not be saved. Try again.";
-        throw new ApiError(503, "UNAVAILABLE", WATCH_ROUTE_TEXT.halfDone + why);
+        throw new ApiError(503, "UNAVAILABLE", err instanceof WatchedFoldersUnreadableError ? WATCH_ROUTE_TEXT.halfDoneUnreadable : WATCH_ROUTE_TEXT.halfDone);
       }
       // The change holds at once (W4: otherwise a running watch reads its choices only every 10 s).
       await watchOf(s, projectId, rec.id)?.refreshChoices();
@@ -604,7 +678,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
       // status already says so in the engine's words; nothing is started.
       if (cur && !cur.stopped && stuck(cur.status())) return undefined;
       // Only this folder restarts: the engine needs no restart of the project's other watches.
-      await stopOne(s, projectId, rec.id);
+      await stopOne(ctx, s, projectId, rec.id);
       return startOne(ctx, s, projectId, rec, dir);
     });
     if (fresh) await Promise.race([fresh.ready.catch(() => {}), new Promise((r) => setTimeout(r, 5000).unref?.())]);
@@ -618,12 +692,25 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     requireUnlocked(s, projectId);
     const wid = paramsOf(req).wid ?? "";
     await serial(state, async () => {
-      if (!(await listWatchedFolders(settingsDeps(s), projectId)).some((w) => w.id === wid)) throw notFound("That watched folder");
+      // The device list is read BEFORE the watch is stopped: one that cannot be read refuses with the folder still
+      // watched and listed (R233 M8).
+      const rec = (await listWatchedFolders(settingsDeps(s), projectId)).find((w) => w.id === wid);
+      if (!rec) throw notFound("That watched folder");
       // The watch stops before its records go; the register and the sources stay (Accept 4).
-      await stopOne(s, projectId, wid);
-      await removeWatchedFolder(settingsDeps(s), projectId, wid);
-      await removeWatchChoices(settingsDeps(s), projectId, wid);
-      coalescer.forget(`${projectId}\u0000${wid}`);
+      await stopOne(ctx, s, projectId, wid);
+      try {
+        await removeWatchedFolder(settingsDeps(s), projectId, wid);
+      } catch (err) {
+        // Not removed after all: watched again, as it was (never stopped-but-listed).
+        if (rec.dir && (s.repo.getProject(projectId).watchedFolders ?? []).some((w) => w.id === wid)) startOne(ctx, s, projectId, rec, rec.dir);
+        throw err;
+      }
+      // Removed. This computer's choices for it are cleaned up when they can be; a failure here does not undo the
+      // removal (the choices of a watch that no longer exists are never read).
+      await removeWatchChoices(settingsDeps(s), projectId, wid).catch(() => {
+        app.log.warn("the choices of a removed watched folder could not be cleaned up");
+      });
+      coalescer.forget(keyOf(s, projectId, wid));
     });
     return { removed: true };
   });
@@ -636,7 +723,8 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     const q = queryOf(req);
     const kind = q.kind === undefined || q.kind === "" ? undefined : (q.kind as WatchedFileListKind);
     if (kind !== undefined && !WATCHED_FILE_LIST_KINDS.includes(kind)) throw badRequest(`"kind" must be one of: ${WATCHED_FILE_LIST_KINDS.join(", ")}.`);
-    const offset = intParam(q.offset, "offset", 0, Number.MAX_SAFE_INTEGER, 0);
+    if (q.offset !== undefined && q.offset !== "" && !/^\d{1,15}$/u.test(q.offset)) throw badRequest(WATCH_ROUTE_TEXT.offset);
+    const offset = q.offset === undefined || q.offset === "" ? 0 : Number(q.offset);
     const limit = intParam(q.limit, "limit", 1, WATCHED_FILES_LIMIT_MAX, WATCHED_FILES_LIMIT_MAX);
     const rec = await folderParam(s, projectId, req);
     const items: WatchedFolderFileItem[] = [];
