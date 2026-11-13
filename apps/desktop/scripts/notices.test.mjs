@@ -12,7 +12,7 @@ import { crateLicenceTexts, crateNotices, nodeLicenceText, npmLicenceTexts, npmN
 const pkg = (name, version, license, extra = {}) => ({ id: `${name} ${version}`, name, version, license, license_file: null, repository: `https://github.com/x/${name}`, targets: [{ kind: ["lib"] }], ...extra });
 const METADATA = {
   packages: [
-    pkg("ao-desktop", "0.0.0", "UNLICENSED"),
+    pkg("ao-desktop", "0.0.0", "AGPL-3.0-or-later"),
     pkg("tauri", "2.12.5", "Apache-2.0 OR MIT"),
     pkg("cssparser", "0.29.6", "MPL-2.0", { repository: "https://github.com/servo/rust-cssparser" }),
     pkg("tauri-build", "2.7.4", "Apache-2.0 OR MIT"),
