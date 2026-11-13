@@ -123,7 +123,7 @@ import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, WATCHED_FOLDER_TOOL, createAttac
 import { proxyQueueFor, type ProxyQueue } from "./proxies.js";
 import { SIDECAR_EXTS } from "./sidecar.js";
 import { WatchedFoldersUnreadableError, reserveWatchDownload, getWatchChoices, getWatchDownloadCount, type WatchChoices, type WatchDownloadCount } from "./watch-choices.js";
-import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, fileKey, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
+import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, fileKey, folderRuleRefusal, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
 
 /** Names never imported (moved to watch-local.ts so the two modules do not import each other; A2). */
 export { ignoredName } from "./watch-local.js";
@@ -211,6 +211,8 @@ export const WATCH_REASONS = {
   registerUnwritable: "The record of which files in this folder are in the library could not be saved, so nothing new is brought in from this folder until it can be. Nothing in the library has been lost.",
   /** A watch must have its id (A8): without it nothing could be recorded. */
   noWatchId: "This watched folder has no id of its own, so it is not watched.",
+  /** R233 M3: the stored folder's real path is no longer the one chosen (e.g. replaced by a link): it is not followed. */
+  notWhereChosen: "This folder is not where it was when you chose it. Choose it again.",
   /** Task W4: the researcher paused the folder. */
   paused: "Paused. Files put in the folder meanwhile come in when you resume.",
   /** Task W4 (ruled wording): `{files}` in the en-US number style, `{size}` in the interface's size style (`sizeText`). */
@@ -404,11 +406,18 @@ export interface FolderWatch {
    * (`setWatchChoices`); otherwise a running watch reads them by itself only every WATCH_CHOICES_POLL_MS (N4).
    */
   refreshChoices(): Promise<void>;
+  /**
+   * The folder's collection changed (R233 I3): every file attached from now on goes into `collectionId` (none: no
+   * collection), whatever the watch is doing — stuck, downloading or paused. Reads nothing in the folder; checks only
+   * that the collection exists (the "no collection" reason, as at start).
+   */
+  setCollection(collectionId: string | undefined): void;
 }
 
 const within = (folder: string, p: string) => {
   const rel = relative(folder, p);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  // A name that merely starts with ".." (`..inner`) is inside (R233 M2): only ".." itself or "../…" is outside.
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 };
 
 /** Whether `dir` (a real path) is the library, inside it, or holds it. */
@@ -671,6 +680,8 @@ const sameStored = (e: WatchRegisterEntry, r: Reading) => e.size === r.size && e
  */
 export function watchFolder(deps: WatchDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT>, watchId: string): FolderWatch {
   const opts = WatchedFolderOptions.parse(options);
+  /** The collection new files go into: from the options, and changed while running by `setCollection` (R233 I3). */
+  let collectionId: string | undefined = opts.collectionId;
   const root = resolve(dir);
   const emit = (e: WatchEvent) => {
     try {
@@ -699,6 +710,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const me = Symbol("watch");
   const ownKeys: string[] = [];
   const claim = (k: string): boolean => {
+    // A stopped watch holds no claim, whenever it was stopped (R233 I1): a claim asked for after the stop is refused.
+    if (stopped) return false;
     const holder = activeWatches.get(k);
     if (holder && holder !== me) return false;
     if (!holder) {
@@ -892,7 +905,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
   /** Whether the chosen collection exists (none chosen: nothing to say). */
   async function checkCollection(): Promise<void> {
-    const id = opts.collectionId;
+    const id = collectionId;
     let gone = false;
     if (id) {
       try {
@@ -1264,7 +1277,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       if (err instanceof FolderNotAnsweringError) throw err;
       return { reason: folderReason(err) };
     }
-    return (await overlapsLibrary(realRoot, deps.lib)) ? { stop: WATCH_REASONS.library } : null;
+    if (await overlapsLibrary(realRoot, deps.lib)) return { stop: WATCH_REASONS.library };
+    // R233 M3: watched only where it was chosen — a folder whose real path is no longer the stored one (replaced by a
+    // link, say) is not followed; and the rule on where a folder may be is applied again at every start.
+    if (realRoot !== root) return { stop: WATCH_REASONS.notWhereChosen };
+    const rule = folderRuleRefusal(realRoot, env);
+    return rule ? { stop: rule } : null;
   }
   /** Null when the folder is there (one `stat`), else why not. */
   async function rootProblem(): Promise<string | null> {
@@ -1808,7 +1826,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     current = { abs, b };
     let o: AttachOutcome | undefined;
     try {
-      [o] = await attach.attachFiles(projectId, [abs], { ...(persist ? { origin: { watchId: watchId! } } : {}), ...(opts.collectionId ? { collectionId: opts.collectionId } : {}) });
+      [o] = await attach.attachFiles(projectId, [abs], { ...(persist ? { origin: { watchId: watchId! } } : {}), ...(collectionId ? { collectionId } : {}) });
     } catch (err) {
       deps.debug?.(`watched folder: import failed (${err instanceof Error ? err.name : "error"})`);
       o = { path: abs, outcome: "failed", reason: WATCH_REASONS.failed };
@@ -2305,6 +2323,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let stopping: Promise<void> | undefined;
   /** `inside`: called by the watch's own work, which must not wait for itself. */
   function stopWith(reason?: string, inside = false): Promise<void> {
+    // The watch's own work (its start refusing itself, say) never waits for an outer stop() already under way: that one
+    // awaits `ready`, so waiting for it here would be each waiting for the other (R233 I1).
+    if (stopping && inside) return Promise.resolve();
     stopping ??= (async () => {
       stopped = true;
       stopReason = reason;
@@ -2397,6 +2418,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
     // One folder feeds one project (I6): an older record of a folder that an earlier-added watch keeps is not started.
     const keeper = await folderKeeper(deps, projectId, watchId);
+    if (stopped) return; // stopped while it was being decided: nothing is claimed (R233 I1)
     if (keeper) {
       const reason = keeper.projectId === projectId ? WATCH_REASONS.alreadyWatched : WATCH_REASONS.folderOfAnotherProject;
       emit({ kind: "error", reason });
@@ -2420,12 +2442,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     try {
       const bad = await checkRoot();
       rootChecked = true;
+      if (stopped) return;
       if (bad?.stop) {
         emit({ kind: "error", reason: bad.stop });
-        await stopWith(bad.stop === WATCH_REASONS.alreadyWatched ? bad.stop : undefined, true);
+        await stopWith(bad.stop === WATCH_REASONS.library ? undefined : bad.stop, true);
         return;
       }
-      if (stopped) return;
       if (bad) goUnreachable(bad.reason!);
       else {
         let entries: Entry[] | undefined;
@@ -2460,6 +2482,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       return { total: all.length, items: all.slice(Math.max(0, offset), Math.max(0, offset) + Math.max(0, limit)).map((p) => ({ ...p })) };
     },
     refreshChoices: () => (stopped ? Promise.resolve() : refreshChoices()),
+    setCollection: (id) => {
+      collectionId = id ?? undefined;
+      if (!stopped) void checkCollection().catch(() => {});
+    },
   };
 }
 
@@ -2809,23 +2835,28 @@ function putFolder(deps: WatchSettingsDeps, projectId: string, id: string, real:
 }
 
 /** Adds a watched folder: its id and options to project.json (governed, audited), its folder to this device's settings. */
-export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}): Promise<WatchedFolder> {
+export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}, o: { signal?: AbortSignal } = {}): Promise<WatchedFolder> {
   const real = await checkedFolder(deps, dir);
+  // A caller that stopped waiting (its time limit passed while the folder did not answer, R233 I2): nothing is stored.
+  o.signal?.throwIfAborted();
   deps.repo.getProject(projectId); // NotFoundError for an unknown project
   // A list that cannot be read refuses before the project is changed (Task 68, R178 a); so does a folder already
   // watched for a project of this library (I6: one folder feeds one project).
   await readStore(deps.lib.appConfigDir);
   await refuseWatchedFolder(deps, real);
+  o.signal?.throwIfAborted();
   const wf = await addWatchedFolderEntry(deps.repo, projectId, options);
   await putFolder(deps, projectId, wf.id, real);
   return wf;
 }
 
 /** Chooses this computer's folder for a watch the project already has (e.g. one added on another computer). */
-export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string, id: string, dir: string): Promise<void> {
+export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string, id: string, dir: string, o: { signal?: AbortSignal } = {}): Promise<void> {
   if (!(deps.repo.getProject(projectId).watchedFolders ?? []).some((w) => w.id === id)) throw new TypeError("This project has no such watched folder.");
   const real = await checkedFolder(deps, dir);
   await refuseWatchedFolder(deps, real, id);
+  // A caller that stopped waiting (R233 I2): nothing is stored.
+  o.signal?.throwIfAborted();
   await putFolder(deps, projectId, id, real);
 }
 

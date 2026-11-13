@@ -18,6 +18,7 @@
 import { execFile } from "node:child_process";
 import type { Stats } from "node:fs";
 import fsp from "node:fs/promises";
+import path from "node:path";
 import { classifyLocation, type LocationEnv } from "../location.js";
 
 /**
@@ -408,4 +409,36 @@ export function cloudProviderOf(realPath: string, env: LocationEnv): CloudProvid
 /** The register key of a relative name: NFC, because cloud services often create NFD names and macOS compares them without regard to normalisation. */
 export function fileKey(rel: string): string {
   return rel.normalize("NFC");
+}
+
+/** A3: a folder that is or holds the whole cloud-storage area (the home folder, ~/Library included). */
+export const WHOLE_DRIVE_REASON = "Choose the folder inside your cloud drive that you want watched, not a folder that holds the whole drive.";
+/** R207 (6): no check of "on this computer" on Windows yet. */
+export const WINDOWS_CLOUD_REASON = "Watching a cloud-drive folder is not available on Windows yet.";
+
+/**
+ * Whether `child` is `parent` or inside it, by whole path segments (case-insensitively on macOS and Windows). A name
+ * that merely starts with ".." (`..inner`) is inside (R233 M2: the check never fails open).
+ */
+export function isOrInside(child: string, parent: string, env: Pick<LocationEnv, "platform">): boolean {
+  const P = env.platform === "win32" ? path.win32 : path.posix;
+  const fold = (x: string) => (env.platform === "win32" || env.platform === "darwin" ? x.toLowerCase() : x);
+  const rel = P.relative(fold(P.normalize(parent)), fold(P.normalize(child)));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${P.sep}`) && !P.isAbsolute(rel));
+}
+
+/**
+ * The one rule on where a watched folder may be, used by the service when a folder is chosen and by the engine at every
+ * start (R233 M3): not the whole cloud-storage area nor a folder holding it (A3), and on Windows not a cloud-drive folder
+ * (R207 6). `homes`: the home folder as given and as its real path. Null when the folder may be watched.
+ */
+export function folderRuleRefusal(real: string, env: LocationEnv, homes: readonly string[] = [env.homeDir]): string | null {
+  const P = env.platform === "win32" ? path.win32 : path.posix;
+  for (const home of new Set(homes)) {
+    for (const area of [P.join(home, "Library", "CloudStorage"), P.join(home, "Library", "Mobile Documents")]) {
+      if (isOrInside(area, real, env)) return WHOLE_DRIVE_REASON;
+    }
+  }
+  if (env.platform === "win32" && cloudProviderOf(real, env) !== null) return WINDOWS_CLOUD_REASON;
+  return null;
 }
