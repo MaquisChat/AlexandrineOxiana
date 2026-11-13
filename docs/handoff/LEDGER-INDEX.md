@@ -153,3 +153,4 @@ R228 (2026-11-13): find-and-acquire F2 after review — a title without its subt
 R229 (2026-11-13): reader R10 — a drag must end on a page: let go elsewhere, nothing is stored and the researcher is told; the toolbar closes when the selection changes.
 R230 (2026-11-13): find-and-acquire F3 after its second review — one line-reading routine for read and compaction; compaction when dead lines outnumber live and are at least 64; restore copies unreadable queue and watch-register lines through and counts them.
 R231 (2026-11-13): find-and-acquire F2 after its second review — an untyped number in the subtitle means ask; the OpenAlex pause ends by the next midnight UTC; ordinals and multi-letter roman numerals are numbers; a non-matching word beside the family name reads as another person.
+R232 (2026-11-13): find-and-acquire F3 — compaction checks before writing that its new content holds the same live entries and every carried line, or writes nothing.
