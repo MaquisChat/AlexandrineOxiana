@@ -5,9 +5,10 @@
  * annotations says so ("Found in an annotation", Task 58). "Needs review" leads to the project's
  * review queue at that source's entries (Task 67) when the screen gives the way there. A source a
  * later capture found gone from its platform says so (Task 69, AvailabilityMark). A hit in an
- * annotation also offers "Show in the reader" (Task R12): a button named for its row. A row does not
- * say whether its source has a readable PDF (the list reads only the light record, R186), so it is
- * offered for every such hit and the reader says what it says for a source with no PDF.
+ * annotation also offers "Show in the reader" (Task R12): a button named for its row. The row says
+ * whether its source has a readable PDF (`hasReadablePdf`, from the light read, R222); the button is
+ * offered unless it says there is none (an older answer without the field: cannot tell, offered; the
+ * reader says "No PDF" for such a source).
  */
 import type { MouseEvent } from "react";
 import type { SourceRow } from "../api/library";
@@ -112,7 +113,7 @@ export function SourceTable({ items, total, onOpen, selectedId, incomplete, limi
                   </>
                 )}
                 {s.matchedIn === "annotation" && <span className="ao-muted"> Found in an annotation</span>}
-                {s.matchedIn === "annotation" && !s.locked && onShowInReader && (
+                {s.matchedIn === "annotation" && !s.locked && s.hasReadablePdf !== false && onShowInReader && (
                   <>
                     {" "}
                     <button type="button" aria-label={`Show in the reader: ${s.title || "Untitled"}`} onClick={() => onShowInReader(s.id)}>

@@ -54,11 +54,19 @@ describe("Library: a search hit found in an annotation (Task R12)", () => {
     expect(screen.getByText("Found in an annotation")).toBeTruthy();
   });
 
-  it("is offered for every hit in an annotation that is not locked, and for no other row", async () => {
-    serve({ hits: [hit("s1", "Has a PDF"), hit("s2", "No PDF"), { ...base, id: "s3", title: "Found by title" }, hit("s4", "Locked", { locked: true, title: "" })] });
+  it("is offered for a hit in an annotation of a source whose row says it has a readable PDF, or does not say; not when it says it has none; for no other row", async () => {
+    serve({
+      hits: [
+        hit("s1", "Has a PDF", { hasReadablePdf: true }),
+        hit("s2", "No PDF", { hasReadablePdf: false }),
+        hit("s3", "Older answer"),
+        { ...base, id: "s4", title: "Found by title", hasReadablePdf: true },
+        hit("s5", "Locked", { locked: true, title: "" }),
+      ],
+    });
     renderLibrary();
     await screen.findByRole("button", { name: "Show in the reader: Has a PDF" });
-    expect(screen.getAllByRole("button", { name: /^Show in the reader/ }).map((b) => b.getAttribute("aria-label"))).toEqual(["Show in the reader: Has a PDF", "Show in the reader: No PDF"]);
+    expect(screen.getAllByRole("button", { name: /^Show in the reader/ }).map((b) => b.getAttribute("aria-label"))).toEqual(["Show in the reader: Has a PDF", "Show in the reader: Older answer"]);
   });
 
   it("makes no request per row: 100 annotation hits and a second answer ask for no source's details at all", async () => {
