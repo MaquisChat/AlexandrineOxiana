@@ -47,6 +47,8 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
     "This computer's choices for its watched folders were damaged and were set aside. Folders whose choices could not be kept went back to the defaults: they are watched, not paused, and files that are not downloaded to this Mac are left alone. The damaged file is kept beside the app's settings.",
   "zotero-sync-settings-set-aside":
     "This computer's Zotero sync settings could not be read and were set aside. Automatic sync is off until you set it up again. Nothing in your library has changed.",
+  "zotero-sync-settings-newer":
+    "These sync settings were written by a newer version of the app. Update the app to change them. Until then, automatic sync with Zotero is off on this computer. Nothing in your library has changed.",
 };
 
 const READ_ONLY_REASONS: Record<string, string> = {

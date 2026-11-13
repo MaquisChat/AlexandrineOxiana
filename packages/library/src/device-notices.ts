@@ -30,6 +30,7 @@ const ABOUT: Record<DeviceNoticeKind, string> = {
   "libraries-list-set-aside": "this computer's list of libraries was damaged and was set aside",
   "watched-folder-choices-set-aside": "this computer's choices for its watched folders were damaged and were set aside",
   "zotero-sync-settings-set-aside": "this computer's Zotero sync settings were damaged and were set aside, so automatic sync is off",
+  "zotero-sync-settings-newer": "this computer's Zotero sync settings were written by a newer version of the app and were left as they are, so automatic sync is off",
 };
 
 const pending = new Set<Promise<void>>();

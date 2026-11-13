@@ -5,7 +5,8 @@
  * never moves ahead of what is safely written; one run at a time per Zotero library and project; back-off obeyed with
  * an injected clock; the key in no file, record, error or log line; pauses; the counts mapping; resume, not restart.
  */
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -44,10 +45,25 @@ import {
   readZoteroSyncHistory,
   readZoteroSyncSettings,
   runningZoteroSyncRuns,
+  setZoteroSyncUnfinished,
+  updateZoteroSyncSettings,
   writeZoteroSyncSettings,
   type ZoteroSyncLink,
   type ZoteroSyncRun,
 } from "./zotero-sync-settings.js";
+
+/** M9: how many batch records are read through readBatchAt (the runner's own reads; the engine's findBatch reads inside its module). */
+const batchReads = vi.hoisted(() => ({ n: 0 }));
+vi.mock("./bulk/batch.js", async (orig) => {
+  const m = await orig<typeof import("./bulk/batch.js")>();
+  return {
+    ...m,
+    readBatchAt: (...a: Parameters<typeof m.readBatchAt>) => {
+      batchReads.n++;
+      return m.readBatchAt(...a);
+    },
+  };
+});
 
 const FAST = 2 ** 10;
 const U = "user:42";
@@ -374,12 +390,13 @@ describe("the plan's tests", () => {
     const p = await project({ encrypted: true });
     await articles(2);
     const r = await sync(await linked(linkOf(p)));
-    expect(r.counts).toMatchObject({ new: 2 });
+    // The record is returned in the form it is saved in (M2): no counts for an encrypted project.
+    expect(r.counts).toBeUndefined();
     const text = await readFile(join(config, ZOTERO_SYNC_HISTORY_FILE), "utf8");
     expect(text).not.toMatch(/counts/u);
-    expect((await history())[0]!.counts).toBeUndefined();
+    expect((await history())[0]).toEqual(r);
     // How a caller gets them: from the batch, while the project is unlocked.
-    expect(await zoteroSyncRunCounts(repo, p.id, r.batchId!)).toEqual(r.counts);
+    expect(await zoteroSyncRunCounts(repo, p.id, r.batchId!)).toMatchObject({ new: 2 });
     repo.lockProject(p.id);
     expect(await zoteroSyncRunCounts(repo, p.id, r.batchId!)).toBeUndefined();
   });
@@ -884,4 +901,297 @@ describe("every count is mapped (plan A8, A9)", () => {
   it("failed = failed", () => expect(only("failed")).toEqual({ ...none, failed: 3 }));
   it("back = backInZotero", () => expect(only("backInZotero")).toEqual({ ...none, back: 3 }));
   it("clearedKept = clearedInZoteroKept", () => expect(only("clearedInZoteroKept")).toEqual({ ...none, clearedKept: 3 }));
+});
+
+// ------------------------------------------------------------------------------------------
+// Fix round 1 (R244).
+
+/** Aborts the run once the batch has done `n` items. */
+const stopAt = (ctl: AbortController, n: number) => (_p: string, h: BatchHandle) => {
+  void (async () => {
+    for await (const pr of h.progress) if (pr.done >= n) return ctl.abort();
+  })();
+};
+
+/** A first sync of `n` items stopped after 2: its batch is paused, the link's own. */
+async function stoppedFirstSync(p: Project, n = 24): Promise<ZoteroSyncRun> {
+  await articles(n);
+  const ctl = new AbortController();
+  const r = await sync(await linked(linkOf(p)), { signal: ctl.signal }, { onBatch: stopAt(ctl, 2) });
+  expect(r).toMatchObject({ outcome: "stopped", batchId: expect.any(String) });
+  return r;
+}
+
+const sha = (t: string) => createHash("sha256").update(t, "utf8").digest("hex");
+async function setGov(p: Project, yaml: string): Promise<void> {
+  const cur = await repo.getGovernanceText(p.id);
+  await repo.setGovernance(p.id, yaml, { baseSha256: sha(cur), reason: "test: the rules put back" });
+}
+
+describe("R244 (a) I1: a run that could not confirm the whole picture", () => {
+  it("P2: a full run whose key list is not whole is finished-with-problems / deletions-unconfirmed; fullDone stays false, since as it was", async () => {
+    const p = await project();
+    const keys = await articles(3);
+    await sync(await linked(linkOf(p)));
+    const since = zoteroWebSince(repo, p.id, U);
+    z.remove(U, keys[0]!);
+    await updateZoteroSyncSettings(config, lib.id, (c) => ({ ...c, links: c.links.map((l) => ({ ...l, fullDone: false })) }));
+    const orig = z.serve.bind(z);
+    z.serve = (req, host) => (req.path.includes("format=versions") ? { status: 500, headers: {}, body: "x" } : orig(req, host));
+    const r = await sync(await stored());
+    expect(r).toMatchObject({ outcome: "finished-with-problems", reason: "deletions-unconfirmed" });
+    expect((await findBatch(repo, p.id, r.batchId!))!.recordedLibraryVersion).toBeUndefined();
+    expect((await stored()).fullDone).toBe(false);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(since);
+  });
+
+  it("P1: an incremental page short of its announced total is finished-with-problems / deletions-unconfirmed; the next sync reads the whole library", async () => {
+    const p = await project();
+    const [a] = await articles(2);
+    await sync(await linked(linkOf(p)));
+    const since = zoteroWebSince(repo, p.id, U);
+    z.editItem(U, a!, { title: "changed" });
+    const orig = z.serve.bind(z);
+    z.serve = (req, host) => {
+      const res = orig(req, host);
+      if (/^\/users\/42\/items\?/u.test(req.path) && req.path.includes("since=") && res.headers["total-results"]) res.headers["total-results"] = String(Number(res.headers["total-results"]) + 5);
+      return res;
+    };
+    const r = await sync(await stored());
+    expect(r).toMatchObject({ outcome: "finished-with-problems", reason: "deletions-unconfirmed" });
+    expect(zoteroWebSince(repo, p.id, U)).toBe(since);
+    expect((await stored()).fullDone).toBe(false);
+  });
+});
+
+describe("R244 (b) M4: an own batch that can never be resumed", () => {
+  it("is ended for good (what came in stays), the run is failed / batch-ended with the engine's sentence, and the next run is a fresh full run", async () => {
+    const p = await project();
+    const stopped = await stoppedFirstSync(p);
+    const came = sourceCount(p);
+    // The batch now links its sources to a fieldwork session that does not exist: the engine refuses every resume.
+    const rec = (await findBatch(repo, p.id, stopped.batchId!))!;
+    const file = join(lib.root, repo.getProject(p.id).folder, rec.dir, "batch.json");
+    await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file, "utf8")), fieldwork: { sessionId: "gone-session" } }));
+    const r = await sync(await stored());
+    expect(r).toMatchObject({ outcome: "failed", reason: "batch-ended", batchId: stopped.batchId });
+    expect(r.note).toMatch(/fieldwork session/u);
+    expect((await findBatch(repo, p.id, stopped.batchId!))!.state).toBe("finished");
+    expect(sourceCount(p)).toBe(came); // nothing undone
+    expect((await stored()).fullDone).toBe(false);
+    const next = await sync(await stored());
+    expect(next.outcome).toBe("finished");
+    expect(next.batchId).not.toBe(stopped.batchId);
+    expect(sourceCount(p)).toBe(24);
+  });
+
+  it("a passing failure (the project's rules refuse for now) leaves the batch to be resumed", async () => {
+    const p = await project();
+    const stopped = await stoppedFirstSync(p);
+    await setGov(p, GOV.replace("captureMethods: [zotero_import]", "captureMethods: [manual_upload]"));
+    const r = await sync(await stored());
+    expect(r).toMatchObject({ outcome: "failed", reason: "error" });
+    expect((await findBatch(repo, p.id, stopped.batchId!))!.state).toBe("paused");
+    await setGov(p, GOV);
+    const resumed = await sync(await stored());
+    expect(resumed).toMatchObject({ outcome: "finished", batchId: stopped.batchId });
+  });
+});
+
+describe("R244 (d) M1, M2, M3", () => {
+  it("M1: a stale caller copy that says paused does not override the stored un-pause", async () => {
+    const p = await project();
+    await articles(1);
+    await linked(linkOf(p));
+    expect((await sync(linkOf(p, U, { paused: "key-refused" }))).outcome).toBe("finished");
+  });
+
+  it("M2: a link that cannot make a valid record is refused before any request, and says its record was not saved", async () => {
+    const p = await project();
+    for (const bad of [linkOf({ id: "a b" } as Project), linkOf(p, "user:042")]) {
+      const r = await sync(bad);
+      expect(r).toMatchObject({ outcome: "failed", reason: "error", recordSaved: false });
+    }
+    expect(z.requests).toEqual([]);
+    expect(await history()).toEqual([]);
+  });
+
+  it("M3: a final history write that fails: the record says so, and the started record reads stopped / app-closed", async () => {
+    const p = await project();
+    await articles(3);
+    const file = join(config, ZOTERO_SYNC_HISTORY_FILE);
+    const onBatch = () => {
+      void (async () => {
+        await rename(file, `${file}.kept`);
+        await mkdir(file); // the final write (and its second try) cannot replace a folder
+      })();
+    };
+    const r = await sync(await linked(linkOf(p)), {}, { onBatch });
+    expect(r).toMatchObject({ outcome: "finished", recordSaved: false });
+    expect(logged.some((l) => l.includes("the run's record could not be saved"))).toBe(true);
+    await rm(file, { recursive: true });
+    await rename(`${file}.kept`, file);
+    const [h] = await history();
+    expect(h).toMatchObject({ id: r.id, outcome: "stopped", reason: "app-closed" });
+    expect(h!.finishedAt).toBeUndefined();
+  });
+});
+
+describe("R244 (d) M5: the back-off time carried in the record (the clock at real time)", () => {
+  it("a 3-hour Backoff on the cheap check is carried as such", async () => {
+    clock = Date.now();
+    const p = await project();
+    await articles(1);
+    await sync(await linked(linkOf(p)));
+    z.backoffOnce(3 * 3600);
+    const r = await sync(await stored());
+    expect(r.outcome).toBe("up-to-date");
+    expect(Math.abs(Date.parse(r.backoffUntil!) - (Date.now() + 3 * 3_600_000))).toBeLessThan(60_000);
+  });
+
+  it("a 3-hour Backoff on the key check before a batch is backing-off, with its time (no batch is started)", async () => {
+    clock = Date.now();
+    const p = await project();
+    await articles(1);
+    z.backoffOnce(3 * 3600);
+    const r = await sync(await linked(linkOf(p)));
+    expect(r).toMatchObject({ outcome: "failed", reason: "backing-off" });
+    expect(r.batchId).toBeUndefined();
+    expect(Math.abs(Date.parse(r.backoffUntil!) - (Date.now() + 3 * 3_600_000))).toBeLessThan(60_000);
+  });
+
+  it("a 3-hour Backoff during the batch's scan (waited out) is carried in the finished run's record", async () => {
+    clock = Date.now();
+    const p = await project();
+    await articles(1);
+    const orig = z.serve.bind(z);
+    z.serve = (req, host) => {
+      const res = orig(req, host);
+      if (req.path.startsWith("/users/42/items")) res.headers["backoff"] = String(3 * 3600);
+      return res;
+    };
+    const r = await sync(await linked(linkOf(p)));
+    expect(r.outcome).toBe("finished");
+    expect(Math.abs(Date.parse(r.backoffUntil!) - (Date.now() + 3 * 3_600_000))).toBeLessThan(60_000);
+  });
+
+  it("a Retry-After of a year on the cheap check is backing-off for a day", async () => {
+    clock = Date.now();
+    const p = await project();
+    await articles(1);
+    await sync(await linked(linkOf(p)));
+    z.failNext(20, 429, 365 * 86_400);
+    const r = await sync(await stored());
+    expect(r).toMatchObject({ outcome: "failed", reason: "backing-off" });
+    expect(Math.abs(Date.parse(r.backoffUntil!) - (Date.now() + ZOTERO_SYNC_MAX_BACKOFF_MS))).toBeLessThan(60_000);
+  });
+});
+
+describe("R244 (d) M8: endings that had no test", () => {
+  it("a batch cancelled by someone else is stopped / stopped-by-you", async () => {
+    const p = await project();
+    await articles(60);
+    const r = await sync(await linked(linkOf(p)), {}, { onBatch: (_p, h) => h.cancel() });
+    expect(r).toMatchObject({ outcome: "stopped", reason: "stopped-by-you" });
+  });
+
+  it("a batch that fails for a reason that is neither close nor lock is failed / error", async () => {
+    const p = await project();
+    await articles(3);
+    // The engine's index cannot be reached when the run begins: the batch itself ends `failed` (not an item failure).
+    const index = {
+      get db(): never {
+        throw new Error("index broken");
+      },
+    };
+    const r = await sync(await linked(linkOf(p)), {}, { index });
+    expect(r).toMatchObject({ outcome: "failed", reason: "error", batchId: expect.any(String) });
+  });
+
+  it("a settings file that cannot be read during a run: the caller's link stands, nothing is written to it", async () => {
+    const p = await project();
+    await articles(1);
+    await linked(linkOf(p));
+    await rm(join(config, ZOTERO_SYNC_FILE));
+    await mkdir(join(config, ZOTERO_SYNC_FILE));
+    const r = await sync(linkOf(p));
+    expect(r.outcome).toBe("finished");
+    expect((await readdir(join(config, ZOTERO_SYNC_FILE))).length).toBe(0);
+  });
+
+  it("startBatch refused because the project was locked meanwhile is failed / project-locked, with no batch", async () => {
+    const p = await project({ encrypted: true });
+    await articles(1);
+    await linked(linkOf(p));
+    const orig = z.serve.bind(z);
+    z.serve = (req, host) => {
+      if (req.path.startsWith("/keys/current")) repo.lockProject(p.id);
+      return orig(req, host);
+    };
+    const r = await sync(await stored());
+    expect(r).toMatchObject({ outcome: "failed", reason: "project-locked" });
+    await repo.unlockProject(p.id, "pw");
+    expect(await batchDirs(repo, p.id)).toEqual([]);
+  });
+
+  it("an abort while startBatch runs (before the listener) still suspends the batch: stopped", async () => {
+    const p = await project();
+    await articles(30);
+    await linked(linkOf(p));
+    const ctl = new AbortController();
+    let armed = false;
+    const orig = z.serve.bind(z);
+    z.serve = (req, host) => {
+      if (req.path.startsWith("/keys/current")) armed = true;
+      return orig(req, host);
+    };
+    const getProject = repo.getProject.bind(repo);
+    repo.getProject = ((id: string) => {
+      if (armed) ctl.abort();
+      return getProject(id);
+    }) as typeof repo.getProject;
+    try {
+      const r = await sync(await stored(), { signal: ctl.signal });
+      expect(r).toMatchObject({ outcome: "stopped", reason: "stopped-by-you", batchId: expect.any(String) });
+      expect((await findBatch(repo, p.id, r.batchId!))!.state).toBe("paused");
+    } finally {
+      repo.getProject = getProject;
+    }
+  });
+});
+
+describe("R244 (d) M9: the runner finds its unfinished batch without reading every batch record", () => {
+  it("a quiet run with no unfinished batch reads no batch record at all", async () => {
+    const p = await project();
+    await articles(2);
+    await sync(await linked(linkOf(p)));
+    expect((await stored()).unfinished).toBeUndefined();
+    batchReads.n = 0;
+    expect((await sync(await stored())).outcome).toBe("up-to-date");
+    expect(batchReads.n).toBe(0);
+  });
+
+  it("the hint names the unfinished batch: one record is read, and it is resumed", async () => {
+    const p = await project();
+    const stopped = await stoppedFirstSync(p);
+    expect((await stored()).unfinished).toMatch(new RegExp(`/${stopped.batchId}$`, "u"));
+    batchReads.n = 0;
+    let readsBeforeBatch = -1;
+    const r = await sync(await stored(), {}, { onBatch: () => void (readsBeforeBatch = batchReads.n) });
+    expect(readsBeforeBatch).toBe(1);
+    expect(r).toMatchObject({ outcome: "finished", batchId: stopped.batchId });
+    expect((await stored()).unfinished).toBeUndefined();
+  });
+
+  it("a wrong hint, or none in a settings file set aside, falls back to the scan and still resumes", async () => {
+    const p = await project();
+    const stopped = await stoppedFirstSync(p);
+    await setZoteroSyncUnfinished(config, lib.id, U, p.id, "batch-0099/not-this-one");
+    const ctl = new AbortController();
+    const again = await sync(await stored(), { signal: ctl.signal }, { onBatch: stopAt(ctl, 4) });
+    expect(again.batchId).toBe(stopped.batchId);
+    await writeFile(join(config, ZOTERO_SYNC_FILE), "{ damaged");
+    const r = await sync(linkOf(p));
+    expect(r).toMatchObject({ outcome: "finished", batchId: stopped.batchId });
+  });
 });

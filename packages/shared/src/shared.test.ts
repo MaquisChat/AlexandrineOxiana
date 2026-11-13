@@ -108,4 +108,8 @@ describe("device notices (R242): the Zotero sync settings notice is one of the c
     expect(isDeviceNoticeKind("zotero-sync-settings-set-aside")).toBe(true);
     expect(isDeviceNoticeKind("zotero-sync-history-set-aside")).toBe(false);
   });
+
+  it("R244 M7: and the notice for sync settings written by a newer version", () => {
+    expect(isDeviceNoticeKind("zotero-sync-settings-newer")).toBe(true);
+  });
 });

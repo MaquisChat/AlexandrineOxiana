@@ -45,6 +45,14 @@ describe("device-level notices (Task 68)", () => {
     expect(bannersFor({ notices: [{ kind: "zotero-sync-settings-set-aside", at: "2026-11-13T10:15:30.000Z" }] })).toEqual([{ kind: "notice", notice: "zotero-sync-settings-set-aside" }]);
   });
 
+  it("the Zotero sync settings from a newer version (R244 M7): says so, says what to do, nothing changed", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "zotero-sync-settings-newer" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toContain("These sync settings were written by a newer version of the app. Update the app to change them.");
+    expect(t).toMatch(/automatic sync with Zotero is off/);
+    expect(t).not.toMatch(/set aside|damaged/);
+  });
+
   it("watched folders that could not be read at open: a plain warning for this session (review round 2, Rm4)", () => {
     const t = warningText("watched-folders-unreadable", "library");
     expect(t).toMatch(/list of watched folders could not be read when this library was opened/);

@@ -56,14 +56,16 @@ import { isClosed } from "../library.js";
 import { ProjectLockedError } from "../repo/errors.js";
 import { projectEncrypted, repoLibrary, type Repo } from "../repo/repo.js";
 import { SecretStoreUnavailableError, getSecret } from "../secrets.js";
-import { activeBatches, batchDirs, countOutcomes, findBatch, latestByKey, readBatchAt, readJournal, type BatchRecord, type JournalEntry } from "./bulk/batch.js";
-import { BatchRefusedError, isBatchActive, resumeBatch, startBatch, type BatchCounts, type BatchHandle, type BatchResult, type BulkImportDeps } from "./bulk/run.js";
+import { BOOKKEEPING, activeBatches, batchDirs, countOutcomes, findBatch, latestByKey, readBatchAt, readJournal, writeBatchRecord, type BatchRecord, type JournalEntry } from "./bulk/batch.js";
+import { BatchRefusedError, REASONS as BULK_REASONS, isBatchActive, resumeBatch, startBatch, type BatchCounts, type BatchHandle, type BatchResult, type BulkImportDeps } from "./bulk/run.js";
 import { ZoteroAccountError, checkZoteroKey, zoteroLibraryUnchanged, type ZoteroAccountReason } from "./zotero-web-account.js";
-import { ZOTERO_WEB_FILE_NOTES, ZOTERO_WEB_REASONS, finishZoteroWebRun, zoteroWebAdapter, zoteroWebSince, type ZoteroWebAdapter } from "./zotero-web.js";
+import { ZOTERO_WEB_FILE_NOTES, ZOTERO_WEB_NOTES, ZOTERO_WEB_REASONS, finishZoteroWebRun, zoteroWebAdapter, zoteroWebSince, type ZoteroWebAdapter } from "./zotero-web.js";
 import {
   ZOTERO_REF,
   ZOTERO_SYNC_MAX_HOSTS,
+  isZoteroSyncId,
   markZoteroSyncFullDone,
+  setZoteroSyncUnfinished,
   pauseAllZoteroSyncLinks,
   pauseLink,
   putZoteroSyncRun,
@@ -242,14 +244,34 @@ class Ending extends Error {
 
 const isAbort = (err: unknown, signal: AbortSignal) => signal.aborted || (err as Error | undefined)?.name === "AbortError";
 
+/** Batch states this runner resumes ("interrupted" is `running` with no process running it). */
+const UNFINISHED = new Set<BatchRecord["state"]>(["running", "paused", "cancelled", "failed"]);
+
+/** The note written into a batch the runner ended because it could never be resumed (R244 b). */
+export const ZOTERO_SYNC_ENDED_NOTE = "This sync could not be resumed, so it was ended here; what it brought in stays. The next sync reads the whole Zotero library again.";
+
+/**
+ * Whether a refusal to resume this link's own batch means it can NEVER be resumed (R244 b): the batch record is gone
+ * (NotFoundError), or the engine refuses it as `invalid` — its record or its source cannot be used (a fieldwork
+ * session or participant it links to was deleted, the source cannot be rebuilt) — EXCEPT the unreadable record of
+ * sources deleted here, which every Zotero batch meets alike and the researcher can reset. Passing refusals leave the
+ * batch to be resumed later: `locked` (the project), `running` (it runs now), `denied` (the project's rules, which the
+ * researcher may change back), `finished` (not unfinished after all), and every failure that is not a refusal.
+ */
+function neverResumable(err: unknown): boolean {
+  if ((err as Error | undefined)?.name === "NotFoundError") return true;
+  return err instanceof BatchRefusedError && err.kind === "invalid" && err.reason !== BULK_REASONS.deletedRecordsUnreadable;
+}
+
 /**
  * One sync of `link` (see the header). Never throws for anything that can go wrong in a run: every ending is a record,
- * returned and kept in this computer's history. (A record that cannot be saved — the history file unreadable — is
- * still returned; the debug line says so, without a path.)
+ * returned in the form it is kept in this computer's history (R244 M2). A record the history file cannot take, even on
+ * a second try, is returned with `recordSaved: false` and a debug note (R244 M3).
  */
 export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLink, o: ZoteroSyncOptions): Promise<ZoteroSyncRun> {
   const now = () => (deps.now ? deps.now() : Date.now());
   const iso = (ms: number) => new Date(ms).toISOString();
+  const debugName = (err: unknown) => (err instanceof Error ? err.name : "error");
   // A damaged history file is set aside with a debug note only (R242); the settings file raises its device notice itself.
   const fileOpts: ZoteroSyncFileOptions = {
     onSetAside: (file, keptAs) => {
@@ -258,6 +280,12 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     },
   };
   const run: ZoteroSyncRun = { id: newId(), ref: link.ref, projectId: link.projectId, trigger: o.trigger, startedAt: iso(now()), outcome: "stopped", reason: "app-closed" };
+  // M2: ids are checked once, here. A link that cannot make a valid record is refused before anything else (no
+  // request, no lock, no file), and its record says it was not saved.
+  if (!ZOTERO_REF.test(link.ref) || !isZoteroSyncId(link.projectId) || (o.trigger !== "manual" && o.trigger !== "automatic")) {
+    deps.debug?.("zotero sync: a run was refused: its link is not valid, so no record of it could be kept");
+    return { ...run, ref: String(link.ref), projectId: String(link.projectId), outcome: "failed", reason: "error", finishedAt: run.startedAt, recordSaved: false };
+  }
   // The runner's own lock, taken before anything is awaited: two calls at the same moment are one run and one refusal.
   const key = lockKey(deps.libraryId, link.ref);
   const busy = running.has(key);
@@ -269,18 +297,41 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
       return false;
     }
   })();
-  const save = async (r: ZoteroSyncRun) => {
+  /** Saves the record as it is returned; `tries` 2 for the final one (M3). */
+  const save = async (tries = 1): Promise<boolean> => {
+    for (let t = 1; t <= tries; t++) {
+      try {
+        await putZoteroSyncRun(deps.appConfigDir, deps.libraryId, run, fileOpts);
+        return true;
+      } catch (err) {
+        if (t === tries) deps.debug?.(`zotero sync: the run's record could not be saved (${debugName(err)})`);
+      }
+    }
+    return false;
+  };
+  /** The runner's own changes to its stored link; a settings file that cannot take them leaves a debug note only. */
+  const settingsChange = async (what: string, change: () => Promise<void>) => {
     try {
-      const kept = encrypted ? (({ counts: _c, ...rest }) => rest)(r) : r;
-      await putZoteroSyncRun(deps.appConfigDir, deps.libraryId, kept, fileOpts);
+      await change();
     } catch (err) {
-      deps.debug?.(`zotero sync: the run's record could not be saved (${err instanceof Error ? err.name : "error"})`);
+      deps.debug?.(`zotero sync: ${what} could not be saved (${debugName(err)})`);
     }
   };
   let started = false;
+  /** The stored link (the settings file's own copy), when there is one: it wins over the caller's copy (M1). */
+  let stored: ZoteroSyncLink | undefined;
   let handle: BatchHandle | undefined;
   let scanResult: (() => ReturnType<ZoteroWebAdapter["scanResult"]>) | undefined;
+  /** The latest moment Zotero asked to wait for, from any answer of this run (M5). */
+  let asked: number | undefined;
+  const ask = (until: number | undefined) => {
+    if (until !== undefined) asked = Math.max(asked ?? 0, until);
+  };
   const onAbort = () => void handle?.suspend().catch(() => {});
+  const setHint = (hint: string | undefined) =>
+    stored ? settingsChange("the batch hint", () => setZoteroSyncUnfinished(deps.appConfigDir, deps.libraryId, link.ref, link.projectId, hint, fileOpts)) : Promise.resolve();
+  const setFullDone = (done: boolean) => settingsChange("fullDone", () => markZoteroSyncFullDone(deps.appConfigDir, deps.libraryId, link.ref, link.projectId, fileOpts, done));
+  const hintOf = (r: BatchRecord) => `${r.dir.split("/").pop()}/${r.id}`;
   try {
     const checkStop = () => {
       if (o.signal.aborted) throw new Ending("stopped", stopReason(o.signal));
@@ -296,21 +347,21 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     }
     if (encrypted && !deps.repo.isUnlocked(link.projectId)) throw new Ending("failed", "project-locked");
     let settingsReadable = true;
-    let current = link;
     try {
       const s = await readZoteroSyncSettings(deps.appConfigDir, deps.libraryId, fileOpts);
-      current = s.links.find((l) => l.ref === link.ref && l.projectId === link.projectId) ?? link;
+      stored = s.links.find((l) => l.ref === link.ref && l.projectId === link.projectId);
     } catch {
       settingsReadable = false; // the caller's copy of the link stands
     }
+    const current = stored ?? link;
     checkStop();
-    const paused = current.paused ?? link.paused;
+    // M1: the stored link's pause, or its absence, is what counts; the caller's copy only when nothing is stored.
+    const paused = current.paused;
     if (paused) throw new Ending("failed", paused === "undone" ? "sync-undone" : paused);
     if (busy || (await zoteroImportRunning(deps.repo, link.projectId, link.ref))) throw new Ending("failed", "import-running");
     checkStop();
     const waitUntil = zoteroSyncBackoff(o.backoffUntil, now());
     if (waitUntil !== undefined) throw new Ending("failed", "backing-off", waitUntil);
-    if (!ZOTERO_REF.test(link.ref)) throw new Ending("failed", "error");
     try {
       // Only whether a key is saved: the value is dropped at once.
       let k: string | null = await getSecret("zotero-api-key");
@@ -326,7 +377,7 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     // 2. Started.
     runningZoteroSyncRuns.add(run.id);
     started = true;
-    await save(run);
+    await save();
     checkStop();
 
     const [type, id] = link.ref.split(":") as ["user" | "group", string];
@@ -351,16 +402,30 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
       } catch (err) {
         if (isAbort(err, o.signal)) throw new Ending("stopped", stopReason(o.signal));
         if (!(err instanceof ZoteroAccountError)) throw err;
+        ask(err.backoffUntil);
         const reason = err.reason === "key-refused" ? await refusedFor() : ACCOUNT_REASON[err.reason];
-        throw new Ending("failed", reason, askedBackoff(err.backoffUntil, now()));
+        throw new Ending("failed", reason);
       }
     };
 
-    // 3. This link's own unfinished batch is resumed: found in the project by its record alone (origin, kind, ref), so
-    // a history file set aside loses nothing (R242). A batch without the origin is never adopted.
-    const own = (await webBatches(deps.repo, link.projectId, link.ref)).find(
-      (r) => r.origin === "zotero-sync" && !isBatchActive(r.id) && (r.state === "running" || r.state === "paused" || r.state === "cancelled" || r.state === "failed"),
-    );
+    // 3. This link's own unfinished batch (M9): by the stored hint when there is one; no hint on a stored link means
+    // none (the hint is written before every batch is started, and cleared only when the batch ended for good); the
+    // scan of the project's batch records only when the hint is `unknown`, wrong, or there is no stored link.
+    const isOwnUnfinished = (r: BatchRecord | undefined): r is BatchRecord =>
+      !!r && r.origin === "zotero-sync" && r.source.kind === "zotero-web" && r.source.location === link.ref && !isBatchActive(r.id) && UNFINISHED.has(r.state);
+    let own: BatchRecord | undefined;
+    let scan = !stored;
+    if (stored?.unfinished && stored.unfinished !== "unknown") {
+      const [dirName, batchId] = stored.unfinished.split("/") as [string, string];
+      const r = await readBatchAt(deps.repo, link.projectId, dirName).catch(() => undefined);
+      if (r?.id === batchId && isOwnUnfinished(r)) own = r;
+      else if (r?.id === batchId && r.origin === "zotero-sync" && (r.state === "finished" || r.state === "undone")) await setHint(undefined);
+      else scan = true;
+    } else if (stored?.unfinished === "unknown") scan = true;
+    if (scan) {
+      own = (await webBatches(deps.repo, link.projectId, link.ref)).find(isOwnUnfinished);
+      if (stored) await setHint(own ? hintOf(own) : undefined);
+    }
     checkStop();
     let full = false;
     if (own) {
@@ -372,20 +437,46 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
       const read = ro?.zoteroReadVersions;
       if (Array.isArray(read) && read.length && read.every((v) => Number.isInteger(v) && v >= 0)) adapter.resumeOptions!.zoteroReadVersions = [...read];
       else delete adapter.resumeOptions!.zoteroReadVersions;
-      handle = finishZoteroWebRun(deps, link.projectId, adapter, await resumeBatch(deps, link.projectId, own.id, adapter), since);
+      run.batchId = own.id;
+      let resumed: BatchHandle;
+      try {
+        resumed = await resumeBatch(deps, link.projectId, own.id, adapter);
+      } catch (err) {
+        if (!neverResumable(err)) throw err;
+        // R244 b: ended for good through the batch's own record (the engine's terminal state; nothing undone), the hint
+        // cleared and the next run a fresh full one.
+        const sentence = err instanceof BatchRefusedError ? err.reason : "The batch could not be found.";
+        const cur = await findBatch(deps.repo, link.projectId, own.id).catch(() => undefined);
+        if (cur) {
+          const projectRel = deps.repo.getProject(link.projectId).folder;
+          await deps.repo.mutate(
+            link.projectId,
+            BOOKKEEPING,
+            (tx) => writeBatchRecord(tx, projectRel, { ...cur, state: "finished", finishedAt: iso(Math.max(now(), Date.parse(cur.startedAt) || 0)), notes: [...cur.notes, ZOTERO_SYNC_ENDED_NOTE] }),
+            { op: "import.batch.save" },
+          );
+        }
+        await setHint(undefined);
+        await setFullDone(false);
+        run.note = sentence.replace(/[\p{Cc}\p{Cf}]/gu, " ").slice(0, 500);
+        throw new Ending("failed", "batch-ended");
+      }
+      handle = finishZoteroWebRun(deps, link.projectId, adapter, resumed, since);
       scanResult = () => adapter.scanResult();
     } else {
       // 4. The cheap question, when there is a version to ask about and a full run has been done.
       const since = zoteroWebSince(deps.repo, link.projectId, link.ref);
       if (current.fullDone && since !== undefined) {
         const u = await accountCall(() => zoteroLibraryUnchanged({ ref: link.ref, since, signal: o.signal, ...seams }));
-        if (u.unchanged) throw new Ending("up-to-date", undefined, askedBackoff(u.backoffUntil, now()));
+        ask(u.backoffUntil);
+        if (u.unchanged) throw new Ending("up-to-date");
       }
       checkStop();
       // 5. What the key may read, then the batch.
       const access = await accountCall(() => checkZoteroKey({ signal: o.signal, ...seams }));
+      ask(access.backoffUntil);
       const readable = type === "user" ? access.userId === id && access.personal.library : access.groups.some((g) => g.ref === link.ref);
-      if (!readable) throw new Ending("failed", "library-gone", askedBackoff(access.backoffUntil, now()));
+      if (!readable) throw new Ending("failed", "library-gone");
       checkStop();
       full = !current.fullDone || since === undefined;
       const adapter = zoteroWebAdapter({
@@ -396,57 +487,68 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
         ...seams,
       });
       const options = { structure: current.options.structure, duplicates: current.options.duplicates, includeDeleted: false };
+      // The hint first (M9): a batch may exist only while the stored link says one may.
+      await setHint("unknown");
       handle = finishZoteroWebRun(deps, link.projectId, adapter, await startBatch(deps, link.projectId, adapter, options, { origin: "zotero-sync" }), full ? undefined : since);
       scanResult = () => adapter.scanResult();
     }
     run.batchId = handle.batchId;
     o.signal.addEventListener("abort", onAbort, { once: true });
     if (o.signal.aborted) onAbort();
-    await save(run);
     try {
       deps.onBatch?.(link.projectId, handle);
     } catch {
       // the caller's own trouble: the run goes on
     }
+    if (!own) {
+      const made = await findBatch(deps.repo, link.projectId, handle.batchId).catch(() => undefined);
+      if (made) await setHint(hintOf(made));
+    }
+    await save();
 
     // 6. Wait for it (since is recorded, or not, inside finishZoteroWebRun before `done` settles).
     const result: BatchResult = await handle.done;
     const sr = scanResult();
+    ask(sr.backoffUntil);
     const rec = await findBatch(deps.repo, link.projectId, result.batchId).catch(() => undefined);
+    if (result.state === "finished") await setHint(undefined);
     let detail: ReturnType<typeof batchCountsOf> = { counts: zoteroSyncCounts(result.counts), retryDownloads: false };
     try {
       if (rec) detail = batchCountsOf(await readJournal(deps.repo, link.projectId, rec.dir));
     } catch {
       // the journal cannot be read (the project locked under it): the run's own counts stand
     }
-    run.counts = detail.counts;
+    // Never in the device file for an encrypted project, and the record is returned as it is kept (M2, Accept 4).
+    if (!encrypted) run.counts = detail.counts;
     // Host names only, in the form the history file accepts (one odd name must not make the record unsaveable).
     const hosts = sr.refusedHosts.filter((h) => /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/u.test(h)).slice(0, ZOTERO_SYNC_MAX_HOSTS);
     if (hosts.length) run.refusedHosts = hosts;
-    const asked = askedBackoff(sr.backoffUntil, now());
     const closed = isClosed(repoLibrary(deps.repo));
     if (result.state === "paused" || result.state === "cancelled") {
-      throw new Ending("stopped", o.signal.aborted ? stopReason(o.signal) : result.state === "paused" ? "app-closed" : "stopped-by-you", asked);
+      throw new Ending("stopped", o.signal.aborted ? stopReason(o.signal) : result.state === "paused" ? "app-closed" : "stopped-by-you");
     }
     if (result.state === "failed") {
-      if (closed) throw new Ending("stopped", "app-closed", asked);
-      if (o.signal.aborted) throw new Ending("stopped", stopReason(o.signal), asked);
+      if (closed) throw new Ending("stopped", "app-closed");
+      if (o.signal.aborted) throw new Ending("stopped", stopReason(o.signal));
       const locked = (encrypted && !deps.repo.isUnlocked(link.projectId)) || rec?.notes.some((n) => /project was locked/u.test(n));
-      throw new Ending(locked ? "stopped" : "failed", locked ? "project-locked" : "error", asked);
+      throw new Ending(locked ? "stopped" : "failed", locked ? "project-locked" : "error");
     }
-    if (result.state !== "finished") throw new Ending("failed", "error", asked);
+    if (result.state !== "finished") throw new Ending("failed", "error");
     if (detail.scanFailure !== undefined) {
       const reason = scanReason(detail.scanFailure);
-      throw new Ending("failed", reason === "key-refused" ? await refusedFor() : reason, asked);
+      throw new Ending("failed", reason === "key-refused" ? await refusedFor() : reason);
+    }
+    // R244 a (A7, R214, R215): the scan did not see the whole picture — the batch's own note (a full run whose key list
+    // was not whole) or the scan's own flag (a listing cut, moved or short of its total). The version was not recorded
+    // (finishZoteroWebRun keeps that rule); the next sync reads the whole library again, so fullDone is false.
+    if (rec?.notes.includes(ZOTERO_WEB_NOTES.notConfirmed) || !sr.completed) {
+      if (settingsReadable) await setFullDone(false);
+      throw new Ending("finished-with-problems", "deletions-unconfirmed");
     }
     // A full run truly finished: this batch recorded a version (the key list was whole, nothing held back).
-    if (full && rec?.recordedLibraryVersion !== undefined && settingsReadable) {
-      await markZoteroSyncFullDone(deps.appConfigDir, deps.libraryId, link.ref, link.projectId, fileOpts).catch((err: unknown) => {
-        deps.debug?.(`zotero sync: fullDone could not be saved (${err instanceof Error ? err.name : "error"})`);
-      });
-    }
+    if (full && rec?.recordedLibraryVersion !== undefined && settingsReadable) await setFullDone(true);
     const problems = detail.counts.failed > 0 || hosts.length > 0 || sr.downloadsFailed > 0 || detail.retryDownloads;
-    throw new Ending(problems ? "finished-with-problems" : "finished", undefined, asked);
+    throw new Ending(problems ? "finished-with-problems" : "finished");
   } catch (err) {
     let end: Ending;
     if (err instanceof Ending) end = err;
@@ -454,20 +556,24 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     else if (err instanceof BatchRefusedError) end = new Ending("failed", err.kind === "locked" ? "project-locked" : err.kind === "running" ? "import-running" : "error");
     else if (err instanceof ProjectLockedError) end = new Ending("failed", "project-locked");
     else {
-      deps.debug?.(`zotero sync: the run stopped on an unexpected error (${err instanceof Error ? err.name : "error"})`);
+      deps.debug?.(`zotero sync: the run stopped on an unexpected error (${debugName(err)})`);
       end = new Ending("failed", "error");
     }
     run.outcome = end.outcome;
     if (end.reason) run.reason = end.reason;
     else delete run.reason;
-    if (end.backoffUntil !== undefined) run.backoffUntil = iso(end.backoffUntil);
+    // The back-off in force after this run: a refusal inside one carries its time; otherwise what Zotero asked for.
+    const until = end.reason === "backing-off" && end.backoffUntil !== undefined ? end.backoffUntil : askedBackoff(asked, now());
+    if (until !== undefined) run.backoffUntil = iso(until);
     run.finishedAt = iso(Math.max(now(), Date.parse(run.startedAt)));
     // Pauses (Accept 3): a refused key pauses every link of the library; a library gone, this link. Not for a refusal
     // that only read a pause already there.
-    if (started && run.reason === "key-refused") await pauseAllZoteroSyncLinks(deps.appConfigDir, deps.libraryId, fileOpts).catch(() => {});
-    if (started && run.reason === "library-gone") await pauseLink(deps.appConfigDir, deps.libraryId, link.ref, "library-gone", fileOpts).catch(() => {});
-    await save(run);
-    return structuredClone(run);
+    if (started && run.reason === "key-refused") await settingsChange("the pause", () => pauseAllZoteroSyncLinks(deps.appConfigDir, deps.libraryId, fileOpts));
+    if (started && run.reason === "library-gone") await settingsChange("the pause", () => pauseLink(deps.appConfigDir, deps.libraryId, link.ref, "library-gone", fileOpts));
+    const saved = await save(2);
+    // M3: a record the history could not take says so; the started record on disk then reads stopped / app-closed
+    // in every later read (this run no longer runs), which says less than happened, never more.
+    return saved ? structuredClone(run) : { ...structuredClone(run), recordSaved: false };
   } finally {
     o.signal.removeEventListener("abort", onAbort);
     runningZoteroSyncRuns.delete(run.id);

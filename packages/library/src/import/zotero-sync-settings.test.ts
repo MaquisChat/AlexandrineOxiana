@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ZOTERO_SYNC_FILE,
   ZOTERO_SYNC_HISTORY_FILE,
+  ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
   markZoteroSyncFullDone,
   pauseAllZoteroSyncLinks,
@@ -19,6 +20,8 @@ import {
   readZoteroSyncHistory,
   readZoteroSyncSettings,
   runningZoteroSyncRuns,
+  setZoteroSyncUnfinished,
+  updateZoteroSyncSettings,
   writeZoteroSyncSettings,
   type ZoteroSyncLink,
   type ZoteroSyncRun,
@@ -127,7 +130,7 @@ describe("settings file", () => {
     for (const bad of [
       { v: 1, libraries: { [LIB]: { ...settings([link("user:42")]), title: "My library" } } },
       { v: 1, libraries: { [LIB]: settings([{ ...link("user:42"), paused: "sleeping" } as unknown as ZoteroSyncLink]) } },
-      { v: 2, libraries: {} },
+      // (`{ v: 2 }` is a newer version's file since R244 M7: left as it is, see below.)
       [],
     ]) {
       await writeFile(join(dir, ZOTERO_SYNC_FILE), JSON.stringify(bad));
@@ -245,5 +248,78 @@ describe("history file", () => {
     await expect(putZoteroSyncRun(dir, LIB, runRec(1, { refusedHosts: ["a.x", "b.x", "c.x", "d.x", "e.x", "f.x"] }))).rejects.toThrow(TypeError);
     await expect(putZoteroSyncRun(dir, LIB, { ...runRec(1), title: "x" } as ZoteroSyncRun)).rejects.toThrow(TypeError);
     expect(await readdir(dir)).toEqual([]);
+  });
+});
+
+describe("fix round 1 (R244)", () => {
+  it("M7: a settings file from a newer version is left exactly as it is: not read, not set aside, writes refused, a notice", async () => {
+    const newer = JSON.stringify({ v: 2, libraries: { [LIB]: { automatic: true, everyMinutes: 60, links: [], somethingNew: 1 } } });
+    await writeFile(join(dir, ZOTERO_SYNC_FILE), newer);
+    const told: string[] = [];
+    expect(await readZoteroSyncSettings(dir, LIB, { onSetAside: (f) => told.push(f) })).toEqual({ automatic: false, everyMinutes: 60, links: [] });
+    await expect(writeZoteroSyncSettings(dir, LIB, settings([link("user:42")]))).rejects.toThrow(
+      "These sync settings were written by a newer version of the app. Update the app to change them.",
+    );
+    await expect(pauseLink(dir, LIB, "user:42", "undone")).rejects.toBeInstanceOf(ZoteroSyncFileNewerError);
+    expect(await readFile(join(dir, ZOTERO_SYNC_FILE), "utf8")).toBe(newer);
+    expect(told).toEqual([]);
+    expect((await readdir(dir)).filter((n) => n.includes(".unreadable-"))).toEqual([]);
+    await deviceNoticesIdle();
+    expect((await readDeviceNotices(dir)).map((n) => n.kind)).toEqual(["zotero-sync-settings-newer"]);
+  });
+
+  it("M7: a history file from a newer version is left as it is: read as empty, writes refused, no notice", async () => {
+    const newer = JSON.stringify({ v: 3, libraries: {} });
+    await writeFile(join(dir, ZOTERO_SYNC_HISTORY_FILE), newer);
+    expect(await readZoteroSyncHistory(dir, LIB)).toEqual([]);
+    await expect(putZoteroSyncRun(dir, LIB, runRec(1))).rejects.toBeInstanceOf(ZoteroSyncFileNewerError);
+    expect(await readFile(join(dir, ZOTERO_SYNC_HISTORY_FILE), "utf8")).toBe(newer);
+    await deviceNoticesIdle();
+    expect(await readDeviceNotices(dir)).toEqual([]);
+  });
+
+  it("M7: only a file truly damaged is set aside (v 1 of the wrong shape, v 0, v not a number)", async () => {
+    for (const bad of [{ v: 1, libraries: [] }, { v: 0, libraries: {} }, { v: "2", libraries: {} }]) {
+      await writeFile(join(dir, ZOTERO_SYNC_FILE), JSON.stringify(bad));
+      await readZoteroSyncSettings(dir, LIB);
+      expect(await readdir(dir)).not.toContain(ZOTERO_SYNC_FILE);
+    }
+  });
+
+  it("M6: a settings update and the runner's changes made at once lose nothing", async () => {
+    await writeZoteroSyncSettings(dir, LIB, settings([link("user:42")]));
+    await Promise.all([
+      updateZoteroSyncSettings(dir, LIB, (cur) => ({ ...cur, everyMinutes: 240, links: [...cur.links, link("group:9", "p2")] })),
+      pauseLink(dir, LIB, "user:42", "library-gone"),
+      markZoteroSyncFullDone(dir, LIB, "user:42", "p1"),
+      updateZoteroSyncSettings(dir, LIB, (cur) => ({ ...cur, automatic: false })),
+    ]);
+    const s = await readZoteroSyncSettings(dir, LIB);
+    expect(s.everyMinutes).toBe(240);
+    expect(s.automatic).toBe(false);
+    expect(s.links.map((l) => [l.ref, l.paused, l.fullDone])).toEqual([
+      ["user:42", "library-gone", true],
+      ["group:9", undefined, false],
+    ]);
+  });
+
+  it("M6: history writes made at once are all kept", async () => {
+    await Promise.all(Array.from({ length: 25 }, (_, i) => putZoteroSyncRun(dir, LIB, runRec(i + 1))));
+    expect(await readZoteroSyncHistory(dir, LIB)).toHaveLength(25);
+  });
+
+  it("M9: the runner's hint of its unfinished batch is kept by a settings write, and cannot be set by one", async () => {
+    await writeZoteroSyncSettings(dir, LIB, settings([link("user:42")]));
+    await setZoteroSyncUnfinished(dir, LIB, "user:42", "p1", "batch-0003/b-3");
+    expect((await readZoteroSyncSettings(dir, LIB)).links[0]!.unfinished).toBe("batch-0003/b-3");
+    await writeZoteroSyncSettings(dir, LIB, settings([link("user:42", "p1", { unfinished: "batch-0009/forged" })], { everyMinutes: 30 }));
+    expect((await readZoteroSyncSettings(dir, LIB)).links[0]!.unfinished).toBe("batch-0003/b-3");
+    // A link given to another project starts without one.
+    await writeZoteroSyncSettings(dir, LIB, settings([link("user:42", "p2")]));
+    expect((await readZoteroSyncSettings(dir, LIB)).links[0]!.unfinished).toBeUndefined();
+    await setZoteroSyncUnfinished(dir, LIB, "user:42", "p2", "unknown");
+    expect((await readZoteroSyncSettings(dir, LIB)).links[0]!.unfinished).toBe("unknown");
+    await setZoteroSyncUnfinished(dir, LIB, "user:42", "p2", undefined);
+    expect((await readZoteroSyncSettings(dir, LIB)).links[0]!.unfinished).toBeUndefined();
   });
 });

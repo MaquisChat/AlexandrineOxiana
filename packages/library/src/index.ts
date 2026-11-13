@@ -206,6 +206,7 @@ export {
 export type { ZoteroAccountReason, ZoteroKeyAccess } from "./import/zotero-web-account.js";
 export {
   ZOTERO_SYNC_MAX_BACKOFF_MS,
+  ZOTERO_SYNC_ENDED_NOTE,
   ZOTERO_SYNC_MIN_BACKOFF_MS,
   syncZoteroLibrary,
   zoteroImportRunning,
@@ -222,12 +223,15 @@ export {
   ZOTERO_SYNC_HISTORY_MAX,
   ZOTERO_SYNC_INTERVALS,
   ZOTERO_SYNC_MAX_LINKS,
+  ZOTERO_SYNC_NEWER_SENTENCE,
   ZOTERO_SYNC_REASONS,
+  ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
   pauseAllZoteroSyncLinks,
   pauseLink,
   readZoteroSyncHistory,
   readZoteroSyncSettings,
+  updateZoteroSyncSettings,
   writeZoteroSyncSettings,
 } from "./import/zotero-sync-settings.js";
 export type {

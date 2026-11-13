@@ -21,11 +21,13 @@
  *  - `zotero-sync-settings-set-aside`: this computer's Zotero sync settings (which Zotero library feeds which
  *    project, how often) were damaged, so they were kept aside; automatic sync is off until the researcher sets it up
  *    again (Task Z7, R242). A damaged sync history raises no notice.
+ *  - `zotero-sync-settings-newer`: this computer's Zotero sync settings were written by a newer version of the app;
+ *    they were left exactly as they are, not read and not changed, so automatic sync is off here (R244 M7).
  *
  * Carried in `library.state` (`notices`); dismissed with `POST /settings/notices/dismiss { kind }`
  * (the desktop app's token only).
  */
-export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside", "approved-folders-list-set-aside", "libraries-list-set-aside", "watched-folder-choices-set-aside", "zotero-sync-settings-set-aside"] as const;
+export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside", "approved-folders-list-set-aside", "libraries-list-set-aside", "watched-folder-choices-set-aside", "zotero-sync-settings-set-aside", "zotero-sync-settings-newer"] as const;
 export type DeviceNoticeKind = (typeof DEVICE_NOTICE_KINDS)[number];
 
 export function isDeviceNoticeKind(v: unknown): v is DeviceNoticeKind {
