@@ -37,9 +37,29 @@
  * responding" and it holds the project's store queue); and what is kept per file (`Rec`, about 255 bytes at
  * 40,000 files) grows with the folder, not with time.
  *
+ * The register (Task W3; R207 2 and 3, which replace R81's "a changed file is imported again"): each watch keeps,
+ * in the project, which file became which source (repo/watch-register.ts). The engine NOTES what a colleague later
+ * does to such a file and never acts on it:
+ *   - a registered file whose size and exact time are unchanged is not read again (not even at start);
+ *   - one whose size or time changed is hashed if it is local (through the whole order above): the same content
+ *     updates the reading; other content is noted "changed". One that is not local is noted "may-have-changed"
+ *     and is not read;
+ *   - one missing from a complete listing is noted "gone" — unless at least WATCH_MASS_GONE_MIN of the folder's
+ *     "in-library" entries, and at least half of them, are missing at once (a provider signed out or starting):
+ *     then nothing is noted and the status says `massGone`. A folder that cannot be reached is never listed
+ *     completely, so it never marks anything;
+ *   - a new file whose content is a registered entry's whose old name is gone (renamed, moved, or its name now
+ *     differs only by case or normalisation, A3) takes that entry over: no second source;
+ *   - content the register holds for a source the researcher deleted is not imported again (it counts as
+ *     already in the library);
+ *   - a source the watch created whose register line was lost (a crash between the two) is adopted, never
+ *     imported again (its provenance names the watch).
+ * A note is a register line and NOTHING else: no source, file or annotations.json changes because of the drive
+ * (Decision 4). Only the researcher's own act brings a changed file in (`bringInNewVersion`, a further original
+ * of the same source; `settleWatchedFile` keeps the library's copy). Lines are written in batches (at most
+ * WATCH_REGISTER_BATCH, or WATCH_REGISTER_FLUSH_MS after the first, and at stop()), each one governed change.
+ *
  * Other behaviour kept from Task 26:
- *   - a file whose content changes after it came in is imported again (its new content is a new source;
- *     unchanged content is recognised by its SHA-256 and skipped) — R81's rule, replaced in W3;
  *   - when the watch starts, when the folder returns and when a locked encrypted project is unlocked, the
  *     folder is scanned; files already in the project (by SHA-256) are skipped silently;
  *   - links: the watched folder is the file's only allowed root (R67). A link to a file elsewhere is
@@ -63,17 +83,19 @@ import { constants as fsConstants, watch as nodeWatch, type BigIntStats, type FS
 import fsp, { type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { WatchedFolderOptions, type WatchedFolder, type WatchedFolderOptions as WatchedFolderOptionsT } from "@ao/core";
+import { WatchedFolderOptions, isId, type WatchedFolder, type WatchedFolderOptions as WatchedFolderOptionsT } from "@ao/core";
 import { raiseDeviceNotice } from "../device-notices.js";
 import { writeSmallFileAtomic } from "../fs/atomic.js";
 import { isClosed, type Library } from "../library.js";
 import type { LocationEnv } from "../location.js";
 import type { HttpClient } from "../lookup/index.js";
-import { addWatchedFolderEntry, projectEncrypted, removeWatchedFolderEntry, type Repo } from "../repo/repo.js";
-import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, createAttach, type Attach, type AttachOutcome, type AttachStatus } from "./attach.js";
+import { InvalidInputError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { addWatchedFolderEntry, projectCollectionsAndTags, projectEncrypted, removeWatchedFolderEntry, type Repo } from "../repo/repo.js";
+import { WATCHED_FILE_STATES, isRegisterEntry, type WatchRegisterEntry, type WatchedFileState } from "../repo/watch-register.js";
+import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, WATCHED_FOLDER_TOOL, createAttach, type Attach, type AttachOutcome, type AttachStatus } from "./attach.js";
 import { proxyQueueFor, type ProxyQueue } from "./proxies.js";
 import { SIDECAR_EXTS } from "./sidecar.js";
-import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
+import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, fileKey, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
 
 /** Names never imported (moved to watch-local.ts so the two modules do not import each other; A2). */
 export { ignoredName } from "./watch-local.js";
@@ -105,6 +127,20 @@ const BATCH = WATCH_LOCAL_BATCH;
 const SETTLING_MAX = 10_000;
 /** Bytes read per call while hashing (each read is one call through the folder's gate). */
 const HASH_CHUNK = 1024 * 1024;
+/** Register lines written in one change at most (Task W3). */
+export const WATCH_REGISTER_BATCH = 50;
+/** A register line waits at most this long before it is written. */
+export const WATCH_REGISTER_FLUSH_MS = 5000;
+/** At least this many "in-library" entries, and at least half of them, missing at once: nothing is marked gone. */
+export const WATCH_MASS_GONE_MIN = 20;
+
+/** A file the researcher asked to bring in is not on this computer now, or not as it was checked: nothing was read. */
+export class WatchFileNotLocalError extends Error {
+  constructor() {
+    super("The file in the folder is not downloaded to this Mac, or it is still changing, so it was not read. Download it in Finder, then try again.");
+    this.name = "WatchFileNotLocalError";
+  }
+}
 
 export const WATCH_REASONS = {
   outside: "The file is outside the watched folder (it is a link to somewhere else), so it was not imported.",
@@ -125,6 +161,9 @@ export const WATCH_REASONS = {
   notPermitted: "macOS did not allow the app to read files managed by {provider}, so this folder is not watched. Press “Try again” and choose Allow if macOS asks.",
   notResponding: "The folder did not answer for 30 seconds ({provider} may be starting, signed out or offline). Watching goes on when it answers.",
   missing: "The folder cannot be found. If {provider} is signed out or still starting, watching resumes when the folder is back.",
+  /** Task W3: most of the register missing at once; `{provider}` is filled by `withProvider`. */
+  massGone: "Most files in this folder disappeared at once. This usually means {provider} is signed out or still starting. Nothing in the library has changed.",
+  noCollection: "The collection chosen for this folder no longer exists, so new files go into the project without a collection.",
 } as const;
 
 /** A reason with `{provider}` filled: the cloud service's name, or "the system" for a plain folder. */
@@ -162,6 +201,10 @@ export interface WatchStatus {
     waiting: number;
     /** Files that did not come in for another reason (listed in `problems()`). */
     didNotComeIn: number;
+    /** Registered files noted "changed" or "may-have-changed" (Task W3). */
+    changed: number;
+    /** Registered files noted "gone". */
+    gone: number;
   };
 }
 
@@ -233,6 +276,8 @@ export interface WatchDeps {
   watcherForm?: "tree" | "per-folder";
   /** Test seam: Node's `fs.watch`. */
   fsWatch?: typeof nodeWatch;
+  /** Test seam: how long a register line waits before it is written (default WATCH_REGISTER_FLUSH_MS). */
+  registerFlushMs?: number;
 }
 
 export interface FolderWatch {
@@ -425,6 +470,65 @@ const outstandingFolders = new Map<string, Promise<void>>();
 /** A reading of nothing (a file the system would not let the app look at). */
 const NO_READING: Reading = { ino: 0n, size: 0, blocks: 0, mtimeNs: 0n };
 
+/** "Is this content on this computer?" with the gate's `lstat`; answers given across a call that did not answer are thrown away. */
+async function gatedJudge(gate: FolderGate, fsx: WatchFs, presence: typeof contentState, abs: string[]): Promise<Map<string, ContentState>> {
+  const epoch = gate.epoch;
+  const lstat = async (p: string) => {
+    const s = await gate.call(() => fsx.lstat(p));
+    return { size: Number(s.size), blocks: Number(s.blocks), ino: s.ino, mtimeNs: s.mtimeNs, isFile: () => s.isFile() };
+  };
+  const m = await presence(abs, { lstat, signal: gate.signal });
+  if (gate.epoch !== epoch || gate.stuck) throw new FolderNotAnsweringError();
+  return m;
+}
+
+/** SHA-256 of a file: open (read-only, O_NOFOLLOW), each read and close are calls through the gate. Only for a file just judged local. */
+async function gatedHash(gate: FolderGate, fsx: WatchFs, abs: string, buf: Buffer): Promise<string> {
+  const fh = await gate.call(() => fsx.open(abs, OPEN_FLAGS));
+  try {
+    const h = createHash("sha256");
+    for (;;) {
+      const { bytesRead } = await gate.call(() => fh.read(buf, 0, buf.length, null));
+      if (bytesRead === 0) break;
+      h.update(buf.subarray(0, bytesRead));
+    }
+    return h.digest("hex");
+  } finally {
+    // Closing is a call too: it takes its turn at the gate; if the folder is stuck (on this handle's read), it
+    // waits until that call has settled — even when the watch has stopped meanwhile — and is never issued beside it.
+    await gate.call(() => fh.close()).catch((err: unknown) => {
+      if (err instanceof FolderNotAnsweringError) void gate.afterSettle().then(() => gate.call(() => fh.close()).catch(() => {}));
+    });
+  }
+}
+
+/** The calls a researcher's act on one file makes (bringInNewVersion), each through the folder's one gate. */
+interface FileIo {
+  realRoot: string;
+  stabilityMs: number;
+  lstat(abs: string): Promise<BigIntStats>;
+  judge(abs: string[]): Promise<Map<string, ContentState>>;
+  hash(abs: string): Promise<string>;
+  /** attach with `readable` answering for `abs` only while a fresh `lstat` equals `b`. */
+  attach(abs: string, b: Reading, toSourceId: string): Promise<AttachOutcome | undefined>;
+}
+
+/** A running watch, for the researcher's acts on its files (one per repo, project and watch id). */
+interface LiveWatch {
+  /** Runs `fn` as one step of the watch's own worker (so its calls are the folder's one call in flight). */
+  exclusive<T>(fn: (io: FileIo) => Promise<T>): Promise<T>;
+  /** Writes the register lines waiting to be written. */
+  flush(): Promise<void>;
+  /** A line written by the researcher's act: the watch's own view follows it. */
+  apply(e: WatchRegisterEntry): void;
+}
+const liveWatches = new WeakMap<Repo, Map<string, LiveWatch>>();
+const liveKey = (projectId: string, watchId: string) => `${projectId}\u0000${watchId}`;
+
+/** Two names of the same file on a file system that ignores case and normalisation (macOS): equal when folded. */
+const foldedName = (rel: string) => rel.normalize("NFC").toLowerCase();
+const sameStored = (e: WatchRegisterEntry, r: Reading) => e.size === r.size && e.mtimeNs === r.mtimeNs.toString();
+
 /**
  * Watches `dir` (absolute) and adds each new file to the project. Errors are reported through
  * `onEvent` and the status, never thrown.
@@ -459,8 +563,6 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let unreachable: string | null = null;
   /** Paused because the project is locked: a full scan follows the unlock. */
   let locked = false;
-  /** SHA-256 of every file already in the project (read when first needed, kept up to date). */
-  let known: Set<string> | null = null;
 
   const records = new Map<string, Rec>();
   const tally: Record<Kind, number> = { in: 0, known: 0, nd: 0, unknown: 0, problem: 0 };
@@ -481,8 +583,6 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
    * `lstat` still equals it (A6, C1). Small: sidecar names only.
    */
   const sidecarOk = new Map<string, Reading>();
-  /** Which file came in with which content (came-in files only): a renamed one is not imported again (M3). */
-  const cameInBySha = new Map<string, string>();
   /** The listing in progress: folders still to read, and what was found (to drop files that went away). */
   let walk: { dirs: Array<{ dir: string; depth: number; entries?: Entry[] }>; found: Set<string>; complete: boolean } | null = null;
   let pollDue = false;
@@ -490,6 +590,257 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let nextRecheck = Date.now() + recheckMs;
   /** The file being imported and its stability reading (for attach's `readable`). */
   let current: { abs: string; b: Reading } | null = null;
+
+  // ---- the register (Task W3) ---------------------------------------------------------------------------------
+  /** Written to the library only for a watch with an id (the service's watches); otherwise kept for this run. */
+  const persist = watchId !== undefined && isId(watchId);
+  const flushMs = deps.registerFlushMs ?? WATCH_REGISTER_FLUSH_MS;
+  /** The register by key; null until read, and while the project is locked (sealed content is not kept then). */
+  let reg: Map<string, WatchRegisterEntry> | null = persist ? null : new Map();
+  /** The register has been read (and the collection checked) since the start or the last lock. */
+  let regReady = false;
+  /** Keys by content (`sha256`, and `newSha256`): renames, copies and sources deleted here. */
+  const regBySha = new Map<string, Set<string>>();
+  /** Keys by source: a source of this watch with no entry is adopted (Accept 1). */
+  const regBySource = new Map<string, string>();
+  const regCounts = Object.fromEntries(WATCHED_FILE_STATES.map((st) => [st, 0])) as Record<WatchedFileState, number>;
+  /** Lines noted and not yet written (already in `reg`). */
+  const unwritten: WatchRegisterEntry[] = [];
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  let flushing: Promise<void> = Promise.resolve();
+  /** The last complete listing missed most of the register at once (nothing was marked gone). */
+  let massGone = false;
+  /** The collection chosen for this folder no longer exists. */
+  let noCollection = false;
+
+  const indexShas = (e: WatchRegisterEntry) => (e.newSha256 && e.newSha256 !== e.sha256 ? [e.sha256, e.newSha256] : [e.sha256]);
+  function unindex(e: WatchRegisterEntry) {
+    for (const sha of indexShas(e)) {
+      const keys = regBySha.get(sha);
+      keys?.delete(e.key);
+      if (keys && keys.size === 0) regBySha.delete(sha);
+    }
+    if (regBySource.get(e.sourceId) === e.key) regBySource.delete(e.sourceId);
+    regCounts[e.state]--;
+  }
+  /** Applies an entry to the register in memory (a rename drops the old key). */
+  function putEntry(e: WatchRegisterEntry) {
+    if (!reg) return;
+    if (e.renamedFrom !== undefined && e.renamedFrom !== e.key) {
+      const was = reg.get(e.renamedFrom);
+      if (was) {
+        unindex(was);
+        reg.delete(e.renamedFrom);
+      }
+    }
+    const old = reg.get(e.key);
+    if (old) unindex(old);
+    reg.set(e.key, e);
+    for (const sha of indexShas(e)) {
+      let keys = regBySha.get(sha);
+      if (!keys) regBySha.set(sha, (keys = new Set()));
+      keys.add(e.key);
+    }
+    regBySource.set(e.sourceId, e.key);
+    regCounts[e.state]++;
+    touch();
+  }
+  /** A change of a file's state: in the register now, written with the next batch. The ONLY write a note makes. */
+  function note(e: WatchRegisterEntry) {
+    putEntry(e);
+    if (!persist) return;
+    if (!isRegisterEntry(e)) {
+      deps.debug?.("watched folder: a register entry was not well formed and is kept for this run only");
+      return;
+    }
+    unwritten.push(e);
+    if (unwritten.length >= WATCH_REGISTER_BATCH) void flush();
+    else scheduleFlush();
+  }
+  function scheduleFlush() {
+    if (flushTimer || stopped || unwritten.length === 0) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      void flush();
+    }, flushMs);
+    flushTimer.unref?.();
+  }
+  /** Writes the lines not yet written, in batches of WATCH_REGISTER_BATCH (each one governed change); a failure keeps them for later. */
+  function flush(): Promise<void> {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = undefined;
+    }
+    flushing = flushing.then(async () => {
+      while (unwritten.length > 0) {
+        const batch = unwritten.slice(0, WATCH_REGISTER_BATCH);
+        try {
+          await deps.repo.recordWatchedFiles(projectId, watchId!, batch);
+        } catch (err) {
+          deps.debug?.(`watched folder: the register could not be written now (${err instanceof Error ? err.name : "error"})`);
+          scheduleFlush(); // tried again later (e.g. once the project is unlocked)
+          return;
+        }
+        unwritten.splice(0, batch.length);
+      }
+    });
+    return flushing;
+  }
+  /** Whether the chosen collection exists (none chosen: nothing to say). */
+  async function checkCollection(): Promise<void> {
+    const id = opts.collectionId;
+    let gone = false;
+    if (id) {
+      try {
+        gone = !(await projectCollectionsAndTags(deps.repo, projectId)).collections.some((c) => c.id === id);
+      } catch {
+        gone = noCollection; // unreadable now: what was known stays
+      }
+    }
+    if (gone !== noCollection) {
+      noCollection = gone;
+      touch();
+    }
+  }
+  /** Reads the register (sealed: only while unlocked) and checks the collection. False when it cannot be read now. */
+  async function loadRegister(): Promise<boolean> {
+    if (projectLocked()) {
+      pauseForLock();
+      return false;
+    }
+    if (persist) {
+      let m: Map<string, WatchRegisterEntry>;
+      try {
+        m = await deps.repo.watchRegister(projectId, watchId!);
+      } catch (err) {
+        if (err instanceof ProjectLockedError) pauseForLock();
+        else deps.debug?.(`watched folder: the register could not be read (${err instanceof Error ? err.name : "error"})`);
+        return false;
+      }
+      reg = new Map();
+      regBySha.clear();
+      regBySource.clear();
+      for (const st of WATCHED_FILE_STATES) regCounts[st] = 0;
+      for (const e of m.values()) putEntry(e);
+      for (const e of unwritten) putEntry(e); // noted before the lock and not yet written: they are the latest
+    }
+    await checkCollection();
+    regReady = true;
+    touch();
+    return true;
+  }
+
+  /**
+   * The project's sources and the content they hold, kept up to date with the project: sources added since are
+   * read, sources removed (deleted here, or taken away by an undo) are dropped, and then every file counted as
+   * "already in the library" is looked at again (its content may no longer be in the library).
+   */
+  type LibIndex = { ids: Set<string>; shas: Map<string, Set<string>>; ofSource: Map<string, { shas: string[]; ours: boolean }> };
+  let libIdx: LibIndex | null = null;
+  async function libraryIndex(): Promise<LibIndex> {
+    const ids = deps.repo.listSourceIds(projectId);
+    const first = libIdx === null;
+    const idx: LibIndex = libIdx ?? { ids: new Set(), shas: new Map(), ofSource: new Map() };
+    libIdx = idx;
+    const now = new Set(ids);
+    let removed = false;
+    for (const id of [...idx.ids]) {
+      if (now.has(id)) continue;
+      removed = true;
+      idx.ids.delete(id);
+      for (const sha of idx.ofSource.get(id)?.shas ?? []) {
+        const owners = idx.shas.get(sha);
+        owners?.delete(id);
+        if (owners && owners.size === 0) idx.shas.delete(sha);
+      }
+      idx.ofSource.delete(id);
+    }
+    for (const id of ids) {
+      if (idx.ids.has(id)) continue;
+      idx.ids.add(id);
+      try {
+        const sf = await deps.repo.getSource(projectId, id);
+        const shas = sf.assets.map((a) => a.sha256);
+        const ours = persist && sf.source.provenance.externalKeys?.[WATCHED_FOLDER_TOOL] === watchId;
+        idx.ofSource.set(id, { shas, ours });
+        for (const sha of shas) {
+          let owners = idx.shas.get(sha);
+          if (!owners) idx.shas.set(sha, (owners = new Set()));
+          owners.add(id);
+        }
+      } catch {
+        // unreadable source: its files are compared by attach itself
+      }
+    }
+    if (removed && !first) for (const [rel, rec] of records) if (rec.kind === "known") addPending(rel, QUIET | FORCE);
+    return idx;
+  }
+  /** Whether the source holds content `sha` now (read afresh: a further original may have been added). */
+  async function sourceHolds(sourceId: string, sha: string): Promise<boolean> {
+    try {
+      return (await deps.repo.getSource(projectId, sourceId)).assets.some((a) => a.sha256 === sha);
+    } catch {
+      return false;
+    }
+  }
+  const sameEntry = (a: WatchRegisterEntry, b: WatchRegisterEntry) => JSON.stringify({ ...a, at: "" }) === JSON.stringify({ ...b, at: "" });
+  /** `e` without the parts that describe a change (an entry "in-library" again). */
+  const settledShape = (e: WatchRegisterEntry): WatchRegisterEntry => {
+    const { newSha256: _n, newSize: _s, renamedFrom: _r, ...rest } = e;
+    return rest;
+  };
+  /** Notes `next` unless it says nothing new about the file. */
+  function noteIfChanged(prev: WatchRegisterEntry, next: WatchRegisterEntry) {
+    const { renamedFrom: _r, ...clean } = next;
+    if (!sameEntry(settledShape(prev), settledShape(clean)) || prev.newSha256 !== clean.newSha256 || prev.newSize !== clean.newSize) note({ ...clean, at: new Date().toISOString() });
+  }
+
+  /** A registered file whose size and exact time are as when its content was last known: not read. */
+  async function registeredUnchanged(rel: string, e: WatchRegisterEntry, b: Reading): Promise<void> {
+    setRec(rel, b, "in");
+    dropProblem(rel);
+    let next: WatchRegisterEntry = { ...e, file: rel };
+    if (e.state === "gone") {
+      // Back, as it was when last known: "changed" if that was a change, else in the library again.
+      next = e.newSha256 && e.newSha256 !== e.sha256 ? { ...next, state: "changed" } : { ...settledShape(next), state: "in-library" };
+    } else if (e.state === "changed" && e.newSha256 && (await sourceHolds(e.sourceId, e.newSha256))) {
+      // The new version was brought in and the process stopped before its line was written: healed.
+      next = { ...settledShape(next), sha256: e.newSha256, state: "in-library" };
+    }
+    noteIfChanged(e, next);
+  }
+  /** A registered file whose size or time changed and which is not on this computer: noted, never read. */
+  function registeredNotLocal(rel: string, e: WatchRegisterEntry, b: Reading) {
+    setRec(rel, b, "in");
+    dropProblem(rel);
+    if (e.state === "may-have-changed" && e.newSize === b.size && e.file === rel) return;
+    const { newSha256: _n, renamedFrom: _r, ...rest } = e;
+    note({ ...rest, file: rel, state: "may-have-changed", newSize: b.size, at: new Date().toISOString() });
+  }
+  /** A registered file whose size or time changed, read through the whole order: what its content is now. */
+  async function registeredHashed(rel: string, e: WatchRegisterEntry, b: Reading, sha: string): Promise<void> {
+    setRec(rel, b, "in");
+    dropProblem(rel);
+    const reading = { file: rel, size: b.size, mtimeNs: b.mtimeNs.toString() };
+    let next: WatchRegisterEntry;
+    if (sha === e.sha256) next = { ...settledShape(e), ...reading, state: "in-library" };
+    else if (await sourceHolds(e.sourceId, sha)) next = { ...settledShape(e), ...reading, sha256: sha, state: "in-library" };
+    else if (sha === e.newSha256 && (e.state === "changed" || e.state === "settled")) next = { ...e, ...reading };
+    else next = { ...e, ...reading, state: "changed", newSha256: sha, newSize: b.size };
+    noteIfChanged(e, next);
+  }
+  /**
+   * A new file whose content is a registered entry's, whose old name is gone — "gone" already, missing now, or
+   * (macOS) the same file under a name differing only by case or normalisation (A3): renamed or moved.
+   */
+  async function renamedFrom(rel: string, b: Reading, sha: string): Promise<WatchRegisterEntry | undefined> {
+    const keys = [...(regBySha.get(sha) ?? [])].filter((k) => k !== fileKey(rel));
+    const entries = keys.map((k) => reg!.get(k)!).filter((e) => e && (e.sha256 === sha || e.newSha256 === sha));
+    const gone = entries.find((e) => e.state === "gone");
+    if (gone) return gone;
+    for (const e of entries) if (await goneFrom(e.file, rel, b)) return e;
+    return undefined;
+  }
 
   const relName = (p: string) => relative(realRoot, p).split(sep).join("/");
   const absOf = (rel: string) => join(realRoot, ...rel.split("/"));
@@ -513,18 +864,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     stat: (p: string) => gate.call(() => fsx.stat(p)),
     realpath: (p: string) => gate.call(() => fsx.realpath(p)),
   };
-  /** `contentState`'s own `lstat`, through the gate (W1 runs two at a time; the gate makes them one). */
-  const presenceLstat = async (p: string) => {
-    const s = await g.lstat(p);
-    return { size: Number(s.size), blocks: Number(s.blocks), ino: s.ino, mtimeNs: s.mtimeNs, isFile: () => s.isFile() };
-  };
-  /** "Is this content on this computer?" for `abs` paths; answers given across a call that did not answer are thrown away. */
-  async function judge(abs: string[]): Promise<Map<string, ContentState>> {
-    const epoch = gate.epoch;
-    const m = await presence(abs, { lstat: presenceLstat, signal: gate.signal });
-    if (gate.epoch !== epoch || gate.stuck) throw new FolderNotAnsweringError();
-    return m;
-  }
+  /** "Is this content on this computer?" for `abs` paths (`contentState`'s own `lstat`s through the gate: W1 runs two at a time, the gate makes them one). */
+  const judge = (abs: string[]) => gatedJudge(gate, fsx, presence, abs);
 
   // ---- the per-file record, the counts and the problem list -------------------------------------------------
   function untally(old: Rec) {
@@ -584,7 +925,18 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const stateNow = (): WatchStatus["state"] => (stopped ? "stopped" : unreachable ? "unreachable" : locked ? "locked" : "watching");
   function status(): WatchStatus {
     const state = stateNow();
-    const reason = state === "stopped" ? stopReason : state === "unreachable" ? unreachable! : state === "locked" ? WATCH_REASONS.locked : undefined;
+    const reason =
+      state === "stopped"
+        ? stopReason
+        : state === "unreachable"
+          ? unreachable!
+          : state === "locked"
+            ? WATCH_REASONS.locked
+            : massGone
+              ? withProvider(WATCH_REASONS.massGone, provider)
+              : noCollection
+                ? WATCH_REASONS.noCollection
+                : undefined;
     return {
       ...(watchId ? { watchId } : {}),
       state,
@@ -598,6 +950,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         notDownloadedBytes: ndBytes,
         waiting: pending.size + settling.size + imports.length,
         didNotComeIn: tally.problem,
+        changed: regCounts.changed + regCounts["may-have-changed"],
+        gone: regCounts.gone,
       },
     };
   }
@@ -828,8 +1182,40 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   function finishWalk() {
     const w = walk!;
     walk = null;
-    if (w.complete) for (const rel of [...records.keys()]) if (!w.found.has(rel) && !pending.has(rel) && !settling.has(rel) && !imports.some((j) => j.rel === rel)) removeRec(rel);
+    if (w.complete) {
+      for (const rel of [...records.keys()]) if (!w.found.has(rel) && !pending.has(rel) && !settling.has(rel) && !imports.some((j) => j.rel === rel)) removeRec(rel);
+      markGone(w.found);
+    }
     touch();
+  }
+  /**
+   * After a COMPLETE listing (a folder that cannot be reached is never listed completely): registered files it
+   * did not find are noted "gone" — unless at least WATCH_MASS_GONE_MIN "in-library" entries, and at least half of
+   * them, are missing at once (a provider signed out or still starting): then nothing is noted (`massGone`).
+   * A note is a register line and nothing else: the sources stay as they are.
+   */
+  function markGone(found: Set<string>) {
+    if (!reg || !regReady) return;
+    const present = new Set<string>();
+    for (const rel of found) present.add(fileKey(rel));
+    const missing: WatchRegisterEntry[] = [];
+    let missingInLibrary = 0;
+    for (const e of reg.values()) {
+      if (e.state === "gone" || e.state === "settled" || present.has(e.key)) continue;
+      missing.push(e);
+      if (e.state === "in-library") missingInLibrary++;
+    }
+    const mass = missingInLibrary >= WATCH_MASS_GONE_MIN && missingInLibrary * 2 >= regCounts["in-library"];
+    if (mass !== massGone) {
+      massGone = mass;
+      touch();
+    }
+    if (mass) return;
+    const at = new Date().toISOString();
+    for (const e of missing) {
+      const { renamedFrom: _r, ...rest } = e;
+      note({ ...rest, state: "gone", at });
+    }
   }
 
   /** The first reading of up to BATCH waiting files: the name rule, then one `lstat` each. */
@@ -952,10 +1338,22 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         stable.push({ rel, abs: absOf(rel), b, flags: s.flags, ...(s.waits ? { waits: s.waits } : {}) });
       }
       if (stable.length === 0) return;
+      // A registered file as it was when its content was last known: nothing to read (Task W3).
+      for (let i = stable.length - 1; i >= 0; i--) {
+        const s = stable[i]!;
+        const e = reg?.get(fileKey(s.rel));
+        if (e && sameStored(e, s.b)) {
+          stable.splice(i, 1);
+          await registeredUnchanged(s.rel, e, s.b);
+        }
+      }
+      if (stable.length === 0) return;
       const judged = await judge(stable.map((s) => s.abs));
       for (const s of stable) {
         const c = judged.get(s.abs);
-        if (!c || c.presence !== "local") {
+        const e = reg?.get(fileKey(s.rel));
+        if (e && (!c || c.presence !== "local")) registeredNotLocal(s.rel, e, s.b);
+        else if (!c || c.presence !== "local") {
           notLocal(s.rel, s.b, c?.presence ?? "unknown");
           sidecarOk.delete(s.rel);
         } else if (!sameReading(s.b, c)) settling.set(s.rel, { a: c, at: Date.now(), flags: s.flags });
@@ -994,41 +1392,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
   }
 
-  async function knownHashes(): Promise<Set<string>> {
-    if (known) return known;
-    const out = new Set<string>();
-    for (const id of deps.repo.listSourceIds(projectId)) {
-      try {
-        for (const a of (await deps.repo.getSource(projectId, id)).assets) out.add(a.sha256);
-      } catch {
-        // unreadable source: its files are compared by attach itself
-      }
-    }
-    known = out;
-    return out;
-  }
-
   let hashBuf: Buffer | undefined;
-  /** SHA-256 of a file: open, each read and close are calls through the gate. Only for a file just judged local. */
-  async function hashOf(abs: string): Promise<string> {
-    const fh = await gate.call(() => fsx.open(abs, OPEN_FLAGS));
-    try {
-      const h = createHash("sha256");
-      const buf = (hashBuf ??= Buffer.allocUnsafe(HASH_CHUNK));
-      for (;;) {
-        const { bytesRead } = await gate.call(() => fh.read(buf, 0, buf.length, null));
-        if (bytesRead === 0) break;
-        h.update(buf.subarray(0, bytesRead));
-      }
-      return h.digest("hex");
-    } finally {
-      // Closing is a call too: it takes its turn at the gate; if the folder is stuck (on this handle's read), it
-      // waits until that call has settled — even when the watch has stopped meanwhile — and is never issued beside it.
-      await gate.call(() => fh.close()).catch((err: unknown) => {
-        if (err instanceof FolderNotAnsweringError) void gate.afterSettle().then(() => gate.call(() => fh.close()).catch(() => {}));
-      });
-    }
-  }
+  /** SHA-256 of a file (O_NOFOLLOW; open, each read and close through the gate). Only for a file just judged local. */
+  const hashOf = (abs: string) => gatedHash(gate, fsx, abs, (hashBuf ??= Buffer.allocUnsafe(HASH_CHUNK)));
 
   const isSidecarName = (rel: string) => (SIDECAR_EXTS as readonly string[]).some((ext) => rel.toLowerCase().endsWith(ext));
   /**
@@ -1100,25 +1466,50 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       deps.debug?.(`watched folder: a file could not be read (${errCode(err) ?? "error"})`);
       return report(rel, b, "could-not-import", WATCH_REASONS.failed);
     }
-    // The same content as a file that came in here and is no longer under its old name: a rename (M3) — it stays
-    // counted as it was, and is not imported or announced again.
-    const prev = cameInBySha.get(sha);
-    if (prev !== undefined && prev !== rel && (await goneFrom(prev))) {
-      removeRec(prev);
+    const key = fileKey(rel);
+    // A registered file whose size or time changed: what its content is now is noted; it is never imported (W3).
+    const known = reg!.get(key);
+    if (known) return registeredHashed(rel, known, b, sha);
+    // The same content as a registered file whose old name is gone: a rename or move (M3, W3 Accept 4) — the entry
+    // follows the file; nothing is imported or announced, and it stays counted as it was.
+    const moved = await renamedFrom(rel, b, sha);
+    if (moved) {
+      if (moved.file !== rel) removeRec(moved.file);
+      const reading = { key, file: rel, size: b.size, mtimeNs: b.mtimeNs.toString(), renamedFrom: moved.key, at: new Date().toISOString() };
+      const state: WatchedFileState = sha === moved.sha256 ? "in-library" : moved.state === "gone" || moved.state === "may-have-changed" ? "changed" : moved.state;
+      note(state === "in-library" ? { ...settledShape(moved), ...reading, state } : { ...moved, ...reading, state, newSha256: sha, newSize: b.size });
       setRec(rel, b, "in");
-      cameInBySha.set(sha, rel);
       dropProblem(rel);
       return;
     }
-    if (flags & QUIET && (await knownHashes()).has(sha)) {
+    // Content the register holds — a copy of a registered file, or the file of a source deleted here (which stays
+    // deleted, W3 Accept 5): already in the library.
+    if (regBySha.has(sha)) {
       setRec(rel, b, "known");
       dropProblem(rel);
       return;
     }
+    const lib = await libraryIndex();
+    const owners = lib.shas.get(sha);
+    if (owners) {
+      // A source this watch created whose register line was lost (a crash between the two): adopted (Accept 1).
+      const adopt = [...owners].find((id) => lib.ofSource.get(id)?.ours && !regBySource.has(id));
+      if (adopt) {
+        note({ key, file: rel, sourceId: adopt, sha256: sha, size: b.size, mtimeNs: b.mtimeNs.toString(), state: "in-library", at: new Date().toISOString() });
+        setRec(rel, b, "in");
+        dropProblem(rel);
+        return;
+      }
+      if (flags & QUIET) {
+        setRec(rel, b, "known");
+        dropProblem(rel);
+        return;
+      }
+    }
     current = { abs, b };
     let o: AttachOutcome | undefined;
     try {
-      [o] = await attach.attachFiles(projectId, [abs]);
+      [o] = await attach.attachFiles(projectId, [abs], { ...(persist ? { origin: { watchId: watchId! } } : {}), ...(opts.collectionId ? { collectionId: opts.collectionId } : {}) });
     } catch (err) {
       deps.debug?.(`watched folder: import failed (${err instanceof Error ? err.name : "error"})`);
       o = { path: abs, outcome: "failed", reason: WATCH_REASONS.failed };
@@ -1141,9 +1532,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       setRec(rel, b, "problem");
       setProblem(rel, { file: rel, kind: reason === ATTACH_REASONS.unsupported ? "not-supported" : "could-not-import", reason });
     } else {
-      (await knownHashes()).add(sha);
       setRec(rel, b, o.outcome === "duplicate" ? "known" : "in");
-      if (o.outcome !== "duplicate") cameInBySha.set(sha, rel);
+      if (o.outcome !== "duplicate" && o.sourceId) note({ key, file: rel, sourceId: o.sourceId, sha256: sha, size: b.size, mtimeNs: b.mtimeNs.toString(), state: "in-library", at: new Date().toISOString() });
+      if (o.noCollection && !noCollection) {
+        noCollection = true;
+        touch();
+      }
       dropProblem(rel);
     }
     emit({
@@ -1163,12 +1557,14 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     const stem = rel.slice(0, slash + 1) + (dot > 0 ? name.slice(0, dot) : name);
     return SIDECAR_EXTS.map((ext) => stem + ext).filter((r) => r !== rel);
   }
-  /** Whether the file `rel` is no longer there (one `lstat`, through the gate). */
-  async function goneFrom(rel: string): Promise<boolean> {
-    if (!records.has(rel)) return true;
+  /**
+   * Whether the file `rel` is no longer there (one `lstat`, through the gate) — or is the very file `now` (`r`) under
+   * a name that differs only by case or normalisation (a file system that ignores both answers the old name).
+   */
+  async function goneFrom(rel: string, now: string, r: Reading): Promise<boolean> {
     try {
-      await g.lstat(absOf(rel));
-      return false;
+      const st = await g.lstat(absOf(rel));
+      return rel !== now && foldedName(rel) === foldedName(now) && st.ino === r.ino;
     } catch (err) {
       if (err instanceof FolderNotAnsweringError) throw err;
       return errCode(err) === "ENOENT";
@@ -1178,7 +1574,14 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   function pauseForLock() {
     if (locked) return;
     locked = true;
-    known = null;
+    libIdx = null;
+    regReady = false;
+    if (persist) {
+      // Sealed content is not kept while the project is locked; it is read again after the unlock.
+      reg = null;
+      regBySha.clear();
+      regBySource.clear();
+    }
     emit({ kind: "paused", reason: WATCH_REASONS.locked });
     touch();
   }
@@ -1214,6 +1617,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     if (Date.now() >= nextRescan) {
       nextRescan = Date.now() + rescanMs;
       if (!walk) startWalk();
+      if (regReady) {
+        await libraryIndex(); // sources removed since (deleted, or an undo): their files are looked at again
+        await checkCollection();
+      }
     }
   }
 
@@ -1243,6 +1650,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
           if (!stopped) await tryResume();
           continue;
         }
+        if (jobs.length > 0) {
+          await jobs.shift()!();
+          continue;
+        }
         if (pollDue) {
           pollDue = false;
           await poll();
@@ -1250,6 +1661,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         }
         if (unreachable || locked) {
           await idle(pollMs);
+          continue;
+        }
+        if (!regReady) {
+          if (!(await loadRegister())) await idle(pollMs);
           continue;
         }
         if (imports.length > 0) {
@@ -1294,16 +1709,66 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       stopReason = reason;
       clearInterval(timer);
       gate.release();
+      if (persist && liveWatches.get(deps.repo)?.get(liveKey(projectId, watchId!)) === live) liveWatches.get(deps.repo)!.delete(liveKey(projectId, watchId!));
+      for (const j of jobs.splice(0)) void j(); // each refuses: the watch has stopped
       wake();
       await closeWatcher();
       if (!inside) {
         await ready.catch(() => {});
         await loopDone.catch(() => {});
       }
+      // The register lines noted and not yet written (if the library or project allows it now; otherwise the next
+      // start finds the same again: adoption, the readings, the listing).
+      if (persist) await flush().catch(() => {});
       emit({ kind: "stopped", ...(reason ? { reason } : {}) });
       send();
     })();
     return stopping;
+  }
+
+  // ---- the researcher's acts on this watch's files (bringInNewVersion, settleWatchedFile) -----------------------
+  const jobs: Array<() => Promise<void>> = [];
+  const io: FileIo = {
+    get realRoot() {
+      return realRoot;
+    },
+    stabilityMs: stability,
+    lstat: (abs) => g.lstat(abs),
+    judge,
+    hash: hashOf,
+    attach: async (abs, b, toSourceId) => {
+      current = { abs, b };
+      try {
+        return (await attach.attachFiles(projectId, [abs], { toSourceId }))[0];
+      } finally {
+        current = null;
+      }
+    },
+  };
+  const live: LiveWatch = {
+    exclusive: <T>(fn: (io: FileIo) => Promise<T>) =>
+      new Promise<T>((resolveJob, rejectJob) => {
+        if (gate.stuck) return rejectJob(new FolderNotAnsweringError()); // never queued behind a call that does not answer
+        jobs.push(async () => {
+          try {
+            if (stopped) throw new FolderNotAnsweringError();
+            await flush();
+            resolveJob(await fn(io));
+          } catch (err) {
+            rejectJob(err);
+          }
+        });
+        wake();
+      }),
+    flush: () => (persist ? flush() : Promise.resolve()),
+    apply: (e) => {
+      if (regReady) putEntry(e);
+    },
+  };
+  if (persist) {
+    let m = liveWatches.get(deps.repo);
+    if (!m) liveWatches.set(deps.repo, (m = new Map()));
+    m.set(liveKey(projectId, watchId!), live);
   }
 
   // A call an earlier watch made on this folder is still outstanding: nothing is issued until it settles (A6).
@@ -1359,6 +1824,142 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
 }
 
 type Entry = Awaited<ReturnType<WatchFs["readdir"]>>[number];
+
+// ------------------------------------------------------------------------------------------
+// The researcher's acts on a registered file (Task W3; W7 puts routes on them).
+
+/** A read-only library and a locked project are refused in plain words, before anything is read or written. */
+function refuseUnwritable(deps: Pick<WatchDeps, "repo" | "lib">, projectId: string): void {
+  if (isClosed(deps.lib) || deps.lib.mode !== "read-write") throw new ReadOnlyLibraryError(deps.lib.readOnlyReason);
+  if (projectEncrypted(deps.repo, projectId) && !deps.repo.isUnlocked(projectId)) throw new ProjectLockedError(projectId);
+}
+
+/**
+ * The folder's calls for one act when no watch of it runs here: its own one-call gate (a folder with a call that
+ * did not answer is refused, A6), and attach's `readable` answering for the one file being read.
+ */
+async function standaloneIo(deps: WatchDeps, projectId: string, watchId: string): Promise<FileIo> {
+  const dir = (await listWatchedFolders(deps, projectId)).find((w) => w.id === watchId)?.dir;
+  if (!dir) throw new InvalidInputError("This watched folder has no folder chosen on this computer.");
+  const root = resolve(dir);
+  if (outstandingFolders.has(root)) throw new FolderNotAnsweringError();
+  const fsx: WatchFs = { ...realFs, ...deps.fs };
+  const presence = deps.presence ?? contentState;
+  const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, () => {
+    const settledAt = gate.afterSettle();
+    outstandingFolders.set(root, settledAt);
+    void settledAt.then(() => {
+      if (outstandingFolders.get(root) === settledAt) outstandingFolders.delete(root);
+    });
+  });
+  const realRoot = await gate.call(() => fsx.realpath(root));
+  if (outstandingFolders.has(realRoot)) throw new FolderNotAnsweringError();
+  let current: { abs: string; b: Reading } | null = null;
+  const readable = async (p: string) => {
+    if (!current || current.abs !== p) return false;
+    try {
+      const st = await gate.call(() => fsx.lstat(p));
+      return st.isFile() && sameReading(current.b, readingOf(st));
+    } catch {
+      return false;
+    }
+  };
+  const attach = createAttach({ repo: deps.repo, http: deps.http, proxies: deps.proxies ?? proxyQueueFor(deps.repo), readable, ...(deps.debug ? { debug: deps.debug } : {}) });
+  const buf = Buffer.allocUnsafe(HASH_CHUNK);
+  return {
+    realRoot,
+    stabilityMs: deps.stabilityMs ?? WATCH_STABILITY_MS,
+    lstat: (abs) => gate.call(() => fsx.lstat(abs)),
+    judge: (abs) => gatedJudge(gate, fsx, presence, abs),
+    hash: (abs) => gatedHash(gate, fsx, abs, buf),
+    attach: async (abs, b, toSourceId) => {
+      current = { abs, b };
+      try {
+        return (await attach.attachFiles(projectId, [abs], { toSourceId }))[0];
+      } finally {
+        current = null;
+      }
+    },
+  };
+}
+
+/** Runs one act: inside the running watch of the folder (its one call in flight, its lines written first), or on its own. */
+async function act<T>(deps: WatchDeps, projectId: string, watchId: string, needsFolder: boolean, fn: (io: FileIo | null, apply: (e: WatchRegisterEntry) => void) => Promise<T>): Promise<T> {
+  const live = liveWatches.get(deps.repo)?.get(liveKey(projectId, watchId));
+  if (live) return live.exclusive((io) => fn(io, live.apply));
+  return fn(needsFolder ? await standaloneIo(deps, projectId, watchId) : null, () => {});
+}
+
+async function registeredEntry(deps: WatchDeps, projectId: string, watchId: string, key: string, states: readonly WatchedFileState[], refusal: string): Promise<WatchRegisterEntry> {
+  if (typeof key !== "string") throw new InvalidInputError("This file is not in the watched folder's register.");
+  const e = (await deps.repo.watchRegister(projectId, watchId)).get(key);
+  if (!e) throw new InvalidInputError("This file is not in the watched folder's register.");
+  if (!states.includes(e.state)) throw new InvalidInputError(refusal);
+  return e;
+}
+
+/**
+ * "Bring in the new version as a new file of this source" (the researcher's act; W9). Needs the state "changed" or
+ * "may-have-changed" AND a file that passes the whole order NOW — the name rule, stable (two `lstat`s
+ * `stabilityMs` apart), `contentState` "local", the judged state equal to the stability reading — else
+ * WatchFileNotLocalError and nothing is read. Then the hash (O_NOFOLLOW) and attach onto the same source (its
+ * `readable` compares a fresh `lstat` before each open): a further original; the first is kept. The register
+ * line "in-library" with the new content follows in the same act; a crash between the two is healed when the
+ * watch next looks at the file (the source holds the folder's content: "in-library").
+ */
+export async function bringInNewVersion(deps: WatchDeps, projectId: string, watchId: string, key: string): Promise<AttachOutcome> {
+  refuseUnwritable(deps, projectId);
+  return act(deps, projectId, watchId, true, async (io, apply) => {
+    const e = await registeredEntry(deps, projectId, watchId, key, ["changed", "may-have-changed"], "The file in the folder has not changed since it came in.");
+    const f = io!;
+    if (e.file.split("/").some((part) => nameRule(part) !== null)) throw new WatchFileNotLocalError();
+    const abs = join(f.realRoot, ...e.file.split("/"));
+    if (!within(f.realRoot, abs)) throw new WatchFileNotLocalError();
+    const read = async (): Promise<Reading | null> => {
+      try {
+        const st = await f.lstat(abs);
+        return st.isFile() ? readingOf(st) : null;
+      } catch (err) {
+        if (err instanceof FolderNotAnsweringError) throw err;
+        return null;
+      }
+    };
+    const a = await read();
+    if (!a) throw new WatchFileNotLocalError();
+    await new Promise((r) => setTimeout(r, f.stabilityMs));
+    const b = await read();
+    if (!b || !sameReading(a, b)) throw new WatchFileNotLocalError();
+    const c = (await f.judge([abs])).get(abs);
+    if (!c || c.presence !== "local" || !sameReading(b, c)) throw new WatchFileNotLocalError();
+    // Checked: "local", exactly as the stability rule saw it; read at once (the window W2 describes, one file).
+    let sha: string;
+    try {
+      sha = await f.hash(abs);
+    } catch (err) {
+      if (err instanceof FolderNotAnsweringError) throw err;
+      throw new WatchFileNotLocalError();
+    }
+    const o = await f.attach(abs, b, e.sourceId);
+    if (!o || (o.outcome === "failed" && o.reason === NOT_DOWNLOADED_REASON)) throw new WatchFileNotLocalError();
+    if (o.outcome !== "attached" && o.outcome !== "duplicate") return o;
+    const next: WatchRegisterEntry = { key: e.key, file: e.file, sourceId: e.sourceId, sha256: sha, size: b.size, mtimeNs: b.mtimeNs.toString(), state: "in-library", at: new Date().toISOString() };
+    await deps.repo.recordWatchedFiles(projectId, watchId, [next]);
+    apply(next);
+    return o;
+  });
+}
+
+/** "Keep the library's copy as it is" (the researcher's act; W9): a changed, may-have-changed or gone file is noted "settled". Nothing is read. */
+export async function settleWatchedFile(deps: WatchDeps, projectId: string, watchId: string, key: string): Promise<void> {
+  refuseUnwritable(deps, projectId);
+  await act(deps, projectId, watchId, false, async (_io, apply) => {
+    const e = await registeredEntry(deps, projectId, watchId, key, ["changed", "may-have-changed", "gone"], "There is nothing to settle for this file: it is as it came in.");
+    const { renamedFrom: _r, ...rest } = e;
+    const next: WatchRegisterEntry = { ...rest, state: "settled", at: new Date().toISOString() };
+    await deps.repo.recordWatchedFiles(projectId, watchId, [next]);
+    apply(next);
+  });
+}
 
 // ------------------------------------------------------------------------------------------
 // Settings: project.json (id + options) and this device's folder for each watch (R69).
