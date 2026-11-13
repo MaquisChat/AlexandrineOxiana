@@ -38,6 +38,7 @@ const cannotShow = (): ApiError => badRequest("This file cannot be shown here.")
 const missing = (): ApiError => new ApiError(404, "NOT_FOUND", "The file of this source is not where it was recorded.");
 const unsafe = (): ApiError => badRequest("This file could not be opened safely.");
 const tooLarge = (): ApiError => new ApiError(413, "PAYLOAD_TOO_LARGE", "This PDF is larger than 512 MB, too large to open in the app.");
+const closedMeanwhile = (): ApiError => new ApiError(409, "CONFLICT", "The library was closed while this file was being read.");
 const locked = (): ApiError => new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
 
 const header = (req: FastifyRequest, name: string): string | undefined => {
@@ -125,7 +126,8 @@ export function registerDocuments(app: FastifyInstance, ctx: Ctx): void {
       throw openFailure(err);
     }
     const c = guarded(opened, () => {
-      if (state.session !== s || !s.repo.isUnlocked(projectId)) throw new ProjectLockedError(projectId);
+      if (state.session !== s) throw closedMeanwhile();
+      if (!s.repo.isUnlocked(projectId)) throw new ProjectLockedError(projectId);
     });
     if (c.size > max) {
       await c.close();
@@ -141,7 +143,14 @@ export function registerDocuments(app: FastifyInstance, ctx: Ctx): void {
       return reply.status(416).header("Content-Range", `bytes */${c.size}`).header("Cache-Control", "no-store").header("X-Content-Type-Options", "nosniff").send();
     }
     const end = Math.min(r.end, r.start + DOCUMENT_RANGE_MAX_BYTES - 1);
-    if (ctx.documentBeforeRead) await ctx.documentBeforeRead();
+    if (ctx.documentBeforeRead) {
+      try {
+        await ctx.documentBeforeRead();
+      } catch (err) {
+        await c.close();
+        throw err;
+      }
+    }
     reply.header("Accept-Ranges", "bytes").header("Content-Range", `bytes ${r.start}-${end}/${c.size}`);
     return sendContent(req, reply, c, { start: r.start, end }, 206, {});
   };
