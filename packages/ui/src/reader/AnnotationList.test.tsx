@@ -398,6 +398,35 @@ describe("AnnotationList (Task R9)", () => {
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { level: 2, name: "Annotations (0)" })));
   });
 
+  it("after a delete the focus is right even when the screen draws the list without it before the answer is read", async () => {
+    function DrawsFirst() {
+      const [items, setItems] = useState([rec({ id: "h" }), rec({ id: "n", kind: "note", page: 3 })]);
+      return (
+        <AnnotationList
+          annotations={items}
+          assetId="a1"
+          readOnly={false}
+          pageCount={1}
+          onJump={() => {}}
+          onSaveNote={noop}
+          onRecolour={noop}
+          onDelete={async (id) => {
+            // As the screen does: the service's answer applied, then a moment before the promise settles.
+            setItems((l) => l.filter((a) => a.id !== id));
+            await new Promise((r) => setTimeout(r, 20));
+          }}
+        />
+      );
+    }
+    const user = userEvent.setup();
+    render(<DrawsFirst />);
+    await user.click(within(entry("n")).getByRole("button", { name: /^Delete/ }));
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(live().textContent).toBe("Note deleted."));
+    await waitFor(() => expect(document.activeElement).toBe(entry("h")));
+    expect(entry("h").tabIndex).toBe(0);
+  });
+
   it("an annotation with no place is listed at the end, says so and can be deleted (A5)", async () => {
     const answers: string[] = [];
     const user = userEvent.setup();

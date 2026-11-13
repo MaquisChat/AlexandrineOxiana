@@ -658,14 +658,15 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     setConfirmFor(undefined);
     if (!e || readOnly) return;
     const kind = e.a.kind;
+    // The next entry, else the previous one, else the heading: taken from the list as it is when the
+    // delete is asked (the screen may have drawn the list without it before its answer is read here).
+    const i = flat.findIndex((x) => x.a.id === id);
+    const after = (flat[i + 1] ?? flat[i - 1])?.a.id;
     void run(
       id,
       () => onDelete(id),
       () => {
-        // The next entry, else the previous one, else the heading (in the list as it is now).
-        const now = latest.current.flat;
-        const i = now.findIndex((x) => x.a.id === id);
-        const next = i < 0 ? undefined : (now[i + 1] ?? now[i - 1])?.a.id;
+        const next = after !== undefined && latest.current.byId.has(after) ? after : undefined;
         if (next !== undefined) {
           setActiveId(next);
           focusLater({ id: next, what: "entry" });
