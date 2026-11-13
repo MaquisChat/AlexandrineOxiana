@@ -60,6 +60,26 @@ describe("highlight tokens", () => {
     expect(new Set(seen).size).toBe(HIGHLIGHT_COLOURS.length);
   });
 
+  it("the underline reaches 3:1 against white paper for every colour: the colour at full strength over a thin --hl-edge line (A11, M2)", () => {
+    const edge = tokens.light["hl-edge"]!;
+    const css = readFileSync(new URL("../reader/Reader.css", import.meta.url), "utf8");
+    for (const name of HIGHLIGHT_COLOURS) {
+      const line = tokens.light[`hl-${name}-line`];
+      expect(line, `--hl-${name}-line`).toBeDefined();
+      // The colour at full strength: the fill's own colour, opaque, the same in all four themes.
+      expect(line!.toUpperCase()).toBe(tokens.light[`hl-${name}`]!.slice(0, 7).toUpperCase());
+      expect(new Set(THEME_NAMES.map((t) => tokens[t][`hl-${name}-line`])).size, `--hl-${name}-line in every theme`).toBe(1);
+      // The shape as a whole: the coloured line, and the edge beneath it; the stronger of the two parts.
+      const shape = Math.max(contrastRatio(line!, "#FFFFFF"), contrastRatio(edge, "#FFFFFF"));
+      expect(shape, `underline in ${name}`).toBeGreaterThanOrEqual(3);
+    }
+    // The stylesheet draws it so: the line in --hl-line (the full-strength token), the edge in --hl-edge.
+    const rule = (sel: string) => new RegExp(`${sel.replace(/[.]/g, "\\.")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] ?? "";
+    expect(rule(".ao-hl--underline.ao-hl--edge-bottom")).toMatch(/border-bottom: 3px solid var\(--hl-line\)/);
+    expect(rule(".ao-hl--underline")).toMatch(/var\(--hl-edge\)/);
+    for (const name of HIGHLIGHT_COLOURS) expect(rule(`.ao-hl--${name}`)).toContain(`--hl-line: var(--hl-${name}-line)`);
+  });
+
   it("the line the overlay draws round a chosen or changed highlight is the same in all four themes and stands out on white", () => {
     const values = THEME_NAMES.map((t) => tokens[t]["hl-edge"]);
     expect(new Set(values).size).toBe(1);
