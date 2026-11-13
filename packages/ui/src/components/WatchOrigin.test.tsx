@@ -164,6 +164,44 @@ describe("WatchOrigin", () => {
     expect(document.activeElement).toBe(keep);
   });
 
+  it("after a refusal focus is put back on the pressed button even when the browser dropped it while it was disabled (N1)", async () => {
+    const svc = service([origin()]);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    svc.acting(async () => {
+      await gate;
+      return serviceError(503, "UNAVAILABLE", "The folder did not answer. Try again when it is reachable.");
+    });
+    const user = userEvent.setup();
+    render(ui());
+    const keep = await screen.findByRole("button", { name: new RegExp(`^${KEEP}`) });
+    await user.click(keep);
+    await waitFor(() => expect((keep as HTMLButtonElement).disabled).toBe(true));
+    // The browser dropped the focus while the button was disabled: it is somewhere else now.
+    const elsewhere = document.body.appendChild(document.createElement("button"));
+    elsewhere.focus();
+    expect(document.activeElement).toBe(elsewhere);
+    release();
+    await screen.findByRole("alert");
+    await waitFor(() => expect(document.activeElement).toBe(keep));
+  });
+
+  it("when the re-read after a successful act fails, focus goes to \"Try again\", not the page body (N2)", async () => {
+    let reads = 0;
+    server.use(
+      http.get(url(ORIGIN), () => {
+        reads++;
+        return reads === 1 ? HttpResponse.json({ origins: [origin()] }) : serviceError(500, "INTERNAL", "boom");
+      }),
+      http.post(url(ACTION), () => HttpResponse.json({ done: "settled", sourceId: "s1" })),
+    );
+    const user = userEvent.setup();
+    render(ui());
+    await user.click(await screen.findByRole("button", { name: new RegExp(`^${KEEP}`) }));
+    const again = await screen.findByRole("button", { name: "Try again" });
+    await waitFor(() => expect(document.activeElement).toBe(again));
+  });
+
   it("a removed folder offers no bring-in and no download advice, only keeping", async () => {
     service([origin({ folderRemoved: true, folderLabel: "", local: false })]);
     render(ui());

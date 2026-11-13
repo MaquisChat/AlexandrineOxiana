@@ -18,7 +18,8 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../api/client";
 import { formatSize } from "../api/tools";
-import type { WatchedFoldersApi, WatchedSourceOrigin } from "../api/watched-folders";
+import type { WatchedSourceOrigin } from "@ao/shared";
+import type { WatchedFoldersApi } from "../api/watchedFolders";
 import { UserText } from "./UserText";
 import "./WatchOrigin.css";
 
@@ -59,6 +60,7 @@ export function WatchOrigin({ api, projectId, sourceId, readOnly, onChanged }: W
   const [toHeading, setToHeading] = useState(0);
   const [toButton, setToButton] = useState(0);
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const tryRef = useRef<HTMLButtonElement>(null);
   const pressed = useRef<HTMLElement | null>(null);
   const changedRef = useRef(onChanged);
   changedRef.current = onChanged;
@@ -78,7 +80,7 @@ export function WatchOrigin({ api, projectId, sourceId, readOnly, onChanged }: W
     const k = `${projectId}\n${sourceId}`;
     setReading(true);
     try {
-      const res = await apiRef.current.sourceOrigin(projectId, sourceId);
+      const res = await apiRef.current.origin(projectId, sourceId);
       if (g !== gen.current || seq !== readSeq.current) return;
       setRead({ key: k, state: "ok", origins: Array.isArray(res?.origins) ? res.origins : [] });
     } catch (err) {
@@ -106,7 +108,8 @@ export function WatchOrigin({ api, projectId, sourceId, readOnly, onChanged }: W
   }, [key, load]);
 
   useEffect(() => {
-    if (toHeading > 0) headingRef.current?.focus();
+    // The heading; when the re-read failed and only the quiet line is shown, its "Try again" (never the page body: N2).
+    if (toHeading > 0) (headingRef.current ?? tryRef.current)?.focus();
   }, [toHeading]);
   useEffect(() => {
     if (toButton > 0 && pressed.current?.isConnected) pressed.current.focus();
@@ -120,7 +123,7 @@ export function WatchOrigin({ api, projectId, sourceId, readOnly, onChanged }: W
     setOutcome("");
     setRefusals((r) => ({ ...r, [o.watchId]: "" }));
     try {
-      const res = await apiRef.current.actOnSourceOrigin(projectId, sourceId, { watchId: o.watchId, action });
+      const res = await apiRef.current.act(projectId, sourceId, { watchId: o.watchId, action });
       if (g !== gen.current) return;
       const added = action === "bring-in-new-version" && res.done === "attached";
       setOutcome(action === "keep-as-it-is" ? KEPT : added ? ADDED : ALREADY);
@@ -146,7 +149,7 @@ export function WatchOrigin({ api, projectId, sourceId, readOnly, onChanged }: W
     return (
       <div className="ao-watch-origin__quiet">
         <p className="ao-muted">Where this source came from could not be shown.</p>
-        <button type="button" disabled={reading} onClick={() => void load(gen.current)}>
+        <button type="button" ref={tryRef} disabled={reading} onClick={() => void load(gen.current)}>
           Try again
         </button>
         {outcome && (

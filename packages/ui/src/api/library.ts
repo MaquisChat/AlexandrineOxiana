@@ -11,7 +11,7 @@ import type { DeviceNotice, DeviceNoticeDismissRequest, DeviceNoticeKind, Projec
 
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
-import { watchedFoldersApi } from "./watched-folders";
+import { watchedFoldersApi } from "./watchedFolders";
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -396,7 +396,7 @@ export function libraryApi(client: ApiClient) {
     },
     /** Field verification, recheck, pictures and retries (Task 34d, api/verification.ts). */
     verification: verificationApi(client),
-    /** Where a source came from, and the two acts on it (Task W9, api/watched-folders.ts). */
+    /** Where a source came from, and the two acts on it (Task W9, api/watchedFolders.ts). */
     watchedFolders: watchedFoldersApi(client),
     citations: {
       styles: async (q?: string, opts: { signal?: AbortSignal } = {}) =>

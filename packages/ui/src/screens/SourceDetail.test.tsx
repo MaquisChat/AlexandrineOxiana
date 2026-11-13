@@ -75,13 +75,16 @@ describe("SourceDetail", () => {
         return HttpResponse.json({ done: "attached", sourceId: "s1" });
       }),
     );
-    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const onChanged = vi.fn();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onChanged={onChanged} />);
     const region = await screen.findByRole("region", { name: "Source details" });
     const files = async () => (await within(region).findByRole("heading", { name: "Files" })).nextElementSibling as HTMLElement;
     expect(within(await files()).getAllByRole("listitem")).toHaveLength(1);
     await userEvent.click(await within(region).findByRole("button", { name: /^Bring in the new version/ }));
     await waitFor(async () => expect(within(await files()).getAllByRole("listitem")).toHaveLength(2));
     expect(within(region).getByText("smith-2019-v2.pdf")).toBeTruthy();
+    // The parent (the library list) is told once (N3).
+    expect(onChanged).toHaveBeenCalledTimes(1);
   });
 
   it("says in words that the source is no longer available at its source, with the date noticed; nothing while it is available (Task 69, D17)", async () => {
