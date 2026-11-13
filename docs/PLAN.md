@@ -573,14 +573,14 @@ Update after every task; commit and push.
 | 72 A later conflict enters the review queue (D19) | complete | 3fd15df (merge) | R190, R193, R194; reviewed with probes over two fix rounds; D19 closed |
 | 73 The audit says which field was confirmed (D20) | complete | 0e890cd (merge) | R191; reviewed with 18 probes; D20 closed |
 | R1 Reader: anchor, annotation and colour model | complete (on the reader branch) | e188c3c (merge) | reviewed with probes over one fix round (R195; plan Amendments A1–A4); verification clean |
-| R5 Reader: ranged PDF route and the client's range reader | fix round 1 in re-review | 6181d6c (worktree branch) | the shell can read a range across origins (end-to-end in both browsers); an early abort releases the file |
+| R5 Reader: ranged PDF route and the client's range reader | approved; verification running | 6181d6c (worktree branch) | reviewed with probes over one fix round; end-to-end in both browsers |
 | R2 Reader: the Zotero import keeps the sort index; re-import respects changes | in review | 629b8d0 (worktree branch) | the hash of existing annotations unchanged; the back-fill undoable |
 | R3 Reader: governed annotation operations in the library | approved; a small round (one ruling, two tests) | 3f58c53 (worktree branch) | reviewed with twelve probes; plan Amendment A5 |
 | R4, R6–R13 Reader: the remaining tasks | not started | | order: R6 after R5, R4 after R3, R7 after R6, then R8, R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
-| 55 Owner hands-on tests | the owner reports no errors found (2026-11-12, Mac build 3) | | the build is run 3 of "Desktop (macOS)" (id 43271302338, commit 4a7255b); the owner goes on to the review pages (Task 53) |
+| 55 Owner hands-on tests | the owner reports no errors found (2026-11-12, Mac build 3); build 4 available (2026-11-13) | | the current download is run 4 of "Desktop (macOS)" (id 43348805951, commit 14da33e): build 3 plus the fixes of D18, D19 and D20; the owner goes on to the review pages (Task 53) |
 | 56 Close out | not started | | |
 
 ## 9. What needs the owner
