@@ -685,6 +685,19 @@ processing:
     expect(await sha(fx.db)).toBe(before);
   });
 
+  it("D22: an annotation without an author in Zotero has none here; one with an author keeps it", async () => {
+    zoteroEdit((db) => db.prepare("UPDATE itemAnnotations SET authorName = 'Ngozi Okafor' WHERE itemID = 10").run());
+    const p = await project();
+    await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    const by = (k: string) => a.annotations.find((x) => x.externalKey === `zotero:${k}`)!;
+    expect(by("ANNO0001")).not.toHaveProperty("author");
+    expect(by("ANNO0002").author).toBe("Ngozi Okafor");
+    expect(by("NOTE0001")).not.toHaveProperty("author");
+    // The repository's actor (the computer's account name in the app) is nowhere in the annotations.
+    expect(await readFile(join(lib.root, a.source.folder, "annotations.json"), "utf8")).not.toContain("tester");
+  });
+
   it("an approved linked file is linked in place", async () => {
     const p = await project();
     const r = await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;

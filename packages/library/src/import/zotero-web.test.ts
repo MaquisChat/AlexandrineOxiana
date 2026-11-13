@@ -2128,6 +2128,85 @@ processing:
     });
   });
 
+  describe("an annotation's author is only the one Zotero gave (D22), against the stand-in", () => {
+    const U = "user:42";
+    let z: FakeZotero;
+    let zweb: ZoteroWebOptions;
+    beforeEach(async () => {
+      z = newFake();
+      await setSecret("zotero-api-key", z.key);
+      zweb = { libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} };
+    });
+    const pos = (page: number) => JSON.stringify({ pageIndex: page - 1, rects: [[10, 20, 110, 40]] });
+    const sourceOf = async (p: Project, key: string) => (await sources(p)).find((s) => s.source.provenance.externalKeys?.zoteroKey === key)!;
+    const highlight = (parent: string, text: string, author?: string) =>
+      z.addItem(U, { itemType: "annotation", annotationType: "highlight", annotationText: text, annotationColor: "#ffd400", annotationPosition: pos(1), ...(author ? { annotationAuthorName: author } : {}) }, { parent });
+    const run = async (p: Project, o: Partial<ZoteroWebOptions> = {}) => {
+      const h = await startZoteroWebImport(bulkDeps(), p.id, { ...zweb, ...o });
+      return { r: await h.done, report: await createBulkImport(bulkDeps()).batchReport(p.id, h.batchId) };
+    };
+
+    it("an annotation without an author in Zotero has none here; one with an author keeps it", async () => {
+      const p = await project();
+      const key = z.addItem(U, { itemType: "journalArticle", title: "Whose highlight" });
+      const att = z.addItem(U, { itemType: "attachment", contentType: "application/pdf", filename: "f.pdf" }, { parent: key, file: { bytes: await buildPdf({ extra: "whose" }) } });
+      const none = highlight(att, "nobody's");
+      const named = highlight(att, "a colleague's", "Ngozi Okafor");
+      const note = z.addItem(U, { itemType: "note", note: "<p>A child note</p>" }, { parent: key });
+      await run(p);
+      const sf = await sourceOf(p, key);
+      const by = (k: string) => sf.annotations.find((a) => a.externalKey === `zotero:${k}`)!;
+      expect(by(none)).not.toHaveProperty("author");
+      expect(by(named).author).toBe("Ngozi Okafor");
+      expect(by(note)).not.toHaveProperty("author");
+      // The repository's actor (here "tester"; the computer's account name in the app) is nowhere in the annotations.
+      expect(await readFile(join(lib.root, sf.source.folder, "annotations.json"), "utf8")).not.toContain("tester");
+    });
+
+    it("a re-import over annotations stored with the old fallback changes nothing the researcher did", async () => {
+      const p = await project();
+      const key = z.addItem(U, { itemType: "journalArticle", title: "Stored before the fix" });
+      const att = z.addItem(U, { itemType: "attachment", contentType: "application/pdf", filename: "f.pdf" }, { parent: key, file: { bytes: await buildPdf({ extra: "before" }) } });
+      const recoloured = highlight(att, "recoloured here");
+      const deleted = highlight(att, "deleted here");
+      const untouched = highlight(att, "untouched");
+      const changed = highlight(att, "changed in Zotero");
+      await run(p);
+      const id = (await sourceOf(p, key)).source.id;
+      // As stored before D22 was fixed: every imported annotation carries the computer's account name.
+      const { importChange } = await import("../repo/repo.js");
+      await importChange(repo, p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, async (ops) => {
+        const cur = await ops.readSource(id);
+        await ops.writeSource(cur, { ...cur, annotations: cur.annotations.map((a) => ({ ...a, author: "root" })) });
+      }, { op: "test.old-fallback" });
+      const ext = (k: string) => (sf: SourceFile) => sf.annotations.find((a) => a.externalKey === `zotero:${k}`);
+      const sf0 = await repo.getSource(p.id, id);
+      await repo.updateAnnotation(p.id, id, ext(recoloured)(sf0)!.id, { colorName: "purple", body: "my note" });
+      await repo.deleteAnnotation(p.id, id, ext(deleted)(sf0)!.id);
+      const annFile = join(lib.root, sf0.source.folder, "annotations.json");
+
+      // A full re-import with nothing changed in Zotero changes nothing: the old author is not a change by anyone.
+      const bytes = await readFile(annFile);
+      const quiet = await run(p, { full: true });
+      expect(quiet.r.counts).toMatchObject({ unchanged: 1, updated: 0, failed: 0 });
+      expect(await readFile(annFile)).toEqual(bytes);
+
+      // Zotero changes one highlight: only that one is updated, keeping its stored author; the rest is as it was.
+      z.editItem(U, changed, { annotationText: "changed in Zotero, revised" });
+      const before = await repo.getSource(p.id, id);
+      const { r, report } = await run(p);
+      expect(r.counts).toMatchObject({ updated: 1, failed: 0 });
+      expect(report.keptFields).toEqual([]);
+      const after = await repo.getSource(p.id, id);
+      expect(ext(changed)(after)).toMatchObject({ quote: "changed in Zotero, revised", author: "root" });
+      expect(ext(recoloured)(after)).toEqual(ext(recoloured)(before));
+      expect(ext(recoloured)(after)).toMatchObject({ colorName: "purple", body: "my note", author: "root" });
+      expect(ext(untouched)(after)).toEqual(ext(untouched)(before));
+      expect(ext(deleted)(after)).toBeUndefined();
+      expect(after.annotations).toHaveLength(3);
+    });
+  });
+
   it("every request in this suite is a GET", async () => {
     // The after-each hook checks every request of every test (stand-ins and the plain mock agent). This
     // test makes requests of its own, so it proves the hook's input is there even when run alone (M9).

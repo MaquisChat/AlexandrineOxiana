@@ -99,6 +99,21 @@ describe("availability in the list rows and the source view (Task 69, D17)", () 
     expect(list.json.items.find((i: { id: string }) => i.id === gone).availability).toEqual({ status: "available" });
   });
 
+  it("the mark reaches the list row and the detail screen: a source gone from Zotero carries which (Task Z5), through the same light read", async () => {
+    const { pid, gone } = await setup();
+    const repo = svc.state.session!.repo;
+    // As the Zotero import marks an item deleted in Zotero (bulk/run.ts, Z5).
+    await repo.updateSource(pid, gone, { availability: { status: "unavailable-on-platform", zotero: "deleted", firstNoticedAt: NOTICED } });
+    const list = await call({ url: `/projects/${pid}/sources` });
+    expect(list.json.items.find((i: { id: string }) => i.id === gone).availability).toEqual({ status: "unavailable-on-platform", zotero: "deleted", firstNoticedAt: NOTICED });
+    const rec = await call({ url: `/projects/${pid}/sources/${gone}` });
+    expect(rec.json.source.availability).toEqual({ status: "unavailable-on-platform", zotero: "deleted", firstNoticedAt: NOTICED });
+    await repo.updateSource(pid, gone, { availability: { status: "unavailable-on-platform", zotero: "bin", firstNoticedAt: NOTICED } });
+    const binned = await call({ url: `/projects/${pid}/sources?text=Gone` });
+    expect(binned.json.items[0].availability).toEqual({ status: "unavailable-on-platform", zotero: "bin", firstNoticedAt: NOTICED });
+    expect(repo.integrityWarnings).toEqual([]);
+  });
+
   it("a text search's rows carry it too", async () => {
     const { pid, gone } = await setup();
     await svc.state.session!.repo.updateSource(pid, gone, { availability: { status: "unavailable-on-platform", firstNoticedAt: NOTICED } });
