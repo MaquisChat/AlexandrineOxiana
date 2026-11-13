@@ -42,6 +42,13 @@ export interface ImportReport {
     backInZotero?: number;
     backInZoteroUpdated?: number;
     goneNotMarked?: number;
+    /**
+     * Task Z6 (absent in reports written before it): items with a field changed in Zotero and here, waiting for the
+     * researcher (an item that also took in other changes is in `updated` too); collections renamed in Zotero that
+     * arrived under their new name, the old one kept.
+     */
+    conflicts?: number;
+    collectionsRenamed?: number;
   };
   /** Files this import stored: copied into the library, and left as links where they were (R136). Always given. */
   files: { copied: number; linked: number };
@@ -113,6 +120,9 @@ function markdown(r: ImportReport): string {
     ...(r.counts.goneInZoteroBin ? [`- In the Zotero bin: ${r.counts.goneInZoteroBin}`] : []),
     ...(r.counts.goneAlready ? [`- Still gone from Zotero (marked earlier): ${r.counts.goneAlready}`] : []),
     ...(r.counts.backInZotero ? [`- Back in Zotero: ${r.counts.backInZotero}`] : []),
+    // Task Z6: the researcher's value was kept; Zotero's waits beside it in the review queue.
+    ...(r.counts.conflicts ? [`- Changed in Zotero and here — waiting for you: ${r.counts.conflicts}`] : []),
+    ...(r.counts.collectionsRenamed ? [`- Collections renamed in Zotero arrive under their new name; the old one is kept here: ${r.counts.collectionsRenamed}`] : []),
     ...(r.annotationsDeletedHere ? [`- Annotations deleted here — not re-imported: ${r.annotationsDeletedHere}`] : []),
     `- Failed: ${r.counts.failed}`,
     `- Files copied into the library: ${r.files.copied}`,

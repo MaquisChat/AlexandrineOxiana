@@ -188,8 +188,10 @@ describe("a field changed in Zotero and here (Z6)", () => {
     expect(report.counts).toMatchObject({ conflicts: 1, updated: 0 });
     expect(await reportMd(p, 2)).toContain("- Changed in Zotero and here — waiting for you: 1");
     const upd = (await auditEvents(p)).filter((e) => opOf(e) === "import.update");
-    expect(upd).toHaveLength(1);
-    expect((upd[0]!.details as Record<string, unknown>).reviewQueued).toEqual([{ entry: entries[0]!.id, fields: ["/title"] }]);
+    // One governed change (one txn), whose policy events (capture and store) each say what it queued.
+    expect(new Set(upd.map((e) => (e.details as { txn: string }).txn)).size).toBe(1);
+    expect(upd.map((e) => e.action).sort()).toEqual(["capture", "store"]);
+    for (const e of upd) expect((e.details as Record<string, unknown>).reviewQueued).toEqual([{ entry: entries[0]!.id, fields: ["/title"] }]);
     // The batch record agrees with the report.
     const rec = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "batch.json"), "utf8")) as { countsDetail?: Record<string, number> };
     expect(rec.countsDetail).toMatchObject({ conflicts: 1 });
@@ -414,7 +416,7 @@ describe("a field changed in Zotero and here (Z6)", () => {
     await run(p);
     const events = await auditEvents(p);
     const upd = events.filter((e) => opOf(e) === "import.update");
-    expect(upd).toHaveLength(1);
+    expect(upd).toHaveLength(2); // one change: its capture and store events
     const text = JSON.stringify(events);
     expect(text).not.toMatch(/Oyo|Ibadan|Registers, my reading/u);
     expect(JSON.stringify(upd)).not.toContain(REASON);
@@ -510,11 +512,14 @@ describe("undo of a batch that queued a conflict (R177 c)", () => {
 });
 
 describe("a crash between the source's change and the queue's entry (R194)", () => {
-  // The crash is armed from inside the conflict's own governed change (when it makes its snapshot folder), and every
-  // later audit append fails, so the run cannot carry on in-process after it.
+  // The crash is armed from inside the conflict's own governed change (when it makes its snapshot folder). Before the
+  // commit point every later audit append fails too, so the run cannot carry on in-process after it; at
+  // before-marker-delete the change's audit events are already written (it is committed) and the marker is left
+  // behind, as when the process dies there.
   for (const point of ["before-changes", "before-audit", "before-marker-delete"] as const) {
     it(`a crash inside the conflict's change (${point}): the source, the entry, the journal and the audit agree; the next run or the next open lists it`, async () => {
       const { seams } = await import("../../repo/testing.js");
+      const commits = point === "before-marker-delete";
       const p = await project();
       const { key, id } = await imported(p);
       await repo.updateSource(p.id, id, { title: mt("My own title") });
@@ -524,7 +529,7 @@ describe("a crash between the source's change and the queue's entry (R194)", () 
         if (fired || !abs.endsWith("snapshots")) return;
         fired = true;
         seams.crashAt = point;
-        seams.failAuditAppendFor = p.id;
+        if (!commits) seams.failAuditAppendFor = p.id;
       };
       try {
         await (await startZoteroWebImport(bulkDeps(), p.id, zweb)).done;
@@ -547,8 +552,8 @@ describe("a crash between the source's change and the queue's entry (R194)", () 
       await queueAgrees(p, id);
       const lines = (await journal(p, 2).catch(() => [])).filter((e) => e.conflictsQueued);
       expect(lines).toHaveLength(conflicted ? 1 : 0);
-      expect((await auditEvents(p)).filter((e) => opOf(e) === "import.update")).toHaveLength(conflicted ? 1 : 0);
-      if (point !== "before-marker-delete") expect(conflicted).toBe(false);
+      expect((await auditEvents(p)).filter((e) => opOf(e) === "import.update")).toHaveLength(conflicted ? 2 : 0); // capture and store, one txn
+      expect(conflicted).toBe(commits); // before the commit point: rolled back; after it: kept whole
       expect(titleOf(sf)).toBe("My own title");
       // The next run lists it (raised again when it was rolled back; nothing more when it was committed).
       await run(p);

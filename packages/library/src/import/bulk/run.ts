@@ -125,6 +125,8 @@ import {
   readBatchAt,
   readJournal,
   readParts,
+  readCols,
+  collectionHash,
   writeBatchRecord,
   type BatchRecord,
   type BatchState,
@@ -138,7 +140,7 @@ import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./o
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
-import { capAnnotations, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
+import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = libraryVersion();
 const TOOL = { name: "bulk-import", version: VERSION };
@@ -164,6 +166,12 @@ const REMOVED_NOTE = /^(?:An attached file you removed here was|\d+ attached fil
 
 /** A stored file's parts as journaled (Z4). */
 type Parts = Record<string, { v: number; sha256?: string }>;
+/** What the newest journal line of an item says (R72; Z4 parts; Z6 the collections Zotero had it in, as name hashes). */
+type Known = { sourceId: string; version: string; parts?: Parts; cols?: string[][] };
+/** Task Z6: an item's collection paths (names), and the same as name hashes, as journaled. */
+const itemPaths = (item: ScanItem): string[][] => [item.folderPath ?? [], ...(item.moreFolderPaths ?? [])].filter((p) => p.length > 0);
+const hashPath = (p: string[]): string[] => p.map(collectionHash);
+const pathKey = (h: string[]) => h.join("/");
 
 export const REASONS = {
   missing: "The file could not be found or read.",
@@ -254,6 +262,14 @@ export interface BatchCounts {
   backInZotero: number;
   backInZoteroUpdated: number;
   goneNotMarked: number;
+  /**
+   * Task Z6 (Zotero Web): ITEMS with a field changed in Zotero AND here, to different values, now waiting for the
+   * researcher in the review queue ("Changed in Zotero and here — waiting for you: N"). An item that also took in
+   * other changes is counted in `updated` as well; one whose only change was the conflict is in `items` and here only.
+   */
+  conflicts: number;
+  /** Task Z6: collections renamed in Zotero that arrived as new collections under the new name (the old one kept), each once. */
+  collectionsRenamed: number;
 }
 
 export interface BatchResult {
@@ -518,7 +534,16 @@ class Run {
   private fileOwners = new Map<string, string>();
   private readonly workName: string;
   /** Incremental import (R72): identity → the source and version token the newest journal line recorded. */
-  private known = new Map<string, { sourceId: string; version: string; parts?: Parts }>();
+  private known = new Map<string, Known>();
+  /** Task Z6 (Zotero Web): item key → the collections Zotero has it in now, as name hashes (journaled with its outcome). */
+  private cols = new Map<string, string[][]>();
+  /**
+   * Task Z6: conflicts (a field changed in Zotero and here) and memberships added on update are the account sync's
+   * alone (the plan: Zotero Web). Every other adapter, the local Zotero import included, behaves as before.
+   */
+  private get zoteroWeb(): boolean {
+    return this.rec.source.kind === "zotero-web";
+  }
   /** Task Z5: source id → the availability changes its "gone from Zotero" marks made, oldest first (batches not undone, and this run). */
   private marks: Marks = new Map();
   /** Whether a Zotero item's source was deleted here (R73); re-read for each group and whenever a known source is gone (R74 M4). */
@@ -663,6 +688,11 @@ class Run {
         backInZoteroUpdated: c.backInZoteroUpdated,
         goneNotMarked: c.goneNotMarked,
       };
+    }
+    // Z6: items waiting for the researcher's decision, and renamed collections, counted apart in the record too (only
+    // when there are any; the report's `conflicts` and `collectionsRenamed` are the same numbers).
+    if (c.conflicts || c.collectionsRenamed) {
+      this.rec.countsDetail = { ...(this.rec.countsDetail ?? {}), conflicts: c.conflicts, collectionsRenamed: c.collectionsRenamed };
     }
     this.rec.createdSourceIds = [...this.createdIds];
     this.rec.governance = [
@@ -836,10 +866,13 @@ class Run {
       if (item.unreadable) return this.queue({ key: item.key, outcome: "failed", reason: item.unreadable });
       if (this.adapter.incremental && item.version) {
         this.versions.set(item.key, item.version);
+        if (this.zoteroWeb) this.cols.set(item.key, itemPaths(item).map(hashPath));
         const k = this.known.get(item.version.id);
         if (k && !hasSource(this.repo, this.projectId, k.sourceId)) await this.refreshDeleted(); // deleted meanwhile?
         if (k && hasSource(this.repo, this.projectId, k.sourceId)) {
-          if (k.version === item.version.version) {
+          // Z6: an item Zotero did not change but whose collections did (a rename does not change the item's version)
+          // goes through the update when it has a membership that is new; the check is in memory (no read).
+          if (k.version === item.version.version && !this.newMemberships(item, k).length) {
             // Z4: with stored files, the source's assets decide which parts are journaled and whether a known
             // file was removed here (one read; an item without files costs none, as before).
             const target = item.version.parts && Object.keys(item.version.parts).length ? await this.repo.getSource(this.projectId, k.sourceId) : undefined;
@@ -905,6 +938,8 @@ class Run {
     // item seen again as content is then never "unchanged" (its mark is taken away, below in updateInner) and its
     // files are not downloaded again (Z4).
     this.versions.set(item.key, { id: v.id, version: v.version, ...(k.parts ? { parts: k.parts } : {}) });
+    // Z6: the collections the item was last seen in are carried over too (a gone item has none of its own).
+    if (k.cols) this.cols.set(item.key, k.cols);
     const same = (a: Availability) => a.status === "unavailable-on-platform" && a.zotero === g;
     if (same(target.source.availability)) return this.queue({ key: item.key, outcome: "zotero-gone", sourceId: k.sourceId, gone: g }, target.assets);
     await this.flush();
@@ -983,8 +1018,9 @@ class Run {
     const notes = this.fileNotes.get(e.key);
     const v = WITH_VERSION.has(e.outcome) && e.sourceId ? this.versions.get(e.key) : undefined;
     const parts = v ? this.partsFor(v, e.sourceId!, assets) : undefined;
-    const ext = v ? { id: v.id, version: v.version, ...(parts ? { parts } : {}) } : undefined;
-    if (ext) this.known.set(ext.id, { sourceId: e.sourceId!, version: ext.version, ...(parts ? { parts } : {}) });
+    const cols = v ? this.cols.get(e.key) : undefined;
+    const ext = v ? { id: v.id, version: v.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}) } : undefined;
+    if (ext) this.known.set(ext.id, { sourceId: e.sourceId!, version: ext.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}) });
     const dropped = e.outcome === "created" || e.outcome === "needs-review" ? this.annotationsDropped.get(e.key) : undefined;
     return { ...e, ...(notes?.length ? { notes } : {}), ...(ext ? { ext } : {}), ...(dropped ? { annotationsDropped: dropped } : {}) };
   }
@@ -1069,6 +1105,45 @@ class Run {
       if (entries.length && entries.every((a) => a.status === "destroyed")) n++;
     }
     if (n) this.fileNotes.set(item.key, [...(this.fileNotes.get(item.key) ?? []), ...Array<string>(n).fill(ENGINE_FILE_NOTES.removedHere)]);
+  }
+
+  /**
+   * Task Z6 (Zotero Web, Accept 4): the item's collection paths that are NEW in Zotero since the newest journal line
+   * of it (`known.cols`): only those are added on update. A membership the researcher removed here was in that line
+   * too, so it is not new and never comes back; one Zotero removed is simply not here any more (nothing is removed
+   * here). A line without `cols` (written before Z6) knows none: nothing is new (none is added; the run's own line
+   * then records them). Nothing either when the batch maps no structure. In memory only.
+   */
+  private newMemberships(item: ScanItem, k: Known | undefined = item.version ? this.known.get(item.version.id) : undefined): string[][] {
+    if (!this.zoteroWeb || this.rec.options.structure === "none" || !k?.cols) return [];
+    const had = new Set(k.cols.map(pathKey));
+    return itemPaths(item).filter((p) => !had.has(pathKey(hashPath(p))));
+  }
+
+  /**
+   * Task Z6: the collections a rename in Zotero made here, as far as this item shows it: a new path that differs from
+   * a path the item lost (one in its last line, not in Zotero now) by exactly one name, at the same depth, names the
+   * collection at that place under its new name. Counted (once per collection, by the hashes of its path) only when
+   * this batch made it; the old one is kept. Collections mode only. A move to a new sibling collection in Zotero reads
+   * the same and is counted too: the sentence stays true of what happened here (a new collection beside the old one).
+   */
+  private async renamedBy(item: ScanItem, k: Known | undefined, added: string[][]): Promise<string[]> {
+    if (this.rec.options.structure !== "collections" || !k?.cols || !added.length) return [];
+    const now = new Set(itemPaths(item).map((p) => pathKey(hashPath(p))));
+    const lost = k.cols.filter((h) => !now.has(pathKey(h)));
+    const out = new Set<string>();
+    for (const p of added) {
+      const h = hashPath(p);
+      for (const l of lost) {
+        if (l.length !== h.length) continue;
+        const diff = h.map((x, i) => (x === l[i] ? -1 : i)).filter((i) => i >= 0);
+        if (diff.length !== 1) continue;
+        const at = diff[0]!;
+        const { collectionIds } = await this.structure(p.slice(0, at + 1));
+        if (collectionIds[0] && this.rec.createdCollectionIds.includes(collectionIds[0])) out.add(pathKey(h.slice(0, at + 1)));
+      }
+    }
+    return [...out];
   }
 
   /** Clears the deletion records of items imported again with includeDeleted (one bookkeeping change). */
@@ -1742,7 +1817,9 @@ class Run {
     const ref = item.referenceMetadata ?? {};
     const haveSha = new Set(target.assets.map((a) => a.sha256));
     const newInputs = inputs.filter((f) => !haveSha.has(prep.shaOf.get(f.path) ?? ""));
-    const pre = planUpdate(target, ref, evSource, new Date().toISOString());
+    // Z6 (Zotero Web): a field changed in Zotero and here becomes a conflict for the researcher, not a kept field.
+    const conflicts = this.zoteroWeb;
+    const pre = planUpdate(target, ref, evSource, new Date().toISOString(), { conflicts });
     const preAnn = this.annotationPlan(item, target, prep, "");
     this.projectTags ??= await projectCollectionsAndTags(this.repo, this.projectId);
     const known = this.projectTags.tags;
@@ -1750,8 +1827,21 @@ class Run {
       const t = known.find((x) => x.name.toLowerCase() === n.toLowerCase());
       return !t || !target.source.tagIds.includes(t.id);
     });
+    // Z6 (Accept 4): memberships new in Zotero since the last run, through the same structure machinery as creation
+    // (collections found or made by name under their parents, or tags); nothing is removed.
+    const prevKnown = item.version ? this.known.get(item.version.id) : undefined;
+    const newPaths = this.newMemberships(item, prevKnown);
+    const structCols: string[] = [];
+    const structTags: string[] = [];
+    for (const fp of newPaths) {
+      const s = await this.structure(fp);
+      structCols.push(...s.collectionIds);
+      structTags.push(...s.tagIds);
+    }
+    const renamed = await this.renamedBy(item, prevKnown, newPaths);
+    const newStructure = structCols.some((c) => !target.source.collectionIds.includes(c)) || structTags.some((t) => !target.source.tagIds.includes(t));
     const kept = [...pre.kept, ...keptLabels(target, preAnn.kept)];
-    const anything = pre.filled.length || pre.evidence.length || newInputs.length || preAnn.added.length || preAnn.updated.length || newTags;
+    const anything = pre.filled.length || pre.evidence.length || newInputs.length || preAnn.added.length || preAnn.updated.length || newTags || newStructure;
     // Z5: marked gone from Zotero and seen again as content: the mark goes (the availability before it comes back)
     // in this same change, before the rest of the update; with nothing else to update, the change is the mark's alone.
     const marked = target.source.availability.zotero !== undefined;
@@ -1759,7 +1849,7 @@ class Run {
     if (!anything && !preAnn.backfilled.length && !marked) {
       return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(kept.length ? { merge: emptyRecord(kept) } : {}), ...(preAnn.dropped ? { annotationsDropped: preAnn.dropped } : {}), ...(preAnn.deletedHere ? { annotationsDeletedHere: preAnn.deletedHere } : {}) }, target.assets);
     }
-    const tagIds = await this.namedTags(item.tags, item.tagColors);
+    const tagIds = [...(await this.namedTags(item.tags, item.tagColors)), ...structTags];
     // New files may carry a location: location governance applies to them (R57; R74 I1; R83).
     const proxyPlan = await planProxies(newInputs, { all: this.adapter.viewingProxies === true });
     const located = proxyPlan.located;
@@ -1768,6 +1858,8 @@ class Run {
     let deletedHere = 0;
     /** R224 a: a back whose change also updated the item's content (counted as back and as updated). */
     let contentUpdated = false;
+    /** Z6: fields this change put in conflict (journaled as `conflictsQueued`). */
+    let conflicted = 0;
     const out = await this.changeSource(
       item,
       sourceId,
@@ -1777,11 +1869,21 @@ class Run {
       async (ops, cur) => {
         const back = cur.source.availability.zotero !== undefined ? this.restoreFor(cur.source.id, cur.source.availability) : undefined;
         const backTo = back?.to;
-        const plan = planUpdate(cur, ref, evSource, ops.tx.at);
+        const plan = planUpdate(cur, ref, evSource, ops.tx.at, { conflicts });
         const added = await this.addFiles(ops, cur, inputs);
         const merged = applyMerge(cur, added, plan.filled, plan.evidence, ops.tx.at, ops.tx.actor, tagIds);
+        // Z6: the conflicts' own evidence (Zotero's value) is recorded with them, and taken off with them by undo.
+        const inConflict = new Set(plan.conflicts.map((c) => c.path));
         // Evidence of values that were already current is recorded too (not reverted by undo: it is true either way).
-        const extraEvidence = plan.evidence.filter((e) => !plan.filled.some((f) => f.path === e.field));
+        const extraEvidence = plan.evidence.filter((e) => !plan.filled.some((f) => f.path === e.field) && !inConflict.has(e.field));
+        const conflictRecords = plan.conflicts.map((c) => ({
+          path: c.path,
+          ...(cur.verification[c.path] ? { before: cur.verification[c.path] } : {}),
+          after: conflictVerification(cur, c, evSource),
+          evidence: plan.evidence.filter((e) => e.field === c.path),
+        }));
+        // Z6: memberships new in Zotero that the source is not in (re-read inside the change).
+        const addedCollectionIds = [...new Set(structCols)].filter((c) => !cur.source.collectionIds.includes(c));
         const ann = this.annotationPlan(item, merged.next, prep, ops.tx.actor);
         dropped = ann.dropped;
         deletedHere = ann.deletedHere;
@@ -1794,18 +1896,28 @@ class Run {
           // R224 b: the marks this back takes away, with their batches, and the availability before them all (its own
           // after), so that its undo never puts back a mark whose batch is undone.
           ...(back ? { availability: { before: cur.source.availability, after: back.to, preMark: back.to, marks: back.marks } } : {}),
+          ...(conflictRecords.length ? { conflicts: conflictRecords } : {}),
+          ...(addedCollectionIds.length ? { addedCollectionIds } : {}),
         };
-        const changed = plan.filled.length > 0 || added.length > 0 || ann.added.length > 0 || ann.updated.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0;
+        const changed =
+          plan.filled.length > 0 || added.length > 0 || ann.added.length > 0 || ann.updated.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0 || addedCollectionIds.length > 0;
+        conflicted = conflictRecords.length;
         // Only a back-filled sort index (R195): written and recorded for undo, but reported as unchanged.
-        if (!changed && !ann.backfilled.length && !backTo) return { next: null, record, outcome: "unchanged" };
+        if (!changed && !ann.backfilled.length && !backTo && !conflicted) return { next: null, record, outcome: "unchanged" };
         const replaced = new Map([...ann.updated, ...ann.backfilled].map((u) => [u.after.id, u.after]));
+        // A back-fill alone, or a conflict alone, leaves the source as it is (not marked modified, R196; Z6: the value
+        // here is untouched, only Zotero's is recorded beside it).
+        const base = changed ? merged.next : cur;
         const updated: SourceFile = this.withPendingProxies(
           item.key,
           {
-            // A back-fill alone leaves the source as it is (not marked modified, R196).
-            ...(changed ? merged.next : cur),
+            ...base,
+            ...(addedCollectionIds.length ? { source: { ...base.source, collectionIds: [...base.source.collectionIds, ...addedCollectionIds] } } : {}),
             annotations: [...merged.next.annotations.map((a) => replaced.get(a.id) ?? a), ...ann.added],
-            fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence],
+            fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence, ...conflictRecords.flatMap((c) => c.evidence)],
+            // Z6: each field in conflict is marked; writeSource then lists it in a pending capture-conflict entry in this
+            // same change (R190, R193 b, R194) and the audit says which entry and field (`reviewQueued`), never a value.
+            ...(conflicted ? { verification: { ...cur.verification, ...Object.fromEntries(conflictRecords.map((c) => [c.path, c.after])) } } : {}),
           },
           this.pendingForAdded(proxyPlan, newInputs, prep.shaOf, added, rule.mode()),
           rule.mode(),
@@ -1813,9 +1925,15 @@ class Run {
         // Z5: the availability before the mark, and nothing more of its own (not a modification of the source).
         const next: SourceFile = backTo ? { ...updated, source: { ...updated.source, availability: backTo } } : updated;
         contentUpdated = !!backTo && changed;
-        return { next, record, outcome: backTo ? "zotero-back" : changed ? "updated" : "unchanged" };
+        return { next, record, outcome: backTo ? "zotero-back" : changed ? "updated" : conflicted ? "zotero-conflict" : "unchanged" };
       },
-      () => ({ ...(dropped ? { annotationsDropped: dropped } : {}), ...(deletedHere ? { annotationsDeletedHere: deletedHere } : {}), ...(contentUpdated ? { contentUpdated: true as const } : {}) }),
+      () => ({
+        ...(dropped ? { annotationsDropped: dropped } : {}),
+        ...(deletedHere ? { annotationsDeletedHere: deletedHere } : {}),
+        ...(contentUpdated ? { contentUpdated: true as const } : {}),
+        ...(conflicted ? { conflictsQueued: conflicted } : {}),
+        ...(renamed.length ? { renamedCollections: renamed } : {}),
+      }),
       rule.hook,
       marked ? { marked: "back" } : undefined,
     );
@@ -1841,7 +1959,7 @@ class Run {
     targetId: string,
     reqs: Parameters<typeof importChange>[2],
     op: string,
-    fn: (ops: Parameters<Parameters<typeof importChange>[3]>[0], cur: SourceFile) => Promise<{ next: SourceFile | null; record: MergeRecord; outcome: "merged" | "updated" | "unchanged" | "zotero-gone" | "zotero-back" }>,
+    fn: (ops: Parameters<Parameters<typeof importChange>[3]>[0], cur: SourceFile) => Promise<{ next: SourceFile | null; record: MergeRecord; outcome: "merged" | "updated" | "unchanged" | "zotero-gone" | "zotero-back" | "zotero-conflict" }>,
     /** More fields for the journal line, known once `fn` ran. */
     extra: () => Partial<JournalEntry> = () => ({}),
     /** Watches the decision (the location rule, R83); never refuses. */
@@ -1945,15 +2063,15 @@ const deletedNote = (n: number) =>
 const emptyRecord = (kept: string[]): MergeRecord => ({ addedAssetIds: [], filled: [], addedEvidence: [], kept });
 
 /** Outcomes whose journal line records the item's version (R72). */
-const WITH_VERSION = new Set(["created", "needs-review", "merged", "updated", "unchanged", "zotero-gone", "zotero-back"]);
+const WITH_VERSION = new Set(["created", "needs-review", "merged", "updated", "unchanged", "zotero-gone", "zotero-back", "zotero-conflict"]);
 
 /**
  * Incremental import (R72): for each item identity, the source and version token recorded by the
  * newest journal line of the project's batches of this kind that were not undone. With `marks` (Z5), also each
  * source's "gone from Zotero" marks, oldest first, from the same lines.
  */
-async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"], marks?: Marks): Promise<Map<string, { sourceId: string; version: string; parts?: Parts }>> {
-  const out = new Map<string, { sourceId: string; version: string; parts?: Parts }>();
+async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"], marks?: Marks): Promise<Map<string, Known>> {
+  const out = new Map<string, Known>();
   for (const d of await batchDirs(repo, projectId)) {
     let rec: BatchRecord | undefined;
     try {
@@ -1971,7 +2089,9 @@ async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["s
       if (!e.ext || !e.sourceId) continue;
       // The newest line decides, its parts too (Z4): a line without parts (written before Z4) knows no file.
       const parts = readParts(e.ext.parts);
-      out.set(e.ext.id, { sourceId: e.sourceId, version: e.ext.version, ...(parts ? { parts } : {}) });
+      // Z6: and the collections Zotero had it in (a line written before Z6, or of another kind, has none: unknown).
+      const cols = readCols(e.ext.cols);
+      out.set(e.ext.id, { sourceId: e.sourceId, version: e.ext.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}) });
     }
   }
   return out;
