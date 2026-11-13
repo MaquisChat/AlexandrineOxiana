@@ -573,9 +573,9 @@ Update after every task; commit and push.
 | 72 A later conflict enters the review queue (D19) | complete | 3fd15df (merge) | R190, R193, R194; reviewed with probes over two fix rounds; D19 closed |
 | 73 The audit says which field was confirmed (D20) | complete | 0e890cd (merge) | R191; reviewed with 18 probes; D20 closed |
 | R1 Reader: anchor, annotation and colour model | complete (on the reader branch) | e188c3c (merge) | reviewed with probes over one fix round (R195; plan Amendments A1–A4); verification clean |
-| R5 Reader: ranged PDF route and the client's range reader | fix round 1 | c047738 (worktree branch) | review: the page could not read `Content-Range` cross-origin; a file handle left open on an early abort; both to fix, with an end-to-end test in both browsers |
+| R5 Reader: ranged PDF route and the client's range reader | fix round 1 in re-review | 6181d6c (worktree branch) | the shell can read a range across origins (end-to-end in both browsers); an early abort releases the file |
 | R2 Reader: the Zotero import keeps the sort index; re-import respects changes | in review | 629b8d0 (worktree branch) | the hash of existing annotations unchanged; the back-fill undoable |
-| R3 Reader: governed annotation operations in the library | in review | 3f58c53 (worktree branch) | 27 tests; reached through the repository's methods |
+| R3 Reader: governed annotation operations in the library | approved; a small round (one ruling, two tests) | 3f58c53 (worktree branch) | reviewed with twelve probes; plan Amendment A5 |
 | R4, R6–R13 Reader: the remaining tasks | not started | | order: R6 after R5, R4 after R3, R7 after R6, then R8, R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
