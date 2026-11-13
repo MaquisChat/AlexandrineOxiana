@@ -193,7 +193,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     if (!isAbsolute(dir)) throw badRequest('"dir" must be an absolute path.');
     const options = (optObj(b, "options") ?? {}) as Parameters<typeof addWatchedFolder>[3];
     const w = await addWatchedFolder({ repo: s.repo, lib: s.lib }, projectId, dir, options);
-    const watch = watchFolder(state.watchDeps(s, projectId), projectId, dir, options);
+    const watch = watchFolder(state.watchDeps(s, projectId), projectId, dir, w.options, w.id); // with its id: its register (A8)
     s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), watch]);
     return w;
   });
