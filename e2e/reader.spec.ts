@@ -581,7 +581,8 @@ async function readFromLibrary(page: Page, app: AppHarness, projectId: string, s
   await expect(page.getByRole("heading", { level: 1, name: title })).toBeVisible();
 }
 
-const region = (page: Page, n: number, of: number) => page.getByRole("region", { name: `Page ${n} of ${of}`, exact: true });
+/** A page's box, by its label: a region while it is drawn, a group otherwise (A10). */
+const region = (page: Page, n: number, of: number) => page.locator(`[data-page-number="${n}"][aria-label="Page ${n} of ${of}"]`);
 const toolbar = (page: Page) => page.getByRole("toolbar", { name: "Reader" });
 const pageField = (page: Page) => toolbar(page).getByRole("spinbutton", { name: "Page" });
 const zoomValue = (page: Page) => toolbar(page).getByRole("status", { name: "Zoom" });
@@ -697,7 +698,18 @@ test("a 900-page scan opens, jumps to page 900 and says it has no text", async (
 
   await expect(at(1)).toBeVisible();
   await expect(at(1)).toContainText(NO_TEXT);
-  await expect(page.getByRole("region", { name: /^Page \d+ of 900$/ })).toHaveCount(900);
+  // Every page has its labelled box; only the drawn ones are landmark regions (A10).
+  await expect(page.locator('[data-page-number][aria-label$=" of 900"]')).toHaveCount(900);
+  const regionsAreTheDrawnPages = async () => {
+    const r = await page.evaluate(() => ({
+      regions: [...document.querySelectorAll('[role="region"][aria-label^="Page "]')].map((e) => e.getAttribute("aria-label")).sort(),
+      drawn: [...document.querySelectorAll<HTMLElement>("[data-rendered]")].map((e) => `Page ${e.dataset.pageNumber} of 900`).sort(),
+    }));
+    expect(r.regions.length).toBeLessThanOrEqual(6);
+    expect(r.regions).toEqual(r.drawn);
+  };
+  await regionsAreTheDrawnPages();
+  await expect(page.getByRole("group", { name: "Page 900 of 900", exact: true })).toHaveCount(1);
   await check("opened");
 
   await test.step("type 900 in the Page field: page 900 has focus and says it has no text", async () => {
@@ -707,6 +719,9 @@ test("a 900-page scan opens, jumps to page 900 and says it has no text", async (
     await expect(at(900)).toBeInViewport();
     await expect(at(900)).toContainText(NO_TEXT);
     await expect.poll(async () => (await canvasesNow(page)).pages.includes(900)).toBe(true);
+    await expect(page.getByRole("region", { name: "Page 900 of 900", exact: true })).toHaveCount(1);
+    await expect(page.getByRole("group", { name: "Page 1 of 900", exact: true })).toHaveCount(1);
+    await regionsAreTheDrawnPages();
     await check("at page 900");
   });
 
@@ -879,6 +894,16 @@ test("Page Down moves to the next page", async ({ page, app }) => {
   await expect(region(page, 1, 6)).toBeInViewport();
   // A control that becomes disabled under the focus hands it to its neighbour, never to the body (A9, R145).
   const button = (name: string) => toolbar(page).getByRole("button", { name });
+  // However the limit is reached (A10): focus on "Next page", the last page reached with the wheel.
+  await page.keyboard.press("Home");
+  await expect(pageField(page)).toHaveValue("1");
+  await button("Next page").focus();
+  const area = (await page.getByRole("group", { name: "Pages" }).boundingBox())!;
+  await page.mouse.move(area.x + area.width / 2, area.y + area.height / 2);
+  for (let i = 0; i < 12 && (await button("Next page").isEnabled()); i++) await page.mouse.wheel(0, 2000);
+  await expect(pageField(page)).toHaveValue("6");
+  await expect(button("Next page")).toBeDisabled();
+  await expect(button("Previous page")).toBeFocused();
   const active = () => page.evaluate(() => (document.activeElement === document.body ? "BODY" : (document.activeElement?.textContent ?? "")));
   await pageField(page).fill("5");
   await pageField(page).press("Enter");
