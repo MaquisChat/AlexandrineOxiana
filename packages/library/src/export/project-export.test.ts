@@ -153,6 +153,36 @@ describe("exportProjectOpenFormats", () => {
     expect(text).toContain("A standalone note with \\`code\\`");
   });
 
+  it("an annotation with no author (an imported one Zotero gave none for, D22) is signed with its time alone", async () => {
+    const p = await makeProject(kit);
+    const pdf = await scratchFile(kit, "y.pdf", "%PDF-1.4");
+    const draft: SourceDraft = {
+      projectIds: [p.id],
+      type: "article-journal",
+      title: { variants: [{ lang: "en", kind: "original", value: "Authorless" }] },
+      creators: [],
+      identifiers: {},
+      caseAttributes: {},
+      availability: { status: "available" },
+      collectionIds: [],
+      tagIds: [],
+      participantIds: [],
+    };
+    const at = "2027-03-12T10:00:00.000Z";
+    await kit.repo.createSource(p.id, draft, [{ path: pdf, role: "original", handling: "copy" }], {
+      provenance: { captureMethod: "manual_upload", capturedAt: at, tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+      annotations: (sourceId, assets): Annotation[] => [
+        { id: newId(), sourceId, kind: "highlight", quote: "nobody's line", anchors: [{ kind: "pdf", id: newId(), assetId: assets[0]!.id, page: 1, rects: [{ x: 0, y: 0, w: 1, h: 1 }] }], createdAt: at },
+        { id: newId(), sourceId, kind: "note", body: "nobody's note", anchors: [], createdAt: at },
+      ],
+    });
+    const r = await exportProjectOpenFormats(kit.repo, p.id, await outDir());
+    const md = (await walk(r.path)).find((n) => n.endsWith(".md"))!;
+    const text = await readFile(join(r.path, md), "utf8");
+    expect(text.match(/^\*2027-03-12T10:00:00\.000Z\*$/gmu)).toHaveLength(2);
+    expect(text).not.toContain("undefined");
+  });
+
   it("pseudonymised file names: no participant's handle in any exported file or folder name", async () => {
     const p = await makeProject(kit, PSEUDO_GOV, true, "Names");
     const mp4 = await scratchFile(kit, "@maria.cocina reel.mp4", "video bytes");

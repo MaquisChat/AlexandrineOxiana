@@ -193,6 +193,7 @@ export {
   zoteroWebSince,
 } from "./import/zotero-web.js";
 export type { ZoteroWebAdapter, ZoteroWebOptions, ZoteroWebScanResult } from "./import/zotero-web.js";
+export { clearZoteroWebVersion } from "./repo/repo.js";
 export {
   ZOTERO_ACCOUNT_MAX_WAIT_MS,
   ZOTERO_ACCOUNT_MESSAGES,

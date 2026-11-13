@@ -47,6 +47,22 @@ export function recordZoteroWebVersion(core: RepoCore, projectId: string, ref: s
   });
 }
 
+/**
+ * Forgets the Zotero library version recorded for `ref` (Task Z5, R206 4: undoing a batch that recorded it), so
+ * that the next Web import of that library is a full one. One governed, audited change; nothing is written when
+ * no version is recorded.
+ */
+export async function resetZoteroWebVersion(core: RepoCore, projectId: string, ref: string): Promise<void> {
+  if (!/^(user|group):\d{1,12}$/u.test(ref)) throw new TypeError("invalid Zotero library reference");
+  const zw = core.state(projectId).project.importSettings?.zoteroWeb;
+  if (!zw || !Object.hasOwn(zw, ref)) return;
+  await changeProject(core, projectId, "project.import-settings.zotero-web.reset", (p) => {
+    const zoteroWeb = { ...(p.importSettings?.zoteroWeb ?? {}) };
+    delete zoteroWeb[ref];
+    p.importSettings = { ...p.importSettings, zoteroWeb };
+  });
+}
+
 /** Adds a watched folder's record (id + options; the folder itself is a device setting). */
 export function addWatchedFolderRecord(core: RepoCore, projectId: string, options: unknown): Promise<WatchedFolder> {
   const parsed = WatchedFolderOptions.parse(options ?? {});

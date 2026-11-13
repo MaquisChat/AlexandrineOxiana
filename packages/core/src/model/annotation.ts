@@ -31,7 +31,11 @@ export const Annotation = z.object({
   externalHash: z.string().max(128).optional(),
   codeId: Id.optional(),
   codebookVersion: z.number().int().optional(),
-  author: z.string(),
+  /**
+   * Who made it: the researcher's name for an annotation made here; for an imported one, the name its
+   * source gave, and none when the source gave none (D22: never this computer's account name).
+   */
+  author: z.string().optional(),
   createdAt: Timestamp,
   /** When and by whom it was last changed here (absent until changed). */
   modifiedAt: Timestamp.optional(),
