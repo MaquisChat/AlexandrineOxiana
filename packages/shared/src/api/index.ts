@@ -17,4 +17,5 @@ export * from "./capture.js";
 export * from "./errors.js";
 export * from "./settings-reset.js";
 export * from "./device-notices.js";
+export * from "./annotations.js";
 export * from "./documents.js";
