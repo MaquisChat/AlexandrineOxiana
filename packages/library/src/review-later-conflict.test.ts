@@ -138,17 +138,48 @@ describe("a field newly in conflict after a later check is queued in the same ch
     expect((await auditEvents(kit, p)).at(-1)?.details).not.toHaveProperty("reviewQueued");
   });
 
-  it("nothing is written when a pending entry already lists the field", async () => {
+  it("a capture entry that lists the field as unverified: the same entry now lists it as in conflict (M1), no second entry", async () => {
     const sf = await kit.repo.createSource(p.id, draft("Rivers and Memory"), [], {
       provenance: provenance(),
       fieldEvidence: [{ field: "/title", value: "Rivers and Memory", source: { kind: "page-dom" }, at: kit.clock.now.toISOString() }],
       reviewItem: { fields: { "/title": "unverified" }, reasons: ["The title was in doubt."], cause: { kind: "capture-conflict" } },
     });
-    const lines = await reviewLineCount();
+    const [captured] = await pendingOf(sf.source.id);
     const next = await laterCheck(sf.source.id, { "/title": "Rivers and Memories" });
     expect(next.verification["/title"]?.status).toBe("conflict");
+    const pending = await pendingOf(sf.source.id);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ id: captured!.id, fields: { "/title": "conflict" }, cause: { kind: "capture-conflict" } });
+  });
+
+  it("a recheck on a source whose conflict is already listed as such adds nothing and audits no reviewQueued", async () => {
+    const sid = await existing();
+    await laterCheck(sid, { "/title": "Rivers and Memories" });
+    const lines = await reviewLineCount();
+    const before = await auditEvents(kit, p);
+    await kit.repo.recheckSource(p.id, sid);
+    await laterCheck(sid, { "/title": "Rivers and Memories" });
     expect(await reviewLineCount()).toBe(lines);
-    expect(await pendingOf(sf.source.id)).toHaveLength(1);
+    const added = (await auditEvents(kit, p)).slice(before.length);
+    for (const e of added) expect(e.details).not.toHaveProperty("reviewQueued");
+  });
+
+  it("R193 a (I2): a pending import entry that lists the field does not count; the conflict gets a capture entry, which outlives the import decision", async () => {
+    const at = kit.clock.now.toISOString();
+    const sf = await kit.repo.createSource(p.id, draft("Rivers and Memory"), [], {
+      provenance: provenance(),
+      fieldEvidence: [{ field: "/title", value: "Rivers and Memory", source: { kind: "page-dom" }, at }],
+      reviewItem: { kind: "import", fields: { "/title": "unverified" }, reasons: ["Low confidence."] },
+    });
+    const sid = sf.source.id;
+    const importEntry = (await pendingOf(sid))[0]!;
+    await laterCheck(sid, { "/title": "Rivers and Memories" });
+    const capture = (await pendingOf(sid)).filter((e) => reviewCauseOf(e)?.kind === "capture-conflict");
+    expect(capture).toEqual([expect.objectContaining({ fields: { "/title": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" } })]);
+    const { decideReview } = await import("./import/bulk/review.js");
+    await decideReview(kit.repo, p.id, importEntry.id, { action: "accept" });
+    expect((await kit.repo.getSource(p.id, sid)).verification["/title"]?.status).toBe("conflict");
+    expect((await pendingOf(sid)).map((e) => e.id)).toEqual([capture[0]!.id]);
   });
 
   it("nothing is raised for a field the researcher has confirmed", async () => {
@@ -192,6 +223,66 @@ describe("crash safety (R26): never a conflict without its entry nor an entry wi
     await kit.reopen();
     expect((await kit.repo.getSource(p.id, sid)).verification["/title"]?.status).toBe("conflict");
     expect(await pendingOf(sid)).toEqual([expect.objectContaining({ fields: { "/title": "conflict" } })]);
+  });
+});
+
+describe("R193 b: an invariant — a source left with a conflict and no entry (as D19 left it) is put right at its next check", () => {
+  /** A stored conflict on the title, its evidence disagreeing, and no review entry: what D19 left behind. */
+  async function d19Victim() {
+    const at = kit.clock.now.toISOString();
+    const page = { kind: "page-dom" as const };
+    const platform = { kind: "platform-json" as const };
+    const sf = await kit.repo.createSource(p.id, draft("Rivers and Memory"), [], {
+      provenance: provenance(),
+      fieldEvidence: [
+        { field: "/title", value: "Rivers and Memory", source: page, at },
+        { field: "/title", value: "Rivers and Memories", source: platform, at },
+      ],
+    });
+    // The report as a later check computed it before this fix: stored without an entry.
+    const { recheckSourceFile: rc } = await import("@ao/core");
+    const report = rc(sf, {}).verification;
+    expect(report["/title"]?.status).toBe("conflict");
+    const folder = join(kit.lib.root, sf.source.folder);
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(folder, "source.json"), JSON.stringify({ ...sf, verification: report }, null, 2));
+    await kit.reopen();
+    expect((await kit.repo.getSource(p.id, sf.source.id)).verification["/title"]?.status).toBe("conflict");
+    expect(await entriesOf(sf.source.id)).toEqual([]);
+    return sf.source.id;
+  }
+
+  it("the next recheck writes its entry, once; a further recheck adds nothing", async () => {
+    const sid = await d19Victim();
+    const before = await auditEvents(kit, p);
+    await kit.repo.recheckSource(p.id, sid);
+    const pending = await pendingOf(sid);
+    expect(pending).toEqual([expect.objectContaining({ fields: { "/title": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" } })]);
+    const added = (await auditEvents(kit, p)).slice(before.length);
+    expect(added).toHaveLength(1);
+    expect(added[0]!.details).toMatchObject({ op: "source.update", reviewQueued: [{ entry: pending[0]!.id, fields: ["/title"] }] });
+    const lines = await reviewLineCount();
+    const events = (await auditEvents(kit, p)).length;
+    await kit.repo.recheckSource(p.id, sid);
+    expect(await reviewLineCount()).toBe(lines);
+    expect((await auditEvents(kit, p)).length).toBe(events);
+  });
+
+  it("a crash on the healing path leaves neither the entry nor its audit before the commit point, and exactly one entry after it", async () => {
+    const sid = await d19Victim();
+    seams.crashAt = "before-audit";
+    await expect(kit.repo.recheckSource(p.id, sid)).rejects.toBeInstanceOf(SimulatedCrash);
+    await kit.reopen();
+    expect(await entriesOf(sid)).toEqual([]);
+
+    seams.crashAt = "before-marker-delete";
+    await expect(kit.repo.recheckSource(p.id, sid)).rejects.toBeInstanceOf(SimulatedCrash);
+    await kit.reopen();
+    expect(await pendingOf(sid)).toEqual([expect.objectContaining({ fields: { "/title": "conflict" } })]);
+    const lines = await reviewLineCount();
+    await kit.repo.recheckSource(p.id, sid);
+    expect(await reviewLineCount()).toBe(lines);
+    expect(await pendingOf(sid)).toHaveLength(1);
   });
 });
 

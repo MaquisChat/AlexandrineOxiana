@@ -1371,7 +1371,7 @@ describe("Task 72 (R190): an import decision that puts a field newly in conflict
    * A batch with one item; its source carries a page's date (2014); the item's import entry offers a
    * candidate dated 2018. Accepting the candidate puts the date newly in conflict.
    */
-  async function decidedIntoConflict() {
+  async function decidedIntoConflict(fields: Record<string, string> = {}) {
     const { projectReviewEntries } = await import("../../repo/repo.js");
     const p = await project();
     const { handle: h } = await run(p, folderAdapter(await folderWith("r190", { "a.pdf": await workPdf("r190") })));
@@ -1386,7 +1386,7 @@ describe("Task 72 (R190): an import decision that puts a field newly in conflict
         sourceId: sid!,
         kind: "import",
         batchId: h.batchId,
-        fields: {},
+        fields,
         reasons: ["low confidence"],
         candidates: [{ provider: "openalex", title: WORK_TITLE, creators: [], issued: "2018", type: "article-journal", identifiers: {} }],
       }),
@@ -1405,6 +1405,11 @@ describe("Task 72 (R190): an import decision that puts a field newly in conflict
     const decide = (await auditEvents(p)).filter((e) => (e.details as { op?: string } | undefined)?.op === "review.decide");
     expect(decide).toHaveLength(1);
     expect(decide[0]!.details).toMatchObject({ reviewQueued: [{ entry: queued[0]!.id, fields: ["/issued"] }] });
+  });
+
+  it("R193 a (I1): the item's own import entry lists the field, as reviewFor writes it: the decision still queues the conflict", async () => {
+    const { queued } = await decidedIntoConflict({ "/issued": "unverified" });
+    expect(queued).toEqual([expect.objectContaining({ fields: { "/issued": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" } })]);
   });
 
   it("undoing the batch takes the entry back in the change that removes the source", async () => {
