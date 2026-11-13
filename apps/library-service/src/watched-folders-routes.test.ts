@@ -1125,3 +1125,82 @@ describe("fix round 2 (R234)", () => {
     expect((await summary(pid, wid)).place?.display).toBe(await realpath(moved));
   });
 });
+
+describe("R241 (a): one order for summaries, from the service", () => {
+  it("every summary, list and watch.status carries seq: it grows across list, act and event and no two draws repeat", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const events: Array<{ type: string; data: any }> = [];
+    svc!.state.events.subscribe((e) => events.push(e as { type: string; data: any }));
+    const dir = await folder("Ordered");
+    const added = await add(pid, dir, { label: "Ordered" });
+    expect(added.status, added.body).toBe(201);
+    const wid = added.json.id as string;
+    expect(Number.isSafeInteger(added.json.seq)).toBe(true);
+    const list1 = await call({ url: `/projects/${pid}/watched-folders` });
+    expect(Number.isSafeInteger(list1.json.seq)).toBe(true);
+    expect(list1.json.seq).toBeGreaterThan(added.json.seq);
+    // A list's summaries are read under the list's own number.
+    for (const f of list1.json.folders as WatchedFolderSummary[]) expect(f.seq).toBe(list1.json.seq);
+    const paused = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { paused: true } });
+    expect(paused.json.seq).toBeGreaterThan(list1.json.seq);
+    const resumed = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { paused: false } });
+    expect(resumed.json.seq).toBeGreaterThan(paused.json.seq);
+    await pdf(join(dir, "ordered.pdf"), "An Ordered File");
+    await until(async () => events.some((e) => e.type === "watch.status" && e.data.folder.id === wid && e.data.folder.counts.cameIn === 1), 30_000, "a watch.status with the file");
+    const retried = await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` });
+    const list2 = await call({ url: `/projects/${pid}/watched-folders` });
+    expect(list2.json.seq).toBeGreaterThan(retried.json.seq);
+    const evSeqs = events.filter((e) => e.type === "watch.status").map((e) => e.data.folder.seq as number);
+    expect(evSeqs.length).toBeGreaterThan(0);
+    // Events are published in the order of their numbers, each later than the add.
+    expect([...evSeqs].sort((a, b) => a - b)).toEqual(evSeqs);
+    for (const n of evSeqs) expect(n).toBeGreaterThan(added.json.seq);
+    // The event that told of the file is a later reading than the answers before it.
+    const told = events.find((e) => e.type === "watch.status" && e.data.folder.counts.cameIn === 1)!.data.folder.seq as number;
+    expect(told).toBeGreaterThan(resumed.json.seq);
+    const draws = [added.json.seq, list1.json.seq, paused.json.seq, resumed.json.seq, retried.json.seq, list2.json.seq, ...evSeqs];
+    expect(new Set(draws).size).toBe(draws.length);
+    for (const e of events.filter((x) => x.type === "watch.status")) answers.push(JSON.stringify(e.data.folder));
+  }, 60_000);
+
+  it("N1: the number only grows for the life of the service: a library closed and opened again goes on from it", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const dir = await folder("Again");
+    const added = await add(pid, dir);
+    const list1 = await call({ url: `/projects/${pid}/watched-folders` });
+    const highest = Math.max(added.json.seq, list1.json.seq);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const list2 = await call({ url: `/projects/${pid}/watched-folders` });
+    expect(list2.status, list2.body).toBe(200);
+    expect(list2.json.seq).toBeGreaterThan(highest);
+    for (const f of list2.json.folders as WatchedFolderSummary[]) expect(f.seq).toBeGreaterThan(highest);
+  }, 30_000);
+
+  it("an event is a reading of the folder when it is sent, never of an earlier push: after a pause, every later event says paused", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const events: Array<{ type: string; data: any }> = [];
+    svc!.state.events.subscribe((e) => events.push(e as { type: string; data: any }));
+    const dir = await folder("Live2");
+    const wid = (await add(pid, dir)).json.id as string;
+    // A status pushed while watching, held by the coalescer and sent after the pause's answer.
+    const watch = (svc!.state.session!.watches.get(pid) ?? []).find((w) => !w.stopped)!;
+    await until(async () => watch.status().state === "watching", 10_000, "watching");
+    const before = watch.status();
+    const paused = await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { paused: true } });
+    expect(paused.json.state).toBe("paused");
+    // A status read before the pause reaches the coalescer after the answer (the engine's own pushes are throttled, so
+    // the one waiting to be sent can be older than the folder is now).
+    svc!.state.onWatchStatus!(svc!.state.session!, pid, before);
+    svc!.state.onWatchStatus!(svc!.state.session!, pid, before);
+    await until(async () => events.some((e) => e.type === "watch.status" && e.data.folder.seq > paused.json.seq), 5_000, "an event after the pause");
+    for (const e of events.filter((x) => x.type === "watch.status" && x.data.folder.seq > paused.json.seq)) expect(e.data.folder.state).toBe("paused");
+    for (const e of events.filter((x) => x.type === "watch.status")) answers.push(JSON.stringify(e.data.folder));
+  }, 30_000);
+});

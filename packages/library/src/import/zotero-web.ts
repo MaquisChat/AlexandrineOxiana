@@ -739,7 +739,13 @@ async function changedTree(api: ZoteroApi, prefix: string, since: number, result
   return { tree, tops };
 }
 
-async function collectionPaths(api: ZoteroApi, prefix: string): Promise<(keys: unknown) => string[][]> {
+/**
+ * The item's collection paths (names, root first) and, beside each (Z6, R236 f), the Zotero collection keys along it:
+ * the key, not the name, tells a collection renamed in Zotero from a new one.
+ */
+type CollectionPaths = (keys: unknown) => { paths: string[][]; keys: string[][] };
+
+async function collectionPaths(api: ZoteroApi, prefix: string): Promise<CollectionPaths> {
   const colls = new Map<string, { name: string; parent?: string }>();
   for await (const p of pages(api, `${prefix}/collections`, {})) {
     for (const c of p.items) {
@@ -749,10 +755,11 @@ async function collectionPaths(api: ZoteroApi, prefix: string): Promise<(keys: u
       colls.set(c.key, { name: text(str(c.data.name)).slice(0, 200) || "Untitled", ...(parent ? { parent } : {}) });
     }
   }
-  const cache = new Map<string, string[] | null>();
-  const pathOf = (key: string): string[] | null => {
+  const cache = new Map<string, { names: string[]; keys: string[] } | null>();
+  const pathOf = (key: string): { names: string[]; keys: string[] } | null => {
     if (cache.has(key)) return cache.get(key)!;
     const chain: string[] = [];
+    const chainKeys: string[] = [];
     const seen = new Set<string>();
     let ok = true;
     for (let k: string | undefined = key; k; ) {
@@ -764,18 +771,22 @@ async function collectionPaths(api: ZoteroApi, prefix: string): Promise<(keys: u
       if (seen.has(k) || chain.length >= MAX_COLLECTION_DEPTH) break;
       seen.add(k);
       chain.push(c.name);
+      chainKeys.push(k);
       k = c.parent;
     }
-    const out = ok && chain.length ? chain.reverse() : null;
+    const out = ok && chain.length ? { names: chain.reverse(), keys: chainKeys.reverse() } : null;
     cache.set(key, out);
     return out;
   };
   return (keys) => {
-    const out: string[][] = [];
+    const out = { paths: [] as string[][], keys: [] as string[][] };
     for (const k of Array.isArray(keys) ? keys : []) {
       if (typeof k !== "string" || !colls.has(k)) continue;
       const p = pathOf(k);
-      if (p && out.length < MAX_FOLDER_PATHS) out.push(p);
+      if (p && out.paths.length < MAX_FOLDER_PATHS) {
+        out.paths.push(p.names);
+        out.keys.push(p.keys);
+      }
     }
     return out;
   };
@@ -882,7 +893,7 @@ async function* scanWeb(
   const skip = (key: string): boolean => ctx.skip?.(key) === true;
   let tree!: Tree;
   let tops: Set<string> | undefined;
-  let pathsOf!: (keys: unknown) => string[][];
+  let pathsOf!: CollectionPaths;
   let colors: Map<string, string>;
   /** Keys `/deleted?since=` lists (items; children among them). */
   let deletedKeys: string[] = [];
@@ -1070,7 +1081,7 @@ async function* scanWeb(
         const c = colors.get(t.toLowerCase());
         if (c) tagColors[t] = c;
       }
-      const paths = pathsOf(d.collections);
+      const { paths, keys: pathKeys } = pathsOf(d.collections);
       const related = relatedOf(d);
       const added = zoteroTimestamp(d.dateAdded);
       const modified = zoteroTimestamp(d.dateModified);
@@ -1092,6 +1103,7 @@ async function* scanWeb(
         referenceSource: { kind: "zotero", provider: "zotero-web" },
         ...(paths[0] ? { folderPath: paths[0] } : {}),
         ...(paths.length > 1 ? { moreFolderPaths: paths.slice(1) } : {}),
+        ...(paths.length ? { folderKeys: pathKeys } : {}),
         ...(fields.tags?.length ? { tags: fields.tags } : {}),
         ...(Object.keys(tagColors).length ? { tagColors } : {}),
         ...(annotations.length ? { annotations } : {}),

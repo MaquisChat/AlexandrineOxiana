@@ -63,6 +63,13 @@ export interface WatchedFolderCounts {
 }
 
 export interface WatchedFolderSummary {
+  /**
+   * The order of readings (R241): one counter per open library in the service, drawn when the summary (or the list
+   * holding it) is built, before anything is read for it. It only grows: of two summaries of one folder — from a list,
+   * an act's answer or a `watch.status` event, however they arrive — the higher `seq` is the later reading. The
+   * summaries of one list share the list's number.
+   */
+  seq: number;
   id: string;
   label?: string;
   recursive: boolean;
@@ -80,6 +87,8 @@ export interface WatchedFolderSummary {
 }
 
 export interface WatchedFoldersListResponse {
+  /** The list's reading (R241): a folder it does not hold is gone, for a reader that last saw it with a lower `seq`. */
+  seq: number;
   folders: WatchedFolderSummary[];
 }
 

@@ -13,7 +13,7 @@
  * Also here: ScanAnnotation → Annotation, and unique citation keys.
  */
 import { isDeepStrictEqual } from "node:util";
-import { Annotation, BIBLIO_FIELDS, newId, primary, type Asset, type FieldEvidence, type MultiText, type SourceDraft, type SourceFile } from "@ao/core";
+import { Annotation, BIBLIO_FIELDS, ZOTERO_CONFLICT_CHECK, newId, primary, type Asset, type FieldEvidence, type FieldVerification, type MultiText, type SourceDraft, type SourceFile } from "@ao/core";
 import { annotationHash, getAt, unedited, type FilledField } from "./merge.js";
 import type { ScanAnnotation } from "./scan.js";
 
@@ -26,11 +26,11 @@ export const UPDATABLE = [
 /** Fields a source cannot be without: an update changes them but never removes them. */
 const REQUIRED = new Set(["/type", "/title", "/creators"]);
 
-const present = (v: unknown) => v !== undefined && v !== "" && !(Array.isArray(v) && v.length === 0);
+const present = (v: unknown) => v !== undefined && v !== null && v !== "" && !(Array.isArray(v) && v.length === 0);
 const norm = (v: unknown) => (present(v) ? v : undefined);
 
 /** A field's value as evidence records it (titles and containers as their primary text). */
-function asEvidence(path: string, v: unknown): unknown {
+export function asEvidence(path: string, v: unknown): unknown {
   if (path === "/title" || path === "/container") return v && typeof v === "object" ? norm(primary(v as MultiText).trim()) : norm(v);
   return norm(v);
 }
@@ -74,28 +74,77 @@ export interface UpdatePlan {
   evidence: FieldEvidence[];
   /** Fields changed since the previous import: kept. */
   kept: string[];
+  /**
+   * Task Z6 (with `conflicts`): fields changed at the source AND here since the previous import, to three different
+   * values, both present. The value here is kept; the source's value (`value`, in evidence form) is recorded as
+   * evidence (it is also in `evidence`) and the field is to be marked in conflict (see conflictVerification). Not in
+   * `kept`. Without the option, such a field is in `kept`, as before.
+   */
+  conflicts: Array<{ path: string; value: unknown }>;
+  /**
+   * R236 a (with `keepCleared`: both Zotero importers): fields the source no longer has a value for that have one here: kept here, edited or
+   * not; the clearing is in `evidence` as an empty value (`null`), so it is noticed once. Not emptied, not asked.
+   */
+  cleared: string[];
+}
+
+/** Task Z6: the reason a field changed in Zotero and here is in conflict (Accept 1; no value in it). */
+export const ZOTERO_CONFLICT_REASON = "Zotero now has a different value; you changed it here.";
+
+/**
+ * Task Z6: the verification entry of a field changed in Zotero and here (Accept 1): in conflict, Zotero's value as
+ * the one value given against it, the record's own value as `current`.
+ */
+export function conflictVerification(cur: SourceFile, c: { path: string; value: unknown }, source: FieldEvidence["source"]): FieldVerification {
+  const here = getAt(cur.source, c.path);
+  return { status: "conflict", checks: [ZOTERO_CONFLICT_CHECK], reason: ZOTERO_CONFLICT_REASON, values: [{ value: c.value, source }], ...(here !== undefined ? { current: here } : {}) };
 }
 
 /**
  * What an update changes on `cur` (see the module comment). `kind` is the evidence kind the
  * previous import recorded its values under; `source` the evidence source for the new ones.
+ *
+ * How "changed here" and "what the last import brought" are known, for every kind of field: the last import's value
+ * is the NEWEST field evidence of the source's kind (`prev`, in evidence form: a title or container as its primary
+ * text, trimmed; creators, dates, identifiers and plain strings as stored; an empty value as absent). The value here
+ * is the source's own value in the same form (`now`). Changed at the source: `next` differs from `prev`. Changed
+ * here: `now` differs from `prev` (a field the researcher cleared is `now` absent; one the researcher only confirmed
+ * without changing it is `now` equal to `prev`, so not changed here). Lists are compared whole (deep equality).
+ * Task Z6 (`opts.conflicts`): changed on both sides to different values, both present → `conflicts`; the same value
+ * on both sides is no conflict (the value is recorded as evidence only); the researcher cleared it here → `kept`, as
+ * before (the existing confirm cannot record an empty value, so such an entry could not be settled as the researcher
+ * chose); the source cleared it while it has a value here (edited or not) → `cleared` (`opts.keepCleared`, R236 a: kept here, noted once,
+ * counted; never emptied).
  */
-export function planUpdate(cur: SourceFile, ref: Partial<SourceDraft>, source: FieldEvidence["source"], at: string): UpdatePlan {
+export function planUpdate(cur: SourceFile, ref: Partial<SourceDraft>, source: FieldEvidence["source"], at: string, opts: { conflicts?: boolean; keepCleared?: boolean } = {}): UpdatePlan {
   const next = referenceValues(ref);
-  const plan: UpdatePlan = { filled: [], evidence: [], kept: [] };
+  const plan: UpdatePlan = { filled: [], evidence: [], kept: [], conflicts: [], cleared: [] };
   const s = cur.source;
   for (const path of UPDATABLE) {
-    let prev: unknown;
+    /** What the source said last (empty when it last cleared the field), and the last value it had (R236 a). */
+    let seen: unknown;
+    let lastValue: unknown;
     let recorded = false;
     for (const e of cur.fieldEvidence) {
       if (e.field === path && e.source.kind === source.kind) {
-        prev = norm(e.value);
+        seen = norm(e.value);
+        if (seen !== undefined) lastValue = seen;
         recorded = true;
       }
     }
+    // "What the last import brought", for telling a change here: with `keepCleared`, the last
+    // VALUE the source gave (a clearing noted since is not a value here's field can have kept); otherwise, as before.
+    const prev = opts.keepCleared ? lastValue : seen;
     const nv = next.get(path);
-    if (recorded && isDeepStrictEqual(nv, prev)) continue; // unchanged at the source
+    if (recorded && isDeepStrictEqual(nv, seen)) continue; // unchanged at the source (a clearing noticed once)
     const now = asEvidence(path, getAt(s, path));
+    // R236 a (Zotero Web): the source no longer has a value that this field has here: the value here stays, edited or
+    // not; the clearing is recorded as the source's evidence (an empty value), so it is noticed once, and counted.
+    if (opts.keepCleared && recorded && nv === undefined && now !== undefined) {
+      plan.cleared.push(path);
+      plan.evidence.push({ field: path, value: null, source, at });
+      continue;
+    }
     const evidence = nv === undefined ? [] : [{ field: path, value: nv, source, at }];
     if (isDeepStrictEqual(now, nv)) {
       // Already the new value: only record it (so the next re-import compares with it).
@@ -104,6 +153,13 @@ export function planUpdate(cur: SourceFile, ref: Partial<SourceDraft>, source: F
     }
     const mayChange = recorded ? isDeepStrictEqual(now, prev) : now === undefined;
     if (!mayChange) {
+      // Z6: changed here AND at the source, to different values, both present: the value here is kept, the source's
+      // recorded beside it as evidence (so the same value never asks again: it is then `prev`), the field in conflict.
+      if (opts.conflicts && recorded && now !== undefined && nv !== undefined) {
+        plan.conflicts.push({ path, value: nv });
+        plan.evidence.push(...evidence);
+        continue;
+      }
       // Changed since the previous import (by the user or another step): kept. A field the previous
       // import never recorded is not the import's to change, and not reported.
       if (recorded) plan.kept.push(path);

@@ -11,7 +11,7 @@
  * plaintext. Unencrypted files are owner-only (0600). The index holds no batch data: these files
  * are the record.
  */
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { join } from "node:path";
 import { ImportBatch, encName, type PolicyDecision } from "@ao/core";
 import type { MergeRecord } from "./merge.js";
@@ -44,6 +44,9 @@ export type ShownState = BatchState | "interrupted";
  * `zotero-gone` an item deleted in Zotero or in its bin whose source here was marked (or already was, the same
  * way: counted only); `zotero-gone-unmarked` one that has no source of its own here to mark (deleted here, or
  * only merged into another source); `zotero-back` a marked item seen again, its earlier availability restored.
+ * Task Z6: `zotero-conflict` an item whose only change was to put fields in conflict (changed in Zotero AND here):
+ * Zotero's value recorded as evidence beside the researcher's, the field marked, the review queue told; nothing of
+ * the researcher's replaced. (An item that also took in other changes is `updated`, with `conflictsQueued`.)
  */
 export type ItemOutcome =
   | "created"
@@ -57,7 +60,8 @@ export type ItemOutcome =
   | "incomplete"
   | "zotero-gone"
   | "zotero-gone-unmarked"
-  | "zotero-back";
+  | "zotero-back"
+  | "zotero-conflict";
 
 export interface JournalEntry {
   key: string;
@@ -89,6 +93,19 @@ export interface JournalEntry {
      * once more and dropped by their hash, after which the line has parts.
      */
     parts?: Record<string, { v: number; sha256?: string }>;
+    /**
+     * Zotero Web (Task Z6): the collections Zotero had the item in when this line was written, each as the list of
+     * its path's names, every name as a short hash (`collectionHash`; never the name). The next run adds only the
+     * memberships that are not here: those new in Zotero since. Absent in lines written before Z6 and in lines of
+     * other kinds: no membership is then new (none is added; the line written records them for the next run).
+     */
+    cols?: string[][];
+    /**
+     * Zotero Web (R236 f): beside `cols`, the Zotero collection key of every name along each path (opaque Zotero ids,
+     * like `externalKeys.zoteroKey`; sealed with the line in an encrypted project). A key seen again under another
+     * name is a collection renamed in Zotero. Absent when the adapter gave none.
+     */
+    colKeys?: string[][];
   };
   /** Zotero item keys this line's deletion recorded as deleted here (review skip/merge); undo takes them back (R74 I3). */
   tombstoned?: string[];
@@ -105,6 +122,19 @@ export interface JournalEntry {
    * tags or annotations), not only its availability: it is counted as back AND as updated.
    */
   contentUpdated?: true;
+  /**
+   * Task Z6: fields this line's change put in conflict (changed in Zotero and here, to different values), each listed
+   * in a pending capture-conflict review entry in the same change (R190, R193 b). Counted per item in `conflicts`.
+   */
+  conflictsQueued?: number;
+  /** R236 a: fields Zotero cleared that this line's change kept here (noted once). Counted per item in `clearedInZoteroKept`. */
+  clearedKept?: number;
+  /**
+   * Task Z6: collections renamed in Zotero, as far as this item shows it (one of its paths lost a name and gained
+   * another at the same place), that this batch made under the new name; the old one is kept. Each as the hashes of
+   * the new path (no name). Counted once per collection over the batch (`collectionsRenamed`).
+   */
+  renamedCollections?: string[];
 }
 
 /** A journal line's `files`, from whether each stored file is a link; undefined when none was stored. */
@@ -279,6 +309,37 @@ export function readParts(raw: unknown): Record<string, { v: number; sha256: str
   return any ? out : undefined;
 }
 
+const COL_HASH = /^[0-9a-f]{12}$/u;
+
+/** Task Z6: a collection name as a journal line keeps it: the first 12 hex of its SHA-256 (no name in the journal). */
+export function collectionHash(name: string): string {
+  return createHash("sha256").update(name, "utf8").digest("hex").slice(0, 12);
+}
+
+/** Task Z6: a journal line's `ext.cols` as it may be trusted (bounded lists of name hashes); undefined otherwise. */
+export function readCols(raw: unknown): string[][] | undefined {
+  if (!Array.isArray(raw) || raw.length > 256) return undefined;
+  const out: string[][] = [];
+  for (const p of raw) {
+    if (!Array.isArray(p) || p.length === 0 || p.length > 64 || !p.every((x) => typeof x === "string" && COL_HASH.test(x))) return undefined;
+    out.push([...(p as string[])]);
+  }
+  return out;
+}
+
+const COL_KEY = /^[A-Za-z0-9]{1,32}$/u;
+
+/** R236 f: a line's `ext.colKeys`, trusted only when it has exactly the shape of its `cols`; undefined otherwise. */
+export function readColKeys(raw: unknown, cols: string[][] | undefined): string[][] | undefined {
+  if (!cols || !Array.isArray(raw) || raw.length !== cols.length) return undefined;
+  const out: string[][] = [];
+  for (const [i, p] of raw.entries()) {
+    if (!Array.isArray(p) || p.length !== cols[i]!.length || !p.every((x) => typeof x === "string" && COL_KEY.test(x))) return undefined;
+    out.push([...(p as string[])]);
+  }
+  return out;
+}
+
 /** The newest journal line per key (a later review decision supersedes the run's outcome). */
 export function latestByKey(entries: JournalEntry[]): Map<string, JournalEntry> {
   const m = new Map<string, JournalEntry>();
@@ -309,9 +370,22 @@ export function countOutcomes(latest: Iterable<JournalEntry>): {
   backInZoteroUpdated: number;
   /** Items Zotero said are gone that have no source of their own here to mark (deleted here, merged only). */
   goneNotMarked: number;
+  /**
+   * Task Z6: ITEMS with at least one field changed in Zotero and here, now waiting for the researcher ("Changed in
+   * Zotero and here — waiting for you: N"). One that also took in other changes is counted in `updated` as well.
+   */
+  conflicts: number;
+  /** Task Z6: collections renamed in Zotero that arrived under their new name (the old one kept), each once. */
+  collectionsRenamed: number;
+  /** R236 a: ITEMS with a field Zotero cleared that was kept here ("Cleared in Zotero, kept here: N"). */
+  clearedInZoteroKept: number;
 } {
-  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, deletedHere: 0, failed: 0, items: 0, goneInZotero: 0, goneInZoteroBin: 0, goneAlready: 0, backInZotero: 0, backInZoteroUpdated: 0, goneNotMarked: 0 };
+  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, deletedHere: 0, failed: 0, items: 0, goneInZotero: 0, goneInZoteroBin: 0, goneAlready: 0, backInZotero: 0, backInZoteroUpdated: 0, goneNotMarked: 0, conflicts: 0, collectionsRenamed: 0, clearedInZoteroKept: 0 };
+  const renamed = new Set<string>();
   for (const e of latest) {
+    for (const h of e.renamedCollections ?? []) renamed.add(h);
+    if (e.conflictsQueued) c.conflicts++;
+    if (e.clearedKept) c.clearedInZoteroKept++;
     // Items gone from Zotero brought nothing in: counted apart, not as items.
     if (e.outcome === "zotero-gone") {
       if (e.merge?.availability) {
@@ -339,6 +413,8 @@ export function countOutcomes(latest: Iterable<JournalEntry>): {
     else if (e.outcome === "unchanged") c.unchanged++;
     else if (e.outcome === "deleted-here") c.deletedHere++;
     else if (e.outcome === "failed") c.failed++;
+    // "zotero-conflict": an item, counted in `conflicts` only (above).
   }
+  c.collectionsRenamed = renamed.size;
   return c;
 }

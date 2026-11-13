@@ -55,9 +55,15 @@ export type OfferLink = {
 };
 
 /** Task F5: why an entry could not go on (the sentences are `FIND_REASON_TEXT` in the shared package). */
-export type FindReasonCode = "not-allowed" | "switched-off" | "unreachable" | "locked" | "queue-full" | "budget";
+export type FindReasonCode = "not-allowed" | "no-legal-basis" | "switched-off" | "unreachable" | "locked" | "queue-full" | "budget" | "unexpected";
 
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
+
+/** How a work was matched (R237 M3): "find-match" with the rule's score when the app was sure; "find-chosen" when the researcher chose. */
+export type FindMatch = { method: "find-match" | "find-chosen"; confidence: number };
+
+/** The longest DOI a candidate, the queue and a record keep: one bound for F2, the runner and the store (R237 M2). */
+export const FIND_DOI_MAX = 300;
 
 export interface FindEntry {
   id: string;
@@ -76,6 +82,8 @@ export interface FindEntry {
   duplicateOf?: string;
   elsewhere?: true;
   reason?: FindReason;
+  /** How the work was matched, once it was; the record made later (after a duplicate question, or "here as well") says the same. */
+  match?: FindMatch;
   attempts: number;
   nextTryAt?: string;
   parentId?: string;
@@ -90,6 +98,25 @@ export const FIND_QUEUE_MAX = 500;
 export const FIND_LINE_MAX_BYTES = 65_536;
 /** The longest line a researcher can type. */
 export const FIND_TYPED_MAX = 500;
+
+/**
+ * Task F12's "Search sources" settings, as F4 needs them (F12 adds `copies`, `crossrefEmail` and `unpaywallEmail`
+ * with the free copies). `record` lists the services that find a work and its record, in the order asked; a source
+ * that is `on: false` is never asked. Settings can only narrow what a project's rules allow.
+ */
+export type RecordSearchSource = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
+export type SearchSettings = { record: Array<{ id: RecordSearchSource; on: boolean }> };
+
+/** The settings until the researcher changes them (F12 keeps them in `search-sources.json`): every source on but Elicit. */
+export const DEFAULT_SEARCH_SETTINGS: Readonly<SearchSettings> = Object.freeze({
+  record: Object.freeze([
+    Object.freeze({ id: "crossref" as const, on: true }),
+    Object.freeze({ id: "openalex" as const, on: true }),
+    Object.freeze({ id: "openlibrary" as const, on: true }),
+    Object.freeze({ id: "loc" as const, on: true }),
+    Object.freeze({ id: "elicit" as const, on: false }),
+  ]) as SearchSettings["record"],
+});
 
 export const FIND_QUEUE_OPS = {
   add: "project.find.add",

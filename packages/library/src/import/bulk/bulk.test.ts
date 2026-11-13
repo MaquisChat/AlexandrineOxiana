@@ -1561,6 +1561,26 @@ describe("context hooks and gone items (Z2)", () => {
     version: { id: `lib/${key}`, version },
   });
 
+  it("another adapter is unchanged by Z6: a field changed on both sides is kept and reported, nothing is queued, and an update adds no collection", async () => {
+    const p = await project();
+    const withFolder = (title: string, version: string, folder: string[]): ScanItem => ({ ...ref("A", title, version), referenceSource: { kind: "refman", ref: "reference" }, folderPath: folder });
+    await run(p, plain([withFolder("Alpha", "v1", ["Shelf"])]));
+    const id = repo.listSourceIds(p.id)[0]!;
+    await repo.updateSource(p.id, id, { title: { variants: [{ lang: "en", kind: "original", value: "Alpha, as I call it" }] } });
+    const { result, handle: h2 } = await run(p, plain([withFolder("Alpha revised", "v2", ["Another shelf"])]));
+    const batchId = h2.batchId;
+    expect(result.counts).toMatchObject({ conflicts: 0, failed: 0 });
+    const sf = await repo.getSource(p.id, id);
+    expect(primary(sf.source.title)).toBe("Alpha, as I call it");
+    expect(sf.verification["/title"]?.status).not.toBe("conflict");
+    expect(sf.source.collectionIds).toHaveLength(1);
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    expect((await projectReviewEntries(repo, p.id)).filter((e) => e.kind === "verification")).toEqual([]);
+    expect((await bulk.batchReport(p.id, batchId)).keptFields).toEqual([{ item: "A", fields: ["/title"] }]);
+    const lines = (await readFile(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.every((l) => l.conflictsQueued === undefined && (l.ext as { cols?: unknown } | undefined)?.cols === undefined)).toBe(true);
+  });
+
   it("an adapter that knows nothing of skip and knownIds runs unchanged", async () => {
     const p = await project();
     const seen: Array<Record<string, unknown>> = [];
@@ -1820,6 +1840,32 @@ processing:
     expect(journal.some((e: { notes?: string[] }) => e.notes?.includes(ZOTERO_WEB_FILE_NOTES.failed))).toBe(true);
     expect(fileRequests().filter((f) => f.includes(att))).toHaveLength(1);
     expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+  });
+
+  it("an update adds a new Zotero collection membership and removes none (Z6)", async () => {
+    const p = await project(ZGOV);
+    const a = z.addCollection(U, "Fieldwork");
+    const b = z.addCollection(U, "Theory");
+    const key = z.addItem(U, { itemType: "journalArticle", title: "In two collections", collections: [a, b] });
+    await (await startZoteroWebImport(deps(), p.id, web())).done;
+    const id = repo.listSourceIds(p.id)[0]!;
+    const nameOf = async (ids: string[]) => {
+      const { collections } = await projectCollectionsAndTags(repo, p.id);
+      return ids.map((c) => collections.find((x) => x.id === c)!.name).sort();
+    };
+    expect(await nameOf((await repo.getSource(p.id, id)).source.collectionIds)).toEqual(["Fieldwork", "Theory"]);
+    // In Zotero: out of "Theory", into a new "Methods".
+    const c = z.addCollection(U, "Methods");
+    z.editItem(U, key, { collections: [a, c] });
+    const r = await (await startZoteroWebImport(deps(), p.id, web())).done;
+    expect(r.counts).toMatchObject({ updated: 1, failed: 0 });
+    expect(await nameOf((await repo.getSource(p.id, id)).source.collectionIds)).toEqual(["Fieldwork", "Methods", "Theory"]);
+    // The batch made "Methods" and the membership; its undo takes both away again and keeps the others.
+    const rec = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "batch.json"), "utf8")) as { id: string };
+    const u = await bulk.undoBatch(p.id, rec.id);
+    expect(u.reverted).toMatchObject({ updated: 1 });
+    expect(await nameOf((await repo.getSource(p.id, id)).source.collectionIds)).toEqual(["Fieldwork", "Theory"]);
+    expect((await projectCollectionsAndTags(repo, p.id)).collections.map((x) => x.name).sort()).toEqual(["Fieldwork", "Theory"]);
   });
 
   it("the service-free resume of another kind is resumeBatch's", async () => {
