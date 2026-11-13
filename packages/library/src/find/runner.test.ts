@@ -87,22 +87,27 @@ class FakeTimers {
 /** A dispatcher that holds requests for a text until released (a service that answers late), then asks the mock. */
 class Gated extends Dispatcher {
   private readonly holds = new Map<string, Promise<void>>();
+  /** Every request as it was sent (before any hold). */
+  readonly sent: Array<{ service: "crossref" | "openalex"; text: string }> = [];
   constructor(private readonly inner: MockAgent) {
     super();
   }
-  hold(text: string): () => void {
+  /** Holds the requests for `text` (to one service, or to both) until the returned function is called. */
+  hold(text: string, service?: "crossref" | "openalex"): () => void {
     let release!: () => void;
-    this.holds.set(
-      text,
-      new Promise<void>((r) => (release = r)),
-    );
+    const gate = new Promise<void>((r) => (release = r));
+    const keys = service ? [`${service}|${text}`] : [`crossref|${text}`, `openalex|${text}`];
+    for (const k of keys) this.holds.set(k, gate);
     return () => {
       release();
-      this.holds.delete(text);
+      for (const k of keys) this.holds.delete(k);
     };
   }
   override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
-    const gate = this.holds.get(textOf(String(opts.path)) ?? "");
+    const service = String(opts.origin).includes("crossref") ? "crossref" : "openalex";
+    const text = textOf(String(opts.path)) ?? "";
+    this.sent.push({ service, text });
+    const gate = this.holds.get(`${service}|${text}`);
     if (!gate) return this.inner.dispatch(opts, handler);
     void gate.then(() => this.inner.dispatch(opts, handler));
     return true;
@@ -318,6 +323,8 @@ describe("a typed line becomes a record", () => {
     expect(added).toHaveLength(1);
     expect(added[0]!.state).toBe("looking-up");
     await settled(p, added[0]!.id);
+    // The event is sent once the change is committed (its audit included).
+    await until(() => changes.some((c) => c.entryId === added[0]!.id && c.state === "record-complete"), "the event");
     const e = (await entryOf(p, added[0]!.id))!;
     expect(e.state).toBe("record-complete");
     const [sf, ...more] = await sourcesOf(p);
@@ -359,7 +366,7 @@ describe("a typed line becomes a record", () => {
     await expect(r.add(p.id, ["ok line", "y"])).rejects.toBeInstanceOf(InvalidInputError);
     expect((await queue(p)).size).toBe(2);
     // The error never echoes what was typed.
-    const err = await r.add(p.id, ["SECRETWORDqz", "y"]).catch((e: unknown) => e as Error);
+    const err = (await r.add(p.id, ["SECRETWORDqz", "y"]).catch((e: unknown) => e)) as Error;
     expect(String(err.message)).not.toContain("SECRETWORDqz");
   });
 
@@ -447,7 +454,7 @@ describe("a typed line becomes a record", () => {
     const r = runner();
     const { added } = await r.add(p.id, [LINE], c.id);
     expect(added[0]!.collectionId).toBe(c.id);
-    await until(() => asked.length > 0 || notes.length > 0, "the lookup to start");
+    await until(() => gated.sent.length > 0, "the lookup to start");
     await repo.deleteCollection(p.id, c.id);
     release();
     await settled(p, added[0]!.id);
@@ -584,10 +591,11 @@ describe("one work, one source: under every race", () => {
     know(LINE, cr(ZORBLATT));
     know(LINE_2, cr(ZORBLATT));
     const p = await project();
-    const release = gated.hold(parseReference(LINE)!.text);
+    // OpenAlex holds the first line's answer (Crossref takes one request at a time, so it is not the one held).
+    const release = gated.hold(parseReference(LINE)!.text, "openalex");
     const r = runner();
     const first = await r.add(p.id, [LINE]);
-    await until(() => true);
+    await until(() => gated.sent.some((x) => x.service === "openalex"), "the first line's lookup");
     const second = await r.add(p.id, [LINE_2]);
     await settled(p, second.added[0]!.id);
     release();
@@ -604,7 +612,11 @@ describe("crashes are healed by adoption, never by a second source", () => {
     runners = [];
     handle.close();
     await lib.close();
+    // The lookup cache goes too (a new process has a new client), so that "no lookup" below means no request was made.
+    await rm(join(lib.root, ".cache"), { recursive: true, force: true });
     lib = await openLibrary(lib.root, mkDeps());
+    await agent.close();
+    mockServices();
     handle = new IndexHandle(lib.root);
     repo = await repoFor();
     if (encrypted) await repo.unlockProject(p.id, "pw");
@@ -647,10 +659,10 @@ describe("crashes are healed by adoption, never by a second source", () => {
       expect(made).toHaveLength(1);
       expect(made[0]!.source.provenance.externalKeys?.[FIND_ENTRY_KEY]).toBe(added[0]!.id);
       expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
-      const askedBefore = asked.length;
+      const sentBefore = gated.sent.length;
       runner().resume(p.id);
       await settled(p, added[0]!.id);
-      expect(asked.length).toBe(askedBefore);
+      expect(gated.sent.length).toBe(sentBefore);
       expect(await sourcesOf(p)).toHaveLength(1);
       expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "record-complete", sourceId: made[0]!.source.id });
     });
@@ -669,10 +681,10 @@ describe("crashes are healed by adoption, never by a second source", () => {
       const made = await sourcesOf(p);
       expect(made).toHaveLength(1);
       expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "record-complete", sourceId: made[0]!.source.id });
-      const askedBefore = asked.length;
+      const sentBefore = gated.sent.length;
       runner().resume(p.id);
       await new Promise((res) => setTimeout(res, 100));
-      expect(asked.length).toBe(askedBefore);
+      expect(gated.sent.length).toBe(sentBefore);
       expect(await sourcesOf(p)).toHaveLength(1);
     });
   }
@@ -790,12 +802,33 @@ describe("the rules decide, and fail closed; settings only narrow", () => {
     const release = gated.hold(parseReference(LINE)!.text);
     const r = runner();
     const { added } = await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup to be sent");
     const { sha256 } = await repo.getGovernance(p.id);
     await repo.setGovernance(p.id, GOV("acquireMethods: [free_copy]"), { baseSha256: sha256 });
     release();
     await settled(p, added[0]!.id);
     expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "failed", reason: { code: "not-allowed", by: "rules" } });
     expect(await sourcesOf(p)).toEqual([]);
+    // The creation's own governed check refused it, and the refusal is audited (as the capture it would have been).
+    const audit = await auditText(p);
+    expect(audit).toMatch(/"action":"capture"[^\n]*"result":"deny"/u);
+    expect(audit).not.toMatch(/Zorblatt|Quillfeather/u);
+  });
+
+  it("rules that cannot be read refuse: nothing is asked and nothing created", async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    const id = newId();
+    await appendFindEntries(coreOf(), p.id, [{ id, projectId: p.id, typed: LINE, state: "looking-up", createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), attempts: 0 }], "add");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(lib.root, p.folder, "governance.yaml"), "acquireMethods: [downloader]\n: : not yaml\n");
+    const r = runner();
+    r.resume(p.id);
+    await until(() => notes.length > 0, "the refusal");
+    await new Promise((res) => setTimeout(res, 50));
+    expect(gated.sent).toEqual([]);
+    expect(await sourcesOf(p)).toEqual([]);
+    expect((await entryOf(p, id))!.state).toBe("looking-up");
   });
 
   it("a lookup service the rules refuse is not asked", async () => {
@@ -913,6 +946,7 @@ describe("stopping is immediate and clean", () => {
     const release = gated.hold(parseReference(LINE)!.text);
     const r = runner();
     const { added } = await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup to be sent");
     const queueBytes = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"));
     const auditBefore = await auditText(p);
     r.stop(p.id);
@@ -937,10 +971,11 @@ describe("stopping is immediate and clean", () => {
     const release = gated.hold(parseReference(LINE)!.text);
     const r = runner();
     await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup to be sent");
     const queueBytes = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"));
     r.stop(p.id);
     release();
-    await until(() => asked.length >= 1, "the late answer");
+    await until(() => asked.length >= 2, "the late answer");
     await new Promise((res) => setTimeout(res, 100));
     expect(await readFile(join(lib.root, p.folder, "find", "queue.jsonl"))).toEqual(queueBytes);
     expect(await sourcesOf(p)).toEqual([]);
@@ -952,10 +987,10 @@ describe("stopping is immediate and clean", () => {
     const p = await project();
     const r = runner();
     const { added } = await r.add(p.id, [LINE]);
-    await until(async () => (await entryOf(p, added[0]!.id))?.attempts === 1, "a retry timer");
-    expect(timers.pending.size).toBe(1);
+    await until(async () => (await entryOf(p, added[0]!.id))?.attempts === 1 && timers.pending.size === 1, "a retry timer");
     const release = gated.hold(parseReference(LINE_2)!.text);
     await r.add(p.id, [LINE_2]);
+    await until(() => gated.sent.some((x) => x.text === parseReference(LINE_2)!.text), "the second lookup to be sent");
     const t0 = Date.now();
     await r.stopAll();
     expect(Date.now() - t0).toBeLessThan(2_000);
