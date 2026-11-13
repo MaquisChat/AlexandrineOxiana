@@ -1253,8 +1253,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const waiting = [...q.values()].filter((e) => e.state === "looking-up");
       // R247 (e): a record can be made for an entry in other states too (a choose, a duplicate answer, "add it here as
       // well"); a lock or a crash between its creation and the entry's line leaves the entry as it was, without a
-      // `sourceId`. Such an entry is healed here, whatever its state.
-      const unmade = [...q.values()].filter((e) => e.state !== "looking-up" && e.state !== "record-complete" && !e.sourceId);
+      // `sourceId`. Only the states a record is made from are candidates ("choose", "maybe-duplicate", and "already"
+      // with `elsewhere`): "not-found", "failed" and "already" here neither are nor move the scan's bound back (m1).
+      const madeFrom = (e: FindEntry) => e.state === "choose" || e.state === "maybe-duplicate" || (e.state === "already" && e.elsewhere === true);
+      const unmade = [...q.values()].filter((e) => madeFrom(e) && !e.sourceId);
       if (!waiting.length && !unmade.length) return;
       // Sources made for an entry whose line was never written (a crash or a stop in between): read once here,
       // outside any store turn, never per entry. Ids are UUIDv7, ordered by the time they were made, and such a

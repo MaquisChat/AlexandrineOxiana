@@ -313,7 +313,12 @@ export class HttpClient {
         await fsp.mkdir(parent, { mode: 0o700 }).catch((err: NodeJS.ErrnoException) => {
           if (err.code !== "EEXIST") throw err;
         });
-      } else await fsp.mkdir(parent, { recursive: true, mode: 0o700 });
+      } else {
+        // Reached only by a client made for a folder that did not exist yet: in practice the library's own tests (and
+        // tools that make a client before its folder). The service always makes its client for an open library, whose
+        // folder exists, so it takes the branch above (R247 c, m4).
+        await fsp.mkdir(parent, { recursive: true, mode: 0o700 });
+      }
       if (!(await this.realDir(parent))) return;
       await fsp.mkdir(this.cacheDir, { mode: 0o700 }).catch((err: NodeJS.ErrnoException) => {
         if (err.code !== "EEXIST") throw err;

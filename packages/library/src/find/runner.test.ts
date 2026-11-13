@@ -1608,6 +1608,27 @@ describe("last round", () => {
   });
 });
 
+describe("last round (m1): the healing scan at resume reads only what it must", () => {
+  it("old Not found, Failed and Already (not elsewhere) entries do not make resume read older source records", async () => {
+    const p = await project();
+    const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+    const stale = (state: FindState, extra: Partial<FindEntry> = {}): FindEntry => ({ id: newId(), projectId: p.id, typed: LINE, state, createdAt: hoursAgo(5), updatedAt: hoursAgo(4), attempts: 0, ...extra });
+    await appendFindEntries(coreOf(), p.id, [stale("not-found"), stale("failed", { reason: { code: "unreachable" } }), stale("already", { duplicateOf: newId() })], "add");
+    // A source made now, before the one waiting entry (made an hour from now): it cannot have been made for it.
+    await repo.createSource(p.id, draftOf({ ...ZORBLATT, doi: undefined }), [], { provenance: plainProvenance() });
+    const [older] = await sourcesOf(p);
+    const later = new Date(Date.now() + 3_600_000).toISOString();
+    await appendFindEntries(coreOf(), p.id, [{ id: newId(), projectId: p.id, typed: LINE, state: "looking-up", createdAt: later, updatedAt: later, attempts: 0 }], "add");
+    const read = vi.spyOn(repo, "getSourceRecord");
+    settings = { record: DEFAULT_SEARCH_SETTINGS.record.map((x) => ({ ...x, on: false })) };
+    const r = runner();
+    r.resume(p.id);
+    await until(async () => [...(await queue(p)).values()].some((e) => e.state === "failed" && e.createdAt === later), "the waiting entry to be worked on");
+    expect(read.mock.calls.map((c) => c[1])).not.toContain(older!.source.id);
+    read.mockRestore();
+  });
+});
+
 describe("R245: nothing of the runner writes after the library's lock is released", () => {
   const fileOf = (p: Project) => join(lib.root, p.folder, "find", "queue.jsonl");
   const bytesOf = (p: Project) => readFile(fileOf(p)).catch(() => Buffer.alloc(0));
@@ -1685,15 +1706,23 @@ describe("R245: nothing of the runner writes after the library's lock is release
 
   it("an act inside its turn when stopAll is called: stopAll settles after it, within its bound", async () => {
     const p = await project();
-    const r = runner();
+    const order: string[] = [];
+    let watched = "";
+    // The act's own line, written inside its turn, is told by onChange (m3: the order is asserted).
+    const r = runner({
+      onChange: (e) => {
+        changes.push(e);
+        if (e.entryId === watched && e.state === "record-complete") order.push("act's line written");
+      },
+    });
     const { choose } = await twoEntries(r, p);
+    watched = choose.id;
     let release!: () => void;
     let entered = false;
     runnerSeams.inAct = async () => {
       entered = true;
       await new Promise<void>((res) => (release = res));
     };
-    const order: string[] = [];
     const act = r.choose(p.id, choose.id, choose.candidates![0]!.id).then(
       () => order.push("act done"),
       () => order.push("act refused"),
@@ -1706,7 +1735,10 @@ describe("R245: nothing of the runner writes after the library's lock is release
     release();
     await Promise.all([act, stopping]);
     expect(Date.now() - t0).toBeLessThan(FIND_STOP_SETTLE_MS);
-    expect(order.sort()).toEqual(["act done", "stopAll settled"]);
+    // The act finished (its line written) before stopAll settled.
+    expect(order.indexOf("act's line written")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("act's line written")).toBeLessThan(order.indexOf("stopAll settled"));
+    expect(order).toContain("act done");
     // Whatever the act did, it did before stopAll settled: nothing changes afterwards.
     const after = await bytesOf(p);
     await new Promise((res) => setTimeout(res, 50));
