@@ -63,6 +63,7 @@ import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
+import { ZoteroSyncHolder } from "./routes/zotero-sync.js";
 import { Transcriptions } from "./transcriptions.js";
 
 /** A running media worker, shared by every library the service opens. */
@@ -224,6 +225,8 @@ export class ServiceState {
   readonly media = new MediaTickets(() => this.opts.now().getTime());
   /** Transcriptions as jobs (Task 62): live state over the projects' job journals. */
   readonly transcriptions = new Transcriptions(this);
+  /** Zotero account sync (Task Z8): the one run in progress, its abort and the back-off; stopped (with its record) before batches are suspended at a close or move. */
+  readonly zoteroSync = new ZoteroSyncHolder();
   private worker: ServiceWorker | undefined;
   private workerStarting: Promise<ServiceWorker> | undefined;
   private readonly tasks = new Set<Promise<unknown>>();
@@ -949,6 +952,7 @@ export class ServiceState {
     this.media.revokeAll();
     // An index rebuild stops between sources (the library at its new place checks its index again).
     await this.stopIndexRebuild(s);
+    await this.zoteroSync.stop("app-closed");
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
     if (!(await this.drainWork(ms))) {
@@ -1050,6 +1054,8 @@ export class ServiceState {
     // A live transcription is resumable: abandoned at once rather than after the grace period (M7).
     for (const w of stoppable) if (w.kind === "transcription") w.ctl.interrupt?.();
     await this.stopIndexRebuild(s);
+    // A Zotero sync stops first, with its record, its batch suspended (Task Z8): nothing of it is written after the lock goes.
+    await this.zoteroSync.stop("app-closed");
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).
     const { stuck } = await this.suspendBatches(s).catch(() => ({ paused: [], stuck: [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b })) }));

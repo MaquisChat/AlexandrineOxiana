@@ -8,15 +8,19 @@ import type { FastifyInstance } from "fastify";
 import type { ImportOptionsInput } from "@ao/core";
 import {
   adapterFor,
+  pauseLink,
+  readZoteroSyncHistory,
   researcherName,
   researcherNameOk,
   resumeZoteroWebImport,
   startZoteroWebImport,
   zoteroWebAdapter,
   zoteroWebSince,
+  zoteroSyncRunning,
   proxyQueueFor,
   type ImportSourceAdapter,
 } from "@ao/library";
+import { ZOTERO_SYNC_SENTENCES, type ZoteroSyncUndoNote } from "@ao/shared";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { ServiceState } from "../state.js";
 import { registerZotero } from "./zotero.js";
@@ -89,6 +93,8 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const spec = adapterSpec(optObj(b, "adapter"));
     const options = (optObj(b, "options") ?? {}) as ImportOptionsInput;
+    // A sync of the same Zotero library and a manual import never run together (Task Z8, A10).
+    if (spec.web && zoteroSyncRunning(s.lib.id, `${spec.libraryType}:${spec.libraryId}`)) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.importRunning);
     const h = spec.web
       ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
       : await s.bulk.startBatch(projectId, spec.adapter, options);
@@ -118,6 +124,8 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
       const shown = listed?.state;
       if (action !== "resume") throw new ApiError(409, "CONFLICT", "This import is not running.", shown);
       if (shown === "finished" || shown === "undone") throw new ApiError(409, "CONFLICT", "This import has already finished.", shown);
+      // Not while a sync runs (the batch list does not say which Zotero library a batch is of: none is resumed by hand meanwhile; Z8).
+      if (listed?.kind === "zotero-web" && state.zoteroSync.running) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.importRunning);
       // A Zotero Web batch resumes with the version it started from and records the new one when done (Z2).
       const h =
         listed?.kind === "zotero-web"
@@ -135,7 +143,18 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const r = await s.bulk.undoBatch(projectId, batchId);
     s.batches.delete(batchId);
     state.publishState();
-    return r;
+    // An undo of a sync's batch pauses its link in the same request, so the next sync does not at once bring back what
+    // was undone (R206 4, R242 b). The sync's batch is known by its record in this computer's history (the batch list
+    // does not carry its origin).
+    const run = (await readZoteroSyncHistory(state.deps.appConfigDir, s.lib.id).catch(() => [])).find((x) => x.batchId === batchId && x.projectId === projectId);
+    if (!run) return r;
+    let note: ZoteroSyncUndoNote = { paused: true, message: ZOTERO_SYNC_SENTENCES.undonePaused };
+    try {
+      await pauseLink(state.deps.appConfigDir, s.lib.id, run.ref, "undone");
+    } catch {
+      note = { paused: false, message: ZOTERO_SYNC_SENTENCES.undoNotPaused };
+    }
+    return { ...r, zoteroSync: note };
   });
 
   app.get("/imports/:batchId/report", async (req) => {
