@@ -1,6 +1,6 @@
 # Find and acquire — design
 
-Status: draft for the owner's approval (2026-11-13). Nothing here is built.
+Status: draft for the owner's approval (2026-11-13), revised after a builder's reading of it. Nothing here is built.
 Marked **(owner)** where the owner said it; everything else is the coordinator's proposal and can be changed.
 
 ## What it is, and why
@@ -63,7 +63,9 @@ Each entry shows, in words (never by colour or symbol alone): what was typed; wh
 
 **Choosing.** "Choose" lists the candidate works with authors, year, kind, where published and an identifier, the likeliest first, with "None of these". "Choose the person" lists people with their affiliation and a few titles. "Choose works" lists that person's works, newest first, with a filter by year and kind and a text filter; the researcher ticks any number and presses "Add the chosen works".
 
-**Get through my library.** For a paywalled entry the researcher presses this; a separate window opens the item through their library. They sign in on their institution's own page (two-step codes included). When the publisher's page shows, the app looks for the PDF where publishers mark it in the standard way and fetches it in that same window; where there is no such mark, a line at the top of the window says "Open the PDF on this page and the app will add it", and the app takes the download the researcher starts. The window is used for one entry at a time and closes when the file has arrived or the researcher closes it.
+**Get through my library.** For a paywalled entry the researcher presses this; a separate window opens the item through their library. They sign in on their institution's own page. When the publisher's page shows, the app looks for the PDF where publishers mark it in the standard way and goes to it; where there is no such mark, a line at the top of the window says "Open the PDF on this page and the app will add it". Either way, when the window arrives at a PDF the app fetches that file with the window's own signed-in session and adds it. The window is used for one entry at a time; the researcher stays signed in from one entry to the next.
+
+**What sign-in works in that window.** A password with a code or an approval on the phone works. A passkey or a security key does not (the app would need a permission from Apple that an unsigned build does not have), and Google's sign-in refuses to run inside another app's window. For an institution that signs in that way, the fallback below is the way.
 
 **The fallback.** Where an institution's sign-in page refuses to work inside the app's window, the entry offers "Open in my browser instead". The item opens through the library in the researcher's own browser, where they are already signed in; the app's browser extension shows "Add this PDF to Find and acquire" on that page and hands the file to the waiting entry.
 
@@ -85,11 +87,17 @@ The rest builds on what exists:
 
 - **Looking up** reuses the library's lookup machinery (`packages/library/src/lookup/`: Crossref, OpenAlex, Open Library, Library of Congress by title and author, with recorded fixtures for tests), which today is used only inside imports. It gains: a search by free text that returns ranked candidates with a confidence; people by name and a person's works (OpenAlex); and Elicit's paper search as one more source.
 - **The queue** is library data in the project (like the capture queue): governed, audited (kinds, counts and ids only — never the typed text, a title or a name), crash-safe, resumed at start. Lookups and free-copy fetches run by themselves, a few at a time, politely (each service's rate rules honoured); library fetches never run by themselves.
-- **A source is created when the record is complete**, without a file; the file is attached to that same source when it arrives. Duplicates are found with the existing rules (same DOI or ISBN: certain; a close title and author: the researcher is asked).
+- **A source is created when the record is complete**, without a file; the file is attached to that same source when it arrives. Duplicates are found with the existing rules (same DOI or ISBN: certain; a close title and author: the researcher is asked), **within the project the entry is for only** — what is in another project, an encrypted one above all, is never revealed by this check (the coordinator's call).
 - **Free copies** are fetched by the service from a fixed list of hosts per source, with size and type limits, and only as PDF or EPUB.
-- **The sign-in window** is a second window of the desktop shell that shows remote pages and has no access to the app's own commands (the launch check must prove it). Its cookies are kept apart from everything else and are dropped when the app quits, unless the researcher turns on "Stay signed in to my library". The file it downloads is handed from the shell to the service the way a chosen folder is today (a single-use grant on the existing pipe), never through the page.
+- **The sign-in window** is a second window of the desktop shell that shows remote pages and has no access to the app's own commands (no capability names it; the launch check must prove it). Corrected after the builder's reading, because the first draft could not work in macOS's web view:
+  - *Catching the PDF.* The web view shows a PDF inside the window instead of downloading it, so there is no download to catch. Instead the shell watches where the window goes; when it arrives at a PDF, the shell itself fetches that address with the window's cookies, writes the file where only it can, and hands it to the service the way a chosen folder is handed over today (a single-use grant on the existing pipe) — never through the page.
+  - *Finding the PDF.* The shell cannot ask a remote page a question and get an answer. A small script placed in the window at start looks for the publisher's standard mark and, if it is there, goes to it; the shell then sees the window arrive at the PDF. Whatever a page does is untrusted: the check of the file against the record is what decides.
+  - *Staying signed in between entries.* The window has its own store for cookies, apart from everything else and kept from one entry to the next; it is emptied when the app quits and again at the next start (in case the app did not quit cleanly), unless the researcher turns on "Stay signed in to my library".
 - **The extension fallback** adds one action to the existing extension, using its existing pairing and token: ask the app which entries are waiting, and send a PDF for one of them.
-- **Provenance** of each file records how it was got (a free copy from which service; the library; the browser), the publisher's address without any sign-in parts, the time, and the tool — like every other capture. Two new capture methods are added to the governance model so that a project can allow or forbid each: free copies, and the library.
+- **Provenance** of each file records how it was got (a free copy from which service; the library; the browser), the publisher's address without any sign-in parts, the time, and the tool — like every other capture; the model already tells a file got in a signed-in session from a public one. Two new capture methods are added to the governance model so that a project can allow or forbid each: free copies, and the library.
+- **Settings narrow, governance decides** (the coordinator's call): "Search sources" can only switch off what the project's governance allows, never switch on what it forbids; a refusal on an entry says which of the two refused.
+- **Keys** (Elicit's, and any other a source needs) are kept by the existing secrets store in the Mac's keychain, one more named secret beside the Zotero key.
+- **A file that does not match its record** goes to the existing review queue.
 - **Tests never reach the network**: stand-ins for each service; the sign-in window is exercised against a local stand-in for a library and a publisher; what only a real institution can show is listed for the owner.
 
 ## Constraints that bind the build
@@ -110,8 +118,12 @@ The rest builds on what exists:
 
 ## Open questions for the owner
 
-1. **Which institution's library** will you use (so that the first test of the sign-in window is against the real thing)? Do you know its "proxy" address, or shall the app work it out from a link you paste?
-2. **Staying signed in:** drop the library session when the app quits (the proposal), or keep it between sessions by default?
-3. **Unpaywall** finds the most free copies but requires an e-mail address with every request. Are you content to type one into its setting, or should it stay off?
-4. **Where entries land:** the box asks for a project (and optionally a collection) once and remembers it — or should each entry ask?
-5. **Elicit:** which plan is your Elicit account on (its API needs Pro or higher)?
+1. **What projects allow by default.** Each project has governance rules that list which ways of capturing are allowed, and existing projects allow neither of the two new ways until someone says so. Proposal: *free legal copies* are allowed by default under every profile (IRB, GDPR, HIPAA, DMP), because the only thing sent is a work's identifier or title — the same kind of thing the existing lookups already send — and the services asked (arXiv, Europe PMC, Semantic Scholar, the Directory of Open Access Books, the Internet Archive, Unpaywall) are treated as public bibliographic services, like Crossref and OpenAlex today; *through my library* is allowed by default too (it is what the researcher would do in a browser); *Elicit* stays off in every project until the project's rules name it as an allowed service. Each can be switched off per project. Is that right, or should a sensitive project start with them off?
+2. **How you sign in to your institution's library:** a password with a code or a phone approval (works in the app's window), or a passkey, a security key or a Google sign-in (does not; the browser fallback would then be your main way)?
+3. **Which institution's library** will you use, so that the first real test is against it? Do you know its "proxy" address, or shall the app work it out from a link you paste?
+4. **Elicit:** which plan is your Elicit account on (its API needs Pro or higher)?
+
+Assumed unless you say otherwise:
+- The library session is dropped when the app quits; "Stay signed in to my library" is a switch, off at first.
+- Unpaywall stays off until you type an e-mail address into its setting (it requires one with every request).
+- The box asks for a project (and optionally a collection) once and remembers it.
