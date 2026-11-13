@@ -296,3 +296,8 @@
 - `matchAnnotations(list: readonly Pick<Annotation, "id" | "quote" | "body">[], words: string): string[]` — ids in the order of the list given, so sort first.
 - `pdfSortIndex(...)` and `SORT_INDEX_PATTERN` (building and checking a sort index), the `PdfAnchor` type, `highlightColourOf` and the named colour set as the R1 section gives them.
 - The word and CJK splitting used by both the search index and the matcher lives in `packages/core/src/annotations/words.ts` (`latinWords`, `cjkRuns`); `packages/library/src/index/text.ts` imports it. A task that needs to split words uses these and writes no rule of its own.
+
+**A4 — after the re-review of R1 (2026-11-13).**
+- `sortAnnotations` and `matchAnnotations` are always given the annotations of ONE document (one asset): a source can hold several PDFs, and page 3 of one is not page 3 of another. R8, R9 and R12 filter by the open asset first.
+- R12: matching a search hit's words against a document's annotations can take over a second at the 16 MB cap; it runs after the reader has drawn, never on the path that opens the document, and the list says "Looking for the words…" until it is done.
+- Known and accepted for now: a word broken across a line end with a hyphen in the PDF's text ("self-" / "evident") can be found by the search index and missed by the matcher; the reader then opens on the whole list with the plan's stated sentence.
