@@ -25,7 +25,10 @@
  * (as anchors store it) and that page's viewport, for each drawn page.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { TextLayer, type PageViewport, type PDFPageProxy, type RenderTask, type TextContent } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { TextLayer, type PageViewport, type PDFPageProxy, type RenderTask } from "pdfjs-dist/legacy/build/pdf.mjs";
+
+/** A page's text as pdf.js gives it. */
+type TextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>;
 import type { PdfHandle } from "./pdfjs";
 import "./Reader.css";
 
@@ -356,7 +359,7 @@ export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, r
 
   if (layout.tops.length === 0) {
     return (
-      <div className="ao-reader-scroll" ref={scroller}>
+      <div className="ao-reader-scroll" ref={scroller} tabIndex={0} role="group" aria-label="Pages">
         <p role="status" className="ao-reader-loading">
           Opening the pages…
         </p>

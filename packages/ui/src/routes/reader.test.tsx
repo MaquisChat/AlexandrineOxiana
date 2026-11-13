@@ -14,15 +14,10 @@ import { CURRENT_RW, LIBRARIES, server, serviceError, SOURCE_FILE, testClient, u
 import { isReaderPath, readerHref } from "./reader";
 
 // The screen itself is tested in screens/Reader.test.tsx; here only which document it is given.
-vi.mock("../screens/Reader", () => ({
+vi.mock("../screens/Reader", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../screens/Reader")>()),
   ReaderScreen: (p: { projectId: string; sourceId: string; assetId?: string; annotationId?: string; readOnly: boolean }) => (
     <p data-testid="reader-screen">{`${p.projectId}|${p.sourceId}|${p.assetId ?? "-"}|${p.annotationId ?? "-"}|${p.readOnly ? "read-only" : "read-write"}`}</p>
-  ),
-  ReaderStateView: ({ heading, sentence }: { heading: string; sentence: string }) => (
-    <section>
-      <h2>{heading}</h2>
-      <p>{sentence}</p>
-    </section>
   ),
 }));
 

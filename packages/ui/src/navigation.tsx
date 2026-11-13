@@ -23,6 +23,7 @@ export const PATHS = {
   moveLibrary: "/move-library",
   missingFiles: "/missing-files",
   transcript: "/transcript",
+  reader: "/reader",
   capture: "/capture",
   about: "/about",
 } as const;
