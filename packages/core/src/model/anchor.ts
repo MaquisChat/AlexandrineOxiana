@@ -18,7 +18,19 @@ const AnchorShape = z.discriminatedUnion("kind", [
     suffix: z.string().default(""),
     lang: z.string().optional(),
   }),
-  z.object({ kind: z.literal("pdf"), ...base, page: z.number().int().min(1), rects: z.array(Rect).min(1) }),
+  z.object({
+    kind: z.literal("pdf"),
+    ...base,
+    page: z.number().int().min(1),
+    /**
+     * Rectangles in PDF user space, in points: origin at the bottom-left of the page, y up, in the
+     * page's unrotated orientation (its /Rotate is not applied), as Zotero stores them (x, y the
+     * bottom-left corner; w, h the size).
+     */
+    rects: z.array(Rect).min(1),
+    /** Zotero's sort index "PPPPP|OOOOOO|TTTTT" (page from 0, character offset, distance from page top); absent on annotations made here. */
+    sortIndex: z.string().regex(/^\d{5}\|\d{6}\|\d{5}$/).optional(),
+  }),
   z.object({ kind: z.literal("epub-cfi"), ...base, cfi: z.string().min(1), quote: z.string().optional() }),
   z.object({
     kind: z.literal("time-range"),
@@ -46,3 +58,4 @@ export const Anchor = AnchorShape.superRefine((a, ctx) => {
   }
 });
 export type Anchor = z.infer<typeof Anchor>;
+export type PdfAnchor = Extract<Anchor, { kind: "pdf" }>;

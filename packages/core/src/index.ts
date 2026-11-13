@@ -6,6 +6,18 @@ export { isId, newId, shortId } from "./ids.js";
 export * from "./model/index.js";
 
 export {
+  HIGHLIGHT_COLOURS,
+  HIGHLIGHT_COLOUR_LABELS,
+  ZOTERO_REFERENCE_COLOURS,
+  highlightColourOf,
+  nearestHighlightColour,
+} from "./annotations/highlightColours.js";
+export type { HighlightColourName } from "./annotations/highlightColours.js";
+export { SORT_INDEX_PATTERN, pdfSortIndex, sortAnnotations } from "./annotations/sortIndex.js";
+export { cjkBigrams, cjkRuns, hasCjk, latinWords } from "./annotations/words.js";
+export { matchAnnotations } from "./annotations/match.js";
+
+export {
   datedFileName,
   defaultTemplates,
   derivedFileName,

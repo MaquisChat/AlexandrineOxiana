@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { Anchor } from "./anchor.js";
+import { HIGHLIGHT_COLOURS } from "../annotations/highlightColours.js";
 import { Id, Timestamp } from "./text.js";
 
 export const Annotation = z.object({
@@ -16,6 +17,8 @@ export const Annotation = z.object({
   quote: z.string().optional(),
   /** Display colour, e.g. "#ffd400". */
   color: z.string().max(32).optional(),
+  /** The named colour chosen here; wins over `color` (an imported value) when both are set. */
+  colorName: z.enum(HIGHLIGHT_COLOURS).optional(),
   /** The page's printed label, when it differs from its number (e.g. "iv"). */
   pageLabel: z.string().max(64).optional(),
   /** Where it was imported from (e.g. "zotero:ABCD2345"): an import never adds it twice. */
@@ -30,5 +33,8 @@ export const Annotation = z.object({
   codebookVersion: z.number().int().optional(),
   author: z.string(),
   createdAt: Timestamp,
+  /** When and by whom it was last changed here (absent until changed). */
+  modifiedAt: Timestamp.optional(),
+  modifiedBy: z.string().optional(),
 });
 export type Annotation = z.infer<typeof Annotation>;

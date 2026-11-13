@@ -217,6 +217,32 @@ describe("Anchor / Annotation", () => {
     expect(Annotation.safeParse({ ...base, anchors: [{ kind: "bogus" }] }).success).toBe(false);
   });
 
+  it("a pdf anchor takes a Zotero sort index and refuses a malformed one", () => {
+    const base = { id: newId(), assetId: newId(), kind: "pdf", page: 2, rects: [{ x: 0, y: 0, w: 1, h: 1 }] };
+    expect(Anchor.parse(base)).not.toHaveProperty("sortIndex");
+    expect(Anchor.parse({ ...base, sortIndex: "00001|000123|00456" })).toMatchObject({ sortIndex: "00001|000123|00456" });
+    for (const bad of ["", "1|2|3", "00001|000123|0045", "00001-000123-00456", "00001|000123|00456 ", "0000a|000123|00456"]) {
+      expect(Anchor.safeParse({ ...base, sortIndex: bad }).success, bad).toBe(false);
+    }
+  });
+
+  it("an annotation takes colorName, modifiedAt and modifiedBy; a source file takes deletedAnnotationKeys", () => {
+    const a = { id: newId(), sourceId: newId(), kind: "highlight", anchors: [], author: "me", createdAt: now };
+    expect(Annotation.parse(a)).not.toHaveProperty("colorName");
+    expect(Annotation.parse({ ...a, colorName: "blue", modifiedAt: now, modifiedBy: "me" })).toMatchObject({
+      colorName: "blue",
+      modifiedAt: now,
+      modifiedBy: "me",
+    });
+    expect(Annotation.safeParse({ ...a, colorName: "teal" }).success).toBe(false);
+    expect(Annotation.safeParse({ ...a, modifiedAt: "yesterday" }).success).toBe(false);
+    const f = fixture();
+    expect(SourceFile.parse(f)).not.toHaveProperty("deletedAnnotationKeys");
+    expect(SourceFile.parse({ ...f, deletedAnnotationKeys: ["zotero:ABCD2345"] }).deletedAnnotationKeys).toEqual(["zotero:ABCD2345"]);
+    expect(SourceFile.safeParse({ ...f, deletedAnnotationKeys: ["x".repeat(257)] }).success).toBe(false);
+    expect(SourceFile.safeParse({ ...f, deletedAnnotationKeys: Array.from({ length: 10_001 }, (_, i) => `k${i}`) }).success).toBe(false);
+  });
+
   it("requires anchor id and lets a translation anchor reference the original", () => {
     const orig = { id: newId(), kind: "text-range", assetId: newId(), start: 0, end: 5, quote: "hola" };
     const tr = { id: newId(), kind: "text-range", assetId: newId(), start: 0, end: 4, quote: "hi", originalAnchorId: orig.id };
