@@ -112,9 +112,9 @@ const flush = () => act(async () => {
 
 /** jsdom has no 2D context; pdf.js's text layer measures text with one. */
 function stubCanvasContext() {
-  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
-    () => ({ measureText: (t: string) => ({ width: t.length * 5, fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2 }), font: "" }) as unknown as CanvasRenderingContext2D,
-  );
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(function (this: HTMLCanvasElement) {
+    return { canvas: this, measureText: (t: string) => ({ width: t.length * 5, fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2 }), font: "" } as unknown as CanvasRenderingContext2D;
+  } as never);
 }
 
 beforeEach(() => {
