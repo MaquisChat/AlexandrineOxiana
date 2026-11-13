@@ -191,7 +191,7 @@ export function useHighlightMaking(o: MakingOptions) {
     if (typing(target)) return;
     const sel = window.getSelection?.();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
-    offer(sel.getRangeAt(0));
+    offer(sel.getRangeAt(0), "mouse");
   };
 
   /**
@@ -199,7 +199,7 @@ export function useHighlightMaking(o: MakingOptions) {
    * the browser's selection at the end of a press begun on a page (I2); the keyboard's (Task R11)
    * hands it its own range (`takeRange`). True when the toolbar is offered.
    */
-  const offer = (range: Range): boolean => {
+  const offer = (range: Range, by: "mouse" | "keyboard"): boolean => {
     const { area, readOnly, handle: h, isLive } = opts.current;
     const root = area.current;
     if (!root || !h || !isLive(h) || range.collapsed) return false;
@@ -212,16 +212,19 @@ export function useHighlightMaking(o: MakingOptions) {
     if (anchors.length === 0 && boxes.length <= ANNOTATION_ANCHORS_MAX && !unsure) return false;
     setMenu(undefined);
     if (readOnly) {
-      if (!readOnlySaid.current) say(READ_ONLY_MAKING);
-      readOnlySaid.current = true;
+      sayReadOnly();
       return false;
     }
-    // One thing written or chosen at a time (R240 d): the note being written first.
+    // One thing written or chosen at a time (R240 d): no toolbar while a note is being written. A mouse
+    // selection is left as it is, the focus too, and nothing is said: the researcher may be copying
+    // words into the note (J1). Asked for by the keyboard (Enter), the note comes first, said.
     const writing = noteBeingWritten();
     if (writing) {
       setPick(undefined);
-      say(NOTE_FIRST);
-      writing.focus();
+      if (by === "keyboard") {
+        say(NOTE_FIRST);
+        writing.focus();
+      }
       return false;
     }
     if (boxes.length > ANNOTATION_ANCHORS_MAX) {
@@ -315,6 +318,12 @@ export function useHighlightMaking(o: MakingOptions) {
     return true;
   };
   const say = (text: string) => setAnnouncement((s) => ({ text, n: (s?.n ?? 0) + 1 }));
+  /** The reader's read-only sentence, said once for the whole screen, by the mouse's path and the keys alike (R240 f, Q6). */
+  const sayReadOnly = () => {
+    if (readOnlySaid.current) return;
+    readOnlySaid.current = true;
+    say(READ_ONLY_MAKING);
+  };
 
   /**
    * The one way a highlight or a page note is made (Task R10; the keyboard's page note, Task R11, calls
@@ -498,7 +507,8 @@ export function useHighlightMaking(o: MakingOptions) {
     announcement,
     cancel,
     /** The keyboard's path (Task R11): its own range, read exactly as a mouse selection is (`offer`). */
-    takeRange: offer,
+    takeRange: (range: Range) => offer(range, "keyboard"),
+    sayReadOnly,
     /** The one way to make a highlight or a page note (R240 b). */
     make,
     /** Says `text` in the list's live region (the one polite region of the reader). */

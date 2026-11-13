@@ -445,12 +445,12 @@ describe("ReaderScreen: selecting text by keyboard (Task R11)", () => {
     press(scroller(), "s");
     for (let i = 0; i < 6; i++) shift(scroller(), "ArrowDown");
     expect(selected()).toBe("Words of page 1Second line 1Words of page 2Second line 2");
-    await waitFor(() => expect(live()).toBe(KEYBOARD_EDGE));
+    await waitFor(() => expect(live()).toContain(KEYBOARD_EDGE));
     expect(KEYBOARD_EDGE).toBe("The selection stops at the pages on screen. Highlight this part, then carry on from the next page.");
     // Said once, not as an alarm, and never R10's "cannot be highlighted".
     shift(scroller(), "ArrowDown");
     await flush();
-    expect(heard().filter((t) => t === KEYBOARD_EDGE)).toHaveLength(1);
+    expect(heard().filter((t) => t.includes(KEYBOARD_EDGE))).toHaveLength(1);
     expect(screen.queryByRole("alert")).toBeNull();
     expect(document.body.textContent).not.toContain(PAGES_NOT_SHOWN);
     // The part selected is highlighted.
@@ -1002,7 +1002,7 @@ describe("ReaderScreen: by keyboard, fix round 1 (Ruling R240)", () => {
     expect(await screen.findByRole("textbox", { name: "Note" })).toBeTruthy();
   });
 
-  it("M8: one note at a time — a note in the list being written: N, S and a selection's toolbar say so once and give it the focus", async () => {
+  it("M8: one note at a time — a note in the list being written: N and Enter on a selection say so once and give it the focus; S may still select", async () => {
     serveAnnotations(() => [stored1()]);
     await opened();
     const list = screen.getByRole("region", { name: "Annotations (1)" });
@@ -1016,12 +1016,50 @@ describe("ReaderScreen: by keyboard, fix round 1 (Ruling R240)", () => {
     expect(NOTE_FIRST).toBe("Finish or cancel the note you are writing first.");
     expect(document.activeElement).toBe(listNote);
     expect(screen.getAllByRole("textbox", { name: "Note" })).toHaveLength(1);
+    // S still selects (words to copy into the note, J1); Enter, asking for a highlight, is refused.
     act(() => scroller().focus());
     press(scroller(), "s");
     await settle();
-    expect(selected()).toBe("");
+    expect(selected()).toBe("Words");
+    expect(document.activeElement).toBe(scroller());
+    press(scroller(), "Enter");
+    await settle();
+    expect(colourBar()).toBeNull();
     expect(document.activeElement).toBe(listNote);
-    // A mouse selection on the page: no toolbar either.
+    expect(heard().filter((t) => t === NOTE_FIRST)).toHaveLength(2);
+  });
+
+  it("J1: with a note open, a mouse selection on the page stays, the focus stays where the press put it, no toolbar, nothing said — so its words can be copied into the note", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    press(scroller(), "n");
+    const note = await screen.findByRole("textbox", { name: "Note" });
+    fireEvent.change(note, { target: { value: "about " } });
+    // The press on the page puts the focus on the pages (as a browser does for a focusable box).
+    act(() => scroller().focus());
+    const heard = hear();
+    const line = textNode(1, "Words of page 1");
+    fireEvent.mouseDown(line.parentElement!);
+    const r = document.createRange();
+    r.setStart(line, 0);
+    r.setEnd(line, 8);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(r);
+    fireEvent.mouseUp(line.parentElement!);
+    await flush();
+    expect(colourBar()).toBeNull();
+    expect(window.getSelection()!.toString()).toBe("Words of");
+    expect(document.activeElement).toBe(scroller());
+    expect(heard()).toEqual([]);
+    expect((note as HTMLTextAreaElement).value).toBe("about ");
+  });
+
+  it("Q6: read-only — the reader's sentence is said once for the screen, by the keys and a mouse selection together", async () => {
+    serveAnnotations(() => []);
+    await opened(fakeHandle(3), { readOnly: true });
+    const heard = hear();
+    press(scroller(), "s");
+    await settle();
     const line = textNode(1, "Words of page 1");
     fireEvent.mouseDown(line.parentElement!);
     const r = document.createRange();
@@ -1030,9 +1068,59 @@ describe("ReaderScreen: by keyboard, fix round 1 (Ruling R240)", () => {
     window.getSelection()!.removeAllRanges();
     window.getSelection()!.addRange(r);
     fireEvent.mouseUp(line.parentElement!);
+    press(scroller(), "n");
     await flush();
-    expect(colourBar()).toBeNull();
-    expect(heard().filter((t) => t === NOTE_FIRST)).toHaveLength(3);
+    expect(heard()).toEqual([READ_ONLY_MAKING]);
+  });
+
+  it("N1: at the edge, the last state waiting to be said is said with the edge's sentence, not lost", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    const heard = hear();
+    vi.useFakeTimers(FAKE);
+    press(scroller(), "s");
+    await settle();
+    for (let i = 0; i < 7; i++) shift(scroller(), "ArrowDown");
+    await settle();
+    act(() => vi.advanceTimersByTime(600));
+    await settle();
+    vi.useRealTimers();
+    expect(heard()).toEqual([selectedSentence("Words"), `${selectedSentence("Words of page 1\nSecond line 1\nWords of page 2\nSecond line 2")} ${KEYBOARD_EDGE}`]);
+  });
+
+  it("N3: while waiting for a click, Escape in another dialog (Delete this highlight?) is the dialog's", async () => {
+    serveAnnotations(() => [stored1()]);
+    await opened();
+    press(scroller(), "n");
+    await screen.findByRole("textbox", { name: "Note" });
+    fireEvent.click(screen.getByRole("button", { name: "Place by clicking" }));
+    expect(document.querySelector(".ao-reader-area--placing")).toBeTruthy();
+    // Asked by keyboard (no press of the mouse, which would end the wait).
+    const list = screen.getByRole("region", { name: "Annotations (1)" });
+    fireEvent.click(within(list).getByRole("button", { name: /^Delete/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(dialog.isConnected).toBe(false);
+  });
+
+  it("N4: a held letter whose keyup was lost (the window left) stops swallowing: a new press of it, or the window's blur, lets it type", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    press(scroller(), "n", { code: "KeyN" });
+    const note = await screen.findByRole("textbox", { name: "Note" });
+    // No keyup came. A new press of N in the field is typed, and so are its own repeats.
+    expect(fireEvent.keyDown(note, { key: "n", code: "KeyN" })).toBe(true);
+    expect(fireEvent.keyDown(note, { key: "n", code: "KeyN", repeat: true })).toBe(true);
+    fireEvent.keyUp(note, { key: "n", code: "KeyN" });
+    press(note, "Escape");
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "Note" })).toBeNull());
+    // Again, the window left while N was down.
+    act(() => scroller().focus());
+    press(scroller(), "n", { code: "KeyN" });
+    const again = await screen.findByRole("textbox", { name: "Note" });
+    fireEvent.blur(window);
+    expect(fireEvent.keyDown(again, { key: "n", code: "KeyN", repeat: true })).toBe(true);
   });
 
   it("M8: one note at a time — a page note being written: the list's Add note says so and gives it the focus; leaving asks one question", async () => {

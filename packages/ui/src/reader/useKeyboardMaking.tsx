@@ -147,7 +147,7 @@ export interface KeyboardMakingOptions {
    * R10's making: the range reader, the one way to make (`make`, R240 b), the live region, whether its
    * toolbar is shown and how it is given up.
    */
-  making: { takeRange(range: Range): boolean; make(m: MakeRequest): Promise<MakeOutcome>; say(text: string): void; picking: boolean; cancel(): boolean };
+  making: { takeRange(range: Range): boolean; make(m: MakeRequest): Promise<MakeOutcome>; say(text: string): void; sayReadOnly(): void; picking: boolean; cancel(): boolean };
 }
 
 interface NoteDraft {
@@ -179,8 +179,6 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
   const sending = useRef(false);
   const noteSeq = useRef(0);
   const focusToolbar = useRef(false);
-  /** The read-only sentence was said for a key (once, R240 f). */
-  const saidReadOnly = useRef(false);
   /** The edge of the drawn pages was said for this selection (once, R240 c). */
   const edgeSaid = useRef(false);
   /** The drawn pages next to the current one when the selection started, with or without text. */
@@ -217,6 +215,12 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     if (timer.current === undefined) return;
     clearTimeout(timer.current);
     flush();
+  };
+  /** What is waiting to be said, taken (the timer cleared). */
+  const takeWaiting = (): string | undefined => {
+    const t = waiting.current;
+    hush();
+    return t;
   };
   const hush = () => {
     clearTimeout(timer.current);
@@ -297,7 +301,6 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
   /** Why "Select text" cannot act now, or nothing. */
   const selectWhy = (): string | undefined => {
     if (opts.current.readOnly) return READ_ONLY_READER;
-    if (note) return NOTE_FIRST;
     if (selecting) return SELECTING_NOW;
     if (noText(opts.current.page)) return NO_TEXT_TO_SELECT;
     return undefined;
@@ -309,18 +312,16 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     if (selecting && !opts.current.making.picking) return SELECTING_NOW;
     return undefined;
   };
-  /** Says why a key cannot act (read-only: once, R240 f); a note being written takes the focus (R240 d). */
+  /** Says why a key cannot act (read-only: once for the screen, R240 f); a note being written takes the focus (R240 d). */
   const refuse = (why: string) => {
-    if (opts.current.readOnly) {
-      if (saidReadOnly.current) return;
-      saidReadOnly.current = true;
-    }
+    if (opts.current.readOnly) return opts.current.making.sayReadOnly();
     say(why);
     if (why === NOTE_FIRST) noteBeingWritten()?.focus();
   };
 
   const startSelection = () => {
-    const why = selectWhy() ?? (noteBeingWritten() ? NOTE_FIRST : undefined);
+    // A selection may be made while a note is open (to copy words into it, J1); Enter asks for the note first.
+    const why = selectWhy();
     if (why) return refuse(why);
     const { handle: h, isLive, page: n } = opts.current;
     if (!h || !isLive(h)) return;
@@ -377,8 +378,9 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       // pages beyond: said once (R240 c) — what is selected can still be highlighted.
       if ((dir > 0 ? reach.current.last < opts.current.count : reach.current.first > 1) && !edgeSaid.current) {
         edgeSaid.current = true;
-        sayWaiting();
-        say(KEYBOARD_EDGE);
+        // Said with the last state, if any is waiting, in one saying: nothing is lost (N1).
+        const last = takeWaiting();
+        say(last !== undefined ? `${last} ${KEYBOARD_EDGE}` : KEYBOARD_EDGE);
       }
       return;
     }
@@ -660,19 +662,24 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       return !!k && (k.code !== "" ? e.code === k.code : e.key.toLowerCase() === k.key);
     };
     const down = (e: globalThis.KeyboardEvent) => {
-      if (e.repeat && isHeld(e)) {
+      if (!isHeld(e)) return;
+      if (e.repeat) {
         e.preventDefault();
         e.stopPropagation();
-      }
+        // A press of it anew: its keyup was lost (the window left meanwhile, N4); it is held no more.
+      } else held.current = undefined;
     };
     const up = (e: globalThis.KeyboardEvent) => {
       if (isHeld(e)) held.current = undefined;
     };
+    const left = () => (held.current = undefined);
     document.addEventListener("keydown", down, true);
     document.addEventListener("keyup", up, true);
+    window.addEventListener("blur", left);
     return () => {
       document.removeEventListener("keydown", down, true);
       document.removeEventListener("keyup", up, true);
+      window.removeEventListener("blur", left);
     };
   }, []);
 
