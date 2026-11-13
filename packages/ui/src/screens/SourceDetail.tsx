@@ -21,6 +21,7 @@ import { CitePanel } from "../components/CitePanel";
 import { SourceToolNotice } from "../components/MissingToolNotice";
 import { typeLabel } from "../components/SourceTable";
 import { ReaderLink } from "../components/ReaderLink";
+import { WatchOrigin } from "../components/WatchOrigin";
 import { TranscriptLink } from "../components/TranscriptLink";
 import { UserText } from "../components/UserText";
 import { FieldCheck } from "../components/VerificationBadge";
@@ -29,7 +30,7 @@ import "../components/library.css";
 import "../components/verification.css";
 
 export interface SourceDetailProps {
-  api: Pick<LibraryApi, "sources" | "citations" | "verification">;
+  api: Pick<LibraryApi, "sources" | "citations" | "verification" | "watchedFolders">;
   projectId: string;
   sourceId: string;
   readOnly: boolean;
@@ -423,6 +424,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
         {file && src && <TranscriptLink projectId={projectId} assets={file.assets} sourceId={sourceId} />}
         {file && src && <ReaderLink projectId={projectId} sourceId={sourceId} assets={file.assets} />}
       </div>
+      {file && src && <WatchOrigin api={api.watchedFolders} projectId={projectId} sourceId={sourceId} readOnly={readOnly} />}
       {error && (
         <p role="alert" className="ao-error">
           {error}
