@@ -111,7 +111,7 @@ describe("the built folder's launcher", () => {
 
   // R227: the development way of starting (`pnpm start`: tsx, no launcher) runs with sixteen too, from its script's
   // environment; a larger value is kept. The script is run as pnpm runs it (sh -c), and the service it starts is asked.
-  it.skipIf(process.platform !== "linux")("the start script's service has 16 file threads; a larger value is kept", async () => {
+  it.skipIf(process.platform !== "linux")("the start script's service has 16 file threads; a larger value is kept, an odd one replaced (R233 M10)", async () => {
     const pkg = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
     const cwd = fileURLToPath(new URL("..", import.meta.url));
     const threadsOf = (pid) =>
@@ -127,7 +127,7 @@ describe("the built folder's launcher", () => {
       if (readFileSync(`/proc/${pid}/comm`, "utf8").trim() !== "sh") return pid;
       return Number(readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8").trim().split(/\s+/)[0]);
     };
-    for (const [given, want] of [[undefined, 16], ["4", 16], ["20", 20]]) {
+    for (const [given, want] of [[undefined, 16], ["4", 16], ["20", 20], ["16abc", 16]]) {
       const dir = mkdtempSync(join(tmpdir(), "ao-start-"));
       dirs.push(dir);
       const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !["NODE_OPTIONS", "UV_THREADPOOL_SIZE"].includes(k) && !k.toUpperCase().startsWith("AO_")));
@@ -147,9 +147,11 @@ describe("the built folder's launcher", () => {
         });
         expect(threadsOf(nodeOf(child.pid)).filter((n) => n === "libuv-worker").length, `UV_THREADPOOL_SIZE=${given}`).toBe(want);
       } finally {
-        const exited = new Promise((r) => child.once("exit", r));
-        child.stdin.end();
-        await exited;
+        if (child.exitCode === null && child.signalCode === null) {
+          const exited = new Promise((r) => child.once("exit", r));
+          child.stdin.end();
+          await exited;
+        }
       }
     }
   }, 120_000);
