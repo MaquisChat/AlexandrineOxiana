@@ -10,7 +10,9 @@
  *  - Limits said in words, nothing made: a selection over more than 50 pages ("A highlight can cover
  *    at most 50 pages."); one reaching over a page that is not drawn at the moment (its text is not
  *    in the page, so it cannot be quoted); a read-only library or screen shows no toolbar and says
- *    why once ("This library is read-only, so highlights cannot be made.").
+ *    the reader's one read-only sentence once, in the live region (R240 f); while a note is being
+ *    written the toolbar is not offered either ("Finish or cancel the note you are writing first.").
+ *  - The one way of making (`make`, R240 b), which the keyboard's page note (Task R11) calls too:
  *  - A colour chosen: one create through the service's route (`createAnnotation`, Task R4); a draft
  *    is drawn meanwhile (never chosen, never listed), and the service's answer replaces it — on the
  *    page and in the list (`onCreated`), said in the list's live region ("Highlight added: Yellow,

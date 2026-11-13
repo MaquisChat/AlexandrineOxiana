@@ -221,7 +221,7 @@ function countListeners() {
     }
     remove(type, l, o);
   }) as typeof document.removeEventListener);
-  return () => Object.fromEntries([...listening].filter(([k]) => /^(keydown|keyup|mousedown|selectionchange)\|/.test(k)).sort());
+  return () => Object.fromEntries([...listening].filter(([k, n]) => n > 0 && /^(keydown|keyup|mousedown|selectionchange)\|/.test(k)).sort());
 }
 const flush = () =>
   act(async () => {
@@ -471,6 +471,8 @@ describe("ReaderScreen: selecting text by keyboard (Task R11)", () => {
     for (let i = 0; i < 4; i++) shift(scroller(), "ArrowDown");
     await flush();
     expect(heard()).not.toContain(KEYBOARD_EDGE);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(selected()).toBe("Words of page 1Second line 1");
   });
 
   it("never past the document's start: Shift+Left and Shift+Up on its first word say nothing", async () => {

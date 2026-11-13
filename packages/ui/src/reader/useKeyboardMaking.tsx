@@ -9,7 +9,8 @@
  * by a word, Shift+Down and Shift+Up by a line, across into the next or the previous page. It is shown
  * on the page as the mouse's selection is (it IS the browser's selection, with the same tint), and
  * its moving end is kept in view by scrolling the pages. At the edge of the drawn pages it stops, with
- * R10's sentence (PAGES_NOT_SHOWN): a page that is not drawn has no text to select (A9).
+ * KEYBOARD_EDGE, said once (R240 c): a page that is not drawn has no text to select (A9); the part
+ * selected can still be highlighted.
  *  - Said in the reader's one polite live region (the list's, R9): "Selected: <the first 200
  *    characters>", at most once every ANNOUNCE_MS, the last state always said; "Selection cancelled."
  *    when it ends without a highlight.

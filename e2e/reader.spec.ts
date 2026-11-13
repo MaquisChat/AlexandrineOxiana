@@ -869,8 +869,14 @@ test("a read-only library shows the PDF and the notice", async ({ page, app }) =
   // Task R11: the two making buttons are there, disabled, each with its reason shown.
   await expect(toolbar(page).getByRole("button", { name: "Select text" })).toBeDisabled();
   await expect(toolbar(page).getByRole("button", { name: "Add a note to this page" })).toBeDisabled();
-  await expect(page.getByText("Select text: This library is read-only, so highlights cannot be made.", { exact: true })).toBeVisible();
-  await expect(page.getByText("Add a note to this page: This library is read-only, so notes cannot be added.", { exact: true })).toBeVisible();
+  // Ruling R240 (f): the reader's one read-only sentence, shown once; every disabled control refers to it.
+  const sentence = page.getByText("This library is read-only, so highlights and notes cannot be added or changed.", { exact: true });
+  await expect(sentence).toHaveCount(1);
+  await expect(sentence).toBeVisible();
+  const id = await sentence.getAttribute("id");
+  expect(id).toBeTruthy();
+  await expect(toolbar(page).getByRole("button", { name: "Select text" })).toHaveAttribute("aria-describedby", id!);
+  await expect(toolbar(page).getByRole("button", { name: "Add a note to this page" })).toHaveAttribute("aria-describedby", id!);
   expect(seen.pageErrors).toEqual([]);
   expectOnlyOwnOrigins(seen, app);
 });
