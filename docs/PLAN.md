@@ -572,7 +572,7 @@ Update after every task; commit and push.
 | 71 The extension remembers the downloader choice (D18) | complete | 3e41550 (merge) | R189; read by the controller; D18 closed |
 | 72 A later conflict enters the review queue (D19) | complete | 3fd15df (merge) | R190, R193, R194; reviewed with probes over two fix rounds; D19 closed |
 | 73 The audit says which field was confirmed (D20) | complete | 0e890cd (merge) | R191; reviewed with 18 probes; D20 closed |
-| R1 Reader: anchor, annotation and colour model | in progress | | branch `claude/pdf-reader-highlights`; dispatched 2026-11-13 |
+| R1 Reader: anchor, annotation and colour model | fix round 1 | 8393817 (worktree branch) | reviewed: the import hash unchanged; word matching, Korean and the order within a page to fix (R195, the plan's Amendments A1 and A2) |
 | R5 Reader: ranged PDF route and the client's range reader | in progress | | branch `claude/pdf-reader-highlights`; dispatched 2026-11-13 |
 | R2–R4, R6–R13 Reader: the remaining tasks | not started | | see the plan on the reader branch; order: R2 and R3 after R1, R6 after R5, R4 after R3, R7 after R6, then R8, R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
