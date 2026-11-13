@@ -3,8 +3,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { appProcesses, CAPABILITIES_DIR, capabilityProblems, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, helperProblems, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { dirname, join } from "node:path";
+import { appProcesses, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, helperProblems, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -97,6 +97,23 @@ describe("what the page may ask of the shell (capabilities/main-window.json; Tas
     assert.match(with_({ platforms: ["macOS"], extra: 1 }).join("\n"), /extra/);
     assert.match(capabilityProblems({ files: [...files, "second.json"], capability, conf }).join("\n"), /second\.json/);
     assert.match(capabilityProblems({ files, capability, conf: { ...conf, app: { ...conf.app, security: { ...conf.app.security, capabilities: ["main-window", "other"] } } } }).join("\n"), /tauri\.conf\.json/);
+  });
+
+  it("reads the platform files Tauri merges over the configuration, and refuses any security setting or capability in them", () => {
+    const { files, capability, conf } = read();
+    // The real files as they are: tauri.macos.conf.json is read and passes.
+    assert.ok(platformConfFiles().includes("tauri.macos.conf.json"));
+    assert.deepEqual(capabilityFileProblems(), []);
+    const macos = JSON.parse(readFileSync(join(dirname(TAURI_CONF), "tauri.macos.conf.json"), "utf8"));
+    const check = (platform) => capabilityProblems({ files, capability, conf, platform });
+    assert.deepEqual(check([{ name: "tauri.macos.conf.json", conf: macos }]), []);
+    for (const security of [{ capabilities: ["main-window", "other"] }, { capabilities: [{ identifier: "x", windows: ["*"], permissions: ["fs:default"] }] }, { csp: null }, {}]) {
+      const p = check([{ name: "tauri.macos.conf.json", conf: { ...macos, app: { security } } }]);
+      assert.match(p.join("\n"), /tauri\.macos\.conf\.json sets app\.security/, JSON.stringify(security));
+    }
+    assert.match(check([{ name: "tauri.linux.conf.json", conf: { app: { security: { capabilities: [] } } } }]).join("\n"), /tauri\.linux\.conf\.json/);
+    // A platform file that cannot be read as JSON cannot be checked: it fails.
+    assert.match(check([{ name: "tauri.windows.conf.toml", conf: null }]).join("\n"), /tauri\.windows\.conf\.toml could not be checked/);
   });
 });
 
