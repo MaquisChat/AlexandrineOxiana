@@ -198,7 +198,7 @@ test("an address naming an annotation opens at it; one that is gone opens the fi
   const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "By address" });
   const sid = await attach(app, projectId, sourceFile(app, "one.pdf", await buildMultiPagePdf(3)));
   await attach(app, projectId, sourceFile(app, "two.pdf", await buildMultiPagePdf(4)), sid);
-  const [one, two] = (await pdfAssets(app, projectId, sid)) as [{ id: string }, { id: string }];
+  const [one, two] = (await pdfAssets(app, projectId, sid)) as unknown as [{ id: string }, { id: string }];
   await annotate(app, projectId, sid, one.id, { page: 1, quote: "on the first file" });
   const target = await annotate(app, projectId, sid, two.id, { page: 3, quote: "the target highlight" });
   await annotate(app, projectId, sid, two.id, { page: 1, quote: "another" });
