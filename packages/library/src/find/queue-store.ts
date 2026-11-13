@@ -22,16 +22,23 @@
  * them is REFUSED with a plain sentence, never cut. What is handed in is copied, and what a read gives out is
  * frozen all the way down (the cache is shared between readers, so nothing a caller holds can change it).
  *
+ * ONE routine reads and classifies the file's lines (`scanLines`), for the reader and for compaction alike, so that
+ * what the reader sees and what compaction keeps cannot differ: every complete, non-blank line is either an
+ * ENTRY (a line of at most 1 MiB that holds a good entry of this project: any length up to that is accepted on
+ * read; the 64 KiB bound is on the entry's plain JSON and is enforced on WRITE only) or UNREADABLE (not JSON, a
+ * state or shape this build does not know, a seal that does not open, another project's, or over 1 MiB, in
+ * which case it is not even parsed).
+ *
  * Compaction rewrites the file as one governed change (`project.find.compact`) and one atomic replacement, so
- * that a crash leaves the old file or the new one. It drops the superseded lines and the removed entries, and
- * NOTHING ELSE: every complete line it cannot read (not JSON, a state or shape this build does not know, a seal
- * that does not open, too long) is carried over verbatim and in its place among the others, because it may be a
- * newer build's. Such lines are counted (`unreadableLines`) but do not count towards "due". Only a torn last
- * line (no newline after it) is no committed line (R28) and goes. It is due when the lines that CAN be read
- * outnumber twice the live entries (at least 2): `readable > 2 × max(live, 1)`, whatever the file's size (a
- * large queue of live entries is not rewritten at every update). It does not run when more than half of the
- * file's lines cannot be read, or one is over 1 MiB (a note is left in `core.indexErrors`); it never runs on a
- * file in which no line can be read.
+ * that a crash leaves the old file or the new one. It drops the superseded lines and the removed entries
+ * ("dead" lines), and NOTHING ELSE: every unreadable complete line is carried over verbatim and in its place
+ * among the others, because it may be a newer build's. Such lines are counted (`unreadableLines`) but are not
+ * dead. Only a torn last line (no newline after it) is no committed line (R28) and goes. THE RULE: it is due
+ * when `dead > live && dead >= 64`, where dead = the readable lines minus the live entries, whatever the file's
+ * size (a large queue of live entries is not rewritten at every update, and a small queue is not rewritten at
+ * every second change). It does not run when more than half of the file's lines cannot be read, when a line is
+ * over 64 MiB or the file over 256 MiB (a note is left in `core.indexErrors`, once); it never runs on a file in
+ * which no line can be read.
  *
  * Reading folds the lines by id, streaming (memory: one entry per id, never one per line), and is tolerant of
  * the past and strict about shape: an unreadable line is skipped and counted, never an error and never deleted
@@ -55,8 +62,16 @@ const DIR = "find";
 const FILE = "queue.jsonl";
 /** The policy request of every queue write: library data with nothing identifying in it, as the watch register's. */
 const REQ = { action: "store" as const, store: { identifiable: false, hasLocation: false } };
-/** The longest line a compaction can carry over verbatim; a line over it stops the compaction (and is left alone). */
-const CARRY_MAX_BYTES = 1024 * 1024;
+/** The longest line the reader takes in (memory safety): a longer one is unreadable and is not parsed. */
+const RAW_LINE_MAX_BYTES = 1024 * 1024;
+/** The longest line a compaction holds in order to carry it over verbatim; a longer one stops the compaction (and is left alone). */
+const CARRY_MAX_BYTES = 64 * 1024 * 1024;
+/** A file larger than this is not compacted (the new file is built in memory). */
+const COMPACT_FILE_MAX_BYTES = 256 * 1024 * 1024;
+/** Compaction is due only with at least this many dead lines (and more dead lines than live entries). */
+const COMPACT_MIN_DEAD = 64;
+/** At most this many notes are left in `core.indexErrors` for one repository. */
+const NOTES_MAX = 20;
 
 /** What a caller is told when the queue is full: nothing is written. */
 export class FindQueueFullError extends Error {
@@ -264,9 +279,6 @@ interface Folded {
 const emptyFolded = (): Folded => ({ map: new Map(), at: new Map(), lines: 0, unreadable: 0, size: 0 });
 const liveOf = (f: Folded): FindEntry[] => [...f.map.values()].filter((e) => e.removed !== true);
 
-/** The longest line the reader takes in: a sealed line is the entry's JSON in base64 inside a small envelope. */
-const lineMax = (sealed: boolean) => (sealed ? Math.ceil((FIND_LINE_MAX_BYTES + 16) / 3) * 4 + 512 : FIND_LINE_MAX_BYTES);
-
 /** Applies one entry to a folded map (the later wins; the map's order is the order of the latest lines). */
 function apply(f: Folded, e: FindEntry, index: number): void {
   f.map.delete(e.id);
@@ -284,16 +296,26 @@ function parseLine(line: string, projectId: string, key: Uint8Array | null): Fin
   }
 }
 
+/** One complete, non-blank line of the file: its text (null when it is over the `holdMax` it was read with), and its classification. */
+interface ScannedLine {
+  text: string | null;
+  /** The entry the line holds; null when the line is unreadable (see the top of this file). */
+  entry: FindEntry | null;
+}
+
 /**
- * The complete, non-blank lines of a file in order, as text; `null` for one over `holdMax` bytes (never held in
- * memory). A last line with no newline after it is a torn line: not yielded.
+ * THE routine that reads and classifies the lines of the queue file, in order: used by the reader (`foldFile`)
+ * and by compaction, so that they cannot disagree. A last line with no newline after it is a torn line: not
+ * yielded. A line is never held in memory beyond `holdMax` bytes (then `text` is null); classification does not
+ * depend on `holdMax`: a line over `RAW_LINE_MAX_BYTES` is unreadable and is not parsed.
  */
-async function* readLines(abs: string, holdMax: number): AsyncGenerator<string | null> {
+async function* scanLines(abs: string, projectId: string, key: Uint8Array | null, holdMax: number): AsyncGenerator<ScannedLine> {
   const fh = await fsp.open(abs, "r");
   try {
     let carry: Buffer[] = [];
     let carryLen = 0;
     let discarding = false;
+    const classify = (text: string | null, bytes: number): ScannedLine => ({ text, entry: text !== null && bytes <= RAW_LINE_MAX_BYTES ? parseLine(text, projectId, key) : null });
     for await (const chunk of fh.createReadStream() as AsyncIterable<Buffer>) {
       let start = 0;
       for (;;) {
@@ -310,10 +332,11 @@ async function* readLines(abs: string, holdMax: number): AsyncGenerator<string |
           break;
         }
         const piece = chunk.subarray(start, nl);
-        if (discarding || carryLen + piece.length > holdMax) yield null;
+        if (discarding || carryLen + piece.length > holdMax) yield classify(null, Infinity);
         else {
-          const text = (carry.length ? Buffer.concat([...carry, piece]) : piece).toString("utf8");
-          if (text.trim()) yield text;
+          const bytes = Buffer.concat([...carry, piece]);
+          const text = bytes.toString("utf8");
+          if (text.trim()) yield classify(text, bytes.length);
         }
         carry = [];
         carryLen = 0;
@@ -329,10 +352,9 @@ async function* readLines(abs: string, holdMax: number): AsyncGenerator<string |
 async function foldFile(abs: string, projectId: string, key: Uint8Array | null, size: number): Promise<Folded> {
   const out = emptyFolded();
   out.size = size;
-  for await (const text of readLines(abs, lineMax(key !== null))) {
+  for await (const line of scanLines(abs, projectId, key, RAW_LINE_MAX_BYTES)) {
     const index = out.lines++;
-    const e = text === null ? null : parseLine(text, projectId, key);
-    if (e) apply(out, e, index);
+    if (line.entry) apply(out, line.entry, index);
     else out.unreadable++;
   }
   return out;
@@ -347,15 +369,13 @@ function cacheOf(core: RepoCore): Map<string, { sig: string; folded: Folded }> {
   return c;
 }
 
-/** Notes left for the developer in `core.indexErrors` (the repository's place for what does not fail a committed change). */
+/** Notes left for the developer in `core.indexErrors` (the repository's place for what does not fail a committed change): each kind once, and a few at most. */
 const noted = new WeakMap<RepoCore, Set<string>>();
-function note(core: RepoCore, message: string, once?: string): void {
-  if (once !== undefined) {
-    let s = noted.get(core);
-    if (!s) noted.set(core, (s = new Set()));
-    if (s.has(once)) return;
-    s.add(once);
-  }
+function note(core: RepoCore, message: string, once: string): void {
+  let s = noted.get(core);
+  if (!s) noted.set(core, (s = new Set()));
+  if (s.has(once) || s.size >= NOTES_MAX) return;
+  s.add(once);
   core.indexErrors.push({ op: FIND_QUEUE_OPS.compact, error: new Error(message) });
 }
 
@@ -496,7 +516,8 @@ export async function appendFindEntries(core: RepoCore, projectId: string, entri
     await compactFindQueue(core, projectId);
   } catch (err) {
     // Housekeeping: the change above is committed, and the next change tries again. A note is left.
-    note(core, `The queue could not be compacted (${err instanceof Error ? err.name : "Error"}); it will be tried again at the next change.`);
+    const kind = err instanceof Error ? err.name : "Error";
+    note(core, `The queue could not be compacted (${kind}); it will be tried again at the next change.`, `${core.abs(queueRel(st0.rel))}:failed:${kind}`);
   }
 }
 
@@ -562,8 +583,12 @@ function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[]): P
   );
 }
 
-/** Due: the lines that can be read outnumber twice the live entries (at least 2), whatever the file's size. */
-const compactionDue = (f: Folded): boolean => f.lines - f.unreadable > 2 * Math.max(liveOf(f).length, 1);
+/** THE rule: due when dead > live && dead >= 64, dead being the readable lines minus the live entries, whatever the file's size. */
+const compactionDue = (f: Folded): boolean => {
+  const live = liveOf(f).length;
+  const dead = f.lines - f.unreadable - live;
+  return dead > live && dead >= COMPACT_MIN_DEAD;
+};
 /** More than half of the file's lines cannot be read: it is not compacted. */
 const mostlyUnreadable = (f: Folded): boolean => f.unreadable * 2 > f.lines;
 const MOSTLY_UNREADABLE = "More than half of the lines of the Find and acquire queue could not be read, so it was not compacted. Nothing has been changed.";
@@ -603,28 +628,32 @@ export async function compactFindQueue(core: RepoCore, projectId: string): Promi
         }
         const rel = queueRel(st.rel);
         const abs = core.abs(rel);
+        if (folded.size > COMPACT_FILE_MAX_BYTES) {
+          note(core, "The Find and acquire queue is too large to be compacted. Nothing has been changed.", `${abs}:size`);
+          throw new NothingToWrite();
+        }
         const seal = tx.encrypted ? tx.key() : undefined;
         const key = seal ? seal.key : null;
         const out: string[] = [];
         const live: FindEntry[] = [];
         let carried = 0;
         let index = 0;
-        for await (const text of readLines(abs, CARRY_MAX_BYTES)) {
+        // The same routine as the reader's: an entry line is kept only as its id's latest and live; every other line is carried whole.
+        for await (const { text, entry } of scanLines(abs, st.project.id, key, CARRY_MAX_BYTES)) {
           const i = index++;
           if (text === null) {
             note(core, "A line of the Find and acquire queue is too long to be carried over, so it was not compacted. Nothing has been changed.", `${abs}:long`);
             throw new NothingToWrite();
           }
-          const e = parseLine(text, st.project.id, key);
-          if (e === null) {
+          if (entry === null) {
             out.push(text); // unreadable: carried over whole, in its place
             carried++;
             continue;
           }
-          const cur = folded.map.get(e.id);
-          if (folded.at.get(e.id) === i && cur && cur.removed !== true) {
-            live.push(e);
-            out.push(seal ? sealLine(seal.key, seal.keyId, st.project.id, JSON.stringify(e), PURPOSE) : JSON.stringify(e));
+          const cur = folded.map.get(entry.id);
+          if (folded.at.get(entry.id) === i && cur && cur.removed !== true) {
+            live.push(entry);
+            out.push(seal ? sealLine(seal.key, seal.keyId, st.project.id, JSON.stringify(entry), PURPOSE) : JSON.stringify(entry));
           }
         }
         const text = out.map((l) => `${l}\n`).join("");

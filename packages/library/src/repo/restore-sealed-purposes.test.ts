@@ -3,7 +3,8 @@
  * sealed `.jsonl` line, so it must know every purpose a line can be sealed with. The purposes are declared in
  * ONE place (`sealed-purposes.ts`), and these tests fail if one is used and not declared.
  */
-import { appendFile, readFile, readdir } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { appendFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { newId } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -12,6 +13,7 @@ import { OPEN_GOV, PSEUDO_GOV, addSource, makeKit, makeProject, type Kit } from 
 import type { WorkCandidate } from "../find/candidates.js";
 import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
+import { sealLine } from "./io.js";
 import * as purposes from "./sealed-purposes.js";
 import { SEALED_LINE_PURPOSES } from "./sealed-purposes.js";
 import type { RepoCore } from "./state.js";
@@ -52,7 +54,10 @@ describe("the purposes of line-sealed files are declared in one place", () => {
   it("every purpose a line of the project is sealed with, as written in the source, is in the list (or is on the short list of things that are not project lines)", async () => {
     const { glob } = await import("node:fs/promises");
     const root = join(import.meta.dirname, "..");
-    // Not lines of a project's files: the library-level job journal, and purposes of other kinds of seal.
+    // Not lines a restore re-seals: `ao-jobs` seals `<Project>/jobs/journal.jsonl`, a project file, but a restore
+    // REMOVES `jobs/` from the copy before it rewrites any line (restore.ts, "the copy starts with no jobs", R31;
+    // pinned by backup.test.ts). If a restore ever keeps `jobs/`, `ao-jobs` must be listed in sealed-purposes.ts.
+    // The others are seals of other kinds, not lines of a project's files.
     const NOT_PROJECT_LINES = new Set(["ao-jobs", "ao-browser-extension", "ao-withheld", "ao-worker"]);
     const found = new Map<string, string>();
     for await (const f of glob("**/*.ts", { cwd: root })) {
@@ -132,5 +137,65 @@ describe("a backup of an encrypted project that holds a find queue or a watch re
       expect(copy).toContain("not json at all\n");
     }
     expect((await readdir(join(kit.lib.root, "Projects"))).length).toBe(4);
+  });
+});
+
+describe("restore says what it copied unread (R226 / F3 round 2, M10)", () => {
+  const foreign = (projectId: string, purpose: string) => sealLine(randomBytes(32), "foreign-key", projectId, JSON.stringify({ any: "thing" }), purpose);
+  const regEntry = (sourceId: string) => ({ key: "a.pdf", file: "a.pdf", sourceId, sha256: "a".repeat(64), size: 10, mtimeNs: "1763000000123456789", state: "in-library" as const, at: NOW });
+
+  it("a result with nothing unread says zero in both kinds", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true, "Clean");
+    await appendFindEntries(coreOf(), p.id, [entry(p.id)], "add");
+    const r = await backupProject(kit.repo, p.id);
+    expect((await restoreBackup(kit.repo, r.path)).linesCopiedUnread).toEqual({ findQueue: 0, watchRegister: 0 });
+  });
+
+  for (const encrypted of [false, true]) {
+    it(`find queue lines restore cannot open are copied verbatim and counted; a torn last piece is not a line (${encrypted ? "sealed" : "plain"})`, async () => {
+      const p = await makeProject(kit, encrypted ? PSEUDO_GOV : OPEN_GOV, encrypted, encrypted ? "QU E" : "QU P");
+      const a = entry(p.id);
+      await appendFindEntries(coreOf(), p.id, [a], "add");
+      const file = join(kit.lib.root, p.folder, "find", "queue.jsonl");
+      const bad = encrypted ? [foreign(p.id, "ao-find-queue"), foreign(p.id, "ao-find-queue"), "not json"] : ["not json", "{also not"];
+      await appendFile(file, bad.map((l) => `${l}\n`).join(""));
+      await appendFile(file, '{"id":"half');
+      const r = await backupProject(kit.repo, p.id);
+      const restored = await restoreBackup(kit.repo, r.path);
+      expect(restored.linesCopiedUnread).toEqual({ findQueue: bad.length, watchRegister: 0 });
+      const copy = (await readFile(join(kit.lib.root, kit.repo.getProject(restored.projectId).folder, "find", "queue.jsonl"), "utf8")).split("\n");
+      for (const l of bad) expect(copy).toContain(l);
+      expect([...(await readFindQueue(coreOf(), restored.projectId)).keys()]).toEqual([a.id]);
+    });
+
+    it(`a watch register is treated as the queue is: lines restore cannot open are copied verbatim and counted, and a file ALL of whose lines fail still restores (${encrypted ? "sealed" : "plain"})`, async () => {
+      const p = await makeProject(kit, encrypted ? PSEUDO_GOV : OPEN_GOV, encrypted, encrypted ? "WR E" : "WR P");
+      const sf = await addSource(kit, p, { title: "From the folder" });
+      const w1 = newId();
+      const w2 = newId();
+      await kit.repo.recordWatchedFiles(p.id, w1, [regEntry(sf.source.id)]);
+      const bad1 = encrypted ? [foreign(p.id, "ao-watch-register")] : ["not json"];
+      await appendFile(join(kit.lib.root, p.folder, "watched", `${w1}.jsonl`), bad1.map((l) => `${l}\n`).join(""));
+      // A second register in which EVERY line fails to open (the project's key opens everything else).
+      const bad2 = encrypted ? [foreign(p.id, "ao-watch-register"), foreign(p.id, "ao-watch-register")] : ["x", "{y", "[z"];
+      await writeFile(join(kit.lib.root, p.folder, "watched", `${w2}.jsonl`), bad2.map((l) => `${l}\n`).join(""), { mode: 0o600 });
+      const r = await backupProject(kit.repo, p.id);
+      const restored = await restoreBackup(kit.repo, r.path);
+      expect(restored.linesCopiedUnread).toEqual({ findQueue: 0, watchRegister: bad1.length + bad2.length });
+      const dir = join(kit.lib.root, kit.repo.getProject(restored.projectId).folder, "watched");
+      const copy2 = (await readFile(join(dir, `${w2}.jsonl`), "utf8")).split("\n").filter(Boolean);
+      expect(copy2).toEqual(bad2);
+      expect((await readFile(join(dir, `${w1}.jsonl`), "utf8")).split("\n")).toEqual(expect.arrayContaining(bad1));
+      expect([...(await kit.repo.watchRegister(restored.projectId, w1)).keys()]).toEqual(["a.pdf"]);
+      await mkdir(dir, { recursive: true });
+    });
+  }
+
+  it("every other sealed file stays strict: an unreadable sealed line in the review queue still refuses the restore", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true, "Strict");
+    await mkdir(join(kit.lib.root, p.folder, "review"), { recursive: true });
+    await writeFile(join(kit.lib.root, p.folder, "review", "pending.jsonl"), `${foreign(p.id, "ao-review")}\n`, { mode: 0o600 });
+    const r = await backupProject(kit.repo, p.id);
+    await expect(restoreBackup(kit.repo, r.path)).rejects.toThrow(/cannot be read/u);
   });
 });

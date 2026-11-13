@@ -7,7 +7,7 @@ import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
 import { KeyRing } from "../crypto/keys.js";
 import { InvalidInputError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
-import { sealLine } from "../repo/io.js";
+import { openLine, sealLine } from "../repo/io.js";
 import type { Repo } from "../repo/repo.js";
 import type { RepoCore } from "../repo/state.js";
 import { SimulatedCrash, openTestRepo, seams, type CrashPoint } from "../repo/testing.js";
@@ -75,6 +75,7 @@ const project = async (encrypted = false): Promise<Project> =>
   ).project;
 
 const MB4 = 4 * 1024 * 1024;
+const hist = (e: FindEntry, n: number, from = 0): FindEntry[] => Array.from({ length: n }, (_, i) => ({ ...e, attempts: from + i }));
 const NOW = "2026-11-13T10:00:00.000Z";
 const candidate = (extra: Partial<WorkCandidate> = {}): WorkCandidate => ({
   id: "cand-1",
@@ -216,9 +217,10 @@ describe("the queue in the project (Task F3)", () => {
     await append(p, [a, b], "add"); // add
     await append(p, [{ ...a, state: "choose", updatedAt: "2026-11-13T10:01:00.000Z" }], "update"); // update
     await append(p, [b], "remove"); // remove
-    // Lines of a compaction (lines are 4 for 1 live entry: none due yet; force a history, then compact).
-    for (let i = 0; i < 6; i++) await append(p, [{ ...a, attempts: i + 1 }], "update");
+    // Lines of a compaction: a history of 70 superseded lines, then the compaction.
+    await rawAppend(p, hist(a, 70, 1));
     await compactFindQueue(coreOf(), p.id);
+    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
     const lines = await rawLines(p);
     expect(lines.length).toBeGreaterThan(0);
     for (const l of lines) {
@@ -233,7 +235,7 @@ describe("the queue in the project (Task F3)", () => {
     }
     expect((await readFile(queueFile(p), "utf8")).includes(a.id)).toBe(false);
     const q = await read(p);
-    expect(q.get(a.id)).toMatchObject({ typed: a.typed, attempts: 6, candidates: [candidate()] });
+    expect(q.get(a.id)).toMatchObject({ typed: a.typed, attempts: 70, candidates: [candidate()] });
     expect(q.has(b.id)).toBe(false);
   });
 
@@ -413,7 +415,7 @@ describe("the queue in the project (Task F3)", () => {
         const gone = entry(p, { typed: "removed Zorblatt" });
         await append(p, [...live, gone]);
         await append(p, [gone], "remove");
-        await rawAppend(p, Array.from({ length: 40 }, (_, i) => ({ ...live[0]!, attempts: i })));
+        await rawAppend(p, hist(live[0]!, 70));
         const folded = [...(await read(p)).values()];
         expect(folded.map((e) => e.id)).toEqual([live[1]!.id, live[0]!.id]);
         const linesBefore = (await rawLines(p)).length;
@@ -430,7 +432,7 @@ describe("the queue in the project (Task F3)", () => {
         if (!encrypted && process.platform !== "win32") expect((await stat(queueFile(p))).mode & 0o777).toBe(0o600);
         // A queue with nothing live is compacted to an empty file, which can be appended to again.
         await append(p, live, "remove");
-        await rawAppend(p, Array.from({ length: 5 }, (_, i) => ({ ...live[0]!, attempts: i, removed: true as const })));
+        await rawAppend(p, hist(live[0]!, 70).map((e) => ({ ...e, removed: true as const })));
         await compactFindQueue(coreOf(), p.id);
         expect(await readFile(queueFile(p))).toHaveLength(0);
         const again = entry(p);
@@ -439,24 +441,36 @@ describe("the queue in the project (Task F3)", () => {
       }
     });
 
-    it("is due when the lines that can be read outnumber the live entries more than twice, whatever the size; otherwise it changes nothing and audits nothing", async () => {
+    it("is due when the superseded and removed lines outnumber the live entries and number at least 64 (dead > live && dead >= 64); otherwise it changes nothing and audits nothing", async () => {
       const p = await project();
       const a = entry(p);
       const b = entry(p);
-      await append(p, [a, b]); // 2 lines for 2 live entries
-      await append(p, [{ ...a, attempts: 1 }], "update"); // 3
-      await append(p, [{ ...a, attempts: 2 }], "update"); // 4: twice the 2 live entries is not more than twice
+      await append(p, [a, b]); // 2 lines, none dead
+      await rawAppend(p, hist(a, 63)); // 65 lines, 63 dead
       const before = await readFile(queueFile(p));
-      expect(before.toString("utf8").trim().split("\n")).toHaveLength(4);
       await compactFindQueue(coreOf(), p.id);
       expect(await readFile(queueFile(p))).toEqual(before);
       expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
-      // The 5th line passes the rule: the append that wrote it compacts the file.
-      await append(p, [{ ...a, attempts: 99 }], "update");
+      await append(p, [{ ...a, attempts: 99 }], "update"); // 66 lines, 64 dead: the append that makes it due compacts
       expect(await rawLines(p)).toHaveLength(2);
       expect((await read(p)).get(a.id)?.attempts).toBe(99);
       expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toHaveLength(1);
     });
+
+    it("a small queue is not compacted at every second change: one entry changed 30 times compacts at most once", async () => {
+      const p = await project();
+      const a = entry(p);
+      await append(p, [a]);
+      for (let i = 1; i <= 30; i++) await append(p, [{ ...a, attempts: i }], "update");
+      expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBeLessThanOrEqual(1);
+      const q = await project();
+      for (let i = 0; i < 30; i++) {
+        const e = entry(q);
+        await append(q, [e]);
+        await append(q, [e], "remove");
+      }
+      expect((await findEvents(q, FIND_QUEUE_OPS.compact)).length).toBeLessThanOrEqual(1);
+    }, 60_000);
 
     it("a large file of live entries is not rewritten at every update: 4.7 MB of 90 live entries, five updates, no compaction, one audit event per update", async () => {
       const p = await project();
@@ -563,7 +577,7 @@ describe("the queue in the project (Task F3)", () => {
           const gone = entry(p);
           await append(p, [a, b, gone]);
           await append(p, [gone], "remove");
-          await rawAppend(p, Array.from({ length: 30 }, (_, i) => ({ ...a, attempts: i })));
+          await rawAppend(p, hist(a, 70));
           const before = await readFile(queueFile(p));
           const folded = [...(await read(p)).values()];
           const compactsBefore = (await findEvents(p, FIND_QUEUE_OPS.compact)).length;
@@ -623,7 +637,7 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
   };
 
   for (const encrypted of [false, true]) {
-    it(`a newer build's line (an unknown state) survives five updates and a compaction, verbatim and in order (${encrypted ? "sealed" : "plain"})`, async () => {
+    it(`a newer build's line (an unknown state) survives a compaction, verbatim and in order (${encrypted ? "sealed" : "plain"})`, async () => {
       const p = await project(encrypted);
       const a = entry(p);
       const b = entry(p);
@@ -633,8 +647,9 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
       await append(p, [{ ...a, attempts: 1 }], "update");
       const f2 = futureLine(p, encrypted, { typed: "second future" });
       await appendFile(queueFile(p), `${f2}\n`);
-      for (let i = 2; i <= 6; i++) await append(p, [{ ...a, attempts: i }], "update");
-      expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBeGreaterThanOrEqual(1);
+      await rawAppend(p, hist(a, 70, 100));
+      await append(p, [{ ...a, attempts: 6 }], "update"); // the append that makes it due compacts
+      expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
       const lines = await rawLines(p);
       expect(lines.filter((l) => l === f1 || l === f2)).toEqual([f1, f2]); // verbatim, in order
       expect(lines.length).toBe(4); // two entries and the two lines nobody could read
@@ -654,8 +669,9 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
     const a = entry(p);
     await append(p, [a]);
     await appendFile(queueFile(p), '{"id":"01a1d5de-c95e-7508-a8a2-ace1aaa9259a","typed":"cut off here\n');
-    for (let i = 1; i <= 4; i++) await append(p, [{ ...a, attempts: i }], "update");
-    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBeGreaterThanOrEqual(1);
+    await rawAppend(p, hist(a, 70, 100));
+    await append(p, [{ ...a, attempts: 4 }], "update");
+    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
     const lines = await rawLines(p);
     expect(lines).toContain('{"id":"01a1d5de-c95e-7508-a8a2-ace1aaa9259a","typed":"cut off here');
     expect((await read(p)).get(a.id)?.attempts).toBe(4);
@@ -689,12 +705,13 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
     const p = await project();
     const a = entry(p);
     await append(p, [a]);
-    await appendFile(queueFile(p), Array.from({ length: 12 }, (_, i) => `junk ${i}\n`).join(""));
+    await appendFile(queueFile(p), Array.from({ length: 200 }, (_, i) => `junk ${i}\n`).join(""));
+    await rawAppend(p, hist(a, 70, 100));
     const notes = () => coreOf().indexErrors.filter((e) => e.op === FIND_QUEUE_OPS.compact);
-    for (let i = 1; i <= 6; i++) await append(p, [{ ...a, attempts: i }], "update");
+    for (let i = 1; i <= 3; i++) await append(p, [{ ...a, attempts: i }], "update");
     expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
-    expect((await rawLines(p)).length).toBe(19);
-    expect((await read(p)).get(a.id)?.attempts).toBe(6);
+    expect((await rawLines(p)).length).toBe(1 + 200 + 70 + 3);
+    expect((await read(p)).get(a.id)?.attempts).toBe(3);
     expect(notes()).toHaveLength(1);
     expect(String((notes()[0]!.error as Error).message)).toMatch(/could not be read/u);
     await compactFindQueue(coreOf(), p.id);
@@ -718,8 +735,9 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
     await append(p, [mine]);
     mine.candidates![0]!.title = "POISONED TOO";
     mine.candidates!.push(candidate({ id: "y" }));
-    for (let i = 1; i <= 12; i++) await append(p, [{ ...b, attempts: i }], "update"); // compactions run
-    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBeGreaterThanOrEqual(1);
+    await rawAppend(p, hist(b, 70, 100));
+    await append(p, [{ ...b, attempts: 12 }], "update"); // a compaction runs
+    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
     expect(await readFile(queueFile(p), "utf8")).not.toContain("POISONED");
     expect((await read(p)).get(a.id)?.candidates).toEqual([candidate()]);
     expect((await read(p)).get(mine.id)?.candidates).toEqual([candidate()]);
@@ -740,7 +758,7 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
     await append(p, [{ ...a, typed: "again one" }], "add"); // before any compaction
     expect((await read(p)).get(a.id)?.typed).toBe("again one");
     await append(p, [{ ...a, typed: "again one" }], "remove");
-    await rawAppend(p, Array.from({ length: 3 }, (_, i) => ({ ...a, attempts: i, removed: true as const })));
+    await rawAppend(p, hist(a, 70).map((e) => ({ ...e, removed: true as const })));
     await compactFindQueue(coreOf(), p.id);
     expect(await readFile(queueFile(p))).toHaveLength(0);
     await append(p, [{ ...a, typed: "again two" }], "add"); // after one
@@ -784,7 +802,7 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
     expect((await read(p)).get(exact.id)?.candidates?.[0]?.title).toHaveLength(1000);
   });
 
-  it("M5: an automatic compaction that fails leaves a note (the append itself stays committed)", async () => {
+  it("M5/M8: an automatic compaction that fails leaves ONE note per failure state (the append itself stays committed); the next success clears the way", async () => {
     const p = await project();
     const a = entry(p);
     const b = entry(p);
@@ -793,22 +811,180 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
     const real = core.clock.bind(core);
     let calls = 0;
     core.clock = () => (calls++, real());
-    await append(p, [{ ...a, attempts: 1 }], "update"); // line 3: not due
+    await append(p, [{ ...a, attempts: 1 }], "update"); // not due
     const perWrite = calls;
     expect(perWrite).toBeGreaterThan(0);
-    await append(p, [{ ...a, attempts: 2 }], "update"); // line 4: not due
-    calls = 0;
-    core.clock = () => {
-      if (++calls > perWrite) throw new Error("the clock broke");
-      return real();
+    await rawAppend(p, hist(a, 61, 100)); // 64 lines, 62 dead
+    const broken = () => {
+      calls = 0;
+      core.clock = () => {
+        if (++calls > perWrite) throw new Error("the clock broke");
+        return real();
+      };
     };
-    await append(p, [{ ...a, attempts: 3 }], "update"); // line 5: due; the compaction fails after the append
-    core.clock = real;
-    expect((await read(p)).get(a.id)?.attempts).toBe(3);
+    broken();
+    await append(p, [{ ...a, attempts: 3 }], "update"); // 63 dead: not due
+    broken();
+    await append(p, [{ ...a, attempts: 4 }], "update"); // 64 dead: due; the compaction fails after the append
+    expect((await read(p)).get(a.id)?.attempts).toBe(4);
     expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
-    expect(coreOf().indexErrors.filter((e) => e.op === FIND_QUEUE_OPS.compact)).toHaveLength(1);
+    const notes = () => coreOf().indexErrors.filter((e) => e.op === FIND_QUEUE_OPS.compact);
+    expect(notes()).toHaveLength(1);
+    broken();
+    await append(p, [{ ...a, attempts: 5 }], "update"); // still due, fails again: the same note, not another
+    expect(notes()).toHaveLength(1);
+    expect(String((notes()[0]!.error as Error).message)).not.toContain(a.typed);
+    core.clock = real;
     expect(await txnMarkers()).toEqual([]);
-    await append(p, [{ ...a, attempts: 4 }], "update"); // the next write tries again, and now it works
+    await append(p, [{ ...a, attempts: 6 }], "update"); // the next write tries again, and now it works
     expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
+    expect(await rawLines(p)).toHaveLength(2);
   });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fix round 2: one routine reads and classifies the lines, for the reader and for compaction
+
+describe("fix round 2: what the reader sees and what compaction keeps cannot differ", () => {
+  /** An entry whose plain JSON line is about `bytes` long (works of 1,000-character titles). */
+  const sized = (p: Project, bytes: number, extra: Partial<FindEntry> = {}): FindEntry => {
+    const mk = (n: number, last: number): FindEntry => entry(p, { state: "choose-works", works: [...Array.from({ length: n }, (_, i) => candidate({ id: `w${i}`, title: "t".repeat(1000) })), candidate({ id: "last", title: "l".repeat(last) })], ...extra });
+    const e0 = mk(0, 0);
+    for (let n = 1; ; n++) {
+      const full = mk(n, 1000);
+      if (JSON.stringify(full).length >= bytes) {
+        for (let last = 0; last <= 1000; last += 5) {
+          const t = mk(n - 1, last);
+          if (JSON.stringify(t).length >= bytes) return { ...t, id: e0.id };
+        }
+        return { ...full, id: e0.id };
+      }
+    }
+  };
+
+  for (const encrypted of [false, true]) {
+    it(`the reviewer's probe: two valid lines of about 104 KB survive a compaction (${encrypted ? "sealed" : "plain"})`, async () => {
+      const p = await project(encrypted);
+      const a = entry(p);
+      const b = entry(p);
+      await append(p, [a, b]);
+      const big1 = sized(p, 104_000, { id: a.id, attempts: 5 }); // supersedes a live entry
+      const big2 = sized(p, 104_000); // an id of its own
+      expect(JSON.stringify(big1).length).toBeGreaterThan(100_000);
+      await rawAppend(p, [big1, big2]);
+      await rawAppend(p, hist(b, 70, 100));
+      const d = await readFindQueueDetailed(coreOf(), p.id);
+      expect(d.unreadableLines).toBe(0); // a valid line is an entry, whatever its length (up to the memory cap)
+      expect(d.entries.get(a.id)?.works).toHaveLength(big1.works!.length);
+      expect(d.entries.get(big2.id)?.attempts).toBe(0);
+      const before = [...(await read(p)).values()];
+      await compactFindQueue(coreOf(), p.id);
+      expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
+      expect([...(await read(p)).values()]).toEqual(before);
+      expect(await rawLines(p)).toHaveLength(3);
+    });
+  }
+
+  it("a line over the 1 MiB memory cap is carried over unparsed, verbatim and in place, whatever it holds", async () => {
+    const p = await project();
+    const a = entry(p);
+    await append(p, [a]);
+    const huge = JSON.stringify({ ...entry(p), pad: "x".repeat(1_200_000) }); // looks like an entry, but is over the cap
+    const junk = "z".repeat(1_100_000);
+    await appendFile(queueFile(p), `${huge}
+`);
+    await rawAppend(p, hist(a, 70, 100));
+    await appendFile(queueFile(p), `${junk}
+`);
+    expect((await readFindQueueDetailed(coreOf(), p.id)).unreadableLines).toBe(2);
+    await compactFindQueue(coreOf(), p.id);
+    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
+    const lines = await rawLines(p);
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toBe(huge);
+    expect(lines[2]).toBe(junk);
+    expect((await read(p)).get(a.id)?.attempts).toBe(169);
+  });
+
+  it("the 64 KiB bound is on the entry's plain JSON both ways: an entry accepted at 63 KiB plain is read back as an entry after sealing", async () => {
+    const p = await project(true);
+    const e = sized(p, 64_700);
+    const plain = JSON.stringify(e).length;
+    expect(plain).toBeGreaterThanOrEqual(63 * 1024);
+    expect(plain).toBeLessThan(FIND_LINE_MAX_BYTES);
+    await append(p, [e]);
+    const raw = (await rawLines(p))[0]!;
+    expect(raw.length).toBeGreaterThan(plain); // the sealed line is longer than the entry's JSON
+    const d = await readFindQueueDetailed(coreOf(), p.id);
+    expect(d.unreadableLines).toBe(0);
+    expect(d.entries.get(e.id)).toEqual(e);
+    // And it goes through a compaction as an entry.
+    await rawAppend(p, hist(e, 70, 1));
+    await compactFindQueue(coreOf(), p.id);
+    expect((await read(p)).get(e.id)?.attempts).toBe(70);
+    expect((await readFindQueueDetailed(coreOf(), p.id)).unreadableLines).toBe(0);
+  });
+
+  for (const encrypted of [false, true]) {
+    it(`property: in a file of mixed lines every complete line that is not superseded or removed survives a compaction, byte for byte or as its live entry, in order (${encrypted ? "sealed" : "plain"})`, async () => {
+      const p = await project(encrypted);
+      const core = coreOf();
+      const st = core.state(p.id);
+      const k = encrypted ? core.key(st) : undefined;
+      const seal = (o: unknown) => (k ? sealLine(k.key, k.keyId, p.id, JSON.stringify(o), "ao-find-queue") : JSON.stringify(o));
+      let seed = 12345;
+      const rnd = (n: number) => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed % n;
+      };
+      const ids = Array.from({ length: 6 }, () => newId());
+      const mk = (id: string, attempts: number, extra: Partial<FindEntry> = {}): FindEntry => ({ ...entry(p), id, attempts, ...extra });
+      type Line = { text: string; id?: string; removed?: boolean; carried: boolean };
+      const lines: Line[] = [];
+      let big = 0;
+      for (let i = 0; i < 300; i++) {
+        const r = rnd(100);
+        const id = ids[rnd(ids.length)]!;
+        if (r < 60) lines.push({ text: seal(mk(id, i)), id, carried: false });
+        else if (r < 70) lines.push({ text: seal({ ...mk(id, i), removed: true, typed: "" }), id, removed: true, carried: false });
+        else if (r < 78) lines.push({ text: seal({ ...mk(id, i), state: "from-the-future" }), carried: true });
+        else if (r < 86) lines.push({ text: `garbage ${i} ${"g".repeat(rnd(50))}`, carried: true });
+        else if (r < 89 && big < 2) {
+          big++;
+          lines.push({ text: seal(sized(p, 90_000 + rnd(30_000), { id, attempts: i })), id, carried: false }); // valid, over 64 KiB
+        } else if (r < 91 && big < 3) {
+          big++;
+          lines.push({ text: "o".repeat(1_100_000 + rnd(1000)), carried: true }); // over the memory cap
+        } else lines.push({ text: seal(mk(id, i)), id, carried: false });
+      }
+      await mkdirp(join(lib.root, p.folder, "find"));
+      await writeFile(queueFile(p), lines.map((l) => `${l.text}
+`).join(""), { mode: 0o600 });
+      // What must be there afterwards, by the test's own reckoning: carried lines verbatim, and the last line of each id unless it removes it.
+      const last = new Map<string, number>();
+      lines.forEach((l, i) => l.id && last.set(l.id, i));
+      const expected = lines.filter((l, i) => l.carried || (l.id !== undefined && last.get(l.id) === i && !l.removed));
+      const before = await readFindQueueDetailed(coreOf(), p.id);
+      await compactFindQueue(coreOf(), p.id);
+      expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
+      const after = await rawLines(p);
+      expect(after).toHaveLength(expected.length);
+      const tokenOf = (text: string, wasLine?: Line) => {
+        if (wasLine?.carried || !wasLine) {
+          try {
+            const o = JSON.parse(k ? openLine(k.key, p.id, text, "ao-find-queue") : text) as { id?: string; attempts?: number; state?: string };
+            if (o.state && o.state !== "from-the-future" && o.id) return `E:${o.id}:${o.attempts}`;
+          } catch {
+            /* not an entry */
+          }
+          return `U:${text}`;
+        }
+        const o = JSON.parse(k ? openLine(k.key, p.id, text, "ao-find-queue") : text) as { id: string; attempts: number };
+        return `E:${o.id}:${o.attempts}`;
+      };
+      expect(after.map((t) => tokenOf(t))).toEqual(expected.map((l) => tokenOf(l.text, l)));
+      expect([...(await read(p)).values()].map((e) => `${e.id}:${e.attempts}`).sort()).toEqual([...before.entries.values()].map((e) => `${e.id}:${e.attempts}`).sort());
+      expect((await readFindQueueDetailed(coreOf(), p.id)).unreadableLines).toBe(before.unreadableLines);
+    }, 60_000);
+  }
 });
