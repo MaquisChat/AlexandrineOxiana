@@ -1,5 +1,5 @@
 {
-  "request": 3,
+  "request": 4,
   "architectures": "apple-silicon",
-  "note": "The build for the owner's hands-on tests: every defect of the first build fixed (D1-D8, D10-D17, D21), with the browser extension as a download of the same run. Requested after GitHub's run 203 on the last product merge was green."
+  "note": "Build 3 plus the three fixes made after the owner's hands-on tests found no errors: the extension remembers the downloader choice (D18), a conflict found by a later check enters the review queue (D19), the audit names the confirmed field (D20). Requested after GitHub's run 206 was green."
 }
