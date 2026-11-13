@@ -32,6 +32,8 @@ interface FakeOpts {
 function fakeHandle(o: FakeOpts) {
   const got: number[] = [];
   const cleaned: number[] = [];
+  /** The pages whose text was read, once a read. */
+  const textReads: number[] = [];
   const renders: Array<{ page: number; canvas: HTMLCanvasElement; viewport: { width: number; height: number; scale: number; rotation: number }; transform?: number[]; cancelled: boolean; release(): void }> = [];
   let fail: (e: PdfOpenError) => void = () => {};
   const failed = new Promise<PdfOpenError>((r) => {
@@ -90,7 +92,7 @@ function fakeHandle(o: FakeOpts) {
         },
       };
     },
-    getTextContent: async () => ({ items: (o.text?.(n) ?? []).map((str) => ({ str, dir: "ltr", transform: [10, 0, 0, 10, 50, 700], width: 100, height: 10, fontName: "f1", hasEOL: false })), styles: { f1: { fontFamily: "sans-serif", ascent: 0.8, descent: -0.2, vertical: false } }, lang: null }),
+    getTextContent: async () => (textReads.push(n), { items: (o.text?.(n) ?? []).map((str) => ({ str, dir: "ltr", transform: [10, 0, 0, 10, 50, 700], width: 100, height: 10, fontName: "f1", hasEOL: false })), styles: { f1: { fontFamily: "sans-serif", ascent: 0.8, descent: -0.2, vertical: false } }, lang: null }),
     cleanup: () => {
       cleaned.push(n);
       if (dead) return Promise.reject(new PdfOpenError("other", "This document was closed."));
@@ -125,6 +127,7 @@ function fakeHandle(o: FakeOpts) {
   return {
     handle,
     got,
+    textReads,
     cleaned,
     renders,
     workerCleanups,
@@ -304,6 +307,32 @@ describe("PdfPages (Task R7)", () => {
     unmount();
     expect(pending.every((r) => r.cancelled)).toBe(true);
     expect(pending.every((r) => r.canvas.width === 0 && r.canvas.height === 0)).toBe(true);
+  });
+
+  it("each drawn page's text, read once through the guarded read, is handed to onPageText; nothing after the handle failed (R8)", async () => {
+    const f = fakeHandle({ pages: 10, text: (n) => [`Words of page ${n}`] });
+    const onPageText = vi.fn();
+    render(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={1} onPageChange={() => {}} renderOverlay={() => null} onPageText={onPageText} />);
+    await flush();
+    await waitFor(() => expect(onPageText).toHaveBeenCalled());
+    const [index, text] = onPageText.mock.calls.find((c) => c[0] === 0)!;
+    expect(index).toBe(0);
+    expect(text.items.map((i: { str: string }) => i.str)).toEqual(["Words of page 1"]);
+    // Every page handed on was drawn, and its text was read once only (the text layer's read).
+    const handed = onPageText.mock.calls.map((c) => c[0] + 1);
+    for (const n of handed) expect(f.textReads.filter((r) => r === n)).toHaveLength(1);
+
+    // After the failure, a drawing let go late hands nothing on.
+    const g = fakeHandle({ pages: 10, holdRenders: true, text: (n) => [`Words of page ${n}`] });
+    const late = vi.fn();
+    render(<PdfPages handle={g.handle} scale={1} rotation={0} currentPage={1} onPageChange={() => {}} renderOverlay={() => null} onPageText={late} />);
+    await flush();
+    const pending = [...g.renders];
+    g.fail(new PdfOpenError("locked"));
+    await flush();
+    for (const r of pending) r.release();
+    await flush();
+    expect(late).not.toHaveBeenCalled();
   });
 
   it("scrolling to another page reports it", async () => {

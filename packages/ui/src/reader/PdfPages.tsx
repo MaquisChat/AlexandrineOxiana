@@ -45,7 +45,7 @@ import type { PdfHandle } from "./pdfjs";
 import "./Reader.css";
 
 /** A page's text as pdf.js gives it. */
-type TextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>;
+export type TextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>;
 
 /** The most pages that hold a canvas at once. */
 export const MAX_RENDERED_PAGES = 6;
@@ -79,6 +79,12 @@ export interface PdfPagesProps {
   onPageChange(n: number): void;
   /** What to draw over a drawn page (highlights, R8): its 0-based index and its viewport. */
   renderOverlay(pageIndex: number, viewport: PageViewport): ReactNode;
+  /**
+   * Given a drawn page's text (R8: to check highlights' quotes against it), with its 0-based index:
+   * the text its text layer is made from, read once, through the guarded read (raced against the
+   * handle's failure, A7); never after the handle failed, a drawing was dropped or the screen left.
+   */
+  onPageText?(pageIndex: number, text: TextContent): void;
 }
 
 /** A page's size at 100%, turned by its own /Rotate only. */
@@ -155,7 +161,7 @@ function quietly<T>(call: () => T): T | undefined {
   }
 }
 
-export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, renderOverlay }: PdfPagesProps) {
+export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, renderOverlay, onPageText }: PdfPagesProps) {
   const count = handle.pageCount;
   const [sizes, setSizes] = useState<ReadonlyMap<number, Size>>(() => new Map());
   const [drawn, setDrawn] = useState<ReadonlyMap<number, Drawn>>(() => new Map());
@@ -177,6 +183,8 @@ export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, r
   const ownScroll = useRef<number | undefined>(undefined);
   const pageChange = useRef(onPageChange);
   pageChange.current = onPageChange;
+  const pageText = useRef(onPageText);
+  pageText.current = onPageText;
   /** The pages to draw, in the order they are drawn. */
   const order = useRef<number[]>([]);
   const current = useRef(currentPage);
@@ -426,6 +434,7 @@ export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, r
         setDrawn((m) => new Map(m).set(n, { viewport, canvasBytes, pictureBytes: pictures, heldBytes }));
         const text: TextContent = await live(page.getTextContent());
         if (stale()) return;
+        pageText.current?.(n - 1, text);
         const hasText = text.items.some((i) => "str" in i && i.str.trim() !== "");
         if (hasText) {
           const host = textHosts.current.get(n);

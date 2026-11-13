@@ -12,7 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readerApi } from "../api/reader";
+import { readerApi, type AnnotationRecord } from "../api/reader";
 import { PdfOpenError, type PdfHandle } from "../reader/pdfjs";
 import { server, serviceError, SOURCE_FILE, testClient, url, useMockService } from "../test/service";
 import { QUESTION_RETRY_MS, QUESTION_TIMEOUT_MS, ReaderRoute } from "../routes/reader";
@@ -62,8 +62,30 @@ interface Fake {
   holdRenders: Array<() => void>;
 }
 
-/** A stand-in open document of `pages` A4 pages without text. */
-function fakeHandle(pages = 12, opts: { labels?: string[] | null; hold?: boolean } = {}): Fake {
+/** A text item of the stand-in pages: `str` at baseline (x, y), `size` points, `width` points long. */
+const textItem = (str: string, x: number, y: number, size: number, width: number) => ({ str, dir: "ltr", transform: [size, 0, 0, size, x, y], width, height: size, fontName: "f1", hasEOL: false });
+
+/** A viewport of an A4 page (view box 0 0 595 842) as pdf.js 6.4.299 makes it. */
+function a4Viewport(scale: number, rotation: number) {
+  const [A, B, C, D] = rotation === 90 ? [0, 1, 1, 0] : rotation === 180 ? [-1, 0, 0, 1] : rotation === 270 ? [0, -1, -1, 0] : [1, 0, 0, -1];
+  const turned = A === 0;
+  const [cx, cy] = [297.5, 421];
+  const ox = (turned ? cy : cx) * scale;
+  const oy = (turned ? cx : cy) * scale;
+  const t = [A! * scale, B! * scale, C! * scale, D! * scale, ox - A! * scale * cx - C! * scale * cy, oy - B! * scale * cx - D! * scale * cy];
+  return {
+    width: (turned ? 842 : 595) * scale,
+    height: (turned ? 595 : 842) * scale,
+    scale,
+    rotation,
+    rawDims: { pageWidth: 595, pageHeight: 842, pageX: 0, pageY: 0 },
+    transform: t,
+    convertToViewportPoint: (x: number, y: number) => [t[0]! * x + t[2]! * y + t[4]!, t[1]! * x + t[3]! * y + t[5]!],
+  };
+}
+
+/** A stand-in open document of `pages` A4 pages, without text unless `text` gives a page's items. */
+function fakeHandle(pages = 12, opts: { labels?: string[] | null; hold?: boolean; text?: (n: number) => ReturnType<typeof textItem>[]; textReads?: number[] } = {}): Fake {
   let fail: (e: PdfOpenError) => void = () => {};
   const failed = new Promise<PdfOpenError>((r) => {
     fail = r;
@@ -73,7 +95,7 @@ function fakeHandle(pages = 12, opts: { labels?: string[] | null; hold?: boolean
   const destroy = vi.fn(async () => {
     dead = true;
   });
-  const vp = (scale: number, rotation: number) => ({ width: (rotation % 180 ? 842 : 595) * scale, height: (rotation % 180 ? 595 : 842) * scale, scale, rotation, rawDims: { pageWidth: 595, pageHeight: 842, pageX: 0, pageY: 0 } });
+  const vp = a4Viewport;
   const page = (n: number) => ({
     pageNumber: n,
     rotate: 0,
@@ -89,7 +111,10 @@ function fakeHandle(pages = 12, opts: { labels?: string[] | null; hold?: boolean
       else queueMicrotask(release);
       return { promise, cancel: () => reject(Object.assign(new Error("cancelled"), { name: "RenderingCancelledException" })) };
     },
-    getTextContent: async () => ({ items: [], styles: {}, lang: null }),
+    getTextContent: async () => {
+      opts.textReads?.push(n);
+      return { items: opts.text?.(n) ?? [], styles: { f1: { fontFamily: "sans-serif", ascent: 0.718, descent: -0.207, vertical: false } }, lang: null };
+    },
     cleanup: () => true,
   });
   const handle = {
@@ -122,8 +147,14 @@ function screenFor(props: Partial<Parameters<typeof ReaderScreen>[0]> = {}) {
   return render(<ReaderScreen api={readerApi(testClient())} projectId="p1" sourceId="s1" assetId="a1" readOnly={false} {...props} />);
 }
 
+/** The annotation list route: `list`, or what `answer` answers. */
+function serveAnnotations(list: AnnotationRecord[], answer?: () => Response | Promise<Response>) {
+  server.use(http.get(url("/projects/:id/sources/:sid/annotations"), () => (answer ? answer() : (HttpResponse.json({ annotations: list, count: list.length, textChars: 0 }) as unknown as Response))));
+}
+
 beforeEach(() => {
   requests = [];
+  serveAnnotations([]);
   server.events.on("request:start", record);
   openPdf.mockReset();
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(function (this: HTMLCanvasElement) {
@@ -608,10 +639,12 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
     return r;
   }
 
-  /** Nothing of the document is in the page: no canvas, no text layer, no page, no word of it. */
+  /** Nothing of the document is in the page: no canvas, no text layer, no page, no word of it; nothing of its annotations (R8). */
   function expectNothingLeft(container: HTMLElement) {
     expect(container.querySelectorAll("canvas, .ao-reader-text-layer, [data-page-number]").length).toBe(0);
     expect(document.body.textContent).not.toContain("Words of page");
+    expect(container.querySelectorAll(".ao-hl, .ao-hl-layer, .ao-reader-hl-notices").length).toBe(0);
+    expect(document.body.textContent).not.toContain("A quote that is not there");
     expect(document.querySelectorAll("canvas").length === 0 || [...document.querySelectorAll("canvas")].every((c) => !c.isConnected || c.width * c.height === 0)).toBe(true);
   }
 
@@ -620,8 +653,14 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
   it("a lock of its project, with every page already fetched, ends the reader at once", async () => {
     let unlocked = true;
     const svc = serveRoute({ unlocked: () => unlocked });
+    // Two highlights on page 1 (R8): one on its words, one whose text has changed, said so on screen.
+    const at = { id: "", assetId: "a1", page: 1, rects: [{ x: 50, y: 698, w: 100, h: 10 }], sortIndex: "00000|000000|00000", sortIndexDerived: false };
+    const hl = (id: string, quote: string): AnnotationRecord => ({ id, sourceId: "s1", kind: "highlight", pdfAnchors: [{ ...at, id: `${id}-a` }], otherAnchorKinds: [], quote, colorName: "blue", imported: true, author: "me", createdAt: "2026-11-13T10:00:00Z" });
+    serveAnnotations([hl("on-words", "Words of page 1"), hl("changed", "A quote that is not there")]);
     const f = textHandle();
     const { container } = await openRoute(f);
+    await waitFor(() => expect(container.querySelectorAll('[data-page-number="1"] .ao-hl')).toHaveLength(2));
+    await waitFor(() => expect(container.querySelector(".ao-reader-hl-notices")?.textContent).toContain("A quote that is not there"));
     const documentCalls = requests.filter((r) => r.url.includes("/document")).length;
     svc.events.send("library.state", STATE);
     await flush();
@@ -915,5 +954,164 @@ describe("ReaderScreen, fix round 2 (A10)", () => {
     await flush();
     await new Promise((r) => setTimeout(r, 120));
     expect(document.activeElement).toBe(next);
+  });
+});
+
+describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
+  /** "Words of page n" in 10-point Helvetica at x 50, baseline 700 (73.37 points long), on every page. */
+  const words = (n: number) => [textItem(`Words of page ${n}`, 50, 700, 10, 73.37)];
+  /** Its glyphs' box: what a highlight of those words stores. */
+  const onWords = [{ x: 50, y: 700 - 2.07, w: 73.37, h: 9.25 }];
+  let made = 0;
+  function rec(o: Partial<AnnotationRecord> & { page?: number; assetId?: string; rects?: Array<{ x: number; y: number; w: number; h: number }> }): AnnotationRecord {
+    const id = o.id ?? `an-${++made}`;
+    const { page = 1, assetId = "a1", rects = onWords, ...rest } = o;
+    return {
+      id,
+      sourceId: "s1",
+      kind: "highlight",
+      pdfAnchors: [{ id: `${id}-a`, assetId, page, rects, sortIndex: "00000|000000|00000", sortIndexDerived: true }],
+      otherAnchorKinds: [],
+      quote: `Words of page ${page}`,
+      colorName: "yellow",
+      imported: false,
+      author: "me",
+      createdAt: "2026-11-13T10:00:00Z",
+      ...rest,
+    };
+  }
+  const drawnOn = (n: number) => [...document.querySelectorAll<HTMLElement>(`[data-page-number="${n}"] .ao-hl`)].map((e) => e.dataset.annotation);
+  const CHANGED = "The text here has changed since this highlight was made.";
+
+  it("this file's annotations are drawn on their pages, imported and new alike; another file's are not", async () => {
+    serveDocument();
+    serveAnnotations([
+      rec({ id: "imported", imported: true, importedColour: "#ffd400" }),
+      rec({ id: "made", colorName: "green" }),
+      rec({ id: "other-file", assetId: "a2" }),
+      rec({ id: "page-2", page: 2 }),
+      rec({ id: "no-place", pdfAnchors: [] }),
+    ]);
+    openPdf.mockResolvedValueOnce(fakeHandle(3, { text: words }).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 3" });
+    await waitFor(() => expect(drawnOn(1)).toEqual(["imported", "made"]));
+    await waitFor(() => expect(drawnOn(2)).toEqual(["page-2"]));
+    // Both drawn by the same code at the same place; the colour by class only.
+    const [a, b] = [...document.querySelectorAll<HTMLElement>('[data-page-number="1"] .ao-hl')];
+    expect(a!.getAttribute("style")).toBe(b!.getAttribute("style"));
+    expect(a!.classList.contains("ao-hl--yellow")).toBe(true);
+    expect(b!.classList.contains("ao-hl--green")).toBe(true);
+    // At 100% (4/3 CSS pixels a point): x from 50, top from 842 − 707.18.
+    expect(parseFloat(a!.style.left)).toBeCloseTo(50 * (4 / 3), 4);
+    expect(parseFloat(a!.style.top)).toBeCloseTo((842 - (700 - 2.07 + 9.25)) * (4 / 3), 4);
+    // The overlay is hidden from assistive technology; nothing of the quotes is in it.
+    expect(document.querySelector(".ao-hl-layer")!.getAttribute("aria-hidden")).toBe("true");
+    expect(screen.queryByText(CHANGED, { exact: false })).toBeNull();
+  });
+
+  it("a highlight whose text no longer matches says so and is drawn dashed; one on a page the file does not have says so; a page not drawn says nothing yet", async () => {
+    serveDocument();
+    const textReads: number[] = [];
+    serveAnnotations([
+      rec({ id: "same" }),
+      rec({ id: "changed", quote: "Other words entirely" }),
+      rec({ id: "far", page: 412, quote: "On a page long gone" }),
+      rec({ id: "unseen", page: 12, quote: "Not what page 12 says" }),
+    ]);
+    openPdf.mockResolvedValueOnce(fakeHandle(12, { text: words, textReads }).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 12" });
+    const notices = await screen.findByRole("region", { name: "Highlights to check" });
+    await waitFor(() => expect(notices.textContent).toContain(CHANGED));
+    expect(notices.textContent).toContain("This highlight is on page 412, which this file does not have.");
+    const items = within(notices).getAllByRole("listitem").map((li) => li.textContent);
+    expect(items).toEqual(["Page 1, “Other words entirely”: " + CHANGED, "Page 412, “On a page long gone”: This highlight is on page 412, which this file does not have."]);
+    expect(document.querySelector('[data-annotation="changed"]')!.classList.contains("ao-hl--changed")).toBe(true);
+    expect(document.querySelector('[data-annotation="same"]')!.classList.contains("ao-hl--changed")).toBe(false);
+    // Page 12 is not drawn: its highlight is not checked, and nothing is said of it.
+    expect(notices.textContent).not.toContain("Not what page 12 says");
+    // The text was read once a drawn page, by the pages themselves: never a second time to check quotes.
+    expect(textReads.length).toBeGreaterThan(0);
+    for (const n of new Set(textReads)) expect(textReads.filter((r) => r === n)).toHaveLength(1);
+    expect(textReads).not.toContain(12);
+  });
+
+  it("clicking a highlight selects it", async () => {
+    serveDocument();
+    serveAnnotations([rec({ id: "one" })]);
+    openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
+    screenFor();
+    const page = await screen.findByRole("region", { name: "Page 1 of 2" });
+    await waitFor(() => expect(drawnOn(1)).toEqual(["one"]));
+    const mark = document.querySelector<HTMLElement>('[data-annotation="one"]')!;
+    fireEvent.click(page, { clientX: parseFloat(mark.style.left) + 5, clientY: parseFloat(mark.style.top) + 5 });
+    await waitFor(() => expect(document.querySelector('[data-annotation="one"]')!.classList.contains("ao-hl--selected")).toBe(true));
+  });
+
+  it("a 423 while the list is asked for: nothing of the annotations is left, and its answer arriving afterwards is dropped", async () => {
+    serveDocument();
+    let answer: (r: Response) => void = () => {};
+    const held = new Promise<Response>((r) => (answer = r));
+    serveAnnotations([], () => held);
+    const f = fakeHandle(3, { text: words });
+    openPdf.mockResolvedValueOnce(f.handle);
+    const { container } = screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 3" });
+    await waitFor(() => expect(requests.some((r) => r.url.endsWith("/annotations"))).toBe(true));
+    await flush();
+    act(() => f.fail(new PdfOpenError("locked")));
+    await expectState("Project locked", SENTENCES.locked);
+    // The list's answer comes late: dropped.
+    answer(HttpResponse.json({ annotations: [rec({ id: "late", quote: "a late quote" })], count: 1, textChars: 12 }) as unknown as Response);
+    await flush();
+    expect(container.querySelectorAll(".ao-hl, .ao-hl-layer").length).toBe(0);
+    expect(document.body.textContent).not.toContain("a late quote");
+    expect(screen.queryByRole("region", { name: "Highlights to check" })).toBeNull();
+  });
+
+  it("highlights drawn, then a 423: every highlight, quote and notice goes with the document", async () => {
+    serveDocument();
+    serveAnnotations([rec({ id: "kept" }), rec({ id: "changed", quote: "Some quoted words" })]);
+    const f = fakeHandle(3, { text: words });
+    openPdf.mockResolvedValueOnce(f.handle);
+    const { container } = screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 3" });
+    await waitFor(() => expect(drawnOn(1)).toEqual(["kept", "changed"]));
+    await screen.findByRole("region", { name: "Highlights to check" });
+    act(() => f.fail(new PdfOpenError("locked")));
+    await expectState("Project locked", SENTENCES.locked);
+    expect(container.querySelectorAll(".ao-hl, .ao-hl-layer").length).toBe(0);
+    expect(document.body.textContent).not.toContain("Some quoted words");
+    expect(screen.queryByRole("region", { name: "Highlights to check" })).toBeNull();
+  });
+
+  it("a list answer arriving after the screen left is dropped, quietly", async () => {
+    serveDocument();
+    let answer: (r: Response) => void = () => {};
+    const held = new Promise<Response>((r) => (answer = r));
+    serveAnnotations([], () => held);
+    openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
+    const errors = vi.spyOn(console, "error");
+    const { unmount } = screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 2" });
+    await waitFor(() => expect(requests.some((r) => r.url.endsWith("/annotations"))).toBe(true));
+    unmount();
+    answer(HttpResponse.json({ annotations: [rec({ id: "late", quote: "a late quote" })], count: 1, textChars: 12 }) as unknown as Response);
+    await flush();
+    expect(document.body.textContent).not.toContain("a late quote");
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it("the list is asked for once an opening, with ids only; a refused list says so in plain words and the pages still read", async () => {
+    serveDocument();
+    serveAnnotations([], () => serviceError(403, "POLICY_DENIED", "This project's rules do not allow it.") as unknown as Response);
+    openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 2" });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("The highlights of this file could not be shown: This project's rules do not allow it.");
+    expect(requests.filter((r) => r.url.endsWith("/annotations")).map((r) => new URL(r.url).pathname)).toEqual(["/projects/p1/sources/s1/annotations"]);
+    expect(screen.getByRole("region", { name: "Page 1 of 2" })).toBeTruthy();
   });
 });
