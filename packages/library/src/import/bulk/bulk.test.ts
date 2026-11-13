@@ -1578,7 +1578,7 @@ describe("context hooks and gone items (Z2)", () => {
     expect(nonInc[0]).toEqual({ skip: "function", knownIds: undefined });
   });
 
-  it("a gone item changes nothing here and is not journaled (Z5 marks it); a dry run does not count it", async () => {
+  it("a gone item whose source is not its own Zotero item's changes nothing here and is only counted apart (Z5); a dry run does not count it", async () => {
     const p = await project();
     await run(p, plain([ref("A", "Alpha")]));
     const [id] = repo.listSourceIds(p.id);
@@ -1587,9 +1587,11 @@ describe("context hooks and gone items (Z2)", () => {
     expect(before.size).toBeGreaterThan(0);
     const { result, handle: h } = await run(p, plain([{ key: "A", files: [], gone: "deleted", version: { id: "lib/A", version: "deleted" } }]));
     expect(result.state).toBe("finished");
-    expect(result.counts.items).toBe(0);
+    expect(result.counts).toMatchObject({ items: 0, goneInZotero: 0, goneNotMarked: 1 });
     expect(await tree(await folderOf())).toEqual(before);
-    expect(existsSync(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"))).toBe(false);
+    // Z5: the source's provenance does not name this Zotero item of this library: not marked, one line counting it.
+    const lines = readFileSync(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines).toEqual([{ key: "A", outcome: "zotero-gone-unmarked", gone: "deleted" }]);
     expect(h.batchId).toBeTruthy();
     const dry = await bulk.dryRun(p.id, plain([{ key: "B", files: [], gone: "bin", version: { id: "lib/B", version: "bin:3" } }]));
     expect(dry.items).toBe(0);

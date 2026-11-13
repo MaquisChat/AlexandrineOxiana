@@ -421,41 +421,55 @@ describe("gone from Zotero, and back (Z5)", () => {
     expect((await repo.getSource(p.id, id)).source.availability).toEqual(mine);
   });
 
-  it("a crash inside the mark's change rolls it back", async () => {
-    const { SimulatedCrash, seams } = await import("../../repo/testing.js");
-    const p = await project();
-    const { p: key } = await highlighted("Crash while marking");
-    await run(p);
-    const sf = await sourceOf(p, key);
-    const before = await folderBytes(sf.source.folder);
-    z.remove(U, key);
-    // The first new folder of the mark's change is its snapshot folder: crash that change before its audit.
-    let armed = false;
-    seams.beforeMkdir = async (abs) => {
-      if (abs.endsWith("snapshots")) {
+  // The crash is armed from inside the mark's own governed change (when it makes its snapshot folder, the first new
+  // folder of that change), and every later audit append fails, so the run cannot carry on in-process after it.
+  for (const point of ["before-changes", "before-audit", "before-marker-delete"] as const) {
+    it(`a crash inside the mark's change rolls it back (${point}: source, journal and audit agree; the next run marks it)`, async () => {
+      const { seams } = await import("../../repo/testing.js");
+      const p = await project();
+      const { p: key } = await highlighted("Crash while marking");
+      await run(p);
+      const sf = await sourceOf(p, key);
+      const before = await folderBytes(sf.source.folder);
+      z.remove(U, key);
+      let fired = false;
+      seams.beforeMkdir = async (abs) => {
+        if (fired || !abs.endsWith("snapshots")) return;
+        fired = true;
+        seams.crashAt = point;
+        seams.failAuditAppendFor = p.id;
+      };
+      try {
+        await (await startZoteroWebImport(bulkDeps(), p.id, zweb)).done;
+      } catch {
+        // the process "died" at the crash point
+      } finally {
         seams.beforeMkdir = undefined;
-        seams.crashAt = "before-audit";
-        armed = true;
+        seams.crashAt = undefined;
+        seams.failAuditAppendFor = undefined;
       }
-    };
-    const h = await startZoteroWebImport(bulkDeps(), p.id, zweb);
-    await h.done.catch((e: unknown) => {
-      if (!(e instanceof SimulatedCrash)) throw e;
+      expect(fired).toBe(true);
+      handle.close();
+      await lib.close();
+      lib = await openLibrary(join(tmp, "Library"), deps());
+      handle = new IndexHandle(lib.root);
+      repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+      const now = (await repo.getSource(p.id, sf.source.id)).source.availability;
+      const marked = now.zotero === "deleted";
+      const lines = (await journal(p, 2).catch(() => [])).filter((e) => e.outcome === "zotero-gone" && e.merge?.availability);
+      // All of it or none of it: the source, its journal line and its audit event.
+      expect(lines).toHaveLength(marked ? 1 : 0);
+      expect(await marks(p)).toHaveLength(marked ? 1 : 0);
+      if (point !== "before-marker-delete") {
+        expect(marked).toBe(false); // before the commit point: rolled back, byte for byte
+        expect(await folderBytes(sf.source.folder)).toEqual(before);
+      }
+      // The next run (the version was not recorded by the run that died) marks it.
+      await run(p);
+      expect((await repo.getSource(p.id, sf.source.id)).source.availability.zotero).toBe("deleted");
+      expect(await marks(p)).toHaveLength(1);
     });
-    seams.beforeMkdir = undefined;
-    // The crash fired inside the mark's change (the seam is spent).
-    expect(armed).toBe(true);
-    expect(seams.crashAt).toBeUndefined();
-    seams.crashAt = undefined;
-    handle.close();
-    await lib.close();
-    lib = await openLibrary(join(tmp, "Library"), deps());
-    handle = new IndexHandle(lib.root);
-    repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
-    expect(await folderBytes(sf.source.folder)).toEqual(before);
-    expect((await repo.getSource(p.id, sf.source.id)).source.availability).toEqual({ status: "available" });
-    expect(await marks(p)).toEqual([]);
-  });
+  }
 
   it("an encrypted project's audit line holds no title, and nothing of the mark is in the clear", async () => {
     const p = await project({ encrypted: true });
@@ -468,11 +482,15 @@ describe("gone from Zotero, and back (Z5)", () => {
     expect((await repo.getSource(p.id, repo.listSourceIds(p.id)[0]!)).source.availability.zotero).toBe("deleted");
     const [m] = await marks(p);
     expect(m!.details).toMatchObject({ marked: "deleted" });
-    // No byte of the title, and no plain word of the mark, anywhere in the project's files.
+    // No plain word of the mark anywhere in the project's files, and no byte of the title in what the mark wrote:
+    // the audit log, the batch's journal, record and snapshot. (Folder names carry a short title in this project
+    // by its own settings, as before this task: no file name is looked at here.)
     const hits: string[] = [];
     for (const name of await readdir(join(lib.root, p.folder), { recursive: true })) {
       const b = await readFile(join(lib.root, p.folder, name)).catch(() => null);
-      if (b && (b.includes("Confidential fieldwork") || b.includes("unavailable-on-platform"))) hits.push(name);
+      if (!b) continue;
+      if (b.includes("unavailable-on-platform") || b.includes(`"zotero":"deleted"`)) hits.push(name);
+      if ((name.startsWith("audit") || name.startsWith("imports")) && (b.includes("Confidential fieldwork") || b.includes(key))) hits.push(name);
     }
     expect(hits).toEqual([]);
   });

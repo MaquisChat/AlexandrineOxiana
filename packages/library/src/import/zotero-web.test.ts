@@ -1734,7 +1734,7 @@ processing:
       expect(since).toBeUndefined();
     });
 
-    it("imports, records the library version, then asks only since it; Zotero deletions are yielded as gone and change nothing here", async () => {
+    it("imports, records the library version, then asks only since it; Zotero deletions are yielded as gone and only marked here (Z5)", async () => {
       const p = await project();
       const a1 = z.addItem(U, { itemType: "journalArticle", title: "First title" });
       const a2 = z.addItem(U, { itemType: "journalArticle", title: "Second", DOI: "10.5555/ao.web.2024.002" });
@@ -1755,10 +1755,14 @@ processing:
       expect(z.requests.filter((q) => q.path.startsWith("/users/42/items?")).every((q) => page(q.path).get("since") === String(v1))).toBe(true);
       expect(r2.counts).toMatchObject({ updated: 1, created: 0, failed: 0 });
       expect(repo.listSourceIds(p.id)).toHaveLength(2); // the Zotero deletion was not applied here
+      // Z5: the source is kept and marked; nothing else of it changes.
       const second = (await sources(p)).find((sf) => sf.source.provenance.externalKeys?.zoteroKey === a2)!;
-      expect(second).toEqual(before.find((sf) => sf.source.provenance.externalKeys?.zoteroKey === a2));
+      const was = before.find((sf) => sf.source.provenance.externalKeys?.zoteroKey === a2)!;
+      expect(second.source.availability).toEqual({ status: "unavailable-on-platform", zotero: "deleted", firstNoticedAt: expect.any(String) });
+      expect({ ...second, source: { ...second.source, availability: was.source.availability } }).toEqual(was);
       const report = await createBulkImport(bulkDeps()).batchReport(p.id, h2.batchId);
-      expect(report.notes).toContain("1 item you have here was deleted in Zotero since the last sync; nothing was deleted here.");
+      expect(report.notes).toContain("1 item you have here was deleted in Zotero since the last sync; it was kept here and marked.");
+      expect(r2.counts).toMatchObject({ goneInZotero: 1 });
       expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
       const rec = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "batch.json"), "utf8"));
       expect(rec.adapterOptions).toEqual({ zoteroSince: v1, zoteroFiles: true, zoteroReadVersions: [z.libraryVersion(U)] });
