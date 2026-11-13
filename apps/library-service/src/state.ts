@@ -67,7 +67,7 @@ import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
-import { readFindScreen } from "./routes/find.js";
+import { readFindScreen } from "./find-screen.js";
 import { Transcriptions } from "./transcriptions.js";
 
 /** A running media worker, shared by every library the service opens. */
@@ -688,10 +688,7 @@ export class ServiceState {
         }
         throw err;
       } finally {
-        if (s.indexRebuild?.ac === ac) {
-          s.indexRebuild = undefined;
-          this.resumeFind(s); // the index is ready (if it is): the queues go on
-        }
+        if (s.indexRebuild?.ac === ac) s.indexRebuild = undefined;
       }
     })();
     s.indexRebuild = { ac, done: run.catch(() => {}) };
@@ -846,6 +843,7 @@ export class ServiceState {
         await this.runScheduledBackups();
       });
     }
+    s.http.setDiskCache(true); // in use again (after a move that was not made)
     this.startFind(s);
     if (this.worker) this.attachWorker(s, this.worker);
     else if (this.opts.autoStartWorker && this.opts.worker) this.track(this.ensureWorker(), "starting the media helper");
@@ -990,10 +988,13 @@ export class ServiceState {
     }
     try {
       this.stopBackupScheduler();
-      await this.endFind(s);
       await this.stopWatches(s);
       await disposeProxyQueue(s.repo);
       await disposeOcrQueue(s.repo);
+      // Last, so that a rollback above leaves the queue running (R247 M6); `stopAll` always settles, never throws.
+      await this.endFind(s);
+      // Nothing is written into the folder being copied, the lookup cache included (R247 c).
+      s.http.setDiskCache(false);
     } catch (err) {
       this.activate(s);
       this.resumeBatches(paused);
@@ -1098,6 +1099,8 @@ export class ServiceState {
       // already closed
     }
     s.http.purgeSensitive();
+    // No late lookup answer writes into this library once its lock is released (R247 c).
+    s.http.setDiskCache(false);
     s.ring.clear();
     await s.lib.close().catch(() => {});
     this.publishState();
@@ -1105,9 +1108,10 @@ export class ServiceState {
 
   // ---- Find and acquire (Task F5; R237, A3) ---------------------------------------------
   //
-  // One runner per open read-write library, made at `activate`. `resume(projectId)` for each unlocked project once
-  // the index is ready (at open after the rebuild's check, at the end of every rebuild, at unlock, after a failed
-  // move); `stop(projectId)` at an encrypted project's lock, before its key is dropped (routes/projects.ts);
+  // One runner per open read-write library, made at `activate`. `resume(projectId)` for each unlocked project at open
+  // and at unlock, whatever the index's state (R247 a): while the index is not ready the runner itself starts no entry
+  // and makes no record, and goes on by itself once it is; `stop(projectId)` at an encrypted project's lock, before
+  // its key is dropped (routes/projects.ts);
   // `stopAll()` awaited (it is bounded) at close, at a library switch (both `closeLibrary`), before a move and at
   // quiesce (R106, `quiesce`), so that no write of the runner lands after the library's lock is released.
 
@@ -1124,7 +1128,20 @@ export class ServiceState {
    * no rebuild running or failed, and no change that could not be indexed since it was last known good.
    */
   findIndexReady(s: Session): boolean {
-    return this.session === s && !!s.index && s.index.isOpen && !s.stampHold.on && !s.indexRebuild && s.indexStatus === undefined && this.findIndexErrorCount(s) <= (s.findIndexErrors ?? 0);
+    return this.findIndexState(s) === "ready";
+  }
+
+  /**
+   * The index as Find and acquire sees it (R247 b): "rebuilding" while a rebuild (or the check after an open) really
+   * runs; "needs-rebuild" when it cannot be trusted and nothing runs: a change could not be indexed since it was last
+   * known good, or a rebuild failed. The index errors carry no project (`repo.indexErrors` holds an operation and an
+   * error only), so they are counted for the whole library.
+   */
+  findIndexState(s: Session): "ready" | "rebuilding" | "needs-rebuild" {
+    if (this.session !== s || !s.index || !s.index.isOpen) return "needs-rebuild";
+    if (s.stampHold.on || s.indexRebuild || s.indexStatus?.state === "rebuilding") return "rebuilding";
+    if (s.indexStatus !== undefined || this.findIndexErrorCount(s) > (s.findIndexErrors ?? 0)) return "needs-rebuild";
+    return "ready";
   }
 
   /** Makes the open library's runner (once) and resumes what may run now. */
@@ -1160,10 +1177,10 @@ export class ServiceState {
     this.resumeFind(s);
   }
 
-  /** Resumes the queue of every unlocked project (or of `projectId`), only once the index is ready. */
+  /** Resumes the queue of every unlocked project (or of `projectId`), whatever the index's state (R247 a). */
   resumeFind(s: Session, projectId?: string): void {
     const r = s.find;
-    if (!r || this.moving || !this.findIndexReady(s)) return;
+    if (!r || this.moving) return;
     for (const p of s.repo.listProjects()) if ((projectId === undefined || p.id === projectId) && s.repo.isUnlocked(p.id)) r.resume(p.id);
   }
 

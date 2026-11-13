@@ -153,7 +153,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     await limit.guard(id, () => s.repo.unlockProject(id, secret));
     // Work that waited for the key: viewing proxies, OCR and worker jobs of this project (R142), and its daily backup (R99 I7).
     state.resumeProject(s, id, { workerJobs: true });
-    state.resumeFind(s, id); // Find and acquire (Task F5): its queue goes on, once the index is ready
+    state.resumeFind(s, id); // Find and acquire (Task F5): its queue goes on (the runner waits for the index itself)
     state.startWork("backup", async () => {
       await state.runScheduledBackups(id);
     });

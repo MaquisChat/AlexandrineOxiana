@@ -16,6 +16,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FindRunnerClosedError, deviceDeps, rebuildIndexIfNeeded, type Deps } from "@ao/library";
 import { FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STOPPED_TEXT, type FindEntryView, type FindQueueResponse } from "@ao/shared";
 import { serialStore } from "../../../packages/library/src/import/project-queue.js";
+import { runnerSeams } from "../../../packages/library/src/find/runner.js";
+import { existsSync } from "node:fs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 import type { ServiceEvent } from "./events.js";
 
@@ -149,8 +151,12 @@ afterEach(async () => {
   const seen = [logs, ...errorBodies, ...events.map((e) => JSON.stringify(e))].join("\n");
   for (const w of SECRET_WORDS) expect(seen.includes(w), `"${w}" was logged or sent`).toBe(false);
   errorBodies.length = 0;
-  // A lookup released after its library closed may still be writing its answer into the lookup cache.
-  await rm(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  runnerSeams.inAct = undefined;
+  runnerSeams.inCreate = undefined;
+  await rm(tmp, { recursive: true, force: true });
+  // Nothing comes back afterwards (R247 c: a late lookup answer never recreates a library folder).
+  await sleep(100);
+  expect(existsSync(tmp)).toBe(false);
 });
 
 async function start(over: Partial<ServiceOptions> = {}): Promise<LibraryService> {
@@ -229,12 +235,11 @@ const settled = (pid: string, eid: string) => until(async () => ((e) => (e && FI
 const asked = (text: string) => gated.sent.filter((s) => s.service === "crossref" && s.text === text).length;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Every file of the library (but its lookup cache) with its content, for "nothing changed". */
+/** Every file of the library (its lookup cache included) with its content, for "nothing changed". */
 async function snapshot(dir: string, rel = ""): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   for (const d of await readdir(join(dir, rel), { withFileTypes: true })) {
     const r = rel ? `${rel}/${d.name}` : d.name;
-    if (r === ".cache") continue;
     if (d.isDirectory()) Object.assign(out, await snapshot(dir, r));
     else out[r] = (await readFile(join(dir, r))).toString("base64");
   }
@@ -327,6 +332,11 @@ describe("adding lines", () => {
     const one = await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [LINE, "   Z   "] } });
     expect(one.status).toBe(400);
     expect(one.json.error.message).toContain("Line 2");
+    // A line the library's parser refuses (nothing that can be shown): named by its number and its true cause (R247 M2).
+    const unseen = await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [LINE, "\u0000\u0007\u202e"] } });
+    expect(unseen.status).toBe(400);
+    expect(unseen.json.error).toMatchObject({ reason: "line" });
+    expect(unseen.json.error.message).toMatch(/^Line 2 .*cannot be shown/);
     // 51 lines; no lines; not a list; a collection that is not an id.
     expect((await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: Array.from({ length: 51 }, (_, i) => `Reference number ${i}`) } })).json.error.message).toBe(FIND_ROUTE_TEXT.tooManyLines);
     expect((await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [] } })).status).toBe(400);
@@ -502,12 +512,30 @@ describe("refusals", () => {
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
     const q = await until(async () => ((x) => (x.stopped ? x : undefined))(await queue(pid)), "stopped");
     expect(q.stopped).toEqual({ code: "rules-unreadable", text: FIND_STOPPED_TEXT["rules-unreadable"] });
+    // An add refused meanwhile says that nothing was added (R247 M3).
+    const refusedAdd = await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [LINE] } });
+    expect(refusedAdd.status).toBe(409);
+    expect(refusedAdd.json.error).toMatchObject({ reason: "stopped", message: `${FIND_STOPPED_TEXT["rules-unreadable"]} Nothing was added.` });
     await writeFile(gov, goodRules);
     // A queue none of whose lines can be read.
     await writeFile(file, "garbage\nmore garbage\n");
     const r = await call({ url: `/projects/${pid}/find` });
     expect(r.status).toBe(409);
     expect(r.json.error).toMatchObject({ message: FIND_STOPPED_TEXT["queue-unreadable"], reason: "queue-unreadable" });
+  });
+
+  it("a typed line never appears in the log", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject(true);
+    const [e] = await add(pid, [LINE]);
+    await settled(pid, e!.id);
+    await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [`Zorblatt ${"q".repeat(600)}`] } });
+    await call({ method: "POST", url: `/projects/${pid}/find`, raw: '{"lines":["Quillfeather' });
+    await call({ method: "POST", url: `/projects/${pid}/lock` });
+    await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [LINE] } });
+    expect(logs.length).toBeGreaterThan(0);
+    for (const w of SECRET_WORDS) expect(logs.includes(w), w).toBe(false);
   });
 
   it("every reason code has its sentence", () => {
@@ -745,3 +773,189 @@ describe("other projects and the screen's settings", () => {
     expect((await call({ url: "/find/screen" })).json).toEqual({ checkEverything: true });
   });
 });
+
+describe("R247: the index, the cache, and work under way at a close or a move", () => {
+  it("(a, b) unlock always resumes; adds wait while the index is rebuilt; an index that needs a rebuild says so and names the control; the queue goes on by itself after a rebuild", async () => {
+    let gate: Promise<void> | undefined;
+    let open!: () => void;
+    await start({
+      rebuildIndexIfNeeded: (async (...a: Parameters<typeof rebuildIndexIfNeeded>) => {
+        await gate;
+        return rebuildIndexIfNeeded(...a);
+      }) as typeof rebuildIndexIfNeeded,
+    });
+    await openNewLibrary();
+    const pid = await newProject(true);
+    const [c] = await add(pid, [AMBIGUOUS]);
+    const waiting = await settled(pid, c!.id);
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    // A rebuild running: unlock resumes anyway; an add is accepted and waits; choose is a 409 in words.
+    gate = new Promise<void>((r) => (open = r));
+    const rebuilding = call({ method: "POST", url: "/libraries/rebuild-index" });
+    await until(async () => !!svc!.state.session!.indexRebuild, "the rebuild to start");
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    const r1 = await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [LINE] } });
+    expect(r1.status, r1.body).toBe(200);
+    const e1 = r1.json.added[0].id as string;
+    const q1 = await queue(pid);
+    expect(q1.stopped).toEqual({ code: "index-not-ready", text: FIND_STOPPED_TEXT["index-not-ready"] });
+    const chose = await call({ method: "POST", url: `/projects/${pid}/find/${c!.id}/choose`, body: { candidateId: waiting.candidates![0]!.id } });
+    expect(chose.status).toBe(409);
+    expect(chose.json.error).toMatchObject({ reason: "index-not-ready", message: FIND_ROUTE_TEXT.indexNotReady });
+    await sleep(300);
+    expect((await entry(pid, e1))!.state).toBe("looking-up");
+    open();
+    expect((await rebuilding).status).toBe(200);
+    // The runner goes on by itself.
+    expect((await settled(pid, e1)).state).toBe("record-complete");
+    // An index error and no rebuild: "needs a rebuild", naming the control.
+    (svc!.state.session!.repo.indexErrors as Array<{ op: string; error: unknown }>).push({ op: "source.create", error: new Error("index write failed") });
+    const r2 = await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [NOTHING] } });
+    expect(r2.status, r2.body).toBe(200);
+    const q2 = await queue(pid);
+    expect(q2.stopped).toEqual({ code: "index-needs-rebuild", text: FIND_STOPPED_TEXT["index-needs-rebuild"] });
+    expect(q2.stopped!.text).toContain("“Rebuild library from folder”");
+    await sleep(300);
+    expect((await entry(pid, r2.json.added[0].id))!.state).toBe("looking-up");
+    // The researcher rebuilds: the queue goes on by itself.
+    gate = undefined;
+    expect((await call({ method: "POST", url: "/libraries/rebuild-index" })).status).toBe(200);
+    expect((await settled(pid, r2.json.added[0].id)).state).toBe("not-found");
+    expect((await queue(pid)).stopped).toBeUndefined();
+  }, 60_000);
+
+  it("(c) P8: a lookup held across a library switch writes nothing into the old library, and never recreates its folder", async () => {
+    await start();
+    // A: the library is switched while a lookup is held; its answer comes afterwards.
+    const pathA = await openNewLibrary("A");
+    const a = await newProject();
+    const releaseA = gated.hold(LINE);
+    await add(a, [LINE]);
+    await until(async () => asked(LINE) > 0, "A's lookup to be sent");
+    const pathB = await openNewLibrary("B");
+    const cacheA = join(pathA, ".cache", "lookups");
+    const before = existsSync(cacheA) ? (await readdir(cacheA)).sort() : [];
+    releaseA();
+    await sleep(300);
+    expect(existsSync(cacheA) ? (await readdir(cacheA)).sort() : []).toEqual(before);
+    // B: switched away from, then its folder deleted, before the held answer comes: never created again.
+    const b = await newProject();
+    const releaseB = gated.hold(AMBIGUOUS);
+    await add(b, [AMBIGUOUS]);
+    await until(async () => asked(AMBIGUOUS) > 0, "B's lookup to be sent");
+    await openNewLibrary("C");
+    await rm(pathB, { recursive: true, force: true });
+    releaseB();
+    await sleep(300);
+    expect(existsSync(pathB)).toBe(false);
+  });
+
+  it("(d) a creation held inside its turn while the library closes: the close waits; the record and the entry's line are both there; nothing is written after the release", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    let release!: () => void;
+    let entered = false;
+    runnerSeams.inCreate = async () => {
+      entered = true;
+      await new Promise<void>((r) => (release = r));
+    };
+    const [e] = await add(pid, [LINE]);
+    await until(async () => entered, "the creation to be under way");
+    let closedAt = 0;
+    const closing = call({ method: "POST", url: "/libraries/close" }).then((r) => {
+      closedAt = Date.now();
+      return r;
+    });
+    await sleep(5_500);
+    expect(closedAt).toBe(0);
+    release();
+    expect((await closing).status).toBe(200);
+    runnerSeams.inCreate = undefined;
+    const after = await snapshot(path);
+    await sleep(300);
+    expect(await snapshot(path)).toEqual(after);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const done = (await entry(pid, e!.id))!;
+    expect(done.state).toBe("record-complete");
+    const sources = (await call({ url: `/projects/${pid}/sources?limit=10` })).json;
+    expect(sources.total).toBe(1);
+  }, 30_000);
+
+  it("(M5) a retry and a remove held before their turn across a close: 503 in words, and no file of the library changes", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const s = svc!.state.session!;
+    const [n] = await add(pid, [NOTHING]);
+    await settled(pid, n!.id);
+    const [m] = await add(pid, [AMBIGUOUS]);
+    await settled(pid, m!.id);
+    let free!: () => void;
+    const turn = serialStore(s.repo, pid, () => new Promise<void>((r) => (free = r)));
+    const retrying = call({ method: "POST", url: `/projects/${pid}/find/${n!.id}/retry` });
+    const removing = call({ method: "DELETE", url: `/projects/${pid}/find/${m!.id}` });
+    await sleep(50);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const before = await snapshot(path);
+    free();
+    await turn;
+    for (const r of [await retrying, await removing]) {
+      expect(r.status).toBe(503);
+      expect(r.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.closed, reason: "closed" });
+    }
+    await sleep(200);
+    expect(await snapshot(path)).toEqual(before);
+  });
+
+  it("(M5) a move waits for a creation under way: the old copy holds the record and its line before the copy starts", async () => {
+    let release!: () => void;
+    let entered = false;
+    let atCopy: { state?: string; sources?: number } = {};
+    let pid = "";
+    let path = "";
+    await start({
+      beforeExecuteMove: async () => {
+        const raw = await readFile(join(path, await folderOfAt(path, pid), "find", "queue.jsonl"), "utf8");
+        const lines = raw.trim().split("\n").map((l) => JSON.parse(l) as { state: string });
+        atCopy = { state: lines.at(-1)!.state };
+      },
+    });
+    path = await openNewLibrary();
+    pid = await newProject();
+    runnerSeams.inCreate = async () => {
+      entered = true;
+      await new Promise<void>((r) => (release = r));
+    };
+    const [e] = await add(pid, [LINE]);
+    await until(async () => entered, "the creation to be under way");
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    await sleep(300);
+    release();
+    expect((await moving).status).toBe(200);
+    expect(atCopy.state).toBe("record-complete");
+    expect((await entry(pid, e!.id))!.state).toBe("record-complete");
+  }, 30_000);
+
+  it("(M6) a quiesce that is rolled back resumes the queue", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const release = gated.hold(LINE);
+    const [e] = await add(pid, [LINE]);
+    await until(async () => asked(LINE) > 0, "the lookup to be sent");
+    const stopWatches = svc!.state.stopWatches.bind(svc!.state);
+    svc!.state.stopWatches = async () => {
+      throw new Error("watches could not be stopped");
+    };
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    svc!.state.stopWatches = stopWatches;
+    expect(moved.status).not.toBe(200);
+    release();
+    expect((await settled(pid, e!.id)).state).toBe("record-complete");
+  });
+});
+
+async function folderOfAt(_path: string, pid: string): Promise<string> {
+  return svc!.state.session!.repo.getProject(pid).folder;
+}

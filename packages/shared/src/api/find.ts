@@ -69,7 +69,7 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */
-export const FIND_STOPPED_CODES = ["rules-unreadable", "queue-unreadable", "read-only", "recovery-pending", "index-not-ready", "unexpected"] as const;
+export const FIND_STOPPED_CODES = ["rules-unreadable", "queue-unreadable", "read-only", "recovery-pending", "index-not-ready", "index-needs-rebuild", "unexpected"] as const;
 export type FindStoppedCode = (typeof FIND_STOPPED_CODES)[number];
 
 /** The one sentence for each, shown once above the queue. `queue-unreadable` is the queue store's own sentence. */
@@ -78,7 +78,11 @@ export const FIND_STOPPED_TEXT: Record<FindStoppedCode, string> = {
   "queue-unreadable": "The Find and acquire queue of this project could not be read. Nothing has been changed.",
   "read-only": "This library is open read-only, so nothing is looked up.",
   "recovery-pending": "This project is waiting for the library to be reopened before anything can be written.",
+  /** Only while a rebuild is really running (R247 b). */
   "index-not-ready": "The library's index is being rebuilt. Looking up starts when it is ready.",
+  /** The index cannot be trusted and no rebuild is running (a change could not be indexed; a rebuild failed). R247 b. */
+  "index-needs-rebuild":
+    "The library's index is out of date, so nothing is looked up until it is rebuilt. Use “Rebuild library from folder” (on the Missing files screen, under Search index), then looking up goes on.",
   unexpected: "The queue could not be started. Close and reopen the library, and it tries again.",
 };
 
@@ -92,7 +96,8 @@ export const FIND_ROUTE_TEXT = {
   locked: "The project is locked. Unlock it, and the queue goes on.",
   queueFull: "The queue holds 500 entries. Remove some finished ones first.",
   entryState: "This entry is no longer waiting for that. Nothing was changed.",
-  indexNotReady: "The library's index is still being prepared. Try again in a moment. Nothing was changed.",
+  /** A press that would make a record while the index is not ready (R247 a). */
+  indexNotReady: "Nothing was changed: the library's index is not ready. Try again when it is.",
   closed: "Find and acquire has stopped for this library. Nothing was changed.",
   unknownCandidate: "That is not one of the works offered for this entry. Nothing was changed.",
   /** Any act on an id the queue does not hold (never there, or removed by anyone): 404 (R245). */

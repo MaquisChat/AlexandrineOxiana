@@ -13,7 +13,6 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { isId } from "@ao/core";
 import {
-  AppSettingUnreadableError,
   FIND_ADD_MAX_LINES,
   FIND_QUEUE_MAX as LIBRARY_QUEUE_MAX,
   FIND_TYPED_MAX,
@@ -31,10 +30,7 @@ import {
   ProjectLockedError,
   REFERENCE_MIN_CHARS,
   ReadOnlyLibraryError,
-  readAppSettingStrict,
   readFindQueueOf,
-  setAppSettingAside,
-  updateAppSettingStrict,
   type FindEntry,
   type FindMatch as LibraryMatch,
   type FindReasonCode as LibraryReasonCode,
@@ -71,13 +67,14 @@ import {
   type FindWorkCandidate,
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
+import { FIND_SCREEN_KEYS, findScreenOf, readFindScreen, writeFindScreen } from "../find-screen.js";
 import type { Session } from "../state.js";
 import { bodyAs, bodyOf, paramsOf, type Ctx, type Same } from "./util.js";
 
 // The library's types and @ao/shared's declarations are one and the same (Task 47).
 true satisfies Same<LibraryState, FindState>;
 true satisfies Same<LibraryReasonCode, FindReasonCode>;
-true satisfies Same<FindStoppedFor["code"], FindStoppedCode>;
+true satisfies Same<FindStoppedFor["code"] | "index-needs-rebuild", FindStoppedCode>; // the service tells "needs a rebuild" from "being rebuilt" (R247 b)
 true satisfies Same<WorkCandidate, FindWorkCandidate>;
 true satisfies Same<OfferLink, FindOfferLink>;
 true satisfies Same<LibraryMatch, FindMatch>;
@@ -86,36 +83,6 @@ true satisfies Same<typeof LIBRARY_QUEUE_MAX, typeof FIND_QUEUE_MAX>;
 true satisfies Same<typeof FIND_ADD_MAX_LINES, typeof FIND_ADD_LINES_MAX>;
 true satisfies Same<typeof FIND_TYPED_MAX, typeof FIND_LINE_MAX_CHARS>;
 true satisfies Same<typeof REFERENCE_MIN_CHARS, typeof FIND_LINE_MIN_CHARS>;
-
-/** This computer's file of the screen's remembered settings (0600, written with the strict helper). */
-export const FIND_SCREEN_FILE = "find-screen.json";
-const SCREEN_DEFAULTS: FindScreenSettings = Object.freeze({ checkEverything: false }) as FindScreenSettings;
-const SCREEN_KEYS = ["checkEverything", "projectId", "collectionId"];
-
-function isScreen(v: unknown): v is FindScreenSettings {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
-  const o = v as Record<string, unknown>;
-  if (Object.keys(o).some((k) => !SCREEN_KEYS.includes(k))) return false;
-  if (typeof o.checkEverything !== "boolean") return false;
-  for (const k of ["projectId", "collectionId"]) if (o[k] !== undefined && (typeof o[k] !== "string" || !isId(o[k]))) return false;
-  return true;
-}
-
-const screenOf = (v: FindScreenSettings): FindScreenSettings => ({
-  checkEverything: v.checkEverything,
-  ...(v.projectId !== undefined ? { projectId: v.projectId } : {}),
-  ...(v.collectionId !== undefined ? { collectionId: v.collectionId } : {}),
-});
-
-/** The screen's remembered settings: the defaults when the file is missing or cannot be read (never rewritten by a read). */
-export async function readFindScreen(appConfigDir: string): Promise<FindScreenSettings> {
-  try {
-    const v = await readAppSettingStrict(appConfigDir, FIND_SCREEN_FILE, isScreen);
-    return v ? screenOf(v) : { ...SCREEN_DEFAULTS };
-  } catch {
-    return { ...SCREEN_DEFAULTS };
-  }
-}
 
 /** An entry as the screen gets it: no `people` and `works`, at most FIND_CANDIDATES_SENT candidates. */
 export function entryView(e: FindEntry): FindEntryView {
@@ -182,20 +149,35 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
    * A press on the runner. The runner itself refuses a press that reaches its store turn after `stopAll()` or
    * `stop(projectId)` and writes nothing, and `stopAll()` waits for presses already in their turn (R245): the service
    * no longer counts presses. A press refused because Find and acquire stopped for the library meanwhile is a 503 in
-   * words; one refused because the project was stopped is 423 when the project is locked now, else a 409 in words.
+   * words; one refused because the project was stopped is 423 when the project is locked now, else a 409 in words
+   * that say nothing was added (or changed) (R247 M3). A press that fails while the project has been locked meanwhile
+   * is 423.
    */
-  const pressed = async <T>(s: Session, projectId: string, fn: () => Promise<T>): Promise<T> => {
+  const pressed = async <T>(s: Session, projectId: string, fn: () => Promise<T>, nothing = "Nothing was changed."): Promise<T> => {
     try {
       return await fn();
     } catch (err) {
       if (state.session !== s || !s.find || err instanceof FindRunnerClosedError) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
       if (err instanceof FindProjectStoppedError) {
         if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
-        const why = s.find.stoppedFor(projectId)?.code;
-        throw new ApiError(409, "CONFLICT", why ? FIND_STOPPED_TEXT[why] : FIND_ROUTE_TEXT.projectStopped, "stopped");
+        const why = stoppedOf(s, projectId);
+        throw new ApiError(409, "CONFLICT", why ? `${FIND_STOPPED_TEXT[why]} ${nothing}` : FIND_ROUTE_TEXT.projectStopped, "stopped");
       }
+      if (!(err instanceof ApiError) && !s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
       throw said(err);
     }
+  };
+
+  /**
+   * Why nothing is done for the project's queue now: the runner's own code, with the index's state said truly
+   * (R247 b): "index-not-ready" only while a rebuild runs, "index-needs-rebuild" when it cannot be trusted and none runs.
+   */
+  const stoppedOf = (s: Session, projectId: string): FindStoppedCode | undefined => {
+    const code = s.find?.stoppedFor(projectId)?.code;
+    if (code && code !== "index-not-ready") return code;
+    const index = state.findIndexState(s);
+    if (index === "ready") return code === "index-not-ready" ? "index-not-ready" : undefined;
+    return index === "rebuilding" ? "index-not-ready" : "index-needs-rebuild";
   };
 
   /** The entry of THIS project: 404 when its queue does not hold it (never there, another project's, or removed by anyone; R245). */
@@ -211,13 +193,13 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const q = await inWords(() => readFindQueueOf(s.repo, projectId));
     const readOnly = s.lib.mode === "read-only" || !s.index;
     const runner = state.session === s ? s.find : undefined;
-    let stopped: FindStoppedCode | undefined;
-    if (readOnly) stopped = "read-only";
-    else if (runner) stopped = runner.stoppedFor(projectId)?.code ?? (state.findIndexReady(s) ? undefined : "index-not-ready");
+    const stopped: FindStoppedCode | undefined = readOnly ? "read-only" : runner ? stoppedOf(s, projectId) : undefined;
+    // Read from the file every time (R247 M10): right after an open, the answer never lags behind it.
+    const screen = await readFindScreen(state.deps.appConfigDir);
     reply.header("Cache-Control", "no-store");
     return {
       entries: [...q.entries.values()].map(entryView),
-      checkEverything: state.findCheckEverything,
+      checkEverything: screen.checkEverything,
       lockedProjectsNotChecked: runner && !readOnly ? runner.lockedNotChecked() : 0,
       readOnly,
       unreadableLines: q.unreadableLines,
@@ -241,7 +223,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     });
     const collectionId = b.collectionId;
     if (collectionId !== undefined && (typeof collectionId !== "string" || !isId(collectionId))) throw badRequest("The collection is not one of this project's.");
-    const r = await pressed(s, projectId, () => runner.add(projectId, lines, collectionId));
+    const r = await pressed(s, projectId, () => runner.add(projectId, lines, collectionId), "Nothing was added.");
     return { added: r.added.map(entryView), mergedLines: r.mergedLines };
   });
 
@@ -314,21 +296,11 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
   app.put("/find/screen", limit, async (req): Promise<FindScreenSettings> => {
     uiOnly(req);
     const b = bodyOf(req);
-    for (const k of Object.keys(b)) if (!SCREEN_KEYS.includes(k)) throw badRequest(`"${k}" is not part of this request.`);
+    for (const k of Object.keys(b)) if (!FIND_SCREEN_KEYS.includes(k)) throw badRequest(`"${k}" is not part of this request.`);
     if (typeof b.checkEverything !== "boolean") throw badRequest('"checkEverything" must be true or false.');
     for (const k of ["projectId", "collectionId"]) if (b[k] !== undefined && (typeof b[k] !== "string" || !isId(b[k]))) throw badRequest(`"${k}" must be an id.`);
-    const next = screenOf(b as unknown as FindScreenSettings);
-    const dir = state.deps.appConfigDir;
-    try {
-      await updateAppSettingStrict(dir, FIND_SCREEN_FILE, isScreen, () => next);
-    } catch (err) {
-      if (!(err instanceof AppSettingUnreadableError)) throw err;
-      // R245: a file that cannot be read never locks the researcher out of the switch. It is set aside, as the
-      // other settings files of this computer are (`find-screen.json.unreadable-<stamp>`, never deleted), and the new
-      // settings are written. (Set aside only while it still cannot be read; a write in between is then kept.)
-      await setAppSettingAside(dir, FIND_SCREEN_FILE, isScreen, state.opts.now()).catch(() => undefined);
-      await updateAppSettingStrict(dir, FIND_SCREEN_FILE, isScreen, () => next);
-    }
+    const next = findScreenOf(b as unknown as FindScreenSettings);
+    await writeFindScreen(state.deps.appConfigDir, next, state.opts.now());
     state.findCheckEverything = next.checkEverything;
     return next;
   });
