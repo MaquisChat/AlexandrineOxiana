@@ -210,6 +210,8 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
   const classes = ["ao-ann-entry"];
   if (selected) classes.push("ao-ann-entry--selected");
   if (slot) classes.push(slot.grow ? "ao-ann-entry--slot ao-ann-entry--grown" : "ao-ann-entry--slot");
+  // Its colour menu is not cut off by a windowed slot.
+  if (menuOpen) classes.push("ao-ann-entry--open");
   return (
     <li
       data-entry={id}
@@ -218,7 +220,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
       aria-posinset={e.pos}
       aria-current={selected || undefined}
       className={classes.join(" ")}
-      style={slot ? { top: `${slot.top}px`, ...(slot.grow ? {} : { height: `${ENTRY_PX}px` }) } : undefined}
+      style={{ top: slot ? `${slot.top}px` : undefined, height: slot && !slot.grow ? `${ENTRY_PX}px` : undefined }}
     >
       <p className="ao-ann-head">
         <span className={`ao-ann-swatch ao-ann-swatch--${a.colorName}`} aria-hidden="true" />

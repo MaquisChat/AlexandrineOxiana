@@ -327,6 +327,15 @@ describe("AnnotationList (Task R9)", () => {
     expect(note.className).toContain("ao-ann-note");
   });
 
+  it("a quote with markup in it is shown as text, and a button's name cuts it by characters, never inside one", () => {
+    list({ annotations: [rec({ id: "a", quote: "<b>informal</b> markets" }), rec({ id: "e", quote: `${"a".repeat(39)}${"😀".repeat(5)}` })] });
+    expect(entry("a").querySelector("b")).toBeNull();
+    expect(within(entry("a")).getByText("<b>informal</b> markets")).toBeTruthy();
+    const name = within(entry("e")).getByRole("button", { name: /^Go to/ }).getAttribute("aria-label")!;
+    expect(name).toBe(`Go to yellow highlight on page 1, “${"a".repeat(39)}😀…”`);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(name)).toBe(false);
+  });
+
   it("a right-to-left quote keeps its direction", () => {
     list({ annotations: [rec({ id: "a", quote: "השווקים הבלתי פורמליים" })] });
     expect(within(entry("a")).getByText("השווקים הבלתי פורמליים").getAttribute("dir")).toBe("auto");
@@ -462,15 +471,29 @@ describe("AnnotationList (Task R9)", () => {
     outside.remove();
   });
 
-  it("a late answer after the list went is dropped quietly", async () => {
+  it("a late answer after the file changed, or after the list went, is dropped quietly", async () => {
     let release: () => void = () => {};
+    let refuse: (e: Error) => void = () => {};
     const errors = vi.spyOn(console, "error");
     const user = userEvent.setup();
-    const r = list({ annotations: [rec({ id: "a" })], onRecolour: () => new Promise<void>((res) => (release = res)) });
+    const both = rec({ id: "a" });
+    both.pdfAnchors.push({ id: "a-b", assetId: "a2", page: 1, rects: [{ x: 1, y: 1, w: 1, h: 1 }], sortIndex: "00000|000000|00000", sortIndexDerived: false });
+    const onRecolour = vi.fn(() => new Promise<void>((res, rej) => ((release = res), (refuse = rej))));
+    const props = { annotations: [both], readOnly: false, pageCount: 20, onJump: () => {}, onSaveNote: noop, onRecolour, onDelete: noop };
+    const r = render(<AnnotationList assetId="a1" {...props} />);
     await user.click(within(entry("a")).getByRole("button", { name: /^Colour of/ }));
     await user.click(screen.getByRole("menuitemradio", { name: "Red" }));
-    r.unmount();
+    // The other file: the answer to the first file's change says nothing here, and blocks nothing.
+    r.rerender(<AnnotationList assetId="a2" {...props} />);
     await act(async () => release());
+    expect(live().textContent).toBe("");
+    await user.click(within(entry("a")).getByRole("button", { name: /^Colour of/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Blue" }));
+    expect(onRecolour).toHaveBeenCalledTimes(2);
+    r.rerender(<AnnotationList assetId="a1" {...props} />);
+    await act(async () => refuse(new Error("A refusal for the file before.")));
+    expect(screen.queryByRole("alert")).toBeNull();
+    r.unmount();
     expect(errors).not.toHaveBeenCalled();
     errors.mockRestore();
   });

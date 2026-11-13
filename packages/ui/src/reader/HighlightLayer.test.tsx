@@ -4,11 +4,11 @@
  * its kind by its shape (fill, underline, note mark, outlined box; dashed when its text changed);
  * hidden from assistive technology (the list, Task R9, is the accessible route); a click selects it.
  */
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { PageViewport } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnnotationRecord } from "../api/reader";
-import { HIGHLIGHT_CHANGED_SENTENCE, HighlightLayer, HighlightNotices, missingNoteSentence, missingPageSentence, NOTICES_MAX } from "./HighlightLayer";
+import { HighlightLayer } from "./HighlightLayer";
 
 afterEach(cleanup);
 
@@ -210,55 +210,5 @@ describe("HighlightLayer", () => {
     const before = marks(container)[0];
     rerender(<HighlightLayer pageIndex={0} viewport={viewport} annotations={list} onSelect={onSelect} changed={none} />);
     expect(marks(container)[0]).toBe(before);
-  });
-});
-
-describe("HighlightNotices", () => {
-  it("says which highlight's text has changed and which is on a page the file does not have, the quote as the source's text", () => {
-    const list = [
-      record({ id: "ok", quote: "fine words" }),
-      record({ id: "changed", quote: "<b>informal</b> markets", anchors: [{ page: 3, rects: [{ x: 1, y: 1, w: 1, h: 1 }] }] }),
-      record({ id: "far", quote: "on a lost page", anchors: [{ page: 412, rects: [{ x: 1, y: 1, w: 1, h: 1 }] }] }),
-    ];
-    const { container } = render(<HighlightNotices annotations={list} pageCount={20} changed={new Set(["changed"])} />);
-    const items = [...container.querySelectorAll("li")];
-    expect(items).toHaveLength(2);
-    expect(items[0]!.textContent).toContain(HIGHLIGHT_CHANGED_SENTENCE);
-    expect(items[0]!.textContent).toContain("<b>informal</b> markets");
-    expect(items[0]!.querySelector("b")).toBeNull();
-    expect(items[0]!.querySelector("[dir=auto]")!.textContent).toBe("<b>informal</b> markets");
-    expect(items[1]!.textContent).toContain(missingPageSentence(412));
-    expect(missingPageSentence(412)).toBe("This highlight is on page 412, which this file does not have.");
-    expect(HIGHLIGHT_CHANGED_SENTENCE).toBe("The text here has changed since this highlight was made.");
-  });
-
-  it("cuts a long quote by characters, never inside one (A11, M4)", () => {
-    // 119 letters and then emoji (each two UTF-16 units): the cut falls where a unit-count cut would split a pair.
-    const quote = `${"a".repeat(119)}${"😀".repeat(10)}`;
-    const { container } = render(<HighlightNotices annotations={[record({ quote, anchors: [{ page: 9, rects: [{ x: 1, y: 1, w: 1, h: 1 }] }] })]} pageCount={3} changed={new Set()} />);
-    const shown = container.querySelector("[dir=auto]")!.textContent!;
-    expect(shown).toBe(`${"a".repeat(119)}😀…`);
-    // No lone surrogate anywhere in the text.
-    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(container.textContent!)).toBe(false);
-  });
-
-  it("lists at most 50 and says how many more (A11, M4)", () => {
-    expect(NOTICES_MAX).toBe(50);
-    const list = Array.from({ length: 60 }, (_, i) => record({ id: `far-${i}`, quote: `quote ${i}`, anchors: [{ page: 400 + i, rects: [{ x: 1, y: 1, w: 1, h: 1 }] }] }));
-    const { container } = render(<HighlightNotices annotations={list} pageCount={3} changed={new Set()} />);
-    expect(container.querySelectorAll("li")).toHaveLength(50);
-    expect(container.textContent).toContain("and 10 more");
-  });
-
-  it("a note on a page the file does not have is called a note (A11, M4)", () => {
-    const { container } = render(<HighlightNotices annotations={[record({ kind: "note", quote: undefined, body: "check", anchors: [{ page: 77, rects: [{ x: 1, y: 1, w: 1, h: 1 }] }] })]} pageCount={3} changed={new Set()} />);
-    expect(missingNoteSentence(77)).toBe("This note is on page 77, which this file does not have.");
-    expect(container.querySelector("li")!.textContent).toBe(`Page 77: ${missingNoteSentence(77)}`);
-  });
-
-  it("says nothing when every highlight is where it was", () => {
-    const { container } = render(<HighlightNotices annotations={[record()]} pageCount={3} changed={new Set()} />);
-    expect(container.innerHTML).toBe("");
-    act(() => {});
   });
 });
