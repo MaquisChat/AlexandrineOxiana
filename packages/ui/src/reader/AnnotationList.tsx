@@ -431,7 +431,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
  * it (the list asks first when it was changed). While a save is on its way the text can still be
  * typed in; "Save note" and "Cancel" wait for the answer.
  */
-function NoteEditor({ saved, pending, onSave, onAbandon, onBusy, onDraft }: { saved: string; pending: boolean; onSave(text: string): void; onAbandon(text: string): void; onBusy(): void; onDraft(text: string, dirty: boolean): void }) {
+export function NoteEditor({ saved, pending, onSave, onAbandon, onBusy, onDraft }: { saved: string; pending: boolean; onSave(text: string): void; onAbandon(text: string): void; onBusy(): void; onDraft(text: string, dirty: boolean): void }) {
   const id = useId();
   const [text, setText] = useState(saved);
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -468,6 +468,56 @@ function NoteEditor({ saved, pending, onSave, onAbandon, onBusy, onDraft }: { sa
       </div>
     </div>
   );
+}
+
+/**
+ * While `holding` (a changed note not saved is on screen), the app's own way out is held (R192 e,
+ * A13): in-app links and navigate() are refused and `ask` is called with the way out to take after a
+ * "Discard"; a reload asks the browser's question; Back and Forward land on a copy of this address and
+ * ask too (the way TranscriptViewer holds unsaved edits). Shared by the list's notes and the reader's
+ * page note (Task R11).
+ */
+export function useNoteHold(holding: boolean, onAsk: (then: () => void) => void): void {
+  const ask = useRef(onAsk);
+  ask.current = onAsk;
+  useEffect(() => {
+    if (!holding) return;
+    let released = false;
+    let release = () => {};
+    const go = (href: string) => () => {
+      release();
+      navigate(href);
+    };
+    const unblock = blockNavigation((href: string) => ask.current(go(href)));
+    const onUnload = (ev: BeforeUnloadEvent) => {
+      ev.preventDefault();
+      ev.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onUnload);
+    const here = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    window.history.pushState(null, "", here);
+    let restoring = false;
+    const onPop = () => {
+      if (restoring) return;
+      // Where Back (or Forward) went: gone to after a Discard.
+      const went = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      restoring = true;
+      window.history.pushState(null, "", here);
+      // Screens that already followed the address follow it back (in the same task, before React renders).
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      restoring = false;
+      ask.current(go(went));
+    };
+    window.addEventListener("popstate", onPop);
+    release = () => {
+      if (released) return;
+      released = true;
+      window.removeEventListener("beforeunload", onUnload);
+      window.removeEventListener("popstate", onPop);
+      unblock();
+    };
+    return release;
+  }, [holding]);
 }
 
 /** The eight colours, the current one checked; arrows, Home and End move; Escape and Tab close and give the focus back. */
@@ -524,7 +574,7 @@ function ColourMenu({ label, current, onChoose, onClose }: { label: string; curr
 }
 
 /** A question with a dangerous answer and a safe one; the focus starts on the safe one (R145). */
-function Question({ title, yes, no, onYes, onNo }: { title: string; yes: string; no: string; onYes(): void; onNo(): void }) {
+export function Question({ title, yes, no, onYes, onNo }: { title: string; yes: string; no: string; onYes(): void; onNo(): void }) {
   const id = useId();
   const safe = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -783,44 +833,7 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
       },
     });
   };
-  useEffect(() => {
-    if (!holding) return;
-    let released = false;
-    let release = () => {};
-    const go = (href: string) => () => {
-      release();
-      navigate(href);
-    };
-    const unblock = blockNavigation((href: string) => askDiscard.current(go(href)));
-    const onUnload = (ev: BeforeUnloadEvent) => {
-      ev.preventDefault();
-      ev.returnValue = "";
-    };
-    window.addEventListener("beforeunload", onUnload);
-    const here = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-    window.history.pushState(null, "", here);
-    let restoring = false;
-    const onPop = () => {
-      if (restoring) return;
-      // Where Back (or Forward) went: gone to after a Discard.
-      const went = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-      restoring = true;
-      window.history.pushState(null, "", here);
-      // Screens that already followed the address follow it back (in the same task, before React renders).
-      window.dispatchEvent(new PopStateEvent("popstate"));
-      restoring = false;
-      askDiscard.current(go(went));
-    };
-    window.addEventListener("popstate", onPop);
-    release = () => {
-      if (released) return;
-      released = true;
-      window.removeEventListener("beforeunload", onUnload);
-      window.removeEventListener("popstate", onPop);
-      unblock();
-    };
-    return release;
-  }, [holding]);
+  useNoteHold(holding, (then) => askDiscard.current(then));
 
   const say = (text: string) => setSaid((s) => ({ text, n: (s?.n ?? 0) + 1 }));
   // Task R10: what the screen has to say (a highlight made) goes through the same live region —

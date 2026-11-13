@@ -80,6 +80,12 @@ export interface MakingOptions {
   onLocked(h: PdfHandle): void;
   onProjectInDoubt(): void;
   onSelect(id: string): void;
+  /**
+   * The toolbar was given up (Escape, "Cancel", a press elsewhere: `made` false) or a colour chosen
+   * (`made` true) — not when the selection changed under it (N1). The keyboard's selection (Task R11)
+   * ends with it.
+   */
+  onPickClosed?(made: boolean): void;
 }
 
 interface Pick {
@@ -158,45 +164,55 @@ export function useHighlightMaking(o: MakingOptions) {
 
   /** Reads the selection when the mouse button is let go. */
   const takeSelection = (target: EventTarget | null) => {
-    const { area, readOnly, handle: h, isLive } = opts.current;
-    const root = area.current;
-    if (!root || !h || !isLive(h) || typing(target)) return;
+    if (typing(target)) return;
     const sel = window.getSelection?.();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
-    const range = sel.getRangeAt(0);
+    offer(sel.getRangeAt(0));
+  };
+
+  /**
+   * What a selection's range offers: the toolbar, or a limit said in words. The mouse's path hands it
+   * the browser's selection at the end of a press begun on a page (I2); the keyboard's (Task R11)
+   * hands it its own range (`takeRange`). True when the toolbar is offered.
+   */
+  const offer = (range: Range): boolean => {
+    const { area, readOnly, handle: h, isLive } = opts.current;
+    const root = area.current;
+    if (!root || !h || !isLive(h) || range.collapsed) return false;
     const boxes = [...root.querySelectorAll<HTMLElement>("[data-page-number]")].filter((el) => range.intersectsNode(el));
-    if (boxes.length === 0) return;
+    if (boxes.length === 0) return false;
     const geoms = boxes.map(geometryOf);
     const pages = geoms.filter((g): g is PageGeometry => typeof g === "object");
     const anchors = selectionToAnchors(range, pages);
     const unsure = geoms.some((g) => g === undefined || g === "drawing");
-    if (anchors.length === 0 && boxes.length <= ANNOTATION_ANCHORS_MAX && !unsure) return;
+    if (anchors.length === 0 && boxes.length <= ANNOTATION_ANCHORS_MAX && !unsure) return false;
     setMenu(undefined);
     if (readOnly) {
       setReadOnlySaid(true);
-      return;
+      return false;
     }
     if (boxes.length > ANNOTATION_ANCHORS_MAX) {
       setPick(undefined);
       setAlert(TOO_MANY_PAGES);
-      return;
+      return false;
     }
     // A page in the selection that is not drawn now: its text cannot be quoted (R223 d). One drawn
     // but not yet laid out at the zoom shown: in a moment it can (M6).
     if (geoms.some((g) => g === undefined)) {
       setPick(undefined);
       setAlert(PAGES_NOT_SHOWN);
-      return;
+      return false;
     }
     if (geoms.some((g) => g === "drawing")) {
       setPick(undefined);
       setAlert(PAGE_STILL_DRAWING);
-      return;
+      return false;
     }
     setAlert(undefined);
     const last = anchors[anchors.length - 1]!;
     pickedRange.current = range.cloneRange();
     setPick({ anchors, pageIndex: last.page - 1, rect: last.rects[last.rects.length - 1]! });
+    return true;
   };
 
   // The selection is read only at the end of a press that BEGAN in a page's text layer (I2): a
@@ -256,6 +272,7 @@ export function useHighlightMaking(o: MakingOptions) {
   /** The toolbar given up (Escape, "Cancel", a press elsewhere): the browser's selection goes too (I2). */
   const dropPick = () => {
     setPick(undefined);
+    opts.current.onPickClosed?.(false);
     window.getSelection?.()?.removeAllRanges();
   };
   const cancel = (): boolean => {
@@ -269,6 +286,7 @@ export function useHighlightMaking(o: MakingOptions) {
   const create = async (colour: HighlightColourName) => {
     const p = pick;
     setPick(undefined);
+    opts.current.onPickClosed?.(true);
     lastUsed = colour;
     setLastColour(colour);
     const { api, projectId, sourceId, assetId, handle: h, isLive, readOnly } = opts.current;
@@ -422,6 +440,12 @@ export function useHighlightMaking(o: MakingOptions) {
     notices,
     announcement,
     cancel,
+    /** The keyboard's path (Task R11): its own range, read exactly as a mouse selection is (`offer`). */
+    takeRange: offer,
+    /** Says `text` in the list's live region (the one polite region of the reader). */
+    say,
+    /** Whether the colour toolbar is shown. */
+    picking: pick !== undefined,
     /** Placed again on a scroll of the pages (the toolbar and the menu follow their page). */
     onScroll: () => {
       if (pick || menu) setTick((n) => n + 1);

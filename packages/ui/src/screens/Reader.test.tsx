@@ -410,7 +410,7 @@ describe("ReaderScreen (Task R7)", () => {
     expect(screen.getByText(SENTENCES.readOnly)).toBeTruthy();
     // Reading controls only: nothing that makes or changes anything is enabled.
     const enabled = screen.getAllByRole("button").filter((b) => !(b as HTMLButtonElement).disabled).map((b) => b.textContent);
-    expect(enabled.sort()).toEqual(["Fit width", "Next page", "Rotate view", "Zoom in", "Zoom out"].sort());
+    expect(enabled.sort()).toEqual(["Fit width", "Keyboard help", "Next page", "Rotate view", "Zoom in", "Zoom out"].sort());
     cleanup();
     openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
     screenFor({ readOnly: false });

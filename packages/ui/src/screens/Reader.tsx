@@ -65,6 +65,7 @@ import { openPdf, toPdfOpenError, type PdfHandle, type PdfOpenError } from "../r
 import { createRangeTransport } from "../reader/rangeTransport";
 import { canJudge, quoteStillMatches, textsUnderRects, touchesVerticalText } from "../reader/textCheck";
 import { useHighlightMaking } from "../reader/useHighlightMaking";
+import { useKeyboardMaking } from "../reader/useKeyboardMaking";
 import "../reader/Reader.css";
 
 export type ReaderStateKind = "locked" | "missing" | "damaged" | "too-large" | "not-a-pdf" | "password-needed" | "password-wrong" | "unreachable" | "other";
@@ -518,6 +519,15 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   }, [fileAnnotations, partial, textsSeen, handle, count]);
 
   // Task R10: highlights made with the mouse (the toolbar, the drafts, the overlap menu).
+  const pickClosed = useRef<((made: boolean) => void) | undefined>(undefined);
+  /** A highlight or a page note made here: the service's record, listed and drawn at once. */
+  const onCreated = (r: AnnotationRecord) => {
+    // Never listed twice: the list may have been asked for again while the create was on its way (M4).
+    if (annotations) setAnnotations((list) => (list ? (list.some((a) => a.id === r.id) ? list.map((a) => (a.id === r.id ? r : a)) : [...list, r]) : list));
+    else setListAttempt((n) => n + 1);
+    // R223 (f): while the list is filtered to a search's words, a highlight just made is shown in it too.
+    setFilterIds((f) => (f && !f.has(r.id) ? new Set([...f, r.id]) : f));
+  };
   const making = useHighlightMaking({
     api: () => apiRef.current,
     projectId,
@@ -528,29 +538,50 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
     readOnly,
     area,
     annotations: fileAnnotations,
-    onCreated: (r) => {
-      // Never listed twice: the list may have been asked for again while the create was on its way (M4).
-      if (annotations) setAnnotations((list) => (list ? (list.some((a) => a.id === r.id) ? list.map((a) => (a.id === r.id ? r : a)) : [...list, r]) : list));
-      else setListAttempt((n) => n + 1);
-      // R223 (f): while the list is filtered to a search's words, a highlight just made is shown in it too.
-      setFilterIds((f) => (f && !f.has(r.id) ? new Set([...f, r.id]) : f));
-    },
+    onCreated,
     onStoredMeanwhile: () => setListAttempt((n) => n + 1),
     onLocked: endLocked,
     onProjectInDoubt: () => inDoubt.current?.(),
     onSelect: setSelectedId,
+    onPickClosed: (made) => pickClosed.current?.(made),
   });
-  const { noteViewport, drafts, draftIds, onOverlapAt } = making;
+  const { noteViewport, drafts: mouseDrafts, draftIds: mouseDraftIds, onOverlapAt } = making;
+
+  // Task R11: highlights and page notes without a mouse (the keyboard's selection, the page note).
+  const keyboard = useKeyboardMaking({
+    api: () => apiRef.current,
+    projectId,
+    sourceId,
+    assetId,
+    handle,
+    isLive: (h) => current.current === h && !h.dead,
+    readOnly,
+    area,
+    page,
+    count,
+    pageText: (i) => pageTexts.current.get(i),
+    making,
+    onCreated,
+    onStoredMeanwhile: () => setListAttempt((n) => n + 1),
+    onLocked: endLocked,
+    onProjectInDoubt: () => inDoubt.current?.(),
+  });
+  pickClosed.current = keyboard.onPickClosed;
+  const noteDraft = keyboard.draft;
+  const drafts = useMemo(() => (noteDraft ? [...mouseDrafts, noteDraft] : mouseDrafts), [mouseDrafts, noteDraft]);
+  const draftIds = useMemo(() => (noteDraft ? new Set([...mouseDraftIds, noteDraft.id]) : mouseDraftIds), [mouseDraftIds, noteDraft]);
+  const noteViewportHere = keyboard.noteViewport;
 
   const renderOverlay = useCallback(
     (pageIndex: number, viewport: Parameters<typeof HighlightLayer>[0]["viewport"]) => {
       noteViewport(pageIndex, viewport);
+      noteViewportHere(pageIndex, viewport);
       const list = drafts.length > 0 ? [...(fileAnnotations ?? []), ...drafts] : fileAnnotations;
       return list && list.length > 0 ? (
         <HighlightLayer pageIndex={pageIndex} viewport={viewport} annotations={list} {...(selectedId !== undefined ? { selectedId } : {})} onSelect={setSelectedId} changed={changed} onOverlap={onOverlapAt(pageIndex)} drafts={draftIds} />
       ) : null;
     },
-    [fileAnnotations, selectedId, changed, noteViewport, drafts, draftIds, onOverlapAt],
+    [fileAnnotations, selectedId, changed, noteViewport, noteViewportHere, drafts, draftIds, onOverlapAt],
   );
 
   /**
@@ -752,6 +783,11 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
       e.preventDefault();
       return;
     }
+    // Task R11: S, N, and the keyboard's selection (Shift+arrows, Enter, Escape).
+    if (keyboard.onKey(e)) {
+      e.preventDefault();
+      return;
+    }
     const k = e.key;
     if (k === "PageDown") goTo(page + 1, true);
     else if (k === "PageUp") goTo(page - 1, true);
@@ -932,12 +968,16 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
             Rotate view
           </button>
         </span>
+        {keyboard.buttons}
       </div>
+      {keyboard.reasons}
+      {keyboard.help}
       <div className="ao-reader-body">
-        <div className="ao-reader-area" ref={area} onKeyDown={onAreaKey} onScrollCapture={making.onScroll}>
+        <div className={keyboard.placing ? "ao-reader-area ao-reader-area--placing" : "ao-reader-area"} ref={area} onKeyDown={onAreaKey} onScrollCapture={making.onScroll}>
           <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} />
           {making.floating}
           {making.notices}
+          {keyboard.notices}
         </div>
         {(annotations !== undefined || annotationsError !== undefined) && (
           <AnnotationList
