@@ -1558,6 +1558,11 @@ export interface RestoreResult {
    * what those records say (R182 d).
    */
   leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string; unverified?: true }>;
+  /**
+   * Complete lines of the Find and acquire queue and of watch registers that the restore could not open
+   * and copied through unchanged (still unreadable in the copy). Showing it is a later task's.
+   */
+  linesCopiedUnread: { findQueue: number; watchRegister: number };
 }
 
 export interface RestoreOptions {
@@ -1841,7 +1846,7 @@ async function restoreOpened(
     if (!destinations) throw new UnreadableBackupError("The backup could not be read; it was not restored");
     const date = formatModified(repoClock(repo)(), repoTz(repo)).slice(0, 10);
     await restoreSeams.beforeAdopt?.(staging);
-    const { project, notes, leftOut, warnings: inherited } = await adoptRestoredProject(repo, {
+    const { project, notes, leftOut, warnings: inherited, linesCopiedUnread } = await adoptRestoredProject(repo, {
       staging,
       backupSha256,
       ...(expectedHead !== undefined ? { expectedHead } : {}),
@@ -1866,7 +1871,7 @@ async function restoreOpened(
     const { policy } = await lookupPolicyInfo(repo, project.id);
     const due = policy?.retention.rawDataDestroyAfter;
     if (due && isDue(due, repoClock(repo)(), projectTimeZone(repo, project.id))) warnings.push("retention-due");
-    return { projectId: project.id, folder: project.folder, notes, warnings, leftOut };
+    return { projectId: project.id, folder: project.folder, notes, warnings, leftOut, linesCopiedUnread };
   } catch (err) {
     await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
     throw err;

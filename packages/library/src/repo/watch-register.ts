@@ -25,6 +25,7 @@ import { isId } from "@ao/core";
 import { InvalidInputError } from "./errors.js";
 import { openLine, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation } from "./mutate.js";
+import { PURPOSE_WATCH_REGISTER } from "./sealed-purposes.js";
 import type { RepoCore } from "./state.js";
 
 /** What the register says about a file of the folder. */
@@ -55,7 +56,7 @@ export interface WatchRegisterEntry {
 }
 
 export const WATCH_REGISTER_OP = "project.watched-folder.register";
-const PURPOSE = "ao-watch-register";
+const PURPOSE = PURPOSE_WATCH_REGISTER;
 const DIR = "watched";
 /** A name longer than this is not a name (a path component is at most 255 bytes; 20 levels deep at most). */
 const NAME_MAX = 8192;
