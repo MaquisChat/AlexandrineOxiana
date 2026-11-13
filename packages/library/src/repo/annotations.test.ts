@@ -22,6 +22,7 @@ import {
   ANNOTATION_UPDATE_OP,
   AnnotationLimitError,
   type AnnotationDraft,
+  type AnnotationPatch,
 } from "./annotations.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import type { Repo } from "./index.js";
@@ -97,6 +98,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   seams.crashAt = undefined;
+  seams.failAuditAppendFor = undefined;
   pauseBetweenSourceFilesForTests(undefined);
   handle.close();
   await lib.close();
@@ -377,6 +379,109 @@ describe("update and delete", () => {
     const snap = await snapshot(join(lib.root, f.projectFolder));
     await expect(repo.updateAnnotation(f.pid, f.sid, a.id, { colorName: "red" })).resolves.toEqual(a);
     expect(await snapshot(join(lib.root, f.projectFolder))).toEqual(snap);
+  });
+
+  it("an imported #ffd400 highlight recoloured to yellow writes nothing and is not marked edited; recoloured to green it is", async () => {
+    // Ruling M1 (round 1b): the colour it already shows (highlightColourOf) is no change.
+    const f = await fixture();
+    const imported = seedNote(f.sid, "", { kind: "highlight", body: undefined, quote: "zotero quote", color: "#ffd400", externalKey: "zotero:YELLOW01", externalHash: "h" });
+    await seed(f.pid, f.sid, () => [imported]);
+    const snap = await snapshot(join(lib.root, f.projectFolder));
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    const same = await repo.updateAnnotation(f.pid, f.sid, imported.id, { colorName: "yellow" });
+    expect(same).toEqual(imported);
+    expect(same.colorName).toBeUndefined();
+    expect(same.modifiedAt).toBeUndefined();
+    expect(await snapshot(join(lib.root, f.projectFolder))).toEqual(snap);
+    expect(await annotationEvents(f.projectFolder)).toHaveLength(n0);
+    expect(await txnMarkers()).toEqual([]);
+    expect(await repo.listAnnotations(f.pid, f.sid)).toEqual([imported]);
+    // A different named colour is the researcher's edit.
+    const green = await repo.updateAnnotation(f.pid, f.sid, imported.id, { colorName: "green" });
+    expect(green).toMatchObject({ colorName: "green", color: "#ffd400", modifiedAt: NOW, modifiedBy: "tester", externalKey: "zotero:YELLOW01", externalHash: "h" });
+    const ev = (await annotationEvents(f.projectFolder)).slice(n0);
+    expect(ev.map((e) => e.details?.changed)).toEqual([["colorName"]]);
+    // And recolouring back to yellow, now that "green" is stored, is again a change.
+    await expect(repo.updateAnnotation(f.pid, f.sid, imported.id, { colorName: "yellow" })).resolves.toMatchObject({ colorName: "yellow" });
+  });
+
+  it("a recolour to the shown colour together with a new note changes only the note", async () => {
+    const f = await fixture();
+    const imported = seedNote(f.sid, "", { kind: "highlight", body: undefined, quote: "q", color: "#ffd400", externalKey: "zotero:Y2" });
+    await seed(f.pid, f.sid, () => [imported]);
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    const after = await repo.updateAnnotation(f.pid, f.sid, imported.id, { colorName: "yellow", body: "mine" });
+    expect(after.body).toBe("mine");
+    expect(after.colorName).toBeUndefined();
+    expect((await annotationEvents(f.projectFolder)).slice(n0).map((e) => e.details?.changed)).toEqual([["body"]]);
+  });
+
+  it("extra fields in a draft or a patch are dropped: no provenance, import key, author or id can be set", async () => {
+    const f = await fixture();
+    const before = await repo.getSource(f.pid, f.sid);
+    const hostile = {
+      ...highlight(f),
+      id: "chosen-id",
+      externalKey: "zotero:FORGED",
+      externalHash: "forged",
+      author: "someone else",
+      createdAt: "2000-01-01T00:00:00.000Z",
+      color: "#000000",
+      provenance: { identifiable: true },
+      anchors: [{ page: 2, rects: [{ x: 1, y: 2, w: 3, h: 4, z: 9 }], kind: "text-range", assetId: f.txtAssetId, id: "anchor-id" }],
+    } as unknown as AnnotationDraft;
+    const a = await repo.createAnnotation(f.pid, f.sid, hostile);
+    expect(a.id).not.toBe("chosen-id");
+    expect(a).not.toHaveProperty("externalKey");
+    expect(a).not.toHaveProperty("externalHash");
+    expect(a).not.toHaveProperty("color");
+    expect(a).not.toHaveProperty("provenance");
+    expect(a).toMatchObject({ author: "tester", createdAt: NOW });
+    expect(a.anchors).toEqual([{ kind: "pdf", id: expect.any(String), assetId: f.assetId, page: 2, rects: [{ x: 1, y: 2, w: 3, h: 4 }] }]);
+    expect(a.anchors[0]!.id).not.toBe("anchor-id");
+    const patched = await repo.updateAnnotation(f.pid, f.sid, a.id, {
+      colorName: "red",
+      externalKey: "zotero:FORGED",
+      quote: "rewritten",
+      kind: "note",
+      author: "someone else",
+      createdAt: "2000-01-01T00:00:00.000Z",
+      anchors: [],
+      sourceId: "other",
+      provenance: { identifiable: true },
+    } as unknown as AnnotationPatch);
+    expect(patched).toEqual({ ...a, colorName: "red", modifiedAt: NOW, modifiedBy: "tester" });
+    const sf = await repo.getSource(f.pid, f.sid);
+    expect(sf.source).toEqual(before.source);
+    expect(sf.deletedAnnotationKeys).toBeUndefined();
+    // Extra fields on a delete call have nothing to reach either: an annotation made here leaves no key.
+    await expect(repo.deleteAnnotation(f.pid, f.sid, a.id)).resolves.toEqual({ id: a.id, external: false });
+    expect((await repo.getSource(f.pid, f.sid)).deletedAnnotationKeys).toBeUndefined();
+  });
+
+  it("a failed audit append leaves nothing on disk and no marker, for create, update and delete", async () => {
+    const f = await fixture();
+    const a = await repo.createAnnotation(f.pid, f.sid, highlight(f));
+    const imported = seedNote(f.sid, "n", { kind: "highlight", externalKey: "zotero:KEEP" });
+    await importChange(repo, f.pid, STORE, async (ops) => {
+      const cur = await ops.readSource(f.sid);
+      await ops.writeSource(cur, { ...cur, annotations: [...cur.annotations, imported] });
+    }, { op: "test.seed" });
+    const snap = await snapshot(join(lib.root, f.projectFolder));
+    seams.failAuditAppendFor = f.pid;
+    try {
+      await expect(repo.createAnnotation(f.pid, f.sid, highlight(f, { body: NOTE }))).rejects.toThrow();
+      await expect(repo.updateAnnotation(f.pid, f.sid, a.id, { body: NOTE })).rejects.toThrow();
+      await expect(repo.deleteAnnotation(f.pid, f.sid, imported.id)).rejects.toThrow();
+    } finally {
+      seams.failAuditAppendFor = undefined;
+    }
+    expect(await snapshot(join(lib.root, f.projectFolder))).toEqual(snap);
+    expect(await txnMarkers()).toEqual([]);
+    expect(await repo.listAnnotations(f.pid, f.sid)).toEqual([a, imported]);
+    expect((await repo.getSource(f.pid, f.sid)).deletedAnnotationKeys).toBeUndefined();
+    // The project still takes changes afterwards.
+    await expect(repo.updateAnnotation(f.pid, f.sid, a.id, { body: NOTE })).resolves.toMatchObject({ body: NOTE });
   });
 
   it("an unknown annotation is not found", async () => {
