@@ -20,3 +20,4 @@ export * from "./device-notices.js";
 export * from "./annotations.js";
 export * from "./documents.js";
 export * from "./watched-folders.js";
+export * from "./find.js";
