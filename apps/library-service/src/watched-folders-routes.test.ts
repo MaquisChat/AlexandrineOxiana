@@ -33,7 +33,7 @@ import type { WatchedFolderSummary } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { FolderGrants } from "./folder-grants.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
-import { WatchStatusCoalescer, coalescerOf, fileItemOf, placeOf } from "./routes/watched-folders.js";
+import { WatchStatusCoalescer, bringInDone, coalescerOf, fileItemOf, placeOf } from "./routes/watched-folders.js";
 import type { Session } from "./state.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -618,6 +618,10 @@ describe("files and origins", () => {
     expect([filtered.json.total, filtered.json.items.length]).toEqual([250, 5]);
     expect((await call({ url: `${base}?kind=changed` })).json).toEqual({ total: 0, items: [] });
   }, 60_000);
+
+  it("bring in the new version says \"already-there\" when the library already held that content, and \"attached\" when a file was added (R239 d)", () => {
+    expect([bringInDone("duplicate"), bringInDone("attached")]).toEqual(["already-there", "attached"]);
+  });
 
   it("a size-unknown file is listed with its sentence and no size", () => {
     expect(fileItemOf({ file: "x.pdf", kind: "not-downloaded", reason: WATCH_REASONS.sizeUnknown, bytes: 0 }, [])).toEqual({ file: "x.pdf", kind: "not-downloaded", reason: WATCH_REASONS.sizeUnknown });

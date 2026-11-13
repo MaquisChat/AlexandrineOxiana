@@ -152,8 +152,11 @@ export interface WatchedFileActionRequest {
   action: "bring-in-new-version" | "keep-as-it-is";
 }
 
+/** What an act on a source's origin did: "already-there" is "bring in the new version" when the library already held that content (nothing was added). */
+export const WATCHED_FILE_ACTION_DONE = ["attached", "settled", "already-there"] as const;
+
 export interface WatchedFileActionResponse {
-  done: "attached" | "settled";
+  done: (typeof WATCHED_FILE_ACTION_DONE)[number];
   sourceId: string;
 }
 
