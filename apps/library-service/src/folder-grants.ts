@@ -15,7 +15,9 @@
  * "folder-grant", `id` 32 lowercase hexadecimal characters, `path` absolute, at most
  * GRANT_PATH_MAX_BYTES in UTF-8 and without NUL, the whole line at most GRANT_LINE_MAX_BYTES. The
  * text must be byte for byte what `JSON.stringify` makes of those three values (which is also what
- * serde_json makes), so a duplicated key, extra spaces or an unusual escape is not a grant. Every
+ * serde_json makes), so a duplicated key, extra spaces, a leading byte-order mark or an unusual
+ * escape is not a grant. The one tolerance is upstream: the line reader (startup-token.ts
+ * `InputLines`) removes one `\r` before the line end, so `<grant>\r\n` is a grant. Every
  * other line is discarded, never interpreted (R98, R155, as changed by R207 for this one shape).
  */
 import { isAbsolute } from "node:path";

@@ -240,6 +240,19 @@ describe("onInputLines (R155: end of standard input after the token line means s
     expect(ends()).toBe(1);
   });
 
+  it("a grant line led by a byte-order mark is not a grant", async () => {
+    const { input, grants } = await attached();
+    const grant = JSON.stringify({ type: "folder-grant", id: GRANT_ID, path: "/x" });
+    input.write(`﻿${grant}\n`);
+    input.write(`﻿${grant}\r\n`);
+    await tick();
+    expect(grants.size).toBe(0);
+    // The same line without it is one.
+    input.write(`${grant}\n`);
+    await tick();
+    expect(grants.take(GRANT_ID)).toBe("/x");
+  });
+
   it("a grant line in the same write as the token is handed over too (it comes after the token)", async () => {
     const { grants } = await attached(`${TOKEN}\n${JSON.stringify({ type: "folder-grant", id: GRANT_ID, path: "/x" })}\n`);
     await tick();
@@ -281,6 +294,8 @@ describe("onInputLines (R155: end of standard input after the token line means s
     // A line of exactly the bound is read; one byte more is not.
     expect(r.push(Buffer.from("c".repeat(INPUT_LINE_MAX_BYTES) + "\n"))).toEqual(["c".repeat(INPUT_LINE_MAX_BYTES)]);
     expect(r.push(Buffer.from("d".repeat(INPUT_LINE_MAX_BYTES + 1) + "\nok\n"))).toEqual(["ok"]);
+    // A byte-order mark is kept, so a line it leads is not the exact text of anything.
+    expect(r.push(Buffer.from("﻿bom\n"))).toEqual(["﻿bom"]);
     // Bytes that are not UTF-8 are not a line.
     expect(r.push(Buffer.from([0x7b, 0xc3, 0x28, 0x7d, 0x0a, 0x78, 0x0a]))).toEqual(["x"]);
   });

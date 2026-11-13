@@ -167,14 +167,17 @@ export const INPUT_LINE_MAX_BYTES = 8192;
 /**
  * Cuts the bytes after the token into lines, holding at most INPUT_LINE_MAX_BYTES (+1 for a `\r`):
  * a line that grows past that is dropped as it arrives, with everything up to its line end, and never
- * kept. A line that is not valid UTF-8 is dropped. One `\r` before the line end is removed.
+ * kept. A line that is not valid UTF-8 is dropped. One `\r` before the line end is removed (the
+ * only change made to a line's text); everything else, a leading byte-order mark included, is
+ * handed on exactly as it arrived, so such a line is not a grant.
  */
 export class InputLines {
   #parts: Buffer[] = [];
   #size = 0;
   /** Inside a line that is already too long: drop until its line end. */
   #dropping = false;
-  readonly #decoder = new TextDecoder("utf-8", { fatal: true });
+  // ignoreBOM: a byte-order mark is kept as a character, so a line it leads is not exact text.
+  readonly #decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
   /** The complete lines in `chunk` (joined to what came before it). */
   push(chunk: Buffer): string[] {
