@@ -34,7 +34,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { pdfjsLicenceFiles } from "../../../packages/ui/scripts/pdfjs-assets.mjs";
+import { pdfjsBundledComponents, pdfjsLicenceFiles } from "../../../packages/ui/scripts/pdfjs-assets.mjs";
 import { collectLicenceTexts, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts, sbomIn, seeLicenceIn, sourceList, verifyVerbatim } from "../../../scripts/notices/licence-texts.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -87,9 +87,9 @@ export function crateNotices(crates) {
 
 const crateSource = (c) => `${c.repository ?? "(no repository stated)"} (version ${c.version}; also https://crates.io/crates/${c.name}/${c.version})`;
 
-/** One entry per production npm package of `pnpm list --json` output; workspace packages are left out. */
+/** One entry per production npm package of `pnpm list --json` output (and what one bundles without its text); workspace packages are left out. */
 export function npmNotices(list, readPackage) {
-  return npmPackages(list, readPackage).map(({ name, version, licence }) => ({ name, version, licence }));
+  return npmPackages(list, readPackage).map(({ name, version, licence, bundledIn }) => ({ name, version, licence, ...(bundledIn ? { bundledIn } : {}) }));
 }
 
 const fail = (part, problems) => {
@@ -137,7 +137,12 @@ export function crateLicenceTexts(crates, standard = loadStandardTexts()) {
 /** The licence texts of the interface's npm packages (from each package's folder), as one file. Throws on a problem. */
 export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts()) {
   const dirs = new Map();
-  const packages = npmPackages(list, readPackage).map(({ name, version, licence, path, pkg }) => {
+  const packages = npmPackages(list, readPackage).map(({ name, version, licence, path, pkg, bundledIn, copyright }) => {
+    if (bundledIn) {
+      // A component bundled inside another package that ships no text for it (core-js in pdf.js):
+      // the standard text of its identifier, and the copyright line the bundle itself states.
+      return { name, version, licence, files: [], note: `bundled inside ${bundledIn}, which ships no licence text for it; the bundle states: ${copyright}` };
+    }
     const repo = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
     const see = seeLicenceIn(licence);
     const names = licenceFilesIn(path);
@@ -167,6 +172,9 @@ export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts(
 
 /** Licence files inside a package's sub-folders that the interface ships with files copied from those folders. */
 const bundledLicenceFiles = (name, path) => (name === "pdfjs-dist" ? pdfjsLicenceFiles(path) : []);
+
+/** Components a package bundles without shipping their licence texts (core-js inside pdf.js's legacy build). */
+const bundledComponents = (name, path) => (name === "pdfjs-dist" ? pdfjsBundledComponents(path) : []);
 
 /** Where an MPL-2.0 npm package's source is: its repository and its npm page. */
 export const npmSource = (name, version, repo) => `${repo ?? "(no repository stated)"} (version ${version}; also https://www.npmjs.com/package/${name}/v/${version})`;
@@ -208,6 +216,13 @@ function npmPackages(list, readPackage) {
     }
   };
   for (const root of list) walk(root.dependencies);
+  // What a package bundles without shipping its licence text, as the bundle records it (Task R6, A6).
+  for (const p of [...found.values()]) {
+    for (const c of bundledComponents(p.name, p.path)) {
+      const key = `${c.name}@${c.version}`;
+      if (!found.has(key)) found.set(key, { name: c.name, version: c.version, licence: c.licence, path: null, pkg: {}, bundledIn: `${p.name} ${p.version}`, copyright: c.copyright });
+    }
+  }
   return [...found.values()].sort(byName);
 }
 
