@@ -8,7 +8,7 @@ import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { createAnnotation, deleteAnnotation, listAnnotations, updateAnnotation, type AnnotationDraft, type AnnotationPatch } from "./annotations.js";
-import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord, resetZoteroWebVersion } from "./import-settings.js";
+import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord, resetZoteroWebVersion, updateWatchedFolderOptions, type WatchedFolderOptionsPatch } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingOcrMany, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import {
@@ -1294,6 +1294,11 @@ export function clearZoteroWebVersion(repo: Repo, projectId: string, ref: string
 /** Package-internal (watched folders): adds a watch's id + options to project.json (governed, audited). */
 export function addWatchedFolderEntry(repo: Repo, projectId: string, options: unknown): Promise<WatchedFolder> {
   return addWatchedFolderRecord(cores.get(repo)!, projectId, options);
+}
+
+/** Package-internal (watched folders, W7 round 2): changes a watch's label and/or collection in project.json (governed, audited by field names only). */
+export function updateWatchedFolderEntry(repo: Repo, projectId: string, id: string, patch: WatchedFolderOptionsPatch): Promise<WatchedFolder> {
+  return updateWatchedFolderOptions(cores.get(repo)!, projectId, id, patch);
 }
 
 /** Package-internal (watched folders): removes a watch's record from project.json (governed, audited). */

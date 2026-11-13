@@ -1,20 +1,17 @@
 /**
  * Bulk Import (spec 5.4): dry run, start (progress as `import.progress` events), pause / resume /
- * cancel / undo, report, review list; device import (spec 5.3); watched folders. Adapters are the
+ * cancel / undo, report, review list; device import (spec 5.3). Watched folders: routes/watched-folders.ts
+ * (Task W7: a folder only by grant, never a path from the page). Adapters are the
  * library's own (`adapterFor`), chosen by `adapter.kind`.
  */
 import type { FastifyInstance } from "fastify";
 import type { ImportOptionsInput } from "@ao/core";
 import {
-  addWatchedFolder,
   adapterFor,
-  listWatchedFolders,
-  removeWatchedFolder,
   researcherName,
   researcherNameOk,
   resumeZoteroWebImport,
   startZoteroWebImport,
-  watchFolder,
   zoteroWebAdapter,
   zoteroWebSince,
   proxyQueueFor,
@@ -176,38 +173,5 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     });
     state.followBatch(s, projectId, h);
     return { batchId: h.batchId };
-  });
-
-  // ---- watched folders (their folders are this device's settings, R78 c) ----
-  app.get("/projects/:id/watched-folders", async (req) => {
-    const s = state.requireSession();
-    const projectId = projectParam(ctx, req);
-    return { folders: await listWatchedFolders({ repo: s.repo, lib: s.lib }, projectId) };
-  });
-
-  app.post("/projects/:id/watched-folders", async (req) => {
-    const s = state.requireWritable();
-    const projectId = projectParam(ctx, req);
-    const b = bodyOf(req);
-    const dir = str(b, "dir", 4096);
-    if (!isAbsolute(dir)) throw badRequest('"dir" must be an absolute path.');
-    const options = (optObj(b, "options") ?? {}) as Parameters<typeof addWatchedFolder>[3];
-    const w = await addWatchedFolder({ repo: s.repo, lib: s.lib }, projectId, dir, options);
-    const watch = watchFolder(state.watchDeps(s, projectId), projectId, dir, w.options, w.id); // with its id: its register (A8)
-    s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), watch]);
-    return w;
-  });
-
-  app.delete("/projects/:id/watched-folders/:wid", async (req) => {
-    const s = state.requireWritable();
-    const projectId = projectParam(ctx, req);
-    const wid = paramsOf(req).wid ?? "";
-    const known = await listWatchedFolders({ repo: s.repo, lib: s.lib }, projectId);
-    const gone = known.find((w) => w.id === wid);
-    if (!gone) throw notFound("That watched folder");
-    await removeWatchedFolder({ repo: s.repo, lib: s.lib }, projectId, wid);
-    // The project's other watches start again from what is left, with their events (R99).
-    await state.startWatches(s, projectId);
-    return { removed: true };
   });
 }

@@ -13,7 +13,17 @@
 //     folder (R153), so they are never needed;
 //  4. loads the bundled service, main.mjs.
 //
+// Before all of that, as its first statement, it gives the process sixteen file threads (UV_THREADPOOL_SIZE,
+// cloud-drive watched folders, Amendments A3 d and A5): a watched folder whose file-system call never answers holds
+// one thread until it does, and Node has only four for all file work unless told otherwise. libuv reads the
+// variable once, when the first call needs a thread, so it must be set before any file call of the process: here,
+// in the entry point, before the bundled service is even read (its only imports are Node built-ins, which make no
+// such call). A larger value already in the environment is kept.
+//
 // Messages are plain and name no path (R96). Plain JavaScript with Node built-ins only.
+// A3 (d), A5: at least sixteen file threads, before any file call (see above).
+if (!(Number(process.env.UV_THREADPOOL_SIZE) >= 16)) process.env.UV_THREADPOOL_SIZE = "16";
+
 import { readFileSync } from "node:fs";
 import Module from "node:module";
 

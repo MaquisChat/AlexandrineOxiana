@@ -123,7 +123,7 @@ import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, WATCHED_FOLDER_TOOL, createAttac
 import { proxyQueueFor, type ProxyQueue } from "./proxies.js";
 import { SIDECAR_EXTS } from "./sidecar.js";
 import { WatchedFoldersUnreadableError, reserveWatchDownload, getWatchChoices, getWatchDownloadCount, type WatchChoices, type WatchDownloadCount } from "./watch-choices.js";
-import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, fileKey, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
+import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, fileKey, folderRuleRefusal, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
 
 /** Names never imported (moved to watch-local.ts so the two modules do not import each other; A2). */
 export { ignoredName } from "./watch-local.js";
@@ -199,6 +199,8 @@ export const WATCH_REASONS = {
   /** The folder: `{provider}` is filled by `withProvider`. */
   notPermitted: "macOS did not allow the app to read files managed by {provider}, so this folder is not watched. Press “Try again” and choose Allow if macOS asks.",
   notResponding: "The folder did not answer for 30 seconds ({provider} may be starting, signed out or offline). Watching goes on when it answers.",
+  /** R234 M-b: a call given up before the full limit (by a stop), or one merely still outstanding: said without a number. */
+  notAnswering: "This folder is not answering ({provider} may be offline or signed out). Watching goes on when it does.",
   missing: "The folder cannot be found. If {provider} is signed out or still starting, watching resumes when the folder is back.",
   /** Task W3: most of the register missing at once; `{provider}` is filled by `withProvider`. */
   massGone: "Most files in this folder disappeared at once. This usually means {provider} is signed out or still starting. Nothing in the library has changed.",
@@ -211,6 +213,8 @@ export const WATCH_REASONS = {
   registerUnwritable: "The record of which files in this folder are in the library could not be saved, so nothing new is brought in from this folder until it can be. Nothing in the library has been lost.",
   /** A watch must have its id (A8): without it nothing could be recorded. */
   noWatchId: "This watched folder has no id of its own, so it is not watched.",
+  /** R233 M3: the stored folder's real path is no longer the one chosen (e.g. replaced by a link): it is not followed. */
+  notWhereChosen: "This folder is not where it was when you chose it. Choose it again.",
   /** Task W4: the researcher paused the folder. */
   paused: "Paused. Files put in the folder meanwhile come in when you resume.",
   /** Task W4 (ruled wording): `{files}` in the en-US number style, `{size}` in the interface's size style (`sizeText`). */
@@ -404,11 +408,18 @@ export interface FolderWatch {
    * (`setWatchChoices`); otherwise a running watch reads them by itself only every WATCH_CHOICES_POLL_MS (N4).
    */
   refreshChoices(): Promise<void>;
+  /**
+   * The folder's collection changed (R233 I3): every file attached from now on goes into `collectionId` (none: no
+   * collection), whatever the watch is doing — stuck, downloading or paused. Reads nothing in the folder; checks only
+   * that the collection exists (the "no collection" reason, as at start).
+   */
+  setCollection(collectionId: string | undefined): void;
 }
 
 const within = (folder: string, p: string) => {
   const rel = relative(folder, p);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  // A name that merely starts with ".." (`..inner`) is inside (R233 M2): only ".." itself or "../…" is outside.
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 };
 
 /** Whether `dir` (a real path) is the library, inside it, or holds it. */
@@ -438,7 +449,7 @@ type CallKind = "fs" | "fetch";
 class FolderGate {
   private busy = false;
   /** Gives up on the call in flight (as its time limit does), and what kind of call it is. */
-  private inFlight: { kind: CallKind; giveUp: () => void } | null = null;
+  private inFlight: { kind: CallKind; giveUp: (early?: boolean) => void } | null = null;
   private queue: Array<{ go: () => void; fail: () => void }> = [];
   private freeWaiters: Array<() => void> = [];
   private settleWaiters: Array<() => void> = [];
@@ -448,7 +459,7 @@ class FolderGate {
   epoch = 0;
   constructor(
     private readonly timeoutMs: number,
-    private readonly onStuck: (kind: CallKind) => void,
+    private readonly onStuck: (kind: CallKind, early: boolean) => void,
   ) {}
   get signal(): AbortSignal {
     return this.ctl.signal;
@@ -458,7 +469,7 @@ class FolderGate {
     return new Promise<T>((resolveCall, rejectCall) => {
       const go = () => {
         let done = false;
-        const giveUp = () => {
+        const giveUp = (early = false) => {
           if (done) return;
           done = true;
           clearTimeout(timer);
@@ -468,9 +479,9 @@ class FolderGate {
           this.ctl.abort();
           for (const q of this.queue.splice(0)) q.fail();
           rejectCall(new FolderNotAnsweringError());
-          this.onStuck(kind);
+          this.onStuck(kind, early);
         };
-        const timer = setTimeout(giveUp, timeoutMs);
+        const timer = setTimeout(() => giveUp(), timeoutMs);
         timer.unref?.();
         this.inFlight = { kind, giveUp };
         let p: Promise<T>;
@@ -543,6 +554,14 @@ class FolderGate {
   abandon(kind: CallKind): void {
     if (this.inFlight?.kind === kind) this.inFlight.giveUp();
   }
+  /**
+   * The watch stops (R234 I-A): the call in flight, of whatever kind, is given up at once, exactly as one that did not
+   * answer — so the folder is recorded as having a call outstanding before the stop returns, and the next watch of the
+   * folder adopts it instead of issuing a second call beside it.
+   */
+  giveUpNow(): void {
+    this.inFlight?.giveUp(true);
+  }
   /** The watch stops: nobody waits for the stuck call any longer (it is still not followed by another). */
   release(): void {
     for (const f of this.freeWaiters.splice(0)) f();
@@ -597,7 +616,46 @@ const isRefusal = (err: unknown) => errCode(err) === "EACCES" || errCode(err) ==
  * the process (A6): a new watch on such a folder (a restart, W7's "Try again") starts "Cannot be reached" and makes
  * no call until that one settles — the thread it holds is not joined by another.
  */
-const outstandingFolders = new Map<string, { settled: Promise<void>; kind: CallKind }>();
+const outstandingFolders = new Map<string, { settled: Promise<void>; kind: CallKind; early?: boolean }>();
+
+/** Whether a call on this folder (as given, or its real path) is still outstanding in this process (A6, R234 I-A). */
+export function folderCallOutstanding(dir: string): boolean {
+  return outstandingFolders.has(resolve(dir));
+}
+
+/**
+ * Records a call on `dir` that its caller stopped waiting for (the service's own checks of a chosen folder, R234 I-A):
+ * until it settles, a watch of the folder adopts it and issues nothing, and the folder is not asked again.
+ */
+export function noteFolderCallOutstanding(dir: string, call: Promise<unknown>): void {
+  const key = resolve(dir);
+  const entry = { settled: call.then(() => {}, () => {}), kind: "fs" as const, early: true };
+  outstandingFolders.set(key, entry);
+  void entry.settled.then(() => {
+    if (outstandingFolders.get(key) === entry) outstandingFolders.delete(key);
+  });
+}
+
+/** The folder checks of an add or a set-folder under a time limit (R234 I-B): past it, FolderNotAnsweringError, nothing written. */
+async function checkedFolderWithin(deps: WatchSettingsDeps, dir: string, timeoutMs: number | undefined): Promise<string> {
+  if (timeoutMs === undefined) return checkedFolder(deps, dir);
+  if (folderCallOutstanding(dir)) throw new FolderNotAnsweringError();
+  const check = checkedFolder(deps, dir);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_r, reject) => {
+    timer = setTimeout(() => {
+      noteFolderCallOutstanding(dir, check);
+      reject(new FolderNotAnsweringError());
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  check.catch(() => {});
+  try {
+    return await Promise.race([check, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** The watches running in this process, by watch id and by folder (as given and as its real path): one each (I1). */
 const activeWatches = new Map<string, symbol>();
@@ -671,6 +729,8 @@ const sameStored = (e: WatchRegisterEntry, r: Reading) => e.size === r.size && e
  */
 export function watchFolder(deps: WatchDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT>, watchId: string): FolderWatch {
   const opts = WatchedFolderOptions.parse(options);
+  /** The collection new files go into: from the options, and changed while running by `setCollection` (R233 I3). */
+  let collectionId: string | undefined = opts.collectionId;
   const root = resolve(dir);
   const emit = (e: WatchEvent) => {
     try {
@@ -699,6 +759,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const me = Symbol("watch");
   const ownKeys: string[] = [];
   const claim = (k: string): boolean => {
+    // A stopped watch holds no claim, whenever it was stopped (R233 I1): a claim asked for after the stop is refused.
+    if (stopped) return false;
     const holder = activeWatches.get(k);
     if (holder && holder !== me) return false;
     if (!holder) {
@@ -892,7 +954,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
   /** Whether the chosen collection exists (none chosen: nothing to say). */
   async function checkCollection(): Promise<void> {
-    const id = opts.collectionId;
+    const id = collectionId;
     let gone = false;
     if (id) {
       try {
@@ -1093,10 +1155,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const projectLocked = () => projectEncrypted(deps.repo, projectId) && !deps.repo.isUnlocked(projectId);
 
   // ---- the folder's one gate, and the calls made through it ----------------------------------------------
-  const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, (kind) => {
+  const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, (kind, early) => {
     const settledAt = gate.afterSettle();
     const keys = [...new Set([root, realRoot])];
-    const entry = { settled: settledAt, kind };
+    const entry = { settled: settledAt, kind, early };
     for (const k of keys) outstandingFolders.set(k, entry);
     void settledAt.then(() => {
       for (const k of keys) if (outstandingFolders.get(k) === entry) outstandingFolders.delete(k);
@@ -1264,7 +1326,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       if (err instanceof FolderNotAnsweringError) throw err;
       return { reason: folderReason(err) };
     }
-    return (await overlapsLibrary(realRoot, deps.lib)) ? { stop: WATCH_REASONS.library } : null;
+    if (await overlapsLibrary(realRoot, deps.lib)) return { stop: WATCH_REASONS.library };
+    // R233 M3: watched only where it was chosen — a folder whose real path is no longer the stored one (replaced by a
+    // link, say) is not followed; and the rule on where a folder may be is applied again at every start.
+    if (realRoot !== root) return { stop: WATCH_REASONS.notWhereChosen };
+    const rule = folderRuleRefusal(realRoot, env);
+    return rule ? { stop: rule } : null;
   }
   /** Null when the folder is there (one `stat`), else why not. */
   async function rootProblem(): Promise<string | null> {
@@ -1808,7 +1875,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     current = { abs, b };
     let o: AttachOutcome | undefined;
     try {
-      [o] = await attach.attachFiles(projectId, [abs], { ...(persist ? { origin: { watchId: watchId! } } : {}), ...(opts.collectionId ? { collectionId: opts.collectionId } : {}) });
+      [o] = await attach.attachFiles(projectId, [abs], { ...(persist ? { origin: { watchId: watchId! } } : {}), ...(collectionId ? { collectionId } : {}) });
     } catch (err) {
       deps.debug?.(`watched folder: import failed (${err instanceof Error ? err.name : "error"})`);
       o = { path: abs, outcome: "failed", reason: WATCH_REASONS.failed };
@@ -2305,13 +2372,17 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let stopping: Promise<void> | undefined;
   /** `inside`: called by the watch's own work, which must not wait for itself. */
   function stopWith(reason?: string, inside = false): Promise<void> {
+    // The watch's own work (its start refusing itself, say) never waits for an outer stop() already under way: that one
+    // awaits `ready`, so waiting for it here would be each waiting for the other (R233 I1).
+    if (stopping && inside) return Promise.resolve();
     stopping ??= (async () => {
       stopped = true;
       stopReason = reason;
       clearInterval(timer);
       // A download in hand is not waited for (it may take an hour): the folder counts as not answering until it settles,
       // so nothing further is issued on it — by this watch or a new one (Task W4).
-      if (fetching !== null) gate.abandon("fetch");
+      // ... and so is any other call in flight (R234 I-A): it is recorded as outstanding before the stop returns.
+      gate.giveUpNow();
       gate.release();
       for (const k of ownKeys.splice(0)) if (activeWatches.get(k) === me) activeWatches.delete(k);
       if (persist && liveWatches.get(deps.repo)?.get(liveKey(projectId, watchId!)) === live) liveWatches.get(deps.repo)!.delete(liveKey(projectId, watchId!));
@@ -2381,7 +2452,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const prior = refused ? undefined : outstandingFolders.get(root);
   if (prior) {
     gate.adopt(prior.settled);
-    goUnreachable(prior.kind === "fetch" ? withService(WATCH_REASONS.fetchNotResponding, provider) : withProvider(WATCH_REASONS.notResponding, provider));
+    // The full limit passed: its number is true; given up early (a stop, the service), said without it (R234 M-b).
+    goUnreachable(prior.kind === "fetch" ? withService(WATCH_REASONS.fetchNotResponding, provider) : withProvider(prior.early ? WATCH_REASONS.notAnswering : WATCH_REASONS.notResponding, provider));
   }
 
   const ready: Promise<void> = (async () => {
@@ -2397,6 +2469,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
     // One folder feeds one project (I6): an older record of a folder that an earlier-added watch keeps is not started.
     const keeper = await folderKeeper(deps, projectId, watchId);
+    if (stopped) return; // stopped while it was being decided: nothing is claimed (R233 I1)
     if (keeper) {
       const reason = keeper.projectId === projectId ? WATCH_REASONS.alreadyWatched : WATCH_REASONS.folderOfAnotherProject;
       emit({ kind: "error", reason });
@@ -2420,12 +2493,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     try {
       const bad = await checkRoot();
       rootChecked = true;
+      if (stopped) return;
       if (bad?.stop) {
         emit({ kind: "error", reason: bad.stop });
-        await stopWith(bad.stop === WATCH_REASONS.alreadyWatched ? bad.stop : undefined, true);
+        await stopWith(bad.stop === WATCH_REASONS.library ? undefined : bad.stop, true);
         return;
       }
-      if (stopped) return;
       if (bad) goUnreachable(bad.reason!);
       else {
         let entries: Entry[] | undefined;
@@ -2460,6 +2533,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       return { total: all.length, items: all.slice(Math.max(0, offset), Math.max(0, offset) + Math.max(0, limit)).map((p) => ({ ...p })) };
     },
     refreshChoices: () => (stopped ? Promise.resolve() : refreshChoices()),
+    setCollection: (id) => {
+      collectionId = id ?? undefined;
+      if (!stopped) void checkCollection().catch(() => {});
+    },
   };
 }
 
@@ -2809,8 +2886,9 @@ function putFolder(deps: WatchSettingsDeps, projectId: string, id: string, real:
 }
 
 /** Adds a watched folder: its id and options to project.json (governed, audited), its folder to this device's settings. */
-export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}): Promise<WatchedFolder> {
-  const real = await checkedFolder(deps, dir);
+export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}, o: { timeoutMs?: number } = {}): Promise<WatchedFolder> {
+  // Only the calls on the folder are under the caller's limit (R234 I-B); the governed write below is awaited.
+  const real = await checkedFolderWithin(deps, dir, o.timeoutMs);
   deps.repo.getProject(projectId); // NotFoundError for an unknown project
   // A list that cannot be read refuses before the project is changed (Task 68, R178 a); so does a folder already
   // watched for a project of this library (I6: one folder feeds one project).
@@ -2822,9 +2900,10 @@ export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: strin
 }
 
 /** Chooses this computer's folder for a watch the project already has (e.g. one added on another computer). */
-export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string, id: string, dir: string): Promise<void> {
+export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string, id: string, dir: string, o: { timeoutMs?: number } = {}): Promise<void> {
   if (!(deps.repo.getProject(projectId).watchedFolders ?? []).some((w) => w.id === id)) throw new TypeError("This project has no such watched folder.");
-  const real = await checkedFolder(deps, dir);
+  // Only the calls on the folder are under the caller's limit (R234 I-B).
+  const real = await checkedFolderWithin(deps, dir, o.timeoutMs);
   await refuseWatchedFolder(deps, real, id);
   await putFolder(deps, projectId, id, real);
 }
