@@ -204,6 +204,42 @@ export {
   zoteroLibraryUnchanged,
 } from "./import/zotero-web-account.js";
 export type { ZoteroAccountReason, ZoteroKeyAccess } from "./import/zotero-web-account.js";
+export {
+  ZOTERO_SYNC_MAX_BACKOFF_MS,
+  ZOTERO_SYNC_MIN_BACKOFF_MS,
+  syncZoteroLibrary,
+  zoteroImportRunning,
+  zoteroSyncBackoff,
+  zoteroSyncCounts,
+  zoteroSyncRunCounts,
+  zoteroSyncRunning,
+} from "./import/zotero-sync.js";
+export type { ZoteroSyncDeps, ZoteroSyncOptions } from "./import/zotero-sync.js";
+export {
+  DEFAULT_ZOTERO_SYNC_SETTINGS,
+  ZOTERO_SYNC_FILE,
+  ZOTERO_SYNC_HISTORY_FILE,
+  ZOTERO_SYNC_HISTORY_MAX,
+  ZOTERO_SYNC_INTERVALS,
+  ZOTERO_SYNC_MAX_LINKS,
+  ZOTERO_SYNC_REASONS,
+  ZoteroSyncFileUnreadableError,
+  pauseAllZoteroSyncLinks,
+  pauseLink,
+  readZoteroSyncHistory,
+  readZoteroSyncSettings,
+  writeZoteroSyncSettings,
+} from "./import/zotero-sync-settings.js";
+export type {
+  ZoteroSyncCounts,
+  ZoteroSyncFileOptions,
+  ZoteroSyncLink,
+  ZoteroSyncOutcome,
+  ZoteroSyncPause,
+  ZoteroSyncReason,
+  ZoteroSyncRun,
+  ZoteroSyncSettings,
+} from "./import/zotero-sync-settings.js";
 export { SECRET_NAMES, SECRET_SERVICE, SECRET_STORE_UNAVAILABLE, SecretStoreUnavailableError, deleteSecret, getSecret, setSecret } from "./secrets.js";
 export type { SecretName } from "./secrets.js";
 export { DEIDENTIFIED_NOTE, REFMAN_FORMATS, exportRefman, writeRefmanExport } from "./export/refman-export.js";

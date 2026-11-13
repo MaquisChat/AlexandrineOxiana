@@ -188,15 +188,6 @@ export function isZoteroSyncRun(v: unknown): v is ZoteroSyncRun {
   return true;
 }
 
-interface SettingsFile {
-  v: 1;
-  libraries: Record<string, ZoteroSyncSettings>;
-}
-interface HistoryFile {
-  v: 1;
-  libraries: Record<string, ZoteroSyncRun[]>;
-}
-
 const fileOf =
   <T>(entry: (v: unknown) => boolean) =>
   (v: unknown): v is { v: 1; libraries: Record<string, T> } =>

@@ -542,6 +542,38 @@ describe("every way a run ends leaves one honest record", () => {
     expect(zoteroWebSince(repo, p.id, U)).toBeUndefined();
   });
 
+  it("the library handle closed under the run without a suspend: the record says what became of the batch", async () => {
+    // Closing a handle only gives up its lock (the service suspends the batches first: the test above). The run's
+    // record then follows the batch: finished if it finished, stopped / app-closed if it did not; never up to date.
+    const p = await project();
+    await articles(40);
+    let closing: Promise<void> | undefined;
+    const onBatch = (_p: string, h: BatchHandle) => {
+      void (async () => {
+        for await (const pr of h.progress) if (pr.done >= 1) return void (closing = lib.close());
+      })();
+    };
+    const r = await sync(await linked(linkOf(p)), {}, { onBatch });
+    await closing;
+    const state = (await findBatch(repo, p.id, r.batchId!))!.state;
+    if (state === "finished") expect(r.outcome).toBe("finished");
+    else expect(r).toMatchObject({ outcome: "stopped", reason: "app-closed" });
+    expect((await history())[0]).toMatchObject({ id: r.id, outcome: r.outcome, finishedAt: expect.any(String) });
+  });
+
+  it("a group refused in the middle of its scan, with the key still accepted, is library-gone for that link only", async () => {
+    const p = await project();
+    const p2 = await project();
+    z.addGroup(9, "Group");
+    z.addItem(G, { itemType: "book", title: "Group book" });
+    await linked(linkOf(p), linkOf(p2, G));
+    const orig = z.serve.bind(z);
+    z.serve = (req, host) => (req.path.startsWith("/groups/9/items") ? { status: 403, headers: {}, body: "Forbidden" } : orig(req, host));
+    const r = await sync(await stored(G));
+    expect(r).toMatchObject({ outcome: "failed", reason: "library-gone", batchId: expect.any(String) });
+    expect((await readZoteroSyncSettings(config, lib.id)).links.map((l) => l.paused)).toEqual([undefined, "library-gone"]);
+  });
+
   it("a lock during the run stops it: stopped / project-locked", async () => {
     const p = await project({ encrypted: true });
     await articles(40);

@@ -445,7 +445,7 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     let end: Ending;
     if (err instanceof Ending) end = err;
     else if (isAbort(err, o.signal)) end = new Ending("stopped", stopReason(o.signal));
-    else if (err instanceof BatchRefusedError) end = new Ending(err.kind === "locked" ? "failed" : "failed", err.kind === "locked" ? "project-locked" : err.kind === "running" ? "import-running" : "error");
+    else if (err instanceof BatchRefusedError) end = new Ending("failed", err.kind === "locked" ? "project-locked" : err.kind === "running" ? "import-running" : "error");
     else if (err instanceof ProjectLockedError) end = new Ending("failed", "project-locked");
     else {
       deps.debug?.(`zotero sync: the run stopped on an unexpected error (${err instanceof Error ? err.name : "error"})`);
