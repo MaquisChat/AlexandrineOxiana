@@ -12,10 +12,15 @@
  * plan's R4 Interfaces give them; when R4 lands, these declarations are replaced by the import from
  * `@ao/shared` with no change for any caller.
  */
-import type { HighlightColourName } from "@ao/core";
 import type { ApiClient } from "./client";
 
 // ---- Task R4's shapes (to come from @ao/shared once R4 lands) ----
+
+/**
+ * The named highlight colours: R4's shared `HIGHLIGHT_COLOUR_NAMES`, equal to @ao/core's
+ * `HIGHLIGHT_COLOURS` (the interface may not import the root of @ao/core, Task 47).
+ */
+export type HighlightColourName = "yellow" | "red" | "green" | "blue" | "purple" | "magenta" | "orange" | "grey";
 
 /** A rectangle in PDF user space: points, origin bottom-left, on the unrotated page. */
 export interface PdfRectDto {
