@@ -398,7 +398,9 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       const s = window.getSelection?.();
       const now = s && s.rangeCount > 0 ? s.getRangeAt(0) : undefined;
       if (mine && now && sameSelection(now, mine)) return;
-      endSelection({ keepBrowser: true });
+      // A page of it no longer drawn (another zoom, the window of pages moved): what is left of it is
+      // still the keyboard's, and goes. A selection made by anything else is left as it is.
+      endSelection({ keepBrowser: mine !== null });
     };
     document.addEventListener("selectionchange", onChange);
     return () => document.removeEventListener("selectionchange", onChange);
