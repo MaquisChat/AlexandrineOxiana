@@ -74,6 +74,8 @@ export const ANNOTATIONS_READ_ONLY = "This library is read-only, so highlights c
 export const LIST_BROUGHT_UP_TO_DATE = "That highlight or note was no longer there. The list has been brought up to date.";
 /** Said while a change is on its way. */
 export const SAVING = "Saving…";
+/** Said when a note is left (Escape, "Cancel") while its save is on its way. */
+export const NOTE_BUSY = "The note is being saved. It can be closed once it is saved.";
 /** Lists longer than this are windowed. */
 export const WINDOW_FROM = 500;
 /** The height counted for an entry of a windowed list not measured yet, in CSS pixels. */
@@ -253,6 +255,7 @@ interface Actions {
   confirm(id: string): void;
   saveNote(id: string, text: string): void;
   abandonNote(id: string, text: string): void;
+  busy(): void;
   draft(id: string, text: string, dirty: boolean): void;
   choose(id: string, c: HighlightColourName): void;
   closeMenu(id: string, restore: boolean): void;
@@ -349,6 +352,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
           pending={pending}
           onSave={(t) => act.saveNote(id, t)}
           onAbandon={(t) => act.abandonNote(id, t)}
+          onBusy={() => act.busy()}
           onDraft={(t, dirty) => act.draft(id, t, dirty)}
         />
       )}
@@ -398,7 +402,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
  * it (the list asks first when it was changed). While a save is on its way the text can still be
  * typed in; "Save note" and "Cancel" wait for the answer.
  */
-function NoteEditor({ saved, pending, onSave, onAbandon, onDraft }: { saved: string; pending: boolean; onSave(text: string): void; onAbandon(text: string): void; onDraft(text: string, dirty: boolean): void }) {
+function NoteEditor({ saved, pending, onSave, onAbandon, onBusy, onDraft }: { saved: string; pending: boolean; onSave(text: string): void; onAbandon(text: string): void; onBusy(): void; onDraft(text: string, dirty: boolean): void }) {
   const id = useId();
   const [text, setText] = useState(saved);
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -417,7 +421,8 @@ function NoteEditor({ saved, pending, onSave, onAbandon, onDraft }: { saved: str
     } else if (ev.key === "Escape") {
       ev.preventDefault();
       ev.stopPropagation();
-      if (!pending) onAbandon(text);
+      if (pending) onBusy();
+      else onAbandon(text);
     }
   };
   return (
@@ -428,7 +433,7 @@ function NoteEditor({ saved, pending, onSave, onAbandon, onDraft }: { saved: str
         <button type="button" aria-disabled={pending || undefined} onClick={() => !pending && onSave(text)}>
           Save note
         </button>
-        <button type="button" aria-disabled={pending || undefined} onClick={() => !pending && onAbandon(text)}>
+        <button type="button" aria-disabled={pending || undefined} onClick={() => (pending ? onBusy() : onAbandon(text))}>
           Cancel
         </button>
       </div>
@@ -671,17 +676,27 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
   useLayoutEffect(() => {
     if (!anyWindowed) return;
     let moved = false;
+    /** What entries above the view grew (or shrank) by: the view moves with them, so nothing in it jumps. */
+    let above = 0;
+    const el = scroller.current;
     const ro = resized.current;
     ro?.disconnect();
-    for (const li of scroller.current?.querySelectorAll<HTMLElement>(".ao-ann-entry--slot") ?? []) {
+    for (const li of el?.querySelectorAll<HTMLElement>(".ao-ann-entry--slot") ?? []) {
       ro?.observe(li);
       const id = li.dataset.entry;
       const h = li.offsetHeight;
       // No layout (0: not measurable here) keeps the estimate.
       if (id !== undefined && h > 0 && heights.current.get(id) !== h) {
+        const e = byId.get(id);
+        const o = e ? offsets[e.group] : undefined;
+        if (el && e && o && (lists.current[e.group]?.offsetTop ?? 0) + o[e.pos]! <= el.scrollTop) above += h - (heights.current.get(id) ?? ENTRY_ESTIMATE_PX);
         heights.current.set(id, h);
         moved = true;
       }
+    }
+    if (el && above !== 0) {
+      el.scrollTop += above;
+      setScroll({ top: el.scrollTop, view: el.clientHeight || FALLBACK_VIEW_PX });
     }
     if (moved) setHeightsSeen((n) => n + 1);
   });
@@ -695,8 +710,25 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
-  // A changed note holds the app's own way out (and a reload) until it is saved or discarded (R192 e).
-  // When the list goes (the reader ended), the hold goes with it and nothing is asked.
+  // An entry being edited that is no longer in the list (deleted here or elsewhere, a list fetched
+  // again without it): its editor, its draft and any question about it go (I5).
+  useEffect(() => {
+    if (editing !== undefined && !byId.has(editing)) closeEditor(editing);
+    if (discardAsk !== undefined && !byId.has(discardAsk.id)) setDiscardAsk(undefined);
+    // `closeEditor` only sets state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [byId, editing, discardAsk]);
+
+  /**
+   * The one place the hold is decided (I5): held while, and only while, a CHANGED, unsaved note is on
+   * screen: the entry being edited is in this file's list and its text differs from what is saved.
+   * The entry leaving the list, the file changing, the list going (the reader ended): no hold, nothing asked.
+   */
+  const holding = dirty && editing !== undefined && byId.get(editing)?.group === "here" && draftNow.current?.id === editing;
+
+  // A changed note holds the app's own way out until it is saved or discarded (R192 e): in-app links
+  // and navigate() are refused and ask "Discard this note?"; a reload asks the browser's question; Back
+  // and Forward land on a copy of this address and ask too: the way TranscriptViewer holds unsaved edits.
   const askDiscard = useRef<(then: () => void) => void>(() => {});
   askDiscard.current = (then) => {
     const id = draftNow.current?.id ?? editing;
@@ -710,24 +742,43 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     });
   };
   useEffect(() => {
-    if (!dirty) return;
+    if (!holding) return;
+    let released = false;
     let release = () => {};
-    release = blockNavigation((href?: string) =>
-      askDiscard.current(() => {
-        release();
-        if (href !== undefined) navigate(href);
-      }),
-    );
+    const go = (href: string) => () => {
+      release();
+      navigate(href);
+    };
+    const unblock = blockNavigation((href: string) => askDiscard.current(go(href)));
     const onUnload = (ev: BeforeUnloadEvent) => {
       ev.preventDefault();
       ev.returnValue = "";
     };
     window.addEventListener("beforeunload", onUnload);
-    return () => {
-      release();
-      window.removeEventListener("beforeunload", onUnload);
+    const here = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    window.history.pushState(null, "", here);
+    let restoring = false;
+    const onPop = () => {
+      if (restoring) return;
+      // Where Back (or Forward) went: gone to after a Discard.
+      const went = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      restoring = true;
+      window.history.pushState(null, "", here);
+      // Screens that already followed the address follow it back (in the same task, before React renders).
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      restoring = false;
+      askDiscard.current(go(went));
     };
-  }, [dirty]);
+    window.addEventListener("popstate", onPop);
+    release = () => {
+      if (released) return;
+      released = true;
+      window.removeEventListener("beforeunload", onUnload);
+      window.removeEventListener("popstate", onPop);
+      unblock();
+    };
+    return release;
+  }, [holding]);
 
   const say = (text: string) => setSaid((s) => ({ text, n: (s?.n ?? 0) + 1 }));
   const clearError = (id: string) =>
@@ -803,6 +854,7 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
         draftNow.current = { id, text };
         setDirty(isDirty);
       },
+      busy: () => say(NOTE_BUSY),
       abandonNote: (id, text) => {
         const e = latest.current.byId.get(id);
         const close = () => {
