@@ -55,6 +55,12 @@ export interface UndoKept {
 export interface UndoResult {
   removedSources: number;
   revertedMerges: number;
+  /**
+   * Of `revertedMerges`, by what the batch had done (Z5, R224): merges restored, updates reverted (a back that also
+   * updated the item among them), "gone from Zotero" marks taken off, and marks put back (a bare back undone).
+   * Other changes taken back (a sort index filled in) are in `revertedMerges` only.
+   */
+  reverted: { merged: number; updated: number; unmarked: number; remarked: number };
   /** What undo left in place because it is in use or was changed since (R61). */
   kept: UndoKept[];
   /** Z5: the Zotero library version this batch recorded was forgotten, so the next Web import is a full one. */
@@ -98,6 +104,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
   //    undone is never put back; which batches are undone is read from their records (never their journals).
   const undone = journal.some((e) => e.merge?.availability?.marks?.length) ? await undoneBatchIds(repo, projectId) : new Set<string>();
   let revertedMerges = 0;
+  const reverted = { merged: 0, updated: 0, unmarked: 0, remarked: 0 };
   for (const e of [...journal].reverse()) {
     if (!e.mergedInto || !e.merge || !hasSource(repo, projectId, e.mergedInto)) continue;
     const cur = await repo.getSource(projectId, e.mergedInto);
@@ -119,7 +126,13 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
       },
       { op: "import.undo.merge", entity: { type: "source", id: e.mergedInto } },
     );
-    if (changed) revertedMerges++;
+    if (changed) {
+      revertedMerges++;
+      if (e.outcome === "merged") reverted.merged++;
+      else if (e.outcome === "updated" || (e.outcome === "zotero-back" && e.contentUpdated)) reverted.updated++;
+      else if (e.outcome === "zotero-gone") reverted.unmarked++;
+      else if (e.outcome === "zotero-back") reverted.remarked++;
+    }
   }
 
   // 2. Sources the batch created: by provenance, the record and the journal (R45).
@@ -275,5 +288,5 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     kept: kept.length,
     ...(libraryVersionReset ? { libraryVersionReset } : {}),
   });
-  return { removedSources, revertedMerges, kept, ...(libraryVersionReset ? { libraryVersionReset: true as const } : {}) };
+  return { removedSources, revertedMerges, reverted, kept, ...(libraryVersionReset ? { libraryVersionReset: true as const } : {}) };
 }

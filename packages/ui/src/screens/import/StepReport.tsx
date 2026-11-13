@@ -27,19 +27,39 @@ export function undoCounts(r: ImportReport): { remove: number; restore: number; 
   };
 }
 
-/** "Remove 1,284 imported sources, restore 3 merged sources and revert 2 updated sources?" */
+/** Parts joined as a sentence: "a, b and c", its first letter a capital. */
+function sentence(parts: string[]): string {
+  const last = parts[parts.length - 1]!;
+  const s = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${last}` : last;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** "Remove 1,284 imported sources, restore 3 merged sources and revert 2 updated sources?" — a part whose number is 0 is left out. */
 export function undoQuestion(r: ImportReport): string {
   const { remove, restore, revert, unmark, remark } = undoCounts(r);
   // A run that added or changed no source can still have written something small (for instance the order of
   // highlights); undo stays available and puts that back, but the question does not call it a change to sources.
   if (remove === 0 && restore === 0 && revert === 0 && unmark === 0 && remark === 0) return "This import added and changed no sources. Undo it anyway?";
-  const parts = [`Remove ${count(remove, "imported source")}`];
+  const parts: string[] = [];
+  if (remove > 0) parts.push(`remove ${count(remove, "imported source")}`);
   if (restore > 0) parts.push(`restore ${count(restore, "merged source")}`);
   if (revert > 0) parts.push(`revert ${count(revert, "updated source")}`);
   if (unmark > 0) parts.push(`take the Zotero mark off ${count(unmark, "source")}`);
   if (remark > 0) parts.push(`mark ${count(remark, "source")} as gone from Zotero again`);
-  const last = parts.pop()!;
-  return `${parts.length ? `${parts.join(", ")} and ${last}` : last}?`;
+  return `${sentence(parts)}?`;
+}
+
+/** What the undo did, in the question's terms (zeros left out); an older service's answer keeps the earlier sentence. */
+export function undoneText(u: UndoResult): string {
+  const r = u.reverted;
+  if (!r) return `Removed ${count(u.removedSources, "source")} and restored ${count(u.revertedMerges, "source")} that had been merged or updated.`;
+  const parts: string[] = [];
+  if (u.removedSources > 0) parts.push(`removed ${count(u.removedSources, "imported source")}`);
+  if (r.merged > 0) parts.push(`restored ${count(r.merged, "merged source")}`);
+  if (r.updated > 0) parts.push(`reverted ${count(r.updated, "updated source")}`);
+  if (r.unmarked > 0) parts.push(`took the Zotero mark off ${count(r.unmarked, "source")}`);
+  if (r.remarked > 0) parts.push(`marked ${count(r.remarked, "source")} as gone from Zotero again`);
+  return parts.length ? `${sentence(parts)}.` : "No source needed to be changed.";
 }
 
 type CountKey = "created" | "needsReview" | "merged" | "updated" | "duplicates" | "unchanged" | "deletedHere" | "failed";
@@ -63,6 +83,7 @@ function zoteroRows(r: ImportReport): Array<[string, number]> {
     ["Marked as no longer in Zotero", Math.max(0, (c.goneInZotero ?? 0) - bin)],
     ["In the Zotero bin", bin],
     ["Back in Zotero", c.backInZotero ?? 0],
+    ["Still gone from Zotero (marked earlier)", c.goneAlready ?? 0],
   ];
   return rows.filter(([, n]) => n > 0);
 }
@@ -259,7 +280,7 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
           {undone ? (
             <div role="status">
               <p>
-                Removed {count(undone.removedSources, "source")} and restored {count(undone.revertedMerges, "source")} that had been merged or updated.
+                {undoneText(undone)}
               </p>
               {undone.kept.length > 0 && (
                 <ul>

@@ -144,6 +144,8 @@ export interface CreatedByBatch {
 export interface UndoResult {
   removedSources: number;
   revertedMerges: number;
+  /** Of revertedMerges, by what the import had done (Z5; absent from an older service). */
+  reverted?: { merged: number; updated: number; unmarked: number; remarked: number };
   kept: Array<{ kind: string; id: string; sourceId?: string; reason: string }>;
 }
 
