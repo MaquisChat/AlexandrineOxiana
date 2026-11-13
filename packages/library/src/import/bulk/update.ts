@@ -257,6 +257,33 @@ export function planAnnotations(sf: SourceFile, scanned: ScanAnnotation[], make:
   return plan;
 }
 
+/**
+ * The sort-index back-fills alone (R196), for an item Zotero did not change: no files are read or hashed.
+ * Only an annotation that has no index yet, is as last imported and whose scanned content (anchored in the
+ * asset it is already anchored in) hashes the same is touched; a source with none costs one pass over its list.
+ */
+export function planBackfill(sf: SourceFile, scanned: ScanAnnotation[]): Array<{ before: Annotation; after: Annotation }> {
+  const out: Array<{ before: Annotation; after: Annotation }> = [];
+  const byKey = new Map<string, Annotation>();
+  for (const a of sf.annotations) {
+    if (a.externalKey && a.externalHash && a.anchors.some((x) => x.kind === "pdf" && !x.sortIndex)) byKey.set(a.externalKey, a);
+  }
+  if (!byKey.size) return out;
+  const seen = new Set<string>();
+  for (const s of scanned) {
+    const ex = byKey.get(s.key);
+    if (!ex || seen.has(s.key) || s.anchor?.kind !== "pdf" || !s.anchor.sortIndex) continue;
+    seen.add(s.key);
+    const home = ex.anchors.find((x) => x.kind === "pdf");
+    if (!home || !unedited(ex)) continue;
+    const next = toAnnotation(s, sf.source.id, "", () => ({ id: home.assetId }) as Asset);
+    if (next.externalHash !== ex.externalHash) continue;
+    const after = withSortIndex(ex, next);
+    if (after) out.push({ before: ex, after });
+  }
+  return out;
+}
+
 /** `key`, or `key` + a, b, … z, aa, ab … — the first one not in `taken` (then taken). */
 export function uniqueKey(taken: Set<string>, key: string): string {
   let out = key;

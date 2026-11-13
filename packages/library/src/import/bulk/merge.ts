@@ -165,10 +165,16 @@ export function revertMerge(
     else keptAnnotations.push(a.id);
   }
   const restore = new Map<string, Annotation>();
+  // Taking back only a back-filled sort index (R196) is not a modification of the source.
+  let contentRestored = false;
+  const withoutSortIndex = (a: Annotation) => ({ ...a, anchors: a.anchors.map((x) => (x.kind === "pdf" ? { ...x, sortIndex: undefined } : x)) });
   for (const u of rec.updatedAnnotations ?? []) {
     const now = cur.annotations.find((a) => a.id === u.after.id);
     if (!now) continue;
-    if (isDeepStrictEqual(now, u.after)) restore.set(now.id, u.before);
+    if (isDeepStrictEqual(now, u.after)) {
+      restore.set(now.id, u.before);
+      if (!isDeepStrictEqual(withoutSortIndex(u.before), withoutSortIndex(u.after))) contentRestored = true;
+    }
     else keptAnnotations.push(now.id);
   }
   // Merged Zotero keys the merge added come off again (R76: on the source file, not provenance).
@@ -188,7 +194,7 @@ export function revertMerge(
       ...base,
       ...(mergedExternalKeys ? { mergedExternalKeys } : {}),
       ...(pendingLeft.length ? { pendingProxies: pendingLeft } : {}),
-      source: changed ? { ...source, modifiedAt: at, modifiedBy: actor } : source,
+      source: changed && (contentRestored || removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || annIds.size > 0 || dropKeys.size > 0 || droppedPending) ? { ...source, modifiedAt: at, modifiedBy: actor } : source,
       assets: cur.assets.filter((a) => !ids.has(a.id)),
       // An annotation anchored in a removed asset goes with it.
       annotations: cur.annotations

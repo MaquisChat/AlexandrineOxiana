@@ -113,7 +113,7 @@ import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./o
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
-import { capAnnotations, planAnnotations, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
+import { capAnnotations, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = libraryVersion();
 const TOOL = { name: "bulk-import", version: VERSION };
@@ -741,7 +741,7 @@ class Run {
         const k = this.known.get(item.version.id);
         if (k && !hasSource(this.repo, this.projectId, k.sourceId)) await this.refreshDeleted(); // deleted meanwhile?
         if (k && hasSource(this.repo, this.projectId, k.sourceId)) {
-          if (k.version === item.version.version) return this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId });
+          if (k.version === item.version.version) return (await this.backfillOnly(item, k.sourceId)) ?? this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId });
           await this.flush(); // the source may be in the current group
           return await this.update(item, k.sourceId);
         }
@@ -1406,6 +1406,38 @@ class Run {
     return serialStore(this.repo, this.projectId, () => this.updateInner(item, sourceId));
   }
 
+  /**
+   * R196: an item Zotero did not change still gets the sort index its annotations lack (imported before it was kept).
+   * Null when there is nothing to fill (the common case: one read of the source, nothing written) or the write is
+   * refused (the item then stays "unchanged"). The source is not marked modified; it is reported as unchanged; the
+   * batch's undo restores the earlier anchors.
+   */
+  private async backfillOnly(item: ScanItem, sourceId: string): Promise<JournalEntry | null> {
+    if (!item.annotations?.some((a) => a.anchor?.kind === "pdf" && a.anchor.sortIndex)) return null;
+    try {
+      const target = await this.repo.getSource(this.projectId, sourceId);
+      if (!planBackfill(target, item.annotations).length) return null;
+      await this.flush(); // the source may be in the current group
+      const out = await this.changeSource(
+        item,
+        sourceId,
+        [storeRequest(target.source.provenance, false)],
+        "import.update",
+        async (_ops, cur) => {
+          const bf = planBackfill(cur, item.annotations ?? []);
+          const record: MergeRecord = { addedAssetIds: [], filled: [], addedEvidence: [], ...(bf.length ? { updatedAnnotations: bf } : {}) };
+          if (!bf.length) return { next: null, record, outcome: "unchanged" };
+          const replaced = new Map(bf.map((u) => [u.after.id, u.after]));
+          return { next: { ...cur, annotations: cur.annotations.map((a) => replaced.get(a.id) ?? a) }, record, outcome: "unchanged" };
+        },
+      );
+      return out.entry;
+    } catch (err) {
+      if (err instanceof PolicyDeniedError) return null;
+      throw err;
+    }
+  }
+
   private async updateInner(item: ScanItem, sourceId: string): Promise<JournalEntry> {
     const method = CAPTURE_METHOD[this.rec.source.kind];
     const prep = await this.prepareFiles(item);
@@ -1425,7 +1457,7 @@ class Run {
       const t = known.find((x) => x.name.toLowerCase() === n.toLowerCase());
       return !t || !target.source.tagIds.includes(t.id);
     });
-    const kept = [...pre.kept, ...preAnn.kept.map((k) => `annotation ${k}`)];
+    const kept = [...pre.kept, ...keptLabels(target, preAnn.kept)];
     const anything = pre.filled.length || pre.evidence.length || newInputs.length || preAnn.added.length || preAnn.updated.length || newTags;
     if (!anything && !preAnn.backfilled.length) {
       return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(kept.length ? { merge: emptyRecord(kept) } : {}), ...(preAnn.dropped ? { annotationsDropped: preAnn.dropped } : {}), ...(preAnn.deletedHere ? { annotationsDeletedHere: preAnn.deletedHere } : {}) });
@@ -1451,7 +1483,7 @@ class Run {
         const ann = this.annotationPlan(item, merged.next, prep, ops.tx.actor);
         dropped = ann.dropped;
         deletedHere = ann.deletedHere;
-        const keptAll = [...plan.kept, ...ann.kept.map((k) => `annotation ${k}`)];
+        const keptAll = [...plan.kept, ...keptLabels(merged.next, ann.kept)];
         const record: MergeRecord = {
           ...merged.record,
           ...(ann.added.length ? { addedAnnotationIds: ann.added.map((a) => a.id) } : {}),
@@ -1465,7 +1497,8 @@ class Run {
         const next: SourceFile = this.withPendingProxies(
           item.key,
           {
-            ...merged.next,
+            // A back-fill alone leaves the source as it is (not marked modified, R196).
+            ...(changed ? merged.next : cur),
             annotations: [...merged.next.annotations.map((a) => replaced.get(a.id) ?? a), ...ann.added],
             fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence],
           },
@@ -1563,6 +1596,16 @@ class Run {
       }),
     );
   }
+}
+
+/** What a researcher reads for an imported annotation that was kept as changed here: its kind and page, never a Zotero key. */
+function keptLabels(sf: SourceFile, keys: string[]): string[] {
+  return keys.map((k) => {
+    const a = sf.annotations.find((x) => x.externalKey === k);
+    if (!a) return "an annotation (changed here, kept)";
+    const page = a.pageLabel ?? a.anchors.find((x) => x.kind === "pdf")?.page;
+    return `${a.kind}${page !== undefined ? ` on page ${page}` : ""} (changed here, kept)`;
+  });
 }
 
 const DELETED_NOTE = /^\d+ items? you deleted here (?:was|were) not re-imported/u;
