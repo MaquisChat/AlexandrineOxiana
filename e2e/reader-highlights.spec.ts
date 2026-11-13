@@ -1140,3 +1140,92 @@ test("the toolbar comes only for a selection just made on a page (R223, I2)", as
   });
   expect(errors).toEqual([]);
 });
+
+// ---- Task R10, last round: a drag must end on a page (Ruling R229); a highlight made under a search's filter (R223 f) ----
+
+test("a drag let go outside every page stores nothing and says why (R229)", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Let go on the page" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
+  await zoomOut.click();
+  await zoomOut.click();
+  await expect(zoomValue(page)).toHaveText("50%");
+  const lineOf = (n: number) => `This is the text of page ${n}, written for the reader's tests.`;
+  const SENTENCE = "To highlight, let go of the mouse over the page.";
+  const tinted = () => page.evaluate(() => window.getSelection()?.toString() ?? "");
+  /** A press before "text" on page `n`'s line, dragged along it, then let go at `end()`; nothing must come of it. */
+  const letGoAt = async (where: string, n: number, end: () => Promise<Point>) => {
+    await test.step(`let go ${where}`, async () => {
+      const line = lineOf(n);
+      await centreOn(page, { n, words: line, to: 20 });
+      const from = await charPoint(page, n, line, 12, "before");
+      const along = await charPoint(page, n, line, 18, "after");
+      const to = await end();
+      await dragThrough(page, [from, along, to]);
+      await expect(said(page)).toHaveText(SENTENCE);
+      await expect(colourBar(page)).toHaveCount(0);
+      expect(await tinted()).toBe("");
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      // Let go over the page, the toolbar comes as before.
+      await centreOn(page, { n, words: line, to: 20 });
+      await dragSelect(page, { n, words: line, i: 12 }, { n, words: line, i: 15 });
+      await expect(colourBar(page)).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(colourBar(page)).toHaveCount(0);
+    });
+  };
+  await letGoAt("over the annotation list", 1, async () => {
+    const b = (await annotationList(page).boundingBox())!;
+    return { x: b.x + b.width / 2, y: b.y + Math.min(b.height / 2, 40) };
+  });
+  await letGoAt("beyond the left edge of the pages' view", 1, async () => {
+    const b = (await page.locator(".ao-reader-scroll").boundingBox())!;
+    return { x: Math.max(2, b.x - 15), y: b.y + b.height / 2 };
+  });
+  await letGoAt("in the gap between two pages (dragged up from page 2's line)", 2, async () => {
+    const two = (await page.locator('[data-page-number="2"]').boundingBox())!;
+    return { x: two.x + two.width / 3, y: two.y - 8 };
+  });
+  expect(await listed(app, projectId, sid)).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("a highlight made while the list is filtered to a search's words shows in it at once (R223 f)", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Searched" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  const note = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, { kind: "highlight", assetId: aid, anchors: [{ page: 2, rects: [{ x: 50, y: 757.7, w: 70.9, h: 10.2 }] }], quote: "This is the text", body: "the riverbank survey", colorName: "blue" });
+  expect(note.status).toBe(201);
+  const other = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, { kind: "highlight", assetId: aid, anchors: [{ page: 3, rects: [{ x: 50, y: 757.7, w: 70.9, h: 10.2 }] }], quote: "This is the text", colorName: "grey" });
+  expect(other.status).toBe(201);
+  const stored = await app.api<{ source: { title: { variants: Array<{ value: string }> } } }>("GET", `/projects/${projectId}/sources/${sid}`);
+  const title = stored.body.source.title.variants[0]!.value;
+  // The library's search finds the word in the annotation; "Show in the reader" opens the reader filtered to it.
+  await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(projectId)}`);
+  await page.getByRole("searchbox", { name: "Search sources" }).fill("riverbank");
+  const sources = page.getByRole("table", { name: "Sources" });
+  await expect(sources.getByRole("row", { name: new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")) })).toContainText("Found in an annotation");
+  await sources.getByRole("button", { name: `Show in the reader: ${title}`, exact: true }).click();
+  await expect(page.getByRole("region", { name: "Annotations matching your search (1)" })).toBeVisible();
+  await expect(page.locator(`[data-entry="${other.body.id}"]`)).toHaveCount(0);
+  // A highlight made with the mouse on page 1.
+  const line = "This is the text of page 1, written for the reader's tests.";
+  await centreOn(page, { n: 1, words: line, to: 26 });
+  await dragSelect(page, { n: 1, words: line, i: 20 }, { n: 1, words: line, i: 25 });
+  await colourBar(page).getByRole("button", { name: "Highlight in Purple" }).click();
+  await expect(said(page)).toHaveText("Highlight added: Purple, page 1.");
+  const list = page.getByRole("region", { name: "Annotations matching your search (2)" });
+  await expect(list).toBeVisible();
+  const made = (await listed(app, projectId, sid)).find((a) => a.quote === "page 1")!;
+  expect(made).toBeTruthy();
+  await expect(list.locator(`[data-entry="${made.id}"]`)).toBeVisible();
+  await expect(page.locator(`[data-entry="${other.body.id}"]`)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
+  expect(errors).toEqual([]);
+});

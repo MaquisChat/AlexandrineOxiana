@@ -159,7 +159,7 @@ async function lineOf(n: number): Promise<Text> {
  * Selects from (node, offset) to (node, offset) as a mouse would: the button pressed at the start
  * (or on `pressOn`), the selection made, the button let go at the end.
  */
-function select(from: [Node, number], to: [Node, number], pressOn?: Element) {
+function select(from: [Node, number], to: [Node, number], pressOn?: Element, releaseOn?: Element) {
   const elementOf = (n: Node) => (n.nodeType === 3 ? n.parentElement! : (n as Element));
   fireEvent.mouseDown(pressOn ?? elementOf(from[0]));
   const r = document.createRange();
@@ -168,7 +168,7 @@ function select(from: [Node, number], to: [Node, number], pressOn?: Element) {
   const sel = window.getSelection()!;
   sel.removeAllRanges();
   sel.addRange(r);
-  fireEvent.mouseUp(elementOf(to[0]));
+  fireEvent.mouseUp(releaseOn ?? elementOf(to[0]));
 }
 
 let made = 0;
@@ -817,3 +817,132 @@ describe("ReaderScreen: making highlights, review round 1 (Ruling R223)", () => 
     expect("pageLabel" in creates()[0]!).toBe(want !== undefined);
   });
 });
+
+describe("ReaderScreen: making highlights, last round (R223 f, R229, N1, N3)", () => {
+  const LET_GO_ON_PAGE = "To highlight, let go of the mouse over the page.";
+  const selected = () => window.getSelection()!.toString();
+
+  it("R223 f: a highlight made while the list is filtered to a search's words is shown in it at once, and stays", async () => {
+    serveDocument();
+    const stored: AnnotationRecord[] = [rec({ id: "match", page: 2, body: "a note about the riverbank" }), rec({ id: "other", page: 3 })];
+    serveAnnotations(() => stored);
+    serveCreate((body) => {
+      const r = answerOf(body, `new-${creates().length}`);
+      stored.push(r);
+      return HttpResponse.json(r, { status: 201 }) as unknown as Response;
+    });
+    server.use(
+      http.delete(url(ONE), ({ params }) => {
+        const i = stored.findIndex((a) => a.id === params.anid);
+        if (i >= 0) stored.splice(i, 1);
+        return HttpResponse.json({ deleted: true, id: params.anid }) as unknown as Response;
+      }),
+    );
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    const user = userEvent.setup();
+    screenFor({ findWords: "riverbank" });
+    const filtered = await screen.findByRole("region", { name: "Annotations matching your search (1)" });
+    expect(filtered.querySelector('[data-entry="other"]')).toBeNull();
+    // The one match deleted: the filter says none is left.
+    await user.click(within(filtered).getByRole("button", { name: /^Delete/ }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete" }));
+    await screen.findByText("No annotation matching your search is left.");
+    // A highlight made now is shown in the filtered list at once, said like any other, the sentence gone.
+    const line = await lineOf(1);
+    select([line, 0], [line, 5]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Highlight in Green" })));
+    const list = await screen.findByRole("region", { name: "Annotations matching your search (1)" });
+    await waitFor(() => expect(list.querySelector('[data-entry="new-1"]')).toBeTruthy());
+    await waitFor(() => expect(live()).toBe("Highlight added: Green, page 1."));
+    expect(screen.queryByText("No annotation matching your search is left.")).toBeNull();
+    expect(list.querySelector('[data-entry="other"]')).toBeNull();
+    // A second one: the count shown grows by one; the filter stays on.
+    select([line, 6], [line, 10]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Highlight in Blue" })));
+    const two = await screen.findByRole("region", { name: "Annotations matching your search (2)" });
+    expect(two.querySelector('[data-entry="new-2"]')).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Show all" })).toBeTruthy();
+  });
+
+  it.each([
+    ["over the annotation list", () => screen.getByRole("region", { name: /^Annotations/ })],
+    ["over the reader's toolbar, beyond the view's edge", () => screen.getByRole("toolbar", { name: "Reader" })],
+    ["in the gap between two pages", () => document.querySelector<HTMLElement>(".ao-reader-stack")!],
+    ["in the backdrop beside the page", () => document.querySelector<HTMLElement>(".ao-reader-scroll")!],
+  ])("R229: a press begun on a page and let go %s stores nothing, shows no toolbar, removes the tint and says why", async (_where, target) => {
+    serveDocument();
+    serveAnnotations(() => []);
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const one = await lineOf(1);
+    const two = await lineOf(2);
+    select([one, 3], [two, 5], undefined, target());
+    await waitFor(() => expect(live()).toBe(LET_GO_ON_PAGE));
+    expect(toolbar()).toBeNull();
+    expect(selected()).toBe("");
+    expect(screen.queryByRole("alert")).toBeNull();
+    // Let go over the page next time: the toolbar comes as before.
+    select([one, 3], [one, 8]);
+    await waitFor(() => expect(toolbar()).toBeTruthy());
+    await flush();
+    expect(creates()).toHaveLength(0);
+  });
+
+  it("N1: when the selection changes after the toolbar opened (Shift+Arrow), the toolbar closes; an unchanged one keeps it", async () => {
+    serveDocument();
+    serveAnnotations(() => []);
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const line = await lineOf(1);
+    select([line, 0], [line, 5]);
+    await waitFor(() => expect(toolbar()).toBeTruthy());
+    // The same selection reported again (the blank-space guard moving its element): kept.
+    act(() => void document.dispatchEvent(new Event("selectionchange")));
+    expect(toolbar()).toBeTruthy();
+    // Shift+ArrowRight: one character more is tinted than the toolbar would store.
+    act(() => {
+      window.getSelection()!.getRangeAt(0).setEnd(line, 6);
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    await waitFor(() => expect(toolbar()).toBeNull());
+    await flush();
+    expect(creates()).toHaveLength(0);
+  });
+
+  it("N3: a create answered after the reader moved to ANOTHER file does not ask that file's list again", async () => {
+    serveDocument();
+    let lists = 0;
+    server.use(
+      http.get(url(LIST), () => {
+        lists++;
+        return HttpResponse.json({ annotations: [], count: 0, textChars: 0 }) as unknown as Response;
+      }),
+    );
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    serveCreate(async (body) => {
+      await held;
+      return HttpResponse.json(answerOf(body, "late"), { status: 201 }) as unknown as Response;
+    });
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle).mockResolvedValueOnce(fakeHandle(3).handle);
+    const user = userEvent.setup();
+    const view = screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const line = await lineOf(1);
+    select([line, 0], [line, 5]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Highlight in Red" })));
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    // Another file of the source is opened while the create is on its way.
+    view.rerender(<ReaderScreen api={readerApi(testClient())} projectId="p1" sourceId="s1" assetId="a2" readOnly={false} />);
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    await waitFor(() => expect(lists).toBe(2));
+    act(() => release());
+    await flush();
+    await flush();
+    expect(lists).toBe(2);
+    expect(document.querySelector('[data-annotation="late"]')).toBeNull();
+  });
+});
+

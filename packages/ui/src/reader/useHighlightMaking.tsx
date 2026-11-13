@@ -39,6 +39,8 @@ export const TOO_MANY_PAGES = `A highlight can cover at most ${ANNOTATION_ANCHOR
 export const PAGES_NOT_SHOWN = "This selection runs over pages that are not on screen at the moment, so it cannot be highlighted. Select a shorter passage — a few pages at most.";
 /** A page that is drawn but whose text layer is still being laid out, or drawn at a zoom other than the one known (R223, M6). */
 export const PAGE_STILL_DRAWING = "This page is still being drawn. Select the text again in a moment.";
+/** Said through the list's live region when a press begun on a page is let go outside every page (Ruling R229). */
+export const LET_GO_ON_PAGE = "To highlight, let go of the mouse over the page.";
 /** Said through the list's live region between the press and the service's answer (R223, M3). */
 export const ADDING = "Adding the highlight…";
 export const READ_ONLY_MAKING = "This library is read-only, so highlights cannot be made.";
@@ -149,6 +151,10 @@ export function useHighlightMaking(o: MakingOptions) {
   };
   /** Whether the press now ending began in a page's text layer (I2): only then is the selection read. */
   const pressInPage = useRef(false);
+  /** The selection the toolbar was opened for (a live Range, moved with the page's DOM as the selection is): N1. */
+  const pickedRange = useRef<Range | undefined>(undefined);
+  /** Whether the last press began in the colour toolbar (its buttons must not count as a change of selection). */
+  const pressInToolbar = useRef(false);
 
   /** Reads the selection when the mouse button is let go. */
   const takeSelection = (target: EventTarget | null) => {
@@ -189,6 +195,7 @@ export function useHighlightMaking(o: MakingOptions) {
     }
     setAlert(undefined);
     const last = anchors[anchors.length - 1]!;
+    pickedRange.current = range.cloneRange();
     setPick({ anchors, pageIndex: last.page - 1, rect: last.rects[last.rects.length - 1]! });
   };
 
@@ -200,11 +207,24 @@ export function useHighlightMaking(o: MakingOptions) {
     const onDown = (e: MouseEvent) => {
       const t = e.target instanceof Element ? e.target : null;
       pressInPage.current = e.button === 0 && !!t?.closest(".ao-reader-text-layer") && !!opts.current.area.current?.contains(t);
+      pressInToolbar.current = !!t?.closest(".ao-hl-toolbar");
     };
     const onUp = (e: MouseEvent) => {
       const began = pressInPage.current;
       pressInPage.current = false;
-      if (e.button === 0 && began) takeSelection(e.target);
+      if (e.button !== 0 || !began) return;
+      // Ruling R229: a drag must end on a page. Let go anywhere else (the list, the toolbar, beyond the
+      // view's edge, the gap between pages, the backdrop beside a page), it stores nothing: the
+      // browser's selection is removed and the reason said once.
+      const t = e.target instanceof Element ? e.target : null;
+      const page = t?.closest("[data-page-number]");
+      if (!page || !opts.current.area.current?.contains(page)) {
+        window.getSelection?.()?.removeAllRanges();
+        setPick(undefined);
+        say(LET_GO_ON_PAGE);
+        return;
+      }
+      takeSelection(e.target);
     };
     document.addEventListener("mousedown", onDown, true);
     document.addEventListener("mouseup", onUp);
@@ -215,6 +235,23 @@ export function useHighlightMaking(o: MakingOptions) {
     // takeSelection reads the latest options through a ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handle]);
+
+  // N1: the toolbar offers to store what is tinted, nothing else: when the selection changes after it
+  // opened (Shift+Arrow, a click elsewhere on the page), it closes.
+  useEffect(() => {
+    if (!pick) return;
+    const onChange = () => {
+      // Using the toolbar (a press on it, the focus moved into it by Tab) is not a change of what is selected.
+      if (pressInToolbar.current || document.activeElement?.closest(".ao-hl-toolbar")) return;
+      const was = pickedRange.current;
+      const sel = window.getSelection?.();
+      const now = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : undefined;
+      const same = !!was && !!now && now.compareBoundaryPoints(Range.START_TO_START, was) === 0 && now.compareBoundaryPoints(Range.END_TO_END, was) === 0;
+      if (!same) setPick(undefined);
+    };
+    document.addEventListener("selectionchange", onChange);
+    return () => document.removeEventListener("selectionchange", onChange);
+  }, [pick]);
 
   /** The toolbar given up (Escape, "Cancel", a press elsewhere): the browser's selection goes too (I2). */
   const dropPick = () => {
