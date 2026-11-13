@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { LOCATION_NEEDS_ENCRYPTION, evaluate, type PolicyRequest } from "./engine.js";
-import { parseGovernance, type GovernanceConfig } from "./schema.js";
+import { ACQUIRE_METHODS, parseGovernance, type GovernanceConfig } from "./schema.js";
 
 const cfg = (yaml = ""): GovernanceConfig => parseGovernance(yaml);
 const NOW = "2026-11-09T00:00:00Z";
@@ -411,5 +411,92 @@ describe("set-aside (Task 50, R154 d)", () => {
   it("is refused when the payload is missing or the reason is not text", () => {
     expect(evaluate(cfg(), req({ action: "set-aside" })).result).toBe("deny");
     expect(evaluate(cfg(), sa(42)).result).toBe("deny");
+  });
+});
+
+describe("the three ways of acquiring (Find and acquire)", () => {
+  const cap = (method: string) => req({ action: "capture", capture: { method: method as never } });
+  const lookup = (provider: string) => req({ action: "process", process: { op: "metadata_lookup", provider } });
+  const NOT_ENABLED = (m: string) => `Capture method ${m} is not enabled for this project`;
+  const allowed = (c: GovernanceConfig) => ACQUIRE_METHODS.filter((m) => evaluate(c, cap(m)).result === "allow");
+
+  it("an old rules file with an explicit captureMethods list still allows free_copy", () => {
+    const old = cfg("captureMethods: [manual_upload, browser_capture, downloader]");
+    for (const m of ACQUIRE_METHODS) expect(evaluate(old, cap(m))).toEqual({ result: "allow", warnings: [] });
+    // and the list it names still governs the old methods
+    expect(denyReason(evaluate(old, cap("zotero_import")))).toBe(NOT_ENABLED("zotero_import"));
+  });
+  it("a rules file with no acquireMethods key allows all three, under every profile and every combination", () => {
+    const shapes = ["", "captureMethods: [manual_upload]", "captureMethods: [official_api, browser_capture]\nresidency: { allowed: [device] }"];
+    const profiles = [[], ["irb"], ["gdpr"], ["hipaa"], ["dmp"], ["irb", "gdpr"], ["hipaa", "dmp"], ["irb", "gdpr", "hipaa", "dmp"]];
+    for (const shape of shapes) {
+      for (const ps of profiles) {
+        const text = `${shape}\nprotocol: { number: P-1 }\n${ps.length ? `profiles: [${ps.join(", ")}]` : ""}`;
+        expect(allowed(cfg(text)), text).toEqual([...ACQUIRE_METHODS]);
+      }
+    }
+  });
+  it("acquireMethods: [] refuses all three", () => {
+    const c = cfg("acquireMethods: []");
+    for (const m of ACQUIRE_METHODS) expect(denyReason(evaluate(c, cap(m)))).toBe(NOT_ENABLED(m));
+    expect(evaluate(c, cap("manual_upload")).result).toBe("allow");
+  });
+  it("acquireMethods names exactly the ways it allows", () => {
+    const c = cfg("acquireMethods: [free_copy]");
+    expect(allowed(c)).toEqual(["free_copy"]);
+    expect(denyReason(evaluate(c, cap("library_access")))).toBe(NOT_ENABLED("library_access"));
+  });
+  it("the two lists are separate: one never allows what the other governs", () => {
+    // a long captureMethods list cannot allow a way of acquiring that acquireMethods refuses
+    const a = cfg("acquireMethods: []\ncaptureMethods: [manual_upload, downloader, official_api, browser_capture]");
+    expect(allowed(a)).toEqual([]);
+    // an acquireMethods list cannot allow an old capture method
+    const b = cfg("captureMethods: []\nacquireMethods: [reference_lookup, free_copy, library_access]");
+    expect(denyReason(evaluate(b, cap("manual_upload")))).toBe(NOT_ENABLED("manual_upload"));
+    expect(denyReason(evaluate(b, cap("downloader")))).toBe(NOT_ENABLED("downloader"));
+    expect(allowed(b)).toEqual([...ACQUIRE_METHODS]);
+    // a name in neither list is refused
+    expect(denyReason(evaluate(cfg(), cap("carrier_pigeon")))).toBe(NOT_ENABLED("carrier_pigeon"));
+  });
+  it("fails closed when an in-memory config has no usable acquireMethods list", () => {
+    for (const bad of [undefined, "free_copy", null, { free_copy: true }]) {
+      const broken = { ...cfg(), acquireMethods: bad } as unknown as GovernanceConfig;
+      expect(evaluate(broken, cap("free_copy")).result).toBe("deny");
+    }
+  });
+  it("still asks for a protocol number, as for any capture", () => {
+    expect(denyReason(evaluate(cfg("protocol: { requireBeforeCapture: true }"), cap("free_copy")))).toBe("An approved protocol number is required before capture");
+  });
+  it("elicit is refused until processing.metadata_lookup names it and a vendor is declared", () => {
+    expect(denyReason(evaluate(cfg(), lookup("elicit")))).toBe('Processing "metadata_lookup" with provider "elicit" is not permitted for this project');
+    // named but not declared: the rules file itself is invalid
+    expect(() => cfg("processing: { metadata_lookup: [crossref, elicit] }")).toThrow(/unknown vendor "elicit"/);
+    // declared as a vendor but not named under metadata_lookup: still refused
+    expect(evaluate(cfg("vendors: [{ id: elicit }]"), lookup("elicit")).result).toBe("deny");
+    const yes = cfg("vendors: [{ id: elicit }]\nprocessing: { metadata_lookup: [crossref, elicit] }");
+    expect(evaluate(yes, lookup("elicit")).result).toBe("allow");
+    // elicit is not a capture method, and acquiring does not allow it
+    expect(denyReason(evaluate(yes, cap("elicit")))).toBe(NOT_ENABLED("elicit"));
+  });
+});
+
+describe("the engine keeps the two lists apart by itself (in-memory configuration, no parser)", () => {
+  const cap = (method: string) => req({ action: "capture", capture: { method: method as never } });
+  const OLD = ["official_api", "browser_capture", "downloader", "manual_upload", "zotero_import", "device_import", "refman_import", "calibre_import"] as GovernanceConfig["captureMethods"];
+  const base = parseGovernance("");
+  it("refuses free_copy when acquireMethods is [] although captureMethods holds every old method", () => {
+    // captureMethods even holds the name itself (the parser would refuse that file; the engine must not rely on it)
+    const c = { ...base, captureMethods: [...OLD, "free_copy"], acquireMethods: [] } as unknown as GovernanceConfig;
+    expect(denyReason(evaluate(c, cap("free_copy")))).toBe("Capture method free_copy is not enabled for this project");
+    expect(evaluate(c, cap("manual_upload")).result).toBe("allow");
+  });
+  it("refuses manual_upload when captureMethods is [] although acquireMethods holds all three", () => {
+    const c = { ...base, captureMethods: [], acquireMethods: [...ACQUIRE_METHODS, "manual_upload"] } as unknown as GovernanceConfig;
+    expect(denyReason(evaluate(c, cap("manual_upload")))).toBe("Capture method manual_upload is not enabled for this project");
+    expect(evaluate(c, cap("free_copy")).result).toBe("allow");
+  });
+  it("refuses a method name it does not know", () => {
+    expect(evaluate(base, cap("carrier_pigeon")).result).toBe("deny");
+    expect(evaluate({ ...base, captureMethods: OLD, acquireMethods: [...ACQUIRE_METHODS] }, cap("carrier_pigeon")).result).toBe("deny");
   });
 });

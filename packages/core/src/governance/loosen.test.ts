@@ -52,3 +52,29 @@ describe("loosenedControls (R98 I1, R99 I2)", () => {
     expect(loosenedControls(b, g(""))).toEqual([]);
   });
 });
+
+describe("loosenedControls: acquireMethods", () => {
+  const two = "acquireMethods: [reference_lookup, free_copy]";
+  it("adding library_access is loosening; removing it is not", () => {
+    expect(loosenedControls(g(two), g(""))).toEqual(["acquireMethods"]);
+    expect(loosenedControls(g(two), g("acquireMethods: [reference_lookup, free_copy, library_access]"))).toEqual(["acquireMethods"]);
+    expect(loosenedControls(g(""), g(two))).toEqual([]);
+    expect(loosenedControls(g(""), g("acquireMethods: []"))).toEqual([]);
+  });
+  it("from nothing allowed, adding any one is loosening", () => {
+    expect(loosenedControls(g("acquireMethods: []"), g("acquireMethods: [free_copy]"))).toEqual(["acquireMethods"]);
+  });
+  it("an older file gaining the key with all three is not loosening", () => {
+    expect(loosenedControls(g(""), g("acquireMethods: [reference_lookup, free_copy, library_access]"))).toEqual([]);
+    expect(loosenedControls(g("captureMethods: [manual_upload]"), g("captureMethods: [manual_upload]\nacquireMethods: [library_access, free_copy, reference_lookup]"))).toEqual([]);
+  });
+  it("is the same under profiles, and reordering is not loosening", () => {
+    const p = "profiles: [irb, gdpr, hipaa, dmp]\n";
+    expect(loosenedControls(g(p + two), g(p))).toEqual(["acquireMethods"]);
+    expect(loosenedControls(g(p), g(p + two))).toEqual([]);
+    expect(loosenedControls(g("acquireMethods: [free_copy, reference_lookup, library_access]"), g(""))).toEqual([]);
+  });
+  it("captureMethods and acquireMethods are reported each under its own name", () => {
+    expect(loosenedControls(g("acquireMethods: []"), g("captureMethods: [manual_upload, downloader]\nacquireMethods: []"))).toEqual(["captureMethods"]);
+  });
+});

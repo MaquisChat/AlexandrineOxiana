@@ -22,12 +22,22 @@ export const Creator = z.object({
 });
 export type Creator = z.infer<typeof Creator>;
 
+/**
+ * The ways a record or file comes in through Find and acquire. They are not capture methods: the
+ * rules govern them by their own list, `acquireMethods`, which allows all three unless a
+ * project's file says otherwise.
+ */
+export const ACQUIRE_METHODS = ["reference_lookup", "free_copy", "library_access"] as const;
+export type AcquireMethod = (typeof ACQUIRE_METHODS)[number];
+
+const CAPTURE_METHOD_NAMES = [
+  "official_api", "browser_capture", "downloader", "manual_upload",
+  "zotero_import", "device_import", "refman_import", "calibre_import",
+] as const;
+
 /** Immutable after creation (enforced in the repository layer). */
 export const Provenance = z.object({
-  captureMethod: z.enum([
-    "official_api", "browser_capture", "downloader", "manual_upload",
-    "zotero_import", "device_import", "refman_import", "calibre_import",
-  ]),
+  captureMethod: z.enum([...CAPTURE_METHOD_NAMES, ...ACQUIRE_METHODS]),
   capturedAt: Timestamp,
   originalUrl: z.string().optional(),
   tool: z.object({ name: z.string(), version: z.string() }),
