@@ -28,7 +28,6 @@ import { openTestRepo } from "../repo/testing.js";
 import { createAttach, type Attach } from "./attach.js";
 import { POINTER_REASON, contentState, ignoredName as ignoredNameLocal } from "./watch-local.js";
 import { WATCH_CHOICES_FILE, getWatchChoices, getWatchDownloadCount, reserveWatchDownload, setWatchChoices, type WatchChoices } from "./watch-choices.js";
-import { hydrate } from "../reconnect.js";
 import {
   WATCH_DOWNLOAD_CONFIRM_BYTES,
   WATCH_DOWNLOAD_RETRY_MS,
@@ -2409,25 +2408,25 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     const wid = await watched(p);
     const real = await realpath(inbox);
     await sparse(join(inbox, "offline.pdf"), 4096);
-    // The library's own hydrate (the default) reads the file; here nothing downloads it, so it stays as it was.
+    // The engine's own download (the default) reads the file through its checked handle; here nothing downloads it, so
+    // it stays as it was. Every open of the file is counted: one per download, none by the import path.
     const calls: number[] = [];
-    const fetchContent = async (q: string) => {
-      calls.push(Date.now());
-      await hydrate(q);
+    const open = async (q: string, flags: number) => {
+      if (q === join(real, "offline.pdf")) calls.push(Date.now());
+      return realFspOpen(q, flags);
     };
     const attach = quickAttach();
-    const { w, events } = start(p, { ...FASTW, watchId: wid, fetchContent, attach, downloadRetryMs: 800 });
+    const { w, events } = start(p, { ...FASTW, watchId: wid, fetchContent: undefined, attach, downloadRetryMs: 800, fs: { open } });
     await w.ready;
     await until(() => w.status().counts.notDownloaded === 1);
-    const opens = vi.spyOn(fsp, "open");
-    syncBuiltinESMExports();
+    expect(calls).toEqual([]);
     await choose(p, wid, { notDownloaded: "download", confirmedBytes: 4096 });
     await w.refreshChoices();
     await until(() => w.problems(page(10)).items[0]?.kind === "could-not-download");
     expect(w.problems(page(10)).items).toEqual([{ file: "offline.pdf", kind: "could-not-download", reason: withService(WATCH_REASONS.couldNotDownload), bytes: 4096 }]);
     expect(w.status().counts).toMatchObject({ notDownloaded: 1, cameIn: 0 });
     expect(attach.paths).toEqual([]);
-    expect(opens.mock.calls.filter((a) => String(a[0]) === join(real, "offline.pdf"))).toEqual([]); // the import path never opened it
+    expect(calls).toHaveLength(1); // the download's own open; the import path never opened it
     expect(events.some((e) => e.kind === "imported")).toBe(false);
     // Its 4096 bytes were counted before the download: no second try without the researcher's word.
     await sleep(1500);
