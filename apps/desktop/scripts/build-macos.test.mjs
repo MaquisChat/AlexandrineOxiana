@@ -103,6 +103,67 @@ describe("the resource layout", () => {
     assert.doesNotMatch(plist, /NSAllowsArbitraryLoads/);
   });
 
+  // A small reader for the plist's top-level dictionary: keys with their value's tag and text. It checks that
+  // the tags are balanced (so the file is well-formed XML for this simple shape) and throws otherwise.
+  function readTopLevelPlist(xml) {
+    const body = xml.replace(/<!--[\s\S]*?-->/g, "").replace(/<\?xml[^>]*\?>/, "").replace(/<!DOCTYPE[^>]*>/, "");
+    const stack = [];
+    const tokens = body.match(/<[^>]+>|[^<]+/g) ?? [];
+    const entries = [];
+    let key = null;
+    let valueStart = null;
+    for (const t of tokens) {
+      if (t.startsWith("<")) {
+        const closing = t.startsWith("</");
+        const selfClosing = t.endsWith("/>");
+        const name = /^<\/?([A-Za-z]+)/.exec(t)?.[1];
+        assert.ok(name, `unreadable tag ${t}`);
+        if (closing) {
+          assert.equal(stack.pop(), name, `unbalanced </${name}>`);
+          if (stack.length === 2 && valueStart !== null && key !== null) {
+            entries.push({ key, tag: name, text: valueStart.text ?? "" });
+            key = null;
+            valueStart = null;
+          }
+        } else if (selfClosing) {
+          if (stack.length === 2 && key !== null) {
+            entries.push({ key, tag: name, text: "" });
+            key = null;
+          }
+        } else {
+          stack.push(name);
+          if (stack.length === 3 && name !== "key" && valueStart === null && key !== null) valueStart = { text: "" };
+          if (stack.length === 3 && name === "key") {
+            /* key text follows */
+          }
+        }
+      } else if (stack.length === 3 && stack[2] === "key") {
+        key = t;
+      } else if (stack.length === 3 && valueStart !== null) {
+        valueStart.text += t;
+      }
+    }
+    assert.deepEqual(stack, [], "every tag is closed");
+    return entries;
+  }
+
+  it("Info.plist declares NSFileProviderDomainUsageDescription", () => {
+    const xml = readFileSync(join(DESKTOP, "src-tauri", "Info.plist"), "utf8");
+    const entries = readTopLevelPlist(xml);
+    const text = entries.find((e) => e.key === "NSFileProviderDomainUsageDescription");
+    assert.ok(text, "the key is declared");
+    assert.equal(text.tag, "string");
+    assert.equal(
+      text.text,
+      "Alexandrine Oxiana reads the files in the cloud-drive folders you choose to watch, to copy them into your library. It never changes, moves or deletes them.",
+    );
+    // Nothing else in the plist changed: the App Transport Security entry is still there, and these are the only top-level keys.
+    assert.deepEqual(entries.map((e) => e.key).sort(), ["NSAppTransportSecurity", "NSFileProviderDomainUsageDescription"]);
+    assert.match(xml, /<key>NSAppTransportSecurity<\/key>\s*<dict>\s*<key>NSAllowsLocalNetworking<\/key>\s*<true\/>\s*<\/dict>/);
+    // The comment above the key names Apple's page and the date it was read, as the App Transport Security comment does.
+    assert.match(xml, /protected-resources,\s*read 2026-11-13/);
+  });
+
   it("stages the three helpers, keeping the worker's symbolic links and the programs executable", () => {
     const src = mkdtempSync(join(root, "src-"));
     const node = join(src, "release", "bin", "node");
