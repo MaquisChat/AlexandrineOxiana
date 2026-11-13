@@ -25,9 +25,12 @@
  * makes at most ZOTERO_ACCOUNT_RETRIES retries (1 s, then 2 s). Asked to wait longer than what is left,
  * the call does not wait: it throws `backing-off` with the moment Zotero asked for (`backoffUntil`,
  * ms since the epoch, at most a day ahead as in the scan), and the caller (the sync runner, the screen)
- * decides what to do. A shorter wait is waited out silently; a `Backoff` header on an answer that needs no
- * further request is reported, beside the answer, by `zoteroLibraryUnchanged` and is not reported by
- * `checkZoteroKey`, whose result has no place for it.
+ * decides what to do. A shorter wait is waited out silently, and
+ * every pause Zotero asked for on an answer of a call that still succeeded is reported as `backoffUntil`
+ * beside the result (both functions). The whole call is also limited in time, requests and waits together:
+ * ZOTERO_KEY_CHECK_TIMEOUT_MS and ZOTERO_UNCHANGED_TIMEOUT_MS, measured from the call's start with
+ * `setTimeout` and `Date.now` (so fake timers drive them); at the limit whatever is in flight is aborted,
+ * the call throws `offline` and nothing is left running. A caller's `signal` ends a call, and a wait, at once.
  *
  * What `zoteroLibraryUnchanged` does NOT notice. It asks `GET <library>/items/top?limit=1&format=keys`
  * with `If-Modified-Since-Version: <since>`. Zotero's documents say a multi-object read answers 304 when
@@ -51,6 +54,10 @@ export const ZOTERO_ACCOUNT_MAX_WAIT_MS = 10_000;
 export const ZOTERO_ACCOUNT_RETRIES = 2;
 /** A group's name is kept to this many characters. */
 export const ZOTERO_GROUP_NAME_MAX = 200;
+/** The whole of `checkZoteroKey` (requests, retries and waits together), measured from its start; then it ends `offline`. */
+export const ZOTERO_KEY_CHECK_TIMEOUT_MS = 30_000;
+/** The whole of `zoteroLibraryUnchanged`, measured from its start; then it ends `offline`. */
+export const ZOTERO_UNCHANGED_TIMEOUT_MS = 15_000;
 
 const GROUPS_PAGE = 100;
 const MAX_GROUP_PAGES = 50;
@@ -89,6 +96,13 @@ export interface ZoteroKeyAccess {
   personal: { library: boolean; files: boolean; notes: boolean; write: boolean };
   /** Group libraries the key may READ (listed groups the key has no permission for are left out). */
   groups: Array<{ ref: string; name: string; write: boolean }>;
+  /**
+   * Present only when Zotero asked for a pause (`Backoff` or `Retry-After`) on ANY answer during the check
+   * and the check still succeeded (waited out, or sent with the last answer): the moment (ms since the
+   * epoch, at most a day ahead) before which no run of any kind should start. A pause that made the
+   * call fail is the error `backing-off` instead.
+   */
+  backoffUntil?: number;
 }
 
 interface CallOptions {
@@ -104,6 +118,23 @@ class WaitTooLong extends Error {
   constructor(readonly ms: number) {
     super("wait too long");
   }
+}
+
+/** A wait that ends at once, with the abort reason, when `signal` aborts (no timer is left behind). */
+function abortableSleep(signal: AbortSignal): (ms: number) => Promise<void> {
+  return (ms) =>
+    new Promise<void>((resolve, reject) => {
+      if (signal.aborted) return reject(signal.reason);
+      const onAbort = (): void => {
+        clearTimeout(t);
+        reject(signal.reason);
+      };
+      const t = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
 }
 
 function boundedSleep(real: (ms: number) => Promise<void>): (ms: number) => Promise<void> {
@@ -131,10 +162,18 @@ async function readKey(): Promise<string> {
  * Runs `fn` with a client that holds the key, and turns everything that can go wrong into a
  * ZoteroAccountError with a fixed reason. `notFound` is what `notFoundIs` says.
  */
-async function withApi<T>(o: CallOptions, notFoundIs: ZoteroAccountReason, fn: (api: ZoteroApi) => Promise<T>, report?: (backoffUntil: number | undefined) => void): Promise<T> {
+async function withApi<T>(o: CallOptions, notFoundIs: ZoteroAccountReason, timeoutMs: number, fn: (api: ZoteroApi, seen: ZoteroWebScanResult) => Promise<T>): Promise<T> {
   let key: string | null = await readKey();
   const result: ZoteroWebScanResult = { deletedInZotero: 0, completed: false, downloadsFailed: 0, refusedHosts: [], goneKeys: { deleted: 0, bin: 0 } };
-  const real = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  // One limit on the whole call: the deadline aborts whatever is in flight (a request, a wait) and the call ends `offline`.
+  const deadline = new AbortController();
+  const signal = o.signal ? AbortSignal.any([o.signal, deadline.signal]) : deadline.signal;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    deadline.abort(new Error("timeout"));
+  }, timeoutMs);
+  const real = o.sleep ?? abortableSleep(signal);
   const api = new ZoteroApi(
     key,
     {
@@ -146,23 +185,27 @@ async function withApi<T>(o: CallOptions, notFoundIs: ZoteroAccountReason, fn: (
       // The bound is enforced by boundedSleep, which throws instead of waiting: the client must not shorten a wait first.
       maxWaitMs: Number.MAX_SAFE_INTEGER,
     },
-    o.signal ?? new AbortController().signal,
+    signal,
     result,
   );
   key = null;
   try {
-    const out = await fn(api);
-    report?.(result.backoffUntil);
-    return out;
+    return await fn(api, result);
   } catch (err) {
-    if (o.signal?.aborted) throw err;
-    if (err instanceof ZoteroAccountError) throw err;
     const until = result.backoffUntil;
+    if (timedOut) throw new ZoteroAccountError("offline", until);
+    if (o.signal?.aborted) throw err;
+    // An error raised by our own reading of an answer keeps the back-off seen before it.
+    if (err instanceof ZoteroAccountError) throw err.backoffUntil === undefined && until !== undefined ? new ZoteroAccountError(err.reason, until) : err;
     if (err instanceof WaitTooLong) throw new ZoteroAccountError("backing-off", until ?? Date.now() + Math.min(err.ms, MAX_REPORTED_BACKOFF_MS));
     if (err instanceof ZoteroWebError && err.reason === ZOTERO_WEB_REASONS.keyRefused) throw new ZoteroAccountError("key-refused", until);
     if (err instanceof ZoteroWebError && err.reason === ZOTERO_WEB_REASONS.notFound) throw new ZoteroAccountError(notFoundIs, until);
     // Unreachable, 5xx or 429 that outlasted its retries, a cut or unreadable answer, too large, anything unexpected.
     throw new ZoteroAccountError("offline", until);
+  } finally {
+    // Nothing is left running: the timer is cleared and anything still in flight is aborted.
+    clearTimeout(timer);
+    deadline.abort(new Error("done"));
   }
 }
 
@@ -189,7 +232,7 @@ interface KeyAnswer {
 }
 
 /** Reads `/keys/current`. The key field is deleted first; only named fields are kept. Throws `offline` for any other shape. */
-function parseKeyAnswer(body: unknown): KeyAnswer {
+export function parseKeyAnswer(body: unknown): KeyAnswer {
   if (!isObject(body)) throw new ZoteroAccountError("offline");
   Reflect.deleteProperty(body, "key");
   const id = body["userID"];
@@ -226,7 +269,8 @@ export function capGroupName(name: string): string {
     out += segment;
     n += len;
   }
-  return out;
+  // A first character with more than the cap of marks on it: cut by code points rather than return nothing.
+  return out === "" ? Array.from(name).slice(0, ZOTERO_GROUP_NAME_MAX).join("") : out;
 }
 
 /** The ids and names of the groups `/users/<id>/groups` lists (all pages), of those `readable` says may be read. */
@@ -251,10 +295,13 @@ async function listGroups(api: ZoteroApi, userId: string, readable: (id: string)
       out.push({ id, name: capGroupName(name) });
     }
     start += body.length;
+    // The listing is whole or the call fails: every page names the total, and what was read adds up to it.
     const totalHeader = headers["total-results"];
     const total = Number(Array.isArray(totalHeader) ? totalHeader[0] : totalHeader);
-    const hasTotal = totalHeader !== undefined && Number.isSafeInteger(total) && total >= 0;
-    if (body.length === 0 || (hasTotal ? start >= total : body.length < GROUPS_PAGE)) return out;
+    if (totalHeader === undefined || !Number.isSafeInteger(total) || total < 0 || start > total) throw new ZoteroAccountError("offline");
+    if (start === total) return out;
+    // Not there yet, but the page was empty or short: a half-filled list is never returned.
+    if (body.length < GROUPS_PAGE) throw new ZoteroAccountError("offline");
   }
   throw new ZoteroAccountError("offline");
 }
@@ -267,17 +314,19 @@ async function listGroups(api: ZoteroApi, userId: string, readable: (id: string)
  * Throws ZoteroAccountError (see the header for the reasons and for how long it may wait).
  */
 export async function checkZoteroKey(o: CallOptions = {}): Promise<ZoteroKeyAccess> {
-  return withApi(o, "offline", async (api) => {
+  return withApi(o, "offline", ZOTERO_KEY_CHECK_TIMEOUT_MS, async (api, seen) => {
     const { body } = await api.json("/keys/current");
     const a = parseKeyAnswer(body);
     const rule = (id: string): { library: boolean; write: boolean } => a.byId.get(id) ?? a.all ?? { library: false, write: false };
     const anyGroup = a.all?.library === true || [...a.byId.values()].some((v) => v.library);
     const listed = anyGroup ? await listGroups(api, a.userId, (id) => rule(id).library) : [];
-    return {
+    const out: ZoteroKeyAccess = {
       userId: a.userId,
       personal: a.personal,
       groups: listed.map((g) => ({ ref: `group:${g.id}`, name: g.name, write: rule(g.id).write })),
     };
+    if (seen.backoffUntil !== undefined) out.backoffUntil = seen.backoffUntil;
+    return out;
   });
 }
 
@@ -295,23 +344,17 @@ export async function zoteroLibraryUnchanged(o: CallOptions & { ref: string; sin
   if (!m) throw new TypeError("ref must be user:<id> or group:<id>");
   if (!Number.isSafeInteger(o.since) || o.since < 0) throw new TypeError("since must be a library version (a non-negative integer)");
   const prefix = `/${m[1] === "user" ? "users" : "groups"}/${m[2]}`;
-  let backoff: number | undefined;
-  const unchanged = await withApi(
-    o,
-    "library-gone",
-    async (api) => {
-      const url = new URL(`${prefix}/items/top?limit=1&format=keys`, ZOTERO_API_ORIGIN);
-      const res = await api.get(url, true, (s) => s === 200 || s === 304, { "if-modified-since-version": String(o.since) });
-      await res.body.dump().catch(() => {});
-      if (res.statusCode !== 304) return false;
+  return withApi(o, "library-gone", ZOTERO_UNCHANGED_TIMEOUT_MS, async (api, seen) => {
+    const url = new URL(`${prefix}/items/top?limit=1&format=keys`, ZOTERO_API_ORIGIN);
+    const res = await api.get(url, true, (s) => s === 200 || s === 304, { "if-modified-since-version": String(o.since) });
+    await res.body.dump().catch(() => {});
+    let unchanged = false;
+    if (res.statusCode === 304) {
       const v = res.headers["last-modified-version"];
       const reported = Array.isArray(v) ? v[0] : v;
       // A 304 that names another library version than the one asked about is not "nothing changed".
-      return reported === undefined || Number(reported) === o.since;
-    },
-    (until) => {
-      backoff = until;
-    },
-  );
-  return backoff === undefined ? { unchanged } : { unchanged, backoffUntil: backoff };
+      unchanged = reported === undefined || Number(reported) === o.since;
+    }
+    return seen.backoffUntil === undefined ? { unchanged } : { unchanged, backoffUntil: seen.backoffUntil };
+  });
 }

@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { setSecret } from "../secrets.js";
 import { useMemorySecrets, useNoSecretStore } from "../secrets-testing.js";
 import { FakeZotero, guardNetwork } from "../../tests/zotero/fake-zotero.js";
-import { ZOTERO_ACCOUNT_MAX_WAIT_MS, ZoteroAccountError, checkZoteroKey, zoteroLibraryUnchanged } from "./zotero-web-account.js";
+import { ZOTERO_ACCOUNT_MAX_WAIT_MS, ZOTERO_KEY_CHECK_TIMEOUT_MS, ZOTERO_UNCHANGED_TIMEOUT_MS, ZoteroAccountError, capGroupName, checkZoteroKey, parseKeyAnswer, zoteroLibraryUnchanged } from "./zotero-web-account.js";
 
 const KEY = "AccountKeyAbCd0123456789Zz";
 const API = "https://api.zotero.org";
@@ -30,6 +30,7 @@ beforeEach(async () => {
   sleeps.length = 0;
 });
 afterEach(async () => {
+  vi.useRealTimers();
   secrets.restore();
   await z.agent.close();
   for (const a of toClose.splice(0)) await a.close();
@@ -49,14 +50,30 @@ const caught = async (p: Promise<unknown>): Promise<ZoteroAccountError> => {
 };
 
 /** A server that answers /keys/current with exactly `body` (a string is sent as it is), and nothing else. */
-function rawKeyServer(body: unknown, status = 200): MockAgent {
+function rawKeyServer(body: unknown, status = 200, headers: Record<string, string> = {}): MockAgent {
   const m = new MockAgent();
   m.disableNetConnect();
   m.get(API)
     .intercept({ path: "/keys/current", method: "GET" })
-    .reply(status, typeof body === "string" ? body : JSON.stringify(body), { headers: { "content-type": "application/json" } })
+    .reply(status, typeof body === "string" ? body : JSON.stringify(body), { headers: { "content-type": "application/json", ...headers } })
     .persist();
   toClose.push(m);
+  return m;
+}
+
+/** A key with all-groups access, and a group list that answers `pages` one after the other (start=0, 100, ...) with the given Total-Results. */
+function rawGroupsServer(total: number | undefined, pages: unknown[][], extra: Record<string, string> = {}): MockAgent {
+  const m = new MockAgent();
+  m.disableNetConnect();
+  toClose.push(m);
+  const hdr = { "content-type": "application/json" };
+  m.get(API).intercept({ path: "/keys/current", method: "GET" }).reply(200, JSON.stringify({ userID: 42, access: { user: { library: true }, groups: { all: { library: true, write: false } } } }), { headers: hdr }).persist();
+  pages.forEach((rows, i) => {
+    m.get(API)
+      .intercept({ path: `/users/42/groups?limit=100&start=${i * 100}`, method: "GET" })
+      .reply(200, JSON.stringify(rows), { headers: { ...hdr, ...(total === undefined ? {} : { "total-results": String(total) }), ...extra } })
+      .persist();
+  });
   return m;
 }
 
@@ -309,11 +326,116 @@ describe("checkZoteroKey", () => {
     expect(z.requests.filter((r) => r.path.includes("/groups"))).toHaveLength(0);
   });
 
+  it("a long Backoff on the last answer of a successful check is reported in the result (I1)", async () => {
+    z.setKeyAccess({ groups: {} });
+    const before = Date.now();
+    z.backoffOnce(3600);
+    const got = await check();
+    expect(got.personal.library).toBe(true);
+    expect(got.backoffUntil).toBeGreaterThanOrEqual(before + 3600_000);
+    expect(got.backoffUntil).toBeLessThan(Date.now() + 3600_000 + 5000);
+    // and on the last page of the group list
+    z.addGroup(100, "Lab");
+    z.setKeyAccess({ groups: "all" });
+    const m = rawGroupsServer(1, [[{ id: 100, data: { name: "Lab" } }]], { backoff: "3600" });
+    const got2 = await checkZoteroKey({ dispatcher: m, sleep });
+    expect(got2.groups).toHaveLength(1);
+    expect(got2.backoffUntil).toBeGreaterThanOrEqual(before + 3600_000);
+  });
+
+  it("a Backoff on the first answer, short enough to wait for, is waited for and reported (I1)", async () => {
+    z.addGroup(100, "Lab");
+    const before = Date.now();
+    z.backoffOnce(2);
+    const got = await check();
+    expect(got.groups).toHaveLength(1);
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]).toBeGreaterThan(1500);
+    expect(sleeps[0]).toBeLessThanOrEqual(2000);
+    expect(got.backoffUntil).toBeGreaterThanOrEqual(before + 2000);
+    expect(got.backoffUntil).toBeLessThan(Date.now() + 3000);
+  });
+
+  it("with no Backoff the result has no backoffUntil", async () => {
+    expect("backoffUntil" in (await check())).toBe(false);
+  });
+
+  it("150 groups with the second page empty is offline, not a list of 100 (I2)", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ id: 1 + i, data: { name: `G${i}` } }));
+    const e = await caught(checkZoteroKey({ dispatcher: rawGroupsServer(150, [page1, []]), sleep }));
+    expect(e.reason).toBe("offline");
+  });
+
+  it("a short page before the total, and a listing with no total, are offline (I2)", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ id: 1 + i, data: { name: `G${i}` } }));
+    const page2 = Array.from({ length: 20 }, (_, i) => ({ id: 500 + i, data: { name: `H${i}` } }));
+    expect((await caught(checkZoteroKey({ dispatcher: rawGroupsServer(150, [page1, page2]), sleep }))).reason).toBe("offline");
+    expect((await caught(checkZoteroKey({ dispatcher: rawGroupsServer(undefined, [page2]), sleep }))).reason).toBe("offline");
+    // more than the total says is not a whole listing either
+    expect((await caught(checkZoteroKey({ dispatcher: rawGroupsServer(10, [page2]), sleep }))).reason).toBe("offline");
+    // an exact total is fine, and so is an empty list with total 0
+    expect((await checkZoteroKey({ dispatcher: rawGroupsServer(20, [page2]), sleep })).groups).toHaveLength(20);
+    expect((await checkZoteroKey({ dispatcher: rawGroupsServer(0, [[]]), sleep })).groups).toEqual([]);
+  });
+
+  it("a server that never answers is offline at the limit, with nothing left running (M2)", async () => {
+    vi.useFakeTimers();
+    const m = new MockAgent();
+    m.disableNetConnect();
+    toClose.push(m);
+    m.get(API).intercept({ path: "/keys/current", method: "GET" }).reply(200, "{}").delay(10_000_000).persist();
+    let settled = false;
+    const p = caught(checkZoteroKey({ dispatcher: m })).finally(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(ZOTERO_KEY_CHECK_TIMEOUT_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await p).reason).toBe("offline");
+    expect(ZOTERO_KEY_CHECK_TIMEOUT_MS).toBe(30_000);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("an abort during a wait is honoured at once, with no timer left (M1)", async () => {
+    vi.useFakeTimers();
+    z.failNext(1, 503, 8);
+    const c = new AbortController();
+    const p = checkZoteroKey({ dispatcher: z.agent, signal: c.signal });
+    const out = p.then(() => "resolved", (e: unknown) => (e as Error).message);
+    await vi.advanceTimersByTimeAsync(100);
+    c.abort(new Error("stop"));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await out).toBe("stop");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("an earlier Backoff is kept on the error when the answer cannot be read (M6)", async () => {
+    const m = rawKeyServer({ userID: "abc", access: {} }, 200, { backoff: "3600" });
+    const e = await caught(checkZoteroKey({ dispatcher: m, sleep }));
+    expect(e.reason).toBe("offline");
+    expect(e.backoffUntil).toBeGreaterThan(Date.now() + 3500_000);
+  });
+
+  it("the key field is deleted from the parsed answer, and kept in no result (M5)", () => {
+    const body: Record<string, unknown> = { key: KEY, userID: 42, username: "u", access: { user: { library: true } } };
+    const a = parseKeyAnswer(body);
+    expect("key" in body).toBe(false);
+    expect(JSON.stringify(a)).not.toContain(KEY);
+    expect(Object.keys(a).sort()).toEqual(["all", "byId", "personal", "userId"]);
+  });
+
+  it("a name whose first character is longer than the cap is cut by code points, not emptied (M3)", () => {
+    const name = "a" + "\u0301".repeat(250) + "b";
+    const cut = capGroupName(name);
+    expect(Array.from(cut)).toHaveLength(200);
+    expect(cut.startsWith("a\u0301")).toBe(true);
+  });
+
   it("a Backoff short enough to wait for is waited for", async () => {
     z.addGroup(100, "Lab");
     z.backoffOnce(2);
     expect((await check()).groups).toHaveLength(1);
-    expect(sleeps).toContain(2000);
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]).toBeGreaterThan(1500);
+    expect(sleeps[0]).toBeLessThanOrEqual(2000);
   });
 
   it("an aborted call stops with the abort", async () => {
@@ -436,6 +558,22 @@ describe("zoteroLibraryUnchanged", () => {
     z.setKeyAccess({ groups: {} });
     z.addGroup(101, "Other");
     expect((await caught(unchanged("group:101", 1))).reason).toBe("key-refused");
+  });
+
+  it("a server that never answers is offline at the limit, with nothing left running (M2)", async () => {
+    vi.useFakeTimers();
+    const m = new MockAgent();
+    m.disableNetConnect();
+    toClose.push(m);
+    m.get(API).intercept({ path: /^\/users\/42\/items\/top/u, method: "GET" }).reply(200, "").delay(10_000_000).persist();
+    let settled = false;
+    const p = caught(zoteroLibraryUnchanged({ ref: "user:42", since: 3, dispatcher: m })).finally(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(ZOTERO_UNCHANGED_TIMEOUT_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await p).reason).toBe("offline");
+    expect(ZOTERO_UNCHANGED_TIMEOUT_MS).toBe(15_000);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("a ref or a version that is not valid is refused before any request", async () => {

@@ -196,6 +196,8 @@ export type { ZoteroWebAdapter, ZoteroWebOptions, ZoteroWebScanResult } from "./
 export {
   ZOTERO_ACCOUNT_MAX_WAIT_MS,
   ZOTERO_ACCOUNT_MESSAGES,
+  ZOTERO_KEY_CHECK_TIMEOUT_MS,
+  ZOTERO_UNCHANGED_TIMEOUT_MS,
   ZoteroAccountError,
   checkZoteroKey,
   zoteroLibraryUnchanged,
