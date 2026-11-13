@@ -796,7 +796,7 @@ describe("unattended scans against the stand-in (Z2)", () => {
   it("a key list taken after the library changed still decides: the deleted item is gone, the added one is not content (A6)", async () => {
     const a = z.addItem(U, art("Here"));
     let added: string | undefined;
-    // Called in the content loop, after the scan read the library and before the key list is asked for.
+    // Called in the content loop, after the scan read the library (since A7 the key list is asked for before that loop).
     const skip = () => {
       added ??= z.addItem(U, art("Added after the read"));
       return false;
@@ -1194,6 +1194,134 @@ describe("unattended scans against the stand-in (Z2)", () => {
     // Only numbers, host names, a version and booleans (R78).
     for (const k of Object.keys(result)) expect(["backoffUntil", "completed", "deletedInZotero", "downloadsFailed", "goneKeys", "libraryVersion", "refusedHosts"]).toContain(k);
     expect(result.refusedHosts).toEqual(["refused.example.org"]);
+  });
+
+  // ---- Task Z4: no file downloaded twice (adapter level) ----------------------------------------------
+
+  const sha256Of = (b: Uint8Array | Buffer) => createHash("sha256").update(b).digest("hex");
+  const fileRequests = (att: string) => z.requests.filter((r) => r.path.endsWith(`/items/${att}/file`)).length;
+  const storageRequests = () => z.requests.filter((r) => r.path.startsWith("/zoterofilestorage/")).length;
+
+  it("a skipped file makes no request: a known attachment at its version is not fetched, its highlights carry the stored hash, and the token is the downloaded one (Z4)", async () => {
+    const p = z.addItem(U, art("Known file"));
+    const att = await pdfAttachment(p);
+    highlight(att, "anchored in the stored copy");
+    // First: downloaded, as today. Its part names the attachment's version and the hash of the bytes.
+    const first = await scanFake();
+    const got = first.items.find((i) => i.key === `zotero:${p}`)!;
+    expect(got.files).toHaveLength(1);
+    const sha = sha256Of(await readFile(got.files[0]!.path));
+    const attVersion = z.libraryVersion(U) - 1; // the attachment was the second-to-last write (the highlight the last)
+    expect(got.version!.parts).toEqual({ [att]: { v: attVersion, sha256: sha } });
+    expect(got.annotations![0]).toMatchObject({ file: got.files[0]!.path });
+    expect(got.annotations![0]).not.toHaveProperty("assetSha256");
+    // Then: the engine says the attachment at that version is stored (with its hash). Nothing is asked for.
+    z.requests.length = 0;
+    const asked: Array<[string, string, number]> = [];
+    const fileKnown = (id: string, k: string, v: number) => {
+      asked.push([id, k, v]);
+      return k === att && v === attVersion ? { sha256: sha } : undefined;
+    };
+    const second = await scanFake({}, { fileKnown });
+    expect(asked).toEqual([[`${U}/${p}`, att, attVersion]]);
+    expect(fileRequests(att)).toBe(0);
+    expect(storageRequests()).toBe(0); // not even the redirect
+    const skipped = second.items.find((i) => i.key === `zotero:${p}`)!;
+    expect(skipped.files).toEqual([]);
+    expect(skipped.fileNotes).toBeUndefined();
+    expect(skipped.version!.parts).toEqual({ [att]: { v: attVersion, sha256: sha } });
+    expect(skipped.annotations![0]).toMatchObject({ quote: "anchored in the stored copy", assetSha256: sha, anchor: { kind: "pdf", page: 1 } });
+    expect(skipped.annotations![0]).not.toHaveProperty("file");
+    // The version token is computed exactly as today: a known file counts as brought in.
+    expect(skipped.version!.version).toBe(got.version!.version);
+    expect(second.result).toMatchObject({ completed: true, downloadsFailed: 0 });
+    // Another version of the attachment is not known: it is downloaded.
+    z.editItem(U, att, { title: "renamed in Zotero" });
+    z.requests.length = 0;
+    const third = await scanFake({}, { fileKnown });
+    expect(fileRequests(att)).toBe(1);
+    expect(third.items.find((i) => i.key === `zotero:${p}`)!.files).toHaveLength(1);
+  });
+
+  it("a failed download leaves no part; a known file under a standalone attachment item is still yielded (Z4)", async () => {
+    const p = z.addItem(U, art("Fails"));
+    const att = await pdfAttachment(p);
+    z.failFile(U, att, { api: 500 });
+    const { items } = await scanFake({ maxRetries: 0 });
+    const it0 = items.find((i) => i.key === `zotero:${p}`)!;
+    expect(it0.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.failed]);
+    expect(it0.version!.parts ?? {}).toEqual({});
+    // A standalone attachment (no parent item) whose file is known: yielded with its part, nothing fetched.
+    z.failFile(U, att, null);
+    const bytes = await buildPdf({ extra: "standalone" });
+    const solo = z.addItem(U, { itemType: "attachment", contentType: "application/pdf", filename: "solo.pdf" }, { file: { bytes } });
+    const v = z.libraryVersion(U);
+    z.requests.length = 0;
+    const known2 = await scanFake({}, { fileKnown: (_id, k, ver) => (k === solo && ver === v ? { sha256: sha256Of(bytes) } : undefined) });
+    expect(fileRequests(solo)).toBe(0);
+    expect(known2.items.find((i) => i.key === `zotero:${solo}`)!.version!.parts).toEqual({ [solo]: { v, sha256: sha256Of(bytes) } });
+  });
+
+  // ---- Amendment A7 (Ruling R215): the key list before the downloads -----------------------------------
+
+  it("the key list is taken before any download, at the pinned version (A7)", async () => {
+    const a = z.addItem(U, art("Here"));
+    await pdfAttachment(a);
+    await scanFake({}, { knownIds: known(a, "GONEGONE") });
+    const keyList = z.requests.findIndex((r) => r.path.startsWith("/users/42/items?") && page(r.path).get("format") === "versions");
+    const firstFile = z.requests.findIndex((r) => r.path.endsWith("/file"));
+    expect(keyList).toBeGreaterThanOrEqual(0);
+    expect(firstFile).toBeGreaterThan(keyList);
+    expect(z.requests[keyList]!.headers["if-unmodified-since-version"]).toBe(String(z.libraryVersion(U)));
+  });
+
+  it("a library that changes during the downloads: the run still finishes, the right items are gone, the version is the pinned one (A7)", async () => {
+    const seen = z.addItem(U, art("Seen, then deleted in Zotero during the downloads"));
+    const withPdf = z.addItem(U, art("Has a file"));
+    const att = await pdfAttachment(withPdf);
+    const pinned = z.libraryVersion(U);
+    // While the file is downloaded the researcher goes on using Zotero: an unrelated item added, a seen item deleted.
+    const serve = z.serve.bind(z);
+    let changed = false;
+    z.serve = (req, host) => {
+      if (!changed && req.path.endsWith(`/items/${att}/file`)) {
+        changed = true;
+        z.addItem(U, art("Added during the downloads"));
+        z.remove(U, seen);
+      }
+      return serve(req, host);
+    };
+    const { items, result, notes } = await scanFake({}, { knownIds: known(seen, withPdf, "GONEGONE") });
+    expect(changed).toBe(true);
+    expect(goneOf(items)).toEqual([["zotero:GONEGONE", "deleted"]]);
+    expect(contentOf(items).sort()).toEqual([`zotero:${seen}`, `zotero:${withPdf}`].sort());
+    expect(result).toMatchObject({ completed: true, libraryVersion: pinned });
+    expect(notes.some((t) => /could not confirm/u.test(t))).toBe(false);
+  });
+
+  it("a restart re-takes the key list (A7)", async () => {
+    const a = z.addItem(U, art("Here"));
+    const serve = z.serve.bind(z);
+    let asks = 0;
+    z.serve = (req, host) => {
+      if (req.path.startsWith("/users/42/items?") && page(req.path).get("format") === "versions" && ++asks === 1) z.addItem(U, art("Added while the list was asked for"));
+      return serve(req, host);
+    };
+    const { items, result } = await scanFake({}, { knownIds: known(a, "GONEGONE") });
+    expect(asks).toBe(2); // the first answer was refused (412: the library moved on), the scan restarted and asked again
+    expect(z.requests.filter((r) => r.path.startsWith("/users/42/items?") && page(r.path).get("format") === "json" && page(r.path).get("start") === "0")).toHaveLength(2);
+    expect(goneOf(items)).toEqual([["zotero:GONEGONE", "deleted"]]);
+    expect(contentOf(items)).toHaveLength(2);
+    expect(result.completed).toBe(true);
+  });
+
+  it("a key list that fails three times: nobody gone, not finished, and the run says so once (A7)", async () => {
+    const a = z.addItem(U, art("Here"));
+    onKeyList(() => ({ status: 500, headers: { "content-type": "text/plain" }, body: "busy" }));
+    const { items, result, notes } = await scanFake({ maxRetries: 0 }, { knownIds: known(a, "GONEGONE") });
+    expect(goneOf(items)).toEqual([]);
+    expect(result.completed).toBe(false);
+    expect(notes.filter((t) => t === "This sync could not confirm which items were deleted in Zotero, so the next sync will read the whole library again.")).toHaveLength(1);
   });
 });
 
@@ -1635,6 +1763,368 @@ processing:
       const rec = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "batch.json"), "utf8"));
       expect(rec.adapterOptions).toEqual({ zoteroSince: v1, zoteroFiles: true, zoteroReadVersions: [z.libraryVersion(U)] });
       expect(rec.recordedLibraryVersion).toBe(z.libraryVersion(U));
+    });
+  });
+
+  describe("no file downloaded twice (Z4), against the stand-in", () => {
+    const U = "user:42";
+    const REMOVED_NOTE = "An attached file you removed here was not brought in again.";
+    const NOT_CONFIRMED = "This sync could not confirm which items were deleted in Zotero, so the next sync will read the whole library again.";
+    let z: FakeZotero;
+    let zweb: ZoteroWebOptions;
+    beforeEach(async () => {
+      z = newFake();
+      await setSecret("zotero-api-key", z.key);
+      zweb = { libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} };
+    });
+    const pos = (page: number) => JSON.stringify({ pageIndex: page - 1, rects: [[10, 20, 110, 40]] });
+    /** An article with a stored PDF and one highlight on page 1. */
+    const withHighlightedFile = async (title: string) => {
+      const p = z.addItem(U, { itemType: "journalArticle", title, tags: [{ tag: "first" }] });
+      const att = z.addItem(U, { itemType: "attachment", contentType: "application/pdf", filename: "f.pdf" }, { parent: p, file: { bytes: await buildPdf({ extra: title }) } });
+      const ann = z.addItem(U, { itemType: "annotation", annotationType: "highlight", annotationText: "informal markets", annotationColor: "#ffd400", annotationPosition: pos(1) }, { parent: att });
+      return { p, att, ann };
+    };
+    const run = async (p: Project, o: Partial<ZoteroWebOptions> = {}) => {
+      const h = await startZoteroWebImport(bulkDeps(), p.id, { ...zweb, ...o });
+      const r = await h.done;
+      return { r, batchId: h.batchId, report: await createBulkImport(bulkDeps()).batchReport(p.id, h.batchId) };
+    };
+    const fileRequests = (att: string) => z.requests.filter((q) => q.path.endsWith(`/items/${att}/file`)).length;
+    const storageRequests = () => z.requests.filter((q) => q.path.startsWith("/zoterofilestorage/")).length;
+    const sourceOf = async (p: Project, key: string) => (await sources(p)).find((s) => s.source.provenance.externalKeys?.zoteroKey === key)!;
+    const journalPath = (p: Project, n: number) => join(lib.root, p.folder, "imports", `batch-${String(n).padStart(4, "0")}`, "journal.jsonl");
+    const journal = async (p: Project, n: number) => (await readFile(journalPath(p, n), "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, any>);
+    /** Rewrites a batch's journal lines (an unencrypted project's journal is plain JSON lines). */
+    const rewriteJournal = async (p: Project, n: number, change: (e: Record<string, any>) => Record<string, any>) => {
+      const { writeFile } = await import("node:fs/promises");
+      const lines = await journal(p, n);
+      await writeFile(journalPath(p, n), lines.map((e) => JSON.stringify(change(e))).join("\n") + "\n");
+    };
+    /** A new file version uploaded in Zotero: new bytes, md5 and version (the stand-in's public replaceFile, M7). */
+    const uploadNewFile = (att: string, bytes: Uint8Array) => z.replaceFile(U, att, bytes);
+
+    it("a tag added in Zotero does not download the PDF again", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("Tagged later");
+      const first = await run(p);
+      expect(first.r.counts.failed).toBe(0);
+      expect(fileRequests(att)).toBe(1);
+      const before = await sourceOf(p, key);
+      expect(before.assets).toHaveLength(1);
+      const asset = before.assets[0]!;
+      expect(before.annotations[0]!.anchors[0]).toMatchObject({ kind: "pdf", assetId: asset.id, page: 1 });
+      // The journal records the attachment's version and the hash of the asset it became.
+      const line = (await journal(p, 1)).find((e) => e.ext?.id === `${U}/${key}`)!;
+      expect(line.ext.parts).toEqual({ [att]: { v: expect.any(Number), sha256: asset.sha256 } });
+      z.editItem(U, key, { tags: [{ tag: "first" }, { tag: "added in Zotero" }] });
+      z.requests.length = 0;
+      const second = await run(p);
+      expect(second.r.counts).toMatchObject({ updated: 1, failed: 0 });
+      expect(fileRequests(att)).toBe(0);
+      expect(storageRequests()).toBe(0);
+      const after = await sourceOf(p, key);
+      expect(after.assets.map((a) => a.id)).toEqual([asset.id]);
+      expect(after.annotations.map((a) => [a.id, a.anchors[0]?.assetId, a.externalHash])).toEqual(before.annotations.map((a) => [a.id, a.anchors[0]?.assetId, a.externalHash]));
+      expect(after.source.tagIds.length).toBe(before.source.tagIds.length + 1);
+      // The part is carried into the new line, so the run after that skips it too.
+      const line2 = (await journal(p, 2)).find((e) => e.ext?.id === `${U}/${key}`)!;
+      expect(line2.ext.parts).toEqual(line.ext.parts);
+      expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
+    });
+
+    it("a changed highlight on a known file anchors in the stored asset", async () => {
+      const p = await project();
+      const { p: key, att, ann } = await withHighlightedFile("Highlight changed");
+      await run(p);
+      const asset = (await sourceOf(p, key)).assets[0]!;
+      z.editItem(U, ann, { annotationText: "informal markets and credit", annotationPosition: pos(2) });
+      z.addItem(U, { itemType: "annotation", annotationType: "highlight", annotationText: "a new one", annotationPosition: pos(3) }, { parent: att });
+      z.requests.length = 0;
+      const second = await run(p);
+      expect(second.r.counts).toMatchObject({ updated: 1, failed: 0 });
+      expect(fileRequests(att)).toBe(0);
+      const sf = await sourceOf(p, key);
+      expect(sf.assets.map((a) => a.id)).toEqual([asset.id]);
+      expect(sf.annotations.map((a) => [a.quote, a.anchors.map((x) => (x.kind === "pdf" ? [x.assetId, x.page] : null))]).sort()).toEqual(
+        [
+          ["a new one", [[asset.id, 3]]],
+          ["informal markets and credit", [[asset.id, 2]]],
+        ].sort(),
+      );
+    });
+
+    it("a new file version is downloaded", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("New file version");
+      await run(p);
+      const old = (await sourceOf(p, key)).assets[0]!;
+      const fresh = await buildPdf({ extra: "the second version of the file" });
+      uploadNewFile(att, fresh);
+      z.requests.length = 0;
+      const second = await run(p);
+      expect(second.r.counts.failed).toBe(0);
+      expect(fileRequests(att)).toBe(1);
+      const sf = await sourceOf(p, key);
+      expect(sf.assets.map((a) => a.sha256).sort()).toEqual([old.sha256, createHash("sha256").update(fresh).digest("hex")].sort());
+      // The newer part is recorded: the run after that does not fetch it again.
+      z.editItem(U, key, { title: "Retitled" });
+      z.requests.length = 0;
+      await run(p);
+      expect(fileRequests(att)).toBe(0);
+    });
+
+    it("a part that failed is downloaded again next run", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("Fails first");
+      z.failFile(U, att, { api: 500 });
+      const first = await run(p, { maxRetries: 0 });
+      expect(first.r.counts.failed).toBe(0);
+      const line = (await journal(p, 1)).find((e) => e.ext?.id === `${U}/${key}`)!;
+      expect(line.ext.parts).toBeUndefined(); // a failed download leaves no part
+      expect(zoteroWebSince(repo, p.id, U)).toBeUndefined();
+      z.failFile(U, att, null);
+      z.requests.length = 0;
+      await run(p);
+      expect(fileRequests(att)).toBe(1);
+      const sf = await sourceOf(p, key);
+      expect(sf.assets).toHaveLength(1);
+      expect(sf.annotations[0]!.anchors[0]).toMatchObject({ assetId: sf.assets[0]!.id });
+      z.requests.length = 0;
+      await run(p, { full: true });
+      expect(fileRequests(att)).toBe(0);
+    });
+
+    it("an item imported before this task matches as unchanged; a journal line without parts downloads once more, then never", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("Imported before Z4");
+      await run(p);
+      const before = await sourceOf(p, key);
+      // The journal line as the code BEFORE this task wrote it for this very item (I3): `ext` with the id and the
+      // token that code computed, and no parts. The token below was produced by the pre-Z4 adapter (7ca50c9's
+      // zotero-web.ts, scanning the same stand-in library: the stand-in's keys and versions are deterministic),
+      // and is written here literally, so that any change to the token's computation makes this item "updated".
+      const OLD_EXT = { id: "user:42/22222DD5", version: "w1-0fb11037c4fab05f" };
+      expect(`${U}/${key}`).toBe(OLD_EXT.id);
+      // The new code computes the same token for the same item (an "unchanged" count alone would not show it:
+      // a changed token on an unchanged item also ends "unchanged", through the update path).
+      expect((await journal(p, 1)).find((e) => e.ext)!.ext.version).toBe(OLD_EXT.version);
+      await rewriteJournal(p, 1, (e) => (e.ext ? { ...e, ext: OLD_EXT } : e));
+      expect((await journal(p, 1)).filter((e) => e.ext).map((e) => e.ext)).toEqual([OLD_EXT]);
+      z.requests.length = 0;
+      const second = await run(p, { full: true });
+      // The same token: unchanged. The file is fetched once more (nothing says it is stored) and dropped by its hash.
+      expect(second.r.counts).toMatchObject({ unchanged: 1, updated: 0, created: 0, failed: 0 });
+      expect(fileRequests(att)).toBe(1);
+      const after = await sourceOf(p, key);
+      expect(after.assets.map((a) => a.id)).toEqual(before.assets.map((a) => a.id));
+      expect(after).toEqual(before);
+      // That run matched the old line's token (no update) and wrote the part: never again.
+      const line2 = (await journal(p, 2)).find((e) => e.ext?.id === `${U}/${key}`)!;
+      expect(line2.ext.version).toBe(OLD_EXT.version);
+      expect(line2.snapshot).toBeUndefined(); // nothing was written to the source
+      expect(line2.ext.parts).toEqual({ [att]: { v: expect.any(Number), sha256: before.assets[0]!.sha256 } });
+      z.requests.length = 0;
+      const third = await run(p, { full: true });
+      expect(third.r.counts).toMatchObject({ unchanged: 1, failed: 0 });
+      expect(fileRequests(att)).toBe(0);
+    });
+
+    it("an asset the researcher removed here is not brought back, and the run says so", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("Destroyed here");
+      await run(p);
+      const before = await sourceOf(p, key);
+      const { destroyRaw } = await import("../retention.js");
+      await destroyRaw(repo, p.id, [before.assets[0]!.id], "Researcher");
+      const destroyed = await sourceOf(p, key);
+      expect(destroyed.assets[0]!.status).toBe("destroyed");
+      // An unchanged item in a full run, then a changed one in the next: neither fetches the file nor brings it back.
+      z.requests.length = 0;
+      const second = await run(p, { full: true });
+      expect(second.r.counts).toMatchObject({ unchanged: 1, failed: 0 });
+      expect(fileRequests(att)).toBe(0);
+      expect(second.report.notes.filter((n) => n === REMOVED_NOTE)).toHaveLength(1);
+      expect(second.report.fileNotes).toEqual([{ item: expect.any(String), note: "an attached file you removed here was not brought in again" }]);
+      z.editItem(U, key, { title: "Retitled in Zotero" });
+      z.requests.length = 0;
+      const third = await run(p);
+      expect(third.r.counts).toMatchObject({ updated: 1, failed: 0 });
+      expect(fileRequests(att)).toBe(0);
+      expect(third.report.notes).toContain(REMOVED_NOTE);
+      const after = await sourceOf(p, key);
+      expect(after.assets).toEqual(destroyed.assets);
+      // Its highlight stays as it was (anchored in the same asset entry, as before).
+      expect(after.annotations).toEqual(destroyed.annotations);
+    });
+
+    it("a hash that matches no asset of the source is not anchored by guess: the file is downloaded and its copy's hash finds the asset (I1)", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("Journal disagrees");
+      await run(p);
+      const before = await sourceOf(p, key);
+      // The journal names a hash no asset of the source has: nothing says the researcher removed anything.
+      await rewriteJournal(p, 1, (e) => (e.ext?.parts ? { ...e, ext: { ...e.ext, parts: { [att]: { ...e.ext.parts[att], sha256: "0".repeat(64) } } } } : e));
+      z.addItem(U, { itemType: "annotation", annotationType: "highlight", annotationText: "added in Zotero", annotationPosition: pos(4) }, { parent: att });
+      z.requests.length = 0;
+      const second = await run(p);
+      expect(second.r.counts.failed).toBe(0);
+      expect(fileRequests(att)).toBe(1); // not known: fetched as any missing file is
+      const sf = await sourceOf(p, key);
+      expect(sf.assets).toEqual(before.assets); // the copy is dropped by its hash: the asset was there all along
+      // Both highlights are anchored in the real asset, found by the downloaded copy's hash, never by the journal's.
+      expect(sf.annotations.map((a) => [a.quote, a.anchors.map((x) => (x.kind === "pdf" ? x.assetId : null))]).sort()).toEqual(
+        [
+          ["added in Zotero", [before.assets[0]!.id]],
+          ["informal markets", [before.assets[0]!.id]],
+        ].sort(),
+      );
+      expect(second.report.notes).not.toContain(REMOVED_NOTE);
+      // That run recorded the true hash: the next one skips the file.
+      z.editItem(U, key, { title: "Retitled" });
+      z.requests.length = 0;
+      await run(p);
+      expect(fileRequests(att)).toBe(0);
+    });
+
+    it("an undone batch's file comes back with its highlights anchored, even when a later sync carried its part; a file the researcher removed here does not (I1)", async () => {
+      const p = await project();
+      const undone = await withHighlightedFile("Its file was brought in by a batch later undone");
+      const removed = await withHighlightedFile("Its file the researcher removed here");
+      // 1: the first file fails, so its item comes in without it (and the version is not recorded).
+      z.failFile(U, undone.att, { api: 500 });
+      await run(p, { maxRetries: 0 });
+      z.failFile(U, undone.att, null);
+      // 2: the file is added to the existing source (an update); this is the batch that will be undone.
+      const second = await run(p);
+      expect((await sourceOf(p, undone.p)).assets).toHaveLength(1);
+      // 3: a tag changed in Zotero; the file is skipped, its part carried into this line.
+      z.editItem(U, undone.p, { tags: [{ tag: "first" }, { tag: "later" }] });
+      z.requests.length = 0;
+      await run(p);
+      expect(fileRequests(undone.att)).toBe(0);
+      // The researcher destroys the other item's file here (retention); batch 2 is undone.
+      const { destroyRaw } = await import("../retention.js");
+      await destroyRaw(repo, p.id, [(await sourceOf(p, removed.p)).assets[0]!.id], "Researcher");
+      await createBulkImport(bulkDeps()).undoBatch(p.id, second.batchId);
+      expect((await sourceOf(p, undone.p)).assets).toEqual([]);
+      // 4: a full run. The undone file is downloaded again and its highlight anchored in it; the removed one is not.
+      z.editItem(U, undone.p, { title: "Retitled in Zotero" });
+      z.requests.length = 0;
+      const fourth = await run(p, { full: true });
+      expect(fourth.r.counts.failed).toBe(0);
+      expect(fileRequests(undone.att)).toBe(1);
+      expect(fileRequests(removed.att)).toBe(0);
+      const back = await sourceOf(p, undone.p);
+      expect(back.assets).toHaveLength(1);
+      expect(back.annotations[0]!.anchors[0]).toMatchObject({ kind: "pdf", assetId: back.assets[0]!.id });
+      expect((await sourceOf(p, removed.p)).assets.map((a) => a.status)).toEqual(["destroyed"]);
+      // The run says so for the removed one only: once.
+      expect(fourth.report.notes.filter((n) => n === REMOVED_NOTE)).toHaveLength(1);
+      expect(fourth.report.fileNotes).toEqual([{ item: expect.any(String), note: "an attached file you removed here was not brought in again" }]);
+    });
+
+    it("a source deleted here: a full run does not download its file and keeps it deleted; with includeDeleted the file comes in again (M1)", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("Deleted here");
+      await run(p);
+      await repo.deleteSource(p.id, (await sourceOf(p, key)).source.id);
+      z.requests.length = 0;
+      const second = await run(p, { full: true });
+      expect(second.r.counts).toMatchObject({ deletedHere: 1, created: 0, failed: 0 });
+      expect(fileRequests(att)).toBe(0);
+      expect(repo.listSourceIds(p.id)).toEqual([]);
+      // Brought back on request: the file is needed then, and fetched.
+      z.requests.length = 0;
+      const h = await startZoteroWebImport(bulkDeps(), p.id, { ...zweb, full: true }, { includeDeleted: true });
+      expect((await h.done).counts.created + (await h.done).counts.needsReview).toBe(1);
+      expect(fileRequests(att)).toBe(1);
+      const back = await sourceOf(p, key);
+      expect(back.annotations[0]!.anchors[0]).toMatchObject({ assetId: back.assets[0]!.id });
+    });
+
+    it("a downloaded file the engine does not store records no part, and the next full run asks for it again (I2)", async () => {
+      const p = await project();
+      const key = z.addItem(U, { itemType: "journalArticle", title: "Its file is not a supported kind" });
+      // Zotero says PDF; the bytes are plain text: the engine leaves the file out (not supported).
+      const att = z.addItem(U, { itemType: "attachment", contentType: "application/pdf", filename: "f.pdf" }, { parent: key, file: { bytes: Buffer.from("just some words, not a PDF\n") } });
+      const first = await run(p);
+      expect(first.r.counts.failed).toBe(0);
+      expect((await sourceOf(p, key)).assets).toEqual([]);
+      expect(fileRequests(att)).toBe(1);
+      const line = (await journal(p, 1)).find((e) => e.ext?.id === `${U}/${key}`)!;
+      expect(line.ext.parts).toBeUndefined();
+      z.requests.length = 0;
+      await run(p, { full: true });
+      expect(fileRequests(att)).toBe(1);
+    });
+
+    it("a recoloured highlight on a known file keeps its colour after a run in which the file was skipped", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("Recoloured here");
+      await run(p);
+      const sf0 = await sourceOf(p, key);
+      await repo.updateAnnotation(p.id, sf0.source.id, sf0.annotations[0]!.id, { colorName: "blue" });
+      z.editItem(U, key, { tags: [{ tag: "first" }, { tag: "second" }] });
+      z.requests.length = 0;
+      await run(p);
+      expect(fileRequests(att)).toBe(0);
+      z.requests.length = 0;
+      await run(p, { full: true });
+      expect(fileRequests(att)).toBe(0);
+      const sf = await sourceOf(p, key);
+      expect(sf.annotations[0]).toMatchObject({ colorName: "blue", id: sf0.annotations[0]!.id });
+      expect(sf.annotations[0]!.anchors[0]).toMatchObject({ assetId: sf0.assets[0]!.id });
+    });
+
+    it("a run suspended and resumed fetches no file twice, the one in hand at the suspend included", async () => {
+      const p = await project();
+      const atts: string[] = [];
+      for (let i = 0; i < 6; i++) atts.push((await withHighlightedFile(`Item ${i}`)).att);
+      const h = await startZoteroWebImport(bulkDeps(), p.id, zweb);
+      for await (const e of h.progress) {
+        if (e.done >= 2) {
+          await h.suspend();
+          break;
+        }
+      }
+      expect((await h.done).state).toBe("paused");
+      // The resume rebuilds the adapter from the batch record (no test seams): the stand-in serves as the global dispatcher.
+      const { getGlobalDispatcher, setGlobalDispatcher } = await import("undici");
+      const previous = getGlobalDispatcher();
+      setGlobalDispatcher(z.agent);
+      let r;
+      try {
+        const { resumeZoteroWebImport } = await import("./zotero-web.js");
+        r = await (await resumeZoteroWebImport(bulkDeps(), p.id, h.batchId)).done;
+      } finally {
+        setGlobalDispatcher(previous);
+      }
+      expect(r.state).toBe("finished");
+      expect(r.counts.created + r.counts.needsReview).toBe(6);
+      expect(atts.map((a) => fileRequests(a))).toEqual(atts.map(() => 1));
+      expect(storageRequests()).toBe(6);
+      expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
+    });
+
+    it("a key list that cannot be had: the run's notes say so once, and no version is recorded (A7)", async () => {
+      const p = await project();
+      z.addItem(U, { itemType: "journalArticle", title: "Stays" });
+      const gone = z.addItem(U, { itemType: "journalArticle", title: "Deleted in Zotero" });
+      const { att } = await withHighlightedFile("Its file fails first");
+      z.failFile(U, att, { api: 500 });
+      await run(p, { maxRetries: 0 }); // not finished: the next run is full
+      z.failFile(U, att, null);
+      z.remove(U, gone);
+      const serve = z.serve.bind(z);
+      z.serve = (req, host) => {
+        const r = serve(req, host);
+        return req.path.startsWith("/users/42/items?") && page(req.path).get("format") === "versions" ? { status: 500, headers: { "content-type": "text/plain" }, body: "busy" } : r;
+      };
+      const second = await run(p, { maxRetries: 0 });
+      expect(second.r.state).toBe("finished");
+      expect(second.report.notes.filter((n) => n === NOT_CONFIRMED)).toHaveLength(1);
+      expect(zoteroWebSince(repo, p.id, U)).toBeUndefined();
     });
   });
 
