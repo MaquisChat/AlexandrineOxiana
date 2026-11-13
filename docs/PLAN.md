@@ -563,7 +563,7 @@ Update after every task; commit and push.
 | 69 Show that a captured item is no longer available (D17) | complete | 0e12b9e (merge) | reviewed with probes over one fix round (R185, R186); D17 closed |
 | 70 A read never mistakes a write in progress for tampering (D21) | complete | a916b20 (merge) | reviewed with probes (R188); D21 closed; four minors on the final review's list |
 | 71 The extension remembers the downloader choice (D18) | built; read and accepted by the controller; waits to be verified with 72 and 73 | 7ca77e0 (worktree branch) | R189 |
-| 72 A later conflict enters the review queue (D19) | built; a small round (the import path, the merge of 71 and 73), then review | dd9f3fa (worktree branch) | R190 |
+| 72 A later conflict enters the review queue (D19) | in review; verification with 71 and 73 running | 06ee7b4 (worktree branch; it holds 71 and 73 too) | R190; the import path included |
 | 73 The audit says which field was confirmed (D20) | approved; goes in with 71 and 72 | fb78744 (worktree branch) | R191; reviewed with 18 probes |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
