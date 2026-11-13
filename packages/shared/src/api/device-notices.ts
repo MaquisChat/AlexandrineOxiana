@@ -15,11 +15,14 @@
  *    damaged, so it was kept aside and a fresh list started (Task 68 fix round 1).
  *  - `libraries-list-set-aside`: this computer's list of libraries was damaged, so it was kept aside
  *    and a fresh list started; the libraries themselves are untouched (Task 68 fix round 2, R181 a).
+ *  - `watched-folder-choices-set-aside`: this computer's choices for its watched folders (paused, and
+ *    whether files not downloaded are downloaded) were damaged, so they were kept aside; the folders
+ *    whose choices could not be kept went back to the defaults (Task W4).
  *
  * Carried in `library.state` (`notices`); dismissed with `POST /settings/notices/dismiss { kind }`
  * (the desktop app's token only).
  */
-export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside", "approved-folders-list-set-aside", "libraries-list-set-aside"] as const;
+export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside", "approved-folders-list-set-aside", "libraries-list-set-aside", "watched-folder-choices-set-aside"] as const;
 export type DeviceNoticeKind = (typeof DEVICE_NOTICE_KINDS)[number];
 
 export function isDeviceNoticeKind(v: unknown): v is DeviceNoticeKind {

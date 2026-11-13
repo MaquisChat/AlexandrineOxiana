@@ -28,6 +28,7 @@ const ABOUT: Record<DeviceNoticeKind, string> = {
   "watched-folders-list-set-aside": "this computer's list of watched folders was damaged and was set aside",
   "approved-folders-list-set-aside": "this computer's list of folders approved for imports was damaged and was set aside",
   "libraries-list-set-aside": "this computer's list of libraries was damaged and was set aside",
+  "watched-folder-choices-set-aside": "this computer's choices for its watched folders were damaged and were set aside",
 };
 
 const pending = new Set<Promise<void>>();
