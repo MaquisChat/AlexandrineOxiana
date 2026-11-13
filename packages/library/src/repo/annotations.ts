@@ -12,7 +12,7 @@
  * The per-source caps (10,000 annotations, 16 MB of quote and note text; the same as an import's,
  * `capAnnotations`) are enforced whole: a change that would pass one is refused and nothing is written.
  */
-import { Annotation, HIGHLIGHT_COLOURS, SORT_INDEX_PATTERN, newId, type HighlightColourName, type SourceFile } from "@ao/core";
+import { Annotation, HIGHLIGHT_COLOURS, SORT_INDEX_PATTERN, highlightColourOf, newId, type HighlightColourName, type SourceFile } from "@ao/core";
 import { isPdfMime } from "../asset-content.js";
 import { MAX_SOURCE_ANNOTATIONS, MAX_SOURCE_ANNOTATION_TEXT } from "../import/bulk/update.js";
 import { InvalidInputError, NotFoundError } from "./errors.js";
@@ -227,14 +227,17 @@ export async function updateAnnotation(core: RepoCore, projectId: string, source
           if (next !== before.body) changed.push("body");
           body = next;
         }
-        if (patch.colorName !== undefined && patch.colorName !== before.colorName) changed.push("colorName");
+        // The colour it already shows (a stored name, else its imported colour mapped, R1) is no change
+        // (ruling M1): it is not the researcher's edit, so a re-import still updates the annotation.
+        const recolour = patch.colorName !== undefined && patch.colorName !== highlightColourOf(before);
+        if (recolour) changed.push("colorName");
         if (!changed.length) throw new Unchanged(before);
         checkCaps(cur.annotations, 0, (body?.length ?? 0) - (before.body?.length ?? 0));
         const { body: _old, ...rest } = before;
         const after = Annotation.parse({
           ...rest,
           ...(body !== undefined ? { body } : {}),
-          ...(patch.colorName !== undefined ? { colorName: patch.colorName } : {}),
+          ...(recolour ? { colorName: patch.colorName } : {}),
           modifiedAt: tx.at,
           modifiedBy: tx.actor,
         });
