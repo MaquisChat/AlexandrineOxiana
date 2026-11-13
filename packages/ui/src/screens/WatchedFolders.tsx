@@ -93,7 +93,7 @@ function countLines(f: WatchedFolderSummary): string[] {
   return out;
 }
 
-const downloadTitle = (n: number, bytes: number) => `Download ${files(n)} (${formatSize(bytes)}) to this Mac and import them? They stay downloaded afterwards.`;
+const downloadTitle = (n: number, bytes: number) => `Download ${files(n)}${bytes > 0 ? ` (${formatSize(bytes)})` : ""} to this Mac and import them? They stay downloaded afterwards.`;
 
 /** The service's own sentence for a refusal (plain words; the service puts no path in it). */
 const sentenceOf = (err: unknown, fallback: string) => (err instanceof ApiClientError && err.message ? err.message : fallback);
@@ -147,8 +147,19 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   /** A choice of this computer's folder was refused: the button offers the chooser again. */
   const [chooseAgain, setChooseAgain] = useState<Record<string, boolean>>({});
   const [lists, setLists] = useState<Record<string, FileList>>({});
-  const [dialog, setDialog] = useState<Dialog | null>(null);
-  const [picking, setPicking] = useState(false);
+  const [dialog, setDialogState] = useState<Dialog | null>(null);
+  /** The dialog as of now (a second press before the next render sees the first one's change). */
+  const dialogRef = useRef<Dialog | null>(null);
+  const setDialog = useCallback((next: Dialog | null | ((cur: Dialog | null) => Dialog | null)) => {
+    dialogRef.current = typeof next === "function" ? next(dialogRef.current) : next;
+    setDialogState(dialogRef.current);
+  }, []);
+  const [picking, setPickingState] = useState(false);
+  const pickingRef = useRef(false);
+  const setPicking = (v: boolean) => {
+    pickingRef.current = v;
+    setPickingState(v);
+  };
   const [openSource, setOpenSource] = useState<{ sourceId: string; from: HTMLElement | null } | null>(null);
   const [live, setLive] = useState("");
   const [focusFolders, setFocusFolders] = useState(0);
@@ -166,7 +177,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   const acting = useRef(new Map<string, number>());
   const busyRef = useRef<Record<string, Act>>({});
   const listGen = useRef(new Map<string, number>());
-  const relisting = useRef<{ again: boolean } | null>(null);
+  const relisting = useRef<{ again: boolean; done: Promise<void> } | null>(null);
   const foldersHeading = useRef<HTMLHeadingElement>(null);
   const sourceRef = useRef<HTMLElement>(null);
 
@@ -205,7 +216,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     setLists({});
     foldersRef.current = [];
     setFolders(undefined);
-  }, []);
+  }, [setDialog]);
 
   /**
    * The list, merged by the rule above: a folder whose last event arrived after the list was asked for
@@ -214,9 +225,10 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   const relist = useCallback(async (): Promise<void> => {
     if (relisting.current) {
       relisting.current.again = true;
-      return;
+      return relisting.current.done;
     }
-    const mark = { again: false };
+    let settle!: () => void;
+    const mark = { again: false, done: new Promise<void>((r) => (settle = r)) };
     relisting.current = mark;
     const g = gen.current;
     try {
@@ -243,6 +255,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       } while (mark.again);
     } finally {
       if (relisting.current === mark) relisting.current = null;
+      settle();
     }
   }, [api, projectId, commit, markLocked]);
 
@@ -426,7 +439,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
 
   // ---- add ----
   const startAdd = async () => {
-    if (picking || readOnly || !shell || dialog) return;
+    if (pickingRef.current || readOnly || !shell || dialogRef.current) return;
     setPicking(true);
     let picked: { grantId: string; name: string } | null = null;
     try {
@@ -441,7 +454,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     setDialog({ kind: "add", grant: picked.grantId, name: picked.name, busy: false });
   };
   const addStart = async (o: { label: string; recursive: boolean; collectionId: string }) => {
-    const d = dialog;
+    const d = dialogRef.current;
     if (d?.kind !== "add" || d.busy || !d.grant || readOnly) return;
     const grantId = d.grant;
     // The grant is spent by the request whatever its answer (R233 d): never sent twice.
@@ -462,7 +475,8 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     }
   };
   const addChooseAgain = async () => {
-    if (dialog?.kind !== "add" || dialog.busy || !shell) return;
+    const cur = dialogRef.current;
+    if (cur?.kind !== "add" || cur.busy || !shell) return;
     let picked: { grantId: string; name: string } | null = null;
     try {
       picked = await shell.pickWatchFolder(WATCH_TEXT.chooserTitle);
@@ -476,11 +490,11 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
 
   // ---- download, by an agreement to the size the service reported ----
   const openDownload = (f: WatchedFolderSummary) => {
-    if (!canAct(f) || dialog) return;
+    if (!canAct(f) || dialogRef.current) return;
     setDialog({ kind: "download", id: f.id, label: labelOf(f), files: f.counts.notDownloaded, bytes: f.counts.notDownloadedBytes, busy: false });
   };
   const agreeDownload = async () => {
-    const d = dialog;
+    const d = dialogRef.current;
     if (d?.kind !== "download" || d.busy || readOnly) return;
     setDialog({ ...d, busy: true, error: undefined });
     actingInc(d.id, 1);
@@ -507,11 +521,11 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
 
   // ---- remove ----
   const openRemove = (f: WatchedFolderSummary) => {
-    if (!canAct(f) || dialog) return;
+    if (!canAct(f) || dialogRef.current) return;
     setDialog({ kind: "remove", id: f.id, label: labelOf(f), busy: false });
   };
   const confirmRemove = async () => {
-    const d = dialog;
+    const d = dialogRef.current;
     if (d?.kind !== "remove" || d.busy || readOnly) return;
     setDialog({ ...d, busy: true, error: undefined });
     const g = gen.current;

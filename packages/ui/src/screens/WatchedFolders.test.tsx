@@ -24,7 +24,7 @@ const G1 = "a".repeat(32);
 const G2 = "b".repeat(32);
 const ZERO = { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 };
 
-function folder(o: Partial<WatchedFolderSummary> & { counts?: Partial<WatchedFolderSummary["counts"]> } = {}): WatchedFolderSummary {
+function folder(o: Partial<Omit<WatchedFolderSummary, "counts">> & { counts?: Partial<WatchedFolderSummary["counts"]> } = {}): WatchedFolderSummary {
   const { counts, ...rest } = o;
   return {
     id: "w1",
@@ -137,6 +137,66 @@ describe("WatchedFolders", () => {
     expect(within(card("Scans")).getByText("Interviews")).toBeTruthy();
     expect(document.activeElement).toBe(add);
     expect(status().textContent).toBe("Added. “Scans”: Watching.");
+  });
+
+  it("a double press sends one request: the chooser once, the grant once, the agreement once, the removal once", async () => {
+    useService([folder({ counts: { notDownloaded: 2, notDownloadedBytes: 5000 } })]);
+    const chooser = held<{ grantId: string; name: string } | null>();
+    fake.shell!.pickWatchFolder.mockReturnValueOnce(chooser.p);
+    const answer = held<void>();
+    const calls = { post: 0, patch: 0, del: 0 };
+    server.use(
+      http.post(url("/projects/p1/watched-folders"), async () => {
+        calls.post++;
+        await answer.p;
+        return HttpResponse.json(folder({ id: "w2", label: "Two" }), { status: 201 });
+      }),
+      http.patch(url("/projects/p1/watched-folders/w1"), async () => {
+        calls.patch++;
+        await answer.p;
+        return HttpResponse.json(folder({ counts: { notDownloaded: 2, notDownloadedBytes: 5000 }, choices: { paused: false, notDownloaded: "download" } }));
+      }),
+      http.delete(url("/projects/p1/watched-folders/w1"), async () => {
+        calls.del++;
+        return HttpResponse.json({ removed: true });
+      }),
+    );
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    const add = screen.getByRole("button", { name: "Add a folder…" });
+    act(() => {
+      add.click();
+      add.click();
+    });
+    chooser.release({ grantId: G1, name: "Two" });
+    const dialog = await screen.findByRole("dialog", { name: "Add a watched folder" });
+    expect(fake.shell!.pickWatchFolder).toHaveBeenCalledTimes(1);
+    const start = within(dialog).getByRole("button", { name: "Start watching" });
+    act(() => {
+      start.click();
+      start.click();
+    });
+    answer.release();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(calls.post).toBe(1);
+
+    act(() => within(c).getByRole("radio", { name: "Download and import them" }).click());
+    const go = within(await screen.findByRole("dialog")).getByRole("button", { name: "Download and import" });
+    act(() => {
+      go.click();
+      go.click();
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(calls.patch).toBe(1);
+
+    act(() => within(c).getByRole("button", { name: "Remove “Fieldwork scans”…" }).click());
+    const stop = within(await screen.findByRole("dialog")).getByRole("button", { name: "Stop watching" });
+    act(() => {
+      stop.click();
+      stop.click();
+    });
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Fieldwork scans" })).toBeNull());
+    expect(calls.del).toBe(1);
   });
 
   it("a cancelled chooser adds nothing", async () => {
