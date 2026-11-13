@@ -37,6 +37,14 @@ describe("device-level notices (Task 68)", () => {
     expect(t).toMatch(/kept beside the app's settings/);
   });
 
+  it("the Zotero sync settings notice (R242): what happened, that automatic sync is off, that the library is unchanged", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "zotero-sync-settings-set-aside" }} onDismiss={() => undefined} />);
+    expect(screen.getByRole("status").textContent).toContain(
+      "This computer's Zotero sync settings could not be read and were set aside. Automatic sync is off until you set it up again. Nothing in your library has changed.",
+    );
+    expect(bannersFor({ notices: [{ kind: "zotero-sync-settings-set-aside", at: "2026-11-13T10:15:30.000Z" }] })).toEqual([{ kind: "notice", notice: "zotero-sync-settings-set-aside" }]);
+  });
+
   it("watched folders that could not be read at open: a plain warning for this session (review round 2, Rm4)", () => {
     const t = warningText("watched-folders-unreadable", "library");
     expect(t).toMatch(/list of watched folders could not be read when this library was opened/);

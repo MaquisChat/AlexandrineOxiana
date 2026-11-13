@@ -18,11 +18,14 @@
  *  - `watched-folder-choices-set-aside`: this computer's choices for its watched folders (paused, and
  *    whether files not downloaded are downloaded) were damaged, so they were kept aside; the folders
  *    whose choices could not be kept went back to the defaults (Task W4).
+ *  - `zotero-sync-settings-set-aside`: this computer's Zotero sync settings (which Zotero library feeds which
+ *    project, how often) were damaged, so they were kept aside; automatic sync is off until the researcher sets it up
+ *    again (Task Z7, R242). A damaged sync history raises no notice.
  *
  * Carried in `library.state` (`notices`); dismissed with `POST /settings/notices/dismiss { kind }`
  * (the desktop app's token only).
  */
-export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside", "approved-folders-list-set-aside", "libraries-list-set-aside", "watched-folder-choices-set-aside"] as const;
+export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside", "approved-folders-list-set-aside", "libraries-list-set-aside", "watched-folder-choices-set-aside", "zotero-sync-settings-set-aside"] as const;
 export type DeviceNoticeKind = (typeof DEVICE_NOTICE_KINDS)[number];
 
 export function isDeviceNoticeKind(v: unknown): v is DeviceNoticeKind {

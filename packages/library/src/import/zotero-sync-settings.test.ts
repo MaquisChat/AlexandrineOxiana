@@ -3,7 +3,8 @@
  * (`zotero-sync-history.json`). Strict reads, set-aside of damaged content, 0600, atomic, nothing of a library's
  * content, the newest 200 runs per library, and the pauses with what clears each.
  */
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { deviceNoticesIdle, dismissDeviceNotice, readDeviceNotices } from "../device-notices.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -97,6 +98,29 @@ describe("settings file", () => {
     expect(names).not.toContain(ZOTERO_SYNC_FILE); // kept aside, never deleted; the next write starts afresh
     await writeZoteroSyncSettings(dir, LIB, settings([link("user:42")]));
     expect((await readZoteroSyncSettings(dir, LIB)).automatic).toBe(true);
+  });
+
+  it("R242: a damaged settings file raises the device notice, once; a damaged history file raises none", async () => {
+    await writeFile(join(dir, ZOTERO_SYNC_FILE), "not json");
+    await readZoteroSyncSettings(dir, LIB);
+    await writeFile(join(dir, ZOTERO_SYNC_FILE), "[]");
+    await writeZoteroSyncSettings(dir, LIB, settings([link("user:42")]));
+    await deviceNoticesIdle();
+    expect(await readDeviceNotices(dir)).toEqual([{ kind: "zotero-sync-settings-set-aside", at: expect.any(String) }]);
+    await dismissDeviceNotice(dir, "zotero-sync-settings-set-aside");
+    await writeFile(join(dir, ZOTERO_SYNC_HISTORY_FILE), "not json");
+    expect(await readZoteroSyncHistory(dir, LIB)).toEqual([]);
+    await deviceNoticesIdle();
+    expect(await readDeviceNotices(dir)).toEqual([]);
+  });
+
+  it("R242: a settings file that merely cannot be read raises no notice", async () => {
+    await writeZoteroSyncSettings(dir, LIB, settings([link("user:42")]));
+    await rm(join(dir, ZOTERO_SYNC_FILE));
+    await mkdir(join(dir, ZOTERO_SYNC_FILE)); // a folder in its place: not readable, not damaged content
+    await expect(readZoteroSyncSettings(dir, LIB)).rejects.toBeInstanceOf(ZoteroSyncFileUnreadableError);
+    await deviceNoticesIdle();
+    expect(await readDeviceNotices(dir)).toEqual([]);
   });
 
   it("content of the wrong shape (an unknown field, a bad pause) is damaged too", async () => {

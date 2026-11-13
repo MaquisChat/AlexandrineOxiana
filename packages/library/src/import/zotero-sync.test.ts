@@ -13,6 +13,7 @@ import type { Project } from "@ao/core";
 import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
+import { deviceNoticesIdle, readDeviceNotices } from "../device-notices.js";
 import { shutdownExtractors } from "../extract/index.js";
 import { IndexHandle } from "../index/db.js";
 import { createIndexSink } from "../index/sink.js";
@@ -39,6 +40,7 @@ import {
 import {
   ZOTERO_SYNC_FILE,
   ZOTERO_SYNC_HISTORY_FILE,
+  putZoteroSyncRun,
   readZoteroSyncHistory,
   readZoteroSyncSettings,
   runningZoteroSyncRuns,
@@ -666,6 +668,66 @@ describe("one run at a time, whoever starts it", () => {
     expect(r.batchId).not.toBe(manual.batchId);
     expect((await findBatch(repo, p.id, manual.batchId))!.state).toBe("paused");
   });
+
+  it("R242: a batch without the origin is never adopted, even when this link's history names it", async () => {
+    const p = await project();
+    await articles(5);
+    const manual = await startZoteroWebImport(bulkDeps(), p.id, { libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} });
+    await manual.suspend();
+    const l = await linked(linkOf(p));
+    await putZoteroSyncRun(config, lib.id, { id: "old-run", ref: U, projectId: p.id, trigger: "manual", startedAt: new Date(T0).toISOString(), outcome: "stopped", reason: "app-closed", batchId: manual.batchId });
+    const r = await sync(l);
+    expect(r.batchId).not.toBe(manual.batchId);
+    expect((await findBatch(repo, p.id, manual.batchId))!.state).toBe("paused");
+  });
+});
+
+describe("R242: the sync's own batches carry their origin", () => {
+  it("a sync batch's record says origin zotero-sync from its creation, and keeps it across a resume", async () => {
+    const p = await project();
+    await articles(24);
+    const ctl = new AbortController();
+    let atStart: string | undefined;
+    const onBatch = (_p: string, h: BatchHandle) => {
+      void findBatch(repo, p.id, h.batchId).then((rec) => (atStart = rec?.origin));
+      void (async () => {
+        for await (const pr of h.progress) if (pr.done >= 2) return ctl.abort();
+      })();
+    };
+    const stopped = await sync(await linked(linkOf(p)), { signal: ctl.signal }, { onBatch });
+    await vi.waitFor(() => expect(atStart).toBe("zotero-sync"));
+    expect((await findBatch(repo, p.id, stopped.batchId!))!.origin).toBe("zotero-sync");
+    const resumed = await sync(await stored());
+    expect(resumed.batchId).toBe(stopped.batchId);
+    expect((await findBatch(repo, p.id, stopped.batchId!))).toMatchObject({ state: "finished", origin: "zotero-sync" });
+  });
+
+  it("a manual import's batch has no origin", async () => {
+    const p = await project();
+    await articles(1);
+    const manual = await startZoteroWebImport(bulkDeps(), p.id, { libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} });
+    await manual.done;
+    expect((await findBatch(repo, p.id, manual.batchId))!.origin).toBeUndefined();
+  });
+
+  it("a history file set aside does not make the runner lose or duplicate its batch", async () => {
+    const p = await project();
+    await articles(24);
+    const ctl = new AbortController();
+    const onBatch = (_p: string, h: BatchHandle) => {
+      void (async () => {
+        for await (const pr of h.progress) if (pr.done >= 2) return ctl.abort();
+      })();
+    };
+    const stopped = await sync(await linked(linkOf(p)), { signal: ctl.signal }, { onBatch });
+    expect(stopped.outcome).toBe("stopped");
+    await writeFile(join(config, ZOTERO_SYNC_HISTORY_FILE), "{ damaged");
+    const dirs = (await batchDirs(repo, p.id)).length;
+    const resumed = await sync(await stored());
+    expect(resumed).toMatchObject({ outcome: "finished", batchId: stopped.batchId });
+    expect((await batchDirs(repo, p.id)).length).toBe(dirs);
+    expect(sourceCount(p)).toBe(24);
+  });
 });
 
 // ------------------------------------------------------------------------------------------
@@ -738,6 +800,10 @@ describe("device files", () => {
     expect(r.outcome).toBe("finished");
     expect(told).toEqual([ZOTERO_SYNC_HISTORY_FILE]);
     expect((await history()).map((x) => x.id)).toEqual([r.id]);
+    // R242: a debug note only, no device notice.
+    expect(logged.some((l) => l.includes(`${ZOTERO_SYNC_HISTORY_FILE} was set aside`))).toBe(true);
+    await deviceNoticesIdle();
+    expect(await readDeviceNotices(config)).toEqual([]);
   });
 
   it("a damaged settings file: the run uses the link it was given, and no pause or fullDone is written", async () => {

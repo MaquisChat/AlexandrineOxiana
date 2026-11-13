@@ -16,7 +16,8 @@
  * strength; DAMAGED content (not JSON, the wrong shape, an entry this app cannot use, an unknown field) is set aside
  * as `<name>.unreadable-<stamp>` (never deleted or overwritten) and the file starts again empty:
  *   - settings: automatic sync is then off for every library (nothing is linked) until the researcher sets it up
- *     again; the caller is told through `onSetAside` (the device notice belongs there: see the report);
+ *     again; the researcher is told through the device notice `zotero-sync-settings-set-aside` (R242), and the caller
+ *     through `onSetAside`;
  *   - history: it starts empty, and never blocks a sync.
  *
  * Pauses (R206 4, Accept 3) are written by the runner (`key-refused` on every link of the library, `library-gone` on
@@ -27,6 +28,7 @@
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { AppSettingUnreadableError, setAppSettingAside, updateAppSettingStrict } from "../app-settings.js";
+import { raiseDeviceNotice } from "../device-notices.js";
 import { InvalidInputError } from "../repo/errors.js";
 
 export const ZOTERO_SYNC_FILE = "zotero-sync.json";
@@ -225,12 +227,15 @@ async function classify<T>(dir: string, name: string, check: (v: unknown) => v i
 
 async function setAside(dir: string, name: string, check: (v: unknown) => v is unknown, o: ZoteroSyncFileOptions): Promise<void> {
   let keptAs: string;
+  const now = (o.now ?? (() => new Date()))();
   try {
-    keptAs = await setAppSettingAside(dir, name, check, (o.now ?? (() => new Date()))());
+    keptAs = await setAppSettingAside(dir, name, check, now);
   } catch (err) {
     if ((err as Error)?.name === "AppSettingReadableError") return; // put right (or removed) meanwhile
     throw new ZoteroSyncFileUnreadableError(name);
   }
+  // The settings: the researcher is told through the device notices (R242; never throws). The history: no notice.
+  if (name === ZOTERO_SYNC_FILE) await raiseDeviceNotice(dir, "zotero-sync-settings-set-aside", now);
   o.onSetAside?.(name, keptAs);
 }
 

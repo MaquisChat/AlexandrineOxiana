@@ -16,9 +16,9 @@
  *   2. A started record is written (`outcome: "stopped"`, `reason: "app-closed"`, no `finishedAt`: if the process dies
  *      now, that is what happened; readZoteroSyncHistory reads it so in any other process).
  *   3. This link's own unfinished batch (state paused, cancelled, failed or interrupted, kind zotero-web, this ref) is
- *      resumed with the options it started with. "Own": `origin: "zotero-sync"` on the batch record, OR its id in this
- *      link's history (see the report: nothing in the engine sets `origin` yet). A batch of the library started by hand
- *      is never adopted: it blocks while active (1.) and is ignored otherwise.
+ *      resumed with the options it started with. "Own": `origin: "zotero-sync"` on the batch record, which startBatch
+ *      writes at the record's creation for the runner's batches only (R242); the history file plays no part. A batch
+ *      of the library without it (started by hand) is never adopted: it blocks while active (1.), else is ignored.
  *   4. Otherwise, when `fullDone` and the project's remembered version (`since`) are both known: ONE request
  *      (zoteroLibraryUnchanged). 304 → `up-to-date`, and nothing at all is written to the library.
  *   5. Otherwise the key is checked (checkZoteroKey: two GETs) — what it may read decides `files`, and a library the
@@ -67,7 +67,6 @@ import {
   pauseAllZoteroSyncLinks,
   pauseLink,
   putZoteroSyncRun,
-  readZoteroSyncHistory,
   readZoteroSyncSettings,
   runningZoteroSyncRuns,
   type ZoteroSyncCounts,
@@ -251,7 +250,13 @@ const isAbort = (err: unknown, signal: AbortSignal) => signal.aborted || (err as
 export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLink, o: ZoteroSyncOptions): Promise<ZoteroSyncRun> {
   const now = () => (deps.now ? deps.now() : Date.now());
   const iso = (ms: number) => new Date(ms).toISOString();
-  const fileOpts: ZoteroSyncFileOptions = deps.onSetAside ? { onSetAside: deps.onSetAside } : {};
+  // A damaged history file is set aside with a debug note only (R242); the settings file raises its device notice itself.
+  const fileOpts: ZoteroSyncFileOptions = {
+    onSetAside: (file, keptAs) => {
+      deps.debug?.(`zotero sync: the damaged file ${file} was set aside`);
+      deps.onSetAside?.(file, keptAs);
+    },
+  };
   const run: ZoteroSyncRun = { id: newId(), ref: link.ref, projectId: link.projectId, trigger: o.trigger, startedAt: iso(now()), outcome: "stopped", reason: "app-closed" };
   // The runner's own lock, taken before anything is awaited: two calls at the same moment are one run and one refusal.
   const key = lockKey(deps.libraryId, link.ref);
@@ -351,10 +356,10 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
       }
     };
 
-    // 3. This link's own unfinished batch is resumed.
-    const ownIds = new Set((await readZoteroSyncHistory(deps.appConfigDir, deps.libraryId, fileOpts).catch(() => [])).filter((r) => r.ref === link.ref && r.projectId === link.projectId && r.batchId).map((r) => r.batchId!));
+    // 3. This link's own unfinished batch is resumed: found in the project by its record alone (origin, kind, ref), so
+    // a history file set aside loses nothing (R242). A batch without the origin is never adopted.
     const own = (await webBatches(deps.repo, link.projectId, link.ref)).find(
-      (r) => (r.origin === "zotero-sync" || ownIds.has(r.id)) && !isBatchActive(r.id) && (r.state === "running" || r.state === "paused" || r.state === "cancelled" || r.state === "failed"),
+      (r) => r.origin === "zotero-sync" && !isBatchActive(r.id) && (r.state === "running" || r.state === "paused" || r.state === "cancelled" || r.state === "failed"),
     );
     checkStop();
     let full = false;
@@ -391,7 +396,7 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
         ...seams,
       });
       const options = { structure: current.options.structure, duplicates: current.options.duplicates, includeDeleted: false };
-      handle = finishZoteroWebRun(deps, link.projectId, adapter, await startBatch(deps, link.projectId, adapter, options), full ? undefined : since);
+      handle = finishZoteroWebRun(deps, link.projectId, adapter, await startBatch(deps, link.projectId, adapter, options, { origin: "zotero-sync" }), full ? undefined : since);
       scanResult = () => adapter.scanResult();
     }
     run.batchId = handle.batchId;
