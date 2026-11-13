@@ -22,18 +22,37 @@
  *
  * Read-only library: a notice says so; no control that makes or changes anything is enabled (the
  * making controls come with Tasks R9 to R11 and read `readOnly`).
+ *
+ * Highlights (Task R8): once the document is open, the source's annotations are asked for once, and
+ * those of this file (A4) are drawn on each drawn page by HighlightLayer. Whether a highlight's
+ * quote still matches the text under it is worked out from each drawn page's text as PdfPages read
+ * it (`onPageText`, the one guarded read, A7), never by reading a page again: `changed` grows as
+ * pages are drawn; a highlight on a page not drawn yet is not checked and nothing is said of it.
+ * HighlightNotices says which have changed and which lie on a page the file does not have (until
+ * the list of Task R9 says it beside each entry). Everything of the annotations — the list, the
+ * page texts kept to check them, the verdicts, the choice — goes with the document: when it fails
+ * (A7), when the screen ends (A9) or leaves; a list answer arriving after that is dropped.
+ *
+ * A11 (Ruling R209): no verdict when the quote is under four letters, a rectangle touches vertical
+ * text, the page has no text, or the annotation also lies on another file. A 423 answered to the list
+ * ends the reader as locked at once, by the same path as a refused range; a 404 makes the route ask
+ * whether the project is still there (`onProjectInDoubt`: "Project not found" if not, A10); any other
+ * failure leaves the PDF reading, with an alert and "Try again". The request is aborted when the
+ * document ends.
  */
 import { READER_PDF_MAX_BYTES } from "@ao/shared";
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { ApiClientError } from "../api/client";
 import type { SourceAvailability } from "../api/library";
-import type { ReaderApi } from "../api/reader";
+import type { AnnotationRecord, ReaderApi } from "../api/reader";
 import { AvailabilityMark } from "../components/AvailabilityMark";
 import { UserText } from "../components/UserText";
 import { inAppLink, libraryHref } from "../navigation";
-import { PdfPages, type ViewRotation } from "../reader/PdfPages";
+import { HighlightLayer, HighlightNotices } from "../reader/HighlightLayer";
+import { MAX_RENDERED_PAGES, PdfPages, type TextContent, type ViewRotation } from "../reader/PdfPages";
 import { openPdf, toPdfOpenError, type PdfHandle, type PdfOpenError } from "../reader/pdfjs";
 import { createRangeTransport } from "../reader/rangeTransport";
+import { canJudge, quoteStillMatches, textsUnderRects, touchesVerticalText } from "../reader/textCheck";
 import "../reader/Reader.css";
 
 export type ReaderStateKind = "locked" | "missing" | "damaged" | "too-large" | "not-a-pdf" | "password-needed" | "password-wrong" | "unreachable" | "other";
@@ -118,6 +137,11 @@ export interface ReaderScreenProps {
   readOnly: boolean;
   /** The source's availability, said with a missing file. */
   availability?: SourceAvailability;
+  /**
+   * Called when the service says the source's annotations are not found (404): the project may be
+   * gone. The route then asks, and ends the reader with "Project not found" if it is (A10).
+   */
+  onProjectInDoubt?(): void;
 }
 
 type Phase =
@@ -138,9 +162,14 @@ function stateOf(err: unknown, lastRangeError: unknown): { state: ReaderStateKin
   return { state: e.kind, sentence: e.kind === "other" ? e.message : READER_STATES[e.kind].sentence };
 }
 
+const NO_IDS: ReadonlySet<string> = new Set();
+/** Said when the list of annotations could not be had (the service's own sentence follows). */
+export const ANNOTATIONS_NOT_SHOWN = "The highlights of this file could not be shown";
+const hasText = (t: TextContent) => t.items.some((i) => "str" in i && i.str.trim() !== "");
+
 const typing = (t: EventTarget | null) => t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement || (t instanceof HTMLElement && t.isContentEditable);
 
-export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, availability }: ReaderScreenProps) {
+export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, availability, onProjectInDoubt }: ReaderScreenProps) {
   const [phase, setPhase] = useState<Phase>({ kind: "opening" });
   const [page, setPage] = useState(1);
   const [scale, setScale] = useState(1);
@@ -172,6 +201,24 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     b === prevButton.current ? nextButton.current : b === nextButton.current ? prevButton.current : b === zoomOutButton.current ? zoomInButton.current : b === zoomInButton.current ? zoomOutButton.current : null;
   const apiRef = useRef(api);
   apiRef.current = api;
+  /** The source's annotations, as listed for the document open now (R8); none before the answer. */
+  const [annotations, setAnnotations] = useState<AnnotationRecord[] | undefined>(undefined);
+  const [annotationsError, setAnnotationsError] = useState<string | undefined>(undefined);
+  /** Annotations whose quote no longer matches the text under them (R8); grows as pages are drawn. */
+  const [changed, setChanged] = useState<ReadonlySet<string>>(NO_IDS);
+  const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+  /** The text of the pages drawn last (0-based index), at most MAX_RENDERED_PAGES, to check quotes against. */
+  const pageTexts = useRef(new Map<number, TextContent>());
+  /** Moves on when a page's text arrives. */
+  const [textsSeen, setTextsSeen] = useState(0);
+  /** Per annotation, the text found under each of its anchors so far (anchor id -> text; null: the page has no text). */
+  const underText = useRef(new Map<string, Map<string, { byRect: string; byPdf: string } | null>>());
+  /** Annotations already judged. */
+  const judged = useRef(new Set<string>());
+  /** Moves on with "Try again": the list is asked for again. */
+  const [listAttempt, setListAttempt] = useState(0);
+  const inDoubt = useRef(onProjectInDoubt);
+  inDoubt.current = onProjectInDoubt;
 
   const fail = useCallback((s: { state: ReaderStateKind; sentence: string }) => {
     attempts.current++;
@@ -275,6 +322,125 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
 
   const handle = phase.kind === "open" ? phase.handle : undefined;
   const count = handle?.pageCount ?? 0;
+
+  // R8: the annotations, asked for once a document is open (and again on "Try again"); the request is
+  // aborted, and a late answer dropped, when the document ends or the list is asked for again.
+  useEffect(() => {
+    if (!handle) return;
+    let on = true;
+    const ac = new AbortController();
+    const alive = () => on && current.current === handle && !handle.dead;
+    apiRef.current
+      .listAnnotations(projectId, sourceId, ac.signal)
+      .then((r) => {
+        if (alive()) setAnnotations(r.annotations);
+      })
+      .catch((e: unknown) => {
+        if (!alive() || ac.signal.aborted || isAbort(e)) return;
+        if (e instanceof ApiClientError && e.status === 423) {
+          // A11: locked — the same path as a refused range (A7, A9): destroyed at once, never reused.
+          current.current = undefined;
+          void handle.destroy().catch(() => {});
+          fail({ state: "locked", sentence: READER_STATES.locked.sentence });
+          return;
+        }
+        if (e instanceof ApiClientError && e.status === 404) inDoubt.current?.();
+        setAnnotationsError(e instanceof Error && e.message ? e.message : "The library service did not answer.");
+      });
+    return () => {
+      on = false;
+      ac.abort();
+    };
+  }, [handle, projectId, sourceId, listAttempt, fail]);
+
+  // Everything of the annotations goes with the document.
+  useEffect(() => {
+    if (!handle) return;
+    const texts = pageTexts.current;
+    const under = underText.current;
+    const done = judged.current;
+    return () => {
+      texts.clear();
+      under.clear();
+      done.clear();
+      setAnnotations(undefined);
+      setAnnotationsError(undefined);
+      setChanged(NO_IDS);
+      setSelectedId(undefined);
+    };
+  }, [handle, projectId, sourceId]);
+
+  /** This file's annotations, each with only its places in this file (A4); `partial`: those that also lie on another file (no verdict, A11). */
+  const { fileAnnotations, partial } = useMemo(() => {
+    const partial = new Set<string>();
+    if (!annotations || !assetId) return { fileAnnotations: undefined, partial };
+    const out: AnnotationRecord[] = [];
+    for (const a of annotations) {
+      const here = a.pdfAnchors.filter((x) => x.assetId === assetId);
+      if (here.length === 0) continue;
+      if (here.length === a.pdfAnchors.length) out.push(a);
+      else {
+        partial.add(a.id);
+        out.push({ ...a, pdfAnchors: here });
+      }
+    }
+    return { fileAnnotations: out, partial };
+  }, [annotations, assetId]);
+
+  /** A drawn page's text, from the pages' own guarded read: kept (the last few pages) to check quotes against. */
+  const onPageText = useCallback(
+    (pageIndex: number, text: TextContent) => {
+      if (!handle || current.current !== handle || handle.dead) return;
+      const texts = pageTexts.current;
+      texts.delete(pageIndex);
+      texts.set(pageIndex, text);
+      while (texts.size > MAX_RENDERED_PAGES) texts.delete(texts.keys().next().value!);
+      setTextsSeen((n) => n + 1);
+    },
+    [handle],
+  );
+
+  // R8: each highlight's quote against the text under it, once every page it lies on has been drawn.
+  useEffect(() => {
+    if (!fileAnnotations || !handle || current.current !== handle || handle.dead) return;
+    const found: string[] = [];
+    for (const a of fileAnnotations) {
+      if (judged.current.has(a.id)) continue;
+      // No verdict (A11): nothing quoted, too short to judge, also on another file, or on a page the file lacks (said otherwise).
+      if (!a.quote || !canJudge(a.quote) || partial.has(a.id) || a.pdfAnchors.some((x) => x.page > count)) {
+        judged.current.add(a.id);
+        continue;
+      }
+      let under = underText.current.get(a.id);
+      for (const anchor of a.pdfAnchors) {
+        if (under?.has(anchor.id)) continue;
+        const text = pageTexts.current.get(anchor.page - 1);
+        if (!text) continue;
+        if (!under) underText.current.set(a.id, (under = new Map()));
+        // A page without text, or rectangles on vertical text: no verdict (null).
+        under.set(anchor.id, hasText(text) && !touchesVerticalText(text, anchor.rects) ? textsUnderRects(text, anchor.rects) : null);
+      }
+      if (!under || a.pdfAnchors.some((x) => !under!.has(x.id))) continue;
+      judged.current.add(a.id);
+      underText.current.delete(a.id);
+      // A page with no text (a scan) or vertical text cannot say: nothing is said.
+      const parts = [...a.pdfAnchors].sort((x, y) => x.page - y.page).map((x) => under.get(x.id));
+      if (parts.some((t) => t === null || t === undefined)) continue;
+      // A12: changed only when the quote is in neither the reading-order text nor pdf.js's order.
+      const byRect = parts.map((t) => t!.byRect).join(" ");
+      const byPdf = parts.map((t) => t!.byPdf).join(" ");
+      if (!quoteStillMatches(a.quote, byRect) && !quoteStillMatches(a.quote, byPdf)) found.push(a.id);
+    }
+    if (found.length > 0) setChanged((c) => new Set([...c, ...found]));
+  }, [fileAnnotations, partial, textsSeen, handle, count]);
+
+  const renderOverlay = useCallback(
+    (pageIndex: number, viewport: Parameters<typeof HighlightLayer>[0]["viewport"]) =>
+      fileAnnotations && fileAnnotations.length > 0 ? (
+        <HighlightLayer pageIndex={pageIndex} viewport={viewport} annotations={fileAnnotations} {...(selectedId !== undefined ? { selectedId } : {})} onSelect={setSelectedId} changed={changed} />
+      ) : null,
+    [fileAnnotations, selectedId, changed],
+  );
 
   /**
    * Focuses page `n`'s box: now, when no render follows (the page does not change); else once the
@@ -498,8 +664,26 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
           </button>
         </span>
       </div>
+      {annotationsError !== undefined && (
+        <div className="ao-reader-notice">
+          <p role="alert">
+            {ANNOTATIONS_NOT_SHOWN}: <UserText>{annotationsError}</UserText>
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              // One request a press: the button goes with the error until the answer.
+              setAnnotationsError(undefined);
+              setListAttempt((n) => n + 1);
+            }}
+          >
+            Try again
+          </button>
+        </div>
+      )}
+      {fileAnnotations && <HighlightNotices annotations={fileAnnotations} pageCount={count} changed={changed} />}
       <div className="ao-reader-area" ref={area} onKeyDown={onAreaKey}>
-        <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={() => null} />
+        <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} />
       </div>
     </div>
   );

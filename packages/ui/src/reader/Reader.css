@@ -212,3 +212,106 @@
 .ao-reader-loading {
   padding: var(--space-3);
 }
+
+/*
+ * Highlights (Task R8, HighlightLayer.tsx): one element a rectangle, over the page, taking no
+ * pointer events. The colour comes from the class (--hl-* tokens, the same in every theme: the page
+ * is paper); the kind from the shape, never from the colour alone. A fill is laid with multiply, so
+ * the words under it stay as black as they are printed.
+ */
+.ao-hl-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.ao-hl {
+  position: absolute;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.ao-hl--yellow { --hl: var(--hl-yellow); --hl-line: var(--hl-yellow-line); }
+.ao-hl--red { --hl: var(--hl-red); --hl-line: var(--hl-red-line); }
+.ao-hl--green { --hl: var(--hl-green); --hl-line: var(--hl-green-line); }
+.ao-hl--blue { --hl: var(--hl-blue); --hl-line: var(--hl-blue-line); }
+.ao-hl--purple { --hl: var(--hl-purple); --hl-line: var(--hl-purple-line); }
+.ao-hl--magenta { --hl: var(--hl-magenta); --hl-line: var(--hl-magenta-line); }
+.ao-hl--orange { --hl: var(--hl-orange); --hl-line: var(--hl-orange-line); }
+.ao-hl--grey { --hl: var(--hl-grey); --hl-line: var(--hl-grey-line); }
+
+/* A highlight: the words filled. */
+.ao-hl--fill {
+  background: var(--hl);
+  mix-blend-mode: multiply;
+}
+
+/*
+ * An underline: a line at the words' foot, whichever way the page is turned: the colour at full
+ * strength (--hl-line), with a thin dark line of --hl-edge beneath it, so that the shape reaches 3:1
+ * on paper whatever the colour (A11).
+ */
+.ao-hl--underline {
+  --foot: 0 0 0 0 var(--hl-edge);
+
+  box-shadow: var(--foot);
+
+  /* Black letters under the line stay black; over white paper the colour is unchanged. */
+  mix-blend-mode: multiply;
+}
+
+.ao-hl--underline.ao-hl--edge-bottom { border-bottom: 3px solid var(--hl-line); --foot: 0 1px 0 0 var(--hl-edge); }
+.ao-hl--underline.ao-hl--edge-left { border-left: 3px solid var(--hl-line); --foot: -1px 0 0 0 var(--hl-edge); }
+.ao-hl--underline.ao-hl--edge-top { border-top: 3px solid var(--hl-line); --foot: 0 -1px 0 0 var(--hl-edge); }
+.ao-hl--underline.ao-hl--edge-right { border-right: 3px solid var(--hl-line); --foot: 1px 0 0 0 var(--hl-edge); }
+
+/* A note: a mark with a dark edge and a folded corner, at least big enough to see. */
+.ao-hl--note {
+  min-width: 14px;
+  min-height: 14px;
+  background: var(--hl);
+  border: 2px solid var(--hl-edge);
+  border-radius: 2px 6px 2px 2px;
+  box-shadow: inset -5px 5px 0 0 var(--hl-edge);
+}
+
+/* An imported area or drawing, and anything else with a place: an outlined box. */
+.ao-hl--box {
+  border: 3px solid var(--hl);
+  outline: 1px solid var(--hl-edge);
+  outline-offset: -4px;
+}
+
+/* Text that has changed since the highlight was made: dashed. */
+.ao-hl--changed {
+  outline: 2px dashed var(--hl-edge);
+  outline-offset: 1px;
+}
+
+.ao-hl--underline.ao-hl--changed {
+  border-style: dashed;
+}
+
+/* The chosen one: a ring. */
+.ao-hl--selected {
+  box-shadow: 0 0 0 2px var(--hl-edge);
+}
+
+.ao-hl--underline.ao-hl--selected {
+  box-shadow: var(--foot), 0 0 0 2px var(--hl-edge);
+}
+
+.ao-hl--note.ao-hl--selected {
+  box-shadow: inset -5px 5px 0 0 var(--hl-edge), 0 0 0 2px var(--hl-edge);
+}
+
+.ao-reader-hl-notices {
+  border-left: 4px solid var(--line-strong);
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface);
+}
+
+.ao-reader-hl-notices ul {
+  margin: 0;
+  padding-left: var(--space-3);
+}

@@ -1,0 +1,170 @@
+/**
+ * Does a highlight's quote still match the text under its rectangles (Task R8, Accept 5 as changed
+ * by A11, Ruling R209)?
+ *
+ * A highlight stores its rectangles and the words it was made on. If the file was changed since (a
+ * linked file edited elsewhere, another edition put in its place), the rectangles may now lie over
+ * other words; the reader then says "The text here has changed since this highlight was made."
+ * rather than silently marking the wrong words. A wrong verdict costs the researcher's trust in every
+ * such mark, so it is given only on clear evidence:
+ *
+ *  - `textUnderRects` returns the text of the WHOLE text items (pdf.js's pieces of text, usually a
+ *    line or part of one) whose box a rectangle touches, gathered RECTANGLE BY RECTANGLE in the
+ *    order of the anchor's rectangles (each item once, at the first rectangle that touches it; within
+ *    one rectangle in pdf.js's order), A12: the rectangles are in reading order, while pdf.js may
+ *    list two columns row by row or a footnote mark after its paragraph. Which
+ *    characters of an item lie inside a rectangle is not estimated: pdf.js gives an item's position
+ *    and length, not each glyph's, and any estimate is wrong for typewriter faces, justified lines and
+ *    right-to-left text (pdf.js gives such an item in logical order, its position at its visual left).
+ *  - `quoteStillMatches` says whether the quote, normalised, is CONTAINED in that text, normalised;
+ *    `quoteStillUnder` (the verdict the reader uses) says "changed" only when the quote is contained
+ *    NEITHER in the text gathered by rectangle NOR in the touched items in pdf.js's own order.
+ *  - An item's box is at least its font size high (as pdf.js's text layer makes it; a face reporting
+ *    no ascent and descent is given 0.8 and -0.2), and a rectangle within TOUCH_SLACK points of it
+ *    touches it, so that small differences in metrics never decide. Rectangles touching no item on a
+ *    page with text: changed (the words are gone); the reader gives no verdict on a page with none.
+ *    Normalising folds what differs between two readings of the same words: NFKC (ligatures such as
+ *    "ﬁ"), letter case, and everything that is not a letter or a digit (spaces, line breaks, a hyphen
+ *    at a line's end, a soft hyphen, punctuation and its typographic forms; so a trailing ellipsis on
+ *    a quote the importer cut short is ignored too).
+ *  - No verdict at all (`canJudge` false, or `touchesVerticalText` true): a quote of fewer than
+ *    MIN_QUOTE_LETTERS letters and digits once normalised (too short to be evidence), or rectangles
+ *    touching a text item pdf.js marks as vertical. The reader adds its own cases (no text on the
+ *    page, the page not drawn, the handle dead, anchors on another file).
+ *
+ * The same words moved to other lines, or other words in their place, are "changed"; extra words
+ * around the quote are not.
+ *
+ * Pure: nothing here reads a document; the reader hands in a page's text it already has (read
+ * through the guarded path of PdfPages, raced against the handle's failure, A7).
+ */
+import type { PDFPageProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
+import type { PdfRectDto } from "../api/reader";
+
+/** A page's text as pdf.js gives it. */
+export type TextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>;
+
+/** The fewest letters and digits a normalised quote must have for a verdict. */
+export const MIN_QUOTE_LETTERS = 4;
+/** How near (points) a rectangle must come to an item's box to touch it. */
+export const TOUCH_SLACK = 0.5;
+
+interface Item {
+  str: string;
+  transform: number[];
+  width: number;
+  height: number;
+  fontName?: string;
+}
+
+type Styles = Record<string, { ascent?: number; descent?: number; vertical?: boolean } | undefined>;
+interface Bounds {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+const finite = (r: PdfRectDto) => [r.x, r.y, r.w, r.h].every(Number.isFinite);
+
+/** The text items of a page, each with its box in PDF user space and whether pdf.js marks it vertical. */
+function itemsOf(textContent: TextContent): Array<{ str: string; box: Bounds; vertical: boolean }> {
+  const styles = (textContent.styles ?? {}) as Styles;
+  const out: Array<{ str: string; box: Bounds; vertical: boolean }> = [];
+  for (const raw of textContent.items) {
+    if (!("str" in raw)) continue;
+    const item = raw as unknown as Item;
+    if (typeof item.str !== "string" || item.str === "" || !Array.isArray(item.transform) || item.transform.length < 6) continue;
+    const [a, b, c, d, e, f] = item.transform as [number, number, number, number, number, number];
+    if (![a, b, c, d, e, f, item.width, item.height].every(Number.isFinite)) continue;
+    const st = item.fontName ? styles[item.fontName] : undefined;
+    const size = Math.hypot(c, d) || Math.hypot(a, b) || item.height || 1;
+    if (st?.vertical) {
+      // A vertical run goes down the page from its origin for `height`; its box is taken generously (a
+      // rectangle touching it only means no verdict).
+      const run = Math.max(item.height, size);
+      out.push({ str: item.str, box: { x0: e - size, y0: f - run - size, x1: e + size, y1: f + size }, vertical: true });
+      continue;
+    }
+    const run = Math.hypot(a, b) > 0 ? [a / Math.hypot(a, b), b / Math.hypot(a, b)] : [1, 0];
+    const up = Math.hypot(c, d) > 0 ? [c / Math.hypot(c, d), d / Math.hypot(c, d)] : [0, 1];
+    let ascent = typeof st?.ascent === "number" && Number.isFinite(st.ascent) ? st.ascent : 0.8;
+    let descent = typeof st?.descent === "number" && Number.isFinite(st.descent) ? st.descent : -0.2;
+    // A face that reports no metrics: those of an ordinary one. Then at least the font size high.
+    if (ascent === 0 && descent === 0) [ascent, descent] = [0.8, -0.2];
+    if (ascent - descent < 1) {
+      const pad = (1 - (ascent - descent)) / 2;
+      ascent += pad;
+      descent -= pad;
+    }
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (const along of [0, Math.max(0, item.width)]) {
+      for (const h of [descent * size, ascent * size]) {
+        xs.push(e + run[0]! * along + up[0]! * h);
+        ys.push(f + run[1]! * along + up[1]! * h);
+      }
+    }
+    out.push({ str: item.str, box: { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) }, vertical: false });
+  }
+  return out;
+}
+
+/** Whether a rectangle comes within TOUCH_SLACK of a box. */
+const touches = (r: PdfRectDto, b: Bounds) =>
+  Math.min(r.x + r.w, b.x1 + TOUCH_SLACK) - Math.max(r.x, b.x0 - TOUCH_SLACK) > 0 && Math.min(r.y + r.h, b.y1 + TOUCH_SLACK) - Math.max(r.y, b.y0 - TOUCH_SLACK) > 0;
+
+/** The text under `rects` both ways: gathered rectangle by rectangle (reading order), and in pdf.js's own order. */
+export function textsUnderRects(textContent: TextContent, rects: PdfRectDto[]): { byRect: string; byPdf: string } {
+  const live = rects.filter(finite);
+  if (live.length === 0) return { byRect: "", byPdf: "" };
+  const items = itemsOf(textContent);
+  const taken = new Set<number>();
+  const byRect: string[] = [];
+  for (const r of live) {
+    items.forEach((i, n) => {
+      if (!taken.has(n) && touches(r, i.box)) {
+        taken.add(n);
+        byRect.push(i.str);
+      }
+    });
+  }
+  const byPdf = items.filter((_, n) => taken.has(n)).map((i) => i.str);
+  return { byRect: byRect.join(" "), byPdf: byPdf.join(" ") };
+}
+
+/** The text of the whole text items `rects` (PDF user space) touch, gathered rectangle by rectangle, joined by spaces. */
+export function textUnderRects(textContent: TextContent, rects: PdfRectDto[]): string {
+  return textsUnderRects(textContent, rects).byRect;
+}
+
+/** Whether any of `rects` touches a text item pdf.js marks as vertical: then no verdict is given. */
+export function touchesVerticalText(textContent: TextContent, rects: PdfRectDto[]): boolean {
+  const live = rects.filter(finite);
+  return itemsOf(textContent).some((i) => i.vertical && live.some((r) => touches(r, i.box)));
+}
+
+/** What is compared: NFKC, lower case, letters and digits only. */
+function fold(s: string): string {
+  return s.normalize("NFKC").toLocaleLowerCase("und").replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+/** Whether a quote is long enough to judge (MIN_QUOTE_LETTERS letters and digits once normalised). */
+export function canJudge(quote: string): boolean {
+  return [...fold(quote)].length >= MIN_QUOTE_LETTERS;
+}
+
+/**
+ * Whether the quote's words are still in `textUnderRects` (containment after normalisation). A quote
+ * that cannot be judged (`canJudge` false: empty or too short) always "matches": no verdict.
+ */
+export function quoteStillMatches(quote: string, textUnderRects: string): boolean {
+  if (!canJudge(quote)) return true;
+  return fold(textUnderRects).includes(fold(quote.replace(/(…|\.\.\.)\s*$/u, "")));
+}
+
+/** The verdict (A12): false ("changed") only when the quote is in neither the reading-order text nor the pdf.js-order text under `rects`. */
+export function quoteStillUnder(quote: string, textContent: TextContent, rects: PdfRectDto[]): boolean {
+  const { byRect, byPdf } = textsUnderRects(textContent, rects);
+  return quoteStillMatches(quote, byRect) || quoteStillMatches(quote, byPdf);
+}

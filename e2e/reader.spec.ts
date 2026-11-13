@@ -34,7 +34,7 @@
  * a damaged PDF; a password-protected PDF (the password never sent to the service); a missing linked
  * file outside the library; a read-only library; Page Down (and focus kept when a control is
  * disabled); A9: a project locked, or the library closed, while a PDF is shown ends the reader at
- * once, with nothing of the document left; real 600 dpi pages stay within the reader's budget. Each
+ * once, with nothing of the document left (nor of its highlights, R8); real 600 dpi pages stay within the reader's budget. Each
  * under the app's policy, with nothing fetched from elsewhere.
  */
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
@@ -942,10 +942,19 @@ test("a project locked while its PDF is shown, every page already fetched: the r
   const file = sourceFile(app, "short.pdf", await buildMultiPagePdf(3));
   const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Sealed while reading", passphrase: PASSPHRASE });
   const { sid, aid } = await attachPdf(app, projectId, file);
+  // Two highlights on page 1 (R8): one on "This is the text" (11-point Helvetica from x 50 on baseline
+  // 760, 70.917 points long), one whose quote is not what the page says (so a notice shows it).
+  const rect = { x: 50, y: 760 - 0.207 * 11, w: 70.917, h: 0.925 * 11 };
+  for (const quote of ["This is the text", "Words no page of it holds"]) {
+    const made = await app.api("POST", `/projects/${projectId}/sources/${sid}/annotations`, { kind: "highlight", assetId: aid, anchors: [{ page: 1, rects: [rect] }], quote, colorName: "purple" });
+    expect(made.status, JSON.stringify(made.body)).toBe(201);
+  }
   await readFromLibrary(page, app, projectId, sid);
   // The file is whole in the first range: every page is fetched; the pages in view are drawn.
   for (const n of [1, 2]) await expect(region(page, n, 3).locator(".ao-reader-text-layer")).toContainText(`This is the text of page ${n}`);
   await expect.poll(() => inked(page, 1)).toBe(true);
+  await expect(region(page, 1, 3).locator(".ao-hl")).toHaveCount(2);
+  await expect(page.getByRole("region", { name: "Highlights to check" })).toContainText("Words no page of it holds");
   const documentCalls = () => seen.requests.filter((u) => u.includes(`/assets/${aid}/document`)).length;
   const before = documentCalls();
   const workerClosed = new Promise<void>((r) => seen.workers[0]!.once("close", () => r()));
@@ -959,6 +968,9 @@ test("a project locked while its PDF is shown, every page already fetched: the r
   await expect(page.locator("canvas")).toHaveCount(0);
   await expect(page.locator(".ao-reader-text-layer, [data-page-number], .ao-reader-scroll")).toHaveCount(0);
   expect(await page.evaluate(() => document.body.textContent?.includes("This is the text of page") ?? false)).toBe(false);
+  // Nor anything of its annotations (R8): no highlight, no notice, no quote.
+  await expect(page.locator(".ao-hl, .ao-hl-layer, .ao-reader-hl-notices")).toHaveCount(0);
+  expect(await page.evaluate(() => document.body.textContent?.includes("Words no page of it holds") ?? false)).toBe(false);
   // pdf.js's worker (and its copy of the file) ended with the document; nothing was read to learn of the lock.
   await workerClosed;
   expect(documentCalls()).toBe(before);
