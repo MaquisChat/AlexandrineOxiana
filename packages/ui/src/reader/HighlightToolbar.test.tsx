@@ -180,3 +180,41 @@ describe("OverlapMenu (Task R10)", () => {
     expect(b!.textContent).toBe("Grey");
   });
 });
+
+describe("HighlightToolbar and OverlapMenu stay inside the pages' view (R223, M5)", () => {
+  /** jsdom lays nothing out: every element is given this size. */
+  function sized(w: number, h: number) {
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(w);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(h);
+  }
+  afterEach(() => vi.restoreAllMocks());
+  const bounds = { left: 10, top: 20, width: 400, height: 300 };
+  const placed = (el: HTMLElement) => ({ left: parseFloat(el.style.left), top: parseFloat(el.style.top) });
+
+  it("near the view's right and lower edges the toolbar is drawn above the line and within the view", () => {
+    sized(200, 40);
+    render(<HighlightToolbar anchorBox={{ left: 350, top: 290, width: 50, height: 14 }} bounds={bounds} lastColour="yellow" onHighlight={() => {}} onCancel={() => {}} />);
+    const p = placed(screen.getByRole("toolbar"));
+    expect(p.left).toBe(bounds.left + bounds.width - 200);
+    // Below would pass the view's foot (290 + 14 + 6 + 40 > 320): above the line instead.
+    expect(p.top).toBe(290 - 6 - 40);
+  });
+
+  it("a line scrolled out of the view keeps the toolbar inside it, on all four sides", () => {
+    sized(200, 40);
+    const { rerender } = render(<HighlightToolbar anchorBox={{ left: -100, top: 900, width: 50, height: 14 }} bounds={bounds} lastColour="yellow" onHighlight={() => {}} onCancel={() => {}} />);
+    let p = placed(screen.getByRole("toolbar"));
+    expect(p).toEqual({ left: 10, top: 20 + 300 - 40 });
+    rerender(<HighlightToolbar anchorBox={{ left: 900, top: -400, width: 50, height: 14 }} bounds={bounds} lastColour="yellow" onHighlight={() => {}} onCancel={() => {}} />);
+    p = placed(screen.getByRole("toolbar"));
+    expect(p).toEqual({ left: 10 + 400 - 200, top: 20 });
+  });
+
+  it("the overlap menu too", () => {
+    sized(180, 90);
+    render(<OverlapMenu at={{ left: 395, top: 310 }} bounds={bounds} items={[{ id: "a", colorName: "red", words: "x" }, { id: "b", colorName: "blue", words: "y" }]} onChoose={() => {}} onClose={() => {}} />);
+    const el = screen.getByRole("menu").closest<HTMLElement>(".ao-hl-menu")!;
+    expect(placed(el)).toEqual({ left: 10 + 400 - 180, top: 20 + 300 - 90 });
+  });
+});
+

@@ -1105,3 +1105,38 @@ test.describe("a drag let go in blank space stores only what was selected (R223,
     onLine(made, 660, 315, 545);
   });
 });
+
+test("the toolbar comes only for a selection just made on a page (R223, I2)", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Only when made" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  const made = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, { kind: "highlight", assetId: aid, anchors: [{ page: 1, rects: [LINE_ONE] }], quote: "This is the text", colorName: "blue" });
+  expect(made.status).toBe(201);
+  await readFromLibrary(page, app, projectId, sid);
+  const line = "This is the text of page 1, written for the reader's tests.";
+  await centreOn(page, { n: 1, words: line, to: 26 });
+  await test.step("Escape, then a click on Zoom in: no toolbar", async () => {
+    await dragSelect(page, { n: 1, words: line, i: 12 }, { n: 1, words: line, i: 18 });
+    await expect(colourBar(page)).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(colourBar(page)).toHaveCount(0);
+    expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+    await toolbar(page).getByRole("button", { name: "Zoom in" }).click();
+    await expect(zoomValue(page)).toHaveText("125%");
+    await expect(colourBar(page)).toHaveCount(0);
+  });
+  await test.step("select-all with a page focused, then a click on Zoom out or on a list button: no alert and no toolbar", async () => {
+    await page.locator('[data-page-number="1"]').focus();
+    await page.keyboard.press("ControlOrMeta+a");
+    expect((await page.evaluate(() => window.getSelection()?.toString() ?? "")).length).toBeGreaterThan(0);
+    await toolbar(page).getByRole("button", { name: "Zoom out" }).click();
+    await expect(zoomValue(page)).toHaveText("100%");
+    await annotationList(page).getByRole("button", { name: /^Go to/ }).click();
+    await expect(page.locator('[data-page-number="1"]')).toBeFocused();
+    await expect(colourBar(page)).toHaveCount(0);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+  expect(errors).toEqual([]);
+});

@@ -94,7 +94,7 @@ interface Fake {
   fail(e: PdfOpenError): void;
 }
 
-function fakeHandle(pages = 3, text: (n: number) => string | undefined = wordsOf): Fake {
+function fakeHandle(pages = 3, text: (n: number) => string | undefined = wordsOf, labels: string[] | null = null): Fake {
   let fail: (e: PdfOpenError) => void = () => {};
   const failed = new Promise<PdfOpenError>((r) => (fail = r));
   let dead = false;
@@ -112,7 +112,7 @@ function fakeHandle(pages = 3, text: (n: number) => string | undefined = wordsOf
   const handle = {
     doc: { numPages: pages, getPage: async (n: number) => (dead ? Promise.reject(new PdfOpenError("other", "This document was closed.")) : page(n)), cleanup: async () => {} },
     pageCount: pages,
-    pageLabels: null,
+    pageLabels: labels,
     failed,
     get dead() {
       return dead;
@@ -155,16 +155,20 @@ async function lineOf(n: number): Promise<Text> {
   });
 }
 
-/** Selects from (node, offset) to (node, offset) as a mouse would, and lets go of the button there. */
-function select(from: [Node, number], to: [Node, number]) {
+/**
+ * Selects from (node, offset) to (node, offset) as a mouse would: the button pressed at the start
+ * (or on `pressOn`), the selection made, the button let go at the end.
+ */
+function select(from: [Node, number], to: [Node, number], pressOn?: Element) {
+  const elementOf = (n: Node) => (n.nodeType === 3 ? n.parentElement! : (n as Element));
+  fireEvent.mouseDown(pressOn ?? elementOf(from[0]));
   const r = document.createRange();
   r.setStart(from[0], from[1]);
   r.setEnd(to[0], to[1]);
   const sel = window.getSelection()!;
   sel.removeAllRanges();
   sel.addRange(r);
-  const target = to[0].nodeType === 3 ? to[0].parentElement! : (to[0] as Element);
-  fireEvent.mouseUp(target);
+  fireEvent.mouseUp(elementOf(to[0]));
 }
 
 let made = 0;
@@ -263,6 +267,8 @@ describe("ReaderScreen: making highlights with the mouse (Task R10)", () => {
     // The draft is drawn at once, marked as one, while the service is asked.
     await waitFor(() => expect(document.querySelector('[data-page-number="1"] .ao-hl--draft')).toBeTruthy());
     await waitFor(() => expect(creates()).toHaveLength(1));
+    // Said once while the service is asked (M3).
+    await waitFor(() => expect(live()).toBe("Adding the highlight…"));
     const [body] = creates();
     expect(Object.keys(body!).sort()).toEqual(["anchors", "assetId", "colorName", "kind", "quote"]);
     expect(body!.kind).toBe("highlight");
@@ -480,6 +486,8 @@ describe("ReaderScreen: making highlights with the mouse (Task R10)", () => {
     expect(body.colorName).toBe("yellow");
     const list = await screen.findByRole("region", { name: "Annotations (1)" });
     await waitFor(() => expect(within(list).getByText("Pages 1–2")).toBeTruthy());
+    // The buttons' names say the pages too (M7).
+    expect(within(list).getByRole("button", { name: /^Go to yellow highlight on pages 1–2/ })).toBeTruthy();
     await waitFor(() => expect(live()).toBe("Highlight added: Yellow, pages 1–2."));
     await waitFor(() => expect(drawnOn(1)).toEqual(["both"]));
     expect(drawnOn(2)).toEqual(["both"]);
@@ -493,6 +501,11 @@ describe("ReaderScreen: making highlights with the mouse (Task R10)", () => {
     const list = await screen.findByRole("region", { name: "Annotations (1)" });
     const note = within(list).getByText("A note of mine about the river").firstChild!;
     select([note, 2], [note, 10]);
+    await flush();
+    expect(toolbar()).toBeNull();
+    // Even when the drag reaches up into a page: the press began in the list.
+    const line = await lineOf(1);
+    select([line, 5], [note, 10], within(list).getByText("A note of mine about the river"));
     await flush();
     expect(toolbar()).toBeNull();
     const page2 = await screen.findByRole("region", { name: "Page 2 of 3" });
@@ -566,5 +579,241 @@ describe("ReaderScreen: making highlights with the mouse (Task R10)", () => {
     await waitFor(() => expect(document.querySelector('[data-annotation="under"]')!.classList.contains("ao-hl--selected")).toBe(true));
     expect(list.querySelector('[data-entry="under"]')!.getAttribute("aria-current")).toBe("true");
     expect(document.activeElement).toBe(page);
+  });
+});
+
+describe("ReaderScreen: making highlights, review round 1 (Ruling R223)", () => {
+  const NOT_ON_SCREEN = "This selection runs over pages that are not on screen at the moment, so it cannot be highlighted. Select a shorter passage — a few pages at most.";
+  const STILL_DRAWING = "This page is still being drawn. Select the text again in a moment.";
+
+  it("I2: Escape and Cancel also remove the browser's selection; a later click on Zoom in brings nothing back", async () => {
+    serveDocument();
+    serveAnnotations(() => []);
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    const user = userEvent.setup();
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const line = await lineOf(1);
+    document.querySelector<HTMLElement>('[data-page-number="1"]')!.focus();
+    select([line, 0], [line, 5]);
+    await waitFor(() => expect(toolbar()).toBeTruthy());
+    await user.keyboard("{Escape}");
+    expect(toolbar()).toBeNull();
+    expect(window.getSelection()!.rangeCount === 0 || window.getSelection()!.isCollapsed).toBe(true);
+    const zoomIn = screen.getByRole("button", { name: "Zoom in" });
+    await user.click(zoomIn);
+    await flush();
+    expect(toolbar()).toBeNull();
+    // Cancel too.
+    const again = await lineOf(1);
+    select([again, 0], [again, 5]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Cancel" })));
+    expect(toolbar()).toBeNull();
+    expect(window.getSelection()!.rangeCount === 0 || window.getSelection()!.isCollapsed).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Zoom out" }));
+    await flush();
+    expect(toolbar()).toBeNull();
+    expect(creates()).toHaveLength(0);
+  });
+
+  it("I2: select-all with a page focused, then a click on Zoom in or on a list button: no alert and no toolbar", async () => {
+    serveDocument();
+    serveAnnotations(() => [rec({ id: "one" })]);
+    openPdf.mockResolvedValueOnce(fakeHandle(20).handle);
+    screenFor();
+    const list = await screen.findByRole("region", { name: "Annotations (1)" });
+    await lineOf(1);
+    document.querySelector<HTMLElement>('[data-page-number="1"]')!.focus();
+    const all = document.createRange();
+    all.selectNodeContents(document.body);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(all);
+    const zoomIn = screen.getByRole("button", { name: "Zoom in" });
+    fireEvent.mouseDown(zoomIn);
+    fireEvent.mouseUp(zoomIn);
+    await flush();
+    const goTo = within(list).getByRole("button", { name: /^Go to/ });
+    fireEvent.mouseDown(goTo);
+    fireEvent.mouseUp(goTo);
+    await flush();
+    expect(toolbar()).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("I2: a selection changed by the keyboard is not read (the keyboard's own way is Task R11's): no toolbar", async () => {
+    serveDocument();
+    serveAnnotations(() => []);
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    const user = userEvent.setup();
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const line = await lineOf(1);
+    const page1 = document.querySelector<HTMLElement>('[data-page-number="1"]')!;
+    page1.focus();
+    const r = document.createRange();
+    r.setStart(line, 0);
+    r.setEnd(line, 6);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(r);
+    await user.keyboard("{Shift>}{ArrowRight}{/Shift}");
+    await flush();
+    expect(toolbar()).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("I3: a selection over a page box that is not drawn says so; no toolbar, no request", async () => {
+    serveDocument();
+    serveAnnotations(() => []);
+    openPdf.mockResolvedValueOnce(fakeHandle(20).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const line = await lineOf(1);
+    const far = document.querySelector('[data-page-number="10"]')!;
+    expect(far.hasAttribute("data-rendered")).toBe(false);
+    select([line, 3], [far, 0]);
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(NOT_ON_SCREEN));
+    expect(toolbar()).toBeNull();
+    await flush();
+    expect(creates()).toHaveLength(0);
+  });
+
+  it("M6: a drawn page whose text layer is still being laid out, or drawn at another zoom, is still being drawn — not 'not on screen'", async () => {
+    serveDocument();
+    serveAnnotations(() => []);
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const one = await lineOf(1);
+    const two = await lineOf(2);
+    await waitFor(() => expect(document.querySelector('[data-page-number="2"] .ao-reader-end-of-content')).toBeTruthy());
+    // Page 2's layer not yet laid out to its end (its guard not there yet).
+    document.querySelector('[data-page-number="2"] .ao-reader-end-of-content')!.remove();
+    select([one, 0], [two, 5]);
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(STILL_DRAWING));
+    expect(toolbar()).toBeNull();
+    // Page 1 drawn at another size than the viewport known (a new drawing on its way).
+    document.querySelector<HTMLElement>('[data-page-number="1"]')!.style.width = "1px";
+    select([one, 0], [one, 5]);
+    await flush();
+    expect(screen.getByRole("alert").textContent).toBe(STILL_DRAWING);
+    expect(toolbar()).toBeNull();
+    expect(creates()).toHaveLength(0);
+  });
+
+  it("I3: a 404 to a create asks whether the project is still there, and says the service's sentence", async () => {
+    serveDocument();
+    serveAnnotations(() => []);
+    serveCreate(() => serviceError(404, "NOT_FOUND", "That file is not part of this source.") as unknown as Response);
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    const onProjectInDoubt = vi.fn();
+    const user = userEvent.setup();
+    screenFor({ onProjectInDoubt });
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const line = await lineOf(1);
+    select([line, 0], [line, line.data.length]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Highlight" })));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("That file is not part of this source."));
+    expect(onProjectInDoubt).toHaveBeenCalledTimes(1);
+    expect(document.querySelector(".ao-hl")).toBeNull();
+  });
+
+  it("M1 and M2: a create answered after the document failed and was opened again — the list is asked again and shows it; nothing old is said again", async () => {
+    serveDocument();
+    const stored: AnnotationRecord[] = [];
+    let lists = 0;
+    server.use(
+      http.get(url(LIST), () => {
+        lists++;
+        return HttpResponse.json({ annotations: stored, count: stored.length, textChars: 0 }) as unknown as Response;
+      }),
+    );
+    const answers: Array<() => void> = [];
+    serveCreate(async (body) => {
+      const id = `made-${answers.length + 1}`;
+      if (id === "made-2") await new Promise<void>((r) => answers.push(r));
+      else answers.push(() => {});
+      const r = answerOf(body, id);
+      stored.push(r);
+      return HttpResponse.json(r, { status: 201 }) as unknown as Response;
+    });
+    const first = fakeHandle(3);
+    openPdf.mockResolvedValueOnce(first.handle).mockResolvedValueOnce(fakeHandle(3).handle);
+    const user = userEvent.setup();
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    let line = await lineOf(1);
+    select([line, 0], [line, 5]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Highlight in Blue" })));
+    await waitFor(() => expect(live()).toBe("Highlight added: Blue, page 1."));
+    // A second create held; the document fails; it is opened again.
+    line = await lineOf(1);
+    select([line, 6], [line, 10]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Highlight in Red" })));
+    await waitFor(() => expect(creates()).toHaveLength(2));
+    act(() => first.fail(new PdfOpenError("other", "The file changed while it was read.")));
+    await user.click(await screen.findByRole("button", { name: "Open again" }));
+    await screen.findByRole("region", { name: "Annotations (1)" });
+    // M1: the new list does not say again what the old one said.
+    await flush();
+    expect(live()).toBe("");
+    const before = lists;
+    act(() => answers[1]!());
+    // M2: the highlight IS stored: the list is asked for again (this file), and shows it.
+    await screen.findByRole("region", { name: "Annotations (2)" });
+    expect(lists).toBe(before + 1);
+    await waitFor(() => expect(drawnOn(1)).toContain("made-2"));
+  });
+
+  it("M4: an answer for a highlight the list already holds (asked again meanwhile) is not listed twice", async () => {
+    serveDocument();
+    const stored: AnnotationRecord[] = [rec({ id: "noted", page: 2 })];
+    serveAnnotations(() => stored);
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    let made: AnnotationRecord | undefined;
+    serveCreate(async (body) => {
+      made = answerOf(body, "dup-1");
+      stored.push(made);
+      await held;
+      return HttpResponse.json(made, { status: 201 }) as unknown as Response;
+    });
+    // A change to another entry answers 404: the list is asked for again (A13) — and holds the new one.
+    server.use(http.patch(url(ONE), () => serviceError(404, "NOT_FOUND", "Not found.") as unknown as Response));
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    const user = userEvent.setup();
+    screenFor();
+    const list = await screen.findByRole("region", { name: "Annotations (1)" });
+    const line = await lineOf(1);
+    select([line, 0], [line, 5]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Highlight in Green" })));
+    await waitFor(() => expect(made).toBeDefined());
+    await user.click(within(list).getByRole("button", { name: /^Colour of/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Red" }));
+    await screen.findByRole("region", { name: "Annotations (2)" });
+    act(() => release());
+    await waitFor(() => expect(live()).toBe("Highlight added: Green, page 1."));
+    await flush();
+    expect(screen.getByRole("region", { name: "Annotations (2)" }).querySelectorAll('[data-entry="dup-1"]')).toHaveLength(1);
+  });
+
+  it.each([
+    { labels: ["i", "ii", "1"], want: "i" },
+    { labels: ["1", "2", "3"], want: undefined },
+    { labels: ["\u0007bell", "2", "3"], want: undefined },
+    { labels: ["x".repeat(65), "2", "3"], want: undefined },
+  ])("M8: the page label $labels.0 is stored only when it differs from the number, is at most 64 characters and holds no control character", async ({ labels, want }) => {
+    serveDocument();
+    serveAnnotations(() => []);
+    serveCreate((body) => HttpResponse.json(answerOf(body, "l-1"), { status: 201 }) as unknown as Response);
+    openPdf.mockResolvedValueOnce(fakeHandle(3, wordsOf, labels).handle);
+    const user = userEvent.setup();
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    const line = await lineOf(1);
+    select([line, 0], [line, 5]);
+    await user.click(await waitFor(() => within(toolbar()!).getByRole("button", { name: "Highlight in Grey" })));
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    expect(creates()[0]!.pageLabel).toBe(want);
+    expect("pageLabel" in creates()[0]!).toBe(want !== undefined);
   });
 });

@@ -35,6 +35,26 @@ const BELOW_PX = 6;
 /** How many characters of a highlight's words the overlap menu shows. */
 const MENU_WORDS = 40;
 
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(v, hi));
+
+/**
+ * Places `el` at (`left`, `top`) kept inside `bounds` (R223, M5: the pages' view, in the same
+ * coordinates), measured as it is drawn; `above` is where it goes instead when it would pass the
+ * view's foot (the toolbar: above the selection's line).
+ */
+function placeInside(el: HTMLElement, left: number, top: number, bounds: Box | undefined, above?: number): void {
+  if (bounds) {
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const bottom = bounds.top + bounds.height;
+    if (above !== undefined && top + h > bottom) top = above - h;
+    left = clamp(left, bounds.left, bounds.left + bounds.width - w);
+    top = clamp(top, bounds.top, bottom - h);
+  }
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+}
+
 /**
  * Gives the focus back, when the component goes while the focus is in it (or nowhere), to the element
  * that had it when the component came — if that is still in the page.
@@ -84,12 +104,14 @@ function moveFocus(e: KeyboardEvent, items: HTMLElement[], along: "row" | "colum
 export interface HighlightToolbarProps {
   /** The selection's last line, in the coordinates of the toolbar's positioned parent. */
   anchorBox: Box;
+  /** The pages' view in the same coordinates: the toolbar stays inside it (R223, M5). */
+  bounds?: Box;
   lastColour: HighlightColourName;
   onHighlight(c: HighlightColourName): void;
   onCancel(): void;
 }
 
-export function HighlightToolbar({ anchorBox, lastColour, onHighlight, onCancel }: HighlightToolbarProps) {
+export function HighlightToolbar({ anchorBox, bounds, lastColour, onHighlight, onCancel }: HighlightToolbarProps) {
   const id = useId();
   const root = useRef<HTMLDivElement>(null);
   const chosen = useRef(false);
@@ -97,6 +119,9 @@ export function HighlightToolbar({ anchorBox, lastColour, onHighlight, onCancel 
   const stop = useRef(0);
   useFocusReturn(root);
   usePressElsewhere(root, onCancel);
+  useLayoutEffect(() => {
+    if (root.current) placeInside(root.current, anchorBox.left, anchorBox.top + anchorBox.height + BELOW_PX, bounds, anchorBox.top - BELOW_PX);
+  });
 
   const choose = (c: HighlightColourName) => {
     if (chosen.current) return;
@@ -151,6 +176,8 @@ export interface OverlapMenuItem {
 export interface OverlapMenuProps {
   /** Where the click was, in the coordinates of the menu's positioned parent. */
   at: { left: number; top: number };
+  /** The pages' view in the same coordinates: the menu stays inside it (R223, M5). */
+  bounds?: Box;
   items: OverlapMenuItem[];
   onChoose(id: string): void;
   onClose(): void;
@@ -162,11 +189,14 @@ function opening(s: string, n: number): string {
   return chars.length > n ? `${chars.slice(0, n).join("")}…` : chars.join("");
 }
 
-export function OverlapMenu({ at, items, onChoose, onClose }: OverlapMenuProps) {
+export function OverlapMenu({ at, bounds, items, onChoose, onClose }: OverlapMenuProps) {
   const id = useId();
   const root = useRef<HTMLDivElement>(null);
   useFocusReturn(root);
   usePressElsewhere(root, onClose);
+  useLayoutEffect(() => {
+    if (root.current) placeInside(root.current, at.left, at.top, bounds);
+  });
   useEffect(() => {
     root.current?.querySelector<HTMLElement>("[role='menuitem']")?.focus({ preventScroll: true });
   }, []);

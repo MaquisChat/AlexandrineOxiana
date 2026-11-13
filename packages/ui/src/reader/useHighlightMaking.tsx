@@ -33,9 +33,14 @@ import type { AnnotationCreateRequest, AnnotationRecord, HighlightColourName, Re
 import { HighlightToolbar, OverlapMenu } from "./HighlightToolbar";
 import { pdfRectToBox, selectionToAnchors, type Box, type PageGeometry, type SelectionAnchor } from "./geometry";
 import type { PdfHandle } from "./pdfjs";
+import { END_OF_CONTENT_CLASS } from "./textLayerSelection";
 
 export const TOO_MANY_PAGES = `A highlight can cover at most ${ANNOTATION_ANCHORS_MAX} pages.`;
-export const PAGES_NOT_SHOWN = "Part of this selection is on a page that is not shown at the moment, so it cannot be highlighted. Select a shorter passage.";
+export const PAGES_NOT_SHOWN = "This selection runs over pages that are not on screen at the moment, so it cannot be highlighted. Select a shorter passage — a few pages at most.";
+/** A page that is drawn but whose text layer is still being laid out, or drawn at a zoom other than the one known (R223, M6). */
+export const PAGE_STILL_DRAWING = "This page is still being drawn. Select the text again in a moment.";
+/** Said through the list's live region between the press and the service's answer (R223, M3). */
+export const ADDING = "Adding the highlight…";
 export const READ_ONLY_MAKING = "This library is read-only, so highlights cannot be made.";
 const SERVICE_SILENT = "The library service did not answer, so the highlight was not made.";
 
@@ -65,6 +70,11 @@ export interface MakingOptions {
   /** This file's annotations (for the overlap menu's words). */
   annotations: AnnotationRecord[] | undefined;
   onCreated(r: AnnotationRecord): void;
+  /**
+   * A create answered after the document failed and was opened again (its answer dropped, A7): the
+   * highlight IS stored, so the screen asks for the list again (R223, M2).
+   */
+  onStoredMeanwhile(): void;
   onLocked(h: PdfHandle): void;
   onProjectInDoubt(): void;
   onSelect(id: string): void;
@@ -111,6 +121,7 @@ export function useHighlightMaking(o: MakingOptions) {
       setMenu(undefined);
       setDrafts([]);
       setAlert(undefined);
+      setAnnouncement(undefined);
     };
   }, [handle]);
 
@@ -119,19 +130,25 @@ export function useHighlightMaking(o: MakingOptions) {
     viewports.current.set(pageIndex, viewport);
   }, []);
 
-  /** A drawn page whose text layer is laid out (or which says it has no text), at the viewport it is drawn at. */
-  const geometryOf = (el: HTMLElement): PageGeometry | "no-text" | undefined => {
+  /**
+   * A page of a selection: its geometry when it is drawn and its text layer laid out to its end (the
+   * blank-space guard is put there last, PdfPages); "no-text" for a drawn page without text;
+   * "drawing" for a drawn page whose text layer is still being laid out or which is drawn at a zoom
+   * other than the viewport known (M6); undefined for a page not drawn at all (not on screen).
+   */
+  const geometryOf = (el: HTMLElement): PageGeometry | "no-text" | "drawing" | undefined => {
     const n = Number(el.dataset.pageNumber);
+    if (!el.hasAttribute("data-rendered")) return undefined;
     const vp = viewports.current.get(n - 1);
-    if (!el.hasAttribute("data-rendered") || !vp) return undefined;
     if (el.querySelector(".ao-reader-no-text")) return "no-text";
     const layer = el.querySelector(".ao-reader-text-layer");
-    if (!layer || layer.childNodes.length === 0) return undefined;
-    // Drawn at another zoom or turn than the viewport known (a new drawing on its way): not yet.
+    if (!vp || !layer || !layer.querySelector(`:scope > .${END_OF_CONTENT_CLASS}`)) return "drawing";
     const w = parseFloat(el.style.width);
-    if (Number.isFinite(w) && Math.abs(w - Math.floor(vp.width)) > 1) return undefined;
+    if (Number.isFinite(w) && Math.abs(w - Math.floor(vp.width)) > 1) return "drawing";
     return { page: n, element: el, textLayer: layer, viewport: vp };
   };
+  /** Whether the press now ending began in a page's text layer (I2): only then is the selection read. */
+  const pressInPage = useRef(false);
 
   /** Reads the selection when the mouse button is let go. */
   const takeSelection = (target: EventTarget | null) => {
@@ -146,7 +163,8 @@ export function useHighlightMaking(o: MakingOptions) {
     const geoms = boxes.map(geometryOf);
     const pages = geoms.filter((g): g is PageGeometry => typeof g === "object");
     const anchors = selectionToAnchors(range, pages);
-    if (anchors.length === 0 && boxes.length <= ANNOTATION_ANCHORS_MAX) return;
+    const unsure = geoms.some((g) => g === undefined || g === "drawing");
+    if (anchors.length === 0 && boxes.length <= ANNOTATION_ANCHORS_MAX && !unsure) return;
     setMenu(undefined);
     if (readOnly) {
       setReadOnlySaid(true);
@@ -157,10 +175,16 @@ export function useHighlightMaking(o: MakingOptions) {
       setAlert(TOO_MANY_PAGES);
       return;
     }
-    // A page in the selection that is not drawn now: its text cannot be quoted.
+    // A page in the selection that is not drawn now: its text cannot be quoted (R223 d). One drawn
+    // but not yet laid out at the zoom shown: in a moment it can (M6).
     if (geoms.some((g) => g === undefined)) {
       setPick(undefined);
       setAlert(PAGES_NOT_SHOWN);
+      return;
+    }
+    if (geoms.some((g) => g === "drawing")) {
+      setPick(undefined);
+      setAlert(PAGE_STILL_DRAWING);
       return;
     }
     setAlert(undefined);
@@ -168,23 +192,42 @@ export function useHighlightMaking(o: MakingOptions) {
     setPick({ anchors, pageIndex: last.page - 1, rect: last.rects[last.rects.length - 1]! });
   };
 
+  // The selection is read only at the end of a press that BEGAN in a page's text layer (I2): a
+  // press anywhere else (the reader's toolbar, the list, a note) never reads it. A selection made or
+  // changed by the keyboard is not read here (the keyboard's own way to highlight is Task R11's).
   useEffect(() => {
     if (!handle) return;
-    const onUp = (e: MouseEvent) => {
-      if (e.button === 0) takeSelection(e.target);
+    const onDown = (e: MouseEvent) => {
+      const t = e.target instanceof Element ? e.target : null;
+      pressInPage.current = e.button === 0 && !!t?.closest(".ao-reader-text-layer") && !!opts.current.area.current?.contains(t);
     };
+    const onUp = (e: MouseEvent) => {
+      const began = pressInPage.current;
+      pressInPage.current = false;
+      if (e.button === 0 && began) takeSelection(e.target);
+    };
+    document.addEventListener("mousedown", onDown, true);
     document.addEventListener("mouseup", onUp);
-    return () => document.removeEventListener("mouseup", onUp);
+    return () => {
+      document.removeEventListener("mousedown", onDown, true);
+      document.removeEventListener("mouseup", onUp);
+    };
     // takeSelection reads the latest options through a ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handle]);
 
+  /** The toolbar given up (Escape, "Cancel", a press elsewhere): the browser's selection goes too (I2). */
+  const dropPick = () => {
+    setPick(undefined);
+    window.getSelection?.()?.removeAllRanges();
+  };
   const cancel = (): boolean => {
     if (!pick && !menu) return false;
-    setPick(undefined);
+    if (pick) dropPick();
     setMenu(undefined);
     return true;
   };
+  const say = (text: string) => setAnnouncement((s) => ({ text, n: (s?.n ?? 0) + 1 }));
 
   const create = async (colour: HighlightColourName) => {
     const p = pick;
@@ -219,6 +262,7 @@ export function useHighlightMaking(o: MakingOptions) {
     };
     setDrafts((d) => [...d, draft]);
     setAlert(undefined);
+    say(ADDING);
     const dropDraft = () => setDrafts((d) => d.filter((x) => x.id !== id));
     let made: AnnotationRecord;
     try {
@@ -235,14 +279,19 @@ export function useHighlightMaking(o: MakingOptions) {
       setAlert(e instanceof Error && e.message ? e.message : SERVICE_SILENT);
       return;
     }
-    if (!isLive(h) || opts.current.handle !== h) return;
+    if (!isLive(h) || opts.current.handle !== h) {
+      // Dropped (A7) — but stored: if this file was opened again meanwhile, its list is asked for again (M2).
+      const now = opts.current.handle;
+      if (now && now !== h && opts.current.isLive(now) && opts.current.assetId === assetId) opts.current.onStoredMeanwhile();
+      return;
+    }
     dropDraft();
     opts.current.onCreated(made);
     const pages = made.pdfAnchors.filter((a) => a.assetId === assetId).map((a) => a.page);
     const lo = Math.min(...pages);
     const hi = Math.max(...pages);
     const where = pages.length === 0 ? "" : lo === hi ? `, page ${lo}` : `, pages ${lo}–${hi}`;
-    setAnnouncement((s) => ({ text: `Highlight added: ${label(made.colorName)}${where}.`, n: (s?.n ?? 0) + 1 }));
+    say(`Highlight added: ${label(made.colorName)}${where}.`);
   };
 
   /** Where a point of page `pageIndex` lies in the page area (CSS pixels), or nothing when the page is not there. */
@@ -252,7 +301,16 @@ export function useHighlightMaking(o: MakingOptions) {
     if (!root || !el) return undefined;
     const a = root.getBoundingClientRect();
     const p = el.getBoundingClientRect();
-    return { left: Math.max(0, p.left - a.left + el.clientLeft + left), top: Math.max(0, p.top - a.top + el.clientTop + top) };
+    return { left: p.left - a.left + el.clientLeft + left, top: p.top - a.top + el.clientTop + top };
+  };
+  /** The pages' view (the scroller's inside) in the page area's coordinates: the toolbar and the menu stay in it (M5). */
+  const viewBounds = (): Box | undefined => {
+    const root = opts.current.area.current;
+    const sc = root?.querySelector<HTMLElement>(".ao-reader-scroll");
+    if (!root || !sc) return undefined;
+    const a = root.getBoundingClientRect();
+    const v = sc.getBoundingClientRect();
+    return { left: v.left - a.left + sc.clientLeft, top: v.top - a.top + sc.clientTop, width: sc.clientWidth, height: sc.clientHeight };
   };
 
   /** HighlightLayer's `onOverlap` for page `pageIndex` (one function a page, so that a page's layer is not drawn again for nothing). */
@@ -277,7 +335,8 @@ export function useHighlightMaking(o: MakingOptions) {
     const at = b ? inArea(pick.pageIndex, b.left, b.top) : undefined;
     if (b && at) {
       const anchorBox: Box = { left: at.left, top: at.top, width: b.width, height: b.height };
-      floating = <HighlightToolbar anchorBox={anchorBox} lastColour={lastColour} onHighlight={(c) => void create(c)} onCancel={() => setPick(undefined)} />;
+      const bounds = viewBounds();
+      floating = <HighlightToolbar anchorBox={anchorBox} {...(bounds ? { bounds } : {})} lastColour={lastColour} onHighlight={(c) => void create(c)} onCancel={dropPick} />;
     }
   } else if (menu) {
     const at = inArea(menu.pageIndex, menu.at.left, menu.at.top);
@@ -286,10 +345,12 @@ export function useHighlightMaking(o: MakingOptions) {
       const a = byId.get(id);
       return a ? [{ id, colorName: a.colorName, words: a.quote || a.body || "" }] : [];
     });
+    const bounds = viewBounds();
     if (at && items.length > 1)
       floating = (
         <OverlapMenu
           at={at}
+          {...(bounds ? { bounds } : {})}
           items={items}
           onChoose={(id) => {
             setMenu(undefined);

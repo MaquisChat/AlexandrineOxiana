@@ -198,8 +198,8 @@ function opening(s: string, n: number): string {
   return chars.length > n ? `${chars.slice(0, n).join("")}…` : chars.join("");
 }
 
-function describe(a: AnnotationRecord, group: Group, page: number | undefined): string {
-  const where = group === "unplaced" ? "not placed on a page" : group === "elsewhere" ? (page !== undefined ? `on page ${page} of another file` : "on another file") : `on page ${page}`;
+function describe(a: AnnotationRecord, group: Group, page: number | undefined, pageTo?: number): string {
+  const where = group === "unplaced" ? "not placed on a page" : group === "elsewhere" ? (page !== undefined ? `on page ${page} of another file` : "on another file") : pageTo !== undefined ? `on pages ${page}–${pageTo}` : `on page ${page}`;
   const words = a.quote || a.body;
   return `${a.colorName} ${kindLabel(a.kind).toLowerCase()} ${where}${words ? `, “${opening(words, NAME_WORDS)}”` : ""}`;
 }
@@ -241,7 +241,7 @@ function entriesOf(list: AnnotationRecord[], assetId: string, pageCount: number 
       e.pos = i + 1;
       e.size = size;
       e.flat = flat.length;
-      e.desc = describe(e.a, e.group, e.page);
+      e.desc = describe(e.a, e.group, e.page, e.pageTo);
       flat.push(e);
     });
   }
@@ -786,9 +786,13 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
   }, [holding]);
 
   const say = (text: string) => setSaid((s) => ({ text, n: (s?.n ?? 0) + 1 }));
-  // Task R10: what the screen has to say (a highlight made) goes through the same live region.
+  // Task R10: what the screen has to say (a highlight made) goes through the same live region —
+  // each announcement once, never again when the list comes anew (R223, M1).
+  const announced = useRef(announcement?.n);
   useEffect(() => {
-    if (announcement !== undefined) say(announcement.text);
+    if (announcement === undefined || announcement.n === announced.current) return;
+    announced.current = announcement.n;
+    say(announcement.text);
     // Said once for each announcement.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [announcement]);

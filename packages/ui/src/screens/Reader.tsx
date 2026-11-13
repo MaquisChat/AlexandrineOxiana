@@ -472,9 +472,11 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     area,
     annotations: fileAnnotations,
     onCreated: (r) => {
-      if (annotations) setAnnotations((list) => (list ? [...list, r] : list));
+      // Never listed twice: the list may have been asked for again while the create was on its way (M4).
+      if (annotations) setAnnotations((list) => (list ? (list.some((a) => a.id === r.id) ? list.map((a) => (a.id === r.id ? r : a)) : [...list, r]) : list));
       else setListAttempt((n) => n + 1);
     },
+    onStoredMeanwhile: () => setListAttempt((n) => n + 1),
     onLocked: endLocked,
     onProjectInDoubt: () => inDoubt.current?.(),
     onSelect: setSelectedId,
