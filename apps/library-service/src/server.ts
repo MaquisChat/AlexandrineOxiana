@@ -32,6 +32,7 @@ import { registerReview } from "./routes/review.js";
 import { registerSources } from "./routes/sources.js";
 import { registerTools } from "./routes/tools.js";
 import { registerWatchedFolders } from "./routes/watched-folders.js";
+import { registerFind } from "./routes/find.js";
 
 export type { ServiceWorker, WorkerProvider } from "./state.js";
 
@@ -315,6 +316,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerMedia(app, ctx);
   registerDocuments(app, ctx);
   registerWatchedFolders(app, ctx);
+  registerFind(app, ctx);
 
   let closing: Promise<void> | undefined;
   return {

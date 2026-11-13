@@ -56,13 +56,18 @@ import {
   rebuildIndexIfNeeded,
   rememberLastOpenLibrary,
   type RebuildResult,
+  createFindRunner,
+  DEFAULT_SEARCH_SETTINGS,
+  type FindRunner,
+  type IndexDb,
 } from "@ao/library";
-import type { CaptureQueueProgressEvent, CaptureStartedBy, DeviceNotice } from "@ao/shared";
+import type { CaptureQueueProgressEvent, CaptureStartedBy, DeviceNotice, FindProgressEvent } from "@ao/shared";
 import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
+import { readFindScreen } from "./routes/find.js";
 import { Transcriptions } from "./transcriptions.js";
 
 /** A running media worker, shared by every library the service opens. */
@@ -133,6 +138,10 @@ export interface Session {
    * Rm4): e.g. this computer's watched folders could not be read at open, so none run now.
    */
   sessionWarnings?: Array<{ kind: string; detail: string }>;
+  /** Find and acquire's runner (Task F5): one per open read-write library, made at `activate`; see "Find and acquire" below. */
+  find?: FindRunner;
+  /** The index errors already seen when the index was last known good (Task F5): a new one means it cannot be trusted. */
+  findIndexErrors?: number;
 }
 
 /**
@@ -667,6 +676,7 @@ export class ServiceState {
           s.indexStatus = undefined;
           if (r?.errors.length) this.opts.log.warn({ errors: r.errors.length }, "index rebuild: some folders could not be read");
           if (wasShown || r) this.publishState();
+          s.findIndexErrors = this.findIndexErrorCount(s);
         }
         return r;
       } catch (err) {
@@ -678,7 +688,10 @@ export class ServiceState {
         }
         throw err;
       } finally {
-        if (s.indexRebuild?.ac === ac) s.indexRebuild = undefined;
+        if (s.indexRebuild?.ac === ac) {
+          s.indexRebuild = undefined;
+          this.resumeFind(s); // the index is ready (if it is): the queues go on
+        }
       }
     })();
     s.indexRebuild = { ac, done: run.catch(() => {}) };
@@ -833,6 +846,7 @@ export class ServiceState {
         await this.runScheduledBackups();
       });
     }
+    this.startFind(s);
     if (this.worker) this.attachWorker(s, this.worker);
     else if (this.opts.autoStartWorker && this.opts.worker) this.track(this.ensureWorker(), "starting the media helper");
     this.startBackupScheduler();
@@ -976,6 +990,7 @@ export class ServiceState {
     }
     try {
       this.stopBackupScheduler();
+      await this.endFind(s);
       await this.stopWatches(s);
       await disposeProxyQueue(s.repo);
       await disposeOcrQueue(s.repo);
@@ -1042,6 +1057,8 @@ export class ServiceState {
     this.session = undefined;
     // An encrypted project's capture queues go with its key (R30, R50); a plain project's stay readable.
     for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.endCaptures(p.id, "close");
+    // Find and acquire stops for good, awaited (bounded), so that none of its writes lands after the lock is released.
+    await this.endFind(s);
     this.stopBackupScheduler();
     // N-5: the rerun of interrupted jobs starts no further job, and a transcription is asked to stop
     // too; what is still running when the grace period ends is abandoned below.
@@ -1082,6 +1099,82 @@ export class ServiceState {
     s.ring.clear();
     await s.lib.close().catch(() => {});
     this.publishState();
+  }
+
+  // ---- Find and acquire (Task F5; R237, A3) ---------------------------------------------
+  //
+  // One runner per open read-write library, made at `activate`. `resume(projectId)` for each unlocked project once
+  // the index is ready (at open after the rebuild's check, at the end of every rebuild, at unlock, after a failed
+  // move); `stop(projectId)` at an encrypted project's lock, before its key is dropped (routes/projects.ts);
+  // `stopAll()` awaited (it is bounded) at close, at a library switch (both `closeLibrary`), before a move and at
+  // quiesce (R106, `quiesce`), so that no write of the runner lands after the library's lock is released.
+
+  /** "Check everything I have", as remembered on this computer (`find-screen.json`): read at open, set by PUT /find/screen. */
+  findCheckEverything = false;
+
+  private findIndexErrorCount(s: Session): number {
+    // A compaction's note is not an index error (the queue store leaves its notes there too).
+    return s.repo.indexErrors.filter((e) => e.op !== "project.find.compact").length;
+  }
+
+  /**
+   * Whether the index can be trusted for Find and acquire's duplicate check: open, its check after the open has run,
+   * no rebuild running or failed, and no change that could not be indexed since it was last known good.
+   */
+  findIndexReady(s: Session): boolean {
+    return this.session === s && !!s.index && s.index.isOpen && !s.stampHold.on && !s.indexRebuild && s.indexStatus === undefined && this.findIndexErrorCount(s) <= (s.findIndexErrors ?? 0);
+  }
+
+  /** Makes the open library's runner (once) and resumes what may run now. */
+  private startFind(s: Session): void {
+    if (s.lib.mode !== "read-write" || !s.index || s.find) return;
+    void readFindScreen(this.deps.appConfigDir).then((v) => {
+      if (this.session === s) this.findCheckEverything = v.checkEverything;
+    });
+    const handle = s.index;
+    // Always the index's live connection: a rebuild swaps it.
+    const index = new Proxy({} as IndexDb, {
+      get: (_t, k) => {
+        const db = handle.db;
+        const v: unknown = Reflect.get(db, k, db);
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(db) : v;
+      },
+    });
+    s.findIndexErrors = this.findIndexErrorCount(s);
+    s.find = createFindRunner({
+      repo: s.repo,
+      index,
+      http: s.http,
+      // Task F12's "Search sources" settings do not exist yet: until then, its defaults (every service on but Elicit).
+      settings: async () => DEFAULT_SEARCH_SETTINGS,
+      checkEverything: () => this.findCheckEverything,
+      onChange: (e) => {
+        if (this.session === s) this.events.publish("find.progress", { projectId: e.projectId, entryId: e.entryId, state: e.state } satisfies FindProgressEvent);
+      },
+      indexReady: () => this.findIndexReady(s),
+      // Error kinds only (never what was typed, never an error's text: the runner's promise).
+      debug: (note) => this.opts.log.info({ note }, "find and acquire"),
+    });
+    this.resumeFind(s);
+  }
+
+  /** Resumes the queue of every unlocked project (or of `projectId`), only once the index is ready. */
+  resumeFind(s: Session, projectId?: string): void {
+    const r = s.find;
+    if (!r || this.moving || !this.findIndexReady(s)) return;
+    for (const p of s.repo.listProjects()) if ((projectId === undefined || p.id === projectId) && s.repo.isUnlocked(p.id)) r.resume(p.id);
+  }
+
+  /** At an encrypted project's lock, before its key is dropped: nothing more is written for it until `resumeFind`. */
+  stopFind(s: Session, projectId: string): void {
+    s.find?.stop(projectId);
+  }
+
+  /** Stops the runner for good and waits for it (bounded: FIND_STOP_SETTLE_MS); `activate` makes a new one. */
+  private async endFind(s: Session): Promise<void> {
+    const r = s.find;
+    s.find = undefined;
+    await r?.stopAll();
   }
 
   // ---- the media worker --------------------------------------------------------------
