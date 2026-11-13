@@ -85,9 +85,9 @@ export function annotationRecord(a: Annotation): AnnotationRecord {
     otherAnchorKinds: a.anchors.filter((x) => x.kind !== "pdf").map((x) => x.kind),
     colorName,
     imported,
-    author: a.author,
     createdAt: a.createdAt,
   };
+  if (a.author !== undefined) out.author = a.author;
   if (a.quote !== undefined) out.quote = a.quote;
   if (a.body !== undefined) out.body = a.body;
   if (imported && a.color !== undefined && a.color.trim().toLowerCase() !== ZOTERO_REFERENCE_COLOURS[colorName].toLowerCase()) out.importedColour = a.color;

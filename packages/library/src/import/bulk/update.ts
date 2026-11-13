@@ -153,7 +153,10 @@ export function toAnnotation(
     ...content,
     externalKey: a.key.slice(0, 256),
     externalHash: annotationHash(content),
-    author: a.author || actor,
+    // D22: the author Zotero gave, or none. Never the actor (this computer's account name in the app): an
+    // annotation's author is library data, and a local account name does not belong there. `actor` is kept in
+    // the signature for callers; it no longer fills a missing author.
+    ...(a.author ? { author: a.author } : {}),
     createdAt: a.createdAt ?? new Date().toISOString(),
   });
 }
@@ -256,7 +259,10 @@ export function planAnnotations(sf: SourceFile, scanned: ScanAnnotation[], make:
       plan.kept.push(s.key);
       continue;
     }
-    plan.updated.push({ before: ex, after: { ...next, id: ex.id, author: ex.author, createdAt: ex.createdAt } });
+    // The stored author is kept as it is (one stored before D22 was fixed may hold the old fallback): the author
+    // is not content (annotationHash leaves it out), so it is neither Zotero's change nor the researcher's.
+    const { author: _a, ...rest } = next;
+    plan.updated.push({ before: ex, after: { ...rest, id: ex.id, ...(ex.author !== undefined ? { author: ex.author } : {}), createdAt: ex.createdAt } });
   }
   // Updates may grow the text too: within the 16 MB cap, in order; the rest is left as it is (counted).
   let chars = sf.annotations.reduce((n, a) => n + textOf(a), 0);
