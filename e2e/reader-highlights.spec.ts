@@ -1309,3 +1309,43 @@ test("a highlight and a page note made by keyboard alone", async ({ page, app })
   await expect(page.getByText(CHANGED)).toHaveCount(0);
   expect(errors).toEqual([]);
 });
+
+test("a keyboard selection crosses into the next page; a further Shift+arrow closes the toolbar; Escape ends it, nothing stored", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "across.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Across by keyboard" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  for (const n of [1, 2]) await expect(page.locator(`[data-page-number="${n}"] .ao-reader-text-layer > .ao-reader-end-of-content`)).toBeAttached();
+  const pages = page.locator(".ao-reader-scroll");
+  await expect(pages).toBeFocused();
+  const selection = () => page.evaluate(() => document.getSelection()?.toString() ?? "");
+  /** The page the selection's end is on. */
+  const endPage = () => page.evaluate(() => (document.getSelection()?.rangeCount ? Number(document.getSelection()!.getRangeAt(0).endContainer.parentElement?.closest<HTMLElement>("[data-page-number]")?.dataset.pageNumber) : 0));
+  await page.keyboard.press("s");
+  await expect.poll(selection).toBe("Page");
+  // Down by lines until the selection reaches page 2 (its first line, the same place: its first word).
+  for (let i = 0; i < 4 && (await endPage()) !== 2; i++) await page.keyboard.press("Shift+ArrowDown");
+  expect(await endPage()).toBe(2);
+  expect(await selection()).toContain("written for the reader's tests.");
+  await expect.poll(selection).toMatch(/Page$/);
+  // Enter: the toolbar takes the focus; going back to the pages leaves it open.
+  await page.keyboard.press("Enter");
+  await expect(colourBar(page).getByRole("button", { name: "Highlight", exact: true })).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Shift+Tab");
+  await expect(pages).toBeFocused();
+  await expect(colourBar(page)).toBeVisible();
+  // A further Shift+arrow: the selection grows, the toolbar closes (it would store less than is tinted).
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect.poll(selection).toMatch(/Page 2$/);
+  await expect(colourBar(page)).toHaveCount(0);
+  // Escape: ended and said, the tint gone, the focus on the pages; nothing was stored.
+  await page.keyboard.press("Escape");
+  await expect(said(page)).toHaveText("Selection cancelled.");
+  expect(await selection()).toBe("");
+  await expect(pages).toBeFocused();
+  expect(await listed(app, projectId, sid)).toEqual([]);
+  expect(errors).toEqual([]);
+});
