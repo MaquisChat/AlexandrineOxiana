@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup, DEVICE_NOTICE_KINDS, isDeviceNoticeKind } from "./index.js";
 
 describe("@ao/shared", () => {
   it("credential query keys (R96/R98), any case", () => {
@@ -99,5 +99,17 @@ describe("font names a researcher's own file cannot take (Task 57 M5): one list"
     // Verification entries by their cause (R176 3: recorded, or read by the library's reviewCauseOf), never by their fields.
     expect(reviewGroup({ kind: "verification", cause: { kind: "capture-conflict" } })).toBe("capture");
     expect(reviewGroup({ kind: "verification", cause: { kind: "consent-withdrawal", consentIds: ["c1"] } })).toBe("withdrawal");
+  });
+});
+
+describe("device notices (R242): the Zotero sync settings notice is one of the closed list", () => {
+  it("isDeviceNoticeKind knows zotero-sync-settings-set-aside, and still refuses an unknown kind", () => {
+    expect(DEVICE_NOTICE_KINDS).toContain("zotero-sync-settings-set-aside");
+    expect(isDeviceNoticeKind("zotero-sync-settings-set-aside")).toBe(true);
+    expect(isDeviceNoticeKind("zotero-sync-history-set-aside")).toBe(false);
+  });
+
+  it("R244 M7: and the notice for sync settings written by a newer version", () => {
+    expect(isDeviceNoticeKind("zotero-sync-settings-newer")).toBe(true);
   });
 });
