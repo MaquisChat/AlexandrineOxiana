@@ -11,13 +11,11 @@
  * A failure (a locked project, a file gone or changed, an answer of the wrong length, the service
  * out of reach) stops the transport: nothing more is fetched, ever. It is told to whoever listens
  * through `onRangeFailure` (openPdf, which puts it on the handle's `failed`, and the reader then
- * shows its sentence and destroys the document). pdf.js 6.4.299's range transport has no way to
- * fail a range, and pdf.js keeps a range it is waiting for marked as asked for: a range never
- * answered keeps every page read that needs it waiting for ever, then and later. So every range
- * pdf.js is still waiting for at the failure, and every one it asks for afterwards, is answered with
- * blank (zero) bytes, which are never fetched and never come from the file: the reads finish at once
- * (blank, or with pdf.js's own error), and none waits. (Failing the range inside pdf.js instead was
- * tried: the read waiting for it rejects, but the next read of the same bytes waits for ever.)
+ * destroys the document at once, A7). pdf.js is NEVER handed a byte that did not come from the file:
+ * a range that failed, and any range asked for afterwards, is simply never answered (pdf.js 6.4.299
+ * has no way to fail a range; feeding it made-up bytes made one page answer with another's text).
+ * The reads that waited for it are ended by openPdf, which destroys the document and makes every
+ * call on the handle reject.
  * `abort()` (pdf.js calls it when the document is destroyed) stops the transport too, aborts the
  * signal given to every fetch in flight, and reports nothing; so does a fetch that fails because
  * the caller's own signal was aborted (leaving the reader is not a failure).
@@ -43,8 +41,6 @@ type FailureListener = (error: unknown) => void;
 
 const isAbort = (e: unknown) => e instanceof Error && e.name === "AbortError";
 
-/** The blank answer to a range after a failure: zero bytes of the range's length, nothing from the file. */
-const blank = (begin: number, end: number): Uint8Array => new Uint8Array(Math.max(0, end - begin));
 
 class ServiceRangeTransport extends PDFDataRangeTransport {
   readonly #fetchRange: FetchRange;
@@ -52,7 +48,7 @@ class ServiceRangeTransport extends PDFDataRangeTransport {
   readonly #listeners = new Set<FailureListener>();
   #failure: { error: unknown } | undefined;
   /** Each range pdf.js asked for and has not been answered yet: begin → end (exclusive). */
-  readonly #waiting = new Map<number, number>();
+
 
   constructor(first: { bytes: Uint8Array; total: number }, fetchRange: FetchRange) {
     super(first.total, first.bytes);
@@ -61,17 +57,14 @@ class ServiceRangeTransport extends PDFDataRangeTransport {
 
   override requestDataRange(begin: number, end: number): void {
     if (this.#failure) {
-      // Failed already: nothing is fetched; the range is answered blank at once.
-      queueMicrotask(() => this.#hand(begin, blank(begin, Math.min(end, this.length))));
+      // Failed already: nothing is fetched, nothing is handed on.
       return;
     }
-    this.#waiting.set(begin, Math.min(end, this.length));
     void this.#load(begin, Math.min(end, this.length));
   }
 
   /** Hands pdf.js the answer to the range that begins at `begin`. */
   #hand(begin: number, chunk: Uint8Array): void {
-    this.#waiting.delete(begin);
     try {
       this.onDataRange(begin, chunk);
     } catch {
@@ -124,8 +117,6 @@ class ServiceRangeTransport extends PDFDataRangeTransport {
   #fail(error: unknown): void {
     if (this.#failure) return;
     this.#failure = { error };
-    // Every range pdf.js still waits for is answered blank, so that nothing waits for ever.
-    for (const [begin, end] of [...this.#waiting]) this.#hand(begin, blank(begin, end));
     for (const l of [...this.#listeners]) l(error);
     this.#listeners.clear();
   }

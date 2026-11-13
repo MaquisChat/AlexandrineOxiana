@@ -347,6 +347,36 @@ export async function buildMultiPagePdf(pages) {
 }
 
 /**
+ * A PDF read in many ranges (Task R6): `pages` pages, each with ~600 KB of filler and then the words
+ * "Quote on page N" in its content, and all that content written AFTER the page objects, so that
+ * opening it reads little and each page's text needs ranges of its own. Page `latePage` (1-based,
+ * not the last) also has its page object written halfway through the content, so that even getting
+ * that page needs a range. Deterministic; uncompressed.
+ * @param {number} pages
+ * @param {number} latePage
+ */
+export async function buildRangeReadPdf(pages, latePage) {
+  const { PDFName, StandardFonts } = requireLib("pdf-lib");
+  if (!(latePage >= 1 && latePage < pages)) throw new Error("latePage must be a page before the last");
+  const doc = await readerDoc("A document read in ranges");
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const line = `% ${"filler ".repeat(13)}\n`;
+  const content = (n) => doc.context.register(doc.context.stream(`${line.repeat(6000)}BT /FQ 14 Tf 50 700 Td (Quote on page ${n}) Tj ET\n`));
+  const withFont = (page) => {
+    page.node.setFontDictionary(PDFName.of("FQ"), font.ref);
+    return page;
+  };
+  const made = [];
+  for (let n = 1; n <= pages; n++) if (n !== latePage) made[n - 1] = withFont(doc.addPage([595, 842]));
+  const half = Math.floor(pages / 2);
+  for (let n = 1; n <= half; n++) if (n !== latePage) made[n - 1].node.addContentStream(content(n));
+  made[latePage - 1] = withFont(doc.insertPage(latePage - 1, [595, 842]));
+  made[latePage - 1].node.addContentStream(content(latePage));
+  for (let n = half + 1; n <= pages; n++) if (n !== latePage) made[n - 1].node.addContentStream(content(n));
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}
+
+/**
  * A file that starts like a PDF and is not one: the header, then nothing a PDF reader can recover
  * (no objects, no cross-reference table, no trailer). pdf.js answers InvalidPDFException.
  */

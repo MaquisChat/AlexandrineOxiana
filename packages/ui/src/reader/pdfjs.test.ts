@@ -10,7 +10,6 @@
  * process behind a message channel with the browser's semantics (structured clone, transfer,
  * asynchronous delivery). pdf.js's "fake worker" hook is removed, so a fall-back fails here.
  */
-import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, relative } from "node:path";
@@ -19,7 +18,7 @@ import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import bundledWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { READER_PDF_MAX_BYTES } from "@ao/shared";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildDamagedPdf, buildMultiPagePdf } from "../../../../tests/fixtures/generate.mjs";
+import { buildDamagedPdf, buildMultiPagePdf, buildRangeReadPdf } from "../../../../tests/fixtures/generate.mjs";
 import { ApiClientError } from "../api/client";
 import { openPdf, PDF_OPTIONS, PdfOpenError, pdfDocumentParams, toPdfOpenError } from "./pdfjs";
 import { createRangeTransport, type FetchRange } from "./rangeTransport";
@@ -48,24 +47,43 @@ beforeAll(async () => {
 class Endpoint extends EventTarget {
   other: Endpoint | undefined;
   closed = false;
+  /** The worker's side: its answers to the page can be held back (Held.on) and let go later (Held.release). */
+  toPage = false;
   postMessage(data: unknown, transfer?: Transferable[] | { transfer?: Transferable[] }): void {
     const list = Array.isArray(transfer) ? transfer : (transfer?.transfer ?? []);
     const copy = structuredClone(data, { transfer: list });
     const to = this.other;
-    setTimeout(() => {
+    const deliver = () => {
       if (!to || to.closed || this.closed) return;
       to.dispatchEvent(new MessageEvent("message", { data: copy }));
-    }, 0);
+    };
+    if (this.toPage && Held.on) Held.queue.push(deliver);
+    else setTimeout(deliver, 0);
   }
 }
+
+/** Holding the worker's answers back, so that they arrive after something else happened. */
+const Held = {
+  on: false,
+  queue: [] as Array<() => void>,
+  release(): void {
+    Held.on = false;
+    for (const d of Held.queue.splice(0)) setTimeout(d, 0);
+  },
+};
 
 /** A stand-in for `Worker`: records how it was created and runs pdf.js's worker code on the other end. */
 class LoopbackWorker extends Endpoint {
   static made: Array<{ url: string; options: unknown; worker: LoopbackWorker }> = [];
-  static mode: "ok" | "error" = "ok";
+  static mode: "ok" | "error" | "throw" = "ok";
+  terminateCalls = 0;
   terminated = false;
   constructor(url: string | URL, options?: unknown) {
     super();
+    if (LoopbackWorker.mode === "throw") {
+      // As WebKit does when the policy or a same-origin check refuses the worker: synchronously.
+      throw new DOMException("The operation is insecure.", "SecurityError");
+    }
     LoopbackWorker.made.push({ url: String(url), options, worker: this });
     if (LoopbackWorker.mode === "error") {
       // As a browser does when the worker's script cannot be loaded or is refused by the policy.
@@ -73,11 +91,13 @@ class LoopbackWorker extends Endpoint {
       return;
     }
     const inside = new Endpoint();
+    inside.toPage = true;
     inside.other = this;
     this.other = inside;
     WorkerMessageHandler.initializeFromPort(inside);
   }
   terminate(): void {
+    this.terminateCalls++;
     this.terminated = true;
     this.closed = true;
     if (this.other) this.other.closed = true;
@@ -87,6 +107,8 @@ class LoopbackWorker extends Endpoint {
 beforeEach(() => {
   LoopbackWorker.made = [];
   LoopbackWorker.mode = "ok";
+  Held.on = false;
+  Held.queue = [];
   vi.stubGlobal("Worker", LoopbackWorker);
   vi.mocked(getDocument).mockClear();
 });
@@ -99,10 +121,14 @@ function memoryTransport(data: Uint8Array, opts: { firstBytes?: number; fail?: u
   const first = data.subarray(0, Math.min(opts.firstBytes ?? 1048576, data.length));
   const calls: Array<[number, number]> = [];
   // `failFrom` may be moved later (state.failFrom), e.g. once the document is open.
-  const state = { failFrom: opts.failFrom ?? 1 };
+  // `failFrom` may be moved later, and a failure may wait for `gate` before it is thrown.
+  const state: { failFrom: number; gate?: Promise<void> } = { failFrom: opts.failFrom ?? 1 };
   const fetchRange: FetchRange = async (start, end) => {
     calls.push([start, end]);
-    if (opts.fail !== undefined && calls.length >= state.failFrom) throw opts.fail;
+    if (opts.fail !== undefined && calls.length >= state.failFrom) {
+      await state.gate;
+      throw opts.fail;
+    }
     return data.slice(start, end + 1);
   };
   return { transport: createRangeTransport({ bytes: first.slice(), total: data.length }, fetchRange), calls, state };
@@ -126,26 +152,6 @@ const within = async (p: Promise<unknown>, ms: number) =>
     new Promise((r) => setTimeout(() => r("pending"), ms)),
   ]);
 
-/** `pages` pages whose content streams each carry ~600 KB of filler, so that reading a page needs ranges of its own. */
-async function bigPdf(pages: number): Promise<Uint8Array> {
-  type Lib = {
-    PDFDocument: { create(o: object): Promise<{ embedFont(f: string): Promise<unknown>; addPage(s: [number, number]): { drawText(t: string, o: object): void; node: { addContentStream(r: unknown): void } }; context: { register(o: unknown): unknown; stream(s: string): unknown }; save(o: object): Promise<Uint8Array> }> };
-    StandardFonts: { Helvetica: string };
-  };
-  const { PDFDocument, StandardFonts } = createRequire(join(REPO, "packages", "library", "package.json"))("pdf-lib") as Lib;
-  const doc = await PDFDocument.create({ updateMetadata: false });
-  const font = await doc.embedFont(StandardFonts.Helvetica);
-  // Every page first (their objects together at the start of the file, which pdf.js reads to open
-  // it), then each page's filler (written after them, read only when that page is read).
-  const made = Array.from({ length: pages }, (_, i) => {
-    const page = doc.addPage([595, 842]);
-    page.drawText(`Page ${i + 1}`, { x: 50, y: 780, size: 12, font });
-    return page;
-  });
-  for (const page of made) page.node.addContentStream(doc.context.register(doc.context.stream(`% ${randomBytes(300_000).toString("hex")}\n`)));
-  return new Uint8Array(await doc.save({ useObjectStreams: false }));
-}
-
 describe("pdf.js options", () => {
   it("every option is set as the plan lists", async () => {
     expect(PDF_OPTIONS).toEqual({
@@ -161,8 +167,8 @@ describe("pdf.js options", () => {
       cMapPacked: true,
       standardFontDataUrl: "/pdfjs/standard_fonts/",
       wasmUrl: "/pdfjs/wasm/",
-      maxImageSize: 67108864,
-      canvasMaxAreaInBytes: 134217728,
+      maxImageSize: 268435456,
+      canvasMaxAreaInBytes: 268435456,
     });
     expect(Object.isFrozen(PDF_OPTIONS)).toBe(true);
     // pdf.js reads canvasMaxAreaInBytes with `>> 2`: it must stay below 2^31.
@@ -243,6 +249,13 @@ describe("the worker", () => {
     expect((err as PdfOpenError).kind).toBe("other");
     expect((err as PdfOpenError).message).toBe("The PDF reader could not start. Close the reader and open the file again.");
     expect(LoopbackWorker.made[0]!.worker.terminated).toBe(true);
+    expect(getDocument).not.toHaveBeenCalled();
+    // A constructor that throws (WebKit refusing the worker by policy or origin): the same error, nothing left behind.
+    LoopbackWorker.mode = "throw";
+    const thrown = await openPdf({ transport: memoryTransport(data).transport, signal: signal() }).catch((e: unknown) => e);
+    expect(thrown).toBeInstanceOf(PdfOpenError);
+    expect(thrown).toMatchObject({ kind: "other", message: "The PDF reader could not start. Close the reader and open the file again." });
+    expect(LoopbackWorker.made).toHaveLength(1); // only the first, already ended
     expect(getDocument).not.toHaveBeenCalled();
     // No Worker at all (an environment without web workers): the same error, no fall-back.
     vi.stubGlobal("Worker", undefined);
@@ -346,56 +359,99 @@ describe("openPdf", () => {
 });
 
 describe("PdfHandle.failed", () => {
-  /**
-   * Opens `data`, then reads its pages one after another (each needs ranges of its own); the `nth`
-   * range asked for after opening, and every later one, fails with `fail`. `reading` settles when the
-   * reading has stopped, one way or the other.
-   */
-  async function readPages(data: Uint8Array, fail: unknown, nth: number) {
+  const PAGES = 12;
+
+  /** Opens the range-read fixture; the `nth` range asked for after opening, and every later one, fails with `fail`. */
+  async function openThenFail(fail: unknown, nth = 1) {
+    const data = new Uint8Array(await buildRangeReadPdf(PAGES, 4));
     const t = memoryTransport(data, { firstBytes: 1048576, fail, failFrom: Number.POSITIVE_INFINITY });
     const handle = await openPdf({ transport: t.transport, signal: signal() });
+    // A page got (and its object read) before anything fails.
+    const early = await handle.doc.getPage(2);
     const callsAtOpen = t.calls.length;
     t.state.failFrom = callsAtOpen + nth;
-    const reading = (async () => {
-      for (let i = 1; i <= handle.pageCount; i++) await (await handle.doc.getPage(i)).getOperatorList().catch(() => {});
-    })();
-    return { handle, t, callsAtOpen, reading };
+    return { handle, t, early, callsAtOpen };
   }
 
-  it("a range refused after opening (423 on a later range): failed says locked, no range is asked for after it, nothing waits for ever", async () => {
-    const data = await bigPdf(16);
+  /** How a call ended: "rejected", "pending" after 5 s, or what it resolved with (any is a failure of the test). */
+  const outcome = async (p: Promise<unknown>) =>
+    Promise.race([
+      p.then(
+        (v) => `resolved with ${v === undefined ? "nothing" : typeof v === "object" ? Object.keys(v as object).slice(0, 5).join(",") : String(v)}`,
+        () => "rejected",
+      ),
+      new Promise<string>((r) => setTimeout(() => r("pending"), 5000)),
+    ]);
+  const later = (f: () => unknown) => outcome(Promise.resolve().then(f));
+
+  it("a 423 on a later range while a page, its text and its drawing are being read: each rejects, nothing resolves with content, the handle is dead", async () => {
     const locked = new ApiClientError(423, { code: "PROJECT_LOCKED", message: "This project is locked." });
-    const { handle, t, callsAtOpen, reading } = await readPages(data, locked, 3);
+    const { handle, t, early, callsAtOpen } = await openThenFail(locked);
+    expect(handle.dead).toBe(false);
+    let letFail: () => void = () => {};
+    t.state.gate = new Promise<void>((r) => {
+      letFail = r;
+    });
+    // The text of page 2 needs a range that is not read yet: it is asked for, and held.
+    const text = early.getTextContent();
+    await vi.waitFor(() => expect(t.calls.length).toBe(callsAtOpen + 1));
+    // The worker's answers are held back, so that these are still in flight when the refusal comes:
+    // a page, and the drawing of another page (its operator list; a canvas render in the end-to-end test).
+    Held.on = true;
+    const page = handle.doc.getPage(PAGES - 1);
+    const drawing = handle.doc.getPage(PAGES).then((p) => p.getOperatorList());
+    letFail();
     const failure = await handle.failed;
+    // Now pdf.js may answer: whatever it says arrives after the refusal, and is dropped.
+    Held.release();
+    expect(await Promise.all([outcome(page), outcome(text), outcome(drawing)])).toEqual(["rejected", "rejected", "rejected"]);
     expect(failure).toBeInstanceOf(PdfOpenError);
     expect(failure.kind).toBe("locked");
-    // The third range asked for after opening was the one refused, and nothing was asked for after it.
-    expect(t.calls.length).toBe(callsAtOpen + 3);
-    // The page read that was waiting for it, and every later one, finishes: nothing waits for ever.
-    expect(await within(reading, 10000)).toBe("settled");
-    expect(t.calls.length).toBe(callsAtOpen + 3);
-    // The reader then destroys the document, which ends the worker.
-    await handle.destroy();
+    expect(handle.dead).toBe(true);
+    // The document and its worker were destroyed at once.
     expect(LoopbackWorker.made[0]!.worker.terminated).toBe(true);
+    // No later call on that handle returns anything, and no range is asked for any more.
+    expect(await later(() => handle.doc.getPage(1))).toBe("rejected");
+    expect(await later(() => early.getTextContent())).toBe("rejected");
+    expect(await later(() => early.getOperatorList())).toBe("rejected");
+    expect(await later(() => handle.doc.getPageLabels())).toBe("rejected");
+    expect(() => early.getViewport({ scale: 1 })).toThrow();
+    expect(t.calls.length).toBe(callsAtOpen + 1);
   });
 
-  it("a network failure after opening: failed says other, and everything settles", async () => {
-    const data = await bigPdf(16);
+  it("a network failure after opening: failed says other, the handle is dead, the page read in flight rejects", async () => {
     const down = new ApiClientError(0, { code: "UNAVAILABLE", message: "The library service could not be reached." });
-    const { handle, t, callsAtOpen, reading } = await readPages(data, down, 2);
+    const { handle, early } = await openThenFail(down);
+    expect(await outcome(early.getTextContent())).toBe("rejected");
     expect((await handle.failed).kind).toBe("other");
-    expect(await within(reading, 10000)).toBe("settled");
-    expect(t.calls.length).toBe(callsAtOpen + 2);
-    await handle.destroy();
+    expect(handle.dead).toBe(true);
+    expect(await later(() => handle.doc.getPage(3))).toBe("rejected");
   });
 
-  it("an abort is not a failure", async () => {
-    const data = await bigPdf(16);
+  it("an abort is not a failure; a second failure does nothing more; destroying twice is safe", async () => {
     const aborted = new DOMException("The range was no longer wanted.", "AbortError");
-    const { handle, t, callsAtOpen } = await readPages(data, aborted, 2);
-    await vi.waitFor(() => expect(t.calls.length).toBe(callsAtOpen + 2));
-    expect(await within(handle.failed, 500)).toBe("pending");
-    await handle.destroy();
-    expect(await within(handle.failed, 100)).toBe("pending");
+    const a = await openThenFail(aborted);
+    void a.early.getTextContent().catch(() => {});
+    await vi.waitFor(() => expect(a.t.calls.length).toBe(a.callsAtOpen + 1));
+    expect(await within(a.handle.failed, 300)).toBe("pending");
+    expect(a.handle.dead).toBe(false);
+    await a.handle.destroy();
+    await a.handle.destroy();
+    expect(a.handle.dead).toBe(true);
+    expect(await within(a.handle.failed, 100)).toBe("pending");
+    expect(LoopbackWorker.made.at(-1)!.worker.terminateCalls).toBe(1);
+    expect(await later(() => a.handle.doc.getPage(1))).toBe("rejected");
+
+    // A failure, then the worker failing too: the first stands, nothing is ended twice.
+    const locked = new ApiClientError(423, { code: "PROJECT_LOCKED", message: "This project is locked." });
+    const b = await openThenFail(locked);
+    void b.early.getTextContent().catch(() => {});
+    const first = await b.handle.failed;
+    LoopbackWorker.made.at(-1)!.worker.dispatchEvent(new Event("error"));
+    await b.handle.destroy();
+    await b.handle.destroy();
+    expect(await b.handle.failed).toBe(first);
+    expect(first.kind).toBe("locked");
+    expect(LoopbackWorker.made.at(-1)!.worker.terminateCalls).toBe(1);
   });
 });

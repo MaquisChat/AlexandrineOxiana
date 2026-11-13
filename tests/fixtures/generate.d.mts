@@ -12,6 +12,7 @@ export declare function buildScanPdf(pages: number): Promise<Buffer>;
 export declare function buildRotatedCropPdf(): Promise<Buffer>;
 export declare function buildMultiPagePdf(pages: number): Promise<Buffer>;
 export declare function buildDamagedPdf(): Buffer;
+export declare function buildRangeReadPdf(pages: number, latePage: number): Promise<Buffer>;
 export declare function buildCjkPdf(): Promise<Buffer>;
 export declare function buildCameraTiff(path: string): Promise<void>;
 export interface GeneratedFixtures {

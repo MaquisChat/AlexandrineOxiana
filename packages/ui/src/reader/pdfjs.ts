@@ -20,13 +20,18 @@
  *    has 'self';
  *  - `useSystemFonts: true` (R199): a PDF's non-embedded Helvetica, Times or Courier is drawn with the
  *    system's own face (a generic one where the system has none); no GPL font is shipped;
- *  - image limits (A6): `maxImageSize` 2^26 pixels (8192 × 8192): a 600 dpi scan of an A4 or Letter
- *    page is about 35 million pixels and is drawn; one image that declares more is not drawn at all,
- *    decided from its declared size before it is decoded, so a hostile file cannot make pdf.js
- *    allocate gigabytes. `canvasMaxAreaInBytes` 2^27 bytes (128 MiB, about 33 million pixels): an
- *    image drawn larger than that is scaled down in the worker before it reaches the page (a 600 dpi
- *    A4 scan stays sharp at the reader's 400% zoom), so the page never holds a bigger bitmap.
- *    (pdf.js reads it with `>> 2`, so it must stay below 2^31.)
+ *  - image limits (A7, R201), as pdf.js 6.4.299's worker applies them:
+ *    `maxImageSize` 2^28: an image whose DECLARED width × height is over 268,435,456 pixels is left
+ *    out of the page entirely, before anything of it is decoded (pdf.worker.mjs
+ *    `buildPaintImageXObject`: "Image exceeded maximum allowed size and was removed.", a console
+ *    warning only), so a hostile file cannot make pdf.js allocate gigabytes; a 600 dpi A3 scan
+ *    (70 Mpx) and a 1200 dpi bitonal A4 page (139 Mpx) are kept.
+ *    `canvasMaxAreaInBytes` 2^28: pdf.js sets `ImageResizer.MAX_AREA` to it `>> 2`, 67,108,864
+ *    pixels; an image larger than that (or wider or taller than the browser's largest canvas) is
+ *    scaled down in the worker, by about 2× or more, before it reaches the page. A 600 dpi A4 or
+ *    Letter scan (35 and 34 Mpx) is drawn at full size; a 600 dpi A3 scan or a 1200 dpi A4 page is
+ *    drawn, scaled down. (`>> 2` means it must stay below 2^31.) pdf.js gives no supported signal
+ *    when it leaves an image out: a page whose only picture is over 268 megapixels is drawn blank.
  *  - the document's bytes only through the range transport (rangeTransport.ts) over the service's
  *    ranged route, 1 MiB at a time, only what is needed (`disableAutoFetch`, `disableStream`):
  *    never a URL pdf.js fetches itself, never the token in a URL.
@@ -53,8 +58,8 @@ export const PDF_OPTIONS = Object.freeze({
   cMapPacked: true,
   standardFontDataUrl: "/pdfjs/standard_fonts/",
   wasmUrl: "/pdfjs/wasm/",
-  maxImageSize: 67108864,
-  canvasMaxAreaInBytes: 134217728,
+  maxImageSize: 268435456,
+  canvasMaxAreaInBytes: 268435456,
 } as const);
 
 type DocumentParams = NonNullable<Parameters<typeof getDocument>[0]> & typeof PDF_OPTIONS & { range: PDFDataRangeTransport };
@@ -76,6 +81,8 @@ const MESSAGES: Record<PdfOpenErrorKind, string> = {
   other: "This PDF could not be opened.",
 };
 const WORKER_FAILED = "The PDF reader could not start. Close the reader and open the file again.";
+const NOT_A_PDF = "This file cannot be shown here.";
+const CLOSED = "This document was closed.";
 const FILE_CHANGED = "The file changed while it was being read. Open it again to read it as it is now.";
 
 /** Why a document did not open or stopped being readable, as one of the kinds the reader shows; the message is plain words. */
@@ -101,8 +108,9 @@ export function toPdfOpenError(err: unknown): PdfOpenError {
     if (err.status === 413) return new PdfOpenError("too-large");
     if (err.status === 404) return new PdfOpenError("missing");
     if (err.status === 423) return new PdfOpenError("locked");
-    // An asset that is not a PDF: the service's own sentence. A range past the end: the file shrank.
-    if (err.status === 400 && err.message === "This file cannot be shown here.") return new PdfOpenError("other", err.message);
+    // A 400: the asset is not a PDF (the client only ever asks well-formed ranges). A range past the
+    // end (416): the file shrank.
+    if (err.status === 400) return new PdfOpenError("other", NOT_A_PDF);
     if (err.status === 416) return new PdfOpenError("other", FILE_CHANGED);
     return new PdfOpenError("other");
   }
@@ -116,7 +124,13 @@ export function toPdfOpenError(err: unknown): PdfOpenError {
   return new PdfOpenError("other");
 }
 
-/** An open document. `destroy()` ends it: the worker (and its copy of the bytes) and every range still wanted. */
+/**
+ * An open document. `destroy()` ends it: the worker (and its copy of the bytes) and every range
+ * still wanted. Every call on `doc`, on a page got from it, on a page's render task and text stream
+ * goes through a guard: once the handle is dead, each call throws or rejects, and every call still
+ * in flight rejects (with the failure, or "This document was closed."), even where pdf.js itself
+ * would leave it waiting; nothing resolves with content after that.
+ */
 export interface PdfHandle {
   doc: PDFDocumentProxy;
   pageCount: number;
@@ -125,13 +139,83 @@ export interface PdfHandle {
   /**
    * Settles with the reason once the document can no longer be read: a range refused or failed after
    * it was opened (the project locked, the file gone or changed, the service out of reach), or the
-   * worker stopped. From then on no range is asked for, and no page read waits: what pdf.js still
-   * needs is answered with blank bytes (never from the file), so reads finish blank or with an
-   * error. The reader shows the sentence and calls `destroy()`. Never settles after `destroy()`, or
-   * for an abort.
+   * worker stopped. At that moment the handle is dead and the document and its worker are destroyed:
+   * no range is asked for afterwards, and pdf.js is never handed a byte that did not come from the
+   * file. To go on, the reader opens the document again. Never settles after `destroy()`, for an
+   * abort, or twice.
    */
   failed: Promise<PdfOpenError>;
+  /** True once the document failed or was destroyed: nothing from this handle may be used or stored any more. */
+  readonly dead: boolean;
+  /** Ends the document; safe to call more than once. */
   destroy(): Promise<void>;
+}
+
+/**
+ * Guards pdf.js's objects for one handle: a Proxy over the document, over each page got from it and
+ * over each render task, whose every method call throws once `isDead()`, and whose every promise (and
+ * text stream) is raced against `died`, which rejects at the moment the handle dies. A result that
+ * arrives after death is never handed on.
+ */
+function guard(isDead: () => boolean, deadError: () => Error, died: Promise<never>) {
+  const settle = <T>(p: Promise<T>): Promise<T> =>
+    Promise.race([
+      p.then(
+        (v) => {
+          if (isDead()) throw deadError();
+          return v;
+        },
+        (e: unknown) => {
+          throw isDead() ? deadError() : e;
+        },
+      ),
+      died,
+    ]);
+  const stream = (source: ReadableStream<unknown>): ReadableStream<unknown> => {
+    const reader = source.getReader();
+    return new ReadableStream<unknown>(
+      {
+        async pull(controller) {
+          try {
+            if (isDead()) throw deadError();
+            const { value, done } = await Promise.race([reader.read(), died]);
+            if (isDead()) throw deadError();
+            if (done) controller.close();
+            else controller.enqueue(value);
+          } catch (e) {
+            reader.cancel().catch(() => {});
+            controller.error(isDead() ? deadError() : e);
+          }
+        },
+        cancel: (reason) => reader.cancel(reason),
+      },
+      { highWaterMark: 0 },
+    );
+  };
+  const proxies = new WeakMap<object, object>();
+  const wrap = <T extends object>(target: T, kind: "doc" | "page" | "task"): T => {
+    const known = proxies.get(target);
+    if (known) return known as T;
+    const proxy = new Proxy(target, {
+      get(t, prop) {
+        const v: unknown = Reflect.get(t, prop, t);
+        if (kind === "task" && prop === "promise") return settle(v as Promise<unknown>);
+        if (typeof v !== "function") return v;
+        return (...args: unknown[]) => {
+          if (isDead()) throw deadError();
+          const r: unknown = (v as (...a: unknown[]) => unknown).apply(t, args);
+          if (kind === "doc" && prop === "getPage") return settle((r as Promise<object>).then((page) => wrap(page, "page")));
+          if (r instanceof Promise) return settle(r);
+          if (r instanceof ReadableStream) return stream(r);
+          if (kind === "page" && prop === "render" && r && typeof r === "object") return wrap(r, "task");
+          return r;
+        };
+      },
+    });
+    proxies.set(target, proxy);
+    return proxy;
+  };
+  return (doc: PDFDocumentProxy): PDFDocumentProxy => wrap(doc, "doc");
 }
 
 const aborted = (signal: AbortSignal): Error => (signal.reason instanceof Error && signal.reason.name === "AbortError" ? signal.reason : new DOMException("The document is no longer wanted.", "AbortError"));
@@ -139,7 +223,13 @@ const aborted = (signal: AbortSignal): Error => (signal.reason instanceof Error 
 /** Starts the bundled worker and waits for it to say it is ready; an error (not loaded, refused) is a PdfOpenError. */
 function startWorker(signal: AbortSignal): Promise<Worker> {
   if (typeof Worker !== "function") return Promise.reject(new PdfOpenError("other", WORKER_FAILED));
-  const worker = new Worker(workerUrl, { type: "module" });
+  let worker: Worker;
+  try {
+    // WebKit throws here, synchronously (a SecurityError), when the policy or an origin check refuses it.
+    worker = new Worker(workerUrl, { type: "module" });
+  } catch {
+    return Promise.reject(new PdfOpenError("other", WORKER_FAILED));
+  }
   return new Promise<Worker>((resolve, reject) => {
     const stop = () => {
       worker.removeEventListener("message", onMessage);
@@ -169,8 +259,6 @@ function startWorker(signal: AbortSignal): Promise<Worker> {
   });
 }
 
-/** How long destroying waits for pdf.js to end the document before the worker is ended regardless. */
-const DESTROY_WAIT_MS = 2000;
 
 
 /**
@@ -190,12 +278,14 @@ export async function openPdf(opts: { transport: PDFDataRangeTransport; password
   const task = getDocument({ ...pdfDocumentParams(transport, password), worker: pdfWorker });
 
   let ending: Promise<void> | undefined;
-  // pdf.js does not end a worker it was handed: ended here, after pdf.js has had its chance to end
-  // the document (which settles the page reads still waiting), but never later than DESTROY_WAIT_MS.
+  // Ends everything at once (A7): the transport, pdf.js's loading task (not waited for: it may wait on
+  // a range that never comes), and the worker with the document's bytes in it (pdf.js does not end a
+  // worker it was handed). Calls still in flight in pdf.js may never settle; the guard has already
+  // rejected every one the reader holds. Safe to call more than once.
   const destroy = (): Promise<void> =>
     (ending ??= (async () => {
       transport.abort();
-      await Promise.race([task.destroy().catch(() => {}), new Promise((r) => setTimeout(r, DESTROY_WAIT_MS))]);
+      void task.destroy().catch(() => {});
       pdfWorker.destroy();
       worker.terminate();
     })());
@@ -212,18 +302,37 @@ export async function openPdf(opts: { transport: PDFDataRangeTransport; password
   const failed = new Promise<PdfOpenError>((resolve) => {
     reportFailure = resolve;
   });
-  // After opening: the transport has stopped all fetching and answers every range still wanted with
-  // blank bytes, so no page read waits; the reader shows the sentence and destroys the document. (It
-  // is not destroyed here: pdf.js would then leave the reads in flight waiting for ever.) A worker
-  // that stopped answers nothing more: the document is destroyed at once.
-  const fail = (error: unknown, end = false) => {
+  // The handle's life (A7): once it dies (a failure after opening, or destroy()), every guarded call
+  // throws or rejects, and every one in flight rejects at once.
+  let dead = false;
+  let deathError: Error = new PdfOpenError("other", CLOSED);
+  let kill: (e: Error) => void = () => {};
+  const died = new Promise<never>((_, reject) => {
+    kill = reject;
+  });
+  died.catch(() => {});
+  const die = (e: Error) => {
+    if (dead) return false;
+    dead = true;
+    deathError = e;
+    kill(e);
+    return true;
+  };
+  const guarded = guard(
+    () => dead,
+    () => deathError,
+    died,
+  );
+  // After opening: a failure kills the handle and destroys the document and its worker at once.
+  const fail = (error: unknown) => {
     if (!opened) return stopOpening(toPdfOpenError(error));
-    if (ending) return; // destroyed already
-    reportFailure(toPdfOpenError(error));
-    if (end) void destroy();
+    const failure = toPdfOpenError(error);
+    if (!die(failure)) return; // dead already: a second failure, or after destroy(), does nothing more
+    reportFailure(failure);
+    void destroy();
   };
   const onAbort = () => stopOpening(aborted(signal));
-  const onWorkerError = () => fail(new PdfOpenError("other", WORKER_FAILED), true);
+  const onWorkerError = () => fail(new PdfOpenError("other", WORKER_FAILED));
   signal.addEventListener("abort", onAbort, { once: true });
   worker.addEventListener("error", onWorkerError);
   const stopListening = onRangeFailure(transport, (error) => fail(error));
@@ -233,11 +342,21 @@ export async function openPdf(opts: { transport: PDFDataRangeTransport; password
     if (signal.aborted) throw aborted(signal);
     opened = true;
     const handleDestroy = () => {
+      die(new PdfOpenError("other", CLOSED));
       stopListening();
       worker.removeEventListener("error", onWorkerError);
       return destroy();
     };
-    return { doc, pageCount: doc.numPages, pageLabels, failed, destroy: handleDestroy };
+    return {
+      doc: guarded(doc),
+      pageCount: doc.numPages,
+      pageLabels,
+      failed,
+      get dead() {
+        return dead;
+      },
+      destroy: handleDestroy,
+    };
   } catch (err) {
     stopListening();
     worker.removeEventListener("error", onWorkerError);
