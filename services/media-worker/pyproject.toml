@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ao-worker"
 version = "0.1.0"
 description = "AlexandrineOxiana media worker: transcription, capture download, proxies, OCR"
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.12"
 # Pinned: the worker ships with the app. gallery-dl (GPL-2.0-only) is not a dependency any more: the
 # first-use tools dialogue downloads its pinned wheel (ao_worker/toolpins.py, Task 48a, ADR 0009).
