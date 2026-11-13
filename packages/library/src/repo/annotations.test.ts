@@ -449,7 +449,7 @@ describe("update and delete", () => {
 });
 
 describe("crash safety (R26)", () => {
-  const points: CrashPoint[] = ["before-changes", "before-audit", "before-marker-delete"];
+  const points: CrashPoint[] = ["before-changes", "before-audit", "torn-audit", "before-marker-delete"];
   /** Reopens the library as after a crash (recovery runs on open). */
   async function reopen(): Promise<void> {
     handle.close();
