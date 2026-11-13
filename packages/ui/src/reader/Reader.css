@@ -378,7 +378,10 @@
   padding: 0;
 }
 
-/* Windowed (past 500 entries): each entry in a slot of its own; its top is set by the list. */
+/*
+ * Windowed (past 500 entries): each entry placed at its measured offset, at its own full height
+ * (A13: nothing is cut off); its top is set by the list.
+ */
 .ao-ann-list--windowed {
   position: relative;
 }
@@ -397,27 +400,22 @@
   left: 0;
   right: 0;
   box-sizing: border-box;
-  overflow: hidden;
-}
-
-.ao-ann-entry--slot .ao-ann-quote,
-.ao-ann-entry--slot .ao-ann-note {
-  max-height: 2.8em;
-  overflow: hidden;
-}
-
-.ao-ann-entry--grown {
-  z-index: 1;
-}
-
-.ao-ann-entry--grown .ao-ann-quote,
-.ao-ann-entry--grown .ao-ann-note {
-  max-height: none;
 }
 
 .ao-ann-entry--open {
-  overflow: visible;
   z-index: 2;
+}
+
+.ao-ann-saving {
+  margin: var(--space-1) 0;
+  font-size: 0.9rem;
+  font-style: italic;
+}
+
+/* Disabled while a change of the entry is on its way: aria-disabled, so that the focus stays. */
+.ao-ann-entry button[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: progress;
 }
 
 .ao-ann-entry:focus-visible {

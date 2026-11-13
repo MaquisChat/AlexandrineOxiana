@@ -1,12 +1,15 @@
 /**
- * The annotation list beside the pages (Task R9): the accessible route to every highlight and note
- * of the file being read (the overlay on the page is hidden from assistive technology, R8).
+ * The annotation list beside the pages (Task R9, with Amendment A13): the accessible route to every
+ * highlight and note of the file being read (the overlay on the page is hidden from assistive
+ * technology, R8).
  *
- *  - A region "Annotations (N)" (N: this file's), its list in the order the service gives it (the
- *    route orders by document, then `sortAnnotations`, R1 and A1: the list never reorders), then
- *    "On another file of this source (N)" and "Not placed on a page (N)". Each entry says its kind,
- *    its colour by name (beside a swatch: never by colour alone), its page (and printed label), the
- *    quote and the note through UserText, "Imported from Zotero", the author of an imported one, and
+ *  - A region "Annotations (N)" (N: this file's). Its list is sorted here with R1's
+ *    `sortAnnotations` over each annotation's anchors on this file (A13: the service's order is not
+ *    relied on; it is wrong for an annotation on two files). Then "On another file of this source
+ *    (N)" (anchors only on another file, a PDF or an EPUB: read only, no "Delete" here) and "Not
+ *    placed on a page (N)" (no anchor at all: A5's sentence, can be deleted). Each entry says its
+ *    kind, its colour by name (beside a swatch: never by colour alone), its page (and printed label),
+ *    the quote and the note through UserText, "Imported from Zotero" (no author for now, A13), and
  *    the sentences that R8's temporary region used to say (A11): the text changed, the page missing,
  *    the place no longer known (A5).
  *  - Buttons "Go to", "Edit note" / "Add note", "Colour", "Delete", each named with the kind, colour
@@ -18,27 +21,40 @@
  *    it back (R145); after a delete the focus goes to the next entry, the previous one for the last,
  *    the heading when none is left.
  *  - Nothing is saved by itself (R192): a note by "Save note" or Ctrl/Cmd+Enter, exactly as typed (an
- *    empty one removes the note: `null`); "Cancel" and Escape keep what was there.
+ *    empty one removes the note: `null`). A CHANGED note is not abandoned without the question
+ *    "Discard this note?" ("Discard", "Keep editing"; R192 e, A13): on Escape, on "Cancel", and on
+ *    leaving through the app's own navigation (`blockNavigation`, the mechanism the recovery code
+ *    uses, R134) or reloading. An unchanged note closes without a question; a list that goes (the
+ *    reader ended) asks nothing and holds nothing.
  *  - The service decides: each change waits for the screen's answer (which shows the service's
  *    record); a refusal shows the service's sentence in an alert in the entry, and changes nothing.
- *    One request at a time per entry; recolouring to the colour shown sends nothing (A5). An answer
- *    the screen dropped (`AnswerDropped`: the reader ended, the file changed) shows nothing, and any
- *    answer arriving after the list went or its file changed is ignored.
- *  - Every result is said in ONE polite live region: "Highlight recoloured: Green.", "Note saved.",
- *    "Note removed.", "Highlight deleted." ("Note …" for a note).
+ *    While a change of an entry is on its way, that entry says "Saving…" (said once in the live
+ *    region) and its other change controls are disabled (`aria-disabled`, so the focus is kept); a
+ *    late answer never closes or replaces a draft typed meanwhile (A13). Recolouring to the colour
+ *    shown sends nothing (A5). An answer the screen dropped (`AnswerDropped`) shows nothing; an
+ *    answer arriving after the list went or its file changed is ignored. `ListBroughtUpToDate` (the
+ *    annotation was no longer there; the screen asks for the list again) is said for the list.
+ *  - Every result is said in ONE polite live region: "Saving…", "Highlight recoloured: Green.",
+ *    "Note saved.", "Note removed.", "Highlight deleted." ("Note …" for a note).
  *  - Read-only: only "Go to" is enabled; the others stay, disabled, and the panel says why once.
- *  - Past WINDOW_FROM entries a list is windowed: only the entries near the view (and the one with
- *    the focus, the one being edited, any with a menu or an alert) are in the page, each in a slot of
- *    ENTRY_PX; an entry that grows (an editor, an alert) pushes those after it down by what it grew.
+ *  - Past WINDOW_FROM entries a list is windowed: only the entries near the view (and those with the
+ *    focus, an editor, a menu, a dialog or an alert) are in the page. Every entry has its own real,
+ *    measured height (A13: nothing is ever cut off; a long note, an editor, larger text); entries not
+ *    measured yet count ENTRY_ESTIMATE_PX. `offsetsOf` and `windowOf` are the arithmetic.
  *    `aria-setsize` and `aria-posinset` keep each entry's place in the whole list.
  *
  * `filterWords` is Task R12's (the list filtered to a search's words); it is accepted and not used yet.
  */
+import { sortAnnotations } from "@ao/core/annotations/sortIndex";
 import { HIGHLIGHT_COLOUR_NAMES } from "@ao/shared";
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type UIEvent } from "react";
+import { memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type UIEvent } from "react";
 import type { AnnotationKind, AnnotationRecord, HighlightColourName } from "../api/reader";
 import { DialogShell } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
+import { blockNavigation, navigate } from "../navigation";
+
+/** R1's annotation shape, as `sortAnnotations` takes it (the root of @ao/core stays out of the interface). */
+type Annotation = Parameters<typeof sortAnnotations>[0][number];
 
 /** Said of a highlight whose quote no longer matches the text under its rectangles (R8, A11). */
 export const HIGHLIGHT_CHANGED_SENTENCE = "The text here has changed since this highlight was made.";
@@ -46,18 +62,22 @@ export const HIGHLIGHT_CHANGED_SENTENCE = "The text here has changed since this 
 export const missingPageSentence = (page: number) => `This highlight is on page ${page}, which this file does not have.`;
 /** Said of a note on a page the open file does not have. */
 export const missingNoteSentence = (page: number) => `This note is on page ${page}, which this file does not have.`;
-/** Said of an annotation with no place at all (A5). */
+/** Said of an annotation with no anchor at all (A5). */
 export const PLACE_UNKNOWN = "This highlight's place in the document is no longer known.";
-/** Said of a note with no place on a page. */
+/** Said of a note with no anchor at all. */
 export const NOTE_NOT_PLACED = "This note is not placed on a page.";
 /** Said when the list of annotations could not be had (the service's own sentence follows). */
 export const ANNOTATIONS_NOT_SHOWN = "The highlights of this file could not be shown";
 /** Said once in the panel of a read-only library. */
 export const ANNOTATIONS_READ_ONLY = "This library is read-only, so highlights cannot be changed.";
+/** Said when a change found its annotation gone and the list was asked for again (A13). */
+export const LIST_BROUGHT_UP_TO_DATE = "That highlight or note was no longer there. The list has been brought up to date.";
+/** Said while a change is on its way. */
+export const SAVING = "Saving…";
 /** Lists longer than this are windowed. */
 export const WINDOW_FROM = 500;
-/** The height of an entry's slot in a windowed list, in CSS pixels. */
-export const ENTRY_PX = 136;
+/** The height counted for an entry of a windowed list not measured yet, in CSS pixels. */
+export const ENTRY_ESTIMATE_PX = 136;
 /** Entries kept in the page either side of the view, in a windowed list. */
 const OVERSCAN = 6;
 /** The list's view height when the page has no layout to measure (tests). */
@@ -73,8 +93,46 @@ export class AnswerDropped extends Error {
   }
 }
 
+/** Thrown (rejected) by the screen when the annotation was no longer there and the list is being asked for again. */
+export class ListBroughtUpToDate extends Error {
+  override name = "ListBroughtUpToDate";
+  constructor() {
+    super(LIST_BROUGHT_UP_TO_DATE);
+  }
+}
+
+/** The top of each entry and, last, the whole height: offsets[i] is where entry i starts. */
+export function offsetsOf(heights: readonly number[]): number[] {
+  const out = new Array<number>(heights.length + 1);
+  out[0] = 0;
+  for (let i = 0; i < heights.length; i++) out[i + 1] = out[i]! + heights[i]!;
+  return out;
+}
+
+/** The first entry whose offset is above or at `y` (binary search; `offsets.length - 1` if none). */
+function firstAt(offsets: readonly number[], y: number, from: number): number {
+  let lo = from;
+  let hi = offsets.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (offsets[mid]! >= y) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
+/** The entries [from, to) that touch the view from `top` for `view` pixels, with `overscan` either side. */
+export function windowOf(offsets: readonly number[], top: number, view: number, overscan: number): [number, number] {
+  const n = offsets.length - 1;
+  // The first entry whose bottom is below the view's top.
+  let from = Math.max(0, firstAt(offsets, top, 0) - 1);
+  while (from < n && offsets[from + 1]! <= top) from++;
+  const to = Math.max(from, firstAt(offsets, top + view, from));
+  return [Math.max(0, Math.min(from, to) - overscan), Math.min(n, to + overscan)];
+}
+
 export interface AnnotationListProps {
-  /** The source's annotations, in the service's order. */
+  /** The source's annotations (the list groups and sorts them itself). */
   annotations: AnnotationRecord[];
   /** The file being read. */
   assetId: string;
@@ -115,7 +173,7 @@ type Group = "here" | "elsewhere" | "unplaced";
 interface Entry {
   a: AnnotationRecord;
   group: Group;
-  /** The page shown (here: the first on this file; elsewhere: the first of all). */
+  /** The page shown (here: the first on this file; elsewhere: the first PDF page, if any). */
   page?: number;
   /** The page "Go to" goes to (none: it cannot). */
   goPage?: number;
@@ -135,9 +193,22 @@ function opening(s: string, n: number): string {
 }
 
 function describe(a: AnnotationRecord, group: Group, page: number | undefined): string {
-  const where = group === "unplaced" ? "not placed on a page" : group === "elsewhere" ? `on page ${page} of another file` : `on page ${page}`;
+  const where = group === "unplaced" ? "not placed on a page" : group === "elsewhere" ? (page !== undefined ? `on page ${page} of another file` : "on another file") : `on page ${page}`;
   const words = a.quote || a.body;
   return `${a.colorName} ${kindLabel(a.kind).toLowerCase()} ${where}${words ? `, “${opening(words, NAME_WORDS)}”` : ""}`;
+}
+
+/** This file's entries in R1's reading order, over each annotation's anchors on this file (A4, A13). */
+function sortedHere(entries: Entry[], assetId: string): Entry[] {
+  const proxies = entries.map((e) => ({
+    id: e.a.id,
+    createdAt: e.a.createdAt,
+    anchors: e.a.pdfAnchors
+      .filter((x) => x.assetId === assetId)
+      .map((x) => ({ kind: "pdf" as const, id: x.id, assetId: x.assetId, page: x.page, rects: x.rects, ...(x.sortIndexDerived ? {} : { sortIndex: x.sortIndex }) })),
+    entry: e,
+  }));
+  return sortAnnotations(proxies as unknown as Array<Annotation & { entry: Entry }>).map((p) => p.entry);
 }
 
 function entriesOf(list: AnnotationRecord[], assetId: string, pageCount: number | undefined): { groups: Record<Group, Entry[]>; flat: Entry[] } {
@@ -150,9 +221,12 @@ function entriesOf(list: AnnotationRecord[], assetId: string, pageCount: number 
       const present = pages.filter((p) => pageCount === undefined || p <= pageCount);
       const missing = pageCount === undefined ? [] : [...new Set(pages.filter((p) => p > pageCount))].sort((x, y) => x - y);
       groups.here.push({ ...base, group: "here", page, ...(present.length > 0 ? { goPage: Math.min(...present) } : {}), missing });
-    } else if (a.pdfAnchors.length > 0) groups.elsewhere.push({ ...base, group: "elsewhere", page: Math.min(...a.pdfAnchors.map((x) => x.page)) });
-    else groups.unplaced.push({ ...base, group: "unplaced" });
+    } else if (a.pdfAnchors.length > 0 || a.otherAnchorKinds.length > 0) {
+      // On another file of the source: a PDF, or another kind of anchor (an EPUB passage, …).
+      groups.elsewhere.push({ ...base, group: "elsewhere", ...(a.pdfAnchors.length > 0 ? { page: Math.min(...a.pdfAnchors.map((x) => x.page)) } : {}) });
+    } else groups.unplaced.push({ ...base, group: "unplaced" });
   }
+  groups.here = sortedHere(groups.here, assetId);
   const flat: Entry[] = [];
   for (const g of ["here", "elsewhere", "unplaced"] as const) {
     const size = groups[g].length;
@@ -169,7 +243,7 @@ function entriesOf(list: AnnotationRecord[], assetId: string, pageCount: number 
 
 const messageOf = (e: unknown) => (e instanceof Error && e.message ? e.message : "The library service did not answer.");
 
-type FocusWant = { id: string; what: "entry" | "note" | "colour" | "delete" } | "heading";
+type FocusWant = { id: string; what: "entry" | "note" | "note-area" | "colour" | "delete" } | "heading";
 
 /** What an entry's buttons do: one stable object, so that entries are drawn again only when their own inputs change. */
 interface Actions {
@@ -178,7 +252,8 @@ interface Actions {
   menu(id: string): void;
   confirm(id: string): void;
   saveNote(id: string, text: string): void;
-  cancelNote(id: string): void;
+  abandonNote(id: string, text: string): void;
+  draft(id: string, text: string, dirty: boolean): void;
   choose(id: string, c: HighlightColourName): void;
   closeMenu(id: string, restore: boolean): void;
 }
@@ -189,15 +264,16 @@ interface EntryViewProps {
   selected: boolean;
   editing: boolean;
   menuOpen: boolean;
+  pending: boolean;
   error?: string;
   readOnly: boolean;
   changed: boolean;
-  /** Absolutely placed in a windowed list: its top, and whether it may grow beyond its slot. */
-  slot?: { top: number; grow: boolean };
+  /** Absolutely placed in a windowed list, at its measured offset. */
+  top?: number;
   act: Actions;
 }
 
-const EntryView = memo(function EntryView({ e, active, selected, editing, menuOpen, error, readOnly, changed, slot, act }: EntryViewProps) {
+const EntryView = memo(function EntryView({ e, active, selected, editing, menuOpen, pending, error, readOnly, changed, top, act }: EntryViewProps) {
   const { a } = e;
   const id = a.id;
   const tab = active ? 0 : -1;
@@ -205,13 +281,15 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
   for (const p of e.missing) sentences.push(a.kind === "note" ? missingNoteSentence(p) : missingPageSentence(p));
   if (changed) sentences.push(HIGHLIGHT_CHANGED_SENTENCE);
   if (e.group === "unplaced") sentences.push(a.kind === "note" ? NOTE_NOT_PLACED : PLACE_UNKNOWN);
-  const fixedOnly = e.group === "unplaced";
+  // Another file's annotation is read only here; one with no anchor can only be deleted (A5, A13).
+  const noChange = readOnly || e.group !== "here";
   const label = a.pageLabel !== undefined && a.pageLabel !== "" && a.pageLabel !== String(e.page) ? a.pageLabel : undefined;
   const classes = ["ao-ann-entry"];
   if (selected) classes.push("ao-ann-entry--selected");
-  if (slot) classes.push(slot.grow ? "ao-ann-entry--slot ao-ann-entry--grown" : "ao-ann-entry--slot");
-  // Its colour menu is not cut off by a windowed slot.
+  if (top !== undefined) classes.push("ao-ann-entry--slot");
+  // Its colour menu lies over the entries after it.
   if (menuOpen) classes.push("ao-ann-entry--open");
+  const held = pending || undefined;
   return (
     <li
       data-entry={id}
@@ -219,8 +297,9 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
       aria-setsize={e.size}
       aria-posinset={e.pos}
       aria-current={selected || undefined}
+      aria-busy={held}
       className={classes.join(" ")}
-      style={{ top: slot ? `${slot.top}px` : undefined, height: slot && !slot.grow ? `${ENTRY_PX}px` : undefined }}
+      style={{ top: top !== undefined ? `${top}px` : undefined }}
     >
       <p className="ao-ann-head">
         <span className={`ao-ann-swatch ao-ann-swatch--${a.colorName}`} aria-hidden="true" />
@@ -252,33 +331,40 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
           {a.body}
         </UserText>
       )}
-      {a.imported && (
-        <p className="ao-ann-meta">
-          Imported from Zotero
-          {a.author.trim() !== "" && (
-            <>
-              {", by "}
-              <UserText>{a.author}</UserText>
-            </>
-          )}
-        </p>
-      )}
+      {a.imported && <p className="ao-ann-meta">Imported from Zotero</p>}
       {sentences.map((s) => (
         <p key={s} className="ao-ann-sentence">
           {s}
         </p>
       ))}
+      {pending && <p className="ao-ann-saving">{SAVING}</p>}
       {error !== undefined && (
         <p role="alert" className="ao-ann-error">
           {error}
         </p>
       )}
-      {editing && <NoteEditor initial={a.body ?? ""} onSave={(t) => act.saveNote(id, t)} onCancel={() => act.cancelNote(id)} />}
+      {editing && (
+        <NoteEditor
+          saved={a.body ?? ""}
+          pending={pending}
+          onSave={(t) => act.saveNote(id, t)}
+          onAbandon={(t) => act.abandonNote(id, t)}
+          onDraft={(t, dirty) => act.draft(id, t, dirty)}
+        />
+      )}
       <div className="ao-ann-actions">
         <button type="button" tabIndex={tab} data-act="go" disabled={e.goPage === undefined} aria-label={`Go to ${e.desc}`} onClick={() => act.jump(id)}>
           Go to
         </button>
-        <button type="button" tabIndex={tab} data-act="note" disabled={readOnly || fixedOnly || editing} aria-label={a.body ? `Edit note of ${e.desc}` : `Add note to ${e.desc}`} onClick={() => act.edit(id)}>
+        <button
+          type="button"
+          tabIndex={tab}
+          data-act="note"
+          disabled={noChange || editing}
+          aria-disabled={held}
+          aria-label={a.body ? `Edit note of ${e.desc}` : `Add note to ${e.desc}`}
+          onClick={() => !pending && act.edit(id)}
+        >
           {a.body ? "Edit note" : "Add note"}
         </button>
         <span className="ao-ann-menu-anchor">
@@ -286,51 +372,63 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
             type="button"
             tabIndex={tab}
             data-act="colour"
-            disabled={readOnly || fixedOnly}
+            disabled={noChange}
+            aria-disabled={held}
             aria-haspopup="menu"
             aria-expanded={menuOpen}
             aria-label={`Colour of ${e.desc}`}
-            onClick={() => (menuOpen ? act.closeMenu(id, true) : act.menu(id))}
+            onClick={() => (pending ? undefined : menuOpen ? act.closeMenu(id, true) : act.menu(id))}
           >
             Colour
           </button>
           {menuOpen && <ColourMenu label={`Colour of ${e.desc}`} current={a.colorName} onChoose={(c) => act.choose(id, c)} onClose={(restore) => act.closeMenu(id, restore)} />}
         </span>
-        <button type="button" tabIndex={tab} data-act="delete" disabled={readOnly} aria-label={`Delete ${e.desc}`} onClick={() => act.confirm(id)}>
-          Delete
-        </button>
+        {e.group !== "elsewhere" && (
+          <button type="button" tabIndex={tab} data-act="delete" disabled={readOnly} aria-disabled={held} aria-label={`Delete ${e.desc}`} onClick={() => !pending && act.confirm(id)}>
+            Delete
+          </button>
+        )}
       </div>
     </li>
   );
 });
 
-/** The note's text area: "Save note" or Ctrl/Cmd+Enter save it as typed; "Cancel" or Escape keep what was there. */
-function NoteEditor({ initial, onSave, onCancel }: { initial: string; onSave(text: string): void; onCancel(): void }) {
+/**
+ * The note's text area: "Save note" or Ctrl/Cmd+Enter save it as typed; "Cancel" or Escape abandon
+ * it (the list asks first when it was changed). While a save is on its way the text can still be
+ * typed in; "Save note" and "Cancel" wait for the answer.
+ */
+function NoteEditor({ saved, pending, onSave, onAbandon, onDraft }: { saved: string; pending: boolean; onSave(text: string): void; onAbandon(text: string): void; onDraft(text: string, dirty: boolean): void }) {
   const id = useId();
-  const [text, setText] = useState(initial);
+  const [text, setText] = useState(saved);
   const ref = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     ref.current?.focus();
   }, []);
+  const draft = useRef(onDraft);
+  draft.current = onDraft;
+  useEffect(() => {
+    draft.current(text, text !== saved);
+  }, [text, saved]);
   const onKey = (ev: KeyboardEvent<HTMLTextAreaElement>) => {
     if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
       ev.preventDefault();
-      onSave(text);
+      if (!pending) onSave(text);
     } else if (ev.key === "Escape") {
       ev.preventDefault();
       ev.stopPropagation();
-      onCancel();
+      if (!pending) onAbandon(text);
     }
   };
   return (
     <div className="ao-ann-editor">
       <label htmlFor={`${id}-note`}>Note</label>
-      <textarea id={`${id}-note`} ref={ref} dir="auto" rows={4} value={text} onChange={(ev) => setText(ev.target.value)} onKeyDown={onKey} />
+      <textarea id={`${id}-note`} ref={ref} data-act="note-area" dir="auto" rows={4} value={text} onChange={(ev) => setText(ev.target.value)} onKeyDown={onKey} />
       <div className="ao-ann-actions">
-        <button type="button" onClick={() => onSave(text)}>
+        <button type="button" aria-disabled={pending || undefined} onClick={() => !pending && onSave(text)}>
           Save note
         </button>
-        <button type="button" onClick={onCancel}>
+        <button type="button" aria-disabled={pending || undefined} onClick={() => !pending && onAbandon(text)}>
           Cancel
         </button>
       </div>
@@ -391,22 +489,22 @@ function ColourMenu({ label, current, onChoose, onClose }: { label: string; curr
   );
 }
 
-/** "Delete this highlight?" with "Delete" and "Keep it"; the focus starts on "Keep it". */
-function DeleteDialog({ kind, onConfirm, onCancel }: { kind: AnnotationKind; onConfirm(): void; onCancel(): void }) {
+/** A question with a dangerous answer and a safe one; the focus starts on the safe one (R145). */
+function Question({ title, yes, no, onYes, onNo }: { title: string; yes: string; no: string; onYes(): void; onNo(): void }) {
   const id = useId();
-  const keep = useRef<HTMLButtonElement>(null);
+  const safe = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    keep.current?.focus();
+    safe.current?.focus();
   }, []);
   return (
-    <DialogShell labelledBy={`${id}-t`} onCancel={onCancel} className="ao-ann-dialog">
-      <h2 id={`${id}-t`}>{kind === "note" ? "Delete this note?" : "Delete this highlight?"}</h2>
+    <DialogShell labelledBy={`${id}-t`} onCancel={onNo} className="ao-ann-dialog">
+      <h2 id={`${id}-t`}>{title}</h2>
       <div className="ao-ann-actions">
-        <button type="button" className="ao-danger" onClick={onConfirm}>
-          Delete
+        <button type="button" className="ao-danger" onClick={onYes}>
+          {yes}
         </button>
-        <button type="button" ref={keep} onClick={onCancel}>
-          Keep it
+        <button type="button" ref={safe} onClick={onNo}>
+          {no}
         </button>
       </div>
     </DialogShell>
@@ -425,11 +523,20 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
   const [editing, setEditing] = useState<string | undefined>(undefined);
   const [menuFor, setMenuFor] = useState<string | undefined>(undefined);
   const [confirmFor, setConfirmFor] = useState<string | undefined>(undefined);
+  /** The question "Discard this note?", with what a Discard does. */
+  const [discardAsk, setDiscardAsk] = useState<{ id: string; then: () => void } | undefined>(undefined);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [pending, setPending] = useState<Record<string, true>>({});
+  const [notice, setNotice] = useState<string | undefined>(undefined);
   const [said, setSaid] = useState<{ text: string; n: number } | undefined>(undefined);
   const [scroll, setScroll] = useState({ top: 0, view: FALLBACK_VIEW_PX });
-  const [grows, setGrows] = useState<Record<string, number>>({});
+  /** Measured heights of windowed entries, by id; `heightsSeen` moves on when one changes. */
+  const heights = useRef(new Map<string, number>());
+  const [heightsSeen, setHeightsSeen] = useState(0);
   const [, setTick] = useState(0);
+  /** Whether the note being edited differs from what is saved (the way out is then held, R192 e). */
+  const [dirty, setDirty] = useState(false);
+  const draftNow = useRef<{ id: string; text: string } | undefined>(undefined);
   const scroller = useRef<HTMLDivElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   const lists = useRef<Partial<Record<Group, HTMLUListElement | null>>>({});
@@ -438,6 +545,8 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
   /** Moves on when the file changes: answers to changes asked before are ignored. */
   const epoch = useRef(0);
   const want = useRef<FocusWant | undefined>(undefined);
+  /** An entry whose change found it gone: where the focus goes if it leaves the list. */
+  const goneFocus = useRef<{ id: string; after?: string } | undefined>(undefined);
   const windowed = (g: Group) => groups[g].length > WINDOW_FROM;
   const anyWindowed = windowed("here") || windowed("elsewhere") || windowed("unplaced");
 
@@ -455,65 +564,64 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     epoch.current++;
     busy.current.clear();
     want.current = undefined;
+    draftNow.current = undefined;
   }
   useEffect(() => {
     setEditing(undefined);
     setMenuFor(undefined);
     setConfirmFor(undefined);
+    setDiscardAsk(undefined);
     setErrors({});
+    setPending({});
+    setNotice(undefined);
     setSaid(undefined);
-    setGrows({});
+    setDirty(false);
   }, [assetId]);
 
   const view = () => scroller.current?.clientHeight || FALLBACK_VIEW_PX;
 
-  /** The top of entry `i` of a windowed group, within its list. */
-  const topIn = useCallback(
-    (g: Group, i: number) => {
-      let top = i * ENTRY_PX;
-      for (const [id, px] of Object.entries(grows)) {
-        const e = byId.get(id);
-        if (e && e.group === g && e.pos - 1 < i) top += px;
-      }
-      return top;
-    },
-    [grows, byId],
-  );
+  /** The measured offsets of each windowed group's entries. */
+  const offsets = useMemo(() => {
+    const out: Partial<Record<Group, number[]>> = {};
+    for (const g of ["here", "elsewhere", "unplaced"] as const) if (groups[g].length > WINDOW_FROM) out[g] = offsetsOf(groups[g].map((e) => heights.current.get(e.a.id) ?? ENTRY_ESTIMATE_PX));
+    return out;
+    // `heightsSeen` stands for the measured heights.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, heightsSeen]);
 
   /** Scrolls the list so that entry `id` is in view (in a windowed list, so that it is in the page at all). */
-  const reveal = useCallback(
-    (id: string) => {
-      const el = scroller.current;
-      const e = byId.get(id);
-      if (!el || !e) return;
-      let top: number;
-      let height = ENTRY_PX;
-      if (windowed(e.group)) top = (lists.current[e.group]?.offsetTop ?? 0) + topIn(e.group, e.pos - 1);
-      else {
-        const li = [...el.querySelectorAll<HTMLElement>("[data-entry]")].find((x) => x.dataset.entry === id);
-        if (!li) return;
-        const at = li.getBoundingClientRect();
-        top = at.top - el.getBoundingClientRect().top + el.scrollTop;
-        height = at.height;
-      }
-      const v = view();
-      const now = el.scrollTop;
-      const next = top < now ? top : top + height > now + v ? top + height - v : now;
-      if (next !== now) el.scrollTop = next;
-      if (anyWindowed) setScroll({ top: next, view: v });
-    },
-    // `windowed` reads `groups`.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [byId, topIn, groups, anyWindowed],
-  );
+  const reveal = (id: string) => {
+    const el = scroller.current;
+    const e = byId.get(id);
+    if (!el || !e) return;
+    let top: number;
+    let height: number;
+    const o = offsets[e.group];
+    if (o) {
+      top = (lists.current[e.group]?.offsetTop ?? 0) + o[e.pos - 1]!;
+      height = o[e.pos]! - o[e.pos - 1]!;
+    } else {
+      const li = [...el.querySelectorAll<HTMLElement>("[data-entry]")].find((x) => x.dataset.entry === id);
+      if (!li) return;
+      const at = li.getBoundingClientRect();
+      top = at.top - el.getBoundingClientRect().top + el.scrollTop;
+      height = at.height;
+    }
+    const v = view();
+    const now = el.scrollTop;
+    const next = top < now ? top : top + height > now + v ? top + height - v : now;
+    if (next !== now) el.scrollTop = next;
+    if (anyWindowed) setScroll({ top: next, view: v });
+  };
 
   const focusLater = (w: FocusWant) => {
     want.current = w;
     setTick((n) => n + 1);
   };
 
-  // Focus placed where it was asked for, once the entry is in the page (revealing it first in a windowed list).
-  useLayoutEffect(() => {
+  // Focus placed where it was asked for, once the entry is in the page (revealing it first in a
+  // windowed list). A passive effect: it runs after a closing dialog has given the focus back.
+  useEffect(() => {
     const w = want.current;
     if (!w) return;
     if (w === "heading") {
@@ -535,16 +643,47 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     target?.focus();
   });
 
-  // In a windowed list, an entry that grew beyond its slot (an editor, an alert) pushes the next ones down.
+  // An entry whose change found it gone, and now gone from the list: the focus to the next one.
+  useEffect(() => {
+    const g = goneFocus.current;
+    if (!g || byId.has(g.id)) return;
+    goneFocus.current = undefined;
+    const active = document.activeElement;
+    if (active && active !== document.body && active.isConnected) return;
+    if (g.after !== undefined && byId.has(g.after)) {
+      setActiveId(g.after);
+      focusLater({ id: g.after, what: "entry" });
+    } else focusLater("heading");
+  }, [byId]);
+
+  // In a windowed list every entry in the page is measured, and measured again when its size changes
+  // (an editor, an alert, larger text): its real height places the ones after it (A13).
+  const resized = useRef<ResizeObserver | undefined>(undefined);
+  useEffect(() => {
+    if (!anyWindowed || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setTick((n) => n + 1));
+    resized.current = ro;
+    return () => {
+      ro.disconnect();
+      resized.current = undefined;
+    };
+  }, [anyWindowed]);
   useLayoutEffect(() => {
     if (!anyWindowed) return;
-    const next: Record<string, number> = {};
-    for (const li of scroller.current?.querySelectorAll<HTMLElement>(".ao-ann-entry--grown") ?? []) {
-      const px = Math.max(0, li.offsetHeight - ENTRY_PX);
-      if (px > 0 && li.dataset.entry) next[li.dataset.entry] = px;
+    let moved = false;
+    const ro = resized.current;
+    ro?.disconnect();
+    for (const li of scroller.current?.querySelectorAll<HTMLElement>(".ao-ann-entry--slot") ?? []) {
+      ro?.observe(li);
+      const id = li.dataset.entry;
+      const h = li.offsetHeight;
+      // No layout (0: not measurable here) keeps the estimate.
+      if (id !== undefined && h > 0 && heights.current.get(id) !== h) {
+        heights.current.set(id, h);
+        moved = true;
+      }
     }
-    const same = Object.keys(next).length === Object.keys(grows).length && Object.entries(next).every(([k, v]) => grows[k] === v);
-    if (!same) setGrows(next);
+    if (moved) setHeightsSeen((n) => n + 1);
   });
 
   // A highlight chosen on the page: its entry is marked and the list scrolls to it, the focus left where it is.
@@ -556,6 +695,40 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
+  // A changed note holds the app's own way out (and a reload) until it is saved or discarded (R192 e).
+  // When the list goes (the reader ended), the hold goes with it and nothing is asked.
+  const askDiscard = useRef<(then: () => void) => void>(() => {});
+  askDiscard.current = (then) => {
+    const id = draftNow.current?.id ?? editing;
+    if (id === undefined) return;
+    setDiscardAsk({
+      id,
+      then: () => {
+        closeEditor(id);
+        then();
+      },
+    });
+  };
+  useEffect(() => {
+    if (!dirty) return;
+    let release = () => {};
+    release = blockNavigation((href?: string) =>
+      askDiscard.current(() => {
+        release();
+        if (href !== undefined) navigate(href);
+      }),
+    );
+    const onUnload = (ev: BeforeUnloadEvent) => {
+      ev.preventDefault();
+      ev.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      release();
+      window.removeEventListener("beforeunload", onUnload);
+    };
+  }, [dirty]);
+
   const say = (text: string) => setSaid((s) => ({ text, n: (s?.n ?? 0) + 1 }));
   const clearError = (id: string) =>
     setErrors((m) => {
@@ -563,23 +736,52 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
       const { [id]: _gone, ...rest } = m;
       return rest;
     });
+  const setPendingOf = (id: string, on: boolean) =>
+    setPending((m) => {
+      if (on === !!m[id]) return m;
+      if (on) return { ...m, [id]: true };
+      const { [id]: _done, ...rest } = m;
+      return rest;
+    });
+  const closeEditor = (id: string) => {
+    setEditing((x) => (x === id ? undefined : x));
+    if (draftNow.current?.id === id) draftNow.current = undefined;
+    setDirty(false);
+  };
 
-  /** One change of entry `id`: one at a time; its answer ignored once the list went or its file changed. */
+  /**
+   * One change of entry `id`: one at a time, the entry saying "Saving…" meanwhile; its answer ignored
+   * once the list went or its file changed.
+   */
   const run = async (id: string, call: () => Promise<void>, ok: () => void) => {
     if (busy.current.has(id)) return;
     busy.current.add(id);
     const at = epoch.current;
+    const i = latest.current.flat.findIndex((x) => x.a.id === id);
+    const after = (latest.current.flat[i + 1] ?? latest.current.flat[i - 1])?.a.id;
     clearError(id);
+    setNotice(undefined);
+    setPendingOf(id, true);
+    say(SAVING);
+    const current = () => mounted.current && epoch.current === at;
     try {
       await call();
     } catch (err) {
-      if (!mounted.current || epoch.current !== at || err instanceof AnswerDropped) return;
-      setErrors((m) => ({ ...m, [id]: messageOf(err) }));
+      if (!current()) return;
+      setSaid(undefined);
+      if (err instanceof AnswerDropped) return;
+      if (err instanceof ListBroughtUpToDate) {
+        setNotice(err.message);
+        goneFocus.current = { id, ...(after !== undefined ? { after } : {}) };
+      } else setErrors((m) => ({ ...m, [id]: messageOf(err) }));
       return;
     } finally {
-      if (epoch.current === at) busy.current.delete(id);
+      if (epoch.current === at) {
+        busy.current.delete(id);
+        if (mounted.current) setPendingOf(id, false);
+      }
     }
-    if (!mounted.current || epoch.current !== at) return;
+    if (!current()) return;
     ok();
   };
 
@@ -593,21 +795,31 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
         if (e?.goPage !== undefined) latest.current.onJump(id);
       },
       edit: (id) => {
-        if (latest.current.readOnly) return;
+        if (latest.current.readOnly || busy.current.has(id)) return;
         clearError(id);
         setEditing(id);
       },
-      cancelNote: (id) => {
-        setEditing((x) => (x === id ? undefined : x));
-        focusLater({ id, what: "note" });
+      draft: (id, text, isDirty) => {
+        draftNow.current = { id, text };
+        setDirty(isDirty);
+      },
+      abandonNote: (id, text) => {
+        const e = latest.current.byId.get(id);
+        const close = () => {
+          closeEditor(id);
+          focusLater({ id, what: "note" });
+        };
+        // Unchanged: closes at once. Changed: asked first (R192 e).
+        if (!e || text === (e.a.body ?? "")) close();
+        else setDiscardAsk({ id, then: close });
       },
       saveNote: (id, text) => {
         const e = latest.current.byId.get(id);
-        if (!e || latest.current.readOnly) return;
+        if (!e || latest.current.readOnly || busy.current.has(id)) return;
         // Exactly as typed: nothing trimmed; an empty note removes it.
         const body = text === "" ? null : text;
         if (body === (e.a.body ?? null)) {
-          setEditing((x) => (x === id ? undefined : x));
+          closeEditor(id);
           focusLater({ id, what: "note" });
           return;
         }
@@ -615,14 +827,17 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
           id,
           () => latest.current.onSaveNote(id, body),
           () => {
-            setEditing((x) => (x === id ? undefined : x));
-            focusLater({ id, what: "note" });
+            // A draft typed on meanwhile is kept, open, to be saved or discarded (A13).
+            if (draftNow.current?.id !== id || draftNow.current.text === text) {
+              closeEditor(id);
+              focusLater({ id, what: "note" });
+            }
             say(body === null ? "Note removed." : "Note saved.");
           },
         );
       },
       menu: (id) => {
-        if (latest.current.readOnly) return;
+        if (latest.current.readOnly || busy.current.has(id)) return;
         setMenuFor(id);
       },
       closeMenu: (id, restore) => {
@@ -710,7 +925,7 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     setScroll({ top: el.scrollTop, view: el.clientHeight || FALLBACK_VIEW_PX });
   };
 
-  const view_ = (e: Entry, slot?: EntryViewProps["slot"]) => (
+  const view_ = (e: Entry, top?: number) => (
     <EntryView
       key={e.a.id}
       e={e}
@@ -718,10 +933,11 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
       selected={e.a.id === selectedId}
       editing={editing === e.a.id}
       menuOpen={menuFor === e.a.id}
+      pending={pending[e.a.id] === true}
       {...(errors[e.a.id] !== undefined ? { error: errors[e.a.id] } : {})}
       readOnly={readOnly}
       changed={changed?.has(e.a.id) ?? false}
-      {...(slot ? { slot } : {})}
+      {...(top !== undefined ? { top } : {})}
       act={act}
     />
   );
@@ -731,7 +947,8 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     const ref = (el: HTMLUListElement | null) => {
       lists.current[g] = el;
     };
-    if (!windowed(g)) {
+    const o = offsets[g];
+    if (!o) {
       return (
         <ul ref={ref} aria-labelledby={labelId} className="ao-ann-list">
           {items.map((e) => view_(e))}
@@ -740,23 +957,17 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
     }
     // Windowed: the entries near the view, and those that must stay (focus, editor, menu, dialog, alert).
     const listTop = lists.current[g]?.offsetTop ?? 0;
-    const from = Math.max(0, Math.floor((scroll.top - listTop) / ENTRY_PX) - OVERSCAN);
-    const to = Math.min(items.length, Math.ceil((scroll.top - listTop + scroll.view) / ENTRY_PX) + OVERSCAN);
+    const [from, to] = windowOf(o, scroll.top - listTop, scroll.view, OVERSCAN);
     const keep = new Set<number>();
     for (let i = from; i < to; i++) keep.add(i);
-    for (const id of [activeId, editing, menuFor, confirmFor, want.current !== undefined && want.current !== "heading" ? want.current.id : undefined, ...Object.keys(errors)]) {
+    const stay = [activeId, editing, menuFor, confirmFor, discardAsk?.id, want.current !== undefined && want.current !== "heading" ? want.current.id : undefined, ...Object.keys(errors), ...Object.keys(pending)];
+    for (const id of stay) {
       const e = id !== undefined ? byId.get(id) : undefined;
       if (e && e.group === g) keep.add(e.pos - 1);
     }
-    const total = topIn(g, items.length);
     return (
-      <ul ref={ref} aria-labelledby={labelId} className="ao-ann-list ao-ann-list--windowed" style={{ height: `${total}px` }}>
-        {[...keep]
-          .sort((x, y) => x - y)
-          .map((i) => {
-            const e = items[i]!;
-            return view_(e, { top: topIn(g, i), grow: editing === e.a.id || errors[e.a.id] !== undefined });
-          })}
+      <ul ref={ref} aria-labelledby={labelId} className="ao-ann-list ao-ann-list--windowed" style={{ height: `${o[items.length]}px` }}>
+        {[...keep].sort((x, y) => x - y).map((i) => view_(items[i]!, o[i]))}
       </ul>
     );
   };
@@ -779,6 +990,11 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
           </button>
         </div>
       )}
+      {notice !== undefined && (
+        <p role="alert" className="ao-ann-load-error">
+          {notice}
+        </p>
+      )}
       <p role="status" className="ao-ann-live">
         {said && <span key={said.n}>{said.text}</span>}
       </p>
@@ -796,7 +1012,24 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
           ),
         )}
       </div>
-      {deleting && <DeleteDialog kind={deleting.a.kind} onConfirm={() => doDelete(deleting.a.id)} onCancel={() => setConfirmFor(undefined)} />}
+      {deleting && <Question title={deleting.a.kind === "note" ? "Delete this note?" : "Delete this highlight?"} yes="Delete" no="Keep it" onYes={() => doDelete(deleting.a.id)} onNo={() => setConfirmFor(undefined)} />}
+      {discardAsk && (
+        <Question
+          title="Discard this note?"
+          yes="Discard"
+          no="Keep editing"
+          onYes={() => {
+            const then = discardAsk.then;
+            setDiscardAsk(undefined);
+            then();
+          }}
+          onNo={() => {
+            const id = discardAsk.id;
+            setDiscardAsk(undefined);
+            focusLater({ id, what: "note-area" });
+          }}
+        />
+      )}
     </section>
   );
 }

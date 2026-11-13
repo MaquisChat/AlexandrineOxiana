@@ -57,7 +57,7 @@ import type { AnnotationRecord, HighlightColourName, ReaderApi } from "../api/re
 import { AvailabilityMark } from "../components/AvailabilityMark";
 import { UserText } from "../components/UserText";
 import { inAppLink, libraryHref } from "../navigation";
-import { AnnotationList, AnswerDropped } from "../reader/AnnotationList";
+import { AnnotationList, AnswerDropped, ListBroughtUpToDate } from "../reader/AnnotationList";
 import { HighlightLayer } from "../reader/HighlightLayer";
 import { MAX_RENDERED_PAGES, PdfPages, type TextContent, type ViewRotation } from "../reader/PdfPages";
 import { openPdf, toPdfOpenError, type PdfHandle, type PdfOpenError } from "../reader/pdfjs";
@@ -474,39 +474,48 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     focusTo.current = undefined;
     area.current?.querySelector<HTMLElement>(`[data-page-number="${n}"]`)?.focus({ preventScroll: true });
   };
+  /** The highlight "Go to" chose and its page, to bring into view once that page is drawn. */
+  const jumpTo = useRef<{ id: string; page: number } | undefined>(undefined);
   const goTo = (n: number, toPage: boolean) => {
     if (!count) return;
     const to = Math.min(Math.max(1, Math.round(n)), count);
+    // Moving to another page than "Go to" chose ends that wait (M9).
+    if (jumpTo.current && jumpTo.current.page !== to) jumpTo.current = undefined;
     if (toPage) focusPage(to, to !== page);
     setPage(to);
     setDraft(String(to));
   };
-  /** The highlight "Go to" chose, to bring into view once its page is drawn. */
-  const jumpTo = useRef<string | undefined>(undefined);
-  // Once the chosen highlight is drawn on its page, it is brought into view (the page's box keeps the focus).
+  // Once the chosen highlight is drawn on its page (a state, waited for however long it takes: A13,
+  // M9) it is brought into view; the page's box keeps the focus. The wait ends when the page is drawn,
+  // when another page is gone to, or with the document.
   useEffect(() => {
-    const id = jumpTo.current;
-    if (id === undefined || phase.kind !== "open") return;
-    let tries = 0;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const attempt = () => {
-      if (jumpTo.current !== id) return;
-      const mark = [...(area.current?.querySelectorAll<HTMLElement>(".ao-hl") ?? [])].find((m) => m.dataset.annotation === id);
-      if (mark) {
-        jumpTo.current = undefined;
-        mark.scrollIntoView?.({ block: "nearest", inline: "nearest" });
-      } else if (tries++ < 40) timer = setTimeout(attempt, 50);
-      else jumpTo.current = undefined;
+    const want = jumpTo.current;
+    const root = area.current;
+    if (want === undefined || phase.kind !== "open" || !root) return;
+    const find = () => [...root.querySelectorAll<HTMLElement>(".ao-hl")].find((m) => m.dataset.annotation === want.id);
+    const bring = (mark: HTMLElement) => {
+      jumpTo.current = undefined;
+      mark.scrollIntoView?.({ block: "nearest", inline: "nearest" });
     };
-    attempt();
-    return () => clearTimeout(timer);
+    const now = find();
+    if (now) return bring(now);
+    const watch = new MutationObserver(() => {
+      if (jumpTo.current !== want) return watch.disconnect();
+      const mark = find();
+      if (mark) {
+        watch.disconnect();
+        bring(mark);
+      }
+    });
+    watch.observe(root, { childList: true, subtree: true });
+    return () => watch.disconnect();
   });
   /** "Go to" (R9): the highlight's first page in this file, that page's box focused, the highlight chosen. */
   const onJump = (id: string) => {
     const pages = fileAnnotations?.find((a) => a.id === id)?.pdfAnchors.map((x) => x.page).filter((p) => p >= 1 && p <= count) ?? [];
     if (pages.length === 0) return;
     setSelectedId(id);
-    jumpTo.current = id;
+    jumpTo.current = { id, page: Math.min(...pages) };
     goTo(Math.min(...pages), true);
   };
 
@@ -514,7 +523,9 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
    * One change asked of the service (R9). What is shown afterwards is the service's answer. An answer
    * that arrives after the document ended or another was opened is dropped (AnswerDropped: the list
    * shows nothing for it); a 423 ends the reader as locked at once (A9, A11); any other refusal is
-   * handed to the list, which shows the service's sentence.
+   * handed to the list, which shows the service's sentence. A 404 (the annotation deleted elsewhere,
+   * or the project gone): the list is asked for again and the route asked whether the project is still
+   * there (A10, A13); the list says so (ListBroughtUpToDate).
    */
   const change = async <T,>(ask: (api: ReaderApi) => Promise<T>, apply: (answer: T) => void): Promise<void> => {
     const h = current.current;
@@ -528,6 +539,11 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
       if (e instanceof ApiClientError && e.status === 423) {
         endLocked(h);
         throw new AnswerDropped();
+      }
+      if (e instanceof ApiClientError && e.status === 404) {
+        setListAttempt((n) => n + 1);
+        inDoubt.current?.();
+        throw new ListBroughtUpToDate();
       }
       throw e;
     }

@@ -1372,7 +1372,7 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
       expect(document.activeElement).toBe(colour);
       await user.click(within(entryOf("a")).getByRole("button", { name: /^Delete/ }));
       await user.click(screen.getByRole("button", { name: "Delete" }));
-      await waitFor(() => expect(within(entryOf("a")).getByRole("alert").textContent).toBe("That highlight or note was not found."));
+      await waitFor(() => expect(within(panel()).getByRole("alert").textContent).toBe("That highlight or note was no longer there. The list has been brought up to date."));
       expect(drawnOn(1)).toEqual(["a"]);
       expect(said()).toBe("");
     });
@@ -1514,7 +1514,16 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
     it("Go to waits for the page to be drawn, however long that takes, then brings the highlight into view", async () => {
       serveDocument();
       serveAnnotations([rec({ id: "first" }), rec({ id: "on-five", page: 5, quote: "Words of page 5" })]);
-      const f = fakeHandle(12, { text: words, hold: true });
+      const f = fakeHandle(12, { text: words });
+      // Page 5 is slow to come: it is drawn only once it is let go.
+      let letFiveGo: () => void = () => {};
+      const fiveHeld = new Promise<void>((r) => (letFiveGo = r));
+      const doc = f.handle.doc as unknown as { getPage(n: number): Promise<unknown> };
+      const getPage = doc.getPage.bind(doc);
+      doc.getPage = async (n: number) => {
+        if (n === 5) await fiveHeld;
+        return getPage(n);
+      };
       openPdf.mockResolvedValueOnce(f.handle);
       const seen: string[] = [];
       Element.prototype.scrollIntoView = function (this: Element) {
@@ -1522,20 +1531,14 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
       };
       const user = userEvent.setup();
       screenFor();
-      const releaseAll = async () => {
-        await act(async () => {
-          for (const r of f.holdRenders.splice(0)) r();
-        });
-        await flush();
-      };
       await screen.findByRole("region", { name: "Annotations (2)" });
-      await releaseAll();
       await user.click(within(entryOf("on-five")).getByRole("button", { name: /^Go to/ }));
       await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-page-number="5"]')));
       // Longer than any count of ticks the screen once allowed (40 × 50 ms): page 5 is not drawn yet.
       await new Promise((r) => setTimeout(r, 2600));
+      expect(document.querySelector('[data-page-number="5"] .ao-hl')).toBeNull();
       expect(seen).toEqual([]);
-      for (let i = 0; i < 5 && seen.length === 0; i++) await releaseAll();
+      await act(async () => letFiveGo());
       await waitFor(() => expect(seen).toContain("on-five"));
       delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
     }, 15_000);

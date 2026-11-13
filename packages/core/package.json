@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./capture/acknowledgement": "./src/capture/acknowledgement.ts",
+    "./annotations/sortIndex": "./src/annotations/sortIndex.ts",
     "./capture/platforms": "./src/capture/platforms.ts",
     "./governance/merge": "./src/governance/merge.ts",
     "./governance/schema": "./src/governance/schema.ts",

@@ -270,8 +270,10 @@ describe("AnnotationList (Task R9)", () => {
     const colour = within(entry("a")).getByRole("button", { name: /^Colour of/ });
     await user.click(colour);
     await user.click(screen.getByRole("menuitemradio", { name: "Red" }));
+    // While it is on its way the entry says so and its Colour waits (A13): no second menu, no second request.
+    expect(colour.getAttribute("aria-disabled")).toBe("true");
     await user.click(colour);
-    await user.click(screen.getByRole("menuitemradio", { name: "Blue" }));
+    expect(screen.queryByRole("menu")).toBeNull();
     expect(onRecolour).toHaveBeenCalledTimes(1);
     await act(async () => release());
   });
@@ -788,16 +790,17 @@ describe("AnnotationList, fix round 1 (A13, Ruling R216)", () => {
   });
 
   it("past 500, an entry has its own measured height: nothing is cut off, the next one starts below it", async () => {
-    const many = Array.from({ length: 600 }, (_, i) => rec({ id: `n${i}`, quote: `Quote ${i}` }));
+    // Ids that sort in their order (same page, no stored index: the order falls to the id).
+    const many = Array.from({ length: 600 }, (_, i) => rec({ id: `n${String(i).padStart(3, "0")}`, quote: `Quote ${i}` }));
     // Heights as a browser would measure them: entry 1 is tall (a long note).
     const spy = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
-      return this.dataset.entry === "n1" ? 900 : this.dataset.entry ? 120 : 0;
+      return this.dataset.entry === "n001" ? 900 : this.dataset.entry ? 120 : 0;
     });
     list({ annotations: many });
-    await waitFor(() => expect(entry("n2").style.top).toBe("1020px"));
-    expect(entry("n1").style.top).toBe("120px");
-    expect(entry("n1").style.height).toBe("");
-    expect(entry("n1").className).not.toContain("--slot-fixed");
+    await waitFor(() => expect(entry("n002").style.top).toBe("1020px"));
+    expect(entry("n001").style.top).toBe("120px");
+    expect(entry("n001").style.height).toBe("");
+    expect(getComputedStyle(entry("n001")).overflow).not.toBe("hidden");
     spy.mockRestore();
   });
 });
