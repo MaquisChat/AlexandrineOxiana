@@ -133,3 +133,4 @@ R208 (2026-11-13): cloud folders W1 after review — on macOS "local" rests only
 R209 (2026-11-13): reader R8 after review — a 423 on the list ends the reader; "changed" only when the quote is not contained in the touched text items (no verdict for vertical text, short quotes, no text); underline contrast; onPageText, --hl-edge and the temporary region accepted.
 R210 (2026-11-13): Zotero sync — the remembered version is held back only by passing failures, not by a back-off that was waited out or by permanent, noted outcomes.
 R211 (2026-11-13): reader R8 — the "changed" rule gathers text rectangle by rectangle (columns, footnote marks); item boxes at least the font size; rectangles on blank paper of a text page are changed.
+R212 (2026-11-13): Zotero Z2 after review — a resumed batch records the lowest version read; what a complete scan is; absence alone never makes an item gone (a second, complete key list at the same version); honest notes.
