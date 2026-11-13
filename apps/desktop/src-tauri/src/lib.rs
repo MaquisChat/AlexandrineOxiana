@@ -61,6 +61,23 @@ struct Shell {
     relaunch: AtomicBool,
     /// Start-up failed: the program exits non-zero however its error window is closed.
     failed: AtomicBool,
+    /// The watched-folder chooser is open: a second request meanwhile answers null (one chooser at a time).
+    picking: AtomicBool,
+}
+
+/// Marks the watched-folder chooser open while it lives.
+struct Picking<'a>(&'a AtomicBool);
+
+impl<'a> Picking<'a> {
+    fn begin(flag: &'a AtomicBool) -> Option<Self> {
+        (!flag.swap(true, Ordering::SeqCst)).then_some(Picking(flag))
+    }
+}
+
+impl Drop for Picking<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Debug builds only: with NODE_ENV=test the shell reports what the launch check needs on its
@@ -212,8 +229,8 @@ fn focus_main(app: &AppHandle, shell: &Shell) {
 /// here (the page passes only a title). The chosen path goes to the service as a grant line on its
 /// standard input (grant.rs), written under the lock the shutdown closes that pipe under; the page
 /// receives only `{grantId, name}`, or null when the choice was cancelled, the window is not the main
-/// window, the app is closing, the service has exited, the path cannot be put in a grant line, or
-/// the write failed. Granted to the main window only (capabilities/main-window.json); the browser
+/// window, the chooser is already open, the app is closing, the service has exited, the path cannot
+/// be put in a grant line, or the write failed. Granted to the main window only (capabilities/main-window.json); the browser
 /// extension's token is the service's affair and reaches no shell command (it is not a window of
 /// this app and has no IPC).
 #[tauri::command]
@@ -225,6 +242,7 @@ async fn pick_watch_folder(app: AppHandle, window: tauri::WebviewWindow, title: 
     if shell.stopping.load(Ordering::SeqCst) || shell.closing.load(Ordering::SeqCst) {
         return None;
     }
+    let _open = Picking::begin(&shell.picking)?;
     let dialog = app.dialog().file().set_title(grant::chooser_title(&title)).set_parent(&window);
     let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_folder()).await.ok()??;
     let path = picked.into_path().ok()?;
