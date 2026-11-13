@@ -273,3 +273,8 @@
 - Every task that changes what a run does to a source (Z2, Z4, Z5, Z6) is reviewed with the reader's annotation rules in hand (R192, R195–R198): a highlight, note or recolouring made in the app's reader survives every kind of run, including the run that marks its source as gone from Zotero and the run that brings it back.
 - All work for this plan is on the branch `claude/pdf-reader-highlights` (Ruling R204), beside the reader's interface tasks; the file boundaries under "Reader isolation" bind.
 
+
+**A2 — after Task Z1's report (2026-11-13).**
+- The **Verify** lines of every task: `pnpm --filter @ao/library test -- <name>` does NOT filter (it runs the whole suite). Run a single file with `pnpm --filter @ao/library exec vitest run <path-or-name>` (and the same form for `@ao/library-service`, `@ao/ui`, `@ao/cli`); run the whole package suite once at the end.
+- `packages/library/tsconfig.json` includes `tests` beside `src` (Z1), so that the stand-in is checked under the strict settings like everything else.
+- Z11: `fakeZoteroHandler`'s answer may carry `drop: true` (the stand-in's dropped connection); the loopback server destroys the socket on it instead of answering.
