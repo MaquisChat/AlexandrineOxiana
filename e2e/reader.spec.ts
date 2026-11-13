@@ -9,6 +9,13 @@
  * fallback from that folder (no WebAssembly). No `securitypolicyviolation`, no request to any other
  * host (the fixture fails the test on one), no fake worker.
  *
+ * A6: the page's address reads as an opaque origin ("null") to pdf.js, as `tauri://localhost` does
+ * in the shell (shellLikePage); the worker must still be a real one from the bundled file (asked of
+ * the worker itself), never a blob: address, never pdf.js's code on the page's own thread, and with
+ * no violation. (With pdf.js left to start its worker, this page gets "worker-src blob" in both
+ * browsers: checked.) A second PDF uses Helvetica without embedding it: drawn with the system's face,
+ * no Liberation Sans shipped or fetched from elsewhere.
+ *
  * Until the reader screen exists (Task R7) nothing in the app imports pdf.js, so the modules
  * themselves (packages/ui/src/reader/pdfjs.ts, rangeTransport.ts, api/reader.ts, api/client.ts) are
  * built for this test by Vite, as the app's build would build them (the worker emitted with `?url`),
@@ -20,7 +27,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { buildCjkPdf } from "../tests/fixtures/generate.mjs";
+import { buildCjkPdf, buildPdf } from "../tests/fixtures/generate.mjs";
 import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR, REPO_ROOT, UI_DIST } from "./paths.js";
 
@@ -117,17 +124,28 @@ async function attachPdf(app: AppHarness, projectId: string, file: string): Prom
   expect(pdf, JSON.stringify(sf.body.assets)).toBeTruthy();
   return { sid: sid!, aid: pdf!.id };
 }
-
 const TYPES: Record<string, string> = { ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".map": "application/json" };
 
-/** Serves the built reader modules under /__e2e__/reader/ of the app's origin (ahead of the fixture's routing). */
+/** The app's own policy, as its built index.html carries it. */
+function appPolicy(): string {
+  const m = /<meta http-equiv="Content-Security-Policy" content="([^"]+)"/.exec(readFileSync(join(UI_DIST, "index.html"), "utf8"));
+  if (!m) throw new Error("the built index.html has no policy");
+  return m[1]!;
+}
+
+/**
+ * Serves the built reader modules under /__e2e__/reader/ of the app's origin (ahead of the fixture's
+ * routing), each with the app's own policy as a header, as a shell may send it, so that the worker
+ * (whose policy comes with its own script, not from the page) runs under that policy too.
+ */
 async function serveReaderModules(page: Page, dir: string): Promise<void> {
+  const policy = appPolicy();
   await page.route(`${APP_ORIGIN}${MODULE_BASE}**`, async (route) => {
     const rel = decodeURIComponent(new URL(route.request().url()).pathname.slice(MODULE_BASE.length));
     const file = resolve(dir, rel);
     if (!file.startsWith(dir + sep)) return route.fulfill({ status: 404, body: "not found" });
     try {
-      return route.fulfill({ status: 200, contentType: TYPES[extname(file)] ?? "application/octet-stream", body: readFileSync(file) });
+      return route.fulfill({ status: 200, contentType: TYPES[extname(file)] ?? "application/octet-stream", headers: { "Content-Security-Policy": policy }, body: readFileSync(file) });
     } catch {
       return route.fulfill({ status: 404, body: "not found" });
     }
@@ -139,60 +157,85 @@ interface Opened {
   error?: string;
   pageCount?: number;
   text?: string;
-  /** The colour at the middle of the JPEG 2000 picture, and at a blank part of the page. */
-  picture?: number[];
-  blank?: number[];
+  /** Colours ([r, g, b, a]) read from the drawn page at the points asked for (PDF space, origin bottom-left). */
+  pixels?: number[][];
+  /** Whether any pixel in each box asked for is dark (text drawn there). */
+  inked?: boolean[];
   violations?: string[];
+  /** Scripts the page turned into blob: addresses (pdf.js's worker wrapper would be one). */
+  scriptBlobs?: number;
+  /** Whether pdf.js's worker code was ever loaded on the page's own thread (its "fake worker"). */
+  workerCodeOnPage?: boolean;
 }
 
-test("a PDF loads under the app's policy with nothing fetched from elsewhere", async ({ page, app }) => {
-  // The pdfjs/ folder of the real build is what the page reads.
-  expect(readFileSync(join(UI_DIST, "pdfjs", "cmaps", "UniJIS-UCS2-H.bcmap")).length, "packages/ui is built (pnpm --filter @ao/ui run build)").toBeGreaterThan(0);
-
-  const modules = await buildReaderModules();
-  await serveReaderModules(page, modules);
-
-  // Every request the page and its workers make, every policy violation, every console line.
+/** What the page and its workers asked for and said, and the workers it started. */
+function watch(page: Page) {
   const requests: string[] = [];
-  page.on("request", (r) => requests.push(r.url()));
-  page.on("worker", (w) => requests.push(`worker ${w.url()}`));
+  const responses: Array<{ url: string; status: number }> = [];
+  const workers: Array<import("@playwright/test").Worker> = [];
   const consoleLines: string[] = [];
+  const pageErrors: string[] = [];
+  page.on("request", (r) => requests.push(r.url()));
+  page.on("response", (r) => responses.push({ url: r.url(), status: r.status() }));
+  page.on("worker", (w) => workers.push(w));
   page.on("console", (m) => consoleLines.push(m.text()));
-  await page.addInitScript(() => {
-    const seen: string[] = [];
-    (window as unknown as { __aoViolations: string[] }).__aoViolations = seen;
-    document.addEventListener("securitypolicyviolation", (e) => seen.push(`${e.violatedDirective} ${e.blockedURI}`));
-  });
+  page.on("pageerror", (e) => pageErrors.push(String(e)));
+  return { requests, responses, workers, consoleLines, pageErrors };
+}
 
-  const dir = join(app.root, "sources");
-  mkdirSync(dir, { recursive: true });
-  const file = join(dir, "japanese.pdf");
-  writeFileSync(file, await readerFixturePdf());
+/**
+ * Before any app code runs: records policy violations and blob: scripts, and makes the page's own
+ * address read as an opaque origin ("null") to pdf.js, as `tauri://localhost` does in the shell's web
+ * view. Playwright cannot serve a page from a custom scheme, so the one check pdf.js makes of it is
+ * answered as the shell's page answers it: `URL.parse(window.location).origin` is "null" (pdf.js
+ * `PDFWorker._isSameOrigin`; for it pdf.js would wrap its worker in a blob: address).
+ */
+async function shellLikePage(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __aoViolations: string[]; __aoScriptBlobs: number };
+    w.__aoViolations = [];
+    w.__aoScriptBlobs = 0;
+    document.addEventListener("securitypolicyviolation", (e) => w.__aoViolations.push(`${e.violatedDirective} ${e.blockedURI}`));
+    const createObjectURL = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = (obj: Blob | MediaSource) => {
+      if (obj instanceof Blob && /javascript/i.test(obj.type)) w.__aoScriptBlobs++;
+      return createObjectURL(obj);
+    };
+    const parse = URL.parse?.bind(URL);
+    if (parse) {
+      URL.parse = ((url: string | URL, base?: string | URL) => {
+        if ((url as unknown) === window.location || String(url) === window.location.href) return { origin: "null", href: window.location.href } as URL;
+        return parse(url, base);
+      }) as typeof URL.parse;
+    }
+  });
+}
+
+/** Attaches `file` to a new project and opens it in the page with the reader's own modules; leaves the document open as window.__aoHandle. */
+async function openInPage(page: Page, app: AppHarness, file: string, probe: { points: Array<[number, number]>; boxes: Array<[number, number, number, number]> }): Promise<Opened> {
   const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Reading study" });
   const { sid, aid } = await attachPdf(app, projectId, file);
-  // The app's own page (index.html with its policy), freshly loaded with the init script in place.
+  // The app's own page (index.html with its policy), freshly loaded with the init scripts in place.
   await page.goto(`${APP_ORIGIN}/`);
-
-  const opened = await page.evaluate(
-    async ({ modulePath, baseUrl, token, projectId, sid, aid }): Promise<Opened> => {
+  return page.evaluate(
+    async ({ modulePath, baseUrl, token, projectId, sid, aid, probe }): Promise<Opened> => {
+      type Page1 = { getViewport(o: { scale: number }): { width: number; height: number }; getTextContent(): Promise<{ items: Array<{ str?: string }> }>; render(o: object): { promise: Promise<void> } };
       type Mod = {
         createClient(b: string, t: string): unknown;
         readerApi(c: unknown): { documentRange(p: string, s: string, a: string, start: number, end: number, signal?: AbortSignal): Promise<{ bytes: Uint8Array; total: number }> };
-        createRangeTransport(first: { bytes: Uint8Array; total: number }, f: (s: number, e: number, sig?: AbortSignal) => Promise<Uint8Array>): unknown;
-        openPdf(o: { transport: unknown; signal: AbortSignal }): Promise<{
-          pageCount: number;
-          doc: { getPage(n: number): Promise<{ getViewport(o: { scale: number }): { width: number; height: number }; getTextContent(): Promise<{ items: Array<{ str?: string }> }>; render(o: object): { promise: Promise<void> } }> };
-          destroy(): Promise<void>;
-        }>;
+        createRangeTransport(first: { bytes: Uint8Array; total: number }, f: (s: number, e: number, sig?: AbortSignal) => Promise<{ bytes: Uint8Array; total: number }>): unknown;
+        openPdf(o: { transport: unknown; signal: AbortSignal }): Promise<{ pageCount: number; doc: { getPage(n: number): Promise<Page1> }; destroy(): Promise<void> }>;
       };
-      const violations = (window as unknown as { __aoViolations: string[] }).__aoViolations;
+      const w = window as unknown as { __aoViolations: string[]; __aoScriptBlobs: number; __aoHandle?: unknown };
+      const extra = () => ({ violations: [...w.__aoViolations], scriptBlobs: w.__aoScriptBlobs, workerCodeOnPage: "pdfjsWorker" in globalThis });
       try {
         const m = (await import(modulePath)) as Mod;
         const api = m.readerApi(m.createClient(baseUrl, token));
         const ac = new AbortController();
         const first = await api.documentRange(projectId, sid, aid, 0, 1048575, ac.signal);
-        const transport = m.createRangeTransport({ bytes: first.bytes, total: first.total }, (s, e, sig) => api.documentRange(projectId, sid, aid, s, e, sig).then((r) => r.bytes));
+        const transport = m.createRangeTransport({ bytes: first.bytes, total: first.total }, (s, e, sig) => api.documentRange(projectId, sid, aid, s, e, sig));
         const handle = await m.openPdf({ transport, signal: ac.signal });
+        w.__aoHandle = handle;
         const pdfPage = await handle.doc.getPage(1);
         const text = (await pdfPage.getTextContent()).items.map((i) => i.str ?? "").join("|");
         const viewport = pdfPage.getViewport({ scale: 1 });
@@ -201,17 +244,58 @@ test("a PDF loads under the app's policy with nothing fetched from elsewhere", a
         canvas.height = Math.ceil(viewport.height);
         await pdfPage.render({ canvas, viewport }).promise;
         const ctx = canvas.getContext("2d")!;
-        // The picture is drawn at x 50-250, y 400-600 in PDF space (origin bottom-left).
-        const at = (x: number, y: number) => [...ctx.getImageData(x, canvas.height - y, 1, 1).data];
-        const result: Opened = { ok: true, pageCount: handle.pageCount, text, picture: at(150, 500), blank: at(500, 100), violations: [...violations] };
-        await handle.destroy();
-        return result;
+        const pixels = probe.points.map(([x, y]) => [...ctx.getImageData(x, canvas.height - y, 1, 1).data]);
+        const inked = probe.boxes.map(([x, y, bw, bh]) => {
+          const d = ctx.getImageData(x, canvas.height - y - bh, bw, bh).data;
+          for (let i = 0; i < d.length; i += 4) if (d[i]! < 128 && d[i + 1]! < 128 && d[i + 2]! < 128 && d[i + 3]! > 0) return true;
+          return false;
+        });
+        return { ok: true, pageCount: handle.pageCount, text, pixels, inked, ...extra() };
       } catch (e) {
-        return { ok: false, error: `${(e as Error).name}: ${(e as Error).message}`, violations: [...violations] };
+        return { ok: false, error: `${(e as Error).name}: ${(e as Error).message}`, ...extra() };
       }
     },
-    { modulePath: `${MODULE_BASE}${ENTRY}`, baseUrl: app.baseUrl, token: app.token, projectId, sid, aid },
+    { modulePath: `${MODULE_BASE}${ENTRY}`, baseUrl: app.baseUrl, token: app.token, projectId, sid, aid, probe },
   );
+}
+
+/**
+ * The worker is real: exactly one worker, started from the bundled worker file of the app's own
+ * origin (never a blob: address), with pdf.js's worker code loaded INSIDE it (asked of the worker
+ * itself, while the document is open), and never on the page's own thread. Then the document is
+ * destroyed, which ends the worker.
+ */
+async function expectRealWorker(page: Page, seen: ReturnType<typeof watch>, opened: Opened): Promise<void> {
+  expect(seen.workers.map((w) => w.url().replace(/-[\w-]+\.mjs$/, "-*.mjs"))).toEqual([`${APP_ORIGIN}${MODULE_BASE}assets/pdf.worker.min-*.mjs`]);
+  expect(await seen.workers[0]!.evaluate(() => typeof (globalThis as { pdfjsWorker?: { WorkerMessageHandler?: unknown } }).pdfjsWorker?.WorkerMessageHandler)).toBe("function");
+  expect(opened.workerCodeOnPage).toBe(false);
+  expect(opened.scriptBlobs).toBe(0);
+  expect(seen.consoleLines.filter((l) => /fake worker|#getJsModule|Unable to load|Unknown|wasm/i.test(l))).toEqual([]);
+  await page.evaluate(async () => {
+    await (window as unknown as { __aoHandle: { destroy(): Promise<void> } }).__aoHandle.destroy();
+  });
+}
+
+/** Every request went to the app's own origin or to the service (the fixture also fails the test otherwise). */
+function expectOnlyOwnOrigins(seen: ReturnType<typeof watch>, app: AppHarness): void {
+  const service = new URL(app.baseUrl).origin;
+  const urls = [...seen.requests, ...seen.workers.map((w) => w.url())];
+  expect(urls.filter((u) => !u.startsWith(`${APP_ORIGIN}/`) && !u.startsWith(`${service}/`))).toEqual([]);
+}
+
+test("a PDF loads under the app's policy with nothing fetched from elsewhere", async ({ page, app }) => {
+  // The pdfjs/ folder of the real build is what the page reads.
+  expect(readFileSync(join(UI_DIST, "pdfjs", "cmaps", "UniJIS-UCS2-H.bcmap")).length, "packages/ui is built (pnpm --filter @ao/ui run build)").toBeGreaterThan(0);
+  await serveReaderModules(page, await buildReaderModules());
+  const seen = watch(page);
+  await shellLikePage(page);
+
+  const dir = join(app.root, "sources");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "japanese.pdf");
+  writeFileSync(file, await readerFixturePdf());
+  // The picture is drawn at x 50-250, y 400-600; (500, 100) is blank paper.
+  const opened = await openInPage(page, app, file, { points: [[150, 500], [500, 100]], boxes: [] });
 
   expect(opened.error ?? "", JSON.stringify(opened)).toBe("");
   expect(opened.ok).toBe(true);
@@ -220,17 +304,44 @@ test("a PDF loads under the app's policy with nothing fetched from elsewhere", a
   expect(opened.text).toContain("日本語のテキスト");
   expect(opened.text).toContain("Japanese text");
   // The JPEG 2000 picture was decoded (by the JavaScript fallback: no WebAssembly) and drawn: not paper white.
-  expect(opened.blank).toEqual([255, 255, 255, 255]);
-  expect(opened.picture?.slice(0, 3), `picture pixel ${JSON.stringify(opened.picture)}`).not.toEqual([255, 255, 255]);
+  const [picture, paper] = opened.pixels!;
+  expect(paper).toEqual([255, 255, 255, 255]);
+  expect(picture!.slice(0, 3), `picture pixel ${JSON.stringify(picture)}`).not.toEqual([255, 255, 255]);
   // Nothing the policy refused, in the page.
   expect(opened.violations).toEqual([]);
-  // pdf.js ran its real worker, from the app's own files, and never fell back to the main thread.
-  expect(consoleLines.filter((l) => /fake worker|#getJsModule|Unable to load|Unknown|wasm/i.test(l))).toEqual([]);
-  expect(requests.some((u) => u.startsWith(`worker ${APP_ORIGIN}${MODULE_BASE}assets/pdf.worker.min`))).toBe(true);
-  // The character map and the standard font came from the app's own pdfjs/ folder.
-  expect(requests).toContain(`${APP_ORIGIN}/pdfjs/cmaps/UniJIS-UCS2-H.bcmap`);
-  expect(requests).toContain(`${APP_ORIGIN}/pdfjs/standard_fonts/FoxitDingbats.pfb`);
-  // Every request went to the app's own origin or to the service (the fixture also fails the test otherwise).
-  const service = new URL(app.baseUrl).origin;
-  expect(requests.map((u) => u.replace(/^worker /, "")).filter((u) => !u.startsWith(`${APP_ORIGIN}/`) && !u.startsWith(`${service}/`))).toEqual([]);
+  await expectRealWorker(page, seen, opened);
+  // The character map and the ZapfDingbats font came from the app's own pdfjs/ folder.
+  expect(seen.requests).toContain(`${APP_ORIGIN}/pdfjs/cmaps/UniJIS-UCS2-H.bcmap`);
+  expect(seen.requests).toContain(`${APP_ORIGIN}/pdfjs/standard_fonts/FoxitDingbats.pfb`);
+  expectOnlyOwnOrigins(seen, app);
+  expect(seen.pageErrors).toEqual([]);
+});
+
+test("a PDF whose Helvetica is not embedded is drawn with the system's face, asking nothing of elsewhere", async ({ page, app }) => {
+  await serveReaderModules(page, await buildReaderModules());
+  const seen = watch(page);
+  await shellLikePage(page);
+
+  const dir = join(app.root, "sources");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "helvetica.pdf");
+  // pdf-lib's standard Helvetica is never embedded: the file names the font and nothing more.
+  writeFileSync(file, await buildPdf({ title: "Plain Helvetica", lines: ["Helvetica, not embedded, drawn by the system's own face.", "A second line of plain text."] }));
+  expect(readFileSync(file, "latin1")).not.toMatch(/FontFile/);
+  // Line 1 is at y 780 (11 pt), from x 50.
+  const opened = await openInPage(page, app, file, { points: [], boxes: [[50, 776, 250, 14], [50, 60, 250, 14]] });
+
+  expect(opened.error ?? "", JSON.stringify(opened)).toBe("");
+  expect(opened.text).toContain("Helvetica, not embedded");
+  // The text is drawn (ink on the first line, none on empty paper below).
+  expect(opened.inked).toEqual([true, false]);
+  expect(opened.violations).toEqual([]);
+  await expectRealWorker(page, seen, opened);
+  // No Liberation Sans is shipped (R199). If no system face matched, pdf.js asks the app's own folder
+  // for it: that answer is "not found", quietly (no error on the page, the text drawn all the same).
+  const own = seen.responses.filter((r) => r.url.startsWith(`${APP_ORIGIN}/pdfjs/`));
+  for (const r of own) expect([200, 404], r.url).toContain(r.status);
+  for (const r of own.filter((x) => x.status === 404)) expect(r.url).toMatch(/\/pdfjs\/standard_fonts\/LiberationSans-[\w]+\.ttf$/);
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
 });
