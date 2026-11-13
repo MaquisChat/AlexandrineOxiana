@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ROUTES, routeFor } from "../App";
 import { isReadablePdf, ReaderLink } from "../components/ReaderLink";
 import { PATHS, useLocation } from "../navigation";
-import { CURRENT_RW, LIBRARIES, server, serviceError, SOURCE_FILE, testClient, url, useMockService } from "../test/service";
+import { CURRENT_RW, LIBRARIES, PROJECTS, server, serviceError, SOURCE_FILE, sse, testClient, url, useMockService } from "../test/service";
 import { isReaderPath, readerHref } from "./reader";
 
 // The screen itself is tested in screens/Reader.test.tsx; here only which document it is given.
@@ -49,6 +49,9 @@ const pdf = (id: string, name: string, extra: Record<string, unknown> = {}) => (
 function serve(opts: { assets?: unknown[]; mode?: "read-write" | "read-only"; source?: () => Response } = {}) {
   const requests: string[] = [];
   server.use(
+    // The reader listens for the library's state (A9); nothing is sent here.
+    http.get(url("/events"), () => sse([])),
+    http.get(url("/projects"), () => HttpResponse.json(PROJECTS)),
     http.get(url("/libraries"), ({ request }) => {
       requests.push(request.url);
       return HttpResponse.json({ ...LIBRARIES, current: { ...CURRENT_RW, mode: opts.mode ?? "read-write" } });
@@ -156,13 +159,22 @@ describe("reader route (Task R7)", () => {
     window.history.replaceState(null, "", "/reader?project=p1&source=s1");
     render(<Host />);
     expect(await screen.findByText("This project is locked. Unlock it in the library to read its files.")).toBeTruthy();
+    // A locked project points to the library; trying again here cannot help (A9).
+    expect(screen.getByRole("main").querySelector(".ao-reader-state a")?.getAttribute("href")).toBe("/?project=p1");
+    expect(screen.getByRole("link", { name: "Go to the library" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open again" })).toBeNull();
     cleanup();
+    let up = false;
     server.use(
-      http.get(url("/libraries"), () => HttpResponse.error()),
-      http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.error()),
+      http.get(url("/libraries"), () => (up ? HttpResponse.json({ ...LIBRARIES, current: CURRENT_RW }) : HttpResponse.error())),
+      http.get(url("/projects/:id/sources/:sid"), () => (up ? HttpResponse.json(SOURCE_FILE) : HttpResponse.error())),
     );
     render(<Host />);
     expect(await screen.findByText("The library service could not be reached, so this PDF cannot be shown. Try again in a moment.")).toBeTruthy();
+    // Out of reach: trying again can help, and it reads the source again.
+    up = true;
+    await userEvent.setup().click(screen.getByRole("button", { name: "Open again" }));
+    expect((await screen.findByTestId("reader-screen")).textContent).toBe("p1|s1|a1|-|read-write");
   });
 
   it("an address without a source says what to do", () => {

@@ -14,7 +14,8 @@ import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readerApi } from "../api/reader";
 import { PdfOpenError, type PdfHandle } from "../reader/pdfjs";
-import { server, serviceError, testClient, url, useMockService } from "../test/service";
+import { server, serviceError, SOURCE_FILE, testClient, url, useMockService } from "../test/service";
+import { ReaderRoute } from "../routes/reader";
 import { ReaderScreen } from "./Reader";
 
 const openPdf = vi.hoisted(() => vi.fn());
@@ -394,13 +395,13 @@ describe("ReaderScreen (Task R7)", () => {
     for (let i = 0; i < 20; i++) if (!(zoomOut as HTMLButtonElement).disabled) await user.click(zoomOut);
     expect(zoom.textContent).toBe("50%");
     expect(zoomOut).toHaveProperty("disabled", true);
-    expect(screen.getByRole("region", { name: "Page 12 of 120" }).style.width).toBe("297px");
+    expect(screen.getByRole("region", { name: "Page 12 of 120" }).style.width).toBe("396px");
 
-    // Fit width: the page's width fills the page area.
+    // Fit width: the page's width fills the page area (1190 px of 1224: 150% of 793 px).
     const scroller = screen.getByRole("group", { name: "Pages" });
     Object.defineProperty(scroller, "clientWidth", { value: 1224, configurable: true });
     await user.click(within(toolbar).getByRole("button", { name: "Fit width" }));
-    await waitFor(() => expect(zoom.textContent).toBe("200%"));
+    await waitFor(() => expect(zoom.textContent).toBe("150%"));
 
     // Rotate view: the page's box turns; nothing is sent anywhere.
     const before = requests.length;
@@ -440,5 +441,231 @@ describe("ReaderScreen (Task R7)", () => {
     // The keys are the page area's only: typed into the page field they do nothing of the sort.
     fireEvent.keyDown(field, { key: "End" });
     expect(field.value).toBe("1");
+  });
+  it("Open again is offered only where trying again can help; a locked project points to the library (A9)", async () => {
+    const offers = () => ({
+      again: screen.queryByRole("button", { name: "Open again" }) !== null,
+      library: screen.queryByRole("link", { name: "Go to the library" })?.getAttribute("href") ?? null,
+    });
+    const cases: Array<[() => void, string, string, { again: boolean; library: string | null }]> = [
+      [() => serveDocument(4096, () => serviceError(423, "PROJECT_LOCKED", "x") as unknown as Response), "Project locked", SENTENCES.locked, { again: false, library: "/?project=p1" }],
+      [() => serveDocument(4096, () => serviceError(404, "NOT_FOUND", "x") as unknown as Response), "File not found", SENTENCES.missing, { again: true, library: null }],
+      [() => serveDocument(4096, () => serviceError(413, "PAYLOAD_TOO_LARGE", "x") as unknown as Response), "PDF too large", SENTENCES.tooLarge, { again: false, library: null }],
+      [() => serveDocument(4096, () => serviceError(400, "VALIDATION", "This file cannot be shown here.") as unknown as Response), "Not a PDF", "This file cannot be shown here.", { again: false, library: null }],
+      [() => serveDocument(4096, () => HttpResponse.error() as unknown as Response), "Library service not reachable", SENTENCES.unreachable, { again: true, library: null }],
+      [() => (serveDocument(), openPdf.mockRejectedValueOnce(new PdfOpenError("damaged"))), "Damaged PDF", SENTENCES.damaged, { again: true, library: null }],
+      [() => (serveDocument(), openPdf.mockRejectedValueOnce(new PdfOpenError("other", "The file changed while it was being read. Open it again to read it as it is now."))), "PDF not shown", "The file changed while it was being read. Open it again to read it as it is now.", { again: true, library: null }],
+    ];
+    for (const [setUp, heading, sentence, want] of cases) {
+      setUp();
+      const { unmount } = screenFor();
+      await expectState(heading, sentence);
+      expect(offers(), heading).toEqual(want);
+      unmount();
+    }
+    // In mid-read: any failure offers it again, except a lock, which points to the library.
+    for (const [kind, want] of [
+      ["missing", { again: true, library: null }],
+      ["other", { again: true, library: null }],
+      ["locked", { again: false, library: "/?project=p1" }],
+    ] as const) {
+      serveDocument();
+      const f = fakeHandle(3);
+      openPdf.mockResolvedValueOnce(f.handle);
+      const { unmount } = screenFor();
+      await screen.findByRole("region", { name: "Page 1 of 3" });
+      act(() => f.fail(new PdfOpenError(kind)));
+      await screen.findByRole("heading", { level: 2 });
+      expect(offers(), kind).toEqual(want);
+      unmount();
+    }
+  });
+
+  it("a control disabled while it has focus hands focus to its neighbour, never to the page's body (A9, R145)", async () => {
+    serveDocument();
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    const user = userEvent.setup();
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 3" });
+    const button = (name: string) => screen.getByRole("button", { name });
+    // Next page on the last page: focus to Previous page.
+    await user.click(button("Next page"));
+    expect(document.activeElement).toBe(button("Next page"));
+    await user.click(button("Next page"));
+    expect(button("Next page")).toHaveProperty("disabled", true);
+    expect(document.activeElement).toBe(button("Previous page"));
+    // Previous page on the first page: focus to Next page.
+    await user.click(button("Previous page"));
+    await user.click(button("Previous page"));
+    expect(button("Previous page")).toHaveProperty("disabled", true);
+    expect(document.activeElement).toBe(button("Next page"));
+    // Zoom in at 400%: focus to Zoom out; Zoom out at 50%: focus to Zoom in.
+    while (!(button("Zoom in") as HTMLButtonElement).disabled) await user.click(button("Zoom in"));
+    expect(document.activeElement).toBe(button("Zoom out"));
+    while (!(button("Zoom out") as HTMLButtonElement).disabled) await user.click(button("Zoom out"));
+    expect(document.activeElement).toBe(button("Zoom in"));
+    // By keyboard as well (Enter on the focused button).
+    while (!(button("Zoom in") as HTMLButtonElement).disabled) {
+      button("Zoom in").focus();
+      await user.keyboard("{Enter}");
+    }
+    expect(document.activeElement).toBe(button("Zoom out"));
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("100% is the page's printed size: 96 CSS pixels to the inch, as pdf.js's viewer and Zotero show it", async () => {
+    serveDocument();
+    openPdf.mockResolvedValueOnce(fakeHandle(2).handle);
+    screenFor();
+    const p1 = await screen.findByRole("region", { name: "Page 1 of 2" });
+    expect(screen.getByRole("status", { name: "Zoom" }).textContent).toBe("100%");
+    // An A4 page is 595 points wide: 793 CSS pixels at 100%.
+    expect([p1.style.width, p1.style.height]).toEqual(["793px", "1122px"]);
+  });
+});
+
+/** A server-sent event stream the test writes to. */
+function eventStream() {
+  const enc = new TextEncoder();
+  let ctrl: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const queued: string[] = [];
+  const send = (type: string, data: unknown) => {
+    const frame = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+    if (ctrl) ctrl.enqueue(enc.encode(frame));
+    else queued.push(frame);
+  };
+  const response = () =>
+    new HttpResponse(
+      new ReadableStream<Uint8Array>({
+        start(c) {
+          ctrl = c;
+          for (const f of queued.splice(0)) c.enqueue(enc.encode(f));
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    );
+  return { send, response };
+}
+
+describe("ReaderRoute: the reader ends at once when its project is locked or its library closed (A9, Ruling R203)", () => {
+  const LIB = { libraryId: "lib-1", name: "Thesis library", mode: "read-write" };
+  const STATE = { open: true, ...LIB, integrityWarnings: [], projectWarnings: {} };
+  const textHandle = () => {
+    const f = fakeHandle(3);
+    // Every page has text: its text layer is in the page.
+    const doc = f.handle.doc as unknown as { getPage(n: number): Promise<Record<string, unknown>> };
+    const getPage = doc.getPage.bind(doc);
+    doc.getPage = async (n: number) => ({
+      ...(await getPage(n)),
+      getTextContent: async () => ({
+        items: [{ str: `Words of page ${n}`, dir: "ltr", transform: [10, 0, 0, 10, 50, 700], width: 100, height: 10, fontName: "f1", hasEOL: false }],
+        styles: { f1: { fontFamily: "sans-serif", ascent: 0.8, descent: -0.2, vertical: false } },
+        lang: null,
+      }),
+    });
+    return f;
+  };
+
+  function serveRoute(o: { unlocked: () => boolean; current?: Record<string, unknown> }) {
+    const events = eventStream();
+    const projectReads: number[] = [];
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: o.current ?? LIB })),
+      http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(SOURCE_FILE)),
+      http.get(url("/projects"), () => {
+        projectReads.push(Date.now());
+        return HttpResponse.json({ projects: [{ id: "p1", name: "Dissertation", folder: "Dissertation", encrypted: true, unlocked: o.unlocked() }] });
+      }),
+      http.get(url("/events"), () => events.response()),
+    );
+    serveDocument();
+    return { events, projectReads };
+  }
+
+  async function openRoute(f: Fake) {
+    openPdf.mockResolvedValueOnce(f.handle);
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    const r = render(<ReaderRoute client={testClient()} loc={{ pathname: "/reader", search: "?project=p1&source=s1" }} />);
+    await screen.findByRole("region", { name: "Page 1 of 3" });
+    await waitFor(() => expect(r.container.querySelector(".ao-reader-text-layer")?.textContent).toContain("Words of page 1"));
+    await flush();
+    expect(r.container.querySelectorAll("canvas").length).toBeGreaterThan(0);
+    return r;
+  }
+
+  /** Nothing of the document is in the page: no canvas, no text layer, no page, no word of it. */
+  function expectNothingLeft(container: HTMLElement) {
+    expect(container.querySelectorAll("canvas, .ao-reader-text-layer, [data-page-number]").length).toBe(0);
+    expect(document.body.textContent).not.toContain("Words of page");
+    expect(document.querySelectorAll("canvas").length === 0 || [...document.querySelectorAll("canvas")].every((c) => !c.isConnected || c.width * c.height === 0)).toBe(true);
+  }
+
+  afterEach(() => window.history.replaceState(null, "", "/"));
+
+  it("a lock of its project, with every page already fetched, ends the reader at once", async () => {
+    let unlocked = true;
+    const svc = serveRoute({ unlocked: () => unlocked });
+    const f = textHandle();
+    const { container } = await openRoute(f);
+    const documentCalls = requests.filter((r) => r.url.includes("/document")).length;
+    svc.events.send("library.state", STATE);
+    await flush();
+    // Still unlocked: nothing changes.
+    expect(screen.getByRole("region", { name: "Page 1 of 3" })).toBeTruthy();
+    expect(f.destroy).not.toHaveBeenCalled();
+
+    // Locked elsewhere (the state event names no project: the reader asks once).
+    unlocked = false;
+    const reads = svc.projectReads.length;
+    svc.events.send("library.state", STATE);
+    const heading = await screen.findByRole("heading", { level: 2, name: "Project locked" });
+    expect(screen.getByText(SENTENCES.locked)).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    expect(screen.getByRole("link", { name: "Go to the library" }).getAttribute("href")).toBe("/?project=p1");
+    expect(screen.queryByRole("button", { name: "Open again" })).toBeNull();
+    expect(svc.projectReads.length).toBe(reads + 1);
+    expect(f.destroy).toHaveBeenCalled();
+    expectNothingLeft(container);
+    // Nothing was read of the document to learn it.
+    expect(requests.filter((r) => r.url.includes("/document")).length).toBe(documentCalls);
+  });
+
+  it("the library closed or another one opened ends the reader at once, without asking about the project", async () => {
+    for (const state of [{ open: false }, { ...STATE, libraryId: "lib-2", name: "Grant 2025" }]) {
+      const svc = serveRoute({ unlocked: () => true });
+      const f = textHandle();
+      const { container, unmount } = await openRoute(f);
+      const reads = svc.projectReads.length;
+      svc.events.send("library.state", state);
+      await screen.findByRole("heading", { level: 2, name: "Library closed" });
+      expect(screen.getByText("The library this source belongs to is no longer open, so its files cannot be shown.")).toBeTruthy();
+      expect(screen.getByRole("link", { name: "Go to the library" })).toBeTruthy();
+      expect(svc.projectReads.length).toBe(reads);
+      expect(f.destroy).toHaveBeenCalled();
+      expectNothingLeft(container);
+      unmount();
+    }
+  });
+
+  it("the library turning read-only while reading shows the notice (the mode is followed)", async () => {
+    const svc = serveRoute({ unlocked: () => true });
+    await openRoute(textHandle());
+    expect(screen.queryByText(SENTENCES.readOnly)).toBeNull();
+    svc.events.send("library.state", { ...STATE, mode: "read-only", readOnlyReason: "locked-by-other-device" });
+    expect(await screen.findByText(SENTENCES.readOnly)).toBeTruthy();
+    // Still reading the same document.
+    expect(screen.getByRole("region", { name: "Page 1 of 3" })).toBeTruthy();
+  });
+
+  it("a project locked before the reader listened is caught by the first state the reader hears", async () => {
+    let unlocked = true;
+    const svc = serveRoute({ unlocked: () => unlocked });
+    const f = textHandle();
+    await openRoute(f);
+    unlocked = false;
+    // The first state the stream sends on connecting.
+    svc.events.send("library.state", STATE);
+    await screen.findByRole("heading", { level: 2, name: "Project locked" });
+    expect(f.destroy).toHaveBeenCalled();
   });
 });
