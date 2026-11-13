@@ -59,6 +59,58 @@ describe("the undo question", () => {
   });
 });
 
+describe("gone from Zotero, and back (Z5, R224)", () => {
+  it("the undo question counts marked and returned sources as sources it will change", () => {
+    expect(undoQuestion(report({}, { goneInZotero: 1, goneInZoteroBin: 1 }))).toBe("Remove 0 imported sources and take the Zotero mark off 1 source?");
+    expect(undoQuestion(report({}, { goneInZotero: 3 }))).toBe("Remove 0 imported sources and take the Zotero mark off 3 sources?");
+    // A bare back: undo puts the mark back. A back that also changed the item is an updated source (counted once).
+    expect(undoQuestion(report({}, { backInZotero: 2, backInZoteroUpdated: 1, updated: 1 }))).toBe("Remove 0 imported sources, revert 1 updated source and mark 1 source as gone from Zotero again?");
+    // Already marked earlier, or gone with no source of its own here: nothing to undo for those.
+    expect(undoQuestion(report({}, { goneAlready: 4, goneNotMarked: 2 }))).toBe("This import added and changed no sources. Undo it anyway?");
+  });
+
+  it("the report table has the three rows, only when not zero", async () => {
+    show(report({}, { goneInZotero: 3, goneInZoteroBin: 1, backInZotero: 2 }));
+    const table = await screen.findByRole("table", { name: "Items by outcome" });
+    const row = (name: string) => within(table).getByRole("rowheader", { name }).closest("tr")!.textContent;
+    expect(row("Marked as no longer in Zotero")).toContain("2");
+    expect(row("In the Zotero bin")).toContain("1");
+    expect(row("Back in Zotero")).toContain("2");
+  });
+
+  it("no Zotero rows when they are zero or absent (an older report)", async () => {
+    show(report({}, { goneInZotero: 0 }));
+    const table = await screen.findByRole("table", { name: "Items by outcome" });
+    expect(within(table).queryByText(/Zotero/)).toBeNull();
+  });
+
+  it("an availability kept by the undo is said once, with the number", async () => {
+    const r = report({}, { goneInZotero: 2 });
+    const kept = [
+      { kind: "availability", id: "/availability", sourceId: "s1", reason: "its availability was changed after this import, so it was left as it is" },
+      { kind: "availability", id: "/availability", sourceId: "s2", reason: "its availability was changed after this import, so it was left as it is" },
+    ];
+    const api = { report: async () => r, undo: async () => ({ removedSources: 0, revertedMerges: 0, kept }) } as unknown as ImportApi;
+    render(<StepReport api={api} projectId="p" batchId="b" />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Undo import" }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Undo import" }));
+    expect(await screen.findByText("2 sources' availability was changed after this import, so it was left as it is.")).toBeTruthy();
+    expect(screen.queryByText(/Kept: its availability/)).toBeNull();
+  });
+
+  it("the kept availability sentence, singular", async () => {
+    const r = report({}, { goneInZotero: 1 });
+    const kept = [{ kind: "availability", id: "/availability", sourceId: "s1", reason: "x" }];
+    const api = { report: async () => r, undo: async () => ({ removedSources: 0, revertedMerges: 0, kept }) } as unknown as ImportApi;
+    render(<StepReport api={api} projectId="p" batchId="b" />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Undo import" }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Undo import" }));
+    expect(await screen.findByText("1 source's availability was changed after this import, so it was left as it is.")).toBeTruthy();
+  });
+});
+
 describe("kept edits", () => {
   it("shows the kept line as text, whatever the page label holds", async () => {
     show(report({ keptFields: [{ item: "zotero:AAAA1111", fields: ["highlight on page <b>iv</b> (changed here, kept)"] }] }));

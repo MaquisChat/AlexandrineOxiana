@@ -1597,6 +1597,15 @@ describe("context hooks and gone items (Z2)", () => {
     expect(dry.items).toBe(0);
   });
 
+  it("a gone item from an adapter that is not incremental is passed by: no line, no count (Z5, R224 g)", async () => {
+    const p = await project();
+    await run(p, plain([ref("A", "Alpha")]));
+    const { result } = await run(p, { ...plain([{ key: "A", files: [], gone: "deleted", version: { id: "lib/A", version: "deleted" } }]), incremental: false });
+    expect(result.state).toBe("finished");
+    expect(result.counts).toMatchObject({ items: 0, goneInZotero: 0, goneAlready: 0, goneNotMarked: 0 });
+    expect(existsSync(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"))).toBe(false);
+  });
+
   it("skip: an item already in a resumed batch's journal is passed by before the adapter fetches it", async () => {
     const p = await project();
     const asked: string[] = [];

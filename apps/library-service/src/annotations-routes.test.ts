@@ -558,3 +558,14 @@ describe("annotation routes (Task R4)", () => {
     expect(kept.json.body).toBe(odd);
   });
 });
+
+describe("annotationRecord without an author (D22)", () => {
+  it("an imported annotation its source gave no author for has no author in the record; one with an author keeps it", async () => {
+    const { annotationRecord } = await import("./routes/annotations.js");
+    const base: Annotation = { id: newId(), sourceId: newId(), kind: "highlight", anchors: [], quote: "nobody's", externalKey: "zotero:ABCD2345", createdAt: "2027-03-12T10:00:00.000Z" };
+    const none = annotationRecord(base);
+    expect(none).not.toHaveProperty("author");
+    expect(JSON.parse(JSON.stringify(none))).not.toHaveProperty("author");
+    expect(annotationRecord({ ...base, author: "Ngozi Okafor" }).author).toBe("Ngozi Okafor");
+  });
+});

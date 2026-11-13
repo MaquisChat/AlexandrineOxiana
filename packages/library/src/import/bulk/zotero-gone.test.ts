@@ -6,7 +6,7 @@
  * the mark. Undo puts the earlier availability back while it is still the one written, and resets the library's
  * remembered version (R206 4). Against the stand-in Zotero (Z1), through the real engine.
  */
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -341,8 +341,14 @@ describe("gone from Zotero, and back (Z5)", () => {
     const marked = await folderBytes(sf.source.folder);
     const noticed = sf.source.availability.firstNoticedAt;
     // A full run sees it in the bin again.
-    const { r } = await run(p, { full: true });
-    expect(r.counts).toMatchObject({ goneInZotero: 1, failed: 0 });
+    const { r, batchId } = await run(p, { full: true });
+    // R224 (c): counted apart from what this run marked, and reported as such.
+    expect(r.counts).toMatchObject({ goneInZotero: 0, goneInZoteroBin: 0, goneAlready: 1, failed: 0 });
+    const md = await readFile(join(lib.root, p.folder, "imports", "batch-0003", "report.md"), "utf8");
+    expect(md).toContain("- Still gone from Zotero (marked earlier): 1");
+    expect(md).not.toContain("- In the Zotero bin:");
+    expect(md).not.toContain("- Marked as no longer in Zotero:");
+    expect((await bulk().batchReport(p.id, batchId)).notes.filter((n) => /deleted in Zotero/u.test(n))).toEqual([]);
     expect(await folderBytes(sf.source.folder)).toEqual(marked);
     expect((await sourceOf(p, key)).source.availability.firstNoticedAt).toBe(noticed);
     expect((await marks(p)).length).toBe(1);
@@ -424,8 +430,10 @@ describe("gone from Zotero, and back (Z5)", () => {
     z.restore(U, key);
     await run(p); // back: the availability is the earlier one again
     expect((await repo.getSource(p.id, id)).source.availability).toEqual({ status: "available" });
+    // The availability is already the one this undo would put back (the back gave it back): nothing to do, and
+    // nothing reported as kept (R224 g: the same holds for an undo run again after it was interrupted).
     const res = await bulk().undoBatch(p.id, marked.batchId);
-    expect(res.kept).toEqual([{ kind: "availability", id: "/availability", sourceId: id, reason: "its availability changed after the import; kept" }]);
+    expect(res.kept).toEqual([]);
     expect((await repo.getSource(p.id, id)).source.availability).toEqual({ status: "available" });
     // The researcher's own change after a mark is kept too.
     z.trash(U, key);
@@ -433,8 +441,220 @@ describe("gone from Zotero, and back (Z5)", () => {
     const mine = { status: "incomplete" as const };
     await repo.updateSource(p.id, id, { availability: mine });
     const res2 = await bulk().undoBatch(p.id, again.batchId);
-    expect(res2.kept.map((k) => k.kind)).toEqual(["availability"]);
+    expect(res2.kept).toEqual([{ kind: "availability", id: "/availability", sourceId: id, reason: "its availability was changed after this import, so it was left as it is" }]);
     expect((await repo.getSource(p.id, id)).source.availability).toEqual(mine);
+  });
+
+  it("an undo run again after it was interrupted reports nothing kept and changes nothing (R224 g)", async () => {
+    const p = await project();
+    const { p: key } = await highlighted("Undo, interrupted");
+    await run(p);
+    const id = (await sourceOf(p, key)).source.id;
+    await repo.updateSource(p.id, id, { availability: INCOMPLETE });
+    z.trash(U, key);
+    const marked = await run(p);
+    const sf = await repo.getSource(p.id, id);
+    await bulk().undoBatch(p.id, marked.batchId);
+    const after = await folderBytes(sf.source.folder);
+    // As if the undo stopped before its last step (the record still says finished): it is run again.
+    const recPath = join(lib.root, p.folder, "imports", "batch-0002", "batch.json");
+    const rec = JSON.parse(await readFile(recPath, "utf8")) as { state: string };
+    await writeFile(recPath, JSON.stringify({ ...rec, state: "finished" }, null, 2));
+    const again = await bulk().undoBatch(p.id, marked.batchId);
+    expect(again.kept).toEqual([]);
+    expect(await folderBytes(sf.source.folder)).toEqual(after);
+    expect((await repo.getSource(p.id, id)).source.availability).toEqual(INCOMPLETE);
+  });
+
+  it("a back that also changed the item counts as back AND updated; the batch record and the report agree (R224 a)", async () => {
+    const p = await project();
+    const { p: key } = await highlighted("Counted right");
+    await run(p);
+    const recCounts = async (n: number) => (JSON.parse(await readFile(join(lib.root, p.folder, "imports", `batch-000${n}`, "batch.json"), "utf8")) as { counts: Record<string, number>; countsDetail?: Record<string, number> });
+    z.trash(U, key);
+    const mark = await run(p);
+    const markReport = await bulk().batchReport(p.id, mark.batchId);
+    expect(markReport.counts).toMatchObject({ goneInZotero: 1, updated: 0, merged: 0 });
+    expect((await recCounts(2)).counts.merged).toBe(markReport.counts.merged + markReport.counts.updated);
+    expect((await recCounts(2)).countsDetail).toMatchObject({ goneInZotero: 1, goneInZoteroBin: 1, goneAlready: 0, backInZotero: 0, backInZoteroUpdated: 0 });
+    // Back with a new title: back and updated.
+    z.restore(U, key);
+    z.editItem(U, key, { title: "Counted right, revised" });
+    const back = await run(p);
+    expect(back.r.counts).toMatchObject({ backInZotero: 1, backInZoteroUpdated: 1, updated: 1 });
+    const backReport = await bulk().batchReport(p.id, back.batchId);
+    expect(backReport.counts).toMatchObject({ backInZotero: 1, backInZoteroUpdated: 1, updated: 1, merged: 0 });
+    expect((await recCounts(3)).counts.merged).toBe(backReport.counts.merged + backReport.counts.updated);
+    expect(await readFile(join(lib.root, p.folder, "imports", "batch-0003", "report.md"), "utf8")).toContain("- Updated from a newer version: 1");
+    // A bare back: back only.
+    z.trash(U, key);
+    await run(p);
+    z.restore(U, key);
+    const bare = await run(p);
+    expect(bare.r.counts).toMatchObject({ backInZotero: 1, backInZoteroUpdated: 0, updated: 0 });
+    const bareReport = await bulk().batchReport(p.id, bare.batchId);
+    expect((await recCounts(5)).counts.merged).toBe(bareReport.counts.merged + bareReport.counts.updated);
+  });
+});
+
+/** An earlier availability that must never be replaced by "available" (R224 b). */
+const INCOMPLETE = { status: "incomplete" as const, reason: "Only part of it was saved." };
+
+describe("undoing marks and backs in any order (R224 b)", () => {
+  /** The item comes back after Zotero deleted it for good (another device syncs it up again under its key). */
+  const readd = (key: string, title: string) => {
+    const fake = z as unknown as { nextKey: () => string };
+    const real = fake.nextKey.bind(z);
+    fake.nextKey = () => key;
+    try {
+      z.addItem(U, { itemType: "journalArticle", title, tags: [{ tag: "markets" }] });
+    } finally {
+      fake.nextKey = real;
+    }
+  };
+  const avail = async (p: Project, id: string) => (await repo.getSource(p.id, id)).source.availability;
+  /** The next sync after the undos: a full one (since was reset); nothing is marked or brought back that is not so in Zotero. */
+  const nextSyncIsQuiet = async (p: Project, id: string, expected: object) => {
+    const { r } = await run(p);
+    expect(r.counts).toMatchObject({ goneInZotero: 0, goneAlready: 0, backInZotero: 0, failed: 0 });
+    expect(await avail(p, id)).toEqual(expected);
+  };
+
+  for (const [label, earlier] of [
+    ["incomplete, with its reason", INCOMPLETE],
+    ["available", { status: "available" as const }],
+  ] as const) {
+    it(`mark then back, earlier ${label}: undo the mark first, then the back`, async () => {
+      const p = await project();
+      const { p: key } = await highlighted(`Mark first ${label}`);
+      await run(p);
+      const id = (await sourceOf(p, key)).source.id;
+      if (earlier.status !== "available") await repo.updateSource(p.id, id, { availability: earlier });
+      z.trash(U, key);
+      const mark = await run(p);
+      z.restore(U, key);
+      const back = await run(p);
+      expect(await avail(p, id)).toEqual(earlier);
+      await bulk().undoBatch(p.id, mark.batchId);
+      expect(await avail(p, id)).toEqual(earlier);
+      const res = await bulk().undoBatch(p.id, back.batchId);
+      expect(res.kept).toEqual([]);
+      expect(await avail(p, id)).toEqual(earlier); // never the stale "In your Zotero bin"
+      await nextSyncIsQuiet(p, id, earlier);
+    });
+
+    it(`mark then back, earlier ${label}: undo the back first, then the mark`, async () => {
+      const p = await project();
+      const { p: key } = await highlighted(`Back first ${label}`);
+      await run(p);
+      const id = (await sourceOf(p, key)).source.id;
+      if (earlier.status !== "available") await repo.updateSource(p.id, id, { availability: earlier });
+      z.trash(U, key);
+      const mark = await run(p);
+      const binMark = await avail(p, id);
+      z.restore(U, key);
+      const back = await run(p);
+      await bulk().undoBatch(p.id, back.batchId);
+      expect(await avail(p, id)).toEqual(binMark);
+      await bulk().undoBatch(p.id, mark.batchId);
+      expect(await avail(p, id)).toEqual(earlier);
+      await nextSyncIsQuiet(p, id, earlier);
+    });
+  }
+
+  /** bin (B2), deleted (B3), back (B4), each undone in the order given; the state after each undo. */
+  const binDeletedBack = async (title: string) => {
+    const p = await project();
+    const { p: key } = await highlighted(title);
+    await run(p);
+    const id = (await sourceOf(p, key)).source.id;
+    await repo.updateSource(p.id, id, { availability: INCOMPLETE });
+    z.trash(U, key);
+    const b2 = await run(p);
+    const binMark = await avail(p, id);
+    await new Promise((r) => setTimeout(r, 15));
+    z.remove(U, key);
+    const b3 = await run(p);
+    const deletedMark = await avail(p, id);
+    expect(deletedMark.zotero).toBe("deleted");
+    readd(key, title);
+    const b4 = await run(p);
+    expect(b4.r.counts).toMatchObject({ backInZotero: 1 });
+    expect(await avail(p, id)).toEqual(INCOMPLETE);
+    return { p, id, b2, b3, b4, binMark, deletedMark };
+  };
+
+  it("bin, deleted, back: undone newest first (back, deleted, bin)", async () => {
+    const { p, id, b2, b3, b4, binMark, deletedMark } = await binDeletedBack("Newest first");
+    await bulk().undoBatch(p.id, b4.batchId);
+    expect(await avail(p, id)).toEqual(deletedMark);
+    await bulk().undoBatch(p.id, b3.batchId);
+    expect(await avail(p, id)).toEqual(binMark);
+    await bulk().undoBatch(p.id, b2.batchId);
+    expect(await avail(p, id)).toEqual(INCOMPLETE);
+    await nextSyncIsQuiet(p, id, INCOMPLETE);
+  });
+
+  it("bin, deleted, back: undone oldest first (bin, deleted, back)", async () => {
+    const { p, id, b2, b3, b4 } = await binDeletedBack("Oldest first");
+    await bulk().undoBatch(p.id, b2.batchId);
+    expect(await avail(p, id)).toEqual(INCOMPLETE);
+    await bulk().undoBatch(p.id, b3.batchId);
+    expect(await avail(p, id)).toEqual(INCOMPLETE);
+    expect((await bulk().undoBatch(p.id, b4.batchId)).kept).toEqual([]);
+    expect(await avail(p, id)).toEqual(INCOMPLETE); // not a mark of an undone batch
+    await nextSyncIsQuiet(p, id, INCOMPLETE);
+  });
+
+  it("bin, deleted, back: undone deleted, back, bin", async () => {
+    const { p, id, b2, b3, b4, binMark } = await binDeletedBack("Middle first");
+    await bulk().undoBatch(p.id, b3.batchId);
+    expect(await avail(p, id)).toEqual(INCOMPLETE);
+    await bulk().undoBatch(p.id, b4.batchId);
+    expect(await avail(p, id)).toEqual(binMark); // the newest mark whose batch still stands
+    await bulk().undoBatch(p.id, b2.batchId);
+    expect(await avail(p, id)).toEqual(INCOMPLETE);
+    await nextSyncIsQuiet(p, id, INCOMPLETE);
+  });
+
+  it("bin then deleted, the bin batch undone first: undoing the deletion gives back the earlier availability, not the undone bin mark", async () => {
+    const p = await project();
+    const { p: key } = await highlighted("Bin undone first");
+    await run(p);
+    const id = (await sourceOf(p, key)).source.id;
+    await repo.updateSource(p.id, id, { availability: INCOMPLETE });
+    z.trash(U, key);
+    const b2 = await run(p);
+    z.remove(U, key);
+    const b3 = await run(p);
+    const deletedMark = await avail(p, id);
+    const r2 = await bulk().undoBatch(p.id, b2.batchId);
+    expect(r2.kept.map((k) => k.kind)).toEqual(["availability"]);
+    expect(await avail(p, id)).toEqual(deletedMark);
+    await bulk().undoBatch(p.id, b3.batchId);
+    expect(await avail(p, id)).toEqual(INCOMPLETE);
+    // Zotero still has it deleted: the next (full) sync marks it so again, and nothing comes back.
+    const { r } = await run(p);
+    expect(r.counts).toMatchObject({ goneInZotero: 1, backInZotero: 0 });
+    expect((await avail(p, id)).zotero).toBe("deleted");
+  });
+
+  it("bin then deleted, the bin batch undone, then the item back: the availability before both marks returns, not 'available'", async () => {
+    const p = await project();
+    const title = "Back after an undone bin";
+    const { p: key } = await highlighted(title);
+    await run(p);
+    const id = (await sourceOf(p, key)).source.id;
+    await repo.updateSource(p.id, id, { availability: INCOMPLETE });
+    z.trash(U, key);
+    const b2 = await run(p);
+    z.remove(U, key);
+    await run(p);
+    await bulk().undoBatch(p.id, b2.batchId);
+    readd(key, title);
+    const { r } = await run(p);
+    expect(r.counts).toMatchObject({ backInZotero: 1 });
+    expect(await avail(p, id)).toEqual(INCOMPLETE);
   });
 
   // The crash is armed from inside the mark's own governed change (when it makes its snapshot folder, the first new
