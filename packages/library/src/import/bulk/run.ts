@@ -24,7 +24,14 @@
  * location coarsened or removed (R83, ../proxies.ts); without a media worker those stay pending
  * (LOCATION_REASON in the item's notes and the report). Journal lines of items that stored nothing
  * (duplicates, failures) are written with the next store or at the next checkpoint; after a crash
- * such an item is simply processed again, with the same result.
+ * such an item is simply processed again, with the same result. A pause or suspend takes effect
+ * between items, after the item in hand and before the adapter is asked for the next one.
+ *
+ * Incremental adapters (R72) are told what the journals of the batches of their kind that were not
+ * undone know: `knownIds`, and (Z4) `fileKnown`, from the parts of each item's newest line (attachment
+ * version and stored file hash). A journal line records its stored files' parts only for files its
+ * source holds, or known parts carried forward for the same source (partsFor); a known file the source
+ * no longer holds (removed or destroyed here) is never brought back and is noted (`removedHere`).
  *
  * Linking (`fileHandling: 'link'`) stores the file's absolute path and its path relative to the
  * library (LinkedRelativePath, R24) and copies nothing; it is refused in projects whose governance
