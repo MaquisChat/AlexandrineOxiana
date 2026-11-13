@@ -31,7 +31,7 @@ import {
   type ZoteroWebOptions,
   type ZoteroWebScanResult,
 } from "./zotero-web.js";
-import { FakeZotero, guardNetwork } from "../../tests/zotero/fake-zotero.js";
+import { FakeZotero, guardNetwork, type FakeResponse } from "../../tests/zotero/fake-zotero.js";
 
 const FAST = 2 ** 10;
 const KEY = "AbCdEfGh0123456789zyxwvu";
@@ -778,38 +778,93 @@ describe("unattended scans against the stand-in (Z2)", () => {
     expect(page(keyLists[0]!.path).has("limit")).toBe(false);
   });
 
-  it("a key list read at another version yields no item gone by absence; the scan is still complete", async () => {
+  /** Rewrites the stand-in's answers to the key list (`format=versions` on /items); everything else as served. */
+  const onKeyList = (change: (r: FakeResponse) => FakeResponse) => {
+    const serve = z.serve.bind(z);
+    z.serve = (req, host) => {
+      const r = serve(req, host);
+      return /^\/users\/42\/items\?/u.test(req.path) && page(req.path).get("format") === "versions" ? change(r) : r;
+    };
+  };
+  const keyListAsks = () => z.requests.filter((r) => r.path.startsWith("/users/42/items?") && page(r.path).get("format") === "versions").length;
+  const withoutHeader = (r: FakeResponse, h: string): FakeResponse => ({ ...r, headers: Object.fromEntries(Object.entries(r.headers).filter(([k]) => k !== h)) });
+  const keysOnly = (r: FakeResponse, keep: (k: string) => boolean, total?: number): FakeResponse => {
+    const kept = Object.fromEntries(Object.entries(JSON.parse(String(r.body)) as Record<string, number>).filter(([k]) => keep(k)));
+    return { ...r, body: JSON.stringify(kept), headers: { ...r.headers, "total-results": String(total ?? Object.keys(kept).length) } };
+  };
+
+  it("a key list taken after the library changed still decides: the deleted item is gone, the added one is not content (A6)", async () => {
     const a = z.addItem(U, art("Here"));
-    let edited = false;
+    let added: string | undefined;
     // Called in the content loop, after the scan read the library and before the key list is asked for.
     const skip = () => {
-      if (!edited) {
-        edited = true;
-        z.editItem(U, a, { title: "Changed after the read" });
-      }
+      added ??= z.addItem(U, art("Added after the read"));
       return false;
     };
     const { items, result } = await scanFake({}, { knownIds: known(a, "GONEGONE"), skip });
-    expect(edited).toBe(true);
-    expect(goneOf(items)).toEqual([]);
+    expect(added).toBeDefined();
+    expect(goneOf(items)).toEqual([["zotero:GONEGONE", "deleted"]]);
+    expect(contentOf(items)).toEqual([`zotero:${a}`]);
     expect(result.completed).toBe(true);
   });
 
-  it("a key list that fails yields no item gone by absence; the scan is still complete", async () => {
+  it("a key list that cannot be had (3 tries) yields nobody gone by absence and the full run is not finished (A6)", async () => {
     const a = z.addItem(U, art("Here"));
-    let armed = false;
-    const skip = () => {
-      if (!armed) {
-        armed = true;
-        z.failNext(5, 500);
-      }
-      return false;
-    };
-    const { items, result } = await scanFake({ maxRetries: 1 }, { knownIds: known(a, "GONEGONE"), skip });
-    expect(armed).toBe(true);
+    onKeyList(() => ({ status: 500, headers: { "content-type": "text/plain" }, body: "busy" }));
+    const { items, result } = await scanFake({ maxRetries: 0 }, { knownIds: known(a, "GONEGONE") });
     expect(goneOf(items)).toEqual([]);
     expect(items.some((i) => i.unreadable)).toBe(false);
-    expect(result.completed).toBe(true);
+    expect(keyListAsks()).toBe(3);
+    expect(result.completed).toBe(false);
+  });
+
+  it("a key list without Total-Results is not whole: nobody gone (I5)", async () => {
+    const a = z.addItem(U, art("Here"));
+    onKeyList((r) => withoutHeader(r, "total-results"));
+    const { items, result } = await scanFake({}, { knownIds: known(a, "GONEGONE") });
+    expect(goneOf(items)).toEqual([]);
+    expect(result.completed).toBe(false);
+  });
+
+  it("an empty key list where the scan saw items is not whole, even with Total-Results: 0 (I5)", async () => {
+    const a = z.addItem(U, art("Here"));
+    onKeyList((r) => keysOnly(r, () => false));
+    const { items, result } = await scanFake({}, { knownIds: known(a, "GONEGONE") });
+    expect(goneOf(items)).toEqual([]);
+    expect(result.completed).toBe(false);
+  });
+
+  it("a key list lacking a key the scan saw is not whole (I5)", async () => {
+    const a = z.addItem(U, art("Seen, missing from the list"));
+    const b = z.addItem(U, art("Seen"));
+    onKeyList((r) => keysOnly(r, (k) => k !== a));
+    const { items, result } = await scanFake({}, { knownIds: known(a, b, "GONEGONE") });
+    expect(goneOf(items)).toEqual([]);
+    expect(result.completed).toBe(false);
+  });
+
+  it("item pages that understate their total and a short key list without a total: nobody gone (the reviewer's S2, I5)", async () => {
+    const keys = Array.from({ length: 250 }, (_, i) => z.addItem(U, art(`Item ${i}`)));
+    const serve = z.serve.bind(z);
+    z.serve = (req, host) => {
+      const r = serve(req, host);
+      if (!/^\/users\/42\/items\?/u.test(req.path)) return r;
+      if (page(req.path).get("format") === "versions") return withoutHeader(keysOnly(r, (k) => keys.indexOf(k) >= 100), "total-results");
+      // The item pages hide 100 items and say there are 150, so the scan itself looks complete.
+      const body = page(req.path).get("start") === "100" ? JSON.stringify((JSON.parse(String(r.body)) as unknown[]).slice(0, 50)) : r.body;
+      return { ...r, body, headers: { ...r.headers, "total-results": "150" } };
+    };
+    const { items } = await scanFake({}, { knownIds: known(...keys) });
+    expect(contentOf(items)).toHaveLength(150);
+    expect(goneOf(items)).toEqual([]);
+  });
+
+  it("a key list whose length is not its Total-Results is not whole (I5)", async () => {
+    const a = z.addItem(U, art("Here"));
+    onKeyList((r) => ({ ...r, headers: { ...r.headers, "total-results": "7" } }));
+    const { items, result } = await scanFake({}, { knownIds: known(a, "GONEGONE") });
+    expect(goneOf(items)).toEqual([]);
+    expect(result.completed).toBe(false);
   });
 
   it("knownIds of another library are never yielded", async () => {
@@ -1500,6 +1555,46 @@ processing:
       const p2 = await project();
       z.failNext(1, 429, 5);
       expect((await runOnce(p2)).since).toBe(z.libraryVersion(U));
+    });
+
+    it("a full run whose key list cannot be had records no version; the next run is full and makes the check (M11, A6)", async () => {
+      const p = await project();
+      // A first full run that does not record the version (its one file fails for a passing reason).
+      const keep = z.addItem(U, { itemType: "journalArticle", title: "Stays" });
+      const { att } = await withFile("Its file fails first");
+      const removed = z.addItem(U, { itemType: "journalArticle", title: "Deleted in Zotero before the next run" });
+      z.failFile(U, att, { api: 500 });
+      expect((await runOnce(p, { maxRetries: 0 })).since).toBeUndefined();
+      z.failFile(U, att, null);
+      z.remove(U, removed);
+      // The second run is full (nothing recorded); its key list fails every time.
+      const serve = z.serve.bind(z);
+      const isKeyList = (path: string) => path.startsWith("/users/42/items?") && page(path).get("format") === "versions";
+      let refused = 0;
+      z.serve = (req, host) => {
+        const r = serve(req, host); // recorded as usual
+        if (!isKeyList(req.path)) return r;
+        refused++;
+        return { status: 500, headers: { "content-type": "text/plain" }, body: "busy" };
+      };
+      const second = await runOnce(p, { maxRetries: 0 });
+      expect(second.r.counts.failed).toBe(0);
+      expect(refused).toBe(3);
+      expect(second.since).toBeUndefined(); // not finished: the version is not recorded (A6)
+      // The third run is full again; the key list answers: the version is recorded, and the deleted item is gone.
+      z.serve = serve;
+      z.requests.length = 0;
+      const third = await runOnce(p);
+      expect(z.requests.filter((q) => q.path.startsWith("/users/42/items?") && page(q.path).get("format") === "json").every((q) => !page(q.path).has("since"))).toBe(true);
+      expect(z.requests.filter((q) => isKeyList(q.path))).toHaveLength(1);
+      expect(third.since).toBe(z.libraryVersion(U));
+      // What that full run yields for the removed item (the engine passes gone items by until Z5): gone.
+      const a = zoteroWebAdapter(zweb);
+      const work = join(tmp, "w-m11");
+      await mkdir(work, { recursive: true });
+      const gone: ScanItem[] = [];
+      for await (const i of a.scan(new AbortController().signal, { workDir: async () => work, knownIds: () => new Set([`${U}/${keep}`, `${U}/${removed}`]) })) if (i.gone) gone.push(i);
+      expect(gone.map((i) => [i.key, i.gone])).toEqual([[`zotero:${removed}`, "deleted"]]);
     });
 
     it("a 429 that outlasts its retries holds since back", async () => {
