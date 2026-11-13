@@ -10,7 +10,7 @@
  *
  * What may be typed: a note may hold a line break (U+000A) and a tab, a quote the same (a PDF's text
  * breaks lines), a page label neither; no other control character anywhere, a carriage return
- * included. Nothing is trimmed. A note of only spaces is refused; an empty one (or null on update)
+ * included. Nothing is trimmed. A note with nothing visible in it (only white space or invisible characters) is refused; an empty one (or null on update)
  * means no note. R3's own validation accepts any text for a quote, so this is the stricter rule.
  *
  * Nothing typed is ever logged (the request logger holds no body) or audited (R177, in the library).
@@ -35,6 +35,13 @@ export const ANNOTATION_BODY_LIMIT = 1024 * 1024;
 // The shared request types and the library's own are one and the same: a change on either side breaks the build.
 true satisfies Same<AnnotationCreateRequest, AnnotationDraft>;
 true satisfies Same<AnnotationUpdateRequest, AnnotationPatch>;
+// Mutual assignability ignores an optional field renamed on one side, so the keys are held equal too
+// (a renamed `quote` or `body` would otherwise be silently dropped by the library).
+true satisfies Same<keyof AnnotationCreateRequest, keyof AnnotationDraft>;
+true satisfies Same<keyof AnnotationCreateRequest["anchors"][number], keyof AnnotationDraft["anchors"][number]>;
+true satisfies Same<keyof AnnotationUpdateRequest, keyof AnnotationPatch>;
+// The answer's text fields exist, under the same names, on the stored annotation.
+true satisfies Same<"quote" | "body" | "pageLabel" | "modifiedAt" extends keyof Annotation ? true : false, true>;
 
 /** Any control character (C0, DEL, C1). */
 // eslint-disable-next-line no-control-regex
@@ -111,13 +118,21 @@ function onlyKeys(b: object, allowed: readonly string[]): void {
 
 const isObj = (v: unknown): v is object => typeof v === "object" && v !== null && !Array.isArray(v);
 
+/**
+ * Nothing visible: after removing every Unicode white-space character (`White_Space`) and every
+ * invisible format character (`Default_Ignorable_Code_Point`: zero-width spaces and joiners, the word
+ * joiner, the byte-order mark, soft hyphen and others), nothing remains. Both are properties the
+ * regular-expression engine offers; the empty string is not "nothing visible" (it means no note).
+ */
+const NOTHING_VISIBLE = /^[\p{White_Space}\p{Default_Ignorable_Code_Point}]+$/u;
+
 /** What may be typed: see the header. Nothing is trimmed. */
 function checkText(v: { quote?: unknown; body?: unknown; pageLabel?: unknown }): void {
   const control = () => badRequest("A note cannot contain control characters.");
   if (typeof v.quote === "string" && CONTROL_CHARS_EXCEPT_TAB_LF.test(v.quote)) throw control();
   if (typeof v.body === "string") {
     if (CONTROL_CHARS_EXCEPT_TAB_LF.test(v.body)) throw control();
-    if (v.body !== "" && v.body.trim() === "") throw badRequest("A note cannot be only spaces.");
+    if (NOTHING_VISIBLE.test(v.body)) throw badRequest("A note cannot be only spaces.");
   }
   if (typeof v.pageLabel === "string" && CONTROL_CHARS.test(v.pageLabel)) throw control();
 }

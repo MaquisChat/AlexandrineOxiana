@@ -535,4 +535,26 @@ describe("annotation routes (Task R4)", () => {
     }
     expect(made.id).toBeTruthy();
   });
+
+  it("a note with nothing visible in it is refused like a note of only spaces, and never replaces a note; a real note containing such characters is kept as typed", async () => {
+    const f = await fixture();
+    const sentence = "A note cannot be only spaces.";
+    const invisible = ["\u200B", "\u200C", "\u200D", "\u2060", "\uFEFF", "\u180E", "\u00AD", "\u3164", " \u200B\n\u2060\t\uFEFF ", "\u200B\u00A0\u2003"];
+    for (const body of invisible) {
+      const r = await call({ method: "POST", url: f.base, body: make(f.assetId, { body }) });
+      expect(r.status, JSON.stringify(body)).toBe(400);
+      expect(r.json.error.message).toBe(sentence);
+    }
+    const made = (await call({ method: "POST", url: f.base, body: make(f.assetId, { body: "real note" }) })).json as AnnotationRecord;
+    for (const body of invisible) {
+      const r = await call({ method: "PATCH", url: `${f.base}/${made.id}`, body: { body } });
+      expect(r.status, JSON.stringify(body)).toBe(400);
+      expect(r.json.error.message).toBe(sentence);
+    }
+    expect((await call({ url: f.base })).json.annotations[0].body).toBe("real note");
+    const odd = "zero\u200Bwidth \uFEFFand\u2060 joiner\u200D";
+    const kept = await call({ method: "PATCH", url: `${f.base}/${made.id}`, body: { body: odd } });
+    expect(kept.status).toBe(200);
+    expect(kept.json.body).toBe(odd);
+  });
 });
