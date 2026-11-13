@@ -1349,3 +1349,45 @@ test("a keyboard selection crosses into the next page; a further Shift+arrow clo
   expect(await listed(app, projectId, sid)).toEqual([]);
   expect(errors).toEqual([]);
 });
+
+test("with a note open, words selected on the page with the mouse stay selected, to be copied into the note (R11, J1)", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  const file = sourceFile(app, "copy-into-note.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Copy into a note" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  await expect(page.locator('[data-page-number="1"] .ao-reader-text-layer > .ao-reader-end-of-content')).toBeAttached();
+  await expect(page.locator(".ao-reader-scroll")).toBeFocused();
+  await page.keyboard.press("n");
+  const field = page.getByRole("region", { name: "Note on page 1" }).getByRole("textbox", { name: "Note" });
+  await expect(field).toBeFocused();
+  await page.keyboard.type("about ");
+  const before = await said(page).textContent();
+  // Select words of page 2 with the mouse (below the note's field, which lies over the top left of the pages).
+  const line = "This is the text of page 2, written for the reader's tests.";
+  await centreOn(page, { n: 2, words: line, to: 20 });
+  await page.evaluate(() => {
+    const scroller = document.querySelector<HTMLElement>(".ao-reader-scroll")!;
+    const note = document.querySelector<HTMLElement>(".ao-reader-note")!.getBoundingClientRect();
+    const v = scroller.getBoundingClientRect();
+    scroller.scrollTop -= Math.max(0, note.bottom + 40 - (v.top + v.bottom) / 2);
+  });
+  await dragSelect(page, { n: 2, words: line, i: 0 }, { n: 2, words: line, i: 10 });
+  // No toolbar, nothing said; the selection holds those words and the focus is not in the note.
+  await expect(colourBar(page)).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => document.getSelection()?.toString() ?? "")).toBe("This is the");
+  expect(await field.evaluate((el) => el === document.activeElement)).toBe(false);
+  expect(await said(page).textContent()).toBe(before);
+  // (The clipboard cannot be read alike in both browsers: Ctrl/Cmd+C copies the document's selection, asserted above.)
+  // Then into the note: its text unchanged, and still written in.
+  await field.click();
+  await expect(field).toBeFocused();
+  await expect(field).toHaveValue("about ");
+  await page.keyboard.press("End");
+  await page.keyboard.type("these words");
+  await expect(field).toHaveValue("about these words");
+  expect(await listed(app, projectId, sid)).toEqual([]);
+  expect(errors).toEqual([]);
+});
