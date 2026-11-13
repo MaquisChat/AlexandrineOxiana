@@ -870,7 +870,7 @@ describe("cloud-drive folders: fix round 1 (A6, R213)", () => {
   /** The real `fs.watch`, counting the handles left open. */
   function countedWatch() {
     const handles = { open: 0, closed: 0 };
-    const fn = ((d: string, o: fs.WatchOptions) => {
+    const fn = ((d: string, o: { persistent?: boolean; recursive?: boolean }) => {
       const w = fs.watch(d, o);
       handles.open++;
       const close = w.close.bind(w);
@@ -937,7 +937,8 @@ describe("cloud-drive folders: fix round 1 (A6, R213)", () => {
     const { w } = start(p, { stabilityMs: 200, pollMs: 50, fs: { lstat: lstatS } });
     await w.ready;
     await until(() => w.status().counts.notDownloaded === 1);
-    expect(opened(f)).toHaveLength(2);
+    expect(opens).toBe(2); // the hash and the sniff, through the open stand-in
+    expect(opened(f)).toEqual([]); // and no other read of any kind (attach's hash stream, the copy)
     expect(repo.listSourceIds(p.id)).toEqual([]);
   });
 
@@ -1052,7 +1053,7 @@ describe("cloud-drive folders: fix round 1 (A6, R213)", () => {
                 holdRead = false;
                 await held;
               }
-              return fh.read(...(a as [Buffer, number, number, null]));
+              return fh.read(...(a as unknown as [Buffer, number, number, null]));
             }),
           close: () => count(() => (s.closes++, fh.close())),
         } as unknown as fsp.FileHandle;

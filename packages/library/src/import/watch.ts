@@ -50,7 +50,7 @@
  * never silently emptied.
  */
 import { createHash } from "node:crypto";
-import { watch as fsWatch, type BigIntStats, type FSWatcher } from "node:fs";
+import { constants as fsConstants, watch as nodeWatch, type BigIntStats, type FSWatcher } from "node:fs";
 import fsp, { type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -63,6 +63,7 @@ import type { HttpClient } from "../lookup/index.js";
 import { addWatchedFolderEntry, projectEncrypted, removeWatchedFolderEntry, type Repo } from "../repo/repo.js";
 import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, createAttach, type Attach, type AttachOutcome, type AttachStatus } from "./attach.js";
 import { proxyQueueFor, type ProxyQueue } from "./proxies.js";
+import { SIDECAR_EXTS } from "./sidecar.js";
 import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
 
 /** Names never imported (moved to watch-local.ts so the two modules do not import each other; A2). */
@@ -78,11 +79,17 @@ export const WATCH_STATUS_INTERVAL_MS = 1000;
 export const WATCH_PROBLEMS_MAX = 5000;
 /** A file-system call on the folder unanswered for this long marks it "Cannot be reached". */
 export const WATCH_FS_TIMEOUT_MS = 30_000;
+/** How often the files that were not downloaded are asked again (A6: not every poll — a standing cost on a laptop). */
+export const WATCH_RECHECK_MS = 60_000;
 /** How often the folder, the project's lock and the library are checked (R81: at most 10 s). */
 const POLL_MS = 2000;
 const MAX_DEPTH = 20;
 /** Files not downloaded that each poll checks again (round robin). */
-const RECHECK_PER_POLL = 2000;
+const RECHECK_PER_ROUND = 2000;
+/** How often a file waits for an undecided sidecar beside it before it comes in without it. */
+const SIDECAR_WAITS = 3;
+/** Files in a watched folder are opened read-only and never through a symbolic link swapped in meanwhile. */
+const OPEN_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
 /** Files per step (one `contentState` call; on macOS one `/usr/bin/stat` process). */
 const BATCH = WATCH_LOCAL_BATCH;
 /** Files read once and waiting for their second reading; more wait as names only. */
@@ -165,8 +172,8 @@ export interface WatchFs {
   readdir(path: string): Promise<Array<{ name: string; isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean }>>;
   stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean }>;
   realpath(path: string): Promise<string>;
-  /** Read-only. */
-  open(path: string): Promise<FileHandle>;
+  /** Opens with `flags` (the engine passes read-only and, where the platform has it, O_NOFOLLOW). */
+  open(path: string, flags: number): Promise<FileHandle>;
 }
 
 const realFs: WatchFs = {
@@ -174,7 +181,7 @@ const realFs: WatchFs = {
   readdir: (p) => fsp.readdir(p, { withFileTypes: true }),
   stat: (p) => fsp.stat(p),
   realpath: (p) => fsp.realpath(p),
-  open: (p) => fsp.open(p, "r"),
+  open: (p, flags) => fsp.open(p, flags),
 };
 
 export interface WatchDeps {
@@ -196,6 +203,8 @@ export interface WatchDeps {
   presence?: typeof contentState;
   /** How often the folder is listed again (default WATCH_RESCAN_MS). */
   rescanMs?: number;
+  /** How often the files that were not downloaded are asked again (default WATCH_RECHECK_MS). */
+  recheckMs?: number;
   /** How long one file-system call on the folder may go unanswered (default WATCH_FS_TIMEOUT_MS). */
   fsTimeoutMs?: number;
   /** Test seams: the stability period (default WATCH_STABILITY_MS) and how often the folder and library are checked. */
@@ -207,6 +216,14 @@ export interface WatchDeps {
   locationEnv?: LocationEnv;
   /** Test seam (honoured only when NODE_ENV=test, R47): false starts no file-system watcher, so only scans find files. */
   watchEvents?: boolean;
+  /**
+   * How the folder is watched (default: "tree" on macOS and Windows, "per-folder" elsewhere). "tree": ONE watcher for
+   * the whole tree (the system's own recursion, so setting it up is one call). "per-folder": one watcher per folder
+   * (Linux, whose system watches one folder at a time). Injected so that both forms are tested on every platform.
+   */
+  watcherForm?: "tree" | "per-folder";
+  /** Test seam: Node's `fs.watch`. */
+  fsWatch?: typeof nodeWatch;
 }
 
 export interface FolderWatch {
@@ -252,6 +269,7 @@ class FolderGate {
   private busy = false;
   private queue: Array<{ go: () => void; fail: () => void }> = [];
   private freeWaiters: Array<() => void> = [];
+  private settleWaiters: Array<() => void> = [];
   private ctl = new AbortController();
   stuck = false;
   /** Grows each time a call does not answer: answers obtained across a change are not trusted. */
@@ -313,6 +331,7 @@ class FolderGate {
       this.stuck = false;
       this.ctl = new AbortController();
       this.busy = false;
+      for (const f of this.settleWaiters.splice(0)) f();
       for (const f of this.freeWaiters.splice(0)) f();
       return;
     }
@@ -323,6 +342,20 @@ class FolderGate {
   /** Resolves when no call is stuck (at once if none is), or when the watch stops. */
   whenFree(): Promise<void> {
     return this.stuck ? new Promise((r) => this.freeWaiters.push(r)) : Promise.resolve();
+  }
+  /** Resolves only when the stuck call has settled (never merely because the watch stopped): for clean-up calls. */
+  afterSettle(): Promise<void> {
+    return this.stuck ? new Promise((r) => this.settleWaiters.push(r)) : Promise.resolve();
+  }
+  /** A call made on this folder by an earlier watch is still outstanding: this gate is stuck until it settles (A6). */
+  adopt(outstanding: Promise<unknown>): void {
+    if (this.stuck || this.busy) return;
+    this.stuck = true;
+    this.busy = true;
+    this.epoch++;
+    this.ctl.abort();
+    const done = () => this.settled();
+    void outstanding.then(done, done);
   }
   /** The watch stops: nobody waits for the stuck call any longer (it is still not followed by another). */
   release(): void {
@@ -371,6 +404,17 @@ function defaultLocationEnv(): LocationEnv {
 }
 
 const errCode = (err: unknown) => (err as NodeJS.ErrnoException | null)?.code;
+const isRefusal = (err: unknown) => errCode(err) === "EACCES" || errCode(err) === "EPERM";
+
+/**
+ * Folders with a call outstanding that did not answer, by the folder as given and by its real path, for the life of
+ * the process (A6): a new watch on such a folder (a restart, W7's "Try again") starts "Cannot be reached" and makes
+ * no call until that one settles — the thread it holds is not joined by another.
+ */
+const outstandingFolders = new Map<string, Promise<void>>();
+
+/** A reading of nothing (a file the system would not let the app look at). */
+const NO_READING: Reading = { ino: 0n, size: 0, blocks: 0, mtimeNs: 0n };
 
 /**
  * Watches `dir` (absolute) and adds each new file to the project. Errors are reported through
@@ -391,6 +435,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const stability = deps.stabilityMs ?? WATCH_STABILITY_MS;
   const pollMs = Math.min(deps.pollMs ?? POLL_MS, 10_000);
   const rescanMs = deps.rescanMs ?? WATCH_RESCAN_MS;
+  const recheckMs = deps.recheckMs ?? WATCH_RECHECK_MS;
+  const form = deps.watcherForm ?? (process.platform === "darwin" || process.platform === "win32" ? "tree" : "per-folder");
+  const fsWatch = deps.fsWatch ?? nodeWatch;
   const env = deps.locationEnv ?? defaultLocationEnv();
   const eventsOn = deps.watchEvents !== false || process.env.NODE_ENV !== "test";
   // EVERY folder is checked, whatever the provider (A3): `provider` only names the service in the sentences.
@@ -416,13 +463,22 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   /** Files to look at (relative names), with their flags. */
   const pending = new Map<string, number>();
   /** Files read once, waiting for the second reading `stability` ms later (oldest first). */
-  const settling = new Map<string, { a: Reading; at: number; flags: number }>();
+  const settling = new Map<string, { a: Reading; at: number; flags: number; waits?: number }>();
   /** Stable, local files waiting for their turn to be read. */
-  const imports: Array<{ rel: string; b: Reading; flags: number }> = [];
+  const imports: Array<{ rel: string; b: Reading; flags: number; waits?: number }> = [];
+  /**
+   * Sidecar files (`.bib`, `.ris`, `.json`, `.opf`) that passed the whole order by themselves — name rule, stable,
+   * "local", judged state equal to the stability reading — with that state: attach may read one only while a fresh
+   * `lstat` still equals it (A6, C1). Small: sidecar names only.
+   */
+  const sidecarOk = new Map<string, Reading>();
+  /** Which file came in with which content (came-in files only): a renamed one is not imported again (M3). */
+  const cameInBySha = new Map<string, string>();
   /** The listing in progress: folders still to read, and what was found (to drop files that went away). */
   let walk: { dirs: Array<{ dir: string; depth: number; entries?: Entry[] }>; found: Set<string>; complete: boolean } | null = null;
   let pollDue = false;
   let nextRescan = Date.now() + rescanMs;
+  let nextRecheck = Date.now() + recheckMs;
   /** The file being imported and its stability reading (for attach's `readable`). */
   let current: { abs: string; b: Reading } | null = null;
 
@@ -433,6 +489,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
 
   // ---- the folder's one gate, and the calls made through it ----------------------------------------------
   const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, () => {
+    const settledAt = gate.afterSettle();
+    const keys = [...new Set([root, realRoot])];
+    for (const k of keys) outstandingFolders.set(k, settledAt);
+    void settledAt.then(() => {
+      for (const k of keys) if (outstandingFolders.get(k) === settledAt) outstandingFolders.delete(k);
+    });
     goUnreachable(withProvider(WATCH_REASONS.notResponding, provider));
     wake();
   });
@@ -479,6 +541,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       ndOrder.delete(rel);
     }
     settling.delete(rel);
+    sidecarOk.delete(rel);
     dropProblem(rel);
     touch();
   }
@@ -614,40 +677,61 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
 
   // ---- the watcher ------------------------------------------------------------------------------------------
-  // Events come from Node's own `fs.watch`, one per watched FOLDER (the folder itself, and each folder inside it
-  // when the watch is recursive), never one per file. It does not poll, makes no `stat`/`lstat`/`readdir` of its
-  // own and opens no file: an event only names a file to look at (the steps below decide everything, through the
-  // gate). chokidar 5.0.0 is not used here: it keeps one fs.watch per FILE (on macOS a kqueue handle opens each
-  // file; ~2.2 KB of heap per file, 88 MB at 40,000 files, measured in watch.scale.test.ts), `lstat`s every entry
-  // at start and lists and `lstat`s a whole folder again on each of its events — all outside this folder's gate.
-  // What remains outside the gate: creating each folder's watch is one synchronous system call (inotify on
-  // Linux, FSEvents on macOS) made on the main thread when the folder is (re)listed. On the owner's Mac list.
+  // Events come from Node's own `fs.watch` on FOLDERS, never one per file (A6, R213). In the "tree" form (macOS,
+  // Windows) ONE watcher covers the whole tree through the system's own recursion, so setting it up is one call;
+  // in the "per-folder" form (Linux) each watched folder has its own, closed when its folder goes, and a folder
+  // made again under the same name is watched and listed at once. `fs.watch` does not poll, makes no
+  // `stat`/`lstat`/`readdir` of its own and opens no file: an event only names a file to look at (the steps below
+  // decide everything, through the gate). A watcher is set up only immediately after the folder answered an
+  // asynchronous call within its time limit, never while a call on it is stuck. What remains outside the gate:
+  // setting a watcher up is a synchronous system call on the main thread (inotify on Linux; on macOS libuv opens
+  // the folder, reads its real path and starts an FSEvents stream). On the owner's Mac list. (chokidar 5.0.0 is
+  // not used: it keeps one watch, on macOS one open descriptor, per FILE — 80 MB at 40,000 files — and `lstat`s
+  // every entry at start, all outside any gate.)
   const dirWatchers = new Map<string, FSWatcher>();
+  /** The inode of each folder inside the watched one that has been listed (per-folder form: watched too). */
+  const dirInos = new Map<string, bigint>();
   async function closeWatcher(): Promise<void> {
     for (const w of dirWatchers.values()) w.close();
     dirWatchers.clear();
+    dirInos.clear();
+  }
+  /** Forgets the folder `abs` and every folder below it (their watchers closed). */
+  function closeDirsUnder(abs: string) {
+    const under = (k: string) => k === abs || k.startsWith(abs + sep);
+    for (const [k, w] of dirWatchers) {
+      if (!under(k)) continue;
+      w.close();
+      dirWatchers.delete(k);
+    }
+    for (const k of [...dirInos.keys()]) if (under(k)) dirInos.delete(k);
   }
   function watchDir(d: string): void {
-    if (!eventsOn || stopped || unreachable || dirWatchers.has(d)) return;
+    if (!eventsOn || stopped || unreachable || gate.stuck || dirWatchers.has(d)) return;
+    if (form === "tree" && d !== realRoot) return; // the tree's one watcher already covers it
     let w: FSWatcher;
     try {
-      w = fsWatch(d, { persistent: true });
+      w = fsWatch(d, form === "tree" ? { recursive: opts.recursive, persistent: true } : { persistent: true });
     } catch {
       if (d === realRoot) emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
       return; // the next scan finds what this folder holds
     }
     dirWatchers.set(d, w);
-    w.on("change", (eventType, name) => {
+    w.on("change", (eventType: string, name: string | Buffer | null) => {
       if (stopped || unreachable) return;
       if (name === null || name === undefined) {
         if (!walk) startWalk(); // the system lost track of names: the folder is listed again
       } else {
+        // The tree form names a path relative to the watched folder ("Sub/Deeper/x.pdf"), as FSEvents gives it.
         const abs = resolve(d, String(name));
         if (!within(realRoot, abs)) return;
         const rel = relName(abs);
-        if (rel.split("/").some((s) => nameRule(s)?.skip === "silent")) return;
-        // A new or renamed name is told (an "add"); a change of content is quiet (already-known content is skipped silently).
-        addPending(rel, eventType === "change" ? QUIET : 0);
+        const parts = rel.split("/");
+        if (parts.length > MAX_DEPTH + 1 || parts.some((s) => nameRule(s)?.skip === "silent")) return;
+        const kind = records.get(rel)?.kind;
+        // A new or renamed name is told (an "add"); a change of content is quiet (already-known content is skipped
+        // silently); a file that was not downloaded is asked again at once (A6).
+        addPending(rel, (eventType === "change" ? QUIET : 0) | (kind === "nd" || kind === "unknown" ? FORCE : 0));
       }
       wake();
     });
@@ -657,6 +741,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       if (d === realRoot && !unreachable && !stopped) emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
     });
   }
+  /** Called right after the folder's listing answered. */
   async function startWatcher(): Promise<void> {
     watchDir(realRoot);
   }
@@ -678,22 +763,30 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     let entries = given;
     if (!entries) {
       try {
+        if (d !== realRoot) {
+          const ino = (await g.lstat(d)).ino;
+          if (dirInos.has(d) && dirInos.get(d) !== ino) closeDirsUnder(d); // a different folder under the same name
+          dirInos.set(d, ino);
+        }
         entries = await g.readdir(d);
       } catch (err) {
         w.complete = false;
         if (err instanceof FolderNotAnsweringError) throw err;
         if (d === realRoot) goUnreachable(folderReason(err));
+        else if (isRefusal(err)) {
+          const rel = relName(d);
+          w.found.add(rel);
+          report(rel, NO_READING, "not-permitted", WATCH_REASONS.fileNotPermitted);
+        }
         return;
       }
+      watchDir(d); // the folder has just answered
     }
     for (const e of entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
       if (nameRule(e.name)?.skip === "silent") continue;
       const p = join(d, e.name);
       if (e.isDirectory()) {
-        if (opts.recursive && depth < MAX_DEPTH) {
-          watchDir(p);
-          w.dirs.push({ dir: p, depth: depth + 1 });
-        }
+        if (opts.recursive && depth < MAX_DEPTH) w.dirs.push({ dir: p, depth: depth + 1 });
       } else if (e.isFile() || e.isSymbolicLink()) {
         const rel = relName(p);
         w.found.add(rel);
@@ -736,15 +829,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       st = await g.lstat(abs);
     } catch (err) {
       if (err instanceof FolderNotAnsweringError) throw err;
-      if (errCode(err) === "EACCES" || errCode(err) === "EPERM") {
-        if (!problemList.has(rel)) {
-          setProblem(rel, { file: rel, kind: "not-permitted", reason: WATCH_REASONS.fileNotPermitted });
-          emit({ kind: "failed", file: rel, reason: WATCH_REASONS.fileNotPermitted });
-        }
-        return;
-      }
+      if (isRefusal(err)) return report(rel, NO_READING, "not-permitted", WATCH_REASONS.fileNotPermitted);
       // Gone — unless the whole folder is gone (then nothing is decided until it is back).
-      if (!(await folderGone())) removeRec(rel);
+      if (!(await folderGone())) {
+        removeRec(rel);
+        closeDirsUnder(abs); // a folder that went: its watcher is closed, no handle left
+      }
       return;
     }
     const r = readingOf(st);
@@ -759,9 +849,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
     if (st.isDirectory()) {
       // A folder put in a recursive watch: watched, and listed (what it holds goes through the same steps).
+      // Listed (and, per folder, watched) unless it is the very folder already listed under that name.
       const depth = rel.split("/").length;
-      if (opts.recursive && depth <= MAX_DEPTH && !dirWatchers.has(abs)) {
-        watchDir(abs);
+      if (opts.recursive && depth <= MAX_DEPTH && dirInos.get(abs) !== st.ino) {
+        closeDirsUnder(abs);
         if (walk) walk.dirs.push({ dir: abs, depth });
         else walk = { dirs: [{ dir: abs, depth }], found: new Set(), complete: false };
       }
@@ -801,13 +892,13 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   /** The second reading of files read at least `stability` ms ago; the stable ones are judged; local ones queued. */
   async function settleStep(): Promise<void> {
     const now = Date.now();
-    const due: Array<[string, { a: Reading; at: number; flags: number }]> = [];
+    const due: Array<[string, { a: Reading; at: number; flags: number; waits?: number }]> = [];
     for (const e of settling) {
       if (e[1].at + stability > now || due.length >= BATCH) break;
       due.push(e);
     }
     let gone: Promise<string | null> | undefined;
-    const stable: Array<{ rel: string; abs: string; b: Reading; flags: number }> = [];
+    const stable: Array<{ rel: string; abs: string; b: Reading; flags: number; waits?: number }> = [];
     try {
       for (const [rel, s] of due) {
         settling.delete(rel);
@@ -828,15 +919,20 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
           settling.set(rel, { a: b, at: Date.now(), flags: s.flags }); // still changing: waits for the next round
           continue;
         }
-        stable.push({ rel, abs: absOf(rel), b, flags: s.flags });
+        stable.push({ rel, abs: absOf(rel), b, flags: s.flags, ...(s.waits ? { waits: s.waits } : {}) });
       }
       if (stable.length === 0) return;
       const judged = await judge(stable.map((s) => s.abs));
       for (const s of stable) {
         const c = judged.get(s.abs);
-        if (!c || c.presence !== "local") notLocal(s.rel, s.b, c?.presence ?? "unknown");
-        else if (!sameReading(s.b, c)) settling.set(s.rel, { a: c, at: Date.now(), flags: s.flags });
-        else imports.push({ rel: s.rel, b: s.b, flags: s.flags });
+        if (!c || c.presence !== "local") {
+          notLocal(s.rel, s.b, c?.presence ?? "unknown");
+          sidecarOk.delete(s.rel);
+        } else if (!sameReading(s.b, c)) settling.set(s.rel, { a: c, at: Date.now(), flags: s.flags });
+        else {
+          if (isSidecarName(s.rel)) sidecarOk.set(s.rel, s.b); // passed the whole order by itself (A6)
+          imports.push({ rel: s.rel, b: s.b, flags: s.flags, ...(s.waits ? { waits: s.waits } : {}) });
+        }
       }
       stable.length = 0;
     } finally {
@@ -846,13 +942,13 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
   }
 
-  /** Files not downloaded are asked again, up to RECHECK_PER_POLL per poll: one that is local now is looked at. */
+  /** Files not downloaded are asked again, up to RECHECK_PER_ROUND per round (one round per `recheckMs`; an event naming one asks it at once): one that is local now is looked at. */
   async function recheck(): Promise<void> {
     if (ndOrder.size === 0) return;
     const take: string[] = [];
     for (const rel of ndOrder) {
       take.push(rel);
-      if (take.length >= RECHECK_PER_POLL) break;
+      if (take.length >= RECHECK_PER_ROUND) break;
     }
     for (const rel of take) {
       ndOrder.delete(rel);
@@ -885,7 +981,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let hashBuf: Buffer | undefined;
   /** SHA-256 of a file: open, each read and close are calls through the gate. Only for a file just judged local. */
   async function hashOf(abs: string): Promise<string> {
-    const fh = await gate.call(() => fsx.open(abs));
+    const fh = await gate.call(() => fsx.open(abs, OPEN_FLAGS));
     try {
       const h = createHash("sha256");
       const buf = (hashBuf ??= Buffer.allocUnsafe(HASH_CHUNK));
@@ -896,19 +992,28 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       }
       return h.digest("hex");
     } finally {
-      // Closing is a call too: through the gate, or once the folder answers again.
-      await gate.call(() => fh.close()).catch(() => void gate.whenFree().then(() => fh.close().catch(() => {})));
+      // Closing is a call too: it takes its turn at the gate; if the folder is stuck (on this handle's read), it
+      // waits until that call has settled — even when the watch has stopped meanwhile — and is never issued beside it.
+      await gate.call(() => fh.close()).catch((err: unknown) => {
+        if (err instanceof FolderNotAnsweringError) void gate.afterSettle().then(() => gate.call(() => fh.close()).catch(() => {}));
+      });
     }
   }
 
-  /** attach's check, for the item (it must still be in its stability reading) and for each sidecar beside it. */
+  const isSidecarName = (rel: string) => (SIDECAR_EXTS as readonly string[]).some((ext) => rel.toLowerCase().endsWith(ext));
+  /**
+   * attach's check, asked immediately before EACH open of the item (the sniff, the hash, the metadata, the copy) and
+   * before each sidecar is read: a fresh `lstat` (bigint) must equal the state judged "local" — the item's stability
+   * reading, or the sidecar's own (a sidecar that has not passed the whole order by itself is not read). A provider
+   * that evicts a file drops its blocks, so this catches it without starting a process (A6).
+   */
   async function readable(p: string): Promise<boolean> {
     if (!within(realRoot, p)) return false;
-    const expected = current && current.abs === p ? current.b : null;
-    if (!expected && nameRule(basename(p)) !== null) return false;
+    const expected = current && current.abs === p ? current.b : sidecarOk.get(relName(p));
+    if (!expected) return false;
     try {
-      const s = (await judge([p])).get(p);
-      return !!s && s.presence === "local" && (!expected || sameReading(expected, s));
+      const st = await g.lstat(p);
+      return st.isFile() && sameReading(expected, readingOf(st));
     } catch {
       return false;
     }
@@ -944,6 +1049,13 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       settling.set(rel, { a: c, at: Date.now(), flags });
       return;
     }
+    // A sidecar beside it still undecided (seen, not yet stable and judged): the file waits a few rounds for it,
+    // then comes in without it.
+    const waits = job.waits ?? 0;
+    if (!isSidecarName(rel) && waits < SIDECAR_WAITS && sidecarsOf(rel).some((r) => pending.has(r) || settling.has(r))) {
+      settling.set(rel, { a: b, at: Date.now(), flags, waits: waits + 1 });
+      return;
+    }
     // Checked: "local", and exactly the state the stability rule saw. Between this check and the first read
     // there is a window nobody can close (a cloud service may evict the file at any moment); it is kept to
     // this one file, read at once.
@@ -953,8 +1065,20 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       sha = await hashOf(abs);
     } catch (err) {
       if (err instanceof FolderNotAnsweringError) throw err; // looked at again once the folder answers (the rescan)
+      if (errCode(err) === "ELOOP") return addPending(rel, flags); // a link swapped in: not followed, looked at as a link
+      if (isRefusal(err)) return report(rel, b, "not-permitted", WATCH_REASONS.fileNotPermitted);
       deps.debug?.(`watched folder: a file could not be read (${errCode(err) ?? "error"})`);
       return report(rel, b, "could-not-import", WATCH_REASONS.failed);
+    }
+    // The same content as a file that came in here and is no longer under its old name: a rename (M3) — it stays
+    // counted as it was, and is not imported or announced again.
+    const prev = cameInBySha.get(sha);
+    if (prev !== undefined && prev !== rel && (await goneFrom(prev))) {
+      removeRec(prev);
+      setRec(rel, b, "in");
+      cameInBySha.set(sha, rel);
+      dropProblem(rel);
+      return;
     }
     if (flags & QUIET && (await knownHashes()).has(sha)) {
       setRec(rel, b, "known");
@@ -989,6 +1113,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     } else {
       (await knownHashes()).add(sha);
       setRec(rel, b, o.outcome === "duplicate" ? "known" : "in");
+      if (o.outcome !== "duplicate") cameInBySha.set(sha, rel);
       dropProblem(rel);
     }
     emit({
@@ -998,6 +1123,26 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       ...(o.sourceId ? { sourceId: o.sourceId } : {}),
       ...(o.reason ? { reason: o.reason } : {}),
     });
+  }
+
+  /** The sidecar names beside a file (same folder, same base name). */
+  function sidecarsOf(rel: string): string[] {
+    const slash = rel.lastIndexOf("/");
+    const name = rel.slice(slash + 1);
+    const dot = name.lastIndexOf(".");
+    const stem = rel.slice(0, slash + 1) + (dot > 0 ? name.slice(0, dot) : name);
+    return SIDECAR_EXTS.map((ext) => stem + ext).filter((r) => r !== rel);
+  }
+  /** Whether the file `rel` is no longer there (one `lstat`, through the gate). */
+  async function goneFrom(rel: string): Promise<boolean> {
+    if (!records.has(rel)) return true;
+    try {
+      await g.lstat(absOf(rel));
+      return false;
+    } catch (err) {
+      if (err instanceof FolderNotAnsweringError) throw err;
+      return errCode(err) === "ENOENT";
+    }
   }
 
   function pauseForLock() {
@@ -1032,7 +1177,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       return;
     }
     if (locked) return;
-    await recheck();
+    if (Date.now() >= nextRecheck) {
+      nextRecheck = Date.now() + recheckMs;
+      await recheck();
+    }
     if (Date.now() >= nextRescan) {
       nextRescan = Date.now() + rescanMs;
       if (!walk) startWalk();
@@ -1126,6 +1274,13 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       send();
     })();
     return stopping;
+  }
+
+  // A call an earlier watch made on this folder is still outstanding: nothing is issued until it settles (A6).
+  const prior = outstandingFolders.get(root);
+  if (prior) {
+    gate.adopt(prior);
+    goUnreachable(withProvider(WATCH_REASONS.notResponding, provider));
   }
 
   const ready: Promise<void> = (async () => {
