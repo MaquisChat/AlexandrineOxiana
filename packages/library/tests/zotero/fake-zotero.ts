@@ -130,6 +130,8 @@ interface Library {
   /** Group only: the group's own version (moves when it is renamed) and its type. */
   groupVersion: number;
   groupType: "Private" | "PublicClosed" | "PublicOpen";
+  /** Group only: anyone may read the library, key or no key. */
+  publicRead?: boolean;
   version: number;
   items: Map<string, Item>;
   collections: Map<string, Collection>;
@@ -190,12 +192,21 @@ class StandInAgent extends MockAgent {
   markCut(): void {
     if (this.current) this.current.cut = true;
   }
+  /**
+   * An error that holds the key in its message or stack is replaced by a new error of the same name and
+   * code (no `cause`, which could hold the key too). Any other error is passed on untouched: an error we did
+   * not create is never mutated (an AbortError's message is read-only, and undici relies on its identity).
+   */
   private clean<T>(e: T): T {
-    if (e instanceof Error) {
-      e.message = this.scrub(e.message);
-      if (e.stack) e.stack = this.scrub(e.stack);
-    }
-    return e;
+    if (!(e instanceof Error)) return e;
+    const has = (s: string | undefined) => s !== undefined && this.scrub(s) !== s;
+    if (!has(e.message) && !has(e.stack)) return e;
+    const w = new Error(this.scrub(e.message));
+    Object.defineProperty(w, "name", { value: e.name, configurable: true, writable: true });
+    const code = (e as { code?: unknown }).code;
+    if (code !== undefined) Object.defineProperty(w, "code", { value: code, configurable: true, writable: true });
+    w.stack = this.scrub(e.stack ?? `${e.name}: ${w.message}`);
+    return w as unknown as T;
   }
   override dispatch(opts: any, handler: any): boolean {
     const ctx = { cut: false };
@@ -209,7 +220,13 @@ class StandInAgent extends MockAgent {
         if (!ctx.cut) return handler.onResponseData?.(c, d);
         handler.onResponseData?.(c, d.subarray(0, Math.max(1, Math.floor(d.length / 2))));
         sent++;
-        return handler.onResponseError?.(c, new Error("FakeZotero: the connection was cut in the middle of the body"));
+        // Like a real broken connection, the error comes after the headers and the first bytes have been
+        // handed over (undici's fetch loses an error that arrives in the same tick as its response). KNOWN
+        // LIMIT: undici's `fetch` with redirect "follow", cut on the hop AFTER a redirect, never settles under
+        // a mock (reproduced with a plain wrapper, so not specific to this code): fetch the file URL itself,
+        // or use `request`.
+        setImmediate(() => handler.onResponseError?.(c, new Error("FakeZotero: the connection was cut in the middle of the body")));
+        return undefined;
       },
       onResponseEnd: (...a: unknown[]) => (ctx.cut && sent ? undefined : handler.onResponseEnd?.(...a)),
       onResponseError: (c: unknown, e: unknown) => handler.onResponseError?.(c, this.clean(e)),
@@ -299,6 +316,7 @@ export class FakeZotero {
     u.search = "";
     u.hash = "";
     if (/^\/(users|groups|keys)\//u.test(u.pathname)) throw new Error("FakeZotero: a storage path may not overlap the API's paths");
+    if (u.origin === API_ORIGIN) throw new Error("FakeZotero: storage cannot share the API origin (the agent and the handler would disagree)");
     this.mount(u.origin, "storage");
     this.prefixes.add(u.pathname);
     return u.href;
@@ -306,7 +324,15 @@ export class FakeZotero {
 
   /** Redacts the key's value from any text (never the marker itself). */
   private scrub(s: string): string {
-    return s.split(this.key).join(KEY_MARKER);
+    const plain = s.split(this.key).join(KEY_MARKER);
+    // A key written with percent-escapes is redacted too (the text then comes back decoded).
+    try {
+      const decoded = decodeURIComponent(plain);
+      if (decoded !== plain && decoded.includes(this.key)) return decoded.split(this.key).join(KEY_MARKER);
+    } catch {
+      // not valid percent-encoding: nothing more to do
+    }
+    return plain;
   }
 
   private mount(origin: string, host: "api" | "storage"): void {
@@ -491,13 +517,17 @@ export class FakeZotero {
   /**
    * Adds a group library the account belongs to. A public group (`type` PublicClosed or PublicOpen) is listed
    * by /users/<id>/groups even when the key has no permission for it ([basics]); whether its /items then
-   * answers without that permission is UNCONFIRMED here: the stand-in answers 403.
+   * answers without that permission is a point the pages leave open for a key without permission: by default
+   * the stand-in answers 403; with `publicRead: true` anyone may read the library with no key at all ([basics]:
+   * "Authentication is not required for read access to public libraries"). Which of the two the real service
+   * does for a key WITHOUT permission is on the real-account list.
    */
-  addGroup(id: number, name: string, opts: { type?: "Private" | "PublicClosed" | "PublicOpen" } = {}): void {
+  addGroup(id: number, name: string, opts: { type?: "Private" | "PublicClosed" | "PublicOpen"; publicRead?: boolean } = {}): void {
     const ref = `group:${id}`;
     if (this.libs.has(ref)) throw new Error(`FakeZotero: ${ref} exists`);
     const lib = this.newLib("group", id, name);
     lib.groupType = opts.type ?? "Private";
+    if (opts.publicRead) lib.publicRead = true;
     this.libs.set(ref, lib);
   }
 
@@ -603,9 +633,12 @@ export class FakeZotero {
     // [basics] Invalid keys or insufficient privileges return 403. The key may come in a header or `key=`.
     const bearer = /^bearer\s+(.+)$/iu.exec(h["authorization"] ?? "")?.[1];
     const given = h["zotero-api-key"] ?? bearer ?? url.searchParams.get("key") ?? undefined;
-    if (this.revoked || given === undefined || given !== this.key) return text(403, "Forbidden");
-
     const seg = url.pathname.split("/").filter(Boolean);
+    // [basics] "Authentication is not required for read access to public libraries": a group added with
+    // `publicRead` answers a request that carries no key at all. (A key that is given but wrong or revoked is
+    // still 403: UNCONFIRMED.)
+    const anonymous = given === undefined && seg[0] === "groups" && this.libs.get(`group:${seg[1]}`)?.publicRead === true;
+    if (!anonymous && (this.revoked || given === undefined || given !== this.key)) return text(403, "Forbidden");
     if (seg[0] === "keys" && seg[1] === "current" && seg.length === 2) return this.keyInfo(url);
     if (seg[0] === "users" && seg[2] === "groups" && seg.length === 3) return this.groups(url, seg[1]!);
     if ((seg[0] === "users" || seg[0] === "groups") && /^\d+$/u.test(seg[1] ?? "")) {
@@ -619,6 +652,7 @@ export class FakeZotero {
   }
 
   private mayRead(lib: Library): boolean {
+    if (lib.publicRead) return true;
     if (lib.type === "user") return lib.id === this.userId && this.access.library;
     return this.access.groups === "all" || this.access.groups[String(lib.id)]?.library === true;
   }
@@ -627,8 +661,9 @@ export class FakeZotero {
     const bad = this.badParams(url, ["key", "v"]);
     if (bad) return bad;
     const a = this.access;
-    // UNCONFIRMED: the shape is the one the live service is known to use (userID, access.user, access.groups.all
-    // or per group id); the documents do not describe /keys/current.
+    // [syncing] documents /keys/current with an example (userID, username, access.user.{library,files,notes,write},
+    // access.groups.all.{library,write}). UNCONFIRMED: the per-group shape ({ "<id>": {library, write} }) and the
+    // shape of a key with no group access (here `groups: {}`).
     const groups = a.groups === "all" ? { all: { library: true, write: a.write } } : a.groups;
     return json(200, { key: this.key, userID: this.userId, username: "fake-user", access: { user: { library: a.library, files: a.files, notes: a.notes, write: a.write }, groups } });
   }
@@ -944,6 +979,6 @@ export class FakeZotero {
 }
 
 /** The pure handler: the same answers as the MockAgent gives, for a loopback server (task Z11). Serves API and storage paths. */
-export function fakeZoteroHandler(z: FakeZotero): (req: { method: string; path: string; headers: Record<string, string> }) => { status: number; headers: Record<string, string>; body: Uint8Array | string; drop?: true } {
+export function fakeZoteroHandler(z: FakeZotero): (req: FakeRequest) => FakeResponse {
   return (req) => z.serve(req, undefined);
 }

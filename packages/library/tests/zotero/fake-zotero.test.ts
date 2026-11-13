@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { request } from "undici";
+import { fetch, getGlobalDispatcher, request } from "undici";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { useMemorySecrets } from "../../src/secrets-testing.js";
 import { setSecret } from "../../src/secrets.js";
 import type { ScanContext, ScanItem } from "../../src/import/bulk/index.js";
 import { zoteroWebAdapter } from "../../src/import/zotero-web.js";
-import { FakeZotero, KEY_MARKER, fakeZoteroHandler, guardNetwork } from "./fake-zotero.js";
+import { FakeZotero, KEY_MARKER, fakeZoteroHandler, guardNetwork, type FakeResponse } from "./fake-zotero.js";
 
 const API = "https://api.zotero.org";
 const U = "user:42";
@@ -698,12 +698,17 @@ describe("fix round 1: the key never leaks (M5, M6, M7) and what is not modelled
   });
 
   it("guardNetwork refuses a request that bypasses the stand-in, and puts the old dispatcher back", async () => {
+    const before = getGlobalDispatcher();
     const restore = guardNetwork();
     try {
-      await expect(request(new URL("https://api.zotero.org/users/42/items"))).rejects.toThrow();
+      const during = getGlobalDispatcher();
+      expect(during).not.toBe(before);
+      // The mock agent's own refusal, not a DNS or connection error: a broken guard would fail with another code.
+      await expect(request(new URL("https://nowhere.invalid/x"))).rejects.toMatchObject({ code: "UND_MOCK_ERR_MOCK_NOT_MATCHED" });
     } finally {
       restore();
     }
+    expect(getGlobalDispatcher()).toBe(before);
   });
 
   it("numChildren does not count notes the key cannot see", async () => {
@@ -711,5 +716,102 @@ describe("fix round 1: the key never leaks (M5, M6, M7) and what is not modelled
     z.addItem(U, { itemType: "note", note: "<p>n</p>" }, { parent: a });
     z.setKeyAccess({ notes: false });
     expect(((await get(`/users/42/items/${a}`)).json() as { meta: Record<string, unknown> }).meta.numChildren).toBeUndefined();
+  });
+});
+
+describe("fix round 2: errors are never mutated (I5), and the smaller findings", () => {
+  const bytes = Buffer.from("0123456789".repeat(20));
+  const att = () => z.addItem(U, { itemType: "attachment", linkMode: "imported_file", filename: "a.pdf" }, { file: { bytes } });
+  const text = (e: unknown) => `${(e as Error).name} ${(e as Error).message} ${(e as Error).stack ?? ""} ${String((e as { cause?: unknown }).cause ?? "")}`;
+
+  it("an aborted request rejects with an AbortError, as undici does without the stand-in", async () => {
+    z.addItem(U, article("A"));
+    const ac = new AbortController();
+    ac.abort();
+    let err: any;
+    try {
+      await request(new URL("/users/42/items", API), { headers: { "zotero-api-key": z.key }, signal: ac.signal, dispatcher: z.agent });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.name).toBe("AbortError");
+    expect(text(err)).not.toContain(z.key);
+  });
+
+  it("undici fetch follows the 302 to the storage host and gets the bytes", async () => {
+    const k = att();
+    const res = await fetch(new URL(`/users/42/items/${k}/file`, API), { headers: { "zotero-api-key": z.key }, redirect: "follow", dispatcher: z.agent });
+    expect(res.status).toBe(200);
+    expect(Buffer.from(await res.arrayBuffer()).toString()).toBe(bytes.toString());
+  });
+
+  it("fetch of a cut file rejects promptly with a network error and no key", async () => {
+    const k = att();
+    z.failFile(U, k, { storage: "cut" });
+    // (fetch with redirect "follow" that is cut AFTER the redirect never settles under a mock: a known limit, see the stand-in's agent)
+    const first = await fetch(new URL(`/users/42/items/${k}/file`, API), { headers: { "zotero-api-key": z.key }, redirect: "manual", dispatcher: z.agent });
+    const location = first.headers.get("location")!;
+    const t0 = Date.now();
+    let err: unknown;
+    try {
+      const res = await fetch(location, { dispatcher: z.agent });
+      await res.arrayBuffer();
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(text(err)).not.toContain(z.key);
+  });
+
+  it("a request to an unmounted host with the key in its URL keeps the error's name and code, and not the key", async () => {
+    let err: any;
+    try {
+      await request(new URL(`https://example.org/x?key=${z.key}`), { dispatcher: z.agent });
+    } catch (e) {
+      err = e;
+    }
+    expect(err.name).toBe("MockNotMatchedError");
+    expect(err.code).toBe("UND_MOCK_ERR_MOCK_NOT_MATCHED");
+    expect(text(err)).not.toContain(z.key);
+    // fetch wraps it; its cause must not carry the key either
+    let ferr: any;
+    try {
+      await fetch(new URL(`https://example.org/x?key=${z.key}`), { dispatcher: z.agent });
+    } catch (e) {
+      ferr = e;
+    }
+    expect(ferr).toBeInstanceOf(Error);
+    expect(text(ferr)).not.toContain(z.key);
+    expect(text(ferr.cause)).not.toContain(z.key);
+  });
+
+  it("a percent-encoded key in a path is not recorded either", async () => {
+    await get(`/keys/${[...z.key].map((c) => "%" + c.charCodeAt(0).toString(16)).join("")}`);
+    expect(JSON.stringify(z.requests)).not.toContain(z.key);
+    expect(z.requests[0]!.path).toContain(KEY_MARKER);
+  });
+
+  it("a public group can be readable by anyone, with no key at all; the default stays 403", async () => {
+    z.addGroup(9, "Open public group", { type: "PublicOpen", publicRead: true });
+    z.addGroup(10, "Open but key-only", { type: "PublicOpen" });
+    z.setKeyAccess({ groups: {} });
+    expect((await get("/groups/9/items", { key: null })).status).toBe(200);
+    expect((await get("/groups/9/items")).status).toBe(200); // a key without permission may read it too
+    expect((await get("/groups/10/items", { key: null })).status).toBe(403);
+    expect((await get("/groups/10/items")).status).toBe(403);
+    expect((await get("/users/42/items", { key: null })).status).toBe(403); // the personal library never
+  });
+
+  it("the handler's answer is a FakeResponse (cut included) and storage cannot share the API origin", async () => {
+    const k = att();
+    z.failFile(U, k, { storage: "cut" });
+    const h = fakeZoteroHandler(z);
+    const loc = new URL((await get(`/users/42/items/${k}/file`)).headers["location"]!);
+    const r: FakeResponse = h({ method: "GET", path: loc.pathname, headers: {} });
+    expect(r.cut).toBe(true);
+    expect(() => {
+      z.redirectBase = "https://api.zotero.org/files/";
+    }).toThrow(/API origin/u);
   });
 });
