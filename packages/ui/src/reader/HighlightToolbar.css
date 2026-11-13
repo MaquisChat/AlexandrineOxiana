@@ -1,0 +1,81 @@
+/*
+ * The colour toolbar for a selection and the menu where highlights overlap (Task R10,
+ * HighlightToolbar.tsx). Both are placed in the page area (positioned here) at the selection or the
+ * click; their colours come from the theme's tokens, the swatches from the `--hl-*` tokens through
+ * the `ao-ann-swatch--<name>` classes (Reader.css).
+ */
+.ao-reader-area {
+  position: relative;
+}
+
+.ao-hl-toolbar,
+.ao-hl-menu {
+  position: absolute;
+  z-index: 4;
+  padding: var(--space-1);
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+
+.ao-hl-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  max-width: min(36rem, calc(100% - 8px));
+}
+
+.ao-hl-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 1.9rem;
+}
+
+.ao-hl-toolbar__colour .ao-ann-swatch {
+  width: 1.1em;
+  height: 1.1em;
+}
+
+.ao-hl-toolbar__last {
+  margin-inline-end: var(--space-1);
+  font-size: 0.85rem;
+}
+
+.ao-hl-menu {
+  display: flex;
+  flex-direction: column;
+  min-width: 12rem;
+  max-width: 22rem;
+}
+
+.ao-hl-menu__title {
+  margin: 0 0 var(--space-1);
+  font-weight: 600;
+}
+
+.ao-hl-menu [role="menu"] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ao-hl-menu__item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  text-align: start;
+}
+
+.ao-hl-toolbar button:focus-visible,
+.ao-hl-menu__item:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* A highlight on its way to the service: drawn, outlined, until the service's answer replaces it. */
+.ao-hl--draft {
+  outline: 1px dashed var(--hl-edge);
+}
