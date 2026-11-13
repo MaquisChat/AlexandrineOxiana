@@ -46,6 +46,13 @@ describe("parseReference", () => {
     expect(r?.text).not.toMatch(/[\u0000-\u001f\u007f-\u009f​‪-‮⁦-⁩]/u);
   });
 
+  it("a lone surrogate is removed; a whole astral character is kept (M4)", () => {
+    const r = parseReference("\uD800Bourdieu, Dis\uDC00tinction 𝒜");
+    expect(r?.text).toBe("Bourdieu, Distinction 𝒜");
+    expect(() => encodeURIComponent(r!.text)).not.toThrow();
+    expect(r?.tokens).toEqual(["bourdieu", "distinction", "a"]);
+  });
+
   it("diacritics and ligatures: Müller and Muller, ﬁeld and field give the same tokens", () => {
     expect(tokensOf("Müller")).toEqual(tokensOf("Muller"));
     expect(tokensOf("Müller")).toEqual(["muller"]);

@@ -30,7 +30,8 @@ const INVISIBLE = /[\u0080-\u009f​‎‏‪-‮⁠-⁤⁦-⁩﻿]/gu;
 
 /** Outside text made safe to keep and compare: invisible and control characters gone, spacing tidied, NFC. */
 export function cleanText(s: string): string {
-  return clean(s.replace(INVISIBLE, "")).normalize("NFC");
+  // \p{Cs} with the u flag matches only lone surrogates: a well-formed astral character is kept (M4).
+  return clean(s.replace(INVISIBLE, "").replace(/\p{Cs}/gu, "")).normalize("NFC");
 }
 
 const NO_SPACE = /[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;

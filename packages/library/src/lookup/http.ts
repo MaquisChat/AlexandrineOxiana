@@ -11,9 +11,10 @@
  *  - Each attempt (redirects and body included) has an overall deadline (default 60 s).
  *  - Per-host rate limits (Crossref 5/s, OpenAlex 5/s, Open Library 1/s, LoC 1/s; others 1/s).
  *  - Per-host concurrency: Crossref one request at a time (its public pool, F2); others unlimited.
- *  - A 429's allowance headers (X-RateLimit-Remaining, X-RateLimit-Reset) and the start of its body
- *    are kept on the error; a caller may say such an answer is final (OpenAlex's spent daily
- *    budget, F2), and it is then not retried.
+ *  - A 429's allowance headers (X-RateLimit-Remaining, X-RateLimit-Reset) are kept on the error as
+ *    numbers; a caller may judge from them and the start of the body that the answer is final
+ *    (OpenAlex's spent daily budget, F2), and it is then not retried. The body is never kept.
+ *  - Per-host concurrency places are handed out first in, first out.
  *  - 429 / 5xx / network errors: 3 retries with exponential backoff (0.5 s, 1 s, 2 s), or the
  *    server's Retry-After, capped (default 60 s).
  *  - Redirects are followed (at most 3) only within the same origin.
@@ -48,7 +49,7 @@ const DEFAULT_RATE = 1;
 export const DEFAULT_CONCURRENCY: Readonly<Record<string, number>> = {
   "api.crossref.org": 1,
 };
-/** The start of a 429's body kept for the caller to read. */
+/** The start of a 429's body shown to the caller's decision. */
 const RATE_LIMIT_BODY_BYTES = 4096;
 const DAY_MS = 86_400_000;
 /** Not-found answers are kept this long at most (a DOI may be registered tomorrow). */
@@ -61,24 +62,45 @@ const MEMORY_ENTRIES = 2000;
 // semicolons is refused so the address can never change the header's structure.
 const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 
-/** What a 429 answer said about the caller's allowance: two header values and the start of the body (bounded). */
+/**
+ * A 429 answer, shown to `GetOptions.final429` for that one decision and then dropped: the header
+ * values parsed as whole numbers (absent when not digits), the raw Retry-After, and the first
+ * 4 KiB of the body. The body is never kept on an error, logged or cached.
+ */
 export interface RateLimitAnswer {
-  remaining?: string;
-  reset?: string;
+  remaining?: number;
+  reset?: number;
+  retryAfter?: string;
   body: string;
+}
+
+/** What is kept of a 429 on the error: parsed numbers and the caller's decision, never text from the answer. */
+export interface RateLimitInfo {
+  remaining?: number;
+  reset?: number;
+  /** True when `final429` said retrying cannot help (the request was not retried). */
+  final: boolean;
 }
 
 /** A lookup request that failed (after retries), or a response the client refused. */
 export class LookupHttpError extends Error {
   override name = "LookupHttpError";
+  /** Set when the last answer was a 429 (not enumerable: it stays out of serialised errors). */
+  declare readonly rateLimit?: RateLimitInfo;
   constructor(
     message: string,
     readonly status?: number,
-    /** Set when the last answer was a 429. */
-    readonly rateLimit?: RateLimitAnswer,
+    rateLimit?: RateLimitInfo,
   ) {
     super(message);
+    if (rateLimit) Object.defineProperty(this, "rateLimit", { value: Object.freeze({ ...rateLimit }), enumerable: false });
   }
+}
+
+/** A header value as a whole number, or undefined when it is not 1 to 12 digits. */
+function wholeNumber(v: string | undefined): number | undefined {
+  const t = v?.trim();
+  return t && /^\d{1,12}$/u.test(t) ? Number(t) : undefined;
 }
 
 export interface HttpClientOptions {
@@ -294,24 +316,25 @@ export class HttpClient {
     await turn;
   }
 
-  /** Waits until the host has fewer than its limit of requests open, then holds one; the returned function gives it back. */
+  /**
+   * Holds one of the host's places, waiting first in, first out when all are taken; the returned
+   * function gives it back. A place given back goes straight to the longest waiter (the count of
+   * open places does not drop in between), so a newcomer can never overtake a waiter.
+   */
   private async hold(host: string): Promise<() => void> {
     const limit = this.concurrency[host];
     if (limit === undefined || !(limit >= 1)) return () => {};
-    while ((this.open.get(host) ?? 0) >= limit) {
-      await new Promise<void>((r) => {
-        const q = this.waiting.get(host) ?? [];
-        q.push(r);
-        this.waiting.set(host, q);
-      });
-    }
-    this.open.set(host, (this.open.get(host) ?? 0) + 1);
+    const queue = this.waiting.get(host) ?? [];
+    this.waiting.set(host, queue);
+    if ((this.open.get(host) ?? 0) < limit && queue.length === 0) this.open.set(host, (this.open.get(host) ?? 0) + 1);
+    else await new Promise<void>((r) => queue.push(r)); // resolved with the place already counted as ours
     let given = false;
     return () => {
       if (given) return;
       given = true;
-      this.open.set(host, (this.open.get(host) ?? 1) - 1);
-      this.waiting.get(host)?.shift()?.();
+      const next = queue.shift();
+      if (next) next();
+      else this.open.set(host, (this.open.get(host) ?? 1) - 1);
     };
   }
 
@@ -335,9 +358,21 @@ export class HttpClient {
       if (res) {
         if (res.status === 200) return { status: 200, body: res.body };
         if (res.status === 404 || res.status === 410) return { status: 404, body: null };
-        lastError = new LookupHttpError(`The metadata service answered HTTP ${res.status}`, res.status, res.rateLimit);
-        if (res.status !== 429 && res.status < 500) throw lastError;
-        if (res.rateLimit && final429?.(res.rateLimit)) throw lastError;
+        if (res.status === 429 && res.rateLimit) {
+          // The answer (body included) is shown to the caller's decision and then dropped: only
+          // the parsed numbers and the decision stay on the error.
+          const { remaining, reset } = res.rateLimit;
+          const final = final429?.(res.rateLimit) === true;
+          lastError = new LookupHttpError(`The metadata service answered HTTP 429`, 429, {
+            ...(remaining !== undefined ? { remaining } : {}),
+            ...(reset !== undefined ? { reset } : {}),
+            final,
+          });
+          if (final) throw lastError;
+        } else {
+          lastError = new LookupHttpError(`The metadata service answered HTTP ${res.status}`, res.status);
+          if (res.status < 500) throw lastError;
+        }
       }
       if (attempt < this.maxRetries) await this.sleep(this.retryDelay(attempt, res?.retryAfter));
     }
@@ -378,11 +413,17 @@ export class HttpClient {
           continue;
         }
         if (res.statusCode === 429) {
-          const remaining = header("x-ratelimit-remaining")?.slice(0, 100);
-          const reset = header("x-ratelimit-reset")?.slice(0, 100);
+          const remaining = wholeNumber(header("x-ratelimit-remaining"));
+          const reset = wholeNumber(header("x-ratelimit-reset"));
+          const retryAfter = header("retry-after")?.slice(0, 100);
           const body = await readStart(res.body, RATE_LIMIT_BODY_BYTES);
-          const rateLimit: RateLimitAnswer = { ...(remaining !== undefined ? { remaining } : {}), ...(reset !== undefined ? { reset } : {}), body };
-          return { status: 429, body: null, retryAfter: header("retry-after"), rateLimit };
+          const rateLimit: RateLimitAnswer = {
+            ...(remaining !== undefined ? { remaining } : {}),
+            ...(reset !== undefined ? { reset } : {}),
+            ...(retryAfter !== undefined ? { retryAfter } : {}),
+            body,
+          };
+          return { status: 429, body: null, retryAfter, rateLimit };
         }
         if (res.statusCode !== 200) {
           await res.body.dump();

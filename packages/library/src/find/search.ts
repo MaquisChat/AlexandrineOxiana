@@ -14,9 +14,9 @@
  * six conditions and the score 0.6·titleCover + 0.3·creator + 0.1·year. Where the plan left a
  * reading open, the stricter one is taken (see `isSure`): never sure when it should ask.
  *
- * OpenAlex's daily allowance: a 429 that shows the budget spent (X-RateLimit-Remaining: 0, or a
- * body that names a daily budget) is not retried; OpenAlex searches through that same HttpClient
- * pause until X-RateLimit-Reset (or 00:00 UTC), with the note "openalex-budget". The pause is kept
+ * OpenAlex's daily allowance: a 429 that positively shows the budget spent (isOpenAlexBudgetSpent)
+ * is not retried; OpenAlex searches through that same HttpClient pause until X-RateLimit-Reset
+ * (at most 25 h ahead, else 00:00 UTC), with the note "openalex-budget". The pause is kept
  * in `budgetPause`, a WeakMap keyed by the HttpClient, so it lasts as long as the client does and
  * no longer. An ordinary 429 is retried by the client as before and pauses nothing.
  */
@@ -24,10 +24,10 @@ import { createHash } from "node:crypto";
 import { normalizeTitle, titleSimilarity, type Creator } from "@ao/core";
 import { isSensitive, providerAllowed, type LookupContext, type LookupResult } from "../lookup/context.js";
 import { mapCrossref } from "../lookup/crossref.js";
-import { LookupHttpError, type HttpClient, type RateLimitAnswer } from "../lookup/http.js";
+import { LookupHttpError, retryAfterMs, type GetOptions, type HttpClient, type RateLimitAnswer } from "../lookup/http.js";
 import { mapOpenAlex } from "../lookup/openalex.js";
 import type { WorkCandidate } from "./candidates.js";
-import { cleanText, segmentTokens, segmentsOf, tokensOf, type Reference, type Segment } from "./reference.js";
+import { cleanText, parseReference, segmentTokens, segmentsOf, tokensOf, type Reference, type Segment } from "./reference.js";
 
 export type { WorkCandidate } from "./candidates.js";
 
@@ -51,7 +51,7 @@ const DOI_RE = /^10\.\d{4,9}\/\S+$/u;
 const SEARCH_TTL_DAYS = 7;
 const HOUR_MS = 3_600_000;
 /** A reset further away than this is not believed (00:00 UTC is used instead). */
-const MAX_PAUSE_MS = 48 * HOUR_MS;
+const MAX_PAUSE_MS = 25 * HOUR_MS;
 
 /** Typed words that need no explaining (rule 3). */
 const STOP_WORDS: ReadonlySet<string> = new Set(["and", "et", "al", "by", "the", "of", "in"]);
@@ -79,25 +79,36 @@ export function openAlexSearchPausedUntil(http: HttpClient): number | undefined 
   return budgetPause.get(http);
 }
 
-/** A 429 that says the daily budget is spent: retrying cannot help today. */
+const BUDGET_WORD = /\b(?:daily|budget|per[ -]day)\b/iu;
+const SPENT_WORD = /\b(?:exceeded|exhausted|used up|spent|depleted|run out|ran out)\b/iu;
+/** A Retry-After this short (or shorter) says the limit is per second, not per day. */
+const SHORT_RETRY_MS = 60_000;
+
+/**
+ * A 429 that positively shows the daily allowance spent, so retrying cannot help today. Exactly:
+ *  (a) the start of the body names the daily allowance ("daily", "budget" or "per day") AND says
+ *      it is used ("exceeded", "exhausted", "used up", "spent", "depleted", "run out", "ran out"); or
+ *  (b) X-RateLimit-Remaining is exactly the number 0 AND there is no Retry-After of 60 s or less.
+ * Every other 429 is ordinary: the client retries it as before, and nothing is paused.
+ */
 export function isOpenAlexBudgetSpent(a: RateLimitAnswer): boolean {
-  return a.remaining?.trim() === "0" || /daily|budget|per[ -]day/iu.test(a.body);
+  if (BUDGET_WORD.test(a.body) && SPENT_WORD.test(a.body)) return true;
+  if (a.remaining !== 0) return false;
+  const retry = retryAfterMs(a.retryAfter, Date.now());
+  return retry === undefined || retry > SHORT_RETRY_MS;
 }
 
-/** When the allowance comes back: X-RateLimit-Reset (seconds from now, epoch seconds or ms, or a date), else 00:00 UTC. */
-function budgetResetAt(a: RateLimitAnswer, now: number): number {
+/**
+ * When the allowance comes back: X-RateLimit-Reset (whole seconds from now; epoch seconds from
+ * 1e9; epoch ms from 1e12) when that lies after now and at most 25 hours ahead; otherwise (in the
+ * past, not a number, absent, or further away) 00:00 UTC next, never longer.
+ */
+function budgetResetAt(reset: number | undefined, now: number): number {
   const d = new Date(now);
   const midnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
-  const v = a.reset?.trim();
-  let t: number | undefined;
-  if (v && /^\d{1,13}$/u.test(v)) {
-    const n = Number(v);
-    t = n >= 1e12 ? n : n >= 1e9 ? n * 1000 : now + n * 1000;
-  } else if (v) {
-    const p = Date.parse(v);
-    if (!Number.isNaN(p)) t = p;
-  }
-  return t === undefined || t <= now || t > now + MAX_PAUSE_MS ? midnight : t;
+  if (reset === undefined) return midnight;
+  const t = reset >= 1e12 ? reset : reset >= 1e9 ? reset * 1000 : now + reset * 1000;
+  return t <= now || t > now + MAX_PAUSE_MS ? midnight : t;
 }
 
 const nowOf = (ctx: LookupContext) => (ctx.clock?.() ?? new Date()).getTime();
@@ -241,21 +252,44 @@ function badShape(ctx: LookupContext, provider: SearchSource): Asked {
   return { found: [], note: provider === "crossref" ? "crossref-failed" : "openalex-failed" };
 }
 
+/** An answer that is not JSON, or JSON of another shape: never cached, never an error to the caller. */
+class BadAnswer extends Error {}
+
+/**
+ * The list of items in a service's answer, or null when it does not exist (404). The shape is
+ * checked inside the client's `validate`, before anything is cached: an answer of the wrong shape
+ * throws BadAnswer and is not kept (M6), so the next search asks again.
+ */
+async function fetchItems(ctx: LookupContext, url: string, opts: GetOptions, pick: (json: unknown) => unknown[] | null): Promise<unknown[] | null> {
+  const got: { items: unknown[] | null } = { items: null };
+  const check = (body: string) => {
+    let json: unknown;
+    try {
+      json = JSON.parse(body);
+    } catch {
+      throw new BadAnswer();
+    }
+    got.items = pick(json);
+    if (!got.items) throw new BadAnswer();
+  };
+  const body = await ctx.http.getText(url, { ...opts, validate: check });
+  if (body === null) return null;
+  if (!got.items) check(body); // served from the memory cache: validated when it was stored
+  return got.items;
+}
+
+const crossrefItems = (json: unknown) => (isRecord(json) && isRecord(json.message) && Array.isArray(json.message.items) ? json.message.items : null);
+const openAlexResults = (json: unknown) => (isRecord(json) && Array.isArray(json.results) ? json.results : null);
+
 async function askCrossref(ref: Reference, ctx: LookupContext): Promise<Asked> {
   if (!providerAllowed(ctx, "crossref")) return { found: [] };
-  let res: unknown;
+  let items: unknown[] | null;
   try {
-    res = await ctx.http.getJson<unknown>(crossrefSearchUrl(ref.text), {
-      cacheKey: `find:crossref:works:${ref.text}`,
-      ttlDays: SEARCH_TTL_DAYS,
-      sensitive: isSensitive(ctx),
-    });
+    items = await fetchItems(ctx, crossrefSearchUrl(ref.text), { cacheKey: `find:crossref:works:${ref.text}`, ttlDays: SEARCH_TTL_DAYS, sensitive: isSensitive(ctx) }, crossrefItems);
   } catch (e) {
-    return failed(ctx, "crossref", e);
+    return e instanceof BadAnswer ? badShape(ctx, "crossref") : failed(ctx, "crossref", e);
   }
-  if (res === null) return { found: [] };
-  const items = isRecord(res) && isRecord(res.message) && Array.isArray(res.message.items) ? res.message.items : null;
-  if (!items) return badShape(ctx, "crossref");
+  if (items === null) return { found: [] };
   const found: WorkCandidate[] = [];
   for (const item of items.slice(0, PER_SERVICE)) {
     const w = crossrefItem(item);
@@ -276,25 +310,25 @@ async function askOpenAlex(ref: Reference, ctx: LookupContext): Promise<Asked> {
     }
     budgetPause.delete(ctx.http);
   }
-  let res: unknown;
+  let results: unknown[] | null;
   try {
-    res = await ctx.http.getJson<unknown>(openAlexSearchUrl(ref.text), {
-      cacheKey: `find:openalex:works:${ref.text}`,
-      ttlDays: SEARCH_TTL_DAYS,
-      sensitive: isSensitive(ctx),
-      final429: isOpenAlexBudgetSpent,
-    });
+    results = await fetchItems(
+      ctx,
+      openAlexSearchUrl(ref.text),
+      { cacheKey: `find:openalex:works:${ref.text}`, ttlDays: SEARCH_TTL_DAYS, sensitive: isSensitive(ctx), final429: isOpenAlexBudgetSpent },
+      openAlexResults,
+    );
   } catch (e) {
-    if (e instanceof LookupHttpError && e.status === 429 && e.rateLimit && isOpenAlexBudgetSpent(e.rateLimit)) {
-      budgetPause.set(ctx.http, budgetResetAt(e.rateLimit, nowOf(ctx)));
+    if (e instanceof BadAnswer) return badShape(ctx, "openalex");
+    // Only a 429 that our own isOpenAlexBudgetSpent judged final pauses OpenAlex.
+    if (e instanceof LookupHttpError && e.status === 429 && e.rateLimit?.final) {
+      budgetPause.set(ctx.http, budgetResetAt(e.rateLimit.reset, nowOf(ctx)));
       ctx.debug?.("work search via openalex paused: its free daily allowance is used up");
       return { found: [], note: "openalex-budget" };
     }
     return failed(ctx, "openalex", e);
   }
-  if (res === null) return { found: [] };
-  const results = isRecord(res) && Array.isArray(res.results) ? res.results : null;
-  if (!results) return badShape(ctx, "openalex");
+  if (results === null) return { found: [] };
   const found: WorkCandidate[] = [];
   for (const item of results.slice(0, PER_SERVICE)) {
     const w = openAlexItem(item);
@@ -370,13 +404,16 @@ function withIds(list: WorkCandidate[]): WorkCandidate[] {
  * Works for a typed reference from Crossref and OpenAlex (in `opts.sources`, each asked at most
  * once and only when the project's rules allow it): merged, at most 10, the likeliest first.
  * Never throws for a service's failure or a broken answer: those become `notes` (in source order).
+ * The reference is parsed again from its `text` (M5): a Reference built elsewhere (a stored queue
+ * entry) whose text is over 500 characters or has no words sends nothing.
  */
 export async function searchWorks(
-  ref: Reference,
+  given: Reference,
   ctx: LookupContext,
   opts: { sources: SearchSource[] },
 ): Promise<{ candidates: WorkCandidate[]; notes: SearchNote[] }> {
-  if (!ref.tokens.length || !ref.text) return { candidates: [], notes: [] };
+  const ref = typeof given?.text === "string" ? parseReference(given.text) : null;
+  if (!ref || !ref.tokens.length) return { candidates: [], notes: [] };
   const sources = [...new Set(opts.sources)].filter((s): s is SearchSource => s === "crossref" || s === "openalex");
   const asked = await Promise.all(sources.map((s) => (s === "crossref" ? askCrossref(ref, ctx) : askOpenAlex(ref, ctx))));
   const merged: WorkCandidate[] = [];
@@ -463,27 +500,38 @@ function occurrences(hay: string, needle: string): number {
 
 const creatorsOf = (c: WorkCandidate) => c.creators.slice(0, FIND_CREATORS_MAX);
 
+/** The characters of a name's runs in scripts written without spaces, joined ("" when it has none). */
+const runsOf = (name: string | undefined): string =>
+  name ? segmentsOf(cut(name, FIND_NAME_MAX)).flatMap((x) => ("chars" in x ? [x.chars.join("")] : [])).join("") : "";
+
 /**
  * Rule 2: a family name (or a whole literal name) is typed. A part of it that is also a word of
  * the candidate's title counts only when typed twice, so one typed word is never both the title
  * and the author ("Granovetter" typed for a work titled "Granovetter").
+ *
+ * In a script written without spaces (R228 b), a family name counts as typed only where it stands
+ * as a typed run of its own (set off by a space or punctuation), or where it is directly followed,
+ * inside a typed run, by that creator's given name ("丸山眞男"). A character that merely occurs
+ * inside a longer run ("李" in "李白詩選", "王" in "王国の思想") never counts.
  */
 function creatorTyped(p: Prepared, c: WorkCandidate, t: TitleInfo): boolean {
   const titleWords = new Set(t.fullTokens);
-  const typedEnough = (seg: Segment): boolean => {
+  const typedEnough = (seg: Segment, given: string): boolean => {
     if ("word" in seg) return (p.wordCount.get(seg.word) ?? 0) >= (titleWords.has(seg.word) ? 2 : 1);
     const s = seg.chars.join("");
-    const typed = p.runs.reduce((n, r) => n + occurrences(r, s), 0);
-    return typed >= (t.runs.includes(s) ? 2 : 1);
+    const alone = p.runs.filter((r) => r === s).length;
+    const withGiven = given ? p.runs.reduce((n, r) => n + occurrences(r, s + given), 0) : 0;
+    return alone + withGiven >= (t.runs.includes(s) ? 2 : 1);
   };
   for (const person of creatorsOf(c)) {
     if (person.family) {
       const segs = segmentsOf(cut(person.family, FIND_NAME_MAX));
       const named = segs.length > 1 ? segs.filter((s) => !("word" in s && PARTICLES.has(s.word))) : segs;
-      if (named.some(typedEnough)) return true;
+      const given = runsOf(person.given);
+      if (named.some((s) => typedEnough(s, given))) return true;
     } else if (person.literal) {
       const segs = segmentsOf(cut(person.literal, FIND_NAME_MAX)).filter((s) => !("word" in s && STOP_WORDS.has(s.word)));
-      if (segs.length && segs.every(typedEnough)) return true;
+      if (segs.length && segs.every((s) => typedEnough(s, ""))) return true;
     }
   }
   return false;
@@ -513,16 +561,33 @@ export function scoreCandidate(ref: Reference, c: WorkCandidate): CandidateScore
   return scoreWith(prepare(ref), c);
 }
 
-/** Rule 3: typed tokens explained by none of the title, the creators' names, a 4-digit number or the small words. */
-function unexplained(p: Prepared, c: WorkCandidate, t: TitleInfo): number {
+/** Words that contradict a title when typed beside it and left unexplained (R228 c). "un-" is not one. */
+const NEGATIONS: ReadonlySet<string> = new Set(["no", "not", "non", "without", "against", "anti"]);
+/** After one of these, a roman numeral is a number (R228 c). */
+const VOLUME_WORDS: ReadonlySet<string> = new Set(["volume", "vol", "part", "book", "edition", "ed"]);
+const ROMAN = /^[ivxlcdm]+$/u;
+
+/**
+ * Rule 3: the typed tokens explained by none of the title, the creators' names, a 4-digit number
+ * or the small words (`count`), and whether any of them is a contradiction (R228 c): a number
+ * (digits, or a roman numeral right after volume, vol, part, book, edition or ed) or a negation.
+ */
+function unexplained(p: Prepared, c: WorkCandidate, t: TitleInfo): { count: number; contradiction: boolean } {
   const known = new Set<string>([...t.fullTokens, ...STOP_WORDS]);
   for (const person of creatorsOf(c)) {
     for (const n of [person.family, person.given, person.literal]) if (n) for (const tok of tokensOf(cut(n, FIND_NAME_MAX))) known.add(tok);
   }
   let count = 0;
-  for (const seg of p.segments) {
+  let contradiction = false;
+  for (let k = 0; k < p.segments.length; k++) {
+    const seg = p.segments[k]!;
     if ("word" in seg) {
-      if (!known.has(seg.word) && !/^\d{4}$/u.test(seg.word)) count++;
+      if (!known.has(seg.word) && !/^\d{4}$/u.test(seg.word)) {
+        count++;
+        const prev = p.segments[k - 1];
+        const afterVolume = !!prev && "word" in prev && VOLUME_WORDS.has(prev.word);
+        if (/^\d+$/u.test(seg.word) || NEGATIONS.has(seg.word) || (afterVolume && ROMAN.test(seg.word))) contradiction = true;
+      }
       continue;
     }
     // A run without spaces: a character is explained when a known pair (or a known single
@@ -534,7 +599,7 @@ function unexplained(p: Prepared, c: WorkCandidate, t: TitleInfo): number {
     }
     for (let i = 0; i < ch.length; i++) if (!covered[i] && (i === 0 || covered[i - 1])) count++;
   }
-  return count;
+  return { count, contradiction };
 }
 
 /** The highest titleSimilarity between two candidates' whole titles or titles before the subtitle. */
@@ -566,14 +631,39 @@ type Scored = { c: WorkCandidate; i: number; s: CandidateScore; t: TitleInfo };
  *    close title with no identifier at all may be another edition;
  *  - rule 2 does not let one typed word be both a title word and the author (see creatorTyped);
  *  - a candidate given only by Elicit is never sure on its own.
+ *
+ * And the coordinator's rulings (R228):
+ *  - (c) an unexplained typed word that is a number or a negation is never the one allowed;
+ *  - (a) the main-title guard: when rule 1's 90% is reached only through the title before the
+ *    subtitle (the whole title's cover is below 0.9), the candidate is sure only if, besides rules
+ *    2–6, (1) no typed word is unexplained, and every typed number is a token of the whole title
+ *    or is the typed year that matches (rule 4); (2) its type is "book" (the only book type of
+ *    SourceType: Crossref's book, monograph, edited-book and reference-book all map to it); and
+ *    (3) the main title has at least two words other than the small words, or else a year was
+ *    typed and it matches (rule 4's ±1). Otherwise "choose", with that candidate first.
  */
+const BOOK_TYPES: ReadonlySet<string> = new Set(["book"]);
+
 function isSure(p: Prepared, best: Scored, all: Scored[]): boolean {
   const { c, s, t } = best;
   if (!c.providers.length || c.providers.every((x) => x === "elicit")) return false;
   if (s.titleCover < 0.9) return false; // 1
+  const byMainTitleOnly = coverOf(t.fullTokens, p.typed) < 0.9;
   if (!s.creator) return false; // 2
-  if (unexplained(p, c, t) > 1) return false; // 3
+  const u = unexplained(p, c, t);
+  if (u.contradiction) return false; // R228 c
+  if (u.count > (byMainTitleOnly ? 0 : 1)) return false; // 3, and guard (1)
   if (!s.year) return false; // 4
+  if (byMainTitleOnly) {
+    if (!BOOK_TYPES.has(c.type)) return false; // guard (2)
+    for (const seg of p.segments) {
+      if (!("word" in seg) || !/^\d+$/u.test(seg.word)) continue;
+      const isItsYear = p.year !== undefined && Number(seg.word) === p.year && s.year;
+      if (!t.fullTokens.includes(seg.word) && !isItsYear) return false; // guard (1), numbers
+    }
+    const mainWords = (t.mainTokens ?? []).filter((x) => !STOP_WORDS.has(x)).length;
+    if (mainWords < 2 && !(p.year !== undefined && s.year)) return false; // guard (3)
+  }
   for (const o of all) {
     if (o === best) continue;
     if (closeTitles(t, o.t) >= 0.8 && !provablySame(c, o.c)) return false; // 5
