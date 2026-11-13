@@ -276,10 +276,23 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
   const handle = phase.kind === "open" ? phase.handle : undefined;
   const count = handle?.pageCount ?? 0;
 
-  const goTo = (n: number, focusPage: boolean) => {
+  /**
+   * Focuses page `n`'s box: now, when no render follows (the page does not change); else once the
+   * screen has drawn. So no request is ever left pending to take the focus later from wherever the
+   * researcher has put it.
+   */
+  const focusPage = (n: number, rendering: boolean) => {
+    if (rendering) {
+      focusTo.current = n;
+      return;
+    }
+    focusTo.current = undefined;
+    area.current?.querySelector<HTMLElement>(`[data-page-number="${n}"]`)?.focus({ preventScroll: true });
+  };
+  const goTo = (n: number, toPage: boolean) => {
     if (!count) return;
     const to = Math.min(Math.max(1, Math.round(n)), count);
-    if (focusPage) focusTo.current = to;
+    if (toPage) focusPage(to, to !== page);
     setPage(to);
     setDraft(String(to));
   };
@@ -313,7 +326,8 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     else if (k === "-" || k === "_") zoomBy(-1);
     else return;
     e.preventDefault();
-    if (k === "+" || k === "=" || k === "-" || k === "_") focusTo.current = page;
+    // A zoom by key keeps the focus on the current page's box (the same element after the zoom).
+    if (k === "+" || k === "=" || k === "-" || k === "_") focusPage(page, false);
   };
 
   /** Left and Right move between the toolbar's buttons (Tab still goes through every control). */
