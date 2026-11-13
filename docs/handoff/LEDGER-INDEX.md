@@ -142,3 +142,4 @@ R217 (2026-11-13): cloud folders W3 after review — the register covers every f
 R218 (2026-11-13): the project's licence is AGPL-3.0-or-later (the owner's choice; the repository to be made public); the dependency rule becomes "nothing incompatible with AGPL-3.0-or-later is shipped".
 R219 (2026-11-13): cloud folders W4 after review — the fetch never follows a link; the agreed size reserved in the device record; a pause never loses a register line; nothing confirmed, nothing fetched; wording.
 R220 (2026-11-13): reader R12 after review — the list row says whether a source has a readable PDF (no request per row); the filter covers every group; the route asks the annotations once; a dropped search is said.
+R221 (2026-11-13): cloud folders W4 — one folder feeds one project (refused when added); a not-local file of size 0 is never fetched under an allowance; a 0-byte confirmation is none. Task R3a: the annotation update's reading inside the queue's turn.
