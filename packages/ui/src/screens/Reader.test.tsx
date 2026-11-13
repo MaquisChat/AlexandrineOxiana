@@ -889,4 +889,31 @@ describe("ReaderScreen, fix round 2 (A10)", () => {
     await waitFor(() => expect(document.activeElement).toBe(button("Next page")));
     expect(document.activeElement).not.toBe(document.body);
   });
+
+  it("a key that leaves the page where it is (Home on page 1, - at 50%) leaves no focus request to steal the focus later", async () => {
+    serveDocument();
+    openPdf.mockResolvedValueOnce(fakeHandle(5).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 5" });
+    const area = screen.getByRole("group", { name: "Pages" });
+    area.focus();
+    // Home on the first page: the page focused at once, nothing left pending.
+    fireEvent.keyDown(area, { key: "Home" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText("Page 1 of 5")));
+    for (let i = 0; i < 4; i++) fireEvent.keyDown(document.activeElement!, { key: "-" });
+    expect(screen.getByRole("status", { name: "Zoom" }).textContent).toBe("50%");
+    expect(document.activeElement).toBe(screen.getByLabelText("Page 1 of 5"));
+    // The researcher moves to a button; the page then changes by scrolling: focus stays where they put it.
+    const next = screen.getByRole("button", { name: "Next page" });
+    next.focus();
+    const box = area.querySelector<HTMLElement>('[data-page-number="2"]')!;
+    act(() => {
+      area.scrollTop = Number(box.dataset.top) + 5;
+      area.dispatchEvent(new Event("scroll"));
+    });
+    await waitFor(() => expect((screen.getByRole("spinbutton", { name: "Page" }) as HTMLInputElement).value).toBe("2"));
+    await flush();
+    await new Promise((r) => setTimeout(r, 120));
+    expect(document.activeElement).toBe(next);
+  });
 });
