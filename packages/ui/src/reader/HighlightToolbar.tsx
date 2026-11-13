@@ -105,9 +105,10 @@ export function HighlightToolbar({ anchorBox, lastColour, onHighlight, onCancel 
   };
   const buttons = () => [...(root.current?.querySelectorAll<HTMLButtonElement>("button") ?? [])];
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    // Keys pressed in the toolbar are the toolbar's (not the page area's: Home, End, + and -).
+    e.stopPropagation();
     if (e.key === "Escape") {
       e.preventDefault();
-      e.stopPropagation();
       onCancel();
       return;
     }
@@ -171,9 +172,10 @@ export function OverlapMenu({ at, items, onChoose, onClose }: OverlapMenuProps) 
   }, []);
   const entries = () => [...(root.current?.querySelectorAll<HTMLElement>("[role='menuitem']") ?? [])];
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    // Keys pressed in the menu are the menu's (not the page area's).
+    e.stopPropagation();
     if (e.key === "Escape" || e.key === "Tab") {
       if (e.key === "Escape") e.preventDefault();
-      e.stopPropagation();
       onClose();
       return;
     }

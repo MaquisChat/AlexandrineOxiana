@@ -153,6 +153,8 @@ export interface AnnotationListProps {
   /** The service's sentence when the list could not be had (A11); with "Try again". */
   loadError?: string;
   onRetry?(): void;
+  /** Task R10: said in the list's live region when it changes ("Highlight added: Yellow, page 7."). */
+  announcement?: { text: string; n: number };
 }
 
 const KIND_LABELS: Record<AnnotationKind, string> = {
@@ -177,6 +179,8 @@ interface Entry {
   group: Group;
   /** The page shown (here: the first on this file; elsewhere: the first PDF page, if any). */
   page?: number;
+  /** Task R10: the last page on this file, when the annotation lies on more than one ("Pages 4–5"). */
+  pageTo?: number;
   /** The page "Go to" goes to (none: it cannot). */
   goPage?: number;
   /** Pages on this file the file does not have. */
@@ -222,7 +226,8 @@ function entriesOf(list: AnnotationRecord[], assetId: string, pageCount: number 
       const page = Math.min(...pages);
       const present = pages.filter((p) => pageCount === undefined || p <= pageCount);
       const missing = pageCount === undefined ? [] : [...new Set(pages.filter((p) => p > pageCount))].sort((x, y) => x - y);
-      groups.here.push({ ...base, group: "here", page, ...(present.length > 0 ? { goPage: Math.min(...present) } : {}), missing });
+      const pageTo = Math.max(...pages);
+      groups.here.push({ ...base, group: "here", page, ...(pageTo !== page ? { pageTo } : {}), ...(present.length > 0 ? { goPage: Math.min(...present) } : {}), missing });
     } else if (a.pdfAnchors.length > 0 || a.otherAnchorKinds.length > 0) {
       // On another file of the source: a PDF, or another kind of anchor (an EPUB passage, …).
       groups.elsewhere.push({ ...base, group: "elsewhere", ...(a.pdfAnchors.length > 0 ? { page: Math.min(...a.pdfAnchors.map((x) => x.page)) } : {}) });
@@ -313,7 +318,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
           <>
             {", "}
             <span>
-              Page {e.page}
+              {e.pageTo !== undefined ? `Pages ${e.page}–${e.pageTo}` : `Page ${e.page}`}
               {label !== undefined && (
                 <>
                   {" ("}
@@ -519,7 +524,7 @@ function Question({ title, yes, no, onYes, onNo }: { title: string; yes: string;
 const GROUP_TITLES: Record<Exclude<Group, "here">, string> = { elsewhere: "On another file of this source", unplaced: "Not placed on a page" };
 const count = (n: number) => n.toLocaleString("en-GB");
 
-export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJump, onSaveNote, onRecolour, onDelete, changed, pageCount, loadError, onRetry }: AnnotationListProps) {
+export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJump, onSaveNote, onRecolour, onDelete, changed, pageCount, loadError, onRetry, announcement }: AnnotationListProps) {
   const hid = useId();
   const { groups, flat } = useMemo(() => entriesOf(annotations, assetId, pageCount), [annotations, assetId, pageCount]);
   const byId = useMemo(() => new Map(flat.map((e) => [e.a.id, e])), [flat]);
@@ -781,6 +786,12 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
   }, [holding]);
 
   const say = (text: string) => setSaid((s) => ({ text, n: (s?.n ?? 0) + 1 }));
+  // Task R10: what the screen has to say (a highlight made) goes through the same live region.
+  useEffect(() => {
+    if (announcement !== undefined) say(announcement.text);
+    // Said once for each announcement.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [announcement]);
   const clearError = (id: string) =>
     setErrors((m) => {
       if (!(id in m)) return m;

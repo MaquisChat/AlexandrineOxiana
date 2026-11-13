@@ -63,6 +63,7 @@ import { MAX_RENDERED_PAGES, PdfPages, type TextContent, type ViewRotation } fro
 import { openPdf, toPdfOpenError, type PdfHandle, type PdfOpenError } from "../reader/pdfjs";
 import { createRangeTransport } from "../reader/rangeTransport";
 import { canJudge, quoteStillMatches, textsUnderRects, touchesVerticalText } from "../reader/textCheck";
+import { useHighlightMaking } from "../reader/useHighlightMaking";
 import "../reader/Reader.css";
 
 export type ReaderStateKind = "locked" | "missing" | "damaged" | "too-large" | "not-a-pdf" | "password-needed" | "password-wrong" | "unreachable" | "other";
@@ -459,12 +460,36 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     if (found.length > 0) setChanged((c) => new Set([...c, ...found]));
   }, [fileAnnotations, partial, textsSeen, handle, count]);
 
+  // Task R10: highlights made with the mouse (the toolbar, the drafts, the overlap menu).
+  const making = useHighlightMaking({
+    api: () => apiRef.current,
+    projectId,
+    sourceId,
+    assetId,
+    handle,
+    isLive: (h) => current.current === h && !h.dead,
+    readOnly,
+    area,
+    annotations: fileAnnotations,
+    onCreated: (r) => {
+      if (annotations) setAnnotations((list) => (list ? [...list, r] : list));
+      else setListAttempt((n) => n + 1);
+    },
+    onLocked: endLocked,
+    onProjectInDoubt: () => inDoubt.current?.(),
+    onSelect: setSelectedId,
+  });
+  const { noteViewport, drafts, draftIds, onOverlapAt } = making;
+
   const renderOverlay = useCallback(
-    (pageIndex: number, viewport: Parameters<typeof HighlightLayer>[0]["viewport"]) =>
-      fileAnnotations && fileAnnotations.length > 0 ? (
-        <HighlightLayer pageIndex={pageIndex} viewport={viewport} annotations={fileAnnotations} {...(selectedId !== undefined ? { selectedId } : {})} onSelect={setSelectedId} changed={changed} />
-      ) : null,
-    [fileAnnotations, selectedId, changed],
+    (pageIndex: number, viewport: Parameters<typeof HighlightLayer>[0]["viewport"]) => {
+      noteViewport(pageIndex, viewport);
+      const list = drafts.length > 0 ? [...(fileAnnotations ?? []), ...drafts] : fileAnnotations;
+      return list && list.length > 0 ? (
+        <HighlightLayer pageIndex={pageIndex} viewport={viewport} annotations={list} {...(selectedId !== undefined ? { selectedId } : {})} onSelect={setSelectedId} changed={changed} onOverlap={onOverlapAt(pageIndex)} drafts={draftIds} />
+      ) : null;
+    },
+    [fileAnnotations, selectedId, changed, noteViewport, drafts, draftIds, onOverlapAt],
   );
 
   /**
@@ -590,6 +615,10 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
 
   const onAreaKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === "Escape" && making.cancel()) {
+      e.preventDefault();
+      return;
+    }
     const k = e.key;
     if (k === "PageDown") goTo(page + 1, true);
     else if (k === "PageUp") goTo(page - 1, true);
@@ -772,8 +801,10 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
         </span>
       </div>
       <div className="ao-reader-body">
-        <div className="ao-reader-area" ref={area} onKeyDown={onAreaKey}>
+        <div className="ao-reader-area" ref={area} onKeyDown={onAreaKey} onScrollCapture={making.onScroll}>
           <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} />
+          {making.floating}
+          {making.notices}
         </div>
         {(annotations !== undefined || annotationsError !== undefined) && (
           <AnnotationList
@@ -793,6 +824,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
             onSaveNote={onSaveNote}
             onRecolour={onRecolour}
             onDelete={onDelete}
+            {...(making.announcement !== undefined ? { announcement: making.announcement } : {})}
           />
         )}
       </div>

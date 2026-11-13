@@ -1606,6 +1606,8 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
       await waitFor(() => expect(drawnOn(1)).toEqual(["a", "b"]));
       const mark = document.querySelector<HTMLElement>('[data-annotation="b"]')!;
       fireEvent.click(page, { clientX: parseFloat(mark.style.left) + 5, clientY: parseFloat(mark.style.top) + 5 });
+      // "a" and "b" lie on the same words: the click offers both (Task R10), the topmost ("b") first.
+      await user.click((await screen.findAllByRole("menuitem"))[0]!);
       await waitFor(() => expect(entryOf("b").getAttribute("aria-current")).toBe("true"));
       await user.click(within(entryOf("b")).getByRole("button", { name: /^Delete/ }));
       await user.click(screen.getByRole("button", { name: "Delete" }));

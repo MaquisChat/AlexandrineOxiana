@@ -75,6 +75,16 @@
   outline-offset: 1px;
 }
 
+/* What making a highlight has to say (a limit, a refusal, read-only), below the pages. */
+.ao-reader-making-note {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+}
+
 /* A highlight on its way to the service: drawn, outlined, until the service's answer replaces it. */
 .ao-hl--draft {
   outline: 1px dashed var(--hl-edge);
