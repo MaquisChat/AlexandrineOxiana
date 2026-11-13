@@ -165,8 +165,10 @@ describe("PdfPages (Task R7)", () => {
     const { container, rerender } = render(<PdfPages {...props} currentPage={1} />);
     await flush();
     // Every page has its region, the rendered ones and the placeholders alike.
-    expect(screen.getAllByRole("region", { name: /^Page \d+ of 900$/ })).toHaveLength(900);
-    expect(screen.getByRole("region", { name: "Page 3 of 900" })).toBeTruthy();
+    // Every page has its box, labelled; only the drawn ones are regions (A10).
+    expect(container.querySelectorAll("[aria-label^='Page '][aria-label$=' of 900']")).toHaveLength(900);
+    expect(screen.getByLabelText("Page 3 of 900")).toBeTruthy();
+    expect(screen.getAllByRole("region").length).toBeLessThanOrEqual(6);
     const first = canvases(container).length;
     expect(first).toBeGreaterThan(0);
     expect(first).toBeLessThanOrEqual(6);
@@ -396,5 +398,26 @@ describe("PdfPages: memory bounded by weight as well as by number (A9, Ruling R2
     await flush();
     expect(f.workerCleanups.length).toBeGreaterThan(0);
     expect(f.workerCleanups.every((c) => c.drawing === 0 && c.keepLoadedFonts === true)).toBe(true);
+  });
+});
+
+describe("PdfPages: only the pages drawn are regions (A10, Ruling R205)", () => {
+  it("a drawn page is a region, any other page box a group with the same label, and the roles follow the view", async () => {
+    const f = fakeHandle({ pages: 40 });
+    const { rerender } = render(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={1} onPageChange={() => {}} renderOverlay={() => null} />);
+    await flush();
+    const regions = () => screen.getAllByRole("region").map((e) => e.getAttribute("aria-label"));
+    const drawnPages = () => [...document.querySelectorAll<HTMLElement>("[data-rendered]")].map((e) => `Page ${e.dataset.pageNumber} of 40`);
+    expect(regions().sort()).toEqual(drawnPages().sort());
+    expect(regions()).toContain("Page 1 of 40");
+    expect(screen.getByLabelText("Page 30 of 40").getAttribute("role")).toBe("group");
+    expect(screen.getAllByRole("group", { name: /^Page \d+ of 40$/ }).length).toBe(40 - regions().length);
+    rerender(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={30} onPageChange={() => {}} renderOverlay={() => null} />);
+    await flush();
+    expect(screen.getByLabelText("Page 30 of 40").getAttribute("role")).toBe("region");
+    expect(screen.getByLabelText("Page 1 of 40").getAttribute("role")).toBe("group");
+    expect(regions().sort()).toEqual(drawnPages().sort());
+    // Focusable whatever its role.
+    expect(screen.getByLabelText("Page 1 of 40").tabIndex).toBe(-1);
   });
 });

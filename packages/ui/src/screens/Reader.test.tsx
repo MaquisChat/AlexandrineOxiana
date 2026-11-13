@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readerApi } from "../api/reader";
 import { PdfOpenError, type PdfHandle } from "../reader/pdfjs";
 import { server, serviceError, SOURCE_FILE, testClient, url, useMockService } from "../test/service";
-import { ReaderRoute } from "../routes/reader";
+import { QUESTION_RETRY_MS, QUESTION_TIMEOUT_MS, ReaderRoute } from "../routes/reader";
 import { ReaderScreen } from "./Reader";
 
 const openPdf = vi.hoisted(() => vi.fn());
@@ -579,15 +579,17 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
     return f;
   };
 
-  function serveRoute(o: { unlocked: () => boolean; current?: Record<string, unknown> }) {
+  const projectsAnswer = (unlocked: boolean) => HttpResponse.json({ projects: [{ id: "p1", name: "Dissertation", folder: "Dissertation", encrypted: true, unlocked }] }) as unknown as Response;
+
+  function serveRoute(o: { unlocked: () => boolean; current?: Record<string, unknown>; projects?: (request: Request) => Response | Promise<Response> }) {
     const events = eventStream();
     const projectReads: number[] = [];
     server.use(
       http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: o.current ?? LIB })),
       http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(SOURCE_FILE)),
-      http.get(url("/projects"), () => {
+      http.get(url("/projects"), ({ request }) => {
         projectReads.push(Date.now());
-        return HttpResponse.json({ projects: [{ id: "p1", name: "Dissertation", folder: "Dissertation", encrypted: true, unlocked: o.unlocked() }] });
+        return o.projects ? o.projects(request) : projectsAnswer(o.unlocked());
       }),
       http.get(url("/events"), () => events.response()),
     );
@@ -680,5 +682,211 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
     svc.events.send("library.state", STATE);
     await screen.findByRole("heading", { level: 2, name: "Project locked" });
     expect(f.destroy).toHaveBeenCalled();
+  });
+
+  it("a project no longer in the library ends the reader with Project not found (A10)", async () => {
+    const svc = serveRoute({ unlocked: () => true, projects: () => HttpResponse.json({ projects: [] }) });
+    const f = textHandle();
+    const { container } = await openRoute(f);
+    svc.events.send("library.state", STATE);
+    const heading = await screen.findByRole("heading", { level: 2, name: "Project not found" });
+    expect(screen.getByText("This project is no longer in the library, so its files cannot be shown.")).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    expect(screen.getByRole("link", { name: "Go to the library" })).toBeTruthy();
+    expect(f.destroy).toHaveBeenCalled();
+    expectNothingLeft(container);
+  });
+
+  describe("the lock question never fails open (A10, Ruling R205)", () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("a 500 then a locked answer ends the reader after the retry", async () => {
+      const answers: Array<() => Response> = [() => serviceError(500, "INTERNAL", "x") as unknown as Response, () => projectsAnswer(false)];
+      const svc = serveRoute({ unlocked: () => true, projects: () => (answers.shift() ?? (() => projectsAnswer(false)))() });
+      const f = textHandle();
+      await openRoute(f);
+      svc.events.send("library.state", STATE);
+      await waitFor(() => expect(svc.projectReads.length).toBe(1));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      // The question failed: the reader stays, nothing is ended for that alone.
+      expect(f.destroy).not.toHaveBeenCalled();
+      expect(screen.getByRole("region", { name: "Page 1 of 3" })).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(QUESTION_RETRY_MS);
+      });
+      await screen.findByRole("heading", { level: 2, name: "Project locked" });
+      expect(svc.projectReads.length).toBe(2);
+      expect(f.destroy).toHaveBeenCalled();
+    });
+
+    it("a question that never answers is given up at 5 s and asked again", async () => {
+      const signals: AbortSignal[] = [];
+      let calls = 0;
+      const svc = serveRoute({
+        unlocked: () => true,
+        projects: async (request) => {
+          calls++;
+          if (calls === 1) {
+            signals.push(request.signal);
+            await new Promise<void>((r) => request.signal.addEventListener("abort", () => r()));
+            return HttpResponse.error() as unknown as Response;
+          }
+          return projectsAnswer(false);
+        },
+      });
+      const f = textHandle();
+      await openRoute(f);
+      svc.events.send("library.state", STATE);
+      await waitFor(() => expect(calls).toBe(1));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(QUESTION_TIMEOUT_MS - 100);
+      });
+      expect(signals[0]!.aborted).toBe(false);
+      expect(calls).toBe(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(200);
+      });
+      expect(signals[0]!.aborted).toBe(true);
+      expect(f.destroy).not.toHaveBeenCalled();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(QUESTION_RETRY_MS);
+      });
+      await screen.findByRole("heading", { level: 2, name: "Project locked" });
+      expect(calls).toBe(2);
+    });
+
+    it("no timer or request is left after the reader goes", async () => {
+      let calls = 0;
+      const signals: AbortSignal[] = [];
+      const svc = serveRoute({
+        unlocked: () => true,
+        projects: async (request) => {
+          calls++;
+          signals.push(request.signal);
+          if (calls === 1) return serviceError(500, "INTERNAL", "x") as unknown as Response;
+          await new Promise<void>((r) => request.signal.addEventListener("abort", () => r()));
+          return HttpResponse.error() as unknown as Response;
+        },
+      });
+      const f = textHandle();
+      const r = await openRoute(f);
+      svc.events.send("library.state", STATE);
+      await waitFor(() => expect(calls).toBe(1));
+      // A retry is waiting: leaving cancels it.
+      r.unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(QUESTION_RETRY_MS + QUESTION_TIMEOUT_MS * 3);
+      });
+      expect(calls).toBe(1);
+
+      // A request in flight: leaving aborts it, and nothing follows.
+      calls = 0;
+      signals.length = 0;
+      const svc2 = serveRoute({
+        unlocked: () => true,
+        projects: async (request) => {
+          calls++;
+          signals.push(request.signal);
+          await new Promise<void>((res) => request.signal.addEventListener("abort", () => res()));
+          return HttpResponse.error() as unknown as Response;
+        },
+      });
+      const r2 = await openRoute(textHandle());
+      svc2.events.send("library.state", STATE);
+      await waitFor(() => expect(calls).toBe(1));
+      r2.unmount();
+      await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(QUESTION_RETRY_MS + QUESTION_TIMEOUT_MS * 3);
+      });
+      expect(calls).toBe(1);
+    });
+
+    it("a burst of states while a retry waits still makes one request at a time", async () => {
+      let inFlight = 0;
+      let most = 0;
+      let calls = 0;
+      const svc = serveRoute({
+        unlocked: () => true,
+        projects: async () => {
+          calls++;
+          inFlight++;
+          most = Math.max(most, inFlight);
+          await new Promise((r) => setTimeout(r, 50));
+          inFlight--;
+          return calls < 3 ? (serviceError(500, "INTERNAL", "x") as unknown as Response) : projectsAnswer(true);
+        },
+      });
+      const f = textHandle();
+      await openRoute(f);
+      svc.events.send("library.state", STATE);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      for (let i = 0; i < 8; i++) svc.events.send("library.state", STATE);
+      for (let i = 0; i < 6; i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(QUESTION_RETRY_MS);
+        });
+      }
+      expect(most).toBe(1);
+      // Two failures, then answered; the burst adds at most one more question after the answer.
+      expect(calls).toBeGreaterThanOrEqual(3);
+      expect(calls).toBeLessThanOrEqual(4);
+      expect(f.destroy).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("ReaderScreen, fix round 2 (A10)", () => {
+  beforeEach(() => {
+    requests = [];
+    server.events.on("request:start", record);
+    openPdf.mockReset();
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(function (this: HTMLCanvasElement) {
+      return { canvas: this, measureText: () => ({ width: 10 }), font: "" } as unknown as CanvasRenderingContext2D;
+    } as never);
+  });
+
+  it("not a PDF is told by the error's kind, not by its sentence: a reworded message still says Not a PDF", async () => {
+    serveDocument();
+    openPdf.mockRejectedValueOnce(new PdfOpenError("not-a-pdf", "Some other words for a file that is not a PDF."));
+    screenFor();
+    await screen.findByRole("heading", { level: 2, name: "Not a PDF" });
+    expect(screen.getByText("This file cannot be shown here.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open again" })).toBeNull();
+  });
+
+  it("focus is handed over whenever a focused button becomes disabled, however the limit was reached (scrolling here)", async () => {
+    serveDocument();
+    openPdf.mockResolvedValueOnce(fakeHandle(5).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 5" });
+    const button = (name: string) => screen.getByRole("button", { name });
+    const scroller = screen.getByRole("group", { name: "Pages" });
+    const scrollTo = (n: number) => {
+      const box = scroller.querySelector<HTMLElement>(`[data-page-number="${n}"]`)!;
+      act(() => {
+        scroller.scrollTop = Number(box.dataset.top) + 5;
+        scroller.dispatchEvent(new Event("scroll"));
+      });
+    };
+    // Focus on Next page; the last page is reached by scrolling, not by a press.
+    button("Next page").focus();
+    scrollTo(5);
+    await waitFor(() => expect(button("Next page")).toHaveProperty("disabled", true));
+    await waitFor(() => expect(document.activeElement).toBe(button("Previous page")));
+    // Focus on Previous page; the first page is reached by scrolling.
+    scrollTo(1);
+    await waitFor(() => expect(button("Previous page")).toHaveProperty("disabled", true));
+    await waitFor(() => expect(document.activeElement).toBe(button("Next page")));
+    expect(document.activeElement).not.toBe(document.body);
   });
 });
