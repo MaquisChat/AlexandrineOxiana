@@ -290,3 +290,9 @@
 
 **A2 — Ruling R195 (same date): matching a search hit's words.**
 - R1's `matchAnnotations` splits and folds words by the SAME rules as the search index (`packages/library/src/index/text.ts`): punctuation separates words, a query word matches the beginning of a word as the index does, and Chinese, Japanese and Korean text is matched as the index matches it; accent folding never breaks Hangul apart and never makes one kana match another. The rule lives in one place: the pure function is moved to `packages/core` and the library imports it with no change of behaviour (every index test passes untouched), or, if it cannot be moved without changing behaviour, it is replicated in core with a test that holds the two equal over one shared list of examples.
+
+**A3 — What Task R1 exports, as built (2026-11-13).** Wherever a task section above names `annotationSortKey` or `derivedSortIndex`, use this instead; those two no longer exist.
+- `sortAnnotations<T extends Annotation>(list: readonly T[]): T[]` — the one way to order a document's annotations (page, then the rule of A1). Every list, overlay and jump order comes from it.
+- `matchAnnotations(list: readonly Pick<Annotation, "id" | "quote" | "body">[], words: string): string[]` — ids in the order of the list given, so sort first.
+- `pdfSortIndex(...)` and `SORT_INDEX_PATTERN` (building and checking a sort index), the `PdfAnchor` type, `highlightColourOf` and the named colour set as the R1 section gives them.
+- The word and CJK splitting used by both the search index and the matcher lives in `packages/core/src/annotations/words.ts` (`latinWords`, `cjkRuns`); `packages/library/src/index/text.ts` imports it. A task that needs to split words uses these and writes no rule of its own.
