@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { mkdtemp, readFile, readdir, realpath, stat } from "node:fs/promises";
@@ -25,6 +26,7 @@ import { POINTER_REASON, contentState, ignoredName as ignoredNameLocal } from ".
 import {
   WATCH_FS_TIMEOUT_MS,
   WATCH_PROBLEMS_MAX,
+  WATCH_RECHECK_MS,
   WATCH_REASONS,
   WATCH_RESCAN_MS,
   WATCH_STABILITY_MS,
@@ -62,7 +64,37 @@ const rename = tracked(fsp.rename);
 const rm = tracked(fsp.rm);
 const symlink = tracked(fsp.symlink);
 const truncate = tracked(fsp.truncate);
+const chmod = tracked(fsp.chmod);
+/** The real `fsp.open`, captured before any spy. */
+const realFspOpen = fsp.open;
 const watchedDirs = new Set<string>();
+
+// Review M8: besides the ctimes, every call that can change a file is spied on for the whole test. The test's own
+// changes go through the functions above, captured before any spy, so every spied call comes from the code under
+// test; none may name a path in a watched folder.
+const MUTATING_P = ["writeFile", "appendFile", "rename", "rm", "rmdir", "unlink", "mkdir", "symlink", "link", "truncate", "chmod", "chown", "lchown", "utimes", "lutimes", "copyFile", "cp", "open"] as const;
+const MUTATING_S = ["writeFile", "writeFileSync", "appendFile", "appendFileSync", "rename", "renameSync", "rm", "rmSync", "unlink", "unlinkSync", "mkdir", "mkdirSync", "symlink", "symlinkSync", "truncate", "truncateSync", "chmod", "chmodSync", "utimes", "utimesSync", "copyFile", "copyFileSync", "open", "openSync", "createWriteStream"] as const;
+let mutating: Array<{ mock: { calls: unknown[][] }; name: string }> = [];
+function spyMutations() {
+  mutating = [
+    ...MUTATING_P.map((n) => ({ mock: vi.spyOn(fsp, n as "open").mock as { calls: unknown[][] }, name: n })),
+    ...MUTATING_S.map((n) => ({ mock: vi.spyOn(fs, n as "open").mock as { calls: unknown[][] }, name: n })),
+  ];
+  syncBuiltinESMExports();
+}
+/** Calls of the code under test that could change something in a watched folder. */
+function mutationsIn(dirs: string[]): string[] {
+  const inside = (v: unknown) => typeof v === "string" && dirs.some((d) => v === d || v.startsWith(`${d}/`));
+  const writes = (flags: unknown) =>
+    typeof flags === "string" ? /[wa+]/u.test(flags) : typeof flags === "number" && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_APPEND)) !== 0;
+  const out: string[] = [];
+  for (const s of mutating)
+    for (const a of s.mock.calls) {
+      if ((s.name === "open" || s.name === "openSync") && !writes(a[1])) continue;
+      if (inside(a[0]) || ((s.name.startsWith("rename") || s.name.startsWith("copyFile") || s.name.startsWith("symlink") || s.name === "link" || s.name === "cp") && inside(a[1]))) out.push(`${s.name} ${String(a[0])}`);
+    }
+  return out;
+}
 
 /** Every entry under `dir` (dot entries included) with its change time; null when `dir` is gone. */
 async function ctimes(dir: string): Promise<Array<[string, number]> | null> {
@@ -119,10 +151,13 @@ beforeEach(async () => {
   http = new HttpClient({ libraryRoot: lib.root, dispatcher: agent, sleep: async () => {}, maxRetries: 0 });
   inbox = join(tmp, "Inbox");
   await mkdir(inbox);
+  spyMutations();
 });
 
 afterEach(async () => {
   await Promise.all(watches.splice(0).map((w) => w.stop()));
+  const dirs = await Promise.all([...watchedDirs].map((d) => realpath(d).catch(() => d)));
+  expect(mutationsIn([...dirs, ...watchedDirs])).toEqual([]);
   vi.restoreAllMocks();
   syncBuiltinESMExports();
   // Nothing in a watched folder changed after the test's own last change (W2 Accept 8).
@@ -553,7 +588,7 @@ describe("cloud-drive folders: the engine reads nothing it may not (Task W2)", (
       return m;
     };
     await writeFile(join(inbox, "later.pdf"), await buildPdf({ title: "Later", extra: "later" }));
-    const { w, events } = start(p, { stabilityMs: 200, pollMs: 100, presence });
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 100, recheckMs: 100, presence });
     await w.ready;
     await until(() => w.status().counts.notDownloaded === 1);
     expect(events.filter((e) => e.file === "later.pdf")).toEqual([]);
@@ -813,6 +848,352 @@ describe("cloud-drive folders: the engine reads nothing it may not (Task W2)", (
     expect(w.problems(page(10)).items).toEqual([{ file: "mystery.pdf", kind: "not-downloaded", reason: WATCH_REASONS.unknownPresence, bytes: 15 }]);
     await sleep(500);
     expect(opened(join(real, "mystery.pdf"))).toEqual([]);
+  });
+});
+
+describe("cloud-drive folders: fix round 1 (A6, R213)", () => {
+  const noTitle = (extra: string) => buildPdf({ lines: ["Some page text without a title that we could use."], extra });
+  const RIS = "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nER  - \n";
+  const page = (n: number) => ({ offset: 0, limit: n });
+  /** A stand-in for `fs.watch` that records its calls and hands back emitters the test can feed. */
+  function fakeWatch() {
+    const calls: Array<[string, unknown]> = [];
+    const emitters: EventEmitter[] = [];
+    const fn = ((d: string, o: unknown) => {
+      calls.push([d, o]);
+      const e = Object.assign(new EventEmitter(), { close: () => {}, ref: () => e, unref: () => e });
+      emitters.push(e);
+      return e;
+    }) as unknown as typeof fs.watch;
+    return { calls, emitters, fn };
+  }
+  /** The real `fs.watch`, counting the handles left open. */
+  function countedWatch() {
+    const handles = { open: 0, closed: 0 };
+    const fn = ((d: string, o: fs.WatchOptions) => {
+      const w = fs.watch(d, o);
+      handles.open++;
+      const close = w.close.bind(w);
+      let done = false;
+      w.close = () => {
+        if (!done) handles.closed++;
+        done = true;
+        close();
+      };
+      return w;
+    }) as unknown as typeof fs.watch;
+    return { handles, fn };
+  }
+
+  it("a sidecar still changing beside a stable file is never read (C1)", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "paper.pdf"), await noTitle("c1"));
+    await writeFile(join(inbox, "paper.ris"), RIS);
+    const opened = readSpies();
+    const timer = setInterval(() => void appendFile(join(inbox, "paper.ris"), "N1  - more\n").catch(() => {}), 50);
+    try {
+      const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+      await w.ready;
+      await until(() => events.some((e) => e.file === "paper.pdf" && e.kind === "imported"));
+      expect(opened(join(real, "paper.ris"))).toEqual([]);
+    } finally {
+      clearInterval(timer);
+      await sleep(100);
+    }
+    const sf = await repo.getSource(p.id, repo.listSourceIds(p.id)[0]!);
+    expect(sf.source.title.variants[0]?.value ?? "").not.toBe("Weaving and Kinship in Highland Markets");
+  });
+
+  it("a stable sidecar that is on this computer is used", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "paper.pdf"), await noTitle("c1b"));
+    await writeFile(join(inbox, "paper.ris"), RIS);
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await until(() => events.some((e) => e.file === "paper.pdf" && e.kind === "imported"));
+    const sf = await repo.getSource(p.id, events.find((e) => e.file === "paper.pdf")!.sourceId!);
+    expect(sf.source.title.variants[0]!.value).toBe("Weaving and Kinship in Highland Markets");
+  });
+
+  it("a file evicted between the type sniff and the copy is never opened again and nothing stays in the library (M1)", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    const f = join(real, "evicted.pdf");
+    await writeFile(join(inbox, "evicted.pdf"), await buildPdf({ title: "Evicted", extra: "evicted" }));
+    let evicted = false;
+    let opens = 0;
+    const opened = readSpies();
+    vi.spyOn(fsp, "open").mockImplementation((async (...a: Parameters<typeof fsp.open>) => {
+      const r = await realFspOpen(...a);
+      if (String(a[0]) === f && ++opens === 2) evicted = true; // 1: the engine's hash, 2: attach's type sniff
+      return r;
+    }) as typeof fsp.open);
+    syncBuiltinESMExports();
+    const lstatS = async (q: string) => {
+      const s = await fsp.lstat(q, { bigint: true });
+      return evicted && q === f ? (Object.assign(Object.create(Object.getPrototypeOf(s) as object), s, { blocks: 0n }) as typeof s) : s;
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fs: { lstat: lstatS } });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(opened(f)).toHaveLength(2);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("a symbolic link swapped in for the file is not followed (M1)", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    const f = join(real, "linked.pdf");
+    const away = join(tmp, "away.pdf");
+    await writeFile(join(inbox, "linked.pdf"), await buildPdf({ title: "Linked", extra: "linked" }));
+    let swapped = false;
+    let followed = false;
+    const openS = async (q: string, flags?: number) => {
+      if (!swapped && q === f) {
+        swapped = true;
+        await rename(f, away);
+        await symlink(away, f);
+      }
+      const fh = await fsp.open(q, flags);
+      if (swapped && q === f) followed = true; // opened through the link
+      return fh;
+    };
+    const opened = readSpies();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fs: { open: openS } });
+    await w.ready;
+    await until(() => w.problems(page(10)).items.some((i) => i.file === "linked.pdf" && i.reason === WATCH_REASONS.outside));
+    expect(swapped).toBe(true);
+    expect(followed).toBe(false);
+    expect(opened(away)).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("linux form: a folder deleted and made again under the same name is watched and listed at once; no handle is left (I1)", async () => {
+    const p = await project();
+    await mkdir(join(inbox, "Sub"));
+    await writeFile(join(inbox, "Sub", "one.pdf"), await buildPdf({ title: "One", extra: "one" }));
+    const { handles, fn } = countedWatch();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, recursive: true, watcherForm: "per-folder", fsWatch: fn });
+    await w.ready;
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "Sub/one.pdf"));
+    expect(handles.open - handles.closed).toBe(2);
+    await rm(join(inbox, "Sub"), { recursive: true });
+    await until(() => handles.open - handles.closed === 1);
+    await mkdir(join(inbox, "Sub"));
+    await sleep(300);
+    await writeFile(join(inbox, "Sub", "two.pdf"), await buildPdf({ title: "Two", extra: "two" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "Sub/two.pdf"), 10_000);
+    expect(handles.open - handles.closed).toBe(2);
+    await w.stop();
+    expect(handles.open - handles.closed).toBe(0);
+  });
+
+  it("darwin form: ONE recursive watcher for the whole tree, fed with relative paths as FSEvents gives them", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await mkdir(join(inbox, "Sub", "Deeper"), { recursive: true });
+    const fake = fakeWatch();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, recursive: true, watcherForm: "tree", fsWatch: fake.fn });
+    await w.ready;
+    await sleep(300);
+    await writeFile(join(inbox, "Sub", "Deeper", "fed.pdf"), await buildPdf({ title: "Fed", extra: "fed" }));
+    fake.emitters[0]!.emit("change", "rename", "Sub/Deeper/fed.pdf");
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "Sub/Deeper/fed.pdf"));
+    expect(fake.calls).toEqual([[real, { recursive: true, persistent: true }]]);
+  });
+
+  it("a watcher is set up only after the folder has answered, never while a call on it is stuck", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let hold = true;
+    const readdirS = async (d: string) => {
+      if (hold && d === real) await held;
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const fake = fakeWatch();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, watcherForm: "tree", fsWatch: fake.fn, fs: { readdir: readdirS } });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    await sleep(300);
+    expect(fake.calls).toEqual([]);
+    hold = false;
+    release();
+    await until(() => w.status().state === "watching");
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  /** File-system stand-ins that count every call outstanding on the folder; the first `read` of a file is held. */
+  function heldReadFs() {
+    const s = { outstanding: 0, most: 0, closes: 0, release: () => {} };
+    const held = new Promise<void>((r) => (s.release = r));
+    let holdRead = true;
+    const count = async <T>(fn: () => Promise<T>): Promise<T> => {
+      s.most = Math.max(s.most, ++s.outstanding);
+      try {
+        return await fn();
+      } finally {
+        s.outstanding--;
+      }
+    };
+    const fsS = {
+      lstat: (q: string) => count(() => fsp.lstat(q, { bigint: true })),
+      readdir: (q: string) => count(() => fsp.readdir(q, { withFileTypes: true })),
+      stat: (q: string) => count(() => fsp.stat(q)),
+      realpath: (q: string) => count(() => fsp.realpath(q)),
+      open: async (q: string, flags?: number) => {
+        const fh = await count(() => fsp.open(q, flags));
+        return {
+          read: (...a: Parameters<typeof fh.read>) =>
+            count(async () => {
+              if (holdRead) {
+                holdRead = false;
+                await held;
+              }
+              return fh.read(...(a as [Buffer, number, number, null]));
+            }),
+          close: () => count(() => (s.closes++, fh.close())),
+        } as unknown as fsp.FileHandle;
+      },
+    };
+    return { s, fsS };
+  }
+
+  it("stop() issues nothing on a folder whose call is stuck; the stuck read's handle is closed once it settles (I2)", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "big.pdf"), await buildPdf({ title: "Big", extra: "big" }));
+    const { s, fsS } = heldReadFs();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: fsS });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    await w.stop();
+    expect(s.closes).toBe(0);
+    expect(s.outstanding).toBe(1);
+    s.release();
+    await until(() => s.closes === 1);
+    expect(s.most).toBe(1);
+  });
+
+  it("when a stuck read answers at last, its close takes its turn beside the folder's other calls (I2)", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "big.pdf"), await buildPdf({ title: "Big again", extra: "big2" }));
+    const { s, fsS } = heldReadFs();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: fsS });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    s.release();
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "big.pdf"));
+    expect(s.closes).toBeGreaterThanOrEqual(1);
+    expect(s.most).toBe(1);
+  });
+
+  it("a folder with a call outstanding stays \"Cannot be reached\" for a new watch, which issues nothing until it settles", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "after.pdf"), await buildPdf({ title: "After", extra: "after" }));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let hold = true;
+    let calls = 0;
+    const readdirS = async (d: string) => {
+      calls++;
+      if (hold && d === real) await held;
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const lstatS = async (q: string) => (calls++, fsp.lstat(q, { bigint: true }));
+    const a = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: { readdir: readdirS, lstat: lstatS } });
+    await a.w.ready;
+    await until(() => a.w.status().state === "unreachable");
+    await a.w.stop();
+    const n = calls;
+    const b = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: { readdir: readdirS, lstat: lstatS } });
+    await b.w.ready;
+    expect(b.w.status()).toMatchObject({ state: "unreachable", reason: withProvider(WATCH_REASONS.notResponding, null) });
+    await sleep(500);
+    expect(calls).toBe(n);
+    hold = false;
+    release();
+    await until(() => b.events.some((e) => e.kind === "imported" && e.file === "after.pdf"));
+  });
+
+  it("an event naming a not-downloaded file re-checks it at once (M7)", async () => {
+    const p = await project();
+    let online = true;
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) {
+        const s = m.get(q);
+        if (online && q.endsWith("later.pdf") && s?.presence === "local") m.set(q, { ...s, presence: "not-downloaded" });
+      }
+      return m;
+    };
+    await writeFile(join(inbox, "later.pdf"), await buildPdf({ title: "Later by event", extra: "event" }));
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    online = false;
+    await sleep(600);
+    expect(events.some((e) => e.file === "later.pdf")).toBe(false); // no round in 60 s
+    await chmod(join(inbox, "later.pdf"), 0o600); // an event that changes no size, time or block
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "later.pdf"), 5000);
+  });
+
+  it("otherwise files not downloaded are re-checked once per WATCH_RECHECK_MS (M7, fake time)", async () => {
+    expect(WATCH_RECHECK_MS).toBe(60_000);
+    const p = await project();
+    await sparse(join(inbox, "online.pdf"), 10_000);
+    let asked = 0;
+    const presence: typeof contentState = async (paths, o) => {
+      if (paths.some((q) => q.endsWith("online.pdf"))) asked++;
+      return contentState(paths, o);
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    const k = asked;
+    await sleep(600);
+    expect(asked).toBe(k);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 60_001);
+      await sleep(600);
+      expect(asked).toBe(k + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a file the system refuses to open, and a folder it refuses to list, are \"not-permitted\" and counted (M4, M5)", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "locked.pdf"), await buildPdf({ title: "Locked", extra: "locked" }));
+    await mkdir(join(inbox, "Private"));
+    const eacces = () => Object.assign(new Error("permission denied"), { code: "EACCES" });
+    const openS = async (q: string, flags?: number) => (q === join(real, "locked.pdf") ? Promise.reject(eacces()) : fsp.open(q, flags));
+    const readdirS = async (d: string) => (d === join(real, "Private") ? Promise.reject(eacces()) : fsp.readdir(d, { withFileTypes: true }));
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, recursive: true, fs: { open: openS, readdir: readdirS } });
+    await w.ready;
+    await until(() => w.status().counts.didNotComeIn === 2);
+    expect(w.problems({ kind: "not-permitted", offset: 0, limit: 10 }).items.map((i) => [i.file, i.reason]).sort()).toEqual([
+      ["Private", WATCH_REASONS.fileNotPermitted],
+      ["locked.pdf", WATCH_REASONS.fileNotPermitted],
+    ]);
+    expect(WATCH_REASONS.fileNotPermitted).toBe("The app was not allowed to read this file.");
+  });
+
+  it("a renamed file that already came in is not counted or announced as a duplicate (M3)", async () => {
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await writeFile(join(inbox, "first.pdf"), await buildPdf({ title: "Renamed", extra: "renamed" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "first.pdf"));
+    await rename(join(inbox, "first.pdf"), join(inbox, "second.pdf"));
+    await sleep(1500);
+    expect(events.filter((e) => e.file === "second.pdf")).toEqual([]);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, alreadyInLibrary: 0, waiting: 0 });
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
   });
 });
 

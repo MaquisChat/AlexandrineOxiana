@@ -1144,6 +1144,26 @@ describe("cloud-drive folders: attach reads only what `readable` allows (Task W2
     expect(sf.source.title.variants[0]?.value ?? "").not.toBe("Weaving and Kinship in Highland Markets");
   });
 
+  it("readable is asked again immediately before each open: the sniff, the hash, the metadata, the copy (A6)", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("each.pdf", await buildPdf({ title: "Each open", extra: "each" }));
+    const asked: string[] = [];
+    const [ok] = await createAttach({ repo, http, readable: async (q) => (asked.push(q), true) }).attachFiles(p.id, [path]);
+    expect(ok!.sourceId).toEqual(expect.any(String));
+    expect(asked.filter((q) => q === path).length).toBeGreaterThanOrEqual(4);
+    // Evicted after the sniff and the hash: refused at the next open, nothing stored.
+    const p2 = await project(NO_LOOKUP_GOV);
+    const path2 = await put("evicted.pdf", await buildPdf({ title: "Evicted later", extra: "evicted2" }));
+    let n = 0;
+    const opened = readSpies();
+    const [r] = await createAttach({ repo, http, readable: async (q) => q !== path2 || ++n <= 2 }).attachFiles(p2.id, [path2]);
+    expect(r).toEqual({ path: path2, outcome: "failed", reason: NOT_DOWNLOADED_REASON });
+    expect(repo.listSourceIds(p2.id)).toEqual([]);
+    const reads = opened(path2).length;
+    expect(reads).toBeGreaterThan(0);
+    expect(reads).toBeLessThanOrEqual(2); // the sniff and the hash; never the metadata or the copy
+  });
+
   it("attach and findSidecars without `readable` behave as before", async () => {
     const p = await project(NO_LOOKUP_GOV);
     const path = await put("scan0003.pdf", await buildPdf({ lines: ["Some page text without a title that we could use."], extra: "w2b" }));
