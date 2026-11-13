@@ -1294,12 +1294,16 @@ processing:
       expect(a.scanResult().refusedHosts).toEqual(["unknown-host.example.net"]);
     });
 
-    it("a missing (WebDAV) file does not hold since back", async () => {
+    it("a missing (WebDAV) file does not hold since back; the item comes in with its highlight, unanchored", async () => {
       const p = await project();
-      await withFile("On WebDAV", { storage: "webdav" });
+      const { p: key, att } = await withFile("On WebDAV", { storage: "webdav" });
+      z.addItem(U, { itemType: "annotation", annotationType: "highlight", annotationText: "kept", annotationPosition: JSON.stringify({ pageIndex: 2, rects: [[1, 2, 3, 4]] }) }, { parent: att });
       const { r, since } = await runOnce(p);
       expect(r.counts.failed).toBe(0);
       expect(since).toBe(z.libraryVersion(U));
+      const sf = (await sources(p)).find((s) => s.source.provenance.externalKeys?.zoteroKey === key)!;
+      expect(sf.assets).toEqual([]);
+      expect(sf.annotations.map((a) => [a.kind, a.quote, a.anchors])).toEqual([["highlight", "kept", []]]);
     });
 
     it("a file whose checksum never matches is noted after N tries and does not hold since back", async () => {
