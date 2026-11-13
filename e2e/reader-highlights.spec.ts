@@ -126,6 +126,9 @@ function expectOnItsWords(p: Placed, along: number, where: string): void {
   const detail = `${where}: highlight ${JSON.stringify(m)} words ${JSON.stringify(w)}`;
   const [mA0, mA1, wA0, wA1] = p.across ? [m.left, m.right, w.left, w.right] : [m.top, m.bottom, w.top, w.bottom];
   const [mX0, mX1, wX0, wX1] = p.across ? [m.top, m.bottom, w.top, w.bottom] : [m.left, m.right, w.left, w.right];
+  const measured = `${where}: ends ${Math.abs(mA0 - wA0).toFixed(2)} and ${Math.abs(mA1 - wA1).toFixed(2)} px off (allowed ${along}); height ${(mX1 - mX0).toFixed(1)} px against the span's ${(wX1 - wX0).toFixed(1)}`;
+  test.info().annotations.push({ type: "placed", description: measured });
+  console.log(`[${test.info().project.name}] ${measured}`);
   expect(Math.abs(mA0 - wA0), detail).toBeLessThanOrEqual(along);
   expect(Math.abs(mA1 - wA1), detail).toBeLessThanOrEqual(along);
   const middle = (mX0 + mX1) / 2;
