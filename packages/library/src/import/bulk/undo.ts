@@ -21,7 +21,7 @@
  * folders (trashed through the repository) and the copies a merge added. Linked originals and the
  * user's files outside the library are never touched.
  */
-import { appendLibraryEvent, hasSource, importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
+import { appendLibraryEvent, clearZoteroWebVersion, hasSource, importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
 import { encName } from "@ao/core";
 import { decryptBytes, readMaybe } from "../../repo/io.js";
@@ -43,7 +43,8 @@ async function readProjectRel(repo: Repo, projectId: string, rel: string): Promi
 }
 
 export interface UndoKept {
-  kind: "tag" | "collection" | "field" | "annotation";
+  /** `availability` (Z5): a source's availability changed after the batch marked it (or took its mark away); kept. */
+  kind: "tag" | "collection" | "field" | "annotation" | "availability";
   /** The tag or collection id, or the field's JSON pointer. */
   id: string;
   /** For fields: the source. */
@@ -56,6 +57,8 @@ export interface UndoResult {
   revertedMerges: number;
   /** What undo left in place because it is in use or was changed since (R61). */
   kept: UndoKept[];
+  /** Z5: the Zotero library version this batch recorded was forgotten, so the next Web import is a full one. */
+  libraryVersionReset?: true;
 }
 
 export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
@@ -93,6 +96,8 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
         for (const a of r.removed) await ops.trashAssetFile(a);
         for (const path of r.kept) kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: "changed after the import; kept" });
         for (const id of r.keptAnnotations) kept.push({ kind: "annotation", id, sourceId: e.mergedInto!, reason: "edited after the import; kept" });
+        // Z5: an availability changed since this batch wrote it (a later batch, or the researcher) is left as it is.
+        if (r.keptAvailability) kept.push({ kind: "availability", id: "/availability", sourceId: e.mergedInto!, reason: "changed after the import; kept" });
         if (r.changed) await ops.writeSource(now, r.next);
         return r.changed;
       },
@@ -223,6 +228,15 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     }
   }
 
+  // 4b. Zotero Web (Z5, R206 4): a batch that recorded the library's version had it forgotten, so the next run is a
+  //     full one and brings back what this undo took away. Before the record says undone: an undo that stops in
+  //     between is done again, and forgetting twice changes nothing.
+  let libraryVersionReset = false;
+  if (rec.source.kind === "zotero-web" && rec.recordedLibraryVersion !== undefined && /^(user|group):\d{1,12}$/u.test(rec.source.location)) {
+    await clearZoteroWebVersion(repo, projectId, rec.source.location);
+    libraryVersionReset = true;
+  }
+
   // 5. Review entries, the record, the audit log.
   const pending = (await projectReviewEntries(repo, projectId)).filter((e) => e.status === "pending" && (e.batchId === batchId || (e.sourceId && removed.has(e.sourceId))));
   rec.state = "undone";
@@ -243,6 +257,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     removedSources,
     revertedMerges,
     kept: kept.length,
+    ...(libraryVersionReset ? { libraryVersionReset } : {}),
   });
-  return { removedSources, revertedMerges, kept };
+  return { removedSources, revertedMerges, kept, ...(libraryVersionReset ? { libraryVersionReset: true as const } : {}) };
 }

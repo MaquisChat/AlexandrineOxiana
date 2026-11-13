@@ -39,8 +39,25 @@ export type BatchState = "running" | "paused" | "cancelled" | "finished" | "fail
 /** As shown: a `running` batch no process is running is `interrupted` (R45). */
 export type ShownState = BatchState | "interrupted";
 
-/** `updated` / `unchanged`: incremental re-import of an item imported before (R72). */
-export type ItemOutcome = "created" | "needs-review" | "duplicate" | "merged" | "updated" | "unchanged" | "deleted-here" | "failed" | "incomplete";
+/**
+ * `updated` / `unchanged`: incremental re-import of an item imported before (R72). Zotero (Task Z5):
+ * `zotero-gone` an item deleted in Zotero or in its bin whose source here was marked (or already was, the same
+ * way: counted only); `zotero-gone-unmarked` one that has no source of its own here to mark (deleted here, or
+ * only merged into another source); `zotero-back` a marked item seen again, its earlier availability restored.
+ */
+export type ItemOutcome =
+  | "created"
+  | "needs-review"
+  | "duplicate"
+  | "merged"
+  | "updated"
+  | "unchanged"
+  | "deleted-here"
+  | "failed"
+  | "incomplete"
+  | "zotero-gone"
+  | "zotero-gone-unmarked"
+  | "zotero-back";
 
 export interface JournalEntry {
   key: string;
@@ -81,6 +98,8 @@ export interface JournalEntry {
   annotationsDeletedHere?: number;
   /** The files this line stored: copied into the library, or left as links (R136; for the report). */
   files?: { copied: number; linked: number };
+  /** Task Z5: what Zotero said of the item (`zotero-gone`, `zotero-gone-unmarked`): deleted, or in its bin. */
+  gone?: "deleted" | "bin";
 }
 
 /** A journal line's `files`, from whether each stored file is a link; undefined when none was stored. */
@@ -130,6 +149,8 @@ export interface BatchRecord extends ImportBatch {
   adapterOptions?: { researcherName?: string; zoteroSince?: number; zoteroFiles?: boolean; zoteroReadVersions?: number[] };
   /** Zotero Web (Z2): the library version this batch recorded in the project when it finished (undo resets it, Z5). */
   recordedLibraryVersion?: number;
+  /** Task Z5 (for Z7): a batch started by the Zotero sync runner, which resumes its own unfinished batches. */
+  origin?: "zotero-sync";
 }
 
 /** `<project folder>/imports`. */
@@ -271,11 +292,28 @@ export function countOutcomes(latest: Iterable<JournalEntry>): {
   deletedHere: number;
   failed: number;
   items: number;
+  /** Task Z5: sources marked gone from Zotero (or already marked the same way), of them in Zotero's bin, and back. */
+  goneInZotero: number;
+  goneInZoteroBin: number;
+  backInZotero: number;
+  /** Items Zotero said are gone that have no source of their own here to mark (deleted here, merged only). */
+  goneNotMarked: number;
 } {
-  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, deletedHere: 0, failed: 0, items: 0 };
+  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, deletedHere: 0, failed: 0, items: 0, goneInZotero: 0, goneInZoteroBin: 0, backInZotero: 0, goneNotMarked: 0 };
   for (const e of latest) {
+    // Items gone from Zotero brought nothing in: counted apart, not as items.
+    if (e.outcome === "zotero-gone") {
+      c.goneInZotero++;
+      if (e.gone === "bin") c.goneInZoteroBin++;
+      continue;
+    }
+    if (e.outcome === "zotero-gone-unmarked") {
+      c.goneNotMarked++;
+      continue;
+    }
     c.items++;
-    if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
+    if (e.outcome === "zotero-back") c.backInZotero++;
+    else if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
     else if (e.outcome === "needs-review") c.needsReview++;
     else if (e.outcome === "duplicate" || e.outcome === "skipped") c.duplicates++;
     else if (e.outcome === "merged") c.merged++;

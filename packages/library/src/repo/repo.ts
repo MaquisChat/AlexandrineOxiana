@@ -8,7 +8,7 @@ import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { createAnnotation, deleteAnnotation, listAnnotations, updateAnnotation, type AnnotationDraft, type AnnotationPatch } from "./annotations.js";
-import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
+import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord, resetZoteroWebVersion } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingOcrMany, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import {
@@ -1086,7 +1086,7 @@ export function importChange<T>(
   projectId: string,
   reqs: MutateRequest | MutateRequest[],
   fn: (ops: ImportOps) => Promise<T>,
-  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook },
+  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook; auditDetails?: Record<string, unknown> },
 ): Promise<T> {
   return runImportChange(cores.get(repo)!, projectId, reqs, fn, opts);
 }
@@ -1276,6 +1276,14 @@ export async function lookupPolicyInfo(
 /** Package-internal (Zotero Web import): records the library version a finished import saw (governed, audited). */
 export function recordZoteroWebLibraryVersion(repo: Repo, projectId: string, ref: string, version: number): Promise<void> {
   return recordZoteroWebVersion(cores.get(repo)!, projectId, ref, version);
+}
+
+/**
+ * Task Z5 (R206 4): forgets the Zotero library version recorded for `ref` (op
+ * `project.import-settings.zotero-web.reset`), so the next Web import of that library is a full one.
+ */
+export function clearZoteroWebVersion(repo: Repo, projectId: string, ref: string): Promise<void> {
+  return resetZoteroWebVersion(cores.get(repo)!, projectId, ref);
 }
 
 /** Package-internal (watched folders): adds a watch's id + options to project.json (governed, audited). */

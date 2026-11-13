@@ -21,7 +21,22 @@ export interface ImportReport {
   state: ShownState;
   startedAt: string;
   finishedAt?: string;
-  counts: { items: number; created: number; needsReview: number; duplicates: number; merged: number; updated: number; unchanged: number; deletedHere: number; failed: number };
+  counts: {
+    items: number;
+    created: number;
+    needsReview: number;
+    duplicates: number;
+    merged: number;
+    updated: number;
+    unchanged: number;
+    deletedHere: number;
+    failed: number;
+    /** Task Z5 (absent in reports written before it): marked gone from Zotero (of them in its bin), back, and gone with no source of their own here. */
+    goneInZotero?: number;
+    goneInZoteroBin?: number;
+    backInZotero?: number;
+    goneNotMarked?: number;
+  };
   /** Files this import stored: copied into the library, and left as links where they were (R136). Always given. */
   files: { copied: number; linked: number };
   failures: Array<{ item: string; reason: string }>;
@@ -87,6 +102,10 @@ function markdown(r: ImportReport): string {
     `- Merged into existing sources: ${r.counts.merged}`,
     ...(r.counts.updated || r.counts.unchanged ? [`- Updated from a newer version: ${r.counts.updated}`, `- Unchanged since the last import: ${r.counts.unchanged}`] : []),
     ...(r.counts.deletedHere ? [`- Deleted here — not re-imported: ${r.counts.deletedHere}`] : []),
+    // Task Z5: kept here and marked, never deleted.
+    ...((r.counts.goneInZotero ?? 0) - (r.counts.goneInZoteroBin ?? 0) > 0 ? [`- Marked as no longer in Zotero: ${(r.counts.goneInZotero ?? 0) - (r.counts.goneInZoteroBin ?? 0)}`] : []),
+    ...(r.counts.goneInZoteroBin ? [`- In the Zotero bin: ${r.counts.goneInZoteroBin}`] : []),
+    ...(r.counts.backInZotero ? [`- Back in Zotero: ${r.counts.backInZotero}`] : []),
     ...(r.annotationsDeletedHere ? [`- Annotations deleted here — not re-imported: ${r.annotationsDeletedHere}`] : []),
     `- Failed: ${r.counts.failed}`,
     `- Files copied into the library: ${r.files.copied}`,
