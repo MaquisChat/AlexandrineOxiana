@@ -322,7 +322,10 @@ function disjoint(a: readonly string[], b: readonly string[]): boolean {
   return !a.some((x) => b.includes(x));
 }
 
-/** One work: the same DOI; or, with no conflicting identifier, the same normalised title, first family and year. */
+/**
+ * One work: the same DOI; or, with no conflicting identifier, the same normalised title, first
+ * family name and year (both needed: two records with no author are never merged by title alone).
+ */
 function sameWork(a: WorkCandidate, b: WorkCandidate): boolean {
   const da = a.identifiers.doi;
   const db = b.identifiers.doi;
@@ -330,7 +333,7 @@ function sameWork(a: WorkCandidate, b: WorkCandidate): boolean {
   const ia = a.identifiers.isbn ?? [];
   const ib = b.identifiers.isbn ?? [];
   if (ia.length && ib.length && disjoint(ia, ib)) return false;
-  return normalizeTitle(a.title) !== "" && mergeKey(a) === mergeKey(b);
+  return normalizeTitle(a.title) !== "" && firstFamily(a) !== "" && mergeKey(a) === mergeKey(b);
 }
 
 /** `a` with what only `b` knows: the first service's values win. */
@@ -405,7 +408,8 @@ interface Prepared {
 }
 
 function prepare(ref: Reference): Prepared {
-  const segments = segmentsOf(ref.text);
+  // A Reference built elsewhere (a stored queue entry) is bounded here too.
+  const segments = segmentsOf(cut(ref.text, RAW_MAX));
   const wordCount = new Map<string, number>();
   const runs: string[] = [];
   for (const s of segments) {
@@ -540,18 +544,25 @@ function closeTitles(a: TitleInfo, b: TitleInfo): number {
   return best;
 }
 
-/** Two records known to be one work: they share a DOI or an ISBN. */
-function shareIdentifier(a: WorkCandidate, b: WorkCandidate): boolean {
-  if (a.identifiers.doi && a.identifiers.doi === b.identifiers.doi) return true;
+/**
+ * Two records known to be one work: they share a DOI or an ISBN, and neither has a DOI or an
+ * ISBN list the other contradicts (a chapter shares its book's ISBN but has its own DOI).
+ */
+function provablySame(a: WorkCandidate, b: WorkCandidate): boolean {
+  const da = a.identifiers.doi;
+  const db = b.identifiers.doi;
+  const ia = a.identifiers.isbn ?? [];
   const ib = b.identifiers.isbn ?? [];
-  return (a.identifiers.isbn ?? []).some((i) => ib.includes(i));
+  if (da && db && da !== db) return false;
+  if (ia.length && ib.length && disjoint(ia, ib)) return false;
+  return (!!da && da === db) || ia.some((i) => ib.includes(i));
 }
 
 type Scored = { c: WorkCandidate; i: number; s: CandidateScore; t: TitleInfo };
 
 /**
  * The six conditions. Readings the plan left open, each taken the strict way:
- *  - rule 5 blocks unless the other record is provably the same work (a shared DOI or ISBN): a
+ *  - rule 5 blocks unless the other record is provably the same work (see provablySame): a
  *    close title with no identifier at all may be another edition;
  *  - rule 2 does not let one typed word be both a title word and the author (see creatorTyped);
  *  - a candidate given only by Elicit is never sure on its own.
@@ -565,7 +576,7 @@ function isSure(p: Prepared, best: Scored, all: Scored[]): boolean {
   if (!s.year) return false; // 4
   for (const o of all) {
     if (o === best) continue;
-    if (closeTitles(t, o.t) >= 0.8 && !shareIdentifier(c, o.c)) return false; // 5
+    if (closeTitles(t, o.t) >= 0.8 && !provablySame(c, o.c)) return false; // 5
   }
   const next = all.find((o) => o !== best);
   if (next && next.s.score > s.score - 0.2 + 1e-9) return false; // 6

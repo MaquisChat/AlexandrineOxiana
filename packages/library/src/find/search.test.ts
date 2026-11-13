@@ -257,6 +257,16 @@ describe("searchWorks and decideMatch (the confidence rule)", () => {
     expect(decideMatch(ref("Bourdieu"), [blank, punct]).kind).not.toBe("sure");
   });
 
+  it("a book and a chapter sharing its ISBN but with their own DOIs are not one work", () => {
+    const book = cand({ id: "book", title: "Distinction", identifiers: { doi: "10.5555/book", isbn: ["9780000000002"] } });
+    const chapter = cand({ id: "ch", title: "Distinction", type: "chapter", identifiers: { doi: "10.5555/book.ch1", isbn: ["9780000000002"] } });
+    expect(decideMatch(ref("Bourdieu, Distinction"), [book, chapter]).kind).toBe("choose");
+    // A chapter by another author scores 0.3 lower (rule 6 alone would allow it): rule 5 still blocks.
+    const other = { ...chapter, creators: [{ given: "Henrik", family: "Lindqvist", role: "author" as const }] };
+    expect(scoreCandidate(ref("Bourdieu, Distinction"), other).score).toBe(0.7);
+    expect(decideMatch(ref("Bourdieu, Distinction"), [book, other]).kind).toBe("choose");
+  });
+
   it("an Elicit candidate alone is never sure; with another provider it can be", () => {
     const e = cand({ id: "e", title: "Distinction", providers: ["elicit"], identifiers: { doi: "10.5555/e" } });
     expect(decideMatch(ref("Bourdieu, Distinction"), [e])).toEqual({ kind: "choose", ids: ["e"] });
@@ -539,6 +549,17 @@ describe("hostile and broken answers", () => {
     expect(r.candidates[0]!.issued).toBe("1984"); // filled from OpenAlex
   });
 
+  it("records without an author are not merged by their title alone", async () => {
+    const items = [
+      { DOI: "10.5555/ao.find.annual.a", type: "report", title: ["Annual Report"] },
+      { type: "report", title: ["Annual Report"] },
+    ];
+    answer("https://api.crossref.org", crPath("Annual Report"), JSON.stringify({ message: { items } }));
+    const r = await search("Annual Report", ctx(client()), ["crossref"]);
+    expect(r.candidates).toHaveLength(2);
+    expect(new Set(r.candidates.map((c) => c.id)).size).toBe(2);
+  });
+
   it("an empty or whitespace title in a candidate drops that candidate", async () => {
     const items = [
       { DOI: "10.5555/ao.find.blank", type: "book", title: ["   "], author: [{ family: "Bourdieu" }] },
@@ -613,6 +634,32 @@ describe("the lookup client's per-host concurrency", () => {
     const http = client({ maxRetries: 0 });
     await expect(http.getJson("https://api.crossref.org/a", { cacheKey: "t:a" })).rejects.toThrow();
     await expect(http.getJson("https://api.crossref.org/b", { cacheKey: "t:b" })).resolves.toEqual({});
+  });
+});
+
+describe("twelve typed lines (the report's table)", () => {
+  const cases: Array<[line: string, crossrefFile: string, openalexFile: string, kind: "sure" | "choose" | "none"]> = [
+    ["Bourdieu, Distinction", "crossref-distinction.json", "openalex-distinction.json", "sure"],
+    ["Bourdieu, Distinction", "crossref-distinction-editions.json", "openalex-empty.json", "choose"],
+    ["Bourdieu, Distinction", "crossref-distinction-translation.json", "openalex-empty.json", "choose"],
+    ["Bourdieu, Distinction", "crossref-distinction-other-author.json", "openalex-empty.json", "choose"],
+    ["Distinction", "crossref-distinction.json", "openalex-empty.json", "choose"],
+    ["Bourdieu, Distinction 1986", "crossref-distinction.json", "openalex-distinction.json", "choose"],
+    ["Bourdieu, Distinction 1985", "crossref-distinction.json", "openalex-distinction.json", "sure"],
+    ["Bourdieu, Distinction, Paris Minuit", "crossref-distinction.json", "openalex-distinction.json", "choose"],
+    [`"weak ties" Granovetter 1973`, "crossref-weak-ties.json", "openalex-empty.json", "choose"],
+    ["Granovetter, The Strength of Weak Ties, 1973", "crossref-weak-ties.json", "openalex-empty.json", "sure"],
+    ["Okafor, Rivers and Memory in Upland Villages", "crossref-preprint-article.json", "openalex-empty.json", "choose"],
+    ["Muller, Feldforschung im Gebirge", "crossref-diacritics.json", "openalex-empty.json", "sure"],
+    ["日本の思想丸山眞男", "crossref-japanese.json", "openalex-empty.json", "sure"],
+    ["Weber, Economy and Society", "crossref-empty.json", "openalex-empty.json", "none"],
+  ];
+  it.each(cases)("%s with %s and %s → %s", async (line, cr, oa, kind) => {
+    crossref(line, cr);
+    openalex(line, oa);
+    const { candidates, notes: n } = await search(line, ctx(client()));
+    expect(n).toEqual([]);
+    expect(decideMatch(ref(line), candidates).kind).toBe(kind);
   });
 });
 
