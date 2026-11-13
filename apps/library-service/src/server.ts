@@ -18,7 +18,7 @@ import { registerAudit } from "./routes/audit.js";
 import { registerLibraryAudit } from "./routes/library-audit.js";
 import { registerCapture } from "./routes/capture.js";
 import { registerCitations } from "./routes/citations.js";
-import { registerDocuments } from "./routes/documents.js";
+import { isDocumentPreflight, registerDocuments } from "./routes/documents.js";
 import { registerFieldwork } from "./routes/fieldwork.js";
 import { registerGovernance } from "./routes/governance.js";
 import { registerImport } from "./routes/import.js";
@@ -214,7 +214,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
         return reply
           .status(204)
           .header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE")
-          .header("Access-Control-Allow-Headers", "authorization, content-type")
+          // `range` only for the shell's preflight of the document route (Task R5 review I1).
+          .header("Access-Control-Allow-Headers", SHELL_ORIGINS.has(origin) && isDocumentPreflight(req) ? "authorization, content-type, range" : "authorization, content-type")
           .header("Access-Control-Max-Age", "600")
           .send();
       }

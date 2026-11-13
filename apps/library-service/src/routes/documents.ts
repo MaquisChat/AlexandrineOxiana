@@ -26,6 +26,7 @@ import { Readable } from "node:stream";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { InvalidInputError, KeyNotAvailableError, NotFoundError, PathEscapeError, ProjectLockedError, isPdfMime, openAssetContent, type AssetContent } from "@ao/library";
 import { DOCUMENT_RANGE_MAX_BYTES, READER_PDF_MAX_BYTES } from "@ao/shared";
+import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound, toApiError } from "../errors.js";
 import { parseRange, sendContent } from "../media.js";
 import { paramsOf, projectParam, type Ctx } from "./util.js";
@@ -40,6 +41,28 @@ const unsafe = (): ApiError => badRequest("This file could not be opened safely.
 const tooLarge = (): ApiError => new ApiError(413, "PAYLOAD_TOO_LARGE", "This PDF is larger than 512 MB, too large to open in the app.");
 const closedMeanwhile = (): ApiError => new ApiError(409, "CONFLICT", "The library was closed while this file was being read.");
 const locked = (): ApiError => new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+
+/** The document route's path, exactly (its preflight is judged by it: no route matches an OPTIONS). */
+const DOCUMENT_PATH = /^\/projects\/[^/?#]+\/sources\/[^/?#]+\/assets\/[^/?#]+\/document$/;
+
+/**
+ * Whether an OPTIONS request is the preflight of a GET of the document route (Task R5 review I1):
+ * only then does the answer add `range` to the allowed request headers. The origin has been
+ * checked by the caller (server.ts) before this is asked.
+ */
+export function isDocumentPreflight(req: FastifyRequest): boolean {
+  if (req.method !== "OPTIONS") return false;
+  if (String(req.headers["access-control-request-method"] ?? "").toUpperCase() !== "GET") return false;
+  return DOCUMENT_PATH.test(req.url.split("?")[0] ?? "");
+}
+
+/**
+ * The response headers the page must read across origins (the UI runs at the shell's origin and
+ * calls 127.0.0.1): `Content-Range`. `Content-Length` and `Content-Type` are CORS-safelisted, and
+ * `byteRange` reads nothing else. Sent only to an origin the service already accepts (the
+ * shell's: server.ts has refused every other before the handler runs).
+ */
+const EXPOSED = "Content-Range";
 
 const header = (req: FastifyRequest, name: string): string | undefined => {
   const v = req.headers[name];
@@ -62,7 +85,7 @@ function openFailure(err: unknown): ApiError {
  * `c` with every read checked by `ok` before and after it (so no byte read after a lock leaves),
  * and its range stream made of those checked reads.
  */
-function guarded(c: AssetContent, ok: () => void): AssetContent {
+export function guarded(c: AssetContent, ok: () => void): AssetContent {
   const read = async (position: number, length: number): Promise<Buffer> => {
     ok();
     const b = await c.read(position, length);
@@ -95,6 +118,8 @@ export function registerDocuments(app: FastifyInstance, ctx: Ctx): void {
 
   const handler = async (req: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {
     if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Only the desktop app can do this.");
+    const origin = req.headers.origin;
+    if (origin !== undefined && SHELL_ORIGINS.has(origin)) reply.header("Access-Control-Expose-Headers", EXPOSED);
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
     if (!s.repo.isUnlocked(projectId)) throw locked();

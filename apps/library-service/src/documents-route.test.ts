@@ -4,15 +4,19 @@
  * exactly the range asked; each refusal in plain words with no file-system path; reading changes
  * nothing.
  */
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { readdirSync, readlinkSync } from "node:fs";
+import { request as httpRequest, type ClientRequest, type IncomingMessage } from "node:http";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Writable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { deviceDeps, type Deps } from "@ao/library";
+import { deviceDeps, type AssetContent, type Deps } from "@ao/library";
 import { DOCUMENT_RANGE_MAX_BYTES, READER_PDF_MAX_BYTES } from "@ao/shared";
 import { tinyPng } from "../../../tests/fixtures/generate.mjs";
+import { guarded } from "./routes/documents.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -49,7 +53,7 @@ async function start(over: Partial<ServiceOptions> = {}): Promise<LibraryService
   return svc;
 }
 
-type Inject = { method?: "GET" | "POST" | "HEAD"; url: string; body?: unknown; headers?: Record<string, string>; noAuth?: boolean };
+type Inject = { method?: "GET" | "POST" | "HEAD" | "OPTIONS"; url: string; body?: unknown; headers?: Record<string, string>; noAuth?: boolean };
 async function call(r: Inject) {
   const res = await svc.app.inject({
     method: r.method ?? "GET",
@@ -439,5 +443,286 @@ describe("the ranged PDF route (Task R5)", () => {
     expect(statuses).toEqual([206, 206, 206, 400, 400, 416]);
     expect(await snapshot(lib)).toEqual(before);
     expect(await audit()).toBe(auditBefore);
+  });
+});
+
+// ---- fix round 1 ----
+
+const SHELL = ["tauri://localhost", "http://tauri.localhost"];
+const settle = (ms = 50) => new Promise((r) => setTimeout(r, ms));
+
+/** Descriptors this process holds on `file` (Linux: /proc/self/fd). */
+function descriptorsOn(file: string): number {
+  let n = 0;
+  for (const fd of readdirSync("/proc/self/fd")) {
+    try {
+      if (readlinkSync(`/proc/self/fd/${fd}`) === file) n++;
+    } catch {
+      // closed meanwhile
+    }
+  }
+  return n;
+}
+
+/** Waits until `check` holds (or fails after `ms`). */
+async function until(check: () => boolean, ms = 5000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error("timed out waiting");
+    await settle(20);
+  }
+}
+
+/** A GET over a real socket; `abort()` destroys it from the client's side. */
+function socketGet(port: number, path: string, headers: Record<string, string>) {
+  let res: IncomingMessage | undefined;
+  let received = 0;
+  let firstData: () => void = () => {};
+  const first = new Promise<void>((r) => (firstData = r));
+  let ended: (how: string) => void = () => {};
+  const done = new Promise<string>((r) => (ended = r));
+  const req: ClientRequest = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers: { host: `127.0.0.1:${port}`, ...auth, ...headers } }, (r) => {
+    res = r;
+    r.on("data", (d: Buffer) => {
+      received += d.length;
+      if (received === d.length) {
+        r.pause();
+        firstData();
+      }
+    });
+    r.on("close", () => ended(r.complete ? "end" : "aborted"));
+  });
+  req.on("error", () => ended("aborted"));
+  req.end();
+  return { first, done, status: () => res?.statusCode ?? 0, received: () => received, resume: () => res?.resume(), abort: () => req.destroy() };
+}
+
+async function storedPath(pid: string, sid: string): Promise<string> {
+  return join(tmp, "Lib", ...(await svc.state.session!.repo.getSource(pid, sid)).assets[0]!.path.split("/"));
+}
+
+const preflight = (url: string, origin: string, method = "GET", headers = "authorization,range") =>
+  call({ method: "OPTIONS", url, noAuth: true, headers: { origin, "access-control-request-method": method, "access-control-request-headers": headers } });
+
+describe("fix round 1, I1: the shell's origin can read a range (CORS)", () => {
+  it("the preflight from the shell allows Range on the document route, and the answers expose Content-Range", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject();
+    const data = pdfBytes(3000);
+    const { sid, aid } = await sourceWith(pid, await scratch("paper.pdf", data));
+    for (const origin of SHELL) {
+      const pre = await preflight(docUrl(pid, sid, aid), origin);
+      expect(pre.status, pre.body).toBe(204);
+      expect(pre.headers["access-control-allow-origin"]).toBe(origin);
+      expect(String(pre.headers["access-control-allow-headers"]).split(/,\s*/).sort()).toEqual(["authorization", "content-type", "range"]);
+      const r = await get(pid, sid, aid, "bytes=0-9", { origin });
+      expect(r.status).toBe(206);
+      expect(r.headers["access-control-allow-origin"]).toBe(origin);
+      expect(r.headers["access-control-expose-headers"]).toBe("Content-Range");
+      expect(r.raw.equals(data.subarray(0, 10))).toBe(true);
+      const past = await get(pid, sid, aid, "bytes=5000-", { origin });
+      expect(past.status).toBe(416);
+      expect(past.headers["access-control-expose-headers"]).toBe("Content-Range");
+    }
+  });
+
+  it("nothing changes elsewhere, and a foreign origin gets nothing", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject();
+    const { sid, aid } = await sourceWith(pid, await scratch("paper.pdf", pdfBytes(3000)));
+    for (const origin of SHELL) {
+      // Other routes: the preflight and the answers as before.
+      const pre = await preflight(`/projects/${pid}/sources/${sid}/assets/${aid}/content`, origin);
+      expect(pre.headers["access-control-allow-headers"]).toBe("authorization, content-type");
+      const projects = await call({ url: "/projects", headers: { origin } });
+      expect(projects.headers["access-control-expose-headers"]).toBeUndefined();
+      // The document route asked for with another method: no Range offered.
+      const post = await preflight(docUrl(pid, sid, aid), origin, "POST", "authorization");
+      expect(post.headers["access-control-allow-headers"]).toBe("authorization, content-type");
+      // A path that only looks like it: no Range offered.
+      const longer = await preflight(`${docUrl(pid, sid, aid)}/x`, origin);
+      expect(longer.headers["access-control-allow-headers"]).toBe("authorization, content-type");
+    }
+    // No Origin (not a browser): nothing to expose.
+    expect((await get(pid, sid, aid, "bytes=0-9")).headers["access-control-expose-headers"]).toBeUndefined();
+    // A foreign origin: refused, no CORS headers at all, no bytes.
+    for (const origin of ["https://evil.example", "http://127.0.0.1:1234", "null"]) {
+      const pre = await preflight(docUrl(pid, sid, aid), origin);
+      expect(pre.status).toBe(403);
+      expect(pre.headers["access-control-allow-origin"]).toBeUndefined();
+      expect(pre.headers["access-control-allow-headers"]).toBeUndefined();
+      const r = await get(pid, sid, aid, "bytes=0-9", { origin });
+      expect(r.status).toBe(403);
+      expect(r.headers["access-control-allow-origin"]).toBeUndefined();
+      expect(r.headers["access-control-expose-headers"]).toBeUndefined();
+      expect(r.headers["content-range"]).toBeUndefined();
+    }
+  });
+});
+
+describe("fix round 1, I2: an aborted request leaves no file open", () => {
+  it("aborted before the first byte, at any point: the file and its decrypting handle are released", async () => {
+    let entered = 0;
+    let gate: () => void = () => {};
+    let gated = new Promise<void>((r) => (gate = r));
+    await start({
+      documentBeforeRead: async () => {
+        entered++;
+        await gated;
+      },
+    });
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("sealed.pdf", pdfBytes(3 * CHUNK)));
+    const file = await storedPath(pid, sid);
+    const port = await svc.listen(0);
+    const g = socketGet(port, docUrl(pid, sid, aid), { range: "bytes=0-99" });
+    await until(() => entered === 1);
+    expect(descriptorsOn(file)).toBe(1); // open while it waits
+    g.abort();
+    expect(await g.done).toBe("aborted");
+    await settle(50);
+    gate();
+    await until(() => descriptorsOn(file) === 0);
+    // Many more, aborted at every point from before the open to before the first byte.
+    gated = Promise.resolve();
+    for (let i = 0; i < 60; i++) {
+      const r = socketGet(port, docUrl(pid, sid, aid), { range: `bytes=${i * 1000}-${i * 1000 + 999}` });
+      setTimeout(() => r.abort(), i % 8);
+      await r.done;
+    }
+    await until(() => descriptorsOn(file) === 0);
+    await settle(500);
+    expect(descriptorsOn(file)).toBe(0);
+    // And mid-stream.
+    const mid = socketGet(port, docUrl(pid, sid, aid), { range: "bytes=0-" });
+    await mid.first;
+    mid.abort();
+    await mid.done;
+    await until(() => descriptorsOn(file) === 0);
+  });
+
+  it("the picture route shares the release: early aborts leave no file open", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const pic = await sourceWith(pid, await scratch("shot.png", Buffer.concat([tinyPng(), randomBytes(2 * CHUNK)])), "copy", "image");
+    const file = await storedPath(pid, pic.sid);
+    const port = await svc.listen(0);
+    for (let i = 0; i < 40; i++) {
+      const r = socketGet(port, `/projects/${pid}/sources/${pic.sid}/assets/${pic.aid}/content`, {});
+      setTimeout(() => r.abort(), i % 8);
+      await r.done;
+    }
+    await settle(500);
+    await until(() => descriptorsOn(file) === 0);
+  });
+});
+
+describe("fix round 1, minors", () => {
+  it("M1: a FIFO or a folder swapped in for the file is refused at once with the same answer as a link", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject();
+    const linked = await scratch("linked.pdf", pdfBytes(1000));
+    const l = await sourceWith(pid, linked, "link");
+    await unlink(linked);
+    expect(spawnSync("mkfifo", [linked]).status).toBe(0);
+    const started = Date.now();
+    plainError(await get(pid, l.sid, l.aid, "bytes=0-9"), 400, "VALIDATION", UNSAFE);
+    expect(Date.now() - started).toBeLessThan(2000);
+    const c = await sourceWith(pid, await scratch("stored.pdf", pdfBytes(1000)));
+    const abs = await storedPath(pid, c.sid);
+    await unlink(abs);
+    await mkdir(abs);
+    plainError(await get(pid, c.sid, c.aid, "bytes=0-9"), 400, "VALIDATION", UNSAFE);
+  });
+
+  it("M2: the library closed before the first read answers 409 in plain words, and the file is released", async () => {
+    let fileToWatch = "";
+    let held = -1;
+    await start({
+      documentBeforeRead: async () => {
+        held = descriptorsOn(fileToWatch);
+        await svc.state.closeLibrary();
+      },
+    });
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("sealed.pdf", pdfBytes(2 * CHUNK)));
+    fileToWatch = await storedPath(pid, sid);
+    plainError(await get(pid, sid, aid, "bytes=0-99"), 409, "CONFLICT", "The library was closed while this file was being read.");
+    expect(held).toBe(1);
+    await until(() => descriptorsOn(fileToWatch) === 0);
+  });
+
+  it("M2: a failure in the test seam releases the file and answers with fixed text", async () => {
+    let fileToWatch = "";
+    await start({
+      documentBeforeRead: async () => {
+        throw new Error(`failed at ${fileToWatch}`);
+      },
+    });
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("sealed.pdf", pdfBytes(2 * CHUNK)));
+    fileToWatch = await storedPath(pid, sid);
+    plainError(await get(pid, sid, aid, "bytes=0-99"), 500, "INTERNAL");
+    await until(() => descriptorsOn(fileToWatch) === 0);
+  });
+
+  it("M3: guarded() checks before and after every read: nothing read after a lock is handed on", async () => {
+    const data = randomBytes(5 * 64 * 1024);
+    let locked = false;
+    let reads = 0;
+    const stub: AssetContent = {
+      asset: {} as AssetContent["asset"],
+      mime: "application/pdf",
+      size: data.length,
+      async read(position: number, length: number) {
+        reads++;
+        if (reads === 2) locked = true; // the lock arrives while the second slice is being read
+        return data.subarray(position, position + length);
+      },
+      range: () => Readable.from([]),
+      close: async () => {},
+    };
+    const g = guarded(stub, () => {
+      if (locked) throw new Error("locked");
+    });
+    const got: Buffer[] = [];
+    await expect(
+      (async () => {
+        for await (const chunk of g.range(0, data.length - 1)) got.push(chunk as Buffer);
+      })(),
+    ).rejects.toThrow("locked");
+    expect(Buffer.concat(got).equals(data.subarray(0, 64 * 1024))).toBe(true); // the first slice only
+    expect(reads).toBe(2); // and no read after the lock was seen
+    await expect(g.read(0, 10)).rejects.toThrow("locked");
+    expect(reads).toBe(2);
+  });
+
+  it("M3: a project locked in the middle of a stream: the stream ends cleanly, the next range answers as locked", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const data = pdfBytes(6 * CHUNK);
+    const { sid, aid } = await sourceWith(pid, await scratch("sealed.pdf", data));
+    const file = await storedPath(pid, sid);
+    const port = await svc.listen(0);
+    const s = socketGet(port, docUrl(pid, sid, aid), { range: `bytes=0-${DOCUMENT_RANGE_MAX_BYTES - 1}` });
+    await s.first;
+    expect(s.status()).toBe(206);
+    svc.state.session!.repo.lockProject(pid);
+    s.resume();
+    const how = await s.done;
+    // Ends: complete if the service had read it all before the lock, else cut; never anything else.
+    expect(["end", "aborted"]).toContain(how);
+    expect(s.received()).toBeLessThanOrEqual(DOCUMENT_RANGE_MAX_BYTES);
+    await until(() => descriptorsOn(file) === 0);
+    const next = await call({ url: docUrl(pid, sid, aid), headers: { host: `127.0.0.1:${port}`, range: `bytes=${CHUNK}-${CHUNK + 99}` } });
+    plainError(next, 423, "PROJECT_LOCKED");
   });
 });
