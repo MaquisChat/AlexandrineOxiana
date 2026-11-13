@@ -308,6 +308,21 @@ describe("R222: nothing of the list is kept by the route; no words are held with
     expect(screen.queryByTestId("reader-screen")).toBeNull();
   });
 
+  it("words are not lost to a failed read of the source: they wait, and the screen gets them when 'Open again' reads it", async () => {
+    const user = userEvent.setup();
+    let up = false;
+    serve(TWO, list([]));
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => (up ? HttpResponse.json({ ...SOURCE_FILE, assets: [pdf("a1", "one.pdf")] }) : HttpResponse.error())));
+    setPendingFind("p1", "s1", "habitus");
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    await user.click(await screen.findByRole("button", { name: "Open again" }));
+    expect(screen.queryByTestId("reader-screen")).toBeNull();
+    up = true;
+    await user.click(screen.getByRole("button", { name: "Open again" }));
+    expect(await shownScreen()).toBe("a1|-|habitus");
+  });
+
   it("the words are taken only when there is a file to open: while the source is read they wait; a source with no PDF drops them at once", async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));

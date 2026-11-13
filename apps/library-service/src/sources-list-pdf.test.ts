@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { deviceDeps, type Deps } from "@ao/library";
+import { rowAvailability } from "./routes/sources.js";
 import { createService, type LibraryService } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -63,7 +64,7 @@ async function source(pid: string, title: string, files: Record<string, string>)
 const rows = async (pid: string) => {
   const r = await call("GET", `/projects/${pid}/sources?limit=100`);
   expect(r.status, JSON.stringify(r.json)).toBe(200);
-  return Object.fromEntries((r.json.items as Array<{ title: string; hasReadablePdf?: boolean; locked: boolean }>).map((i) => [i.title, i]));
+  return Object.fromEntries((r.json.items as Array<{ title: string; hasReadablePdf?: boolean; locked: boolean; availability?: unknown }>).map((i) => [i.title, i]));
 };
 
 beforeEach(async () => {
@@ -132,5 +133,19 @@ describe("the sources list says whether a source has a readable PDF (R222 b)", (
     expect((calls.getSourceRecord ?? 0) + (calls.getSourceRecordWithAssets ?? 0)).toBe(100);
     expect(calls.getSource ?? 0).toBe(0);
     expect(Object.values(r).every((i) => i.hasReadablePdf === true)).toBe(true);
+  });
+
+  it("the row's availability is exactly what rowAvailability() returns for the record, on the ordinary and on the read-only path (a field added later is covered)", async () => {
+    const pid = await newProject(false);
+    const sid = await source(pid, "Gone from its platform", { "a.pdf": "%PDF-1.7\nx" });
+    await svc.state.session!.repo.updateSource(pid, sid, { availability: { status: "unavailable-on-platform", firstNoticedAt: "2026-11-03T09:15:00.000Z" } });
+    const expected = rowAvailability(await svc.state.session!.repo.getSourceRecord(pid, sid));
+    expect(expected).toEqual({ status: "unavailable-on-platform", firstNoticedAt: "2026-11-03T09:15:00.000Z" });
+    expect((await rows(pid))["Gone from its platform"]!.availability).toEqual(expected);
+    expect((await call("POST", "/libraries/close")).status).toBe(200);
+    const now = new Date().toISOString();
+    await writeFile(join(tmp, "Lib", ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+    expect((await call("POST", "/libraries/open", { path: join(tmp, "Lib") })).json.mode).toBe("read-only");
+    expect((await rows(pid))["Gone from its platform"]!.availability).toEqual(expected);
   });
 });

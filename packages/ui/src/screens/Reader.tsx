@@ -634,6 +634,8 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   // Task R12: a document or a list that could not be had lets go of the words and of the place asked for.
   useEffect(() => {
     if (phase.kind !== "failed" && annotationsError === undefined) return;
+    // A list handed over is for the first document only: a failed opening empties it (R222).
+    if (phase.kind === "failed") preloaded.current = undefined;
     // A list that could not be had: the search is lost, and the researcher is told once the list is shown.
     if (annotationsError !== undefined && finding !== undefined) setSearchLost(true);
     releaseFind();

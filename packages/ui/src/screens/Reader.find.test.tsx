@@ -364,4 +364,16 @@ describe("R222: the list handed over is used once; a lost search is said", () =>
     expect(shown()).toEqual(["m", "z"]);
     expect(screen.queryByRole("button", { name: "Show all" })).toBeNull();
   });
+
+  it("a first opening that fails before there is a document: 'Open again' asks the service, and nothing of the handed list is shown", async () => {
+    let asked = 0;
+    server.use(http.get(url("/projects/:id/sources/:sid/annotations"), () => (asked++, HttpResponse.json({ annotations: [rec("fresh", "from the service", { page: 1 })], count: 1, textChars: 0 }))));
+    openPdf.mockReset();
+    openPdf.mockRejectedValueOnce(new Error("no")).mockResolvedValue(fakeHandle());
+    reader({ preloadedAnnotations: [rec("handed", "handed over", { page: 1 })] });
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Open again" }));
+    await waitFor(() => expect(shown()).toEqual(["fresh"]));
+    expect(asked).toBe(1);
+    expect(document.body.textContent).not.toContain("handed over");
+  });
 });

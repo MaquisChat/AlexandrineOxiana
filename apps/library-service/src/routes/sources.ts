@@ -104,7 +104,7 @@ export interface RowAvailability {
   firstNoticedAt?: string;
 }
 
-const rowAvailability = (src: Source): RowAvailability => {
+export const rowAvailability = (src: Source): RowAvailability => {
   const a = src.availability;
   return { status: a.status, ...(a.firstNoticedAt ? { firstNoticedAt: a.firstNoticedAt } : {}) };
 };
@@ -115,14 +115,14 @@ const rowAvailability = (src: Source): RowAvailability => {
  * and cannot raise an integrity warning while annotations are being written. A locked row, or a
  * record that cannot be read, gets none (the interface then shows nothing).
  */
-async function availabilityOf(repo: { getSourceRecordWithAssets(projectId: string, id: string): Promise<{ source: Source; assets: Asset[] }> }, projectId: string, rows: Array<{ id: string; locked: boolean }>): Promise<Map<string, RowAvailability & { hasReadablePdf: boolean }>> {
-  const out = new Map<string, RowAvailability & { hasReadablePdf: boolean }>();
+async function availabilityOf(repo: { getSourceRecordWithAssets(projectId: string, id: string): Promise<{ source: Source; assets: Asset[] }> }, projectId: string, rows: Array<{ id: string; locked: boolean }>): Promise<Map<string, { availability: RowAvailability; hasReadablePdf: boolean }>> {
+  const out = new Map<string, { availability: RowAvailability; hasReadablePdf: boolean }>();
   await Promise.all(
     rows
       .filter((r) => !r.locked)
       .map(async (r) => {
         const rec = await repo.getSourceRecordWithAssets(projectId, r.id).catch(() => undefined);
-        if (rec) out.set(r.id, { ...rowAvailability(rec.source), hasReadablePdf: rec.assets.some(isReadablePdfAsset) });
+        if (rec) out.set(r.id, { availability: rowAvailability(rec.source), hasReadablePdf: rec.assets.some(isReadablePdfAsset) });
       }),
   );
   return out;
@@ -164,7 +164,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
         ...found,
         items: found.items.map((i) => {
           const a = avail.get(i.id);
-          return { ...i, needsReview: !i.locked && waiting.has(i.id), ...(a ? { availability: { status: a.status, ...(a.firstNoticedAt ? { firstNoticedAt: a.firstNoticedAt } : {}) }, hasReadablePdf: a.hasReadablePdf } : {}) };
+          return { ...i, needsReview: !i.locked && waiting.has(i.id), ...(a ? { availability: a.availability, hasReadablePdf: a.hasReadablePdf } : {}) };
         }),
         ...index,
       };
