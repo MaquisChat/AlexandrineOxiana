@@ -60,8 +60,10 @@ import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError
 import {
   appendFindEntriesIn,
   createSourceRefusing,
+  lookupPolicyInfo,
   projectCollectionsAndTags,
   projectPolicy,
+  recoveryPendingProjects,
   readFindQueueDetailedIn,
   readFindQueueIn,
   repoLibrary,
@@ -71,7 +73,7 @@ import { libraryVersion } from "../resources.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FindQueueUnreadableError, sanitizeEntry } from "./queue-store.js";
 import { parseReference, type Reference } from "./reference.js";
-import { decideMatch, scoreCandidate, searchWorks, type SearchSource } from "./search.js";
+import { decideMatch, openAlexSearchPausedUntil, scoreCandidate, searchWorks, type SearchSource } from "./search.js";
 import {
   FIND_DOI_MAX,
   FIND_LINE_MAX_BYTES,
@@ -97,6 +99,14 @@ export const FIND_SETTINGS_TIMEOUT_MS = 5_000;
 export const FIND_LOOKUP_TIMEOUT_MS = 240_000;
 /** `stopAll()` settles within this time (wall clock) whatever is in flight; what is still running then writes nothing. */
 export const FIND_STOP_SETTLE_MS = 5_000;
+/** While the index cannot be trusted, the runner asks again after this long (one timer, no busy loop). */
+export const FIND_INDEX_WAIT_MS = 2_000;
+/**
+ * At resume, a source made for a waiting entry has an id (UUIDv7, time-ordered) no older than the entry itself: only
+ * the source records whose id time is at or after the oldest waiting entry's `createdAt`, less this margin for clock
+ * steps, are read (R237 Q8).
+ */
+export const FIND_ADOPT_MARGIN_MS = 300_000;
 /** One Add holds at most this many lines. */
 export const FIND_ADD_MAX_LINES = 50;
 /** The tool a record made by Find and acquire names in its provenance. */
@@ -126,6 +136,14 @@ export class FindRunnerClosedError extends Error {
   }
 }
 
+/** The index cannot be trusted yet (still being rebuilt, or a change was not indexed): nothing is created. Nothing was changed. */
+export class FindIndexNotReadyError extends Error {
+  override name = "FindIndexNotReadyError";
+  constructor() {
+    super("The library's index is still being prepared. Try again in a moment. Nothing was changed.");
+  }
+}
+
 /** Test seams (R47: honoured only under NODE_ENV=test): run just before and just after a record's creation. */
 export const runnerSeams: { beforeCreate?: () => void; afterCreate?: () => void } = {};
 const seam = (f: (() => void) | undefined) => {
@@ -151,10 +169,17 @@ export interface FindRunnerDeps {
   timers?: FindTimers;
   /** Beyond the plan's Interfaces: short notes (error kinds only; never what was typed, never an error's text). */
   debug?: (note: string) => void;
+  /**
+   * Whether the index can be trusted for the duplicate check (default: always). While false the runner starts no
+   * entry and creates nothing; it asks again every FIND_INDEX_WAIT_MS and goes on by itself.
+   */
+  indexReady?: () => boolean;
 }
 
-/** Why the runner does nothing for a project (R237 d): nothing can be written for it. */
-export type FindStoppedFor = { code: "rules-unreadable" | "queue-unreadable" | "read-only" };
+/** Why the runner does nothing for a project now. */
+export type FindStoppedFor = {
+  code: "rules-unreadable" | "queue-unreadable" | "read-only" | "recovery-pending" | "unexpected" | "index-not-ready";
+};
 
 export interface FindRunner {
   /**
@@ -320,6 +345,9 @@ function matchOf(e: FindEntry, cand: WorkCandidate): FindMatch {
   return { method: "find-match", confidence: ref ? scoreCandidate(ref, cand).score : 0 };
 }
 
+/** The time (ms since the epoch) a UUIDv7 was made: its first 48 bits. */
+const idTime = (id: string): number => parseInt(id.replace(/-/gu, "").slice(0, 12), 16);
+
 const errName = (err: unknown) => (err instanceof Error ? err.name : "error");
 
 export function createFindRunner(deps: FindRunnerDeps): FindRunner {
@@ -353,6 +381,23 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const blocked = new Map<string, FindStoppedFor>();
 
   const readOnly = () => repoLibrary(repo).mode !== "read-write";
+  /** Whether the index can be trusted for the duplicate check (a throw counts as not ready: fail closed). */
+  const indexReady = () => {
+    try {
+      return deps.indexReady ? deps.indexReady() : true;
+    } catch {
+      return false;
+    }
+  };
+  /** The one timer that asks again whether the index is ready (no busy loop). */
+  let indexWait: unknown;
+  function waitForIndex(): void {
+    if (indexWait !== undefined || closed) return;
+    indexWait = timers.setTimeout(() => {
+      indexWait = undefined;
+      pump();
+    }, FIND_INDEX_WAIT_MS);
+  }
   const keyOfRun = (pid: string, eid: string) => `${pid}\u0000${eid}`;
 
   function freshRun(): Run {
@@ -419,6 +464,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   function pump(): void {
+    if (closed) return;
+    if (!indexReady()) {
+      // Entries wait (they stay "looking-up"); the runner asks again after FIND_INDEX_WAIT_MS.
+      if ([...runs.values()].some((r) => !r.stopped && r.pending.length > 0)) waitForIndex();
+      return;
+    }
     while (!closed && active < FIND_CONCURRENCY) {
       let pick: { pid: string; r: Run; idx: number } | undefined;
       for (const [pid, r] of runs) {
@@ -633,6 +684,22 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   const RULES: FindReason = { code: "not-allowed", by: "rules" };
+  const NO_LEGAL_BASIS: FindReason = { code: "no-legal-basis", by: "rules" };
+
+  /**
+   * Why the engine refused the record (N1). Told apart by what the engine itself decides, never by its sentence:
+   * the refusal is the missing legal basis when it refused the STORE of identifiable data with no basis recorded,
+   * and the same store WITH a basis would not be refused.
+   */
+  async function refusalOf(pid: string, err: PolicyDeniedError, store: { identifiable: boolean; legalBasis?: string }): Promise<FindReason> {
+    if (err.action !== "store" || !store.identifiable || store.legalBasis) return RULES;
+    const info = await lookupPolicyInfo(repo, pid);
+    if (!info.policy) return RULES;
+    const base = { action: "store" as const, projectId: pid, actor: info.actor, now: info.clock().toISOString(), ...(info.tz ? { tz: info.tz } : {}) };
+    const without = evaluate(info.policy, { ...base, store: { identifiable: true, hasLocation: false } });
+    const withBasis = evaluate(info.policy, { ...base, store: { identifiable: true, hasLocation: false, legalBasis: "a recorded basis" } });
+    return without.result === "deny" && withBasis.result !== "deny" ? NO_LEGAL_BASIS : RULES;
+  }
   const SETTINGS: FindReason = { code: "switched-off", by: "settings" };
 
   // ------------------------------------------------------------------------------------------------------------
@@ -669,6 +736,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // A source made for this entry already (a crash or a stop after its creation): adopted, never made twice.
     const adopted = madeFor(pid, eid);
     if (adopted) return settle({ state: "record-complete", sourceId: adopted }, ["duplicateOf", "elsewhere"]);
+    // No duplicate check, and so no creation, on an index that cannot be trusted (N4).
+    if (!indexReady()) throw new FindIndexNotReadyError();
 
     const key = keyOf(cand);
     const dup = matchHere(pid, key);
@@ -725,7 +794,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         }
       }
     } catch (err) {
-      if (err instanceof PolicyDeniedError) return settle({ state: "failed", reason: RULES });
+      if (err instanceof PolicyDeniedError) return settle({ state: "failed", reason: await refusalOf(pid, err, { identifiable, ...(legalBasis ? { legalBasis } : {}) }) });
       throw err;
     }
     madeHere.set(eid, sourceId);
@@ -740,8 +809,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   /** Is this error one that stops all work for the project (nothing can be written)? Acts on it if so. */
   async function projectLevel(pid: string, err: unknown): Promise<boolean> {
-    if (err instanceof ProjectLockedError || err instanceof RecoveryPendingError) {
+    if (err instanceof ProjectLockedError) {
       stopRun(pid);
+      return true;
+    }
+    if (err instanceof RecoveryPendingError) {
+      block(pid, "recovery-pending");
       return true;
     }
     if (err instanceof FindQueueUnreadableError) {
@@ -766,7 +839,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     try {
       entry = await current(pid, eid);
     } catch (err) {
-      if (!(await projectLevel(pid, err))) debug(`find: the queue could not be read (${errName(err)})`);
+      if (!(await projectLevel(pid, err))) {
+        // Not foreseen (an I/O fault, say): the runner stops for the project and says so; `resume` tries again (N2).
+        debug(`find: the queue could not be read (${errName(err)})`);
+        block(pid, "unexpected");
+      }
       return;
     }
     if (!live() || !entry || entry.state !== "looking-up") return;
@@ -794,7 +871,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         return;
       }
       const at = new Date(now().getTime() + delay).toISOString();
-      const w = await finish({ attempts, nextTryAt: at });
+      const w = await finish({ attempts, nextTryAt: at }, ["reason"]);
       if (w && live()) later(pid, eid, at);
     };
 
@@ -894,15 +971,24 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
     const failed = sources.filter((x) => res.notes.includes(`${x}-failed`));
     const budget = sources.includes("openalex") && res.notes.includes("openalex-budget");
-    const answered = sources.length - failed.length - (budget ? 1 : 0);
     /** Every source asked answered: the list is complete (one source left by the rules or the settings counts). */
     const complete = failed.length === 0 && !budget;
     const decision = decideMatch(ref, res.candidates);
     if (decision.kind === "none" && !complete) {
-      if (answered === 0 || failed.length > 0) {
-        await tryLater(failed.length || !budget ? "unreachable" : "budget");
+      // "Not found" only when every source that may be asked has answered (N3).
+      if (failed.length > 0) {
+        await tryLater("unreachable");
         return;
       }
+      // OpenAlex is paused for the day: the entry waits for the pause's end (never less than the first retry delay,
+      // so a clock that disagrees cannot make it spin), saying why; no attempt is counted.
+      const pausedUntil = openAlexSearchPausedUntil(http);
+      const midnight = new Date(now().getTime());
+      midnight.setUTCHours(24, 0, 0, 0);
+      const at = new Date(Math.max(pausedUntil ?? midnight.getTime(), now().getTime() + FIND_RETRY_DELAYS_MS[0]!)).toISOString();
+      const w = await finish({ nextTryAt: at, reason: { code: "budget" } });
+      if (w && live()) later(pid, eid, at);
+      return;
     }
     if (decision.kind === "none") {
       await finish({ state: "not-found" }, ["nextTryAt", "reason", "candidates"]);
@@ -918,13 +1004,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       return;
     }
     const cand = res.candidates.find((c) => c.id === decision.id)!;
-    await inTurn(r, pid, live, () =>
-      completeIn(pid, eid, cand, {
-        match: { method: "find-match", confidence: scoreCandidate(ref, cand).score },
-        expect: (cur) => sameVersion(cur, entry),
-        live,
-      }),
-    );
+    try {
+      await inTurn(r, pid, live, () =>
+        completeIn(pid, eid, cand, {
+          match: { method: "find-match", confidence: scoreCandidate(ref, cand).score },
+          expect: (cur) => sameVersion(cur, entry),
+          live,
+        }),
+      );
+    } catch (err) {
+      if (!(err instanceof FindIndexNotReadyError)) throw err;
+      // Held back until the index can be trusted (N4): the entry waits, unchanged, and is worked on again then.
+      enqueue(pid, eid);
+    }
   }
 
   // ------------------------------------------------------------------------------------------------------------
@@ -966,9 +1058,15 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return { added: written, mergedLines };
   }
 
+  /** A press that may create a record is refused while the index cannot be trusted (N4); nothing is changed. */
+  function assertIndexReady(): void {
+    if (!indexReady()) throw new FindIndexNotReadyError();
+  }
+
   async function choose(projectId: string, entryId: string, candidateId: string | null): Promise<FindEntry> {
     assertOpen();
     assertId(entryId);
+    assertIndexReady();
     return turn(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
@@ -993,6 +1091,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function confirmDuplicate(projectId: string, entryId: string, same: boolean): Promise<FindEntry> {
     assertOpen();
     assertId(entryId);
+    assertIndexReady();
     return turn(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
@@ -1013,6 +1112,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function addHereAsWell(projectId: string, entryId: string): Promise<FindEntry> {
     assertOpen();
     assertId(entryId);
+    assertIndexReady();
     return turn(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
@@ -1079,6 +1179,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     r.adoptable = new Map();
     const gen = r.gen;
     const p = (async () => {
+      if (recoveryPendingProjects(repo).includes(projectId)) {
+        // Its writes wait for the library to be reopened (N2).
+        if (alive(projectId, gen)) block(projectId, "recovery-pending");
+        return;
+      }
       if ((await projectPolicy(repo, projectId)) === null) {
         if (alive(projectId, gen)) block(projectId, "rules-unreadable");
         return;
@@ -1088,10 +1193,15 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const waiting = [...q.values()].filter((e) => e.state === "looking-up");
       if (!waiting.length) return;
       // Sources made for an entry whose line was never written (a crash or a stop in between): read once here,
-      // outside any store turn, never per entry.
+      // outside any store turn, never per entry. Ids are UUIDv7, ordered by the time they were made, and such a
+      // source was made after its entry: only the sources whose id time is at or after the oldest waiting entry's
+      // `createdAt`, less FIND_ADOPT_MARGIN_MS for clock steps, are read (Q8). An id that is not a UUIDv7 is read.
       const want = new Set(waiting.map((e) => e.id));
+      const oldest = Math.min(...waiting.map((e) => Date.parse(e.createdAt)).filter((t) => Number.isFinite(t)));
+      const from = Number.isFinite(oldest) ? oldest - FIND_ADOPT_MARGIN_MS : -Infinity;
       for (const id of repo.listSourceIds(projectId)) {
         if (!alive(projectId, gen)) return;
+        if (isId(id) && idTime(id) < from) continue;
         try {
           const s = await repo.getSourceRecord(projectId, id);
           const tag = s.provenance.externalKeys?.[FIND_ENTRY_KEY];
@@ -1108,7 +1218,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       }
     })()
       .catch(async (err: unknown) => {
-        if (!(await projectLevel(projectId, err))) debug(`find: the queue could not be resumed (${errName(err)})`);
+        if (!(await projectLevel(projectId, err))) {
+          debug(`find: the queue could not be resumed (${errName(err)})`);
+          if (alive(projectId, gen)) block(projectId, "unexpected");
+        }
       })
       .finally(() => inflight.delete(p));
     inflight.add(p);
@@ -1121,6 +1234,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function stopAll(): Promise<void> {
     closed = true;
     for (const pid of runs.keys()) stopRun(pid);
+    if (indexWait !== undefined) {
+      timers.clearTimeout(indexWait);
+      indexWait = undefined;
+    }
     let h: ReturnType<typeof setTimeout> | undefined;
     const bound = new Promise<void>((res) => {
       h = setTimeout(res, FIND_STOP_SETTLE_MS);
@@ -1153,7 +1270,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   function stoppedFor(projectId: string): FindStoppedFor | null {
     if (readOnly()) return { code: "read-only" };
-    return blocked.get(projectId) ?? null;
+    const b = blocked.get(projectId);
+    if (b) return b;
+    if (!indexReady()) return { code: "index-not-ready" };
+    return null;
   }
 
   return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor };

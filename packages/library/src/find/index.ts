@@ -1,8 +1,10 @@
 /** Find and acquire (the library's part): the queue, the searches and the runner. */
 export {
   FIND_ADD_MAX_LINES,
+  FIND_ADOPT_MARGIN_MS,
   FIND_CONCURRENCY,
   FIND_ENTRY_KEY,
+  FIND_INDEX_WAIT_MS,
   FIND_LEGAL_CATEGORY,
   FIND_LOOKUP_TIMEOUT_MS,
   FIND_RETRY_DELAYS_MS,
@@ -10,6 +12,7 @@ export {
   FIND_STOP_SETTLE_MS,
   FIND_TOOL,
   FindEntryStateError,
+  FindIndexNotReadyError,
   FindRunnerClosedError,
   createFindRunner,
   readFindQueueOf,

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_GOVERNANCE, findDuplicate, newId, type Project, type SourceDraft } from "@ao/core";
 import { Dispatcher, MockAgent } from "undici";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
 import { KeyRing } from "../crypto/keys.js";
@@ -14,7 +14,7 @@ import { findSourceBy } from "../index/db.js";
 import { HttpClient } from "../lookup/http.js";
 import { serialStore } from "../import/project-queue.js";
 import { InvalidInputError, ReadOnlyLibraryError } from "../repo/errors.js";
-import type { Repo } from "../repo/repo.js";
+import { recoveryPendingProjects, type Repo } from "../repo/repo.js";
 import type { RepoCore } from "../repo/state.js";
 import { SimulatedCrash, openTestRepo, seams } from "../repo/testing.js";
 import { parseReference } from "./reference.js";
@@ -28,7 +28,9 @@ import {
   FIND_SETTINGS_TIMEOUT_MS,
   FIND_STOP_SETTLE_MS,
   FIND_TOOL,
+  FIND_INDEX_WAIT_MS,
   FindEntryStateError,
+  FindIndexNotReadyError,
   createFindRunner,
   runnerSeams,
   type FindRunner,
@@ -146,7 +148,8 @@ const mkDeps = (): Deps => ({
   clearInterval: () => {},
 });
 const repoFor = (l: Library = lib): Promise<Repo> =>
-  openTestRepo(l, ring, { tz: "UTC", actor: "tester", scryptN: 2 ** 10, index: createIndexSink(handle, { root: l.root, keyRing: ring }) });
+  // The repository's clock (the lookups' clock too: OpenAlex's pause) follows the fake timers.
+  openTestRepo(l, ring, { tz: "UTC", actor: "tester", scryptN: 2 ** 10, clock: () => new Date(timers.now), index: createIndexSink(handle, { root: l.root, keyRing: ring }) });
 const coreOf = (r: Repo = repo) => (r as unknown as { core: RepoCore }).core;
 
 function mockServices(): void {
@@ -161,6 +164,8 @@ function mockServices(): void {
         asked.push({ service, text });
         const a = answers.get(text)?.[service];
         if (a === "fail") return { statusCode: 503, data: "unavailable" };
+        // OpenAlex's free daily allowance is spent (F2 pauses OpenAlex until 00:00 UTC by the client's clock).
+        if (a === "budget") return { statusCode: 429, data: JSON.stringify({ error: "Rate limit exceeded", message: "You have exceeded your daily budget." }) };
         const body = a ?? (service === "crossref" ? cr() : OA_EMPTY);
         return { statusCode: 200, data: JSON.stringify(body), responseOptions: { headers: { "content-type": "application/json" } } };
       })
@@ -171,7 +176,8 @@ function mockServices(): void {
   http = new HttpClient({
     libraryRoot: lib.root,
     dispatcher: gated,
-    clock: () => httpNow,
+    // The client's clock moves with the fake timers too (its own waits add to it).
+    clock: () => httpNow + (timers.now - NOW),
     sleep: async (ms) => {
       httpNow += ms;
     },
@@ -185,8 +191,8 @@ beforeEach(async () => {
   ring = new KeyRing();
   lib = await createLibrary(join(tmp, "Lib"), "Lib", mkDeps());
   handle = new IndexHandle(lib.root);
-  repo = await repoFor();
   timers = new FakeTimers();
+  repo = await repoFor();
   runners = [];
   notes = [];
   changes = [];
@@ -201,6 +207,8 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const r of runners) await r.stopAll();
   seams.crashAt = undefined;
+  seams.failAuditAppendFor = undefined;
+  seams.failUndo = undefined;
   runnerSeams.beforeCreate = undefined;
   runnerSeams.afterCreate = undefined;
   await agent.close();
@@ -1169,7 +1177,8 @@ describe("R237 (a): a record made by Find and acquire is stored under the projec
     const r = runner();
     const { added } = await r.add(viaFind.id, [LINE]);
     await settled(viaFind, added[0]!.id);
-    expect((await entryOf(viaFind, added[0]!.id))!).toMatchObject({ state: "failed", reason: { code: "not-allowed", by: "rules" } });
+    // N1: said as what it is, a missing legal basis (not the general refusal).
+    expect((await entryOf(viaFind, added[0]!.id))!).toMatchObject({ state: "failed", reason: { code: "no-legal-basis", by: "rules" } });
     expect(await sourcesOf(viaFind)).toEqual([]);
   });
 });
@@ -1438,5 +1447,158 @@ describe("R237 (g): minors", () => {
     expect(r.lockedNotChecked()).toBe(0);
     everything = true;
     expect(r.lockedNotChecked()).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// The last round (after the second review: N1–N4, Q8)
+
+describe("last round", () => {
+  it("N1: a refusal for another rule stays not-allowed, even in a project that also lacks the legal basis (the engine refused the capture)", async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project({ gov: GDPR(false) });
+    const release = gated.hold(parseReference(LINE)!.text);
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup");
+    // The way of acquiring is switched off after the lookup: the creation's capture is refused before its store.
+    const { sha256 } = await repo.getGovernance(p.id);
+    await repo.setGovernance(p.id, `${GDPR(false)}acquireMethods: [free_copy]\n`, { baseSha256: sha256 });
+    release();
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "failed", reason: { code: "not-allowed", by: "rules" } });
+    expect(await sourcesOf(p)).toEqual([]);
+  });
+
+  it("N2: a project whose writes wait for the library to be reopened: stoppedFor says recovery-pending", async () => {
+    const p = await project();
+    const id = newId();
+    await appendFindEntries(coreOf(), p.id, [{ id, projectId: p.id, typed: LINE, state: "looking-up", createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), attempts: 0 }], "add");
+    // A change that fails and cannot be undone leaves the project refusing changes until the library is reopened.
+    seams.failAuditAppendFor = p.id;
+    seams.failUndo = "append";
+    await expect(repo.createCollection(p.id, "Broken")).rejects.toThrow();
+    seams.failAuditAppendFor = undefined;
+    seams.failUndo = undefined;
+    expect(recoveryPendingProjects(repo)).toContain(p.id);
+    const r = runner();
+    r.resume(p.id);
+    await until(() => r.stoppedFor(p.id) !== null, "the runner to say so");
+    expect(r.stoppedFor(p.id)).toEqual({ code: "recovery-pending" });
+    expect(gated.sent).toEqual([]);
+  });
+
+  it("N2: an unforeseen error while resuming: stoppedFor says unexpected; resume tries again", async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    const id = newId();
+    await appendFindEntries(coreOf(), p.id, [{ id, projectId: p.id, typed: LINE, state: "looking-up", createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), attempts: 0 }], "add");
+    // The project's list of sources fails once in a way nothing names (an I/O fault, say).
+    const list = vi.spyOn(repo, "listSourceIds").mockImplementationOnce(() => {
+      throw new Error("/secret/path EIO");
+    });
+    const r = runner();
+    r.resume(p.id);
+    await until(() => r.stoppedFor(p.id) !== null, "the runner to say so");
+    expect(r.stoppedFor(p.id)).toEqual({ code: "unexpected" });
+    expect(notes.join("\n")).not.toContain("/secret/path");
+    expect(gated.sent).toEqual([]);
+    list.mockRestore();
+    r.resume(p.id);
+    expect(r.stoppedFor(p.id)).toBeNull();
+    await settled(p, id);
+    expect((await entryOf(p, id))!.state).toBe("record-complete");
+  });
+
+  it("N3: OpenAlex paused for the day and Crossref finding nothing: not Not found; looking-up until the pause ends, reason budget; then asked again", async () => {
+    know(LINE, cr(), "budget");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    const id = added[0]!.id;
+    await until(async () => (await entryOf(p, id))?.reason?.code === "budget" && timers.pending.size === 1, "the pause");
+    const e = (await entryOf(p, id))!;
+    expect(e.state).toBe("looking-up");
+    expect(e.attempts).toBe(0);
+    // The pause ends at the next 00:00 UTC (the fake clock is at 10:00).
+    expect(e.nextTryAt).toBe("2026-11-14T00:00:00.000Z");
+    // OpenAlex has its allowance back after midnight: it is asked again, and only now, with every source answered,
+    // may the entry say Not found (both find nothing).
+    know(LINE, cr(), OA_EMPTY);
+    const openAlexAsked = () => gated.sent.filter((x) => x.service === "openalex").length;
+    const before = openAlexAsked();
+    timers.advance(Date.parse("2026-11-14T00:00:00.000Z") - timers.now - 1);
+    await new Promise((res) => setTimeout(res, 30));
+    expect(openAlexAsked()).toBe(before);
+    timers.advance(1);
+    await settled(p, id);
+    expect(openAlexAsked()).toBe(before + 1);
+    expect((await entryOf(p, id))!.state).toBe("not-found");
+    expect((await entryOf(p, id))!.reason).toBeUndefined();
+  });
+
+  it("N3: a source that failed and the rest finding nothing follows the ordinary retries", async () => {
+    know(LINE, cr(), "fail");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await until(async () => (await entryOf(p, added[0]!.id))?.attempts === 1 && timers.pending.size === 1, "the retry");
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e.state).toBe("looking-up");
+    expect(e.nextTryAt).toBe(new Date(timers.now + FIND_RETRY_DELAYS_MS[0]!).toISOString());
+  });
+
+  it("N4: while the index cannot be trusted nothing starts and nothing is created; it goes on by itself once ready", async () => {
+    know(LINE, cr(ZORBLATT));
+    let ready = false;
+    const p = await project();
+    const r = runner({ indexReady: () => ready });
+    const { added } = await r.add(p.id, [LINE]);
+    await new Promise((res) => setTimeout(res, 100));
+    expect(gated.sent).toEqual([]);
+    expect(r.stoppedFor(p.id)).toEqual({ code: "index-not-ready" });
+    ready = true;
+    timers.advance(FIND_INDEX_WAIT_MS);
+    await settled(p, added[0]!.id);
+    expect(r.stoppedFor(p.id)).toBeNull();
+    expect(await sourcesOf(p)).toHaveLength(1);
+  });
+
+  it("N4: a creation held back while the index is not ready, then made once", async () => {
+    know(LINE, cr(ZORBLATT));
+    let ready = true;
+    const p = await project();
+    const release = gated.hold(parseReference(LINE)!.text, "openalex");
+    const r = runner({ indexReady: () => ready });
+    const { added } = await r.add(p.id, [LINE]);
+    await until(() => gated.sent.some((x) => x.service === "openalex"), "the lookup");
+    ready = false;
+    release();
+    await new Promise((res) => setTimeout(res, 100));
+    expect(await sourcesOf(p)).toEqual([]);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
+    await expect(r.choose(p.id, added[0]!.id, "w-anything")).rejects.toBeInstanceOf(FindIndexNotReadyError);
+    ready = true;
+    timers.advance(FIND_INDEX_WAIT_MS);
+    await settled(p, added[0]!.id);
+    await new Promise((res) => setTimeout(res, 50));
+    expect(await sourcesOf(p)).toHaveLength(1);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
+  });
+
+  it("Q8: at resume only source records made after the oldest waiting entry are read", async () => {
+    const p = await project();
+    // An older source (made now) and an entry made an hour later: the source cannot have been made for the entry.
+    await repo.createSource(p.id, draftOf({ ...ZORBLATT, doi: undefined }), [], { provenance: plainProvenance() });
+    const [older] = await sourcesOf(p);
+    const later = new Date(Date.now() + 3_600_000).toISOString();
+    await appendFindEntries(coreOf(), p.id, [{ id: newId(), projectId: p.id, typed: LINE, state: "looking-up", createdAt: later, updatedAt: later, attempts: 0 }], "add");
+    const read = vi.spyOn(repo, "getSourceRecord");
+    settings = { record: DEFAULT_SEARCH_SETTINGS.record.map((s) => ({ ...s, on: false })) };
+    const r = runner();
+    r.resume(p.id);
+    await until(async () => [...(await queue(p)).values()][0]!.state === "failed", "the entry to be worked on");
+    expect(read.mock.calls.map((c) => c[1])).not.toContain(older!.source.id);
+    read.mockRestore();
   });
 });

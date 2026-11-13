@@ -55,7 +55,7 @@ export type OfferLink = {
 };
 
 /** Task F5: why an entry could not go on (the sentences are `FIND_REASON_TEXT` in the shared package). */
-export type FindReasonCode = "not-allowed" | "switched-off" | "unreachable" | "locked" | "queue-full" | "budget" | "unexpected";
+export type FindReasonCode = "not-allowed" | "no-legal-basis" | "switched-off" | "unreachable" | "locked" | "queue-full" | "budget" | "unexpected";
 
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 
