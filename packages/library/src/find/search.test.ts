@@ -224,6 +224,76 @@ describe("searchWorks and decideMatch (the confidence rule)", () => {
     });
   });
 
+  describe("what counts as a number among the typed words (R231 c)", () => {
+    const marx = [{ given: "Karl", family: "Marx", role: "author" as const }];
+    const capital = cand({ id: "cap", title: "Capital", creators: marx, issued: "1867", identifiers: { isbn: ["9780000000125"] } });
+    const sociology = cand({ id: "soc", title: "Sociology", creators: [{ given: "Anthony", family: "Giddens", role: "author" }], issued: "1989", identifiers: { isbn: ["9780000000132"] } });
+    it("a digit ordinal or a bare roman numeral of two or more letters that the title does not hold asks", () => {
+      expect(decideMatch(ref("Giddens, Sociology 2nd"), [sociology]).kind).toBe("choose");
+      expect(decideMatch(ref("Giddens, Sociology 3rd"), [sociology]).kind).toBe("choose");
+      expect(decideMatch(ref("Marx, Capital II"), [capital]).kind).toBe("choose");
+      expect(decideMatch(ref("Marx, Capital xiv"), [capital]).kind).toBe("choose");
+    });
+    it("the same number in the title explains it", () => {
+      const v2 = cand({ id: "v2", title: "Capital Volume II", creators: marx, issued: "1885", identifiers: { isbn: ["9780000000149"] } });
+      expect(decideMatch(ref("Marx, Capital Volume II"), [v2])).toEqual({ kind: "sure", id: "v2" });
+      const ed2 = cand({ id: "e2", title: "Sociology 2nd edition", creators: sociology.creators, issued: "1993", identifiers: { isbn: ["9780000000156"] } });
+      expect(decideMatch(ref("Giddens, Sociology 2nd edition"), [ed2])).toEqual({ kind: "sure", id: "e2" });
+    });
+    it("single letters i, v and x are initials, not numbers; ordinal words are not numbers", () => {
+      for (const line of ["Marx, Capital x", "Marx, Capital v", "Marx, Capital i", "Giddens, Sociology second"]) {
+        const c = line.startsWith("Marx") ? capital : sociology;
+        expect([line, decideMatch(ref(line), [c]).kind]).toEqual([line, "sure"]);
+      }
+    });
+    it("a second 4-digit number that is not in the title and is not the year asks (M-b)", () => {
+      const cw = cand({ id: "cw", title: "Collected Works", creators: [{ given: "Ann", family: "Smith", role: "author" }], issued: "1950", identifiers: { isbn: ["9780000000163"] } });
+      expect(decideMatch(ref("Smith, Collected Works 1950"), [cw])).toEqual({ kind: "sure", id: "cw" });
+      expect(decideMatch(ref("Smith, Collected Works 1950 1960"), [cw]).kind).toBe("choose");
+    });
+  });
+
+  describe("a number in the subtitle that was not typed, on the main-title path (R231 a)", () => {
+    const s = [{ given: "Ann", family: "Smith", role: "author" as const }];
+    const v3 = cand({ id: "v3", title: "Collected Works: Volume 3", creators: s, issued: "1960", identifiers: { isbn: ["9780000000170"] } });
+    it("Smith, Collected Works against only Collected Works: Volume 3 asks; with the volume typed it is sure", () => {
+      expect(decideMatch(ref("Smith, Collected Works"), [v3])).toEqual({ kind: "choose", ids: ["v3"] });
+      expect(decideMatch(ref("Smith, Collected Works 3"), [v3])).toEqual({ kind: "sure", id: "v3" });
+      expect(decideMatch(ref("Smith, Collected Works volume 3"), [v3])).toEqual({ kind: "sure", id: "v3" });
+      expect(decideMatch(ref("Smith, Collected Works 4"), [v3]).kind).toBe("choose");
+    });
+    it("roman numerals after a volume word and digit ordinals in the subtitle count too", () => {
+      for (const sub of ["Band IV", "Tome II", "Tomo III", "Part ii", "Book XII", "Edition V", "2nd edition", "1950-1960"]) {
+        const c = { ...v3, title: `Collected Works: ${sub}` };
+        expect([sub, decideMatch(ref("Smith, Collected Works"), [c]).kind]).toEqual([sub, "choose"]);
+      }
+    });
+    it("Putnam, Bowling Alone is still sure: its subtitle holds no number", () => {
+      const p = [{ given: "Robert", family: "Putnam", role: "author" as const }];
+      const book = cand({ id: "ba", title: "Bowling Alone: The Collapse and Revival of American Community", creators: p, issued: "2000", identifiers: { isbn: ["9780000000071"] } });
+      expect(decideMatch(ref("Putnam, Bowling Alone"), [book])).toEqual({ kind: "sure", id: "ba" });
+    });
+  });
+
+  describe("a word beside the matched family name that is not that creator's name (R231 d)", () => {
+    const adam = cand({ id: "won", title: "The Wealth of Nations", creators: [{ given: "Adam", family: "Smith", role: "author" }], issued: "1776", identifiers: { isbn: ["9780000000187"] } });
+    const withJones = { ...adam, creators: [...adam.creators, { given: "Mary", family: "Jones", role: "author" as const }] };
+    it.each([
+      ["John Smith, The Wealth of Nations", adam, "choose"],
+      ["J. Smith, The Wealth of Nations", adam, "choose"],
+      ["Smith and Brown, The Wealth of Nations", adam, "choose"],
+      ["Adam Smith, The Wealth of Nations", adam, "sure"],
+      ["A. Smith, The Wealth of Nations", adam, "sure"],
+      ["Smith, A., The Wealth of Nations", adam, "sure"],
+      ["Smith and Jones, The Wealth of Nations", withJones, "sure"],
+      ["Smith & Jones, The Wealth of Nations", withJones, "sure"],
+      // An unexplained word away from the name is the ordinary one allowed word.
+      ["Smith, The Wealth of Nations, Glasgow", adam, "sure"],
+    ] as const)("%s", (line, c, kind) => {
+      expect(decideMatch(ref(line), [c]).kind).toBe(kind);
+    });
+  });
+
   describe("rules 5 and 6 each decide on their own (M8)", () => {
     it("rule 5 alone: an identical title by another author, 0.3 lower, still asks", () => {
       const a = cand({ id: "a", title: "Distinction", identifiers: { doi: "10.5555/a" } });
@@ -508,21 +578,25 @@ describe("OpenAlex's daily allowance", () => {
     expect(openAlexSearchPausedUntil(client())).toBeUndefined();
   });
 
-  it("a reset in the past, not a number, or more than 25 hours ahead pauses until 00:00 UTC, never longer", async () => {
+  it("the pause never runs past the next 00:00 UTC: the earlier of the reset and midnight (R231 b)", async () => {
+    // The clock is 10:00 UTC; midnight is 14 hours on.
+    expect(new Date(now).toISOString()).toBe("2026-11-13T10:00:00.000Z");
     const midnight = Date.parse("2026-11-14T00:00:00Z");
-    for (const reset of ["1000000000", "99999999", "not a time", "-5", "0", "1e3", "", "2026-11-20T00:00:00Z", String(25 * 3600 + 1)]) {
+    const until = async (reset: string) => {
       crossref("Bourdieu, Distinction", "crossref-distinction.json");
       answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), "{}", 429, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset });
       const http = client();
       await search("Bourdieu, Distinction", ctx(http));
-      expect(openAlexSearchPausedUntil(http)).toBe(midnight);
-    }
-    // 25 hours exactly is believed.
-    crossref("Bourdieu, Distinction", "crossref-distinction.json");
-    answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), "{}", 429, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(25 * 3600) });
-    const http = client();
-    await search("Bourdieu, Distinction", ctx(http));
-    expect(openAlexSearchPausedUntil(http)).toBe(now + 25 * 3_600_000);
+      await rm(join(tmp, "Lib"), { recursive: true, force: true });
+      return openAlexSearchPausedUntil(http);
+    };
+    // A reset after midnight (90,000 s = 25 h, 20 h, an epoch next year): midnight.
+    for (const reset of ["90000", String(20 * 3600), "1830000000", String(Date.parse("2026-11-14T06:00:00Z"))]) expect(await until(reset)).toBe(midnight);
+    // In the past, not a number, or missing: midnight.
+    for (const reset of ["1000000000", "not a time", "-5", "0", "1e3", "", "2026-11-14T06:00:00Z"]) expect(await until(reset)).toBe(midnight);
+    // A reset before midnight is kept.
+    expect(await until("3600")).toBe(now + 3_600_000);
+    expect(await until(String(Math.floor(Date.parse("2026-11-13T20:00:00Z") / 1000)))).toBe(Date.parse("2026-11-13T20:00:00Z"));
   });
 
   it("only a 429 that positively shows the daily allowance spent pauses (M1)", async () => {

@@ -16,7 +16,7 @@
  *
  * OpenAlex's daily allowance: a 429 that positively shows the budget spent (isOpenAlexBudgetSpent)
  * is not retried; OpenAlex searches through that same HttpClient pause until X-RateLimit-Reset
- * (at most 25 h ahead, else 00:00 UTC), with the note "openalex-budget". The pause is kept
+ * (never past the next 00:00 UTC), with the note "openalex-budget". The pause is kept
  * in `budgetPause`, a WeakMap keyed by the HttpClient, so it lasts as long as the client does and
  * no longer. An ordinary 429 is retried by the client as before and pauses nothing.
  */
@@ -49,9 +49,6 @@ const ISBN_MAX = 20;
 const DOI_MAX = 300;
 const DOI_RE = /^10\.\d{4,9}\/\S+$/u;
 const SEARCH_TTL_DAYS = 7;
-const HOUR_MS = 3_600_000;
-/** A reset further away than this is not believed (00:00 UTC is used instead). */
-const MAX_PAUSE_MS = 25 * HOUR_MS;
 
 /** Typed words that need no explaining (rule 3). */
 const STOP_WORDS: ReadonlySet<string> = new Set(["and", "et", "al", "by", "the", "of", "in"]);
@@ -91,24 +88,24 @@ const SHORT_RETRY_MS = 60_000;
  *  (b) X-RateLimit-Remaining is exactly the number 0 AND there is no Retry-After of 60 s or less.
  * Every other 429 is ordinary: the client retries it as before, and nothing is paused.
  */
-export function isOpenAlexBudgetSpent(a: RateLimitAnswer): boolean {
+export function isOpenAlexBudgetSpent(a: RateLimitAnswer, now: number = Date.now()): boolean {
   if (BUDGET_WORD.test(a.body) && SPENT_WORD.test(a.body)) return true;
   if (a.remaining !== 0) return false;
-  const retry = retryAfterMs(a.retryAfter, Date.now());
+  const retry = retryAfterMs(a.retryAfter, now);
   return retry === undefined || retry > SHORT_RETRY_MS;
 }
 
 /**
- * When the allowance comes back: X-RateLimit-Reset (whole seconds from now; epoch seconds from
- * 1e9; epoch ms from 1e12) when that lies after now and at most 25 hours ahead; otherwise (in the
- * past, not a number, absent, or further away) 00:00 UTC next, never longer.
+ * When the allowance comes back (R231 b): the EARLIER of X-RateLimit-Reset (whole seconds from
+ * now; epoch seconds from 1e9; epoch ms from 1e12) and the next 00:00 UTC. A reset in the past,
+ * not a number, or missing gives the next 00:00 UTC. The pause never runs past that midnight.
  */
 function budgetResetAt(reset: number | undefined, now: number): number {
   const d = new Date(now);
   const midnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
   if (reset === undefined) return midnight;
   const t = reset >= 1e12 ? reset : reset >= 1e9 ? reset * 1000 : now + reset * 1000;
-  return t <= now || t > now + MAX_PAUSE_MS ? midnight : t;
+  return t <= now ? midnight : Math.min(t, midnight);
 }
 
 const nowOf = (ctx: LookupContext) => (ctx.clock?.() ?? new Date()).getTime();
@@ -315,7 +312,7 @@ async function askOpenAlex(ref: Reference, ctx: LookupContext): Promise<Asked> {
     results = await fetchItems(
       ctx,
       openAlexSearchUrl(ref.text),
-      { cacheKey: `find:openalex:works:${ref.text}`, ttlDays: SEARCH_TTL_DAYS, sensitive: isSensitive(ctx), final429: isOpenAlexBudgetSpent },
+      { cacheKey: `find:openalex:works:${ref.text}`, ttlDays: SEARCH_TTL_DAYS, sensitive: isSensitive(ctx), final429: (a) => isOpenAlexBudgetSpent(a, nowOf(ctx)) },
       openAlexResults,
     );
   } catch (e) {
@@ -442,6 +439,58 @@ interface Prepared {
   wordCount: Map<string, number>;
   /** The typed runs of scripts written without spaces. */
   runs: string[];
+  /** Each typed word that is a number (see numberValue), with its value. */
+  numbers: Array<{ word: string; value: number }>;
+}
+
+/** After one of these, a roman numeral (of any length) is a number. */
+const VOLUME_WORDS: ReadonlySet<string> = new Set(["volume", "vol", "part", "book", "edition", "ed", "band", "tome", "tomo"]);
+const ROMAN = /^[ivxlcdm]{1,15}$/u;
+/** Roman numerals that are numbers wherever they stand: two or more letters, ii to xx (never i, v, x: initials and names). */
+const BARE_ROMAN: ReadonlySet<string> = new Set(["ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii", "xiii", "xiv", "xv", "xvi", "xvii", "xviii", "xix", "xx"]);
+
+/** A well-formed roman numeral's value, or undefined. */
+function romanValue(s: string): number | undefined {
+  const v: Record<string, number> = { i: 1, v: 5, x: 10, l: 50, c: 100, d: 500, m: 1000 };
+  let total = 0;
+  for (let i = 0; i < s.length; i++) {
+    const a = v[s[i]!]!;
+    const b = i + 1 < s.length ? v[s[i + 1]!]! : 0;
+    total += a < b ? -a : a;
+  }
+  // Re-encode to refuse ill-formed numerals ("iiii", "vv", "ic").
+  const parts: Array<[number, string]> = [[1000, "m"], [900, "cm"], [500, "d"], [400, "cd"], [100, "c"], [90, "xc"], [50, "l"], [40, "xl"], [10, "x"], [9, "ix"], [5, "v"], [4, "iv"], [1, "i"]];
+  let n = total;
+  let out = "";
+  for (const [val, sym] of parts) while (n >= val) ((out += sym), (n -= val));
+  return total > 0 && out === s ? total : undefined;
+}
+
+/**
+ * A word's value as a number (R228 c, R231 c), or undefined: digits; a digit ordinal ("2nd",
+ * "3rd", "1st", "4th"); a bare roman numeral ii–xx; or any roman numeral right after a volume
+ * word (volume, vol, part, book, edition, ed, band, tome, tomo). Ordinal words ("second") are not.
+ */
+function numberValue(word: string, prev: string | undefined): number | undefined {
+  if (/^\d{1,12}$/u.test(word)) return Number(word);
+  const o = /^(\d{1,12})(?:st|nd|rd|th)$/u.exec(word);
+  if (o) return Number(o[1]);
+  if (BARE_ROMAN.has(word)) return romanValue(word);
+  if (prev !== undefined && VOLUME_WORDS.has(prev) && ROMAN.test(word)) return romanValue(word);
+  return undefined;
+}
+
+/** The numbers among a text's words, each with the word it was read from. */
+function numbersIn(segments: Segment[]): Array<{ word: string; value: number }> {
+  const out: Array<{ word: string; value: number }> = [];
+  for (let k = 0; k < segments.length; k++) {
+    const seg = segments[k]!;
+    if (!("word" in seg)) continue;
+    const prev = segments[k - 1];
+    const value = numberValue(seg.word, prev && "word" in prev ? prev.word : undefined);
+    if (value !== undefined) out.push({ word: seg.word, value });
+  }
+  return out;
 }
 
 function prepare(ref: Reference): Prepared {
@@ -453,7 +502,7 @@ function prepare(ref: Reference): Prepared {
     if ("word" in s) wordCount.set(s.word, (wordCount.get(s.word) ?? 0) + 1);
     else runs.push(s.chars.join(""));
   }
-  return { typed: new Set(ref.tokens), segments, ...(ref.year !== undefined ? { year: ref.year } : {}), wordCount, runs };
+  return { typed: new Set(ref.tokens), segments, ...(ref.year !== undefined ? { year: ref.year } : {}), wordCount, runs, numbers: numbersIn(segments) };
 }
 
 /** The title before its subtitle ("Distinction" of "Distinction: A Social Critique …"), or null. */
@@ -469,18 +518,25 @@ interface TitleInfo {
   mainTokens: string[] | null;
   /** The title's runs of scripts written without spaces, joined. */
   runs: string;
+  /** The values of the numbers in the whole title. */
+  numbers: Set<number>;
+  /** The values of the numbers in the part after the main title (empty without a subtitle). */
+  subtitleNumbers: Set<number>;
 }
 
 function titleInfo(c: WorkCandidate): TitleInfo {
   const full = cut(c.title, FIND_TITLE_MAX);
   const main = mainTitle(full);
   const segs = segmentsOf(full);
+  const subtitle = main ? full.slice(full.indexOf(main) + main.length) : "";
   return {
     full,
     main,
     fullTokens: [...new Set(segs.flatMap(segmentTokens))],
     mainTokens: main ? tokensOf(main) : null,
     runs: segs.flatMap((s) => ("chars" in s ? [s.chars.join("")] : [])).join(" "),
+    numbers: new Set(numbersIn(segs).map((n) => n.value)),
+    subtitleNumbers: new Set(subtitle ? numbersIn(segmentsOf(subtitle)).map((n) => n.value) : []),
   };
 }
 
@@ -563,20 +619,34 @@ export function scoreCandidate(ref: Reference, c: WorkCandidate): CandidateScore
 
 /** Words that contradict a title when typed beside it and left unexplained (R228 c). "un-" is not one. */
 const NEGATIONS: ReadonlySet<string> = new Set(["no", "not", "non", "without", "against", "anti"]);
-/** After one of these, a roman numeral is a number (R228 c). */
-const VOLUME_WORDS: ReadonlySet<string> = new Set(["volume", "vol", "part", "book", "edition", "ed"]);
-const ROMAN = /^[ivxlcdm]+$/u;
 
 /**
  * Rule 3: the typed tokens explained by none of the title, the creators' names, a 4-digit number
- * or the small words (`count`), and whether any of them is a contradiction (R228 c): a number
- * (digits, or a roman numeral right after volume, vol, part, book, edition or ed) or a negation.
+ * or the small words (`count`), and whether one of them is a contradiction:
+ *  - a negation (R228 c);
+ *  - a word standing directly beside a family name of the candidate's creators (only punctuation,
+ *    "&" or "and" between) that is not an initial of the given name of a creator with that family
+ *    name (R231 d): it reads as another person ("John Smith" for Adam Smith). Given names and
+ *    other creators' names are explained words, so they never reach this test.
+ * Typed numbers are judged separately (see isSure), by their value.
  */
 function unexplained(p: Prepared, c: WorkCandidate, t: TitleInfo): { count: number; contradiction: boolean } {
   const known = new Set<string>([...t.fullTokens, ...STOP_WORDS]);
+  const byFamily = new Map<string, Creator[]>();
   for (const person of creatorsOf(c)) {
     for (const n of [person.family, person.given, person.literal]) if (n) for (const tok of tokensOf(cut(n, FIND_NAME_MAX))) known.add(tok);
+    if (person.family) {
+      for (const tok of tokensOf(cut(person.family, FIND_NAME_MAX))) {
+        if (PARTICLES.has(tok)) continue;
+        byFamily.set(tok, [...(byFamily.get(tok) ?? []), person]);
+      }
+    }
   }
+  const besideFamily = (k: number, dir: -1 | 1): Creator[] => {
+    let seg = p.segments[k + dir];
+    if (seg && "word" in seg && seg.word === "and") seg = p.segments[k + 2 * dir];
+    return seg && "word" in seg ? (byFamily.get(seg.word) ?? []) : [];
+  };
   let count = 0;
   let contradiction = false;
   for (let k = 0; k < p.segments.length; k++) {
@@ -584,9 +654,10 @@ function unexplained(p: Prepared, c: WorkCandidate, t: TitleInfo): { count: numb
     if ("word" in seg) {
       if (!known.has(seg.word) && !/^\d{4}$/u.test(seg.word)) {
         count++;
-        const prev = p.segments[k - 1];
-        const afterVolume = !!prev && "word" in prev && VOLUME_WORDS.has(prev.word);
-        if (/^\d+$/u.test(seg.word) || NEGATIONS.has(seg.word) || (afterVolume && ROMAN.test(seg.word))) contradiction = true;
+        if (NEGATIONS.has(seg.word)) contradiction = true;
+        const owners = [...besideFamily(k, -1), ...besideFamily(k, 1)];
+        const initial = Array.from(seg.word).length === 1 && owners.some((o) => tokensOf(cut(o.given ?? "", FIND_NAME_MAX)).some((g) => g.startsWith(seg.word)));
+        if (owners.length && !initial) contradiction = true;
       }
       continue;
     }
@@ -632,15 +703,22 @@ type Scored = { c: WorkCandidate; i: number; s: CandidateScore; t: TitleInfo };
  *  - rule 2 does not let one typed word be both a title word and the author (see creatorTyped);
  *  - a candidate given only by Elicit is never sure on its own.
  *
- * And the coordinator's rulings (R228):
- *  - (c) an unexplained typed word that is a number or a negation is never the one allowed;
- *  - (a) the main-title guard: when rule 1's 90% is reached only through the title before the
- *    subtitle (the whole title's cover is below 0.9), the candidate is sure only if, besides rules
- *    2–6, (1) no typed word is unexplained, and every typed number is a token of the whole title
- *    or is the typed year that matches (rule 4); (2) its type is "book" (the only book type of
- *    SourceType: Crossref's book, monograph, edited-book and reference-book all map to it); and
- *    (3) the main title has at least two words other than the small words, or else a year was
- *    typed and it matches (rule 4's ±1). Otherwise "choose", with that candidate first.
+ * And the coordinator's rulings (R228, R231). Contradictions, on every path:
+ *  - an unexplained typed negation (no, not, non, without, against, anti) asks;
+ *  - a typed number (digits; a digit ordinal such as "2nd"; a bare roman numeral ii–xx; any roman
+ *    numeral right after volume, vol, part, book, edition, ed, band, tome or tomo) asks unless the
+ *    candidate's title holds a number of the same value, or it is the typed year and rule 4 holds;
+ *  - an unexplained typed word directly beside a matched family name that is not an initial of
+ *    that creator's given name asks (see unexplained).
+ * The main-title guard: when rule 1's 90% is reached only through the title before the subtitle
+ * (the whole title's cover is below 0.9), the candidate is sure only if, besides rules 2–6,
+ *  (1) no typed word is unexplained;
+ *  (2) its type is "book" (the only book type of SourceType: Crossref's book, monograph,
+ *      edited-book and reference-book, and OpenAlex's book, all map to it);
+ *  (3) the main title has at least two words other than the small words, or else a year was typed
+ *      and it matches (rule 4's ±1);
+ *  (4) every number in the subtitle (as counted above) has the same value as a typed number.
+ * Otherwise "choose", with that candidate first.
  */
 const BOOK_TYPES: ReadonlySet<string> = new Set(["book"]);
 
@@ -651,18 +729,19 @@ function isSure(p: Prepared, best: Scored, all: Scored[]): boolean {
   const byMainTitleOnly = coverOf(t.fullTokens, p.typed) < 0.9;
   if (!s.creator) return false; // 2
   const u = unexplained(p, c, t);
-  if (u.contradiction) return false; // R228 c
+  if (u.contradiction) return false; // negations, a word beside the name
+  for (const n of p.numbers) {
+    const isTheYear = p.year !== undefined && n.value === p.year && s.year;
+    if (!t.numbers.has(n.value) && !isTheYear) return false; // a typed number the title does not hold
+  }
   if (u.count > (byMainTitleOnly ? 0 : 1)) return false; // 3, and guard (1)
   if (!s.year) return false; // 4
   if (byMainTitleOnly) {
     if (!BOOK_TYPES.has(c.type)) return false; // guard (2)
-    for (const seg of p.segments) {
-      if (!("word" in seg) || !/^\d+$/u.test(seg.word)) continue;
-      const isItsYear = p.year !== undefined && Number(seg.word) === p.year && s.year;
-      if (!t.fullTokens.includes(seg.word) && !isItsYear) return false; // guard (1), numbers
-    }
     const mainWords = (t.mainTokens ?? []).filter((x) => !STOP_WORDS.has(x)).length;
     if (mainWords < 2 && !(p.year !== undefined && s.year)) return false; // guard (3)
+    const typedValues = new Set(p.numbers.map((n) => n.value));
+    for (const v of t.subtitleNumbers) if (!typedValues.has(v)) return false; // guard (4): which volume?
   }
   for (const o of all) {
     if (o === best) continue;
