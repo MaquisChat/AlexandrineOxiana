@@ -24,9 +24,14 @@ const G1 = "a".repeat(32);
 const G2 = "b".repeat(32);
 const ZERO = { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 };
 
+/** The service's order of readings (R241): every summary and list built here draws the next number unless the test names one. */
+let seqN = 0;
+const nextSeq = () => ++seqN;
+
 function folder(o: Partial<Omit<WatchedFolderSummary, "counts">> & { counts?: Partial<WatchedFolderSummary["counts"]> } = {}): WatchedFolderSummary {
   const { counts, ...rest } = o;
   return {
+    seq: nextSeq(),
     id: "w1",
     label: "Fieldwork scans",
     recursive: false,
@@ -69,7 +74,7 @@ function useService(folders: WatchedFolderSummary[] | (() => JsonBodyType), opts
     http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "lib-1", name: "Thesis library", mode: opts.mode ?? "read-write" } })),
     http.get(url("/projects"), () => HttpResponse.json(PROJECTS)),
     http.get(url("/projects/p1/collections"), () => HttpResponse.json({ collections: [{ id: "c1", projectId: "p1", name: "Interviews" }] })),
-    http.get(url("/projects/p1/watched-folders"), () => HttpResponse.json(typeof folders === "function" ? folders() : { folders })),
+    http.get(url("/projects/p1/watched-folders"), () => HttpResponse.json(typeof folders === "function" ? { seq: nextSeq(), ...(folders() as object) } : { seq: nextSeq(), folders })),
   );
 }
 
@@ -89,7 +94,29 @@ function held<T>() {
 
 beforeEach(() => {
   fake.shell = fakeShell();
+  seqN = 0;
 });
+
+/** Every text the live region (or a dialog's) was given, in order: a repeat counts again (M2). */
+function heard(testId = "watch-live") {
+  const said: string[] = [];
+  const watch = (el: Element) => {
+    const mo = new MutationObserver(() => {
+      const t = el.textContent ?? "";
+      if (t) said.push(t);
+    });
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
+    return mo;
+  };
+  let mo: MutationObserver | undefined;
+  return {
+    said,
+    async start() {
+      mo = watch(await screen.findByTestId(testId));
+    },
+    stop: () => mo?.disconnect(),
+  };
+}
 afterEach(() => {
   fake.shell = undefined;
 });
@@ -136,7 +163,7 @@ describe("WatchedFolders", () => {
     expect(await screen.findByRole("region", { name: "Scans" })).toBeTruthy();
     expect(within(card("Scans")).getByText("Interviews")).toBeTruthy();
     expect(document.activeElement).toBe(add);
-    expect(status().textContent).toBe("Added. “Scans”: Watching.");
+    await waitFor(() => expect(status().textContent).toBe("Added. “Scans”: Watching."));
   });
 
   it("a double press sends one request: the chooser once, the grant once, the agreement once, the removal once", async () => {
@@ -226,11 +253,13 @@ describe("WatchedFolders", () => {
     const start = within(dialog).getByRole("button", { name: "Start watching" });
     await user.click(start);
     expect((await within(dialog).findByRole("alert")).textContent).toBe("This folder is not answering (Google Drive may be offline or signed out). Watching goes on when it does.");
+    // M11: the next useful act has focus.
+    const again = within(dialog).getByRole("button", { name: "Choose the folder again…" });
+    await waitFor(() => expect(document.activeElement).toBe(again));
     // The grant is spent: pressing again sends nothing.
     expect(start.hasAttribute("disabled") || start.getAttribute("aria-disabled") === "true").toBe(true);
     await user.click(start);
     expect(bodies).toHaveLength(1);
-    const again = within(dialog).getByRole("button", { name: "Choose the folder again…" });
     await user.click(again);
     await within(dialog).findByText("Scans 2");
     expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Start watching" }));
@@ -340,7 +369,7 @@ describe("WatchedFolders", () => {
     const dialog = await screen.findByRole("dialog");
     const confirm = within(dialog).getByRole("button", { name: "Download and import" });
     await user.click(confirm);
-    expect((await within(dialog).findByRole("alert")).textContent).toBe("The number of files not downloaded has changed. Look at the new size and choose again.");
+    expect((await within(dialog).findByRole("alert")).textContent).toBe("The number of files not downloaded has changed. Look at the new size and choose again. The folder now reports 4 files (4 MB) not downloaded.");
     // Asked again with the new size; nothing resent by itself.
     await within(dialog).findByRole("heading", { name: "Download 4 files (4 MB) to this Mac and import them? They stay downloaded afterwards." });
     expect(bodies).toHaveLength(1);
@@ -387,6 +416,30 @@ describe("WatchedFolders", () => {
     await user.click(within(c).getByRole("button", { name: "Continue downloading (3 MB) for “Fieldwork scans”" }));
     await waitFor(() => expect(bodies).toEqual([{ notDownloaded: "download", confirmBytes: 3_000_000 }]));
     await waitFor(() => expect(within(c).queryByRole("button", { name: /Continue downloading/ })).toBeNull());
+    expect(document.activeElement).toBe(within(c).getByRole("heading", { level: 3, name: "Fieldwork scans" }));
+  });
+
+  it("M4: Continue downloading answered 409 reads the list again and offers the new size", async () => {
+    let listed = folder({ reason: "held", counts: { notDownloaded: 2, notDownloadedBytes: 3_000_000 }, choices: { paused: false, notDownloaded: "download" }, downloadHeld: { files: 2, bytes: 3_000_000 } });
+    useService(() => ({ folders: [listed] }));
+    const user = userEvent.setup();
+    let gets = 0;
+    server.use(
+      http.get(url("/projects/p1/watched-folders"), () => {
+        gets++;
+        return HttpResponse.json({ seq: nextSeq(), folders: [listed] });
+      }),
+      http.patch(url("/projects/p1/watched-folders/w1"), () => {
+        listed = folder({ reason: "held", counts: { notDownloaded: 3, notDownloadedBytes: 5_000_000 }, choices: { paused: false, notDownloaded: "download" }, downloadHeld: { files: 3, bytes: 5_000_000 } });
+        return serviceError(409, "CONFLICT", "The number of files not downloaded has changed. Look at the new size and choose again.");
+      }),
+    );
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    await user.click(within(c).getByRole("button", { name: "Continue downloading (3 MB) for “Fieldwork scans”" }));
+    expect((await within(c).findByRole("alert")).textContent).toBe("The number of files not downloaded has changed. Look at the new size and choose again.");
+    await within(c).findByRole("button", { name: "Continue downloading (5 MB) for “Fieldwork scans”" });
+    expect(gets).toBe(2);
   });
 
   it("pause and resume show the service's answer", async () => {
@@ -402,10 +455,13 @@ describe("WatchedFolders", () => {
     );
     show();
     const c = await screen.findByRole("region", { name: "Fieldwork scans" });
-    await user.click(within(c).getByRole("button", { name: "Pause watching “Fieldwork scans”" }));
+    const pauseButton = within(c).getByRole("button", { name: "Pause watching “Fieldwork scans”" });
+    await user.click(pauseButton);
     const resume = await within(c).findByRole("button", { name: "Resume watching “Fieldwork scans”" });
     expect(within(c).getByText("Paused")).toBeTruthy();
-    expect(status().textContent).toBe("“Fieldwork scans”: Paused.");
+    // The same button, relabelled: focus stays on it.
+    expect(document.activeElement).toBe(resume);
+    await waitFor(() => expect(status().textContent).toBe("“Fieldwork scans”: Paused."));
     await user.click(resume);
     await within(c).findByRole("button", { name: "Pause watching “Fieldwork scans”" });
     expect(bodies).toEqual([{ paused: true }, { paused: false }]);
@@ -453,6 +509,20 @@ describe("WatchedFolders", () => {
     await within(c).findByText("Watching — looking through the folder…");
     await waitFor(() => expect(status().textContent).toBe("Tried again. “Fieldwork scans”: Watching — looking through the folder…"));
     expect(calls).toBe(1);
+    // Focus was moved to the other folder meanwhile, and stays there.
+    expect(document.activeElement).toBe(within(card("Other")).getByRole("button", { name: "Resume watching “Other”" }));
+  });
+
+  it("I2: after a successful Try again focus is on the folder's heading, and the result is said", async () => {
+    useService([folder({ state: "unreachable", reason: "The folder cannot be found." })]);
+    const user = userEvent.setup();
+    server.use(http.post(url("/projects/p1/watched-folders/w1/retry"), () => HttpResponse.json(folder())));
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    await user.click(within(c).getByRole("button", { name: "Try again for “Fieldwork scans”" }));
+    await within(c).findByText("Watching");
+    expect(document.activeElement).toBe(within(c).getByRole("heading", { level: 3, name: "Fieldwork scans" }));
+    await waitFor(() => expect(status().textContent).toBe("Tried again. “Fieldwork scans”: Watching."));
   });
 
   it("a folder not where it was chosen offers the chooser; a refused choice offers it again", async () => {
@@ -479,6 +549,8 @@ describe("WatchedFolders", () => {
     await user.click(again);
     await within(c).findByText("Watching");
     expect(bodies).toEqual([{ grantId: G1 }, { grantId: G2 }]);
+    expect(document.activeElement).toBe(within(c).getByRole("heading", { level: 3, name: "Fieldwork scans" }));
+    await waitFor(() => expect(status().textContent).toBe("Folder chosen. “Fieldwork scans”: Watching."));
   });
 
   it("remove says nothing is removed from the library", async () => {
@@ -499,7 +571,7 @@ describe("WatchedFolders", () => {
     await user.click(within(dialog).getByRole("button", { name: "Stop watching" }));
     await waitFor(() => expect(screen.queryByRole("region", { name: "Fieldwork scans" })).toBeNull());
     expect(deleted).toBe(1);
-    expect(status().textContent).toBe("Stopped watching “Fieldwork scans”.");
+    await waitFor(() => expect(status().textContent).toBe("Stopped watching “Fieldwork scans”."));
     expect(document.activeElement).toBe(screen.getByRole("heading", { level: 2, name: "Folders" }));
     // A late event for the removed folder does not bring it back.
     await waitFor(() => expect(events.open()).toBe(true));
@@ -588,6 +660,100 @@ describe("WatchedFolders", () => {
     await within(source).findByText("Ethnography at Work");
   });
 
+  it("M10: closing the source after its list was hidden puts focus on the folder's heading", async () => {
+    useService([folder({ counts: { gone: 1 } })]);
+    const user = userEvent.setup();
+    server.use(
+      http.get(url("/projects/p1/watched-folders/w1/files"), () =>
+        HttpResponse.json({ total: 1, items: [{ file: "gone.pdf", kind: "gone", reason: "The file is no longer in the watched folder. The library's copy is unchanged.", sourceId: "s1" }] }),
+      ),
+      http.get(url("/projects/p1/sources/s1"), () => HttpResponse.json(SOURCE_FILE)),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+    );
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    const toggle = within(c).getByRole("button", { name: "Show files that did not come in for “Fieldwork scans”" });
+    await user.click(toggle);
+    await user.click(await within(c).findByRole("button", { name: "Open the source of “gone.pdf”" }));
+    const source = await screen.findByRole("region", { name: "Source" });
+    await within(source).findByText("Ethnography at Work");
+    await user.click(toggle);
+    await user.click(within(source).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Source" })).toBeNull());
+    expect(document.activeElement).toBe(within(c).getByRole("heading", { level: 3, name: "Fieldwork scans" }));
+  });
+
+  it("M6: a double press on Show files, Show more and Choose the folder again… sends one request", async () => {
+    useService([folder({ counts: { notDownloaded: 400, notDownloadedBytes: 1000 } })]);
+    const user = userEvent.setup();
+    const asked: string[] = [];
+    server.use(
+      http.get(url("/projects/p1/watched-folders/w1/files"), ({ request }) => {
+        const offset = Number(new URL(request.url).searchParams.get("offset"));
+        asked.push(String(offset));
+        return HttpResponse.json({ total: 400, items: Array.from({ length: 200 }, (_, i) => ({ file: `f${offset + i}.pdf`, kind: "not-downloaded", reason: "Not downloaded.", bytes: 1 })) });
+      }),
+      http.post(url("/projects/p1/watched-folders"), () => serviceError(400, "VALIDATION", "That folder choice has expired. Choose the folder again.")),
+    );
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    const toggle = within(c).getByRole("button", { name: "Show files that did not come in for “Fieldwork scans”" });
+    // A toggle pressed twice opens and closes: one request at most, none left to answer.
+    act(() => {
+      toggle.click();
+      toggle.click();
+    });
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(asked).toHaveLength(1);
+    expect(within(c).queryByRole("list", { name: "Files of “Fieldwork scans”" })).toBeNull();
+    await user.click(toggle);
+    await within(c).findByText("Showing 200 of 400.");
+    const more = within(c).getByRole("button", { name: "Show more files of “Fieldwork scans”" });
+    act(() => {
+      more.click();
+      more.click();
+    });
+    await within(c).findByText("Showing 400 of 400.");
+    expect(asked).toEqual(["0", "0", "200"]);
+
+    // Choose the folder again…, twice at once: one chooser.
+    const chooser = held<{ grantId: string; name: string } | null>();
+    fake.shell!.pickWatchFolder.mockResolvedValueOnce({ grantId: G1, name: "Scans" }).mockReturnValueOnce(chooser.p);
+    await user.click(screen.getByRole("button", { name: "Add a folder…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add a watched folder" });
+    await user.click(within(dialog).getByRole("button", { name: "Start watching" }));
+    const again = await within(dialog).findByRole("button", { name: "Choose the folder again…" });
+    act(() => {
+      again.click();
+      again.click();
+    });
+    chooser.release(null);
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(fake.shell!.pickWatchFolder).toHaveBeenCalledTimes(2);
+  });
+
+  it("M9: a list that changes between pages shows no entry twice and says so", async () => {
+    useService([folder({ counts: { notDownloaded: 300, notDownloadedBytes: 1000 } })]);
+    const user = userEvent.setup();
+    server.use(
+      http.get(url("/projects/p1/watched-folders/w1/files"), ({ request }) => {
+        const offset = Number(new URL(request.url).searchParams.get("offset"));
+        // A file came in between the pages: everything after it moved by one.
+        const start = offset === 0 ? 0 : offset - 1;
+        const total = offset === 0 ? 300 : 301;
+        const n = Math.min(200, total - offset);
+        return HttpResponse.json({ total, items: Array.from({ length: n }, (_, i) => ({ file: `f${String(start + i).padStart(3, "0")}.pdf`, kind: "not-downloaded", reason: "Not downloaded.", bytes: 1 })) });
+      }),
+    );
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    await user.click(within(c).getByRole("button", { name: "Show files that did not come in for “Fieldwork scans”" }));
+    await within(c).findByText("Showing 200 of 300.");
+    await user.click(within(c).getByRole("button", { name: "Show more files of “Fieldwork scans”" }));
+    await within(c).findByText(/The list changed while it was being read/);
+    expect(within(c).getAllByText("f199.pdf")).toHaveLength(1);
+  });
+
   it("each dialog keeps focus on open, Tab, Shift+Tab and close", async () => {
     useService([folder({ counts: { notDownloaded: 2, notDownloadedBytes: 5000 } })]);
     const user = userEvent.setup();
@@ -660,47 +826,178 @@ describe("WatchedFolders", () => {
     await act(async () => events.push("watch.status", { projectId: "p2", folder: folder({ state: "unreachable" }) }));
     await act(async () => events.push("watch.status", { projectId: "p1", folder: folder({ state: "unreachable", reason: "The folder cannot be found.", counts: { cameIn: 3 } }) }));
     await within(card()).findByText("Cannot be reached");
-    expect(status().textContent).toBe("“Fieldwork scans”: Cannot be reached.");
+    await waitFor(() => expect(status().textContent).toBe("“Fieldwork scans”: Cannot be reached."));
     await act(async () => events.push("watch.status", { projectId: "p1", folder: folder({ state: "unreachable", reason: "The folder cannot be found.", counts: { cameIn: 4 } }) }));
     await within(card()).findByText("4 files came in");
     expect(status().textContent).toBe("“Fieldwork scans”: Cannot be reached.");
   });
 
-  it("a late answer does not overwrite a newer status event", async () => {
-    let lists = 0;
-    const relist = held<void>();
-    useService(() => {
-      lists++;
-      return { folders: [folder({ counts: { cameIn: lists === 1 ? 1 : 6 } })] };
-    });
+  it("R241: a list in flight does not replace a newer answer (folder B's radio)", async () => {
+    const A = (o: Parameters<typeof folder>[0] = {}) => folder({ id: "w1", label: "A", ...o });
+    const B = (o: Parameters<typeof folder>[0] = {}) => folder({ id: "w2", label: "B", ...o });
+    const held1 = { downloadHeld: { files: 2, bytes: 3_000_000 }, counts: { notDownloaded: 2, notDownloadedBytes: 3_000_000 }, choices: { paused: false, notDownloaded: "download" as const } };
+    const dl = { counts: { notDownloaded: 1, notDownloadedBytes: 10 }, choices: { paused: false, notDownloaded: "download" as const } };
+    useService([]);
     const user = userEvent.setup();
-    const answer = held<void>();
+    const later = held<void>();
+    let gets = 0;
     server.use(
       http.get(url("/projects/p1/watched-folders"), async () => {
-        lists++;
-        if (lists > 1) await relist.p;
-        return HttpResponse.json({ folders: [folder({ state: lists === 1 ? "watching" : "paused", choices: { paused: lists > 1, notDownloaded: "leave" }, counts: { cameIn: lists === 1 ? 1 : 6 } })] });
+        gets++;
+        // Read now (before B's change below), answered later.
+        const body = { seq: nextSeq(), folders: [A(held1), B(dl)] };
+        if (gets > 1) await later.p;
+        return HttpResponse.json(body);
+      }),
+      http.patch(url("/projects/p1/watched-folders/w1"), () => serviceError(409, "CONFLICT", "The number of files not downloaded has changed. Look at the new size and choose again.")),
+      http.patch(url("/projects/p1/watched-folders/w2"), () => HttpResponse.json(B({ counts: { notDownloaded: 1, notDownloadedBytes: 10 } }))),
+    );
+    show();
+    const a = await screen.findByRole("region", { name: "A" });
+    const b = card("B");
+    // A 409 on A reads the list again (M4): that list is held.
+    await user.click(within(a).getByRole("button", { name: "Continue downloading (3 MB) for “A”" }));
+    await waitFor(() => expect(gets).toBe(2));
+    const leave = within(b).getByRole("radio", { name: "Leave them until I download them" }) as HTMLInputElement;
+    await user.click(leave);
+    await waitFor(() => expect(leave.checked).toBe(true));
+    later.release();
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(leave.checked).toBe(true);
+  });
+
+  it("R241: an older event arriving during an act or after its answer never overrides the answer; the result is said from the answer", async () => {
+    useService([folder()]);
+    const user = userEvent.setup();
+    const answer = held<void>();
+    let gets = 0;
+    server.use(
+      http.get(url("/projects/p1/watched-folders"), () => {
+        gets++;
+        return HttpResponse.json({ seq: 2, folders: [folder({ seq: 1, counts: { cameIn: 1 } })] });
       }),
       http.patch(url("/projects/p1/watched-folders/w1"), async () => {
         await answer.p;
-        // Built before the event below: an older view.
-        return HttpResponse.json(folder({ state: "paused", choices: { paused: true, notDownloaded: "leave" }, counts: { cameIn: 4 } }));
+        return HttpResponse.json(folder({ seq: 20, state: "paused", choices: { paused: true, notDownloaded: "leave" }, counts: { cameIn: 4 } }));
       }),
     );
     show();
     const c = await screen.findByRole("region", { name: "Fieldwork scans" });
     await within(c).findByText("1 file came in");
     await waitFor(() => expect(events.open()).toBe(true));
+    const ear = heard();
+    await ear.start();
     await user.click(within(c).getByRole("button", { name: "Pause watching “Fieldwork scans”" }));
-    await act(async () => events.push("watch.status", { projectId: "p1", folder: folder({ state: "paused", choices: { paused: true, notDownloaded: "leave" }, counts: { cameIn: 5 } }) }));
+    // Read before the pause, arriving while it is out.
+    await act(async () => events.push("watch.status", { projectId: "p1", folder: folder({ seq: 10, counts: { cameIn: 5 } }) }));
     await within(c).findByText("5 files came in");
     answer.release();
-    // The answer arrived after a newer event: it does not overwrite it; the list is asked for again.
-    await waitFor(() => expect(lists).toBe(2));
-    expect(within(c).getByText("5 files came in")).toBeTruthy();
-    expect(within(c).queryByText("4 files came in")).toBeNull();
-    relist.release();
-    await within(c).findByText("6 files came in");
+    await within(c).findByText("4 files came in");
+    expect(within(c).getByText("Paused")).toBeTruthy();
+    // Read before the pause, arriving after its answer.
+    await act(async () => events.push("watch.status", { projectId: "p1", folder: folder({ seq: 15, counts: { cameIn: 6 } }) }));
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(within(c).getByText("4 files came in")).toBeTruthy();
+    expect(within(c).getByText("Paused")).toBeTruthy();
+    // A later reading is taken.
+    await act(async () => events.push("watch.status", { projectId: "p1", folder: folder({ seq: 25, state: "paused", choices: { paused: true, notDownloaded: "leave" }, counts: { cameIn: 7 } }) }));
+    await within(c).findByText("7 files came in");
+    expect(ear.said).toEqual(["“Fieldwork scans”: Paused."]);
+    // No re-reading of the list was needed.
+    expect(gets).toBe(1);
+  });
+
+  it("R241: a folder removed while a list is in flight does not come back; a list drops only folders it read later", async () => {
+    useService([]);
+    const user = userEvent.setup();
+    const later = held<void>();
+    let gets = 0;
+    const heldB = { downloadHeld: { files: 2, bytes: 3_000_000 }, counts: { notDownloaded: 2, notDownloadedBytes: 3_000_000 }, choices: { paused: false, notDownloaded: "download" as const } };
+    server.use(
+      http.get(url("/projects/p1/watched-folders"), async () => {
+        gets++;
+        if (gets === 1) return HttpResponse.json({ seq: 4, folders: [folder({ seq: 1, id: "w1", label: "A" }), folder({ seq: 2, id: "w2", label: "B", ...heldB }), folder({ seq: 3, id: "w4", label: "D" })] });
+        await later.p;
+        // Read at 1000: A and B still there; D gone; C (added at 2000) not yet.
+        return HttpResponse.json({ seq: 1000, folders: [folder({ seq: 1000, id: "w1", label: "A" }), folder({ seq: 1000, id: "w2", label: "B", ...heldB })] });
+      }),
+      http.patch(url("/projects/p1/watched-folders/w2"), () => serviceError(409, "CONFLICT", "The number of files not downloaded has changed. Look at the new size and choose again.")),
+      http.delete(url("/projects/p1/watched-folders/w1"), () => HttpResponse.json({ removed: true })),
+    );
+    show();
+    const a = await screen.findByRole("region", { name: "A" });
+    await waitFor(() => expect(events.open()).toBe(true));
+    await user.click(within(card("B")).getByRole("button", { name: "Continue downloading (3 MB) for “B”" }));
+    await waitFor(() => expect(gets).toBe(2));
+    await user.click(within(a).getByRole("button", { name: "Remove “A”…" }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Stop watching" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "A" })).toBeNull());
+    await act(async () => events.push("watch.status", { projectId: "p1", folder: folder({ seq: 2000, id: "w3", label: "C" }) }));
+    await screen.findByRole("region", { name: "C" });
+    later.release();
+    await waitFor(() => expect(screen.queryByRole("region", { name: "D" })).toBeNull());
+    expect(screen.queryByRole("region", { name: "A" })).toBeNull();
+    expect(screen.getByRole("region", { name: "C" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "B" })).toBeTruthy();
+  });
+
+  it("R241 (b): an event that takes away the busy Try again moves focus to the folder's heading, not the page", async () => {
+    useService([folder({ state: "unreachable", reason: "The folder cannot be found." })]);
+    const user = userEvent.setup();
+    const answer = held<void>();
+    server.use(
+      http.post(url("/projects/p1/watched-folders/w1/retry"), async () => {
+        await answer.p;
+        return HttpResponse.json(folder());
+      }),
+    );
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    await waitFor(() => expect(events.open()).toBe(true));
+    await user.click(within(c).getByRole("button", { name: "Try again for “Fieldwork scans”" }));
+    await act(async () => events.push("watch.status", { projectId: "p1", folder: folder() }));
+    await waitFor(() => expect(within(c).queryByRole("button", { name: /Try/ })).toBeNull());
+    expect(document.activeElement).toBe(within(c).getByRole("heading", { level: 3 }));
+    answer.release();
+    await waitFor(() => expect(status().textContent).toBe("Tried again. “Fieldwork scans”: Watching."));
+    expect(document.activeElement).toBe(within(c).getByRole("heading", { level: 3 }));
+  });
+
+  it("M2: the same result twice is said twice", async () => {
+    useService([folder({ state: "unreachable", reason: "The folder cannot be found." })]);
+    const user = userEvent.setup();
+    server.use(http.post(url("/projects/p1/watched-folders/w1/retry"), () => HttpResponse.json(folder({ state: "unreachable", reason: "The folder cannot be found." }))));
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    const ear = heard();
+    await ear.start();
+    const retry = within(c).getByRole("button", { name: "Try again for “Fieldwork scans”" });
+    await user.click(retry);
+    await waitFor(() => expect(ear.said).toHaveLength(1));
+    await waitFor(() => expect(retry.getAttribute("aria-disabled")).toBeNull());
+    await user.click(retry);
+    await waitFor(() => expect(ear.said).toEqual(["Tried again. “Fieldwork scans”: Cannot be reached.", "Tried again. “Fieldwork scans”: Cannot be reached."]));
+  });
+
+  it("M3: what is said while a dialog is open is said in the dialog, never inside the inert page; the act's result after it closes", async () => {
+    useService([folder()]);
+    const user = userEvent.setup();
+    fake.shell!.pickWatchFolder.mockResolvedValue({ grantId: G1, name: "Two" });
+    server.use(http.post(url("/projects/p1/watched-folders"), () => HttpResponse.json(folder({ id: "w2", label: "Two" }), { status: 201 })));
+    show();
+    await screen.findByRole("region", { name: "Fieldwork scans" });
+    await waitFor(() => expect(events.open()).toBe(true));
+    await user.click(screen.getByRole("button", { name: "Add a folder…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add a watched folder" });
+    await act(async () => events.push("watch.status", { projectId: "p1", folder: folder({ state: "unreachable" }) }));
+    const inDialog = await within(dialog).findByTestId("watch-dialog-live");
+    await waitFor(() => expect(inDialog.textContent).toBe("“Fieldwork scans”: Cannot be reached."));
+    expect(inDialog.closest("[inert]")).toBeNull();
+    expect(inDialog.getAttribute("aria-live")).toBe("polite");
+    await user.click(within(dialog).getByRole("button", { name: "Start watching" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(status().textContent).toBe("Added. “Two”: Watching."));
+    expect(status().closest("[inert]")).toBeNull();
   });
 
   it("a burst of status events leaves an open dialog and its focus alone", async () => {
@@ -710,6 +1007,13 @@ describe("WatchedFolders", () => {
     const c = await screen.findByRole("region", { name: "Fieldwork scans" });
     await waitFor(() => expect(events.open()).toBe(true));
     await user.click(within(c).getByRole("radio", { name: "Download and import them" }));
+    const bodies: unknown[] = [];
+    server.use(
+      http.patch(url("/projects/p1/watched-folders/w1"), async ({ request }) => {
+        bodies.push(await request.json());
+        return serviceError(409, "CONFLICT", "The number of files not downloaded has changed. Look at the new size and choose again.");
+      }),
+    );
     const dialog = await screen.findByRole("dialog", { name: "Download 3 files (3 MB) to this Mac and import them? They stay downloaded afterwards." });
     const cancel = within(dialog).getByRole("button", { name: "Cancel" });
     await user.tab();
@@ -721,15 +1025,78 @@ describe("WatchedFolders", () => {
     expect(screen.getByRole("dialog", { name: "Download 3 files (3 MB) to this Mac and import them? They stay downloaded afterwards." })).toBe(dialog);
     expect(document.activeElement).toBe(cancel);
     // The change is said, not slipped in.
-    expect(within(dialog).getByText("Since this opened, the folder's count has changed: 8 files (8 MB) are not downloaded now. “Download and import” agrees only to the size above; cancel and choose again for the new size.")).toBeTruthy();
+    const notice = within(dialog).getByText("Since this opened, the folder's count has changed: 8 files (8 MB) are not downloaded now. “Download and import” agrees only to the size above; cancel and choose again for the new size.");
+    expect(notice.closest("[aria-live='polite']")).toBeTruthy();
+    // I3: what is agreed is the size the dialog shows, whatever arrived meanwhile.
+    await user.click(within(dialog).getByRole("button", { name: "Download and import" }));
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0]).toEqual({ notDownloaded: "download", confirmBytes: 2_500_000 });
+  });
+
+  it("I3: Cancel and Escape send nothing", async () => {
+    useService([folder({ counts: { notDownloaded: 3, notDownloadedBytes: 2_500_000 } })]);
+    const user = userEvent.setup();
+    let patches = 0;
+    server.use(
+      http.patch(url("/projects/p1/watched-folders/w1"), () => {
+        patches++;
+        return HttpResponse.json(folder());
+      }),
+    );
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    const download = within(c).getByRole("radio", { name: "Download and import them" });
+    await user.click(download);
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await user.click(download);
+    await screen.findByRole("dialog");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(patches).toBe(0);
+  });
+
+  it("M5: no agreement is offered when there is no size to agree to", async () => {
+    useService([folder({ counts: { notDownloaded: 2, notDownloadedBytes: 0 } }), folder({ id: "w2", label: "Other" })]);
+    const user = userEvent.setup();
+    let patches = 0;
+    server.use(
+      http.patch(url("/projects/p1/watched-folders/:wid"), () => {
+        patches++;
+        return HttpResponse.json(folder());
+      }),
+    );
+    show();
+    const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+    const download = within(c).getByRole("radio", { name: "Download and import them" });
+    await user.click(download);
+    expect((await within(c).findByRole("alert")).textContent).toBe("The size of these files is not known until they are downloaded, so they are left for you to download yourself.");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(download);
+    const other = card("Other");
+    await user.click(within(other).getByRole("radio", { name: "Download and import them" }));
+    expect((await within(other).findByRole("alert")).textContent).toBe("There is nothing to download in this folder at the moment.");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(patches).toBe(0);
   });
 
   it("read-only disables every changing control with the reason", async () => {
-    useService([folder({ state: "unreachable", counts: { notDownloaded: 1, notDownloadedBytes: 10 } }), folder({ id: "w2", label: "Other", state: "not-set-up", place: null })], { mode: "read-only" });
+    useService(
+      [
+        folder({ state: "unreachable", counts: { notDownloaded: 1, notDownloadedBytes: 10 } }),
+        folder({ id: "w2", label: "Other", state: "not-set-up", place: null }),
+        folder({ id: "w3", label: "Third", state: "stopped", reason: "This library is open read-only, so no folder is watched." }),
+      ],
+      { mode: "read-only" },
+    );
     show();
     const c = await screen.findByRole("region", { name: "Fieldwork scans" });
     expect(await screen.findByText("This library is open read-only, so watched folders cannot be added, changed or removed here.")).toBeTruthy();
     expect(screen.getAllByText("This library is open read-only, so watched folders cannot be added, changed or removed here.")).toHaveLength(1);
+    // M7: the reason is visible once, not again on each folder.
+    expect(screen.getAllByText(/read-only/)).toHaveLength(1);
+    expect(within(card("Third")).getByText("Not watched")).toBeTruthy();
     const disabled = (el: HTMLElement) => (el as HTMLButtonElement).disabled;
     expect(disabled(screen.getByRole("button", { name: "Add a folder…" }))).toBe(true);
     expect(disabled(within(c).getByRole("button", { name: "Pause watching “Fieldwork scans”" }))).toBe(true);

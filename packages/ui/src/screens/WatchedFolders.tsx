@@ -6,13 +6,11 @@
  * single-use grant id and the folder's name, and the grant goes to the service once (a refused
  * request spends it too, R233 d, so a refusal offers the chooser again, never a second try).
  *
- * The service is the authority. What a folder shows is the summary the service last gave — from the
- * list, an answer to an act, or a `watch.status` event — whichever is newest. Events and answers
- * travel on different connections and carry no time of their own, so the screen orders them by what
- * it can see: every event is numbered as it arrives, and an answer (or a list) is applied to a folder
- * only if no event for that folder arrived after its request was sent. When one did, the event stays
- * (it may be newer than the answer) and the list is asked for once more, so the screen settles on
- * what the service says now; it never shows a guess.
+ * The service is the authority, and it gives the order (R241). Every summary — from the list, an
+ * answer to an act, or a `watch.status` event — carries the service's `seq`, a number drawn when it
+ * was read; the screen keeps, for each folder, the summary with the highest number it has seen,
+ * whatever arrived last. A folder a list does not hold goes only if the list is the later reading; a
+ * folder removed here never comes back. The result of an act is said from the act's own answer.
  *
  * Downloads happen only by an explicit agreement to a size the service reported (R219, R221): the
  * dialog names the number and size, sends exactly that number as `confirmBytes`, and on a 409 says
@@ -20,12 +18,15 @@
  * service reports, not the last click.
  *
  * One polite live region speaks only a change of a folder's state word, and the results of the
- * researcher's own acts once. Every name from a folder, a file, a collection or the service's reasons
+ * researcher's own acts once; each text is a new node, so the same result twice is said twice. While
+ * a dialog is open the page is inert, so what is said then goes to the dialog's own polite region,
+ * and the result of an act made in a dialog is said in the page's region once it has closed. When the
+ * control that had focus goes away (its state passed), focus goes to its folder's heading (R145). Every name from a folder, a file, a collection or the service's reasons
  * is outside text: through UserText (dir="auto"), never as markup. Dialogs move focus in, trap it,
  * restore it and make the background inert (DialogShell, R145).
  */
 import type { WatchedFolderFileItem, WatchedFolderSummary, WatchFolderState } from "@ao/shared";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type Ref } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type Ref } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { isProjectLocked, libraryApi, type Collection, type LibraryState, type ProjectSummary } from "../api/library";
 import { formatSize } from "../api/tools";
@@ -63,7 +64,15 @@ export const WATCH_TEXT = {
   noFiles: "No files to list.",
   unnamed: "Unnamed folder",
   chooserTitle: "Choose a folder to watch",
+  /** The service's own sentence (W7's WATCH_ROUTE_TEXT.nothing): said instead of offering an agreement to nothing (M5). */
+  nothingToDownload: "There is nothing to download in this folder at the moment.",
+  /** R221 b: files of unknown size are never fetched under an agreement. */
+  sizesUnknown: "The size of these files is not known until they are downloaded, so they are left for you to download yourself.",
+  listChanged: "The list changed while it was being read, so files may have moved between pages. Hide the list and show it again to read it afresh.",
 } as const;
+
+/** The service's reason for every folder of a read-only library (W7's WATCH_ROUTE_TEXT.readOnly): the screen says it once, above (M7). */
+const SERVICE_READ_ONLY = "This library is open read-only, so no folder is watched.";
 
 /** The most files the service keeps per kind (W2's WATCH_PROBLEMS_MAX): `total` is capped there, the counts are not (A9). */
 const KIND_CAP = 5000;
@@ -109,7 +118,25 @@ interface FileList {
   items: WatchedFolderFileItem[];
   total: number;
   loading: boolean;
+  /** Pages disagreed: the list changed while it was read (M9). */
+  changed: boolean;
   error?: string;
+}
+
+const fileKey = (it: WatchedFolderFileItem) => `${it.kind}\u0000${it.file}`;
+
+/** Something said: a new `n` is a new node, so the same text again is said again (M2). */
+interface Said {
+  text: string;
+  n: number;
+}
+
+function LiveRegion({ said, testId }: { said: Said; testId: string }) {
+  return (
+    <p className="ao-visually-hidden" role="status" aria-live="polite" data-testid={testId}>
+      {said.text && <span key={said.n}>{said.text}</span>}
+    </p>
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -146,7 +173,12 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   const [errors, setErrors] = useState<Record<string, string>>({});
   /** A choice of this computer's folder was refused: the button offers the chooser again. */
   const [chooseAgain, setChooseAgain] = useState<Record<string, boolean>>({});
-  const [lists, setLists] = useState<Record<string, FileList>>({});
+  const [lists, setListsState] = useState<Record<string, FileList>>({});
+  const listsRef = useRef<Record<string, FileList>>({});
+  const setLists = useCallback((fn: (m: Record<string, FileList>) => Record<string, FileList>) => {
+    listsRef.current = fn(listsRef.current);
+    setListsState(listsRef.current);
+  }, []);
   const [dialog, setDialogState] = useState<Dialog | null>(null);
   /** The dialog as of now (a second press before the next render sees the first one's change). */
   const dialogRef = useRef<Dialog | null>(null);
@@ -160,26 +192,34 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     pickingRef.current = v;
     setPickingState(v);
   };
-  const [openSource, setOpenSource] = useState<{ sourceId: string; from: HTMLElement | null } | null>(null);
-  const [live, setLive] = useState("");
+  const [openSource, setOpenSource] = useState<{ sourceId: string; folderId: string; from: HTMLElement | null } | null>(null);
+  /** The page's polite region and the open dialog's (M3); each text is a new node, so a repeat is said again (M2). */
+  const [live, setLive] = useState<Said>({ text: "", n: 0 });
+  const [dialogLive, setDialogLive] = useState<Said>({ text: "", n: 0 });
   const [focusFolders, setFocusFolders] = useState(0);
 
   const foldersRef = useRef<WatchedFolderSummary[]>([]);
   const alive = useRef(true);
   /** Moves on at a lock: anything answered for the time before is dropped. */
   const gen = useRef(0);
-  /** Events are numbered as they arrive; per folder, the number of the last one. */
-  const tick = useRef(0);
-  const eventTick = useRef(new Map<string, number>());
-  /** Folders removed here: a late event never brings one back. */
-  const removed = useRef(new Set<string>());
+  /**
+   * Folders known gone, with the reading that said so (R241): removed here (Infinity), or absent from a list with a
+   * higher number. A summary of such a folder is taken only when it is a later reading still.
+   */
+  const gone = useRef(new Map<string, number>());
   /** Folders with an act of the researcher's in flight: its result is said, not the state change. */
   const acting = useRef(new Map<string, number>());
   const busyRef = useRef<Record<string, Act>>({});
   const listGen = useRef(new Map<string, number>());
+  /** Lists being read (one request per press, M6). */
+  const filesBusy = useRef(new Set<string>());
+  const againBusy = useRef(false);
   const relisting = useRef<{ again: boolean; done: Promise<void> } | null>(null);
   const foldersHeading = useRef<HTMLHeadingElement>(null);
   const sourceRef = useRef<HTMLElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
+  /** The last control that had focus, and its folder: if it goes away, focus goes to that folder's heading (I2). */
+  const lastFocus = useRef<{ el: HTMLElement; folderId: string | undefined } | null>(null);
 
   useEffect(() => {
     alive.current = true;
@@ -188,7 +228,11 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     };
   }, []);
 
-  const say = useCallback((text: string) => setLive(text), []);
+  /** Said once, in the open dialog's region while one is open (the page is inert then), else in the page's. */
+  const say = useCallback((text: string) => {
+    if (dialogRef.current) setDialogLive((s) => ({ text, n: s.n + 1 }));
+    else setLive((s) => ({ text, n: s.n + 1 }));
+  }, []);
 
   /** The folders shown from now on; a changed state word is said (unless the researcher's own act will say its result). */
   const commit = useCallback(
@@ -206,22 +250,46 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     [say],
   );
 
-  const upsert = (list: WatchedFolderSummary[], s: WatchedFolderSummary) => (list.some((f) => f.id === s.id) ? list.map((f) => (f.id === s.id ? s : f)) : [...list, s]);
+  /**
+   * Summaries from the service, by its order (R241): a folder keeps the summary with the highest `seq` seen, however
+   * they arrive. With `listSeq` (a whole list): a folder the list does not hold goes only if the list is the later
+   * reading.
+   */
+  const take = useCallback(
+    (incoming: WatchedFolderSummary[], announce: boolean, listSeq?: number) => {
+      let next = [...foldersRef.current];
+      for (const s of incoming) {
+        if ((gone.current.get(s.id) ?? -Infinity) >= s.seq) continue;
+        const i = next.findIndex((f) => f.id === s.id);
+        if (i >= 0 && next[i]!.seq >= s.seq) continue;
+        gone.current.delete(s.id);
+        if (i >= 0) next[i] = s;
+        else next.push(s);
+      }
+      if (listSeq !== undefined) {
+        const held = new Set(incoming.map((f) => f.id));
+        next = next.filter((f) => {
+          if (held.has(f.id) || f.seq >= listSeq) return true;
+          gone.current.set(f.id, listSeq);
+          return false;
+        });
+      }
+      commit(next, announce);
+    },
+    [commit],
+  );
 
   const markLocked = useCallback(() => {
     gen.current++;
     setLocked(true);
     setDialog(null);
     setOpenSource(null);
-    setLists({});
+    setLists(() => ({}));
     foldersRef.current = [];
     setFolders(undefined);
-  }, [setDialog]);
+  }, [setDialog, setLists]);
 
-  /**
-   * The list, merged by the rule above: a folder whose last event arrived after the list was asked for
-   * keeps that event's summary; a folder the list no longer holds goes, unless such an event names it.
-   */
+  /** The list (at load, after a lost stream, an unlock, a 409 or a 404); one at a time, a second ask joins it. */
   const relist = useCallback(async (): Promise<void> => {
     if (relisting.current) {
       relisting.current.again = true;
@@ -234,16 +302,11 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     try {
       do {
         mark.again = false;
-        const sentAt = tick.current;
         try {
           const r = await api.list(projectId);
           if (!alive.current || g !== gen.current) return;
-          const cur = foldersRef.current;
-          const newer = (id: string) => (eventTick.current.get(id) ?? 0) > sentAt;
-          const next = r.folders.filter((f) => !removed.current.has(f.id)).map((f) => (newer(f.id) ? (cur.find((c) => c.id === f.id) ?? f) : f));
-          for (const c of cur) if (!next.some((f) => f.id === c.id) && newer(c.id)) next.push(c);
           setLoadError(undefined);
-          commit(next, true);
+          take(r.folders, true, r.seq);
         } catch (err) {
           if (!alive.current || g !== gen.current) return;
           if (isProjectLocked(err)) {
@@ -257,20 +320,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       if (relisting.current === mark) relisting.current = null;
       settle();
     }
-  }, [api, projectId, commit, markLocked]);
-
-  /** An answer to an act: applied unless an event for the folder arrived after the request was sent (then the list is asked for again). */
-  const applyAnswer = useCallback(
-    (s: WatchedFolderSummary, sentAt: number): WatchedFolderSummary => {
-      if ((eventTick.current.get(s.id) ?? 0) > sentAt) {
-        void relist();
-        return foldersRef.current.find((f) => f.id === s.id) ?? s;
-      }
-      commit(upsert(foldersRef.current, s), false);
-      return s;
-    },
-    [commit, relist],
-  );
+  }, [api, projectId, take, markLocked]);
 
   const refreshCollections = useCallback(() => {
     lib.collections.list(projectId).then(
@@ -313,10 +363,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
             continue;
           }
           const e = watchStatusOf(ev, projectId);
-          if (!e || removed.current.has(e.folder.id)) continue;
-          tick.current++;
-          eventTick.current.set(e.folder.id, tick.current);
-          commit(upsert(foldersRef.current, e.folder), true);
+          if (e) take([e.folder], true);
         }
       } catch {
         // the stream dropped: listen again shortly
@@ -328,7 +375,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       ac.abort();
       clearTimeout(retry);
     };
-  }, [client, projectId, commit, relist]);
+  }, [client, projectId, take, relist]);
 
   useEffect(() => {
     if (focusFolders > 0) foldersHeading.current?.focus();
@@ -336,6 +383,20 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   useEffect(() => {
     if (openSource) sourceRef.current?.focus();
   }, [openSource]);
+  // I2, M10: whenever the control that had focus has gone (its state passed, its list closed, its dialog's opener left),
+  // focus goes to its folder's heading, or to "Folders" when the folder itself has gone — never to the page.
+  useEffect(() => {
+    const lf = lastFocus.current;
+    const now = document.activeElement;
+    if (!lf || lf.el.isConnected || (now && now !== document.body && now.isConnected)) return;
+    const heading = lf.folderId ? mainRef.current?.querySelector<HTMLElement>(`[data-folder-heading="${CSS.escape(lf.folderId)}"]`) : null;
+    (heading ?? foldersHeading.current)?.focus();
+  });
+  const noteFocus = (e: FocusEvent<HTMLElement>) => {
+    const el = e.target as HTMLElement;
+    const holder = el.closest<HTMLElement>("[data-folder-id]");
+    lastFocus.current = { el, folderId: holder?.dataset.folderId };
+  };
 
   const setBusyFor = (id: string, act: Act | undefined) => {
     const next = { ...busyRef.current };
@@ -357,29 +418,32 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       return next;
     });
 
-  /** A refusal: locked → the unlock screen; read-only → said once at the top; gone → the list again. */
+  /** A refusal: locked → the unlock screen; read-only → said once at the top; gone or changed → the list again. */
   const refused = (err: unknown) => {
     if (isProjectLocked(err)) {
       markLocked();
       return true;
     }
     if (err instanceof ApiClientError && err.code === "READ_ONLY") setReadOnly(true);
-    if (err instanceof ApiClientError && err.status === 404) void relist();
+    if (err instanceof ApiClientError && (err.status === 404 || err.status === 409)) void relist();
     return false;
   };
 
-  /** One act on one folder: its button shows it is working and cannot be pressed twice; the rest of the screen stays usable. */
+  /**
+   * One act on one folder: its button shows it is working and cannot be pressed twice; the rest of the screen stays
+   * usable. The answer is taken by its number, and the result is said from the answer itself (R241).
+   */
   const run = async (f: WatchedFolderSummary, act: Act, call: () => Promise<WatchedFolderSummary>, result: (s: WatchedFolderSummary) => string, onRefused?: () => void) => {
     if (busyRef.current[f.id] && busyRef.current[f.id] !== act) return;
     setBusyFor(f.id, act);
     actingInc(f.id, 1);
     setErrorFor(f.id, undefined);
-    const sentAt = tick.current;
     const g = gen.current;
     try {
       const s = await call();
       if (!alive.current || g !== gen.current) return;
-      say(result(applyAnswer(s, sentAt)));
+      take([s], false);
+      say(result(s));
     } catch (err) {
       if (!alive.current || g !== gen.current || refused(err)) return;
       setErrorFor(f.id, sentenceOf(err, "That could not be done. Try again."));
@@ -404,7 +468,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     if (!canAct(f)) return;
     void run(f, "leave", () => api.patch(projectId, f.id, { notDownloaded: "leave" }), (s) => `“${labelOf(s)}”: files not downloaded to this Mac are left until you download them.`);
   };
-  /** "Continue downloading ({size})": the button's own size is the agreement (R219). */
+  /** "Continue downloading ({size})": the button's own size is the agreement (R219); a 409 reads the list again (M4). */
   const continueDownloading = (f: WatchedFolderSummary, held: { files: number; bytes: number }) => {
     if (!canAct(f)) return;
     void run(f, "continue", () => api.patch(projectId, f.id, { notDownloaded: "download", confirmBytes: held.bytes }), (s) => `Agreed to download ${files(held.files)} (${formatSize(held.bytes)}) for “${labelOf(s)}”.`);
@@ -451,6 +515,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     setPicking(false);
     if (!picked) return;
     refreshCollections();
+    setDialogLive({ text: "", n: 0 });
     setDialog({ kind: "add", grant: picked.grantId, name: picked.name, busy: false });
   };
   const addStart = async (o: { label: string; recursive: boolean; collectionId: string }) => {
@@ -461,14 +526,13 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     setDialog({ ...d, grant: null, busy: true, error: undefined });
     const label = o.label.trim();
     const body = { grantId, recursive: o.recursive, ...(label ? { label } : {}), ...(o.collectionId ? { collectionId: o.collectionId } : {}) };
-    const sentAt = tick.current;
     const g = gen.current;
     try {
       const s = await api.add(projectId, body);
       if (!alive.current || g !== gen.current) return;
-      const shown = applyAnswer(s, sentAt);
+      take([s], false);
       setDialog(null);
-      say(end(`Added. “${labelOf(shown)}”: ${stateLine(shown)}`));
+      say(end(`Added. “${labelOf(s)}”: ${stateLine(s)}`));
     } catch (err) {
       if (!alive.current || g !== gen.current || refused(err)) return;
       setDialog((cur) => (cur?.kind === "add" ? { ...cur, busy: false, error: sentenceOf(err, "The folder could not be added.") } : cur));
@@ -476,12 +540,15 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   };
   const addChooseAgain = async () => {
     const cur = dialogRef.current;
-    if (cur?.kind !== "add" || cur.busy || !shell) return;
+    if (cur?.kind !== "add" || cur.busy || !shell || againBusy.current) return;
+    againBusy.current = true;
     let picked: { grantId: string; name: string } | null = null;
     try {
       picked = await shell.pickWatchFolder(WATCH_TEXT.chooserTitle);
     } catch {
       picked = null;
+    } finally {
+      againBusy.current = false;
     }
     if (!alive.current || !picked) return;
     const p = picked;
@@ -491,29 +558,42 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   // ---- download, by an agreement to the size the service reported ----
   const openDownload = (f: WatchedFolderSummary) => {
     if (!canAct(f) || dialogRef.current) return;
+    // Nothing of a known size to agree to (M5; R221 b): no agreement is offered; said in plain words.
+    if (f.counts.notDownloadedBytes === 0) {
+      setErrorFor(f.id, f.counts.notDownloaded === 0 ? WATCH_TEXT.nothingToDownload : WATCH_TEXT.sizesUnknown);
+      return;
+    }
+    setErrorFor(f.id, undefined);
+    setDialogLive({ text: "", n: 0 });
     setDialog({ kind: "download", id: f.id, label: labelOf(f), files: f.counts.notDownloaded, bytes: f.counts.notDownloadedBytes, busy: false });
   };
   const agreeDownload = async () => {
     const d = dialogRef.current;
-    if (d?.kind !== "download" || d.busy || readOnly) return;
+    if (d?.kind !== "download" || d.busy || readOnly || d.bytes === 0) return;
     setDialog({ ...d, busy: true, error: undefined });
     actingInc(d.id, 1);
-    const sentAt = tick.current;
     const g = gen.current;
     try {
+      // Exactly the size the dialog shows (R219): never a number that arrived meanwhile.
       const s = await api.patch(projectId, d.id, { notDownloaded: "download", confirmBytes: d.bytes });
       if (!alive.current || g !== gen.current) return;
-      const shown = applyAnswer(s, sentAt);
+      take([s], false);
       setDialog(null);
-      say(`Agreed to download ${files(d.files)} (${formatSize(d.bytes)}) for “${labelOf(shown)}”.`);
+      say(`Agreed to download ${files(d.files)} (${formatSize(d.bytes)}) for “${labelOf(s)}”.`);
     } catch (err) {
-      if (!alive.current || g !== gen.current || refused(err)) return;
+      if (!alive.current || g !== gen.current || isProjectLocked(err)) {
+        if (isProjectLocked(err)) markLocked();
+        return;
+      }
+      if (err instanceof ApiClientError && err.code === "READ_ONLY") setReadOnly(true);
       const msg = sentenceOf(err, "The download could not be agreed.");
       // A 409 (the size changed, or nothing to download): the service's sentence, and the question again with the size it reports now.
-      if (err instanceof ApiClientError && err.status === 409) await relist();
+      const conflict = err instanceof ApiClientError && err.status === 409;
+      if (conflict || (err instanceof ApiClientError && err.status === 404)) await relist();
       if (!alive.current || g !== gen.current) return;
-      const now = foldersRef.current.find((f) => f.id === d.id);
-      setDialog((cur) => (cur?.kind === "download" && cur.id === d.id ? { ...cur, busy: false, error: msg, ...(now ? { files: now.counts.notDownloaded, bytes: now.counts.notDownloadedBytes } : {}) } : cur));
+      const now = conflict ? foldersRef.current.find((f) => f.id === d.id) : undefined;
+      const nowText = now ? ` The folder now reports ${files(now.counts.notDownloaded)}${now.counts.notDownloadedBytes > 0 ? ` (${formatSize(now.counts.notDownloadedBytes)})` : ""} not downloaded.` : "";
+      setDialog((cur) => (cur?.kind === "download" && cur.id === d.id ? { ...cur, busy: false, error: `${msg}${nowText}`, ...(now ? { files: now.counts.notDownloaded, bytes: now.counts.notDownloadedBytes } : {}) } : cur));
     } finally {
       actingInc(d.id, -1);
     }
@@ -522,6 +602,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   // ---- remove ----
   const openRemove = (f: WatchedFolderSummary) => {
     if (!canAct(f) || dialogRef.current) return;
+    setDialogLive({ text: "", n: 0 });
     setDialog({ kind: "remove", id: f.id, label: labelOf(f), busy: false });
   };
   const confirmRemove = async () => {
@@ -532,14 +613,15 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     try {
       await api.remove(projectId, d.id);
       if (!alive.current || g !== gen.current) return;
-      removed.current.add(d.id);
+      // Removed here: no summary of it is taken again, whatever its number (a late event or a list in flight).
+      gone.current.set(d.id, Infinity);
       listGen.current.set(d.id, (listGen.current.get(d.id) ?? 0) + 1);
       commit(
         foldersRef.current.filter((f) => f.id !== d.id),
         false,
       );
       setDialog(null);
-      if (openSource) setOpenSource(null);
+      if (openSource?.folderId === d.id) setOpenSource(null);
       say(`Stopped watching “${d.label}”.`);
       setFocusFolders((n) => n + 1);
     } catch (err) {
@@ -548,28 +630,47 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     }
   };
 
-  // ---- the files that did not come in, fetched when asked for ----
+  // ---- the files that did not come in, fetched when asked for; one request per press (M6) ----
   const fetchFiles = async (id: string, offset: number) => {
+    if (filesBusy.current.has(id)) return;
+    filesBusy.current.add(id);
     const n = (listGen.current.get(id) ?? 0) + 1;
     listGen.current.set(id, n);
     const g = gen.current;
-    setLists((m) => ({ ...m, [id]: { items: offset === 0 ? [] : (m[id]?.items ?? []), total: m[id]?.total ?? 0, loading: true } }));
+    setLists((m) => ({ ...m, [id]: { items: offset === 0 ? [] : (m[id]?.items ?? []), total: m[id]?.total ?? 0, loading: true, changed: offset === 0 ? false : !!m[id]?.changed } }));
     try {
       const r = await api.files(projectId, id, { offset, limit: PAGE });
       if (!alive.current || g !== gen.current || listGen.current.get(id) !== n) return;
-      setLists((m) => (m[id] ? { ...m, [id]: { items: offset === 0 ? r.items : [...m[id]!.items, ...r.items], total: r.total, loading: false } } : m));
+      setLists((m) => {
+        const cur = m[id];
+        if (!cur) return m;
+        if (offset === 0) return { ...m, [id]: { items: r.items, total: r.total, loading: false, changed: false } };
+        // The list can change between pages (M9): no entry twice, and the change is said.
+        const seen = new Set(cur.items.map(fileKey));
+        const fresh = r.items.filter((it) => !seen.has(fileKey(it)));
+        const changed = cur.changed || r.total !== cur.total || fresh.length !== r.items.length;
+        return { ...m, [id]: { items: [...cur.items, ...fresh], total: r.total, loading: false, changed } };
+      });
     } catch (err) {
       if (!alive.current || g !== gen.current || listGen.current.get(id) !== n || refused(err)) return;
       setLists((m) => (m[id] ? { ...m, [id]: { ...m[id]!, loading: false, error: sentenceOf(err, "The list could not be read.") } } : m));
+    } finally {
+      if (listGen.current.get(id) === n) filesBusy.current.delete(id);
     }
   };
   const toggleFiles = (id: string) => {
-    if (lists[id]) {
+    if (listsRef.current[id]) {
       listGen.current.set(id, (listGen.current.get(id) ?? 0) + 1);
+      filesBusy.current.delete(id);
       setLists(({ [id]: _gone, ...rest }) => rest);
       return;
     }
     void fetchFiles(id, 0);
+  };
+  const moreFiles = (id: string) => {
+    const cur = listsRef.current[id];
+    if (!cur || cur.loading) return;
+    void fetchFiles(id, cur.items.length);
   };
 
   // ---- the page ----
@@ -604,7 +705,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   const liveFolder = dialog && dialog.kind !== "add" ? folders?.find((f) => f.id === dialog.id) : undefined;
 
   return (
-    <main className="ao-page ao-watch" aria-labelledby={`${ids}-h`}>
+    <main ref={mainRef} className="ao-page ao-watch" aria-labelledby={`${ids}-h`} onFocus={noteFocus}>
       {heading}
       <p>{WATCH_TEXT.intro}</p>
       {readOnly && <p className="ao-watch__note">{WATCH_TEXT.readOnly}</p>}
@@ -617,9 +718,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       ) : (
         <p className="ao-watch__note">{WATCH_TEXT.needsApp}</p>
       )}
-      <p className="ao-visually-hidden" role="status" aria-live="polite" data-testid="watch-live">
-        {live}
-      </p>
+      <LiveRegion said={live} testId="watch-live" />
 
       <h2 id={`${ids}-folders`} ref={foldersHeading} tabIndex={-1}>
         Folders
@@ -649,13 +748,13 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
           onContinue={(held) => continueDownloading(f, held)}
           onRemove={() => openRemove(f)}
           onToggleFiles={() => toggleFiles(f.id)}
-          onMoreFiles={() => void fetchFiles(f.id, lists[f.id]?.items.length ?? 0)}
-          onOpenSource={(sourceId, from) => setOpenSource({ sourceId, from })}
+          onMoreFiles={() => moreFiles(f.id)}
+          onOpenSource={(sourceId, from) => setOpenSource({ sourceId, folderId: f.id, from })}
         />
       ))}
 
       {openSource && (
-        <section ref={sourceRef} tabIndex={-1} aria-label="Source" className="ao-watch__source">
+        <section ref={sourceRef} tabIndex={-1} aria-label="Source" className="ao-watch__source" data-folder-id={openSource.folderId}>
           <SourceDetail
             api={lib}
             projectId={projectId}
@@ -665,7 +764,8 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
             onClose={() => {
               const from = openSource.from;
               setOpenSource(null);
-              from?.focus();
+              // Back to the control that opened it; if that has gone, the effect above takes focus to the folder's heading (M10).
+              if (from?.isConnected) from.focus();
             }}
           />
         </section>
@@ -675,13 +775,14 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
         <AddDialog
           d={dialog}
           collections={collections}
+          live={dialogLive}
           onStart={(o) => void addStart(o)}
           onChooseAgain={() => void addChooseAgain()}
           onCancel={() => setDialog(null)}
         />
       )}
-      {dialog?.kind === "download" && <DownloadDialog d={dialog} live={liveFolder} onConfirm={() => void agreeDownload()} onCancel={() => setDialog(null)} />}
-      {dialog?.kind === "remove" && <RemoveDialog d={dialog} onConfirm={() => void confirmRemove()} onCancel={() => setDialog(null)} />}
+      {dialog?.kind === "download" && <DownloadDialog d={dialog} live={liveFolder} said={dialogLive} onConfirm={() => void agreeDownload()} onCancel={() => setDialog(null)} />}
+      {dialog?.kind === "remove" && <RemoveDialog d={dialog} said={dialogLive} onConfirm={() => void confirmRemove()} onCancel={() => setDialog(null)} />}
     </main>
   );
 }
@@ -746,8 +847,8 @@ function FolderCard(props: {
   const many = f.counts.notDownloaded > KIND_CAP || f.counts.didNotComeIn > KIND_CAP;
 
   return (
-    <section className="ao-card ao-watch__folder" aria-labelledby={`${id}-name`}>
-      <h3 id={`${id}-name`}>
+    <section className="ao-card ao-watch__folder" aria-labelledby={`${id}-name`} data-folder-id={f.id}>
+      <h3 id={`${id}-name`} tabIndex={-1} data-folder-heading={f.id}>
         <UserText>{label}</UserText>
       </h3>
       {f.label !== undefined && f.place && (
@@ -764,7 +865,7 @@ function FolderCard(props: {
       <p className="ao-watch__state">
         <strong>{stateLine(f)}</strong>
       </p>
-      {f.reason && (
+      {f.reason && !(readOnly && f.reason === SERVICE_READ_ONLY) && (
         <p>
           <UserText>{f.reason}</UserText>
         </p>
@@ -844,6 +945,7 @@ function FilesPanel({ label, list, many, onMore, onOpenSource }: { label: string
         </p>
       )}
       {many && <p>{WATCH_TEXT.firstOnly}</p>}
+      {list.changed && <p role="status">{WATCH_TEXT.listChanged}</p>}
       {!list.loading && !list.error && list.items.length === 0 && <p>{WATCH_TEXT.noFiles}</p>}
       {list.items.length > 0 && (
         <>
@@ -851,8 +953,8 @@ function FilesPanel({ label, list, many, onMore, onOpenSource }: { label: string
             Showing {num(list.items.length)} of {num(list.total)}.
           </p>
           <ul className="ao-watch__file-list" aria-label={`Files of ${q}`}>
-            {list.items.map((it, i) => (
-              <li key={`${i}:${it.kind}:${it.file}`}>
+            {list.items.map((it) => (
+              <li key={fileKey(it)}>
                 <UserText className="ao-watch__file">{it.file}</UserText>
                 {": "}
                 <UserText>{it.reason}</UserText>
@@ -891,7 +993,12 @@ function DialogError({ error }: { error: string | undefined }) {
   ) : null;
 }
 
-function AddDialog({ d, collections, onStart, onChooseAgain, onCancel }: { d: Extract<Dialog, { kind: "add" }>; collections: Collection[]; onStart: (o: { label: string; recursive: boolean; collectionId: string }) => void; onChooseAgain: () => void; onCancel: () => void }) {
+/** The dialog's own polite region (M3): the page behind it is inert while it is open. */
+function DialogLive({ said }: { said: Said }) {
+  return <LiveRegion said={said} testId="watch-dialog-live" />;
+}
+
+function AddDialog({ d, collections, live, onStart, onChooseAgain, onCancel }: { d: Extract<Dialog, { kind: "add" }>; collections: Collection[]; live: Said; onStart: (o: { label: string; recursive: boolean; collectionId: string }) => void; onChooseAgain: () => void; onCancel: () => void }) {
   const id = useId();
   const [collectionId, setCollectionId] = useState("");
   const [recursive, setRecursive] = useState(false);
@@ -905,9 +1012,15 @@ function AddDialog({ d, collections, onStart, onChooseAgain, onCancel }: { d: Ex
     lastGrant.current = grant;
   }, [grant]);
   const refusedChoice = !grant && !d.busy;
+  // A refusal spent the grant: the next useful act is to choose again (M11).
+  const again = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (refusedChoice && d.error) again.current?.focus();
+  }, [refusedChoice, d.error]);
   return (
     <DialogShell labelledBy={`${id}-t`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog">
       <h2 id={`${id}-t`}>Add a watched folder</h2>
+      <DialogLive said={live} />
       <p>
         Folder: <UserText>{d.name}</UserText>
       </p>
@@ -942,7 +1055,7 @@ function AddDialog({ d, collections, onStart, onChooseAgain, onCancel }: { d: Ex
             {d.busy ? "Starting…" : "Start watching"}
           </button>
           {refusedChoice && (
-            <button type="button" onClick={onChooseAgain}>
+            <button type="button" ref={again} onClick={onChooseAgain}>
               Choose the folder again…
             </button>
           )}
@@ -955,10 +1068,11 @@ function AddDialog({ d, collections, onStart, onChooseAgain, onCancel }: { d: Ex
   );
 }
 
-function DownloadDialog({ d, live, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "download" }>; live: WatchedFolderSummary | undefined; onConfirm: () => void; onCancel: () => void }) {
+function DownloadDialog({ d, live, said, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "download" }>; live: WatchedFolderSummary | undefined; said: Said; onConfirm: () => void; onCancel: () => void }) {
   const id = useId();
   const cancel = useRef<HTMLButtonElement>(null);
-  const nothing = d.files === 0 && d.bytes === 0 && !!d.error;
+  // Nothing of a known size is left to agree to (a 409 said so): only Cancel stays (M5).
+  const nothing = d.bytes === 0;
   // The numbers agreed to here are the ones in the title; a change since is said, never slipped in.
   const moved = live && !d.busy && (live.counts.notDownloaded !== d.files || live.counts.notDownloadedBytes !== d.bytes) ? live.counts : undefined;
   useEffect(() => {
@@ -970,11 +1084,15 @@ function DownloadDialog({ d, live, onConfirm, onCancel }: { d: Extract<Dialog, {
       <p id={`${id}-d`}>
         Folder: <UserText>{d.label}</UserText>
       </p>
-      {moved && (
-        <p>
-          Since this opened, the folder&apos;s count has changed: {files(moved.notDownloaded)} ({formatSize(moved.notDownloadedBytes)}) {moved.notDownloaded === 1 ? "is" : "are"} not downloaded now. “Download and import” agrees only to the size above; cancel and choose again for the new size.
-        </p>
-      )}
+      <DialogLive said={said} />
+      {/* Said when it appears (M3): the numbers agreed to stay the title's. */}
+      <div role="status" aria-live="polite">
+        {moved && (
+          <p>
+            Since this opened, the folder&apos;s count has changed: {files(moved.notDownloaded)} ({formatSize(moved.notDownloadedBytes)}) {moved.notDownloaded === 1 ? "is" : "are"} not downloaded now. “Download and import” agrees only to the size above; cancel and choose again for the new size.
+          </p>
+        )}
+      </div>
       <DialogError error={d.error} />
       <div className="ao-actions">
         {!nothing && (
@@ -990,7 +1108,7 @@ function DownloadDialog({ d, live, onConfirm, onCancel }: { d: Extract<Dialog, {
   );
 }
 
-function RemoveDialog({ d, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "remove" }>; onConfirm: () => void; onCancel: () => void }) {
+function RemoveDialog({ d, said, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "remove" }>; said: Said; onConfirm: () => void; onCancel: () => void }) {
   const id = useId();
   return (
     <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog">
@@ -998,6 +1116,7 @@ function RemoveDialog({ d, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "
         Stop watching “<UserText>{d.label}</UserText>”?
       </h2>
       <p id={`${id}-d`}>{WATCH_TEXT.removeBody}</p>
+      <DialogLive said={said} />
       <DialogError error={d.error} />
       <div className="ao-actions">
         <button type="button" className="ao-danger" aria-disabled={d.busy || undefined} onClick={() => !d.busy && onConfirm()}>

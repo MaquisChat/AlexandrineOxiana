@@ -62,6 +62,6 @@ export function watchStatusOf(ev: ServiceEvent, projectId: string): WatchStatusE
   if (ev.type !== "watch.status" || !isObj(ev.data)) return null;
   const { projectId: pid, folder } = ev.data;
   if (pid !== projectId || !isObj(folder)) return null;
-  if (typeof folder.id !== "string" || typeof folder.state !== "string" || !isObj(folder.counts) || !isObj(folder.choices)) return null;
+  if (typeof folder.id !== "string" || typeof folder.seq !== "number" || typeof folder.state !== "string" || !isObj(folder.counts) || !isObj(folder.choices)) return null;
   return { projectId: pid, folder: folder as unknown as WatchedFolderSummary };
 }
