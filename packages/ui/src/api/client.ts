@@ -43,7 +43,7 @@ export class ApiClientError extends Error {
   }
 }
 
-export type EventType = "library.state" | "job.progress" | "import.progress" | "capture.progress";
+export type EventType = "library.state" | "job.progress" | "import.progress" | "capture.progress" | "watch.status";
 export interface ServiceEvent {
   type: EventType | (string & {});
   data: unknown;

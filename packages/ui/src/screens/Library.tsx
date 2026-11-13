@@ -23,6 +23,7 @@ import { PendingWritesDialog } from "../components/PendingWritesDialog";
 import { StatusBanner, bannersFor, useNoticeDismiss, volumeOf } from "../components/StatusBanner";
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
+import { watchedFoldersHref } from "../api/watchedFolders";
 import "../components/library.css";
 import { navigate as goTo, PATHS } from "../navigation";
 import { clearPendingFind, guardPendingFind, setPendingFind } from "../reader/readerHandoff";
@@ -567,6 +568,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           <a href={PATHS.tools} onClick={(e) => follow(e, PATHS.tools)}>
             Optional tools
           </a>
+          {project && <a href={watchedFoldersHref(project.id)} onClick={(e) => follow(e, watchedFoldersHref(project.id))}>Watched folders</a>}
           <a href={PATHS.about} onClick={(e) => follow(e, PATHS.about)}>About and third-party notices</a>
           {onSwitchLibrary && (
             <button type="button" onClick={onSwitchLibrary}>

@@ -19,6 +19,7 @@ import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import { CaptureRoute } from "./screens/Capture";
 import { ExtensionPairingRoute } from "./screens/ExtensionPairing";
 import { ToolsSetupRoute } from "./screens/ToolsSetup";
+import { WatchedFoldersRoute } from "./screens/WatchedFolders";
 import { ResearcherNameSetting } from "./screens/ResearcherName";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
@@ -43,6 +44,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: (p) => p === PATHS.capture, render: (loc, client) => <CaptureRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.extension, render: (_loc, client, port) => <ExtensionPairingRoute client={client} port={port} />, back: true },
   { matches: (p) => p === PATHS.tools, render: (loc, client) => <ToolsSetupRoute client={client} loc={loc} />, back: true },
+  { matches: (p) => p === PATHS.watchedFolders, render: (loc, client) => <WatchedFoldersRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.about, render: () => <About />, back: true },
   {
     matches: (p) => p === PATHS.appearance,
