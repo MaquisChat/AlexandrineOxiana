@@ -464,6 +464,55 @@ describe("a field changed in Zotero and here (Z6)", () => {
   });
 });
 
+describe("the researcher's value is never replaced (point 2)", () => {
+  for (const encrypted of [false, true]) {
+    it(`${encrypted ? "an encrypted" : "a plain"} project: a first conflict, a resumed batch, a repeated one and an undo leave every source as it was, apart from its verification, evidence and modified time`, async () => {
+      const p = await project({ encrypted });
+      const keys = ["One", "Two", "Three"].map((t) => z.addItem(U, { itemType: "journalArticle", title: `Zotero ${t}`, volume: "1" }));
+      await run(p);
+      const ids = await Promise.all(keys.map(async (k) => (await sourceOf(p, k)).source.id));
+      for (const [i, id] of ids.entries()) await repo.updateSource(p.id, id, { title: mt(`Mine ${i}`), volume: `${i + 10}` });
+      const baseline = await Promise.all(ids.map((id) => allButConflict(p, id)));
+      const same = async () => expect(await Promise.all(ids.map((id) => allButConflict(p, id)))).toEqual(baseline);
+      for (const k of keys) z.editItem(U, k, { title: `Zotero changed ${k}`, volume: "2" });
+      // A batch stopped after its first item, then resumed (as the service resumes a Web batch).
+      const { getGlobalDispatcher, setGlobalDispatcher } = await import("undici");
+      const previous = getGlobalDispatcher();
+      setGlobalDispatcher(z.agent);
+      try {
+        const h = await startZoteroWebImport(bulkDeps(), p.id, zweb);
+        for await (const e of h.progress) {
+          if (e.done >= 1) {
+            h.cancel();
+            break;
+          }
+        }
+        await h.done;
+        await same();
+        const { resumeZoteroWebImport } = await import("../zotero-web.js");
+        const r = await (await resumeZoteroWebImport(bulkDeps(), p.id, h.batchId)).done;
+        expect(r.state).toBe("finished");
+        expect(r.counts).toMatchObject({ conflicts: 3, updated: 0 });
+      } finally {
+        setGlobalDispatcher(previous);
+      }
+      await same();
+      for (const id of ids) await queueAgrees(p, id);
+      expect(await pending(p)).toHaveLength(3);
+      // A repeated conflict: Zotero changes again, to other values.
+      for (const k of keys) z.editItem(U, k, { title: `Zotero again ${k}`, volume: "3" });
+      const again = await run(p);
+      expect(again.r.counts).toMatchObject({ conflicts: 3 });
+      await same();
+      for (const id of ids) await queueAgrees(p, id);
+      // Undone: the conflict marks come off, the researcher's values stay.
+      await bulk().undoBatch(p.id, again.batchId);
+      await same();
+      for (const id of ids) await queueAgrees(p, id);
+    });
+  }
+});
+
 describe("undo of a batch that queued a conflict (R177 c)", () => {
   it("undo resolves the entry as undone and keeps the researcher's value; the next sync asks again", async () => {
     const p = await project();
