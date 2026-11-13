@@ -140,3 +140,4 @@ R215 (2026-11-13): Zotero sync — the key list is taken before the downloads; a
 R216 (2026-11-13): reader R9 after review — "Discard this note?" stands (R192 e); nothing pressed dropped; annotation groups; the list sorts itself; measured heights; no author for now. D22 opened (importer writes the OS user name as author).
 R217 (2026-11-13): cloud folders W3 after review — the register covers every file the library holds; deleted stays deleted (undo included); watchId required; links never followed; torn line survived; time-only changes write nothing.
 R218 (2026-11-13): the project's licence is AGPL-3.0-or-later (the owner's choice; the repository to be made public); the dependency rule becomes "nothing incompatible with AGPL-3.0-or-later is shipped".
+R219 (2026-11-13): cloud folders W4 after review — the fetch never follows a link; the agreed size reserved in the device record; a pause never loses a register line; nothing confirmed, nothing fetched; wording.
