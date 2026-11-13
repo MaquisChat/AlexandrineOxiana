@@ -91,6 +91,25 @@ export const FIND_LINE_MAX_BYTES = 65_536;
 /** The longest line a researcher can type. */
 export const FIND_TYPED_MAX = 500;
 
+/**
+ * Task F12's "Search sources" settings, as F4 needs them (F12 adds `copies`, `crossrefEmail` and `unpaywallEmail`
+ * with the free copies). `record` lists the services that find a work and its record, in the order asked; a source
+ * that is `on: false` is never asked. Settings can only narrow what a project's rules allow.
+ */
+export type RecordSearchSource = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
+export type SearchSettings = { record: Array<{ id: RecordSearchSource; on: boolean }> };
+
+/** The settings until the researcher changes them (F12 keeps them in `search-sources.json`): every source on but Elicit. */
+export const DEFAULT_SEARCH_SETTINGS: SearchSettings = {
+  record: [
+    { id: "crossref", on: true },
+    { id: "openalex", on: true },
+    { id: "openlibrary", on: true },
+    { id: "loc", on: true },
+    { id: "elicit", on: false },
+  ],
+};
+
 export const FIND_QUEUE_OPS = {
   add: "project.find.add",
   update: "project.find.update",
