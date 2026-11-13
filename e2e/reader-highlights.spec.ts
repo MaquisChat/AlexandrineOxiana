@@ -1229,3 +1229,165 @@ test("a highlight made while the list is filtered to a search's words shows in i
   await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
   expect(errors).toEqual([]);
 });
+
+// ---- Task R11: highlights and page notes without a mouse ----
+
+test("a highlight and a page note made by keyboard alone", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "by-keyboard.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "By keyboard" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  await expect(page.locator('[data-page-number="1"] .ao-reader-text-layer > .ao-reader-end-of-content')).toBeAttached();
+  const pages = page.locator(".ao-reader-scroll");
+  // The reader puts the focus on its pages when it opens.
+  await expect(pages).toBeFocused();
+  const selection = () => page.evaluate(() => document.getSelection()?.toString() ?? "");
+
+  // S: the first word visible on page 1; Shift+Right twice; said in the live region.
+  await page.keyboard.press("s");
+  await expect.poll(selection).toBe("Page");
+  await page.keyboard.press("Shift+ArrowRight");
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect.poll(selection).toBe("Page 1 of");
+  await expect(said(page)).toHaveText("Selected: ⁨Page 1 of⁩");
+  // The tint is the browser's own selection, inside page 1's text layer.
+  expect(await page.evaluate(() => !!document.getSelection()?.getRangeAt(0).startContainer.parentElement?.closest('[data-page-number="1"] .ao-reader-text-layer'))).toBe(true);
+  // Enter: R10's toolbar, the focus on "Highlight"; the arrows to Green; Enter.
+  await page.keyboard.press("Enter");
+  await expect(colourBar(page)).toBeVisible();
+  await expect(colourBar(page).getByRole("button", { name: "Highlight", exact: true })).toBeFocused();
+  for (let i = 0; i < 3; i++) await page.keyboard.press("ArrowRight");
+  await expect(colourBar(page).getByRole("button", { name: "Highlight in Green" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(said(page)).toHaveText("Highlight added: Green, page 1.");
+  await expect(colourBar(page)).toHaveCount(0);
+  await expect(pages).toBeFocused();
+  expect(await selection()).toBe("");
+
+  // N: the note field for page 1, placed at the top left of what is shown; Ctrl/Cmd+Enter saves it.
+  await page.keyboard.press("n");
+  const field = page.getByRole("region", { name: "Note on page 1" });
+  await expect(field).toContainText("On page 1, at the top left of what is shown.");
+  await expect(field.getByRole("textbox", { name: "Note" })).toBeFocused();
+  await page.keyboard.type("Typed without a mouse");
+  await page.keyboard.press("ControlOrMeta+Enter");
+  await expect(said(page)).toHaveText("Note added, page 1.");
+  await expect(field).toHaveCount(0);
+  await expect(pages).toBeFocused();
+
+  const all = (await listed(app, projectId, sid)) as Array<Made & { kind: string; body?: string }>;
+  expect(all).toHaveLength(2);
+  const hl = all.find((a) => a.kind === "highlight")!;
+  const note = all.find((a) => a.kind === "note")!;
+  expect(hl.quote).toBe("Page 1 of");
+  expect(hl.colorName).toBe("green");
+  expect(hl.pdfAnchors.map((a) => a.page)).toEqual([1]);
+  expect(hl.pdfAnchors[0]!.sortIndex.startsWith("00000|000000|")).toBe(true);
+  expect(note.body).toBe("Typed without a mouse");
+  expect(note.pdfAnchors.map((a) => a.page)).toEqual([1]);
+  // The view was at the page's top: the note's 22-point square lies at the page's top left, 8 px (6 points) in.
+  const r = note.pdfAnchors[0]!.rects[0]!;
+  const detail = JSON.stringify(r);
+  expect(Math.abs(r.w - 22), detail).toBeLessThan(0.01);
+  expect(Math.abs(r.h - 22), detail).toBeLessThan(0.01);
+  expect(r.x, detail).toBeLessThan(40);
+  expect(r.y + r.h, detail).toBeGreaterThan(842 - 40);
+  expect(note.pdfAnchors[0]!.sortIndex.startsWith("00000|000000|")).toBe(true);
+  // Both are listed and drawn at once.
+  await expect(annotationList(page).locator(`[data-entry="${hl.id}"]`)).toContainText("Page 1 of");
+  await expect(annotationList(page).locator(`[data-entry="${note.id}"]`)).toContainText("Typed without a mouse");
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${note.id}"]`)).toHaveCount(1);
+
+  // Read again: both are still there, drawn on page 1 and listed, the highlight not "changed".
+  await page.reload();
+  await expect(annotationList(page).locator(`[data-entry="${hl.id}"]`)).toContainText("Page 1 of");
+  await expect(annotationList(page).locator(`[data-entry="${note.id}"]`)).toContainText("Typed without a mouse");
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${hl.id}"]`)).toHaveCount(1);
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${note.id}"]`)).toHaveCount(1);
+  await expect(page.getByText(CHANGED)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a keyboard selection crosses into the next page; a further Shift+arrow closes the toolbar; Escape ends it, nothing stored", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "across.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Across by keyboard" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  for (const n of [1, 2]) await expect(page.locator(`[data-page-number="${n}"] .ao-reader-text-layer > .ao-reader-end-of-content`)).toBeAttached();
+  const pages = page.locator(".ao-reader-scroll");
+  await expect(pages).toBeFocused();
+  const selection = () => page.evaluate(() => document.getSelection()?.toString() ?? "");
+  /** The page the selection's end is on. */
+  const endPage = () => page.evaluate(() => (document.getSelection()?.rangeCount ? Number(document.getSelection()!.getRangeAt(0).endContainer.parentElement?.closest<HTMLElement>("[data-page-number]")?.dataset.pageNumber) : 0));
+  await page.keyboard.press("s");
+  await expect.poll(selection).toBe("Page");
+  // Down by lines until the selection reaches page 2 (its first line, the same place: its first word).
+  for (let i = 0; i < 4 && (await endPage()) !== 2; i++) await page.keyboard.press("Shift+ArrowDown");
+  expect(await endPage()).toBe(2);
+  expect(await selection()).toContain("written for the reader's tests.");
+  await expect.poll(selection).toMatch(/Page$/);
+  // Enter: the toolbar takes the focus; going back to the pages leaves it open.
+  await page.keyboard.press("Enter");
+  await expect(colourBar(page).getByRole("button", { name: "Highlight", exact: true })).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Shift+Tab");
+  await expect(pages).toBeFocused();
+  await expect(colourBar(page)).toBeVisible();
+  // A further Shift+arrow: the selection grows, the toolbar closes (it would store less than is tinted).
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect.poll(selection).toMatch(/Page 2$/);
+  await expect(colourBar(page)).toHaveCount(0);
+  // Escape: ended and said, the tint gone, the focus on the pages; nothing was stored.
+  await page.keyboard.press("Escape");
+  await expect(said(page)).toHaveText("Selection cancelled.");
+  expect(await selection()).toBe("");
+  await expect(pages).toBeFocused();
+  expect(await listed(app, projectId, sid)).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("with a note open, words selected on the page with the mouse stay selected, to be copied into the note (R11, J1)", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  const file = sourceFile(app, "copy-into-note.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Copy into a note" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  await expect(page.locator('[data-page-number="1"] .ao-reader-text-layer > .ao-reader-end-of-content')).toBeAttached();
+  await expect(page.locator(".ao-reader-scroll")).toBeFocused();
+  await page.keyboard.press("n");
+  const field = page.getByRole("region", { name: "Note on page 1" }).getByRole("textbox", { name: "Note" });
+  await expect(field).toBeFocused();
+  await page.keyboard.type("about ");
+  const before = await said(page).textContent();
+  // Select words of page 2 with the mouse (below the note's field, which lies over the top left of the pages).
+  const line = "This is the text of page 2, written for the reader's tests.";
+  await centreOn(page, { n: 2, words: line, to: 20 });
+  await page.evaluate(() => {
+    const scroller = document.querySelector<HTMLElement>(".ao-reader-scroll")!;
+    const note = document.querySelector<HTMLElement>(".ao-reader-note")!.getBoundingClientRect();
+    const v = scroller.getBoundingClientRect();
+    scroller.scrollTop -= Math.max(0, note.bottom + 40 - (v.top + v.bottom) / 2);
+  });
+  await dragSelect(page, { n: 2, words: line, i: 0 }, { n: 2, words: line, i: 10 });
+  // No toolbar, nothing said; the selection holds those words and the focus is not in the note.
+  await expect(colourBar(page)).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => document.getSelection()?.toString() ?? "")).toBe("This is the");
+  expect(await field.evaluate((el) => el === document.activeElement)).toBe(false);
+  expect(await said(page).textContent()).toBe(before);
+  // (The clipboard cannot be read alike in both browsers: Ctrl/Cmd+C copies the document's selection, asserted above.)
+  // Then into the note: its text unchanged, and still written in.
+  await field.click();
+  await expect(field).toBeFocused();
+  await expect(field).toHaveValue("about ");
+  await page.keyboard.press("End");
+  await page.keyboard.type("these words");
+  await expect(field).toHaveValue("about these words");
+  expect(await listed(app, projectId, sid)).toEqual([]);
+  expect(errors).toEqual([]);
+});

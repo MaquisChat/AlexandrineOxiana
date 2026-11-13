@@ -24,6 +24,11 @@ import { FIELD_LABELS, SourceDetail } from "./SourceDetail";
 
 useMockService();
 
+// Task W9: the details also ask where the source came from; by default it came from no watched folder.
+beforeEach(() => {
+  server.use(http.get(url("/projects/:id/sources/:sid/watch-origin"), () => HttpResponse.json({ origins: [] })));
+});
+
 const handlers = () => [http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(SOURCE_FILE)), http.get(url("/styles"), () => HttpResponse.json(STYLES))];
 
 // Task 69 (M2): the date is shown in the researcher's own time zone, so the expected day comes from
@@ -42,6 +47,44 @@ describe("SourceDetail", () => {
     expect(within(region).getByText("Smith, Jane")).toBeTruthy();
     expect(within(region).getByText("10.1000/xyz")).toBeTruthy();
     expect(within(region).getByText("smith-2019.pdf")).toBeTruthy();
+  });
+
+  it("shows where the source came from when it came from a watched folder (Task W9)", async () => {
+    server.use(
+      ...handlers(),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () =>
+        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: "in-library", local: true }] }),
+      ),
+    );
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const origin = await screen.findByRole("region", { name: "Watched folder" });
+    expect(origin.textContent).toContain("Came from the watched folder “Fieldwork” as “smith-2019.pdf”.");
+  });
+
+  it("after \"Bring in the new version\" the source's files are read again and the new file is in the list (R239 a)", async () => {
+    let added = false;
+    const withNew = { ...SOURCE_FILE, assets: [...SOURCE_FILE.assets, { ...SOURCE_FILE.assets[0]!, id: "a2", path: "Dissertation/Sources/s1/smith-2019-v2.pdf" }] };
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(added ? withNew : SOURCE_FILE)),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () =>
+        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: added ? "in-library" : "changed", local: true }] }),
+      ),
+      http.post(url("/projects/:id/sources/:sid/watch-origin/action"), () => {
+        added = true;
+        return HttpResponse.json({ done: "attached", sourceId: "s1" });
+      }),
+    );
+    const onChanged = vi.fn();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onChanged={onChanged} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    const files = async () => (await within(region).findByRole("heading", { name: "Files" })).nextElementSibling as HTMLElement;
+    expect(within(await files()).getAllByRole("listitem")).toHaveLength(1);
+    await userEvent.click(await within(region).findByRole("button", { name: /^Bring in the new version/ }));
+    await waitFor(async () => expect(within(await files()).getAllByRole("listitem")).toHaveLength(2));
+    expect(within(region).getByText("smith-2019-v2.pdf")).toBeTruthy();
+    // The parent (the library list) is told once (N3).
+    expect(onChanged).toHaveBeenCalledTimes(1);
   });
 
   it("says in words that the source is no longer available at its source, with the date noticed; nothing while it is available (Task 69, D17)", async () => {

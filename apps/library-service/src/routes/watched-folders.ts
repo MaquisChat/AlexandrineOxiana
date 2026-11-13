@@ -550,6 +550,11 @@ async function folderParam(s: Session, projectId: string, req: FastifyRequest): 
 /** The folder's name when it has no label (its last part; never the path). */
 const folderName = (rec: Rec | undefined) => rec?.options.label ?? (rec?.dir ? path.basename(rec.dir) : "");
 
+/** What the screen is told after "bring in the new version": a `duplicate` means the content was already a file of the project and nothing was added (R239 d). */
+export function bringInDone(outcome: string): "attached" | "already-there" {
+  return outcome === "duplicate" ? "already-there" : "attached";
+}
+
 export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
@@ -833,7 +838,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     }
     const out = await bringInNewVersion(deps, projectId, origin.watchId, origin.entry.key);
     if (out.outcome !== "attached" && out.outcome !== "duplicate") throw new ApiError(409, "CONFLICT", out.reason ? scrubPaths(out.reason, state.roots) : WATCH_ROUTE_TEXT.notBroughtIn);
-    return { done: "attached", sourceId: sid };
+    return { done: bringInDone(out.outcome), sourceId: sid };
   });
 }
 

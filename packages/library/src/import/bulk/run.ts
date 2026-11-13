@@ -2210,8 +2210,12 @@ export async function startBatch(
   projectId: string,
   adapter: ImportSourceAdapter,
   input: ImportOptionsInput = {},
-  /** Package-internal (device import, R83): the session and participants every new source is linked to (checked by the caller). */
-  internal: { fieldwork?: { sessionId?: string; participantIds?: string[] } } = {},
+  /**
+   * Package-internal. Device import (R83): the session and participants every new source is linked to (checked by
+   * the caller). The Zotero sync runner (Task Z7, R242): `origin`, written into the record at its creation (and so
+   * kept by every resume, which reads the record), by which the runner knows its own unfinished batches.
+   */
+  internal: { fieldwork?: { sessionId?: string; participantIds?: string[] }; origin?: "zotero-sync" } = {},
 ): Promise<BatchHandle> {
   // The id is in the running set before anything is awaited (R61).
   const id = newId();
@@ -2248,6 +2252,7 @@ export async function startBatch(
       ...(outsideApprovals.length ? { outsideApprovals } : {}),
       ...(internal.fieldwork && (internal.fieldwork.sessionId || internal.fieldwork.participantIds?.length) ? { fieldwork: internal.fieldwork } : {}),
       ...(adapter.resumeOptions && Object.keys(adapter.resumeOptions).length ? { adapterOptions: { ...adapter.resumeOptions } } : {}),
+      ...(internal.origin === "zotero-sync" ? { origin: "zotero-sync" as const } : {}),
     };
     // Written before anything is created, so an interrupted batch still has its record.
     await saveRecord(deps.repo, projectId, rec);
