@@ -3289,7 +3289,9 @@ describe("W7 fix round 2 (R234): one call per folder however often it is restart
     for (let i = 0; i < 5; i++) {
       const next = start(p, { ...FAST8, dir, attach: quickAttach(), fs: fsSeam });
       await next.w.ready;
-      expect(next.w.status()).toMatchObject({ state: "unreachable", reason: withProvider(WATCH_REASONS.notResponding, null) });
+      // Given up early (by the stop), not after the engine's full limit: said without "30 seconds" (R234 M-b).
+      expect(next.w.status()).toMatchObject({ state: "unreachable", reason: withProvider(WATCH_REASONS.notAnswering, null) });
+      expect(next.w.status().reason).not.toContain("30 seconds");
       if (i < 4) await next.w.stop();
     }
     expect(most).toBe(1);

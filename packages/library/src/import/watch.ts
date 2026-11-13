@@ -199,6 +199,8 @@ export const WATCH_REASONS = {
   /** The folder: `{provider}` is filled by `withProvider`. */
   notPermitted: "macOS did not allow the app to read files managed by {provider}, so this folder is not watched. Press “Try again” and choose Allow if macOS asks.",
   notResponding: "The folder did not answer for 30 seconds ({provider} may be starting, signed out or offline). Watching goes on when it answers.",
+  /** R234 M-b: a call given up before the full limit (by a stop), or one merely still outstanding: said without a number. */
+  notAnswering: "This folder is not answering ({provider} may be offline or signed out). Watching goes on when it does.",
   missing: "The folder cannot be found. If {provider} is signed out or still starting, watching resumes when the folder is back.",
   /** Task W3: most of the register missing at once; `{provider}` is filled by `withProvider`. */
   massGone: "Most files in this folder disappeared at once. This usually means {provider} is signed out or still starting. Nothing in the library has changed.",
@@ -447,7 +449,7 @@ type CallKind = "fs" | "fetch";
 class FolderGate {
   private busy = false;
   /** Gives up on the call in flight (as its time limit does), and what kind of call it is. */
-  private inFlight: { kind: CallKind; giveUp: () => void } | null = null;
+  private inFlight: { kind: CallKind; giveUp: (early?: boolean) => void } | null = null;
   private queue: Array<{ go: () => void; fail: () => void }> = [];
   private freeWaiters: Array<() => void> = [];
   private settleWaiters: Array<() => void> = [];
@@ -457,7 +459,7 @@ class FolderGate {
   epoch = 0;
   constructor(
     private readonly timeoutMs: number,
-    private readonly onStuck: (kind: CallKind) => void,
+    private readonly onStuck: (kind: CallKind, early: boolean) => void,
   ) {}
   get signal(): AbortSignal {
     return this.ctl.signal;
@@ -467,7 +469,7 @@ class FolderGate {
     return new Promise<T>((resolveCall, rejectCall) => {
       const go = () => {
         let done = false;
-        const giveUp = () => {
+        const giveUp = (early = false) => {
           if (done) return;
           done = true;
           clearTimeout(timer);
@@ -477,9 +479,9 @@ class FolderGate {
           this.ctl.abort();
           for (const q of this.queue.splice(0)) q.fail();
           rejectCall(new FolderNotAnsweringError());
-          this.onStuck(kind);
+          this.onStuck(kind, early);
         };
-        const timer = setTimeout(giveUp, timeoutMs);
+        const timer = setTimeout(() => giveUp(), timeoutMs);
         timer.unref?.();
         this.inFlight = { kind, giveUp };
         let p: Promise<T>;
@@ -558,7 +560,7 @@ class FolderGate {
    * folder adopts it instead of issuing a second call beside it.
    */
   giveUpNow(): void {
-    this.inFlight?.giveUp();
+    this.inFlight?.giveUp(true);
   }
   /** The watch stops: nobody waits for the stuck call any longer (it is still not followed by another). */
   release(): void {
@@ -614,7 +616,7 @@ const isRefusal = (err: unknown) => errCode(err) === "EACCES" || errCode(err) ==
  * the process (A6): a new watch on such a folder (a restart, W7's "Try again") starts "Cannot be reached" and makes
  * no call until that one settles — the thread it holds is not joined by another.
  */
-const outstandingFolders = new Map<string, { settled: Promise<void>; kind: CallKind }>();
+const outstandingFolders = new Map<string, { settled: Promise<void>; kind: CallKind; early?: boolean }>();
 
 /** Whether a call on this folder (as given, or its real path) is still outstanding in this process (A6, R234 I-A). */
 export function folderCallOutstanding(dir: string): boolean {
@@ -627,7 +629,7 @@ export function folderCallOutstanding(dir: string): boolean {
  */
 export function noteFolderCallOutstanding(dir: string, call: Promise<unknown>): void {
   const key = resolve(dir);
-  const entry = { settled: call.then(() => {}, () => {}), kind: "fs" as const };
+  const entry = { settled: call.then(() => {}, () => {}), kind: "fs" as const, early: true };
   outstandingFolders.set(key, entry);
   void entry.settled.then(() => {
     if (outstandingFolders.get(key) === entry) outstandingFolders.delete(key);
@@ -1153,10 +1155,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const projectLocked = () => projectEncrypted(deps.repo, projectId) && !deps.repo.isUnlocked(projectId);
 
   // ---- the folder's one gate, and the calls made through it ----------------------------------------------
-  const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, (kind) => {
+  const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, (kind, early) => {
     const settledAt = gate.afterSettle();
     const keys = [...new Set([root, realRoot])];
-    const entry = { settled: settledAt, kind };
+    const entry = { settled: settledAt, kind, early };
     for (const k of keys) outstandingFolders.set(k, entry);
     void settledAt.then(() => {
       for (const k of keys) if (outstandingFolders.get(k) === entry) outstandingFolders.delete(k);
@@ -2450,7 +2452,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const prior = refused ? undefined : outstandingFolders.get(root);
   if (prior) {
     gate.adopt(prior.settled);
-    goUnreachable(prior.kind === "fetch" ? withService(WATCH_REASONS.fetchNotResponding, provider) : withProvider(WATCH_REASONS.notResponding, provider));
+    // The full limit passed: its number is true; given up early (a stop, the service), said without it (R234 M-b).
+    goUnreachable(prior.kind === "fetch" ? withService(WATCH_REASONS.fetchNotResponding, provider) : withProvider(prior.early ? WATCH_REASONS.notAnswering : WATCH_REASONS.notResponding, provider));
   }
 
   const ready: Promise<void> = (async () => {

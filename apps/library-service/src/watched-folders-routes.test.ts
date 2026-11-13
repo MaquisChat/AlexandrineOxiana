@@ -1045,7 +1045,8 @@ describe("fix round 1 (R233)", () => {
 });
 
 describe("fix round 2 (R234)", () => {
-  const notResponding = WATCH_REASONS.notResponding.replace("{provider}", "the system");
+  // M-b: a call given up early, or merely still outstanding, is said without "30 seconds".
+  const notResponding = WATCH_REASONS.notAnswering.replace("{provider}", "the system");
 
   it("I-A: retries and set-folder on a folder whose call is out: at most one call on it throughout; each answers quickly and truthfully; it is watched again when the call settles", async () => {
     await start({ watchFsTimeoutMs: 400 });
@@ -1072,6 +1073,7 @@ describe("fix round 2 (R234)", () => {
     const put = await call({ method: "PUT", url: `/projects/${pid}/watched-folders/${wid}/folder`, body: { grantId: grant(dir) } });
     expect(Date.now() - t1).toBeLessThan(500);
     expect([put.status, put.json.error.message]).toEqual([409, notResponding]);
+    expect(notResponding).toBe("This folder is not answering (the system may be offline or signed out). Watching goes on when it does.");
     expect(holdFs.most).toBe(1);
     holdFs.path = "";
     release();

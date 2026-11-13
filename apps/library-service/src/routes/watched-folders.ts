@@ -262,7 +262,8 @@ async function checkGranted(ctx: Ctx, s: Session, given: string): Promise<string
   // A folder with a call still outstanding (the engine's, or one of ours given up on) is not asked again: one call per
   // folder, whoever made it (R234 I-A). Said in the engine's words.
   const outstanding = (dir: string) => {
-    if (folderCallOutstanding(dir)) throw new ApiError(409, "CONFLICT", withProvider(WATCH_REASONS.notResponding, providerOf(dir, env)));
+    // Merely outstanding (how long is not known here): said without a number (R234 M-b).
+    if (folderCallOutstanding(dir)) throw new ApiError(409, "CONFLICT", withProvider(WATCH_REASONS.notAnswering, providerOf(dir, env)));
   };
   /** One call on the folder, under the limit; given up on, it is recorded as outstanding until it settles. */
   const onFolder = async <T>(dir: string, call: Promise<T>): Promise<T> => {
@@ -361,7 +362,7 @@ function startOne(ctx: Ctx, s: Session, projectId: string, w: { id: string; opti
 
 /** A folder whose file-system call has not answered (A6): its status says so in the engine's own words. */
 function stuck(st: WatchStatus): boolean {
-  return st.state === "unreachable" && (st.reason === withProvider(WATCH_REASONS.notResponding, st.provider) || st.reason === withService(WATCH_REASONS.fetchNotResponding, st.provider));
+  return st.state === "unreachable" && (st.reason === withProvider(WATCH_REASONS.notResponding, st.provider) || st.reason === withProvider(WATCH_REASONS.notAnswering, st.provider) || st.reason === withService(WATCH_REASONS.fetchNotResponding, st.provider));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
