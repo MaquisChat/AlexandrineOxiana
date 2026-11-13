@@ -797,6 +797,26 @@ processing:
     expect(byZoteroKey(await sources(p), "AAAA1111").source.volume).toBe("62");
   });
 
+  it("R236 (a), fix round 2: a field cleared in Zotero's database is kept here and counted once; the next re-import counts nothing", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(byZoteroKey(await sources(p), "AAAA1111").source.volume).toBe("61");
+    zoteroEdit((db) => {
+      db.prepare("DELETE FROM itemData WHERE itemID = 1 AND fieldID = (SELECT fieldID FROM fields WHERE fieldName = 'volume')").run();
+      db.prepare("UPDATE items SET version = 9, clientDateModified = '2024-06-01 08:00:00' WHERE itemID = 1").run();
+    });
+    const r = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(r.counts).toMatchObject({ clearedInZoteroKept: 1, conflicts: 0, created: 0 });
+    expect(byZoteroKey(await sources(p), "AAAA1111").source.volume).toBe("61");
+    zoteroEdit((db) => {
+      db.prepare("UPDATE items SET version = 10, clientDateModified = '2024-06-02 08:00:00' WHERE itemID = 1").run();
+    });
+    const again = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(again.counts).toMatchObject({ clearedInZoteroKept: 0 });
+    expect(byZoteroKey(await sources(p), "AAAA1111").source.volume).toBe("61");
+  });
+
   it("re-import keeps a field the user edited, lists it in the report, and adds new annotations", async () => {
     const p = await project();
     const bulk = bulkImport();

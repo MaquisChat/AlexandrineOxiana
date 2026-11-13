@@ -885,6 +885,18 @@ describe("an old Zotero value is not a claim (Z6, R236 c)", () => {
     expect(r.fields["/volume"]!.status).toBe("conflict");
   });
 
+  it("I5: the researcher's own evidence settles a Zotero conflict only when it is newer than Zotero's newest value", () => {
+    const conflict = { status: "conflict", checks: ["zotero-update"], reason: "Zotero now has a different value; you changed it here.", values: [{ value: "Z2", source: { kind: "zotero", provider: "zotero-web" } }], current: mt("Mine") };
+    const at = (fieldEvidence: FieldEvidence[]) =>
+      ({ source: { ...draft({ title: mt("Mine") }), id: "s" }, fieldEvidence, verification: { "/title": conflict } }) as unknown as SourceFile;
+    // An older "keep mine" (recorded before Zotero's Z2, even in the same second): the conflict stands.
+    const older = at([z("/title", "Z1"), ev("/title", mt("Mine"), "user"), z("/title", "Z2")]);
+    expect(recheckSourceFile(older, {}).verification["/title"]).toEqual(conflict);
+    // A confirm after it: settled.
+    const newer = at([z("/title", "Z1"), z("/title", "Z2"), ev("/title", mt("Mine"), "user")]);
+    expect(recheckSourceFile(newer, {}).verification["/title"]!.status).toBe("user-confirmed");
+  });
+
   it("a recheck keeps a Zotero conflict as recorded while its two values are unchanged", () => {
     const sf = {
       source: { ...draft({ volume: "12" }), id: "s" },

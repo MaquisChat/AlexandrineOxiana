@@ -885,6 +885,56 @@ describe("fix round 1 (R236)", () => {
     });
   });
 
+  describe("I5 (fix round 2): a question Zotero raises again is not answered by an old answer", () => {
+    /** The researcher kept their own title; Zotero then changed it again: a new conflict and a new entry. */
+    const reasked = async () => {
+      const p = await project();
+      const { key, id } = await imported(p, { volume: "3" });
+      await repo.updateSource(p.id, id, { title: mt("Mine") });
+      z.editItem(U, key, { title: "Z1" });
+      await run(p);
+      await confirmField(repo, p.id, id, "/title", mt("Mine"));
+      z.editItem(U, key, { title: "Z2" });
+      await run(p);
+      const [entry] = await pending(p, id);
+      expect(entry).toBeDefined();
+      expect((await repo.getSource(p.id, id)).verification["/title"]).toMatchObject({ status: "conflict", values: [{ value: "Z2" }] });
+      return { p, key, id, entry: entry! };
+    };
+
+    it("a confirm of another field leaves the re-asked title in conflict and its entry pending", async () => {
+      const { p, id, entry } = await reasked();
+      const before = (await repo.getSource(p.id, id)).verification["/title"];
+      await confirmField(repo, p.id, id, "/volume", "3");
+      const sf = await repo.getSource(p.id, id);
+      expect(sf.verification["/title"]).toEqual(before);
+      const now = (await projectReviewEntries(repo, p.id)).find((e) => e.id === entry.id)!;
+      expect(now.status).toBe("pending"); // M4: never recorded as confirmed under another field's confirm
+      expect(now.decision).toBeUndefined();
+      // The project-wide recheck does not answer it either.
+      await repo.recheckSource(p.id, id);
+      expect((await repo.getSource(p.id, id)).verification["/title"]).toEqual(before);
+      expect((await pending(p, id)).map((e) => e.id)).toContain(entry.id);
+    });
+
+    it("confirming the title itself afterwards settles it", async () => {
+      const { p, id, entry } = await reasked();
+      await confirmField(repo, p.id, id, "/volume", "3");
+      await confirmField(repo, p.id, id, "/title", mt("Mine"));
+      expect((await repo.getSource(p.id, id)).verification["/title"]?.status).toBe("user-confirmed");
+      expect((await projectReviewEntries(repo, p.id)).find((e) => e.id === entry.id)).toMatchObject({ status: "resolved", decision: "confirmed" });
+    });
+
+    it("choosing Zotero's value settles it", async () => {
+      const { p, id, entry } = await reasked();
+      await confirmField(repo, p.id, id, "/title", mt("Z2"));
+      const sf = await repo.getSource(p.id, id);
+      expect(titleOf(sf)).toBe("Z2");
+      expect(sf.verification["/title"]?.status).toBe("user-confirmed");
+      expect((await projectReviewEntries(repo, p.id)).find((e) => e.id === entry.id)).toMatchObject({ status: "resolved", decision: "confirmed" });
+    });
+  });
+
   it("M2: after the undo of a batch that extended an entry, the entry no longer lists the field it took off", async () => {
     const p = await project();
     const { key, id } = await imported(p, { volume: "3" });
