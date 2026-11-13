@@ -1461,5 +1461,132 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
         .map((b) => b.textContent);
       expect(enabled).toEqual(["Go to"]);
     });
+
+    it("a 404 on a change brings the list up to date, says so, and asks whether the project is still there (A13)", async () => {
+      serveDocument();
+      let lists = 0;
+      serveAnnotations([], () => {
+        lists++;
+        const now = lists === 1 ? [rec({ id: "a" }), rec({ id: "gone" })] : [rec({ id: "a" })];
+        return HttpResponse.json({ annotations: now, count: now.length, textChars: 0 }) as unknown as Response;
+      });
+      serveChanges(() => serviceError(404, "NOT_FOUND", "That highlight or note was not found.") as unknown as Response);
+      openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
+      const inDoubt = vi.fn();
+      const user = userEvent.setup();
+      screenFor({ onProjectInDoubt: inDoubt });
+      await waitFor(() => expect(drawnOn(1)).toEqual(["a", "gone"]));
+      await user.click(within(entryOf("gone")).getByRole("button", { name: /^Colour of/ }));
+      await user.click(screen.getByRole("menuitemradio", { name: "Red" }));
+      await waitFor(() => expect(within(panel()).getByRole("alert").textContent).toBe("That highlight or note was no longer there. The list has been brought up to date."));
+      await waitFor(() => expect(drawnOn(1)).toEqual(["a"]));
+      expect(panel().querySelector('[data-entry="gone"]')).toBeNull();
+      expect(lists).toBe(2);
+      expect(inDoubt).toHaveBeenCalledTimes(1);
+    });
+
+    it("a 404 answered late, after the file changed, is dropped: no list asked again, no question about the project", async () => {
+      serveDocument();
+      const both = rec({ id: "x" });
+      both.pdfAnchors.push({ id: "x-b", assetId: "a2", page: 1, rects: onWords, sortIndex: "00000|000000|00000", sortIndexDerived: true });
+      serveAnnotations([both]);
+      let release: (r: Response) => void = () => {};
+      serveChanges(() => new Promise<Response>((r) => (release = r)));
+      openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
+      const inDoubt = vi.fn();
+      const user = userEvent.setup();
+      const r = screenFor({ onProjectInDoubt: inDoubt });
+      await waitFor(() => expect(drawnOn(1)).toEqual(["x"]));
+      await user.click(within(entryOf("x")).getByRole("button", { name: /^Colour of/ }));
+      await user.click(screen.getByRole("menuitemradio", { name: "Green" }));
+      await waitFor(() => expect(requests.some((q) => q.url.endsWith("/annotations/x"))).toBe(true));
+      openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
+      r.rerender(<ReaderScreen api={readerApi(testClient())} projectId="p1" sourceId="s1" assetId="a2" readOnly={false} onProjectInDoubt={inDoubt} />);
+      await waitFor(() => expect(drawnOn(1)).toEqual(["x"]));
+      const listsBefore = requests.filter((q) => q.url.endsWith("/annotations")).length;
+      release(serviceError(404, "NOT_FOUND", "That highlight or note was not found.") as unknown as Response);
+      await flush();
+      expect(requests.filter((q) => q.url.endsWith("/annotations")).length).toBe(listsBefore);
+      expect(inDoubt).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("Go to waits for the page to be drawn, however long that takes, then brings the highlight into view", async () => {
+      serveDocument();
+      serveAnnotations([rec({ id: "first" }), rec({ id: "on-five", page: 5, quote: "Words of page 5" })]);
+      const f = fakeHandle(12, { text: words, hold: true });
+      openPdf.mockResolvedValueOnce(f.handle);
+      const seen: string[] = [];
+      Element.prototype.scrollIntoView = function (this: Element) {
+        if (this instanceof HTMLElement && this.dataset.annotation) seen.push(this.dataset.annotation);
+      };
+      const user = userEvent.setup();
+      screenFor();
+      const releaseAll = async () => {
+        await act(async () => {
+          for (const r of f.holdRenders.splice(0)) r();
+        });
+        await flush();
+      };
+      await screen.findByRole("region", { name: "Annotations (2)" });
+      await releaseAll();
+      await user.click(within(entryOf("on-five")).getByRole("button", { name: /^Go to/ }));
+      await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-page-number="5"]')));
+      // Longer than any count of ticks the screen once allowed (40 × 50 ms): page 5 is not drawn yet.
+      await new Promise((r) => setTimeout(r, 2600));
+      expect(seen).toEqual([]);
+      for (let i = 0; i < 5 && seen.length === 0; i++) await releaseAll();
+      await waitFor(() => expect(seen).toContain("on-five"));
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }, 15_000);
+
+    it("a reader ended with a changed note asks nothing and holds no way out", async () => {
+      serveDocument();
+      serveAnnotations([rec({ id: "a", body: "old" })]);
+      const f = fakeHandle(2, { text: words });
+      openPdf.mockResolvedValueOnce(f.handle);
+      const user = userEvent.setup();
+      screenFor();
+      await waitFor(() => expect(drawnOn(1)).toEqual(["a"]));
+      await user.click(within(entryOf("a")).getByRole("button", { name: /^Edit note of/ }));
+      await user.type(screen.getByRole("textbox", { name: "Note" }), " changed");
+      act(() => f.fail(new PdfOpenError("locked")));
+      await expectState("Project locked", SENTENCES.locked);
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.body.textContent).not.toContain("old changed");
+      const { navigate } = await import("../navigation");
+      act(() => navigate("/elsewhere"));
+      expect(window.location.pathname).toBe("/elsewhere");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      window.history.replaceState(null, "", "/");
+    });
+
+    it("deleting the chosen highlight leaves nothing chosen: a list asked again with it back does not mark it", async () => {
+      serveDocument();
+      let lists = 0;
+      serveAnnotations([], () => {
+        lists++;
+        return HttpResponse.json({ annotations: [rec({ id: "a" }), rec({ id: "b" })], count: 2, textChars: 0 }) as unknown as Response;
+      });
+      // The delete is answered, then a later change 404s and the list is asked again: "b" is back (restored elsewhere).
+      serveChanges((m, id) => (m === "DELETE" ? (HttpResponse.json({ deleted: true, id }) as unknown as Response) : (serviceError(404, "NOT_FOUND", "Not found.") as unknown as Response)));
+      openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
+      const user = userEvent.setup();
+      screenFor();
+      const page = await screen.findByRole("region", { name: "Page 1 of 2" });
+      await waitFor(() => expect(drawnOn(1)).toEqual(["a", "b"]));
+      const mark = document.querySelector<HTMLElement>('[data-annotation="b"]')!;
+      fireEvent.click(page, { clientX: parseFloat(mark.style.left) + 5, clientY: parseFloat(mark.style.top) + 5 });
+      await waitFor(() => expect(entryOf("b").getAttribute("aria-current")).toBe("true"));
+      await user.click(within(entryOf("b")).getByRole("button", { name: /^Delete/ }));
+      await user.click(screen.getByRole("button", { name: "Delete" }));
+      await waitFor(() => expect(drawnOn(1)).toEqual(["a"]));
+      await user.click(within(entryOf("a")).getByRole("button", { name: /^Colour of/ }));
+      await user.click(screen.getByRole("menuitemradio", { name: "Red" }));
+      await waitFor(() => expect(lists).toBe(2));
+      await waitFor(() => expect(drawnOn(1)).toEqual(["a", "b"]));
+      expect(entryOf("b").getAttribute("aria-current")).toBeNull();
+      expect(document.querySelector('[data-annotation="b"]')!.classList.contains("ao-hl--selected")).toBe(false);
+    });
   });
 });

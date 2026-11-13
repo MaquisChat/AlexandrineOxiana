@@ -16,12 +16,17 @@ import {
   AnnotationList,
   AnswerDropped,
   HIGHLIGHT_CHANGED_SENTENCE,
+  ListBroughtUpToDate,
+  LIST_BROUGHT_UP_TO_DATE,
   missingNoteSentence,
   missingPageSentence,
+  offsetsOf,
   PLACE_UNKNOWN,
   WINDOW_FROM,
+  windowOf,
   type AnnotationListProps,
 } from "./AnnotationList";
+import { navigate } from "../navigation";
 
 afterEach(() => cleanup());
 
@@ -102,7 +107,9 @@ describe("AnnotationList (Task R9)", () => {
     expect(first.textContent).toContain("Green");
     expect(first.textContent).toContain("Page 1 (vii)");
     expect(first.textContent).toContain("Imported from Zotero");
-    expect(first.textContent).toContain("Ngozi Okafor");
+    // No author for now (A13): the importer cannot tell Zotero's author from the computer's user.
+    expect(first.textContent).not.toContain("Ngozi Okafor");
+    expect(first.textContent).not.toContain(" by ");
     // The quote and the note through UserText (dir="auto").
     expect(within(first).getByText("informal markets").getAttribute("dir")).toBe("auto");
     expect(within(first).getByText("key claim").getAttribute("dir")).toBe("auto");
@@ -279,8 +286,9 @@ describe("AnnotationList (Task R9)", () => {
     expect(document.activeElement).toBe(area);
     expect(area.value).toBe("old note");
     await user.type(area, " and more");
-    // Escape restores what was there; nothing is sent.
+    // Escape restores what was there (after the question, the text having changed); nothing is sent.
     await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "Discard" }));
     expect(screen.queryByRole("textbox", { name: "Note" })).toBeNull();
     expect(entry("a").textContent).toContain("old note");
     expect(entry("a").textContent).not.toContain("and more");
@@ -290,6 +298,7 @@ describe("AnnotationList (Task R9)", () => {
     // Cancel too.
     await user.type(screen.getByRole("textbox", { name: "Note" }), "!");
     await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Discard" }));
     expect(entry("a").textContent).not.toContain("old note!");
     expect(answers).toEqual([]);
     // While one note is edited, the other entries stay usable.
@@ -572,5 +581,223 @@ describe("AnnotationList (Task R9)", () => {
     expect(swatches.map((s) => [...s.classList].find((c) => c.startsWith("ao-ann-swatch--")))).toEqual(names.map((n) => `ao-ann-swatch--${n}`));
     for (const s of swatches) expect(s.getAttribute("style")).toBeNull();
     expect(entry("a").querySelector(".ao-ann-swatch--yellow")).not.toBeNull();
+  });
+});
+
+describe("AnnotationList, fix round 1 (A13, Ruling R216)", () => {
+  const discardDialog = () => screen.getByRole("dialog", { name: "Discard this note?" });
+
+  it("a changed note asks Discard this note? before Escape or Cancel abandon it; the dialog manages focus (R192 e, R145)", async () => {
+    const answers: string[] = [];
+    const user = userEvent.setup();
+    render(
+      <div>
+        <button type="button">Outside</button>
+        <Harness initial={[rec({ id: "a", body: "old note" })]} answer={(w) => void answers.push(w)} />
+      </div>,
+    );
+    const edit = within(entry("a")).getByRole("button", { name: /^Edit note of/ });
+    // Unchanged: Escape closes at once, no question.
+    await user.click(edit);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "Note" })).toBeNull();
+    expect(document.activeElement).toBe(edit);
+    // Changed, then Escape: the question.
+    await user.click(edit);
+    const area = screen.getByRole("textbox", { name: "Note" });
+    await user.type(area, " and more");
+    await user.keyboard("{Escape}");
+    const dialog = discardDialog();
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    const [discard, keep] = [within(dialog).getByRole("button", { name: "Discard" }), within(dialog).getByRole("button", { name: "Keep editing" })];
+    expect(document.activeElement).toBe(keep);
+    await user.keyboard("{Tab}");
+    expect(document.activeElement).toBe(discard);
+    await user.keyboard("{Tab}");
+    expect(document.activeElement).toBe(keep);
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(document.activeElement).toBe(discard);
+    expect(screen.getByRole("button", { name: "Outside", hidden: true }).closest("[inert]")).not.toBeNull();
+    // Keep editing: the text is still there, the focus back in it.
+    await user.click(keep);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.querySelector("[inert]")).toBeNull();
+    expect((screen.getByRole("textbox", { name: "Note" }) as HTMLTextAreaElement).value).toBe("old note and more");
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Note" }));
+    // Escape in the question keeps editing too.
+    await user.keyboard("{Escape}");
+    expect(discardDialog()).toBeTruthy();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Note" }));
+    // Cancel asks too; Discard abandons it: the old note, the focus on its button, nothing sent.
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(within(discardDialog()).getByRole("button", { name: "Discard" }));
+    expect(screen.queryByRole("textbox", { name: "Note" })).toBeNull();
+    expect(entry("a").textContent).toContain("old note");
+    expect(entry("a").textContent).not.toContain("and more");
+    expect(document.activeElement).toBe(edit);
+    expect(answers).toEqual([]);
+  });
+
+  it("leaving through the app's navigation with a changed note asks first; an unchanged note or a list that went asks nothing", async () => {
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    const user = userEvent.setup();
+    const r = render(<Harness initial={[rec({ id: "a", body: "old note" })]} />);
+    await user.click(within(entry("a")).getByRole("button", { name: /^Edit note of/ }));
+    // Unchanged: nothing holds the way out.
+    act(() => navigate("/reader?project=p1&source=s1&asset=a2"));
+    expect(window.location.search).toBe("?project=p1&source=s1&asset=a2");
+    act(() => window.history.replaceState(null, "", "/reader?project=p1&source=s1"));
+    await user.type(screen.getByRole("textbox", { name: "Note" }), "!");
+    act(() => navigate("/"));
+    expect(window.location.pathname).toBe("/reader");
+    expect(document.activeElement).toBe(within(discardDialog()).getByRole("button", { name: "Keep editing" }));
+    await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(window.location.pathname).toBe("/reader");
+    expect((screen.getByRole("textbox", { name: "Note" }) as HTMLTextAreaElement).value).toBe("old note!");
+    act(() => navigate("/"));
+    await user.click(within(discardDialog()).getByRole("button", { name: "Discard" }));
+    expect(window.location.pathname).toBe("/");
+    // A list that goes (the reader ended) with a changed draft asks nothing and holds nothing.
+    act(() => window.history.replaceState(null, "", "/reader?project=p1&source=s1"));
+    await user.click(within(entry("a")).getByRole("button", { name: /^Edit note of/ }));
+    await user.type(screen.getByRole("textbox", { name: "Note" }), "?");
+    r.unmount();
+    act(() => navigate("/"));
+    expect(window.location.pathname).toBe("/");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("while a save is pending the entry's other controls are disabled and it says Saving…; recolour and delete pressed meanwhile do nothing unseen", async () => {
+    let release: () => void = () => {};
+    const answers: string[] = [];
+    const user = userEvent.setup();
+    render(
+      <Harness
+        initial={[rec({ id: "a", body: "old" }), rec({ id: "b" })]}
+        answer={(w) => {
+          answers.push(w);
+          if (w.startsWith("note")) return new Promise<void>((r) => (release = r));
+        }}
+      />,
+    );
+    await user.click(within(entry("a")).getByRole("button", { name: /^Edit note of/ }));
+    await user.type(screen.getByRole("textbox", { name: "Note" }), " new");
+    await user.click(screen.getByRole("button", { name: "Save note" }));
+    expect(entry("a").textContent).toContain("Saving…");
+    expect(live().textContent).toBe("Saving…");
+    const colour = within(entry("a")).getByRole("button", { name: /^Colour of/ });
+    const del = within(entry("a")).getByRole("button", { name: /^Delete/ });
+    expect(colour.getAttribute("aria-disabled")).toBe("true");
+    expect(del.getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByRole("button", { name: "Save note" }).getAttribute("aria-disabled")).toBe("true");
+    await user.click(colour);
+    expect(screen.queryByRole("menu")).toBeNull();
+    await user.click(del);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // The other entries stay usable.
+    expect(within(entry("b")).getByRole("button", { name: /^Colour of/ }).getAttribute("aria-disabled")).toBeNull();
+    await act(async () => release());
+    await waitFor(() => expect(live().textContent).toBe("Note saved."));
+    expect(entry("a").textContent).not.toContain("Saving…");
+    expect(within(entry("a")).getByRole("button", { name: /^Colour of/ }).getAttribute("aria-disabled")).toBeNull();
+    expect(answers).toEqual([`note a "old new"`]);
+  });
+
+  it("a save answered after a newer draft was begun keeps the newer draft", async () => {
+    let release: () => void = () => {};
+    const user = userEvent.setup();
+    render(<Harness initial={[rec({ id: "a", body: "old" })]} answer={() => new Promise<void>((r) => (release = r))} />);
+    await user.click(within(entry("a")).getByRole("button", { name: /^Edit note of/ }));
+    const area = screen.getByRole("textbox", { name: "Note" }) as HTMLTextAreaElement;
+    await user.clear(area);
+    await user.type(area, "first");
+    await user.click(screen.getByRole("button", { name: "Save note" }));
+    // Typing on while it is on its way.
+    await user.type(area, " and second");
+    await act(async () => release());
+    await waitFor(() => expect(live().textContent).toBe("Note saved."));
+    const still = screen.getByRole("textbox", { name: "Note" }) as HTMLTextAreaElement;
+    expect(still.value).toBe("first and second");
+    expect(screen.getByRole("button", { name: "Save note" }).getAttribute("aria-disabled")).toBeNull();
+    // The draft is changed against what was saved: leaving it asks.
+    await user.keyboard("{Escape}");
+    expect(discardDialog()).toBeTruthy();
+  });
+
+  it("an annotation on another file of the source (a PDF or an EPUB) is read only there, with no Delete and no sentence of a lost place; only one with no anchor is Not placed on a page (A13)", () => {
+    list({
+      annotations: [
+        rec({ id: "here" }),
+        rec({ id: "epub", pdfAnchors: [], otherAnchorKinds: ["epub-cfi"], quote: "an EPUB passage", imported: true }),
+        rec({ id: "pdf2", assetId: "a2", page: 4 }),
+        rec({ id: "none", pdfAnchors: [], otherAnchorKinds: [], quote: "a place lost" }),
+      ],
+    });
+    const other = screen.getByRole("list", { name: "On another file of this source (2)" });
+    for (const id of ["epub", "pdf2"]) {
+      const e = entry(id);
+      expect(other.contains(e)).toBe(true);
+      expect(e.textContent).not.toContain(PLACE_UNKNOWN);
+      expect(within(e).queryByRole("button", { name: /^Delete/ })).toBeNull();
+      for (const b of within(e).getAllByRole("button")) expect((b as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect(within(entry("epub")).getByRole("button", { name: /^Go to/ }).getAttribute("aria-label")).toMatch(/^Go to yellow highlight on another file/);
+    const nowhere = screen.getByRole("list", { name: "Not placed on a page (1)" });
+    expect(nowhere.contains(entry("none"))).toBe(true);
+    expect(entry("none").textContent).toContain(PLACE_UNKNOWN);
+  });
+
+  it("the list sorts itself by R1's rule, over the anchors on the file being read (A13)", () => {
+    const at = (id: string, page: number, sortIndex: string, assetId = "a1") => ({ id: `${id}-${assetId}`, assetId, page, rects: [{ x: 50, y: 700, w: 10, h: 10 }], sortIndex, sortIndexDerived: false });
+    const p5 = rec({ id: "p5", pdfAnchors: [at("p5", 5, "00004|000000|00100")] });
+    const p1b = rec({ id: "p1b", pdfAnchors: [at("p1b", 1, "00000|000500|00100")] });
+    const p1a = rec({ id: "p1a", pdfAnchors: [at("p1a", 1, "00000|000010|00100")] });
+    // On page 1 of another file and page 3 of this one: the service puts it after page 5 of this file.
+    const two = rec({ id: "two", pdfAnchors: [at("two", 1, "00000|000000|00000", "a2"), at("two", 3, "00002|000000|00100")] });
+    list({ annotations: [p5, p1b, p1a, two] });
+    expect(entries().map((e) => e.dataset.entry)).toEqual(["p1a", "p1b", "two", "p5"]);
+    expect(entry("two").textContent).toContain("Page 3");
+  });
+
+  it("a change answered 'no longer there' says so for the list, which the screen brings up to date", async () => {
+    const user = userEvent.setup();
+    list({ annotations: [rec({ id: "a" }), rec({ id: "b" })], onRecolour: () => Promise.reject(new ListBroughtUpToDate()) });
+    expect(LIST_BROUGHT_UP_TO_DATE).toBe("That highlight or note was no longer there. The list has been brought up to date.");
+    await user.click(within(entry("a")).getByRole("button", { name: /^Colour of/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Red" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(LIST_BROUGHT_UP_TO_DATE);
+    expect(entry("a").contains(alert)).toBe(false);
+  });
+
+  it("the window's arithmetic: offsets from measured heights, and the entries in view", () => {
+    expect(offsetsOf([10, 20, 30])).toEqual([0, 10, 30, 60]);
+    const offsets = offsetsOf([100, 400, 100, 100, 100, 100]);
+    // A view of 150 px from 50: entries 0 and 1 (0-100, 100-500), with no overscan.
+    expect(windowOf(offsets, 50, 150, 0)).toEqual([0, 2]);
+    // From 520: entries 2 (500-600) and 3 (600-700).
+    expect(windowOf(offsets, 520, 150, 0)).toEqual([2, 4]);
+    expect(windowOf(offsets, 520, 150, 1)).toEqual([1, 5]);
+    // Past the end, and before the start.
+    expect(windowOf(offsets, 5000, 150, 2)).toEqual([4, 6]);
+    expect(windowOf(offsets, -100, 50, 0)).toEqual([0, 0]);
+  });
+
+  it("past 500, an entry has its own measured height: nothing is cut off, the next one starts below it", async () => {
+    const many = Array.from({ length: 600 }, (_, i) => rec({ id: `n${i}`, quote: `Quote ${i}` }));
+    // Heights as a browser would measure them: entry 1 is tall (a long note).
+    const spy = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.dataset.entry === "n1" ? 900 : this.dataset.entry ? 120 : 0;
+    });
+    list({ annotations: many });
+    await waitFor(() => expect(entry("n2").style.top).toBe("1020px"));
+    expect(entry("n1").style.top).toBe("120px");
+    expect(entry("n1").style.height).toBe("");
+    expect(entry("n1").className).not.toContain("--slot-fixed");
+    spy.mockRestore();
   });
 });
