@@ -40,6 +40,14 @@ const MB = 1024 * 1024;
  * stand-in answers synchronously and can hold the worker's event loop for seconds, and a run stopped from outside
  * would lose console output still queued for the test runner.
  */
+/** The live heap: heapUsed right after a forced full collection (the scale configuration passes --expose-gc). */
+const liveHeap = (): number => {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (!gc) throw new Error("run with --expose-gc (pnpm test:scale)");
+  gc();
+  return process.memoryUsage().heapUsed;
+};
+
 const progress = (line: string): void => {
   const to = process.env.AO_SCALE_LOG;
   if (to) appendFileSync(to, `${new Date().toISOString()} ${line}\n`);
@@ -117,6 +125,7 @@ describe("Zotero Web files at scale (Z4)", () => {
       const first = await h.done;
       expect(first.state).toBe("paused");
       const firstMs = Date.now() - started;
+      const liveAtSuspend = liveHeap();
       const v1 = z.libraryVersion(U);
       // Meanwhile the researcher edits, in Zotero, an item the first part brought in (its journal says which).
       const journal = (await readFile(join(lib.root, p.folder, "imports", "batch-0001", "journal.jsonl"), "utf8")).split("\n").filter(Boolean);
@@ -138,6 +147,7 @@ describe("Zotero Web files at scale (Z4)", () => {
         setGlobalDispatcher(previous);
       }
       const ms = Date.now() - started;
+      const liveAtEnd = liveHeap();
       expect(second.state).toBe("finished");
       expect(second.counts.failed).toBe(0);
       expect(second.counts.created + second.counts.needsReview).toBe(N);
@@ -169,13 +179,15 @@ describe("Zotero Web files at scale (Z4)", () => {
       peakHeap = Math.max(peakHeap, process.memoryUsage().heapUsed);
       const requests = z.requests.length;
       console.log(
-        `zotero web ${N} items with files: part one ${firstMs} ms (${first.counts.created + first.counts.needsReview} items), in all ${ms} ms; ${requests} requests (${perFile.size} file, ${storage} storage); peak heap ${Math.round(peakHeap / MB)} MB, peak RSS ${Math.round(peakRss / MB)} MB`,
+        `zotero web ${N} items with files: part one ${firstMs} ms (${first.counts.created + first.counts.needsReview} items), in all ${ms} ms; ${requests} requests (${perFile.size} file, ${storage} storage); live heap ${Math.round(liveAtSuspend / MB)} MB at the suspend, ${Math.round(liveAtEnd / MB)} MB at the end; peak heap ${Math.round(peakHeap / MB)} MB, peak RSS ${Math.round(peakRss / MB)} MB`,
       );
-      // R64 / the task's bound: heap under 300 MB (the process runs with its old space capped, vitest.scale.config.ts).
-      expect(peakHeap).toBeLessThan(300 * MB);
-      // The resident size is printed above, not bounded (the coordinator's ruling after Z4's review): it depends on the
-      // allocator and the runner, and this process also holds the stand-in (24,000 Zotero objects, 12,000 files, its
-      // log of every request), which the app's process does not. The task's bound is the heap.
+      // R64 / the task's bound (ruled after Z4's review, N2): the LIVE heap, after a forced full collection, stays under
+      // 300 MB at the suspend and at the end, the process running under the plan's cap (--max-old-space-size=512,
+      // vitest.scale.config.ts). The peak heap and the resident size are printed, not bounded: they depend on when V8
+      // collects, on the allocator and on the runner, and this process also holds the stand-in (24,000 Zotero objects,
+      // 12,000 files, its log of every request), which the app's process does not.
+      expect(liveAtSuspend).toBeLessThan(300 * MB);
+      expect(liveAtEnd).toBeLessThan(300 * MB);
     } finally {
       clearInterval(timer);
       await z.agent.close();
