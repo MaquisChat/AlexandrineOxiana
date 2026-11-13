@@ -72,7 +72,7 @@ describe("textUnderRects", () => {
     let task: ReturnType<typeof getDocument>;
     let text: TextContent;
     beforeAll(async () => {
-      task = getDocument({ data: new Uint8Array(await buildRotatedCropPdf()), isEvalSupported: false, useSystemFonts: false, verbosity: 0 });
+      task = getDocument({ data: new Uint8Array(await buildRotatedCropPdf()), useSystemFonts: false, verbosity: 0 });
       text = await (await (await task.promise).getPage(1)).getTextContent();
     });
     afterAll(async () => {

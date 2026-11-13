@@ -21,7 +21,7 @@ let page: PDFPageProxy;
 let line: { str: string; transform: number[]; width: number; height: number };
 
 beforeAll(async () => {
-  task = getDocument({ data: new Uint8Array(await buildRotatedCropPdf()), isEvalSupported: false, useSystemFonts: false, verbosity: 0 });
+  task = getDocument({ data: new Uint8Array(await buildRotatedCropPdf()), useSystemFonts: false, verbosity: 0 });
   page = await (await task.promise).getPage(1);
   const text = await page.getTextContent();
   line = text.items.find((i) => "str" in i && i.str.startsWith("The ferry")) as typeof line;
