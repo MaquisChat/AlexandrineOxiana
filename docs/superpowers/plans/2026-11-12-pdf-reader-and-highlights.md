@@ -280,3 +280,24 @@
 - After R3: **R4**. After R6: **R7**. R4 and R7 can run side by side.
 - After R4 and R7: **R8**, then **R9**; then **R10** and **R12** in parallel; then **R11**; **R13** last and only if the coordinator keeps it.
 - Every UI task's end-to-end check runs in both the `chromium` and `webkit` projects; a WebKit-only failure is a failure.
+
+## Amendments (they override the task sections above; newest last)
+
+**A1 — Ruling R195 (2026-11-13, after the review of R1): the order of annotations within a page.**
+- R1: `compareAnnotations` (or whatever R1 names its comparison) orders by page first. Within one page: if EVERY annotation on that page carries a stored `sortIndex`, they are ordered by it; if any one lacks it, the whole page is ordered geometrically (top to bottom, then left to right, from the anchors' rectangles). The two rules are never mixed within a page, so the order is always total and stable.
+- R2: besides keeping Zotero's sort index for newly imported annotations, a re-import fills in the missing `sortIndex` of an annotation that was imported before this plan and is otherwise unchanged — without marking it edited, without changing its hash, and never on an annotation the researcher has changed or deleted. Test first: `a re-import back-fills the sort index of an unchanged imported annotation and reports no change`.
+- R10 and R11: every highlight and page note made in the reader stores a `sortIndex` built from its position in the page's text (the same form as Zotero's), so that reading order holds in two-column pages. Test first in R10: `a highlight made in column two sorts after one made at the foot of column one`.
+
+**A2 — Ruling R195 (same date): matching a search hit's words.**
+- R1's `matchAnnotations` splits and folds words by the SAME rules as the search index (`packages/library/src/index/text.ts`): punctuation separates words, a query word matches the beginning of a word as the index does, and Chinese, Japanese and Korean text is matched as the index matches it; accent folding never breaks Hangul apart and never makes one kana match another. The rule lives in one place: the pure function is moved to `packages/core` and the library imports it with no change of behaviour (every index test passes untouched), or, if it cannot be moved without changing behaviour, it is replicated in core with a test that holds the two equal over one shared list of examples.
+
+**A3 — What Task R1 exports, as built (2026-11-13).** Wherever a task section above names `annotationSortKey` or `derivedSortIndex`, use this instead; those two no longer exist.
+- `sortAnnotations<T extends Annotation>(list: readonly T[]): T[]` — the one way to order a document's annotations (page, then the rule of A1). Every list, overlay and jump order comes from it.
+- `matchAnnotations(list: readonly Pick<Annotation, "id" | "quote" | "body">[], words: string): string[]` — ids in the order of the list given, so sort first.
+- `pdfSortIndex(...)` and `SORT_INDEX_PATTERN` (building and checking a sort index), the `PdfAnchor` type, `highlightColourOf` and the named colour set as the R1 section gives them.
+- The word and CJK splitting used by both the search index and the matcher lives in `packages/core/src/annotations/words.ts` (`latinWords`, `cjkRuns`); `packages/library/src/index/text.ts` imports it. A task that needs to split words uses these and writes no rule of its own.
+
+**A4 — after the re-review of R1 (2026-11-13).**
+- `sortAnnotations` and `matchAnnotations` are always given the annotations of ONE document (one asset): a source can hold several PDFs, and page 3 of one is not page 3 of another. R8, R9 and R12 filter by the open asset first.
+- R12: matching a search hit's words against a document's annotations can take over a second at the 16 MB cap; it runs after the reader has drawn, never on the path that opens the document, and the list says "Looking for the words…" until it is done.
+- Known and accepted for now: a word broken across a line end with a hyphen in the PDF's text ("self-" / "evident") can be found by the search index and missed by the matcher; the reader then opens on the whole list with the plan's stated sentence.
