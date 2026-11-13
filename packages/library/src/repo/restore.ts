@@ -58,6 +58,7 @@ import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError } from "./errors.js";
 import { decryptBytes, encryptBytes, foldName, namesIn, openLine, readMaybe, sealLine } from "./io.js";
 import { appendLibraryRefusal } from "./library-audit.js";
+import { SEALED_LINE_PURPOSES } from "./sealed-purposes.js";
 import { loadProjectFolder, parseProjectJson, type Manifest, type ProjectState, type RepoCore } from "./state.js";
 import { listSourceIds, readSourceFile } from "./sources.js";
 
@@ -108,7 +109,6 @@ export class DestructionRecordError extends RestoreError {
   }
 }
 
-const SEALED_PURPOSES = ["ao-changes", "ao-review", "ao-import-journal"];
 
 /** Every kind of storage the library's folder may be on, as the policy engine is asked (as for a backup, R125). */
 export type RestoreDestinations = NonNullable<PolicyRequest["restore"]>["destinations"];
@@ -723,11 +723,20 @@ export async function adoptRestoredProject(
               out.push(line);
               continue;
             }
-            const o = JSON.parse(line) as { ct?: unknown; nonce?: unknown };
+            // The find queue keeps the lines it cannot read, whole (a newer build's, a damaged one): so does a restore (R226 b).
+            const keepsUnreadable = f.startsWith("find/");
+            let o: { ct?: unknown; nonce?: unknown };
+            try {
+              o = JSON.parse(line) as { ct?: unknown; nonce?: unknown };
+            } catch (err) {
+              if (!keepsUnreadable) throw err;
+              out.push(line);
+              continue;
+            }
             if (typeof o.ct === "string" && typeof o.nonce === "string") {
               if (!key) throw new UnreadableBackupError("The backup holds sealed records but no key");
               let opened: { json: string; purpose: string } | undefined;
-              for (const purpose of SEALED_PURPOSES) {
+              for (const purpose of SEALED_LINE_PURPOSES) {
                 try {
                   opened = { json: openLine(key, old.id, line, purpose), purpose };
                   break;
@@ -735,7 +744,13 @@ export async function adoptRestoredProject(
                   // another purpose
                 }
               }
-              if (!opened) throw new UnreadableBackupError("A sealed record in the backup cannot be read");
+              if (!opened) {
+                if (keepsUnreadable) {
+                  out.push(line);
+                  continue;
+                }
+                throw new UnreadableBackupError("A sealed record in the backup cannot be read");
+              }
               out.push(sealLine(key, keyId!, newProjectId, JSON.stringify(map(JSON.parse(opened.json))), opened.purpose));
             } else out.push(JSON.stringify(map(o)));
           }

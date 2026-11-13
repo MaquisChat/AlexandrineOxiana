@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir as mkdirp, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type AuditEvent, type Project } from "@ao/core";
@@ -13,9 +13,9 @@ import type { RepoCore } from "../repo/state.js";
 import { SimulatedCrash, openTestRepo, seams, type CrashPoint } from "../repo/testing.js";
 import type { WorkCandidate } from "./candidates.js";
 import {
-  FIND_COMPACT_BYTES,
   FindEntryTooLargeError,
   FindQueueFullError,
+  FindQueueUnreadableError,
   appendFindEntries,
   compactFindQueue,
   readFindQueue,
@@ -74,6 +74,7 @@ const project = async (encrypted = false): Promise<Project> =>
     })
   ).project;
 
+const MB4 = 4 * 1024 * 1024;
 const NOW = "2026-11-13T10:00:00.000Z";
 const candidate = (extra: Partial<WorkCandidate> = {}): WorkCandidate => ({
   id: "cand-1",
@@ -243,7 +244,7 @@ describe("the queue in the project (Task F3)", () => {
     await append(p, [a, b], "add");
     await append(p, [{ ...a, state: "not-found" }], "update");
     await append(p, [b], "remove");
-    const evs = await findEvents(p);
+    const evs = (await findEvents(p)).filter((e) => e.details!.op !== FIND_QUEUE_OPS.compact);
     expect(evs).toHaveLength(3);
     expect(evs[0]!.details).toMatchObject({ op: "project.find.add", entries: [a.id, b.id], count: 2, txn: expect.any(String) });
     expect((evs[0]!.details as { states: Record<string, number> }).states).toMatchObject({ "looking-up": 1, choose: 1, "not-found": 0 });
@@ -299,19 +300,21 @@ describe("the queue in the project (Task F3)", () => {
   it("a line over 64 KiB is refused before anything is written, in words that say what to do; one just under is kept", async () => {
     for (const encrypted of [false, true]) {
       const p = await project(encrypted);
-      const big = (n: number) => entry(p, { candidates: [candidate({ title: "t".repeat(n) })] });
+      const big = (n: number) => entry(p, { state: "choose-works", works: Array.from({ length: n }, (_, i) => candidate({ id: `w${i}`, title: "t".repeat(1000) })) });
       let over: Error | undefined;
       try {
-        await append(p, [big(FIND_LINE_MAX_BYTES)]);
+        await append(p, [big(60)]);
       } catch (e) {
         over = e as Error;
       }
       expect(over).toBeInstanceOf(FindEntryTooLargeError);
       expect(over!.message).toMatch(/too large/iu);
       expect(over!.message).not.toContain("ttttt");
+      expect(JSON.stringify(big(60)).length).toBeGreaterThan(FIND_LINE_MAX_BYTES);
+      expect(JSON.stringify(big(50)).length).toBeLessThan(FIND_LINE_MAX_BYTES);
       await expect(stat(join(lib.root, p.folder, "find"))).rejects.toMatchObject({ code: "ENOENT" });
       expect(await findEvents(p)).toEqual([]);
-      const ok = big(FIND_LINE_MAX_BYTES - 1_000);
+      const ok = big(50);
       await append(p, [ok]);
       expect((await read(p)).get(ok.id)).toEqual(ok);
     }
@@ -364,7 +367,7 @@ describe("the queue in the project (Task F3)", () => {
       const before = await readFile(queueFile(p));
       const detail = await readFindQueueDetailed(coreOf(), p.id);
       expect([...detail.entries.keys()]).toEqual([a.id, b.id]);
-      expect(detail.skipped).toBe(junk.length);
+      expect(detail.unreadableLines).toBe(junk.length);
       expect(await readFile(queueFile(p))).toEqual(before); // reading deletes nothing
       expect([...(await read(p)).keys()]).toEqual([a.id, b.id]);
       await append(p, [{ ...b, state: "failed" }], "update");
@@ -420,7 +423,7 @@ describe("the queue in the project (Task F3)", () => {
         expect([...(await read(p)).values()]).toEqual(folded);
         expect(await readFile(queueFile(p), "utf8")).not.toContain("removed Zorblatt");
         const ev = (await findEvents(p, FIND_QUEUE_OPS.compact)).at(-1)!;
-        expect(ev.details).toMatchObject({ op: "project.find.compact", count: 2, linesBefore, linesAfter: 2, txn: expect.any(String) });
+        expect(ev.details).toMatchObject({ op: "project.find.compact", count: 2, linesBefore, linesAfter: 2, unreadable: 0, txn: expect.any(String) });
         expect(JSON.stringify(ev)).not.toContain("Quillfeather");
         expect(JSON.stringify(ev)).not.toContain("Zorblatt");
         expect(await txnMarkers()).toEqual([]);
@@ -436,26 +439,37 @@ describe("the queue in the project (Task F3)", () => {
       }
     });
 
-    it("runs only when the file passes 4 MB or holds more than 5 lines per live entry; otherwise it changes nothing and audits nothing", async () => {
+    it("is due when the lines that can be read outnumber the live entries more than twice, whatever the size; otherwise it changes nothing and audits nothing", async () => {
       const p = await project();
       const a = entry(p);
       const b = entry(p);
-      await append(p, [a, b]);
-      for (let i = 0; i < 4; i++) await append(p, [{ ...a, attempts: i + 1 }], "update"); // 6 lines for 2 live entries
+      await append(p, [a, b]); // 2 lines for 2 live entries
+      await append(p, [{ ...a, attempts: 1 }], "update"); // 3
+      await append(p, [{ ...a, attempts: 2 }], "update"); // 4: twice the 2 live entries is not more than twice
       const before = await readFile(queueFile(p));
+      expect(before.toString("utf8").trim().split("\n")).toHaveLength(4);
       await compactFindQueue(coreOf(), p.id);
       expect(await readFile(queueFile(p))).toEqual(before);
       expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
-      // 10 lines for 2 live entries is still not more than 5 per entry.
-      for (let i = 0; i < 4; i++) await append(p, [{ ...a, attempts: 10 + i }], "update");
-      expect(await rawLines(p)).toHaveLength(10);
-      expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
-      // The 11th line passes the rule: the append that wrote it compacts the file.
+      // The 5th line passes the rule: the append that wrote it compacts the file.
       await append(p, [{ ...a, attempts: 99 }], "update");
       expect(await rawLines(p)).toHaveLength(2);
       expect((await read(p)).get(a.id)?.attempts).toBe(99);
       expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toHaveLength(1);
     });
+
+    it("a large file of live entries is not rewritten at every update: 4.7 MB of 90 live entries, five updates, no compaction, one audit event per update", async () => {
+      const p = await project();
+      const works = (i: number) => Array.from({ length: 150 }, (_, k) => candidate({ id: `w${i}-${k}`, title: `Work ${i} ${k} ${"x".repeat(150)}` }));
+      const es = Array.from({ length: 90 }, (_, i) => entry(p, { state: "choose-works", works: works(i) }));
+      for (let i = 0; i < es.length; i += 10) await append(p, es.slice(i, i + 10));
+      expect((await stat(queueFile(p))).size).toBeGreaterThan(MB4);
+      expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
+      for (let i = 0; i < 5; i++) await append(p, [{ ...es[i]!, attempts: i + 1 }], "update");
+      expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
+      expect(await findEvents(p, FIND_QUEUE_OPS.update)).toHaveLength(5);
+      expect((await rawLines(p)).length).toBe(95);
+    }, 60_000);
 
     it("a file with tens of thousands of lines of history and few live entries stays readable, and the next write compacts it", async () => {
       const p = await project();
@@ -464,7 +478,7 @@ describe("the queue in the project (Task F3)", () => {
       await append(p, [a, b]);
       const history = Array.from({ length: 60_000 }, (_, i) => JSON.stringify({ ...a, attempts: i, updatedAt: `2026-11-13T10:${String(i % 60).padStart(2, "0")}:00.000Z` })).join("\n") + "\n";
       await appendFile(queueFile(p), history);
-      expect((await stat(queueFile(p))).size).toBeGreaterThan(FIND_COMPACT_BYTES);
+      expect((await stat(queueFile(p))).size).toBeGreaterThan(MB4);
       const q = await read(p); // readable meanwhile
       expect(q.size).toBe(2);
       expect(q.get(a.id)?.attempts).toBe(59_999);
@@ -486,8 +500,8 @@ describe("the queue in the project (Task F3)", () => {
           maxLines = Math.max(maxLines, (await rawLines(p)).length);
         }
       }
-      expect(maxLines).toBeLessThanOrEqual(FIND_QUEUE_MAX * 5 + 50);
-      expect((await stat(queueFile(p))).size).toBeLessThan(FIND_COMPACT_BYTES + FIND_LINE_MAX_BYTES * 50);
+      expect(maxLines).toBeLessThanOrEqual(FIND_QUEUE_MAX * 2 + 50);
+      expect((await stat(queueFile(p))).size).toBeLessThan(MB4);
       const q = await read(p);
       expect(q.size).toBe(FIND_QUEUE_MAX);
       expect([...q.values()].every((e) => e.attempts === 10)).toBe(true);
@@ -595,5 +609,206 @@ describe("the queue in the project (Task F3)", () => {
       await append(p, [entry(p)]);
       expect((await read(p)).size).toBe(2);
     });
+  });
+});
+
+describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot change the library, bounds and rules", () => {
+  const futureLine = (p: Project, sealed: boolean, extra: Record<string, unknown> = {}) => {
+    const core = coreOf();
+    const st = core.state(p.id);
+    const o = { ...entry(p), state: "translated-later", ...extra };
+    if (!sealed) return JSON.stringify(o);
+    const k = core.key(st);
+    return sealLine(k.key, k.keyId, p.id, JSON.stringify(o), "ao-find-queue");
+  };
+
+  for (const encrypted of [false, true]) {
+    it(`a newer build's line (an unknown state) survives five updates and a compaction, verbatim and in order (${encrypted ? "sealed" : "plain"})`, async () => {
+      const p = await project(encrypted);
+      const a = entry(p);
+      const b = entry(p);
+      await append(p, [a, b]);
+      const f1 = futureLine(p, encrypted, { typed: "first future" });
+      await appendFile(queueFile(p), `${f1}\n`);
+      await append(p, [{ ...a, attempts: 1 }], "update");
+      const f2 = futureLine(p, encrypted, { typed: "second future" });
+      await appendFile(queueFile(p), `${f2}\n`);
+      for (let i = 2; i <= 6; i++) await append(p, [{ ...a, attempts: i }], "update");
+      expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBeGreaterThanOrEqual(1);
+      const lines = await rawLines(p);
+      expect(lines.filter((l) => l === f1 || l === f2)).toEqual([f1, f2]); // verbatim, in order
+      expect(lines.length).toBe(4); // two entries and the two lines nobody could read
+      const d = await readFindQueueDetailed(coreOf(), p.id);
+      expect(d.unreadableLines).toBe(2);
+      expect(d.entries.get(a.id)?.attempts).toBe(6);
+      expect([...d.entries.keys()].sort()).toEqual([a.id, b.id].sort());
+      // The lines carried over do not count towards "due": nothing compacts again until real history builds up.
+      const n = (await findEvents(p, FIND_QUEUE_OPS.compact)).length;
+      await append(p, [{ ...b, attempts: 1 }], "update");
+      expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(n);
+    });
+  }
+
+  it("a torn line in the middle of the file (cut by a bad disk, ended by a later newline) survives a compaction", async () => {
+    const p = await project();
+    const a = entry(p);
+    await append(p, [a]);
+    await appendFile(queueFile(p), '{"id":"01a1d5de-c95e-7508-a8a2-ace1aaa9259a","typed":"cut off here\n');
+    for (let i = 1; i <= 4; i++) await append(p, [{ ...a, attempts: i }], "update");
+    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBeGreaterThanOrEqual(1);
+    const lines = await rawLines(p);
+    expect(lines).toContain('{"id":"01a1d5de-c95e-7508-a8a2-ace1aaa9259a","typed":"cut off here');
+    expect((await read(p)).get(a.id)?.attempts).toBe(4);
+  });
+
+  for (const encrypted of [false, true]) {
+    it(`a file in which no line can be read is refused, read and write alike, and left byte for byte (${encrypted ? "sealed" : "plain"})`, async () => {
+      const p = await project(encrypted);
+      const core = coreOf();
+      const st = core.state(p.id);
+      const k = encrypted ? core.key(st) : undefined;
+      // Every line fails to open: sealed for another file, or not JSON at all.
+      const other = k ? [1, 2, 3].map((i) => sealLine(k.key, k.keyId, p.id, JSON.stringify({ ...entry(p), typed: `n${i}` }), "ao-watch-register")) : ["{nope", "also not", "[1,2]"];
+      await mkdirp(join(lib.root, p.folder, "find"));
+      await writeFile(queueFile(p), other.map((l) => `${l}\n`).join(""), { mode: 0o600 });
+      const before = await readFile(queueFile(p));
+      const auditBefore = (await auditEvents(p)).length;
+      const msg = "The Find and acquire queue of this project could not be read. Nothing has been changed.";
+      for (const op of [() => read(p), () => readFindQueueDetailed(coreOf(), p.id), () => append(p, [entry(p)], "add"), () => append(p, [entry(p)], "update"), () => compactFindQueue(coreOf(), p.id)]) {
+        const err = await op().catch((e: unknown) => e as Error);
+        expect(err).toBeInstanceOf(FindQueueUnreadableError);
+        expect((err as Error).message).toBe(msg);
+      }
+      expect(await readFile(queueFile(p))).toEqual(before);
+      expect((await auditEvents(p)).length).toBe(auditBefore);
+      expect(await txnMarkers()).toEqual([]);
+    });
+  }
+
+  it("when more than half of the file's lines cannot be read, compaction does not run (and says so once); reads and appends go on", async () => {
+    const p = await project();
+    const a = entry(p);
+    await append(p, [a]);
+    await appendFile(queueFile(p), Array.from({ length: 12 }, (_, i) => `junk ${i}\n`).join(""));
+    const notes = () => coreOf().indexErrors.filter((e) => e.op === FIND_QUEUE_OPS.compact);
+    for (let i = 1; i <= 6; i++) await append(p, [{ ...a, attempts: i }], "update");
+    expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
+    expect((await rawLines(p)).length).toBe(19);
+    expect((await read(p)).get(a.id)?.attempts).toBe(6);
+    expect(notes()).toHaveLength(1);
+    expect(String((notes()[0]!.error as Error).message)).toMatch(/could not be read/u);
+    await compactFindQueue(coreOf(), p.id);
+    expect(notes()).toHaveLength(1);
+    expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
+  });
+
+  it("what a caller holds cannot change the library: entries from a read are frozen all the way down, and what was handed in is copied", async () => {
+    const p = await project();
+    const a = entry(p, { candidates: [candidate()] });
+    const b = entry(p);
+    await append(p, [a, b]);
+    const e = (await read(p)).get(a.id)!;
+    expect(() => {
+      e.candidates![0]!.title = "POISONED";
+    }).toThrow(TypeError);
+    expect(() => e.candidates!.push(candidate({ id: "x" }))).toThrow(TypeError);
+    expect(() => (e.candidates![0]!.creators as unknown[]).pop()).toThrow(TypeError);
+    // What the caller handed in is its own: changing it afterwards changes nothing in the library.
+    const mine = entry(p, { candidates: [candidate()] });
+    await append(p, [mine]);
+    mine.candidates![0]!.title = "POISONED TOO";
+    mine.candidates!.push(candidate({ id: "y" }));
+    for (let i = 1; i <= 12; i++) await append(p, [{ ...b, attempts: i }], "update"); // compactions run
+    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBeGreaterThanOrEqual(1);
+    expect(await readFile(queueFile(p), "utf8")).not.toContain("POISONED");
+    expect((await read(p)).get(a.id)?.candidates).toEqual([candidate()]);
+    expect((await read(p)).get(mine.id)?.candidates).toEqual([candidate()]);
+    for (const l of await rawLines(p)) expect(JSON.parse(l)).toHaveProperty("projectId", p.id);
+  });
+
+  it("M1: one add of 501 entries is a full queue, not a malformed list", async () => {
+    const p = await project();
+    await expect(append(p, Array.from({ length: FIND_QUEUE_MAX + 1 }, () => entry(p)))).rejects.toBeInstanceOf(FindQueueFullError);
+    await expect(stat(join(lib.root, p.folder, "find"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("M2: an id whose latest line is `removed` may be added again, before and after a compaction alike", async () => {
+    const p = await project();
+    const a = entry(p);
+    await append(p, [a]);
+    await append(p, [a], "remove");
+    await append(p, [{ ...a, typed: "again one" }], "add"); // before any compaction
+    expect((await read(p)).get(a.id)?.typed).toBe("again one");
+    await append(p, [{ ...a, typed: "again one" }], "remove");
+    await rawAppend(p, Array.from({ length: 3 }, (_, i) => ({ ...a, attempts: i, removed: true as const })));
+    await compactFindQueue(coreOf(), p.id);
+    expect(await readFile(queueFile(p))).toHaveLength(0);
+    await append(p, [{ ...a, typed: "again two" }], "add"); // after one
+    expect((await read(p)).get(a.id)?.typed).toBe("again two");
+    // A live one is still refused.
+    await expect(append(p, [a], "add")).rejects.toBeInstanceOf(InvalidInputError);
+  });
+
+  it("M4: ids are checked as ids; the plan's bounds are enforced by the store (refused with a plain sentence, never cut); unknown nested fields are dropped", async () => {
+    const p = await project();
+    const refused: Array<[string, Partial<FindEntry>]> = [
+      ["sourceId", { sourceId: "not-an-id" }],
+      ["duplicateOf", { duplicateOf: "../x" }],
+      ["parentId", { parentId: "x" }],
+      ["collectionId", { collectionId: "y" }],
+      ["title", { candidates: [candidate({ title: "t".repeat(1001) })] }],
+      ["name", { candidates: [candidate({ creators: [{ role: "author", family: "f".repeat(201) }] })] }],
+      ["creators", { candidates: [candidate({ creators: Array.from({ length: 101 }, () => ({ role: "author" as const, family: "F" })) })] }],
+      ["candidates", { candidates: Array.from({ length: 11 }, (_, i) => candidate({ id: `c${i}` })) }],
+      ["people", { people: Array.from({ length: 21 }, (_, i) => ({ id: `A${i}`, name: "N", worksCount: 1, sampleTitles: [] })) }],
+      ["works", { works: Array.from({ length: 201 }, (_, i) => candidate({ id: `w${i}` })) }],
+      ["type", { candidates: [candidate({ type: "spaceship" as never })] }],
+    ];
+    for (const [, extra] of refused) {
+      const err = await append(p, [entry(p, extra)]).catch((e: unknown) => e as Error);
+      expect(err).toBeInstanceOf(InvalidInputError);
+      expect((err as Error).message).toMatch(/not well formed|more than the queue keeps/u);
+      expect((err as Error).message).not.toContain("ttttt");
+    }
+    await expect(stat(join(lib.root, p.folder, "find"))).rejects.toMatchObject({ code: "ENOENT" });
+    // At the bounds: kept as given. Beyond what the type knows: dropped.
+    const exact = entry(p, {
+      state: "choose-person",
+      candidates: [{ ...candidate({ title: "t".repeat(1000), creators: Array.from({ length: 100 }, () => ({ role: "author" as const, family: "f".repeat(200) })) }), secret: "Quillfeather's diary" } as WorkCandidate],
+      people: [{ id: "A1", name: "n".repeat(200), worksCount: 3, sampleTitles: ["a", "b", "c"], hidden: "x" } as never],
+    });
+    await append(p, [exact]);
+    const raw = await readFile(queueFile(p), "utf8");
+    expect(raw).not.toContain("diary");
+    expect(raw).not.toContain('"hidden"');
+    expect((await read(p)).get(exact.id)?.candidates?.[0]?.title).toHaveLength(1000);
+  });
+
+  it("M5: an automatic compaction that fails leaves a note (the append itself stays committed)", async () => {
+    const p = await project();
+    const a = entry(p);
+    const b = entry(p);
+    await append(p, [a, b]);
+    const core = coreOf() as unknown as { clock: () => Date };
+    const real = core.clock.bind(core);
+    let calls = 0;
+    core.clock = () => (calls++, real());
+    await append(p, [{ ...a, attempts: 1 }], "update"); // line 3: not due
+    const perWrite = calls;
+    expect(perWrite).toBeGreaterThan(0);
+    await append(p, [{ ...a, attempts: 2 }], "update"); // line 4: not due
+    calls = 0;
+    core.clock = () => {
+      if (++calls > perWrite) throw new Error("the clock broke");
+      return real();
+    };
+    await append(p, [{ ...a, attempts: 3 }], "update"); // line 5: due; the compaction fails after the append
+    core.clock = real;
+    expect((await read(p)).get(a.id)?.attempts).toBe(3);
+    expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
+    expect(coreOf().indexErrors.filter((e) => e.op === FIND_QUEUE_OPS.compact)).toHaveLength(1);
+    expect(await txnMarkers()).toEqual([]);
+    await append(p, [{ ...a, attempts: 4 }], "update"); // the next write tries again, and now it works
+    expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
   });
 });
