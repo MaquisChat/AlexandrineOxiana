@@ -581,10 +581,12 @@ Update after every task; commit and push.
 | R7 Reader: the reader screen | done (GitHub's run not made, R202) | 7282059 (reader branch) | reviewed over two fix rounds (R203, R205); verified with the desktop build; one e2e failure in an untouched file under load, passed alone (R173). Owner's Mac checks: sharpness at 300% and 400%, memory on a large scan, momentum scrolling, VoiceOver |
 | R8 Reader: highlights drawn in place | dispatched | — | Opus implementer; brief `task-R8-brief.md` |
 | R9–R13 Reader: the remaining tasks | not started | | order: R9 (after R8); R10 and R12 in parallel; R11; R13 optional, decided after R11 |
-| Z1 Zotero sync: a stand-in for Zotero's servers | fix round 2 (small) | 970d0c3 (worktree branch `worktree-agent-a262efde0a50e5b62`) | re-review: I1–I4 closed; one new Important (error clean-up broke aborts); then the controller's reading and verification |
-| Z2–Z12 Zotero sync: the remaining tasks | planned | — | order: Z2; Z3 and Z4; Z5; Z6; Z7; Z8; Z9; Z10 (the scheduler, only after the screen); Z11; Z12 after reader R12. Owner's questions in the ledger under R206 |
-| W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | fix round 2 (small) | 0d5b23a (worktree branch `worktree-agent-a375d680f9f00695a`) | re-review: C1 and I1 closed; two new Important (rounded time; listener leak) — A4; then the controller's reading and verification |
-| W2–W10 Cloud folders: the remaining tasks | planned | — | order: W2; W6 beside it; W3; W4; W7; W8 and W9; W10. Owner's questions in the ledger under R207 |
+| Z1 Zotero sync: a stand-in for Zotero's servers | done (GitHub's run not made, R202) | 4e320e1 (reader branch) | test code; reviewed against Zotero's documentation over two fix rounds; what only a real account can prove is listed in the plan (A3) |
+| Z2 Zotero sync: the Web import made fit to run unattended | dispatched | — | Opus implementer; brief `task-Z2-brief.md` |
+| Z3–Z12 Zotero sync: the remaining tasks | planned | — | order: Z3 and Z4 (after Z2); Z5; Z6; Z7; Z8; Z9; Z10 (the scheduler, only after the screen); Z11; Z12 after reader R12. Owner's questions in the ledger under R206 |
+| W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | done (GitHub's run not made, R202) | add12e3 (reader branch) | reviewed over two fix rounds; a Critical in the plan's own rule closed (R208); the real `/usr/bin/stat` never run here — owner's Mac check |
+| W2 Cloud folders: the engine reads nothing it may not | dispatched | — | Opus implementer; brief `task-W2-brief.md` |
+| W3–W10 Cloud folders: the remaining tasks | planned | — | order: W6 (beside W2); W3; W4; W7 (sets the service's thread pool to 16, A3 d); W8 and W9; W10. Owner's questions in the ledger under R207 |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
