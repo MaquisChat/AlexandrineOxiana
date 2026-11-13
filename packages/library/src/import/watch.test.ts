@@ -23,6 +23,7 @@ import { shutdownExtractors } from "../extract/index.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient } from "../lookup/index.js";
 import type { Repo } from "../repo/repo.js";
+import { WatchRegisterUnwritableError } from "../repo/watch-register.js";
 import { openTestRepo } from "../repo/testing.js";
 import { createAttach, type Attach } from "./attach.js";
 import { POINTER_REASON, contentState, ignoredName as ignoredNameLocal } from "./watch-local.js";
@@ -2026,6 +2027,76 @@ describe("the register: where a source came from, and what happened to its file 
     expect(events[0]).toEqual({ kind: "error", reason: WATCH_REASONS.noWatchId });
     expect(repo.listSourceIds(p.id)).toEqual([]);
   });
+
+  it("N4: while the register cannot be saved nothing new comes in; once it can, imports resume and the waiting lines are written once", async () => {
+    const p = await project();
+    const wid = newId();
+    const real = repo.recordWatchedFiles.bind(repo);
+    let fail = true;
+    vi.spyOn(repo, "recordWatchedFiles").mockImplementation(async (...a: Parameters<Repo["recordWatchedFiles"]>) => {
+      if (fail) throw new WatchRegisterUnwritableError();
+      return real(...a);
+    });
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const imported = () => events.filter((e) => e.kind === "imported");
+    await writeFile(join(inbox, "first.pdf"), await buildPdf({ title: "Before the trouble", extra: "n4-1" }));
+    await until(() => imported().length === 1);
+    expect(WATCH_REASONS.registerUnwritable).toBe(
+      "The record of which files in this folder are in the library could not be saved, so nothing new is brought in from this folder until it can be. Nothing in the library has been lost.",
+    );
+    await until(() => w.status().reason === WATCH_REASONS.registerUnwritable);
+    await writeFile(join(inbox, "second.pdf"), await buildPdf({ title: "During the trouble", extra: "n4-2" }));
+    await sleep(1500);
+    expect(imported()).toHaveLength(1);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+    expect(w.status().state).toBe("watching");
+    fail = false;
+    await until(() => imported().length === 2);
+    await untilAsync(async () => (await regOf(p, wid)).size === 2);
+    await until(() => w.status().reason === undefined);
+    const raw = await readFile(join(lib.root, p.folder, "watched", `${wid}.jsonl`), "utf8");
+    expect(raw.split("\n").filter((l) => l.includes('"first.pdf"'))).toHaveLength(1);
+    expect(raw.split("\n").filter((l) => l.includes('"second.pdf"'))).toHaveLength(1);
+  }, 40_000);
+
+  it("N5: two acts at once on a folder no watch runs on take turns: never two calls in flight", async () => {
+    const p = await project();
+    const wf = await addWatchedFolder({ repo, lib }, p.id, inbox);
+    const wid = wf.id;
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const v1 = await buildPdf({ title: "Twice at once", extra: "n5-1" });
+    const sid = await cameIn(p, wid, events, "paper.pdf", v1);
+    await w.stop();
+    const v2 = await buildPdf({ title: "Twice at once, edited", extra: "n5-2" });
+    await writeFile(join(inbox, "paper.pdf"), v2);
+    const e = (await regOf(p, wid)).get("paper.pdf")!;
+    await repo.recordWatchedFiles(p.id, wid, [{ ...e, state: "changed", newSha256: sha256(v2), newSize: v2.length, at: new Date().toISOString() }]);
+    let inFlight = 0;
+    let most = 0;
+    const counted =
+      <A extends unknown[], R>(fn: (...a: A) => Promise<R>) =>
+      async (...a: A): Promise<R> => {
+        most = Math.max(most, ++inFlight);
+        try {
+          return await fn(...a);
+        } finally {
+          inFlight--;
+        }
+      };
+    const actDeps = {
+      repo,
+      http,
+      lib,
+      stabilityMs: 200,
+      fs: { lstat: counted((q: string) => fsp.lstat(q, { bigint: true })), realpath: counted((q: string) => fsp.realpath(q)) },
+    };
+    const results = await Promise.allSettled([bringInNewVersion(actDeps, p.id, wid, "paper.pdf"), bringInNewVersion(actDeps, p.id, wid, "paper.pdf")]);
+    expect(most).toBe(1);
+    expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]); // the second finds it no longer changed
+    expect((await repo.getSource(p.id, sid)).assets.filter((a) => a.role === "original")).toHaveLength(2);
+  }, 40_000);
 
   it("a register that cannot be read stops imports from that folder and says so", async () => {
     const p = await project();

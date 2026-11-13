@@ -145,7 +145,9 @@ describe("watched folders at scale", () => {
     expect(elapsed).toBeLessThan(20_000);
     expect(growth).toBeLessThan(64 * 1024 * 1024);
     for (let i = 1; i < statuses.length; i++) {
-      if (statuses[i]!.state === statuses[i - 1]!.state) expect(statuses[i]!.at - statuses[i - 1]!.at).toBeGreaterThanOrEqual(WATCH_STATUS_INTERVAL_MS - 5);
+      // The engine keeps the interval by its own clock (N6); the stamps here are taken in the listener, after a clone, so
+      // they may lag by the time a busy turn of the event loop takes (about 50 ms under load). The count below is the rate bound.
+      if (statuses[i]!.state === statuses[i - 1]!.state) expect(statuses[i]!.at - statuses[i - 1]!.at).toBeGreaterThanOrEqual(WATCH_STATUS_INTERVAL_MS - 50);
     }
     expect(statuses.length).toBeLessThanOrEqual(Math.ceil(elapsed / WATCH_STATUS_INTERVAL_MS) + 3);
 

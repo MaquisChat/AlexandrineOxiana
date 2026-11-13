@@ -168,8 +168,8 @@ export const WATCH_REASONS = {
   removedHere: "This file was removed from the library here, so it is not brought in again. To bring it in, add it by hand.",
   /** A8 (proposed wording): the register cannot be read, so nothing new comes in from this folder. */
   registerUnreadable: "The record of which files in this folder are already in the library could not be read, so nothing new is brought in from this folder. Nothing in the library has changed.",
-  /** Proposed wording: the register cannot be written now; it is tried again. */
-  registerUnwritable: "The record of which files in this folder are in the library could not be saved. It is tried again; nothing in the library has changed.",
+  /** N4 (ruled): the register cannot be written now; it is tried again, and nothing new comes in meanwhile. */
+  registerUnwritable: "The record of which files in this folder are in the library could not be saved, so nothing new is brought in from this folder until it can be. Nothing in the library has been lost.",
   /** A watch must have its id (A8): without it nothing could be recorded. */
   noWatchId: "This watched folder has no id of its own, so it is not watched.",
 } as const;
@@ -703,9 +703,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
           return;
         }
         unwritten.splice(0, batch.length);
-        if (registerProblem === WATCH_REASONS.registerUnwritable) {
+        if (registerProblem === WATCH_REASONS.registerUnwritable && unwritten.length === 0) {
           registerProblem = null;
           touch();
+          wake();
         }
       }
     });
@@ -1026,9 +1027,17 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let lastPushAt = 0;
   let lastPushedState: string | null = null;
   let pushTimer: ReturnType<typeof setTimeout> | undefined;
-  function send() {
+  function send(fromTimer = false) {
     if (pushTimer) clearTimeout(pushTimer);
     pushTimer = undefined;
+    // A timer may fire a few ms before the interval by the wall clock (libuv starts it from its cached loop time):
+    // the rest is waited for, so two pushes of the same state are never closer than the interval (N6).
+    const early = lastPushAt + WATCH_STATUS_INTERVAL_MS - Date.now();
+    if (fromTimer && early > 0 && stateNow() === lastPushedState && !stopped) {
+      pushTimer = setTimeout(() => send(true), early);
+      pushTimer.unref?.();
+      return;
+    }
     const s = status();
     lastPushAt = Date.now();
     lastPushedState = s.state;
@@ -1043,7 +1052,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     if (!deps.onStatus) return;
     if (stateNow() !== lastPushedState) return send();
     if (pushTimer || stopped) return;
-    pushTimer = setTimeout(send, Math.max(0, lastPushAt + WATCH_STATUS_INTERVAL_MS - Date.now()));
+    pushTimer = setTimeout(() => send(true), Math.max(0, lastPushAt + WATCH_STATUS_INTERVAL_MS - Date.now()));
     pushTimer.unref?.();
   }
 
@@ -1757,6 +1766,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         }
         if (!regReady) {
           if (!(await loadRegister())) await idle(pollMs);
+          continue;
+        }
+        // An import whose line could not be written would be one the register does not know (N4): while the register
+        // cannot be saved, nothing further is looked at or brought in; the lines are tried again (scheduleFlush).
+        if (registerProblem === WATCH_REASONS.registerUnwritable) {
+          await idle(pollMs);
           continue;
         }
         if (imports.length > 0) {
