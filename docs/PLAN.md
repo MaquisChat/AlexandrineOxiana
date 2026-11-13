@@ -576,8 +576,8 @@ Update after every task; commit and push.
 | R5 Reader: ranged PDF route and the client's range reader | complete (on the reader branch) | 4f4c7c6 (merge) | reviewed with probes over one fix round; end-to-end in both browsers; for the owner's Mac check: the Range preflight in the macOS web view |
 | R2 Reader: the Zotero import keeps the sort index; re-import respects changes | approved; verification with R3 running | f784336 (worktree branch) | reviewed with probes over two rounds (R196, R197) |
 | R3 Reader: governed annotation operations in the library | approved; verification with R2 running | 7295e2b (worktree branch) | reviewed with twelve probes; a recolour to the same colour is no change (A5) |
-| R4 Reader: annotation routes in the service | fix round 1 | da3829c (worktree branch, on R3's) | review: optional answer fields must break the build when renamed; grouping by document to test; note rules (R198) |
-| R6 Reader: pdf.js in the interface, bundled, under the policy | in progress | | dispatched 2026-11-13 on top of R5's approved branch |
+| R4 Reader: annotation routes in the service | fix round 1 in re-review | 702a064 (worktree branch) | typed answers; grouping by document tested; note rules (R198) |
+| R6 Reader: pdf.js in the interface, bundled, under the policy | in review | 6f64f07 (worktree branch) | end-to-end in both browsers; one policy change; the GPL-licensed Liberation Sans fonts are not to be bundled (R199) |
 | R7–R13 Reader: the remaining tasks | not started | | order: R7 after R6, then R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
