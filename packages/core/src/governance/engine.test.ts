@@ -479,3 +479,24 @@ describe("the three ways of acquiring (Find and acquire)", () => {
     expect(denyReason(evaluate(yes, cap("elicit")))).toBe(NOT_ENABLED("elicit"));
   });
 });
+
+describe("the engine keeps the two lists apart by itself (in-memory configuration, no parser)", () => {
+  const cap = (method: string) => req({ action: "capture", capture: { method: method as never } });
+  const OLD = ["official_api", "browser_capture", "downloader", "manual_upload", "zotero_import", "device_import", "refman_import", "calibre_import"] as GovernanceConfig["captureMethods"];
+  const base = parseGovernance("");
+  it("refuses free_copy when acquireMethods is [] although captureMethods holds every old method", () => {
+    // captureMethods even holds the name itself (the parser would refuse that file; the engine must not rely on it)
+    const c = { ...base, captureMethods: [...OLD, "free_copy"], acquireMethods: [] } as unknown as GovernanceConfig;
+    expect(denyReason(evaluate(c, cap("free_copy")))).toBe("Capture method free_copy is not enabled for this project");
+    expect(evaluate(c, cap("manual_upload")).result).toBe("allow");
+  });
+  it("refuses manual_upload when captureMethods is [] although acquireMethods holds all three", () => {
+    const c = { ...base, captureMethods: [], acquireMethods: [...ACQUIRE_METHODS, "manual_upload"] } as unknown as GovernanceConfig;
+    expect(denyReason(evaluate(c, cap("manual_upload")))).toBe("Capture method manual_upload is not enabled for this project");
+    expect(evaluate(c, cap("free_copy")).result).toBe("allow");
+  });
+  it("refuses a method name it does not know", () => {
+    expect(evaluate(base, cap("carrier_pigeon")).result).toBe("deny");
+    expect(evaluate({ ...base, captureMethods: OLD, acquireMethods: [...ACQUIRE_METHODS] }, cap("carrier_pigeon")).result).toBe("deny");
+  });
+});
