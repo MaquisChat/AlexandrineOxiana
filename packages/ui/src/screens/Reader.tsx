@@ -52,7 +52,7 @@ import { HighlightLayer, HighlightNotices } from "../reader/HighlightLayer";
 import { MAX_RENDERED_PAGES, PdfPages, type TextContent, type ViewRotation } from "../reader/PdfPages";
 import { openPdf, toPdfOpenError, type PdfHandle, type PdfOpenError } from "../reader/pdfjs";
 import { createRangeTransport } from "../reader/rangeTransport";
-import { canJudge, quoteStillMatches, textUnderRects, touchesVerticalText } from "../reader/textCheck";
+import { canJudge, quoteStillMatches, textsUnderRects, touchesVerticalText } from "../reader/textCheck";
 import "../reader/Reader.css";
 
 export type ReaderStateKind = "locked" | "missing" | "damaged" | "too-large" | "not-a-pdf" | "password-needed" | "password-wrong" | "unreachable" | "other";
@@ -212,7 +212,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
   /** Moves on when a page's text arrives. */
   const [textsSeen, setTextsSeen] = useState(0);
   /** Per annotation, the text found under each of its anchors so far (anchor id -> text; null: the page has no text). */
-  const underText = useRef(new Map<string, Map<string, string | null>>());
+  const underText = useRef(new Map<string, Map<string, { byRect: string; byPdf: string } | null>>());
   /** Annotations already judged. */
   const judged = useRef(new Set<string>());
   /** Moves on with "Try again": the list is asked for again. */
@@ -418,15 +418,18 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
         if (!text) continue;
         if (!under) underText.current.set(a.id, (under = new Map()));
         // A page without text, or rectangles on vertical text: no verdict (null).
-        under.set(anchor.id, hasText(text) && !touchesVerticalText(text, anchor.rects) ? textUnderRects(text, anchor.rects) : null);
+        under.set(anchor.id, hasText(text) && !touchesVerticalText(text, anchor.rects) ? textsUnderRects(text, anchor.rects) : null);
       }
       if (!under || a.pdfAnchors.some((x) => !under!.has(x.id))) continue;
       judged.current.add(a.id);
       underText.current.delete(a.id);
       // A page with no text (a scan) or vertical text cannot say: nothing is said.
       const parts = [...a.pdfAnchors].sort((x, y) => x.page - y.page).map((x) => under.get(x.id));
-      if (parts.some((t) => t === null)) continue;
-      if (!quoteStillMatches(a.quote, parts.join(" "))) found.push(a.id);
+      if (parts.some((t) => t === null || t === undefined)) continue;
+      // A12: changed only when the quote is in neither the reading-order text nor pdf.js's order.
+      const byRect = parts.map((t) => t!.byRect).join(" ");
+      const byPdf = parts.map((t) => t!.byPdf).join(" ");
+      if (!quoteStillMatches(a.quote, byRect) && !quoteStillMatches(a.quote, byPdf)) found.push(a.id);
     }
     if (found.length > 0) setChanged((c) => new Set([...c, ...found]));
   }, [fileAnnotations, partial, textsSeen, handle, count]);

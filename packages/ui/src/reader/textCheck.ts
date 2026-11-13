@@ -9,11 +9,20 @@
  * such mark, so it is given only on clear evidence:
  *
  *  - `textUnderRects` returns the text of the WHOLE text items (pdf.js's pieces of text, usually a
- *    line or part of one) whose box any rectangle touches, in the order pdf.js gives them. Which
+ *    line or part of one) whose box a rectangle touches, gathered RECTANGLE BY RECTANGLE in the
+ *    order of the anchor's rectangles (each item once, at the first rectangle that touches it; within
+ *    one rectangle in pdf.js's order), A12: the rectangles are in reading order, while pdf.js may
+ *    list two columns row by row or a footnote mark after its paragraph. Which
  *    characters of an item lie inside a rectangle is not estimated: pdf.js gives an item's position
  *    and length, not each glyph's, and any estimate is wrong for typewriter faces, justified lines and
  *    right-to-left text (pdf.js gives such an item in logical order, its position at its visual left).
- *  - `quoteStillMatches` says whether the quote, normalised, is CONTAINED in that text, normalised.
+ *  - `quoteStillMatches` says whether the quote, normalised, is CONTAINED in that text, normalised;
+ *    `quoteStillUnder` (the verdict the reader uses) says "changed" only when the quote is contained
+ *    NEITHER in the text gathered by rectangle NOR in the touched items in pdf.js's own order.
+ *  - An item's box is at least its font size high (as pdf.js's text layer makes it; a face reporting
+ *    no ascent and descent is given 0.8 and -0.2), and a rectangle within TOUCH_SLACK points of it
+ *    touches it, so that small differences in metrics never decide. Rectangles touching no item on a
+ *    page with text: changed (the words are gone); the reader gives no verdict on a page with none.
  *    Normalising folds what differs between two readings of the same words: NFKC (ligatures such as
  *    "ﬁ"), letter case, and everything that is not a letter or a digit (spaces, line breaks, a hyphen
  *    at a line's end, a soft hyphen, punctuation and its typographic forms; so a trailing ellipsis on
@@ -37,6 +46,8 @@ export type TextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>;
 
 /** The fewest letters and digits a normalised quote must have for a verdict. */
 export const MIN_QUOTE_LETTERS = 4;
+/** How near (points) a rectangle must come to an item's box to touch it. */
+export const TOUCH_SLACK = 0.5;
 
 interface Item {
   str: string;
@@ -77,8 +88,15 @@ function itemsOf(textContent: TextContent): Array<{ str: string; box: Bounds; ve
     }
     const run = Math.hypot(a, b) > 0 ? [a / Math.hypot(a, b), b / Math.hypot(a, b)] : [1, 0];
     const up = Math.hypot(c, d) > 0 ? [c / Math.hypot(c, d), d / Math.hypot(c, d)] : [0, 1];
-    const ascent = typeof st?.ascent === "number" ? st.ascent : 0.8;
-    const descent = typeof st?.descent === "number" ? st.descent : -0.2;
+    let ascent = typeof st?.ascent === "number" && Number.isFinite(st.ascent) ? st.ascent : 0.8;
+    let descent = typeof st?.descent === "number" && Number.isFinite(st.descent) ? st.descent : -0.2;
+    // A face that reports no metrics: those of an ordinary one. Then at least the font size high.
+    if (ascent === 0 && descent === 0) [ascent, descent] = [0.8, -0.2];
+    if (ascent - descent < 1) {
+      const pad = (1 - (ascent - descent)) / 2;
+      ascent += pad;
+      descent -= pad;
+    }
     const xs: number[] = [];
     const ys: number[] = [];
     for (const along of [0, Math.max(0, item.width)]) {
@@ -92,17 +110,32 @@ function itemsOf(textContent: TextContent): Array<{ str: string; box: Bounds; ve
   return out;
 }
 
-/** Whether a rectangle and a box overlap (sharing an edge only is not touching). */
-const touches = (r: PdfRectDto, b: Bounds) => Math.min(r.x + r.w, b.x1) - Math.max(r.x, b.x0) > 0 && Math.min(r.y + r.h, b.y1) - Math.max(r.y, b.y0) > 0;
+/** Whether a rectangle comes within TOUCH_SLACK of a box. */
+const touches = (r: PdfRectDto, b: Bounds) =>
+  Math.min(r.x + r.w, b.x1 + TOUCH_SLACK) - Math.max(r.x, b.x0 - TOUCH_SLACK) > 0 && Math.min(r.y + r.h, b.y1 + TOUCH_SLACK) - Math.max(r.y, b.y0 - TOUCH_SLACK) > 0;
 
-/** The text of the whole text items any of `rects` (PDF user space) touches, in pdf.js's order, joined by spaces. */
-export function textUnderRects(textContent: TextContent, rects: PdfRectDto[]): string {
+/** The text under `rects` both ways: gathered rectangle by rectangle (reading order), and in pdf.js's own order. */
+export function textsUnderRects(textContent: TextContent, rects: PdfRectDto[]): { byRect: string; byPdf: string } {
   const live = rects.filter(finite);
-  if (live.length === 0) return "";
-  return itemsOf(textContent)
-    .filter((i) => live.some((r) => touches(r, i.box)))
-    .map((i) => i.str)
-    .join(" ");
+  if (live.length === 0) return { byRect: "", byPdf: "" };
+  const items = itemsOf(textContent);
+  const taken = new Set<number>();
+  const byRect: string[] = [];
+  for (const r of live) {
+    items.forEach((i, n) => {
+      if (!taken.has(n) && touches(r, i.box)) {
+        taken.add(n);
+        byRect.push(i.str);
+      }
+    });
+  }
+  const byPdf = items.filter((_, n) => taken.has(n)).map((i) => i.str);
+  return { byRect: byRect.join(" "), byPdf: byPdf.join(" ") };
+}
+
+/** The text of the whole text items `rects` (PDF user space) touch, gathered rectangle by rectangle, joined by spaces. */
+export function textUnderRects(textContent: TextContent, rects: PdfRectDto[]): string {
+  return textsUnderRects(textContent, rects).byRect;
 }
 
 /** Whether any of `rects` touches a text item pdf.js marks as vertical: then no verdict is given. */
@@ -128,4 +161,10 @@ export function canJudge(quote: string): boolean {
 export function quoteStillMatches(quote: string, textUnderRects: string): boolean {
   if (!canJudge(quote)) return true;
   return fold(textUnderRects).includes(fold(quote.replace(/(…|\.\.\.)\s*$/u, "")));
+}
+
+/** The verdict (A12): false ("changed") only when the quote is in neither the reading-order text nor the pdf.js-order text under `rects`. */
+export function quoteStillUnder(quote: string, textContent: TextContent, rects: PdfRectDto[]): boolean {
+  const { byRect, byPdf } = textsUnderRects(textContent, rects);
+  return quoteStillMatches(quote, byRect) || quoteStillMatches(quote, byPdf);
 }

@@ -113,7 +113,7 @@ function fakeHandle(pages = 12, opts: { labels?: string[] | null; hold?: boolean
     },
     getTextContent: async () => {
       opts.textReads?.push(n);
-      return { items: opts.text?.(n) ?? [], styles: { f1: { fontFamily: "sans-serif", ascent: 0.718, descent: -0.207, vertical: false } }, lang: null };
+      return { items: opts.text?.(n) ?? [], styles: { f1: { fontFamily: "sans-serif", ascent: 0.718, descent: -0.207, vertical: false }, v1: { fontFamily: "serif", ascent: 0.88, descent: -0.12, vertical: true } }, lang: null };
     },
     cleanup: () => true,
   });
@@ -1200,5 +1200,55 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
     expect(document.querySelector('[data-annotation="short"]')!.classList.contains("ao-hl--changed")).toBe(false);
     expect(document.querySelector('[data-annotation="two-files"]')!.classList.contains("ao-hl--changed")).toBe(false);
     expect(within(screen.getByRole("region", { name: "Highlights to check" })).getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it("rectangles on a vertical text item give no verdict, on the screen itself (A12, N5)", async () => {
+    serveDocument();
+    // Page 1: the horizontal line, and a vertical run (pdf.js marks its font vertical) at x 300 going down from y 700.
+    const vertical = { ...textItem("非正規市場研究", 300, 700, 12, 12), fontName: "v1", height: 84 };
+    const withVertical = (n: number) => [...words(n), vertical];
+    serveAnnotations([rec({ id: "on-vertical", quote: "Not what the run says", rects: [{ x: 294, y: 650, w: 12, h: 24 }] }), rec({ id: "control", quote: "Not these words at all" })]);
+    openPdf.mockResolvedValueOnce(fakeHandle(2, { text: withVertical }).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 2" });
+    // The control is judged (so the page's text was looked at); the one on vertical text is not.
+    await waitFor(() => expect(document.querySelector('[data-annotation="control"]')?.classList.contains("ao-hl--changed")).toBe(true));
+    expect(document.querySelector('[data-annotation="on-vertical"]')!.classList.contains("ao-hl--changed")).toBe(false);
+    expect(within(screen.getByRole("region", { name: "Highlights to check" })).getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it("rectangles on blank paper: changed on a page with text, no verdict on a page without (A12, N2)", async () => {
+    serveDocument();
+    const blank = [{ x: 300, y: 200, w: 80, h: 12 }];
+    // Page 1 has text; page 2 has none (a scan).
+    serveAnnotations([rec({ id: "blank-text-page", quote: "Words long gone", rects: blank }), rec({ id: "blank-scan", page: 2, quote: "Words a scan has", rects: blank })]);
+    openPdf.mockResolvedValueOnce(fakeHandle(2, { text: (n) => (n === 1 ? words(1) : []) }).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 2 of 2" });
+    await waitFor(() => expect(document.querySelector('[data-annotation="blank-text-page"]')?.classList.contains("ao-hl--changed")).toBe(true));
+    await waitFor(() => expect(drawnOn(2)).toEqual(["blank-scan"]));
+    await flush();
+    expect(document.querySelector('[data-annotation="blank-scan"]')!.classList.contains("ao-hl--changed")).toBe(false);
+  });
+
+  it("a quote is judged on the text gathered by rectangle and in pdf.js's order: either holding it is not changed (A12, N1, N3)", async () => {
+    serveDocument();
+    // A paragraph whose footnote mark "12" is drawn last, after "of" on the first line.
+    const para = () => [textItem("the informal markets of", 72, 700, 11, 120), textItem("Lagos grew quickly", 72, 686, 11, 95), textItem("12", 192.5, 704, 6, 6.7)];
+    const rects = [
+      { x: 72, y: 697.7, w: 127.5, h: 12 },
+      { x: 72, y: 683.7, w: 95, h: 10.2 },
+    ];
+    serveAnnotations([
+      rec({ id: "reading-order", quote: "the informal markets of12 Lagos grew", rects }),
+      rec({ id: "pdf-order", quote: "markets of Lagos grew quickly 12", rects }),
+      rec({ id: "control", quote: "the formal markets of Lagos grew", rects }),
+    ]);
+    openPdf.mockResolvedValueOnce(fakeHandle(2, { text: para }).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 2" });
+    await waitFor(() => expect(document.querySelector('[data-annotation="control"]')?.classList.contains("ao-hl--changed")).toBe(true));
+    expect(document.querySelector('[data-annotation="reading-order"]')!.classList.contains("ao-hl--changed")).toBe(false);
+    expect(document.querySelector('[data-annotation="pdf-order"]')!.classList.contains("ao-hl--changed")).toBe(false);
   });
 });

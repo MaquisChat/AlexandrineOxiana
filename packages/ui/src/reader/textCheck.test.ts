@@ -10,7 +10,7 @@ import { createRequire } from "node:module";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildRotatedCropPdf } from "../../../../tests/fixtures/generate.mjs";
-import { canJudge, quoteStillMatches, textUnderRects, touchesVerticalText, type TextContent } from "./textCheck";
+import { canJudge, quoteStillMatches, quoteStillUnder, textUnderRects, touchesVerticalText, type TextContent } from "./textCheck";
 
 describe("quoteStillMatches", () => {
   it("quoteStillMatches tolerates hyphenation and spacing but not different words", () => {
@@ -71,7 +71,7 @@ const content = (...items: ReturnType<typeof item>[]): TextContent =>
   }) as unknown as TextContent;
 
 describe("textUnderRects", () => {
-  it("gives the whole items the rectangles touch, in pdf.js's order", () => {
+  it("gives the whole items the rectangles touch, rectangle by rectangle", () => {
     const text = content(item("aaaa bbbb cccc", 100, 700, 10, 70.04, { hasEOL: true }), item("dddd eeee gggg", 100, 686, 10, 72.28), item("hhhh", 100, 600, 10, 22));
     const rects = [
       { x: 124.5, y: 698, w: 23.5, h: 10 },
@@ -95,6 +95,64 @@ describe("textUnderRects", () => {
     expect(quoteStillMatches("ומלואו", textUnderRects(content(line), [{ x: 100, y: 697.5, w: 34, h: 11.1 }]))).toBe(true);
     // Other words in their place are still "changed".
     expect(quoteStillMatches("בוקר טוב", under)).toBe(false);
+  });
+
+  it("two columns listed row by row: a quote across the column break is not changed (A12, N1)", () => {
+    // Times, 11 pt; pdf.js lists the left line i, then the right line i (as some generators and OCR layers write them).
+    const L = 72;
+    const R = 320;
+    const rows = [
+      ["Informal markets in Lagos grew", "austerity, as traders filled"],
+      ["quickly during the years", "the gaps left by the state"],
+      ["of structural adjustment and", "and its retreating agencies."],
+    ];
+    const items: ReturnType<typeof item>[] = [];
+    rows.forEach(([l, r], i) => {
+      items.push(item(l!, L, 700 - i * 14, 11, l!.length * 5.2), item(" ", L + l!.length * 5.2, 700 - i * 14, 11, 3), item(r!, R, 700 - i * 14, 11, r!.length * 5.2));
+    });
+    const text = content(...items);
+    // Column one's foot ("structural adjustment and"), then column two's head ("austerity, as traders"): the rectangles in reading order.
+    const rects = [
+      { x: L + 3 * 5.2, y: 700 - 28 - 2.3, w: 25 * 5.2, h: 10.2 },
+      { x: R, y: 700 - 2.3, w: 21 * 5.2, h: 10.2 },
+    ];
+    expect(textUnderRects(text, rects).replace(/\s+/g, " ")).toBe("of structural adjustment and austerity, as traders filled");
+    expect(quoteStillUnder("structural adjustment and austerity, as traders", text, rects)).toBe(true);
+    // Different words, and the same words moved to other lines: still changed.
+    expect(quoteStillUnder("structural reform and austerity, as traders", text, rects)).toBe(false);
+    expect(quoteStillUnder("quickly during the years", text, rects)).toBe(false);
+  });
+
+  it("a footnote mark drawn after its paragraph is not changed (A12, N3)", () => {
+    // The paragraph's lines, then the superscript "12" drawn last, after "of" on line 1.
+    const text = content(item("the informal markets of", 72, 700, 11, 120), item("Lagos grew quickly", 72, 686, 11, 95), item("12", 192.5, 704, 6, 6.7));
+    const rects = [
+      { x: 72, y: 697.7, w: 127.5, h: 12 },
+      { x: 72, y: 683.7, w: 95, h: 10.2 },
+    ];
+    // In reading order the mark follows "of"; in pdf.js's order it comes last: either is not changed.
+    expect(quoteStillUnder("the informal markets of12 Lagos grew", text, rects)).toBe(true);
+    expect(quoteStillUnder("the informal markets of Lagos grew", text, rects)).toBe(true);
+    expect(quoteStillUnder("the formal markets of Lagos grew", text, rects)).toBe(false);
+  });
+
+  it("an item's box is at least its font size high: a face with no ascent and descent, or a rectangle a little off, is not changed (A12, N2)", () => {
+    const flat = {
+      items: [item("informal markets of Lagos", 72, 700, 12, 140, { fontName: "z" })],
+      styles: { z: { fontFamily: "serif", ascent: 0, descent: 0, vertical: false } },
+      lang: null,
+    } as unknown as TextContent;
+    const glyphs = { x: 72, y: 700 - 0.207 * 12, w: 80, h: 0.925 * 12 };
+    expect(quoteStillUnder("informal markets", flat, [glyphs])).toBe(true);
+    // A rectangle 0.1 pt above the face's own box (Helvetica metrics).
+    const helv = content(item("informal markets of Lagos", 72, 700, 12, 140));
+    expect(quoteStillUnder("informal markets", helv, [{ x: 72, y: 700 + 0.718 * 12 + 0.1, w: 80, h: 3 }])).toBe(true);
+  });
+
+  it("rectangles on blank paper of a page with text: changed (A12)", () => {
+    const text = content(item("informal markets of Lagos", 72, 700, 12, 140));
+    expect(textUnderRects(text, [{ x: 300, y: 200, w: 80, h: 12 }])).toBe("");
+    expect(quoteStillUnder("informal markets", text, [{ x: 300, y: 200, w: 80, h: 12 }])).toBe(false);
   });
 
   it("vertical text gets no verdict", () => {
