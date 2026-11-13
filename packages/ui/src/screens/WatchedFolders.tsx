@@ -1,0 +1,999 @@
+/**
+ * "Watched folders" (Task W8; R207, R219, R221, R233, R234; Amendment A9): the folders of a project —
+ * typically inside Google Drive, OneDrive or Dropbox — whose new files are copied into the project by
+ * themselves. The screen adds a folder only through the shell's own folder chooser
+ * (`pickWatchFolder`): the page never holds, shows or sends a path of its own; the chooser gives a
+ * single-use grant id and the folder's name, and the grant goes to the service once (a refused
+ * request spends it too, R233 d, so a refusal offers the chooser again, never a second try).
+ *
+ * The service is the authority. What a folder shows is the summary the service last gave — from the
+ * list, an answer to an act, or a `watch.status` event — whichever is newest. Events and answers
+ * travel on different connections and carry no time of their own, so the screen orders them by what
+ * it can see: every event is numbered as it arrives, and an answer (or a list) is applied to a folder
+ * only if no event for that folder arrived after its request was sent. When one did, the event stays
+ * (it may be newer than the answer) and the list is asked for once more, so the screen settles on
+ * what the service says now; it never shows a guess.
+ *
+ * Downloads happen only by an explicit agreement to a size the service reported (R219, R221): the
+ * dialog names the number and size, sends exactly that number as `confirmBytes`, and on a 409 says
+ * the service's sentence and asks again with the new size. The radio group shows the choice the
+ * service reports, not the last click.
+ *
+ * One polite live region speaks only a change of a folder's state word, and the results of the
+ * researcher's own acts once. Every name from a folder, a file, a collection or the service's reasons
+ * is outside text: through UserText (dir="auto"), never as markup. Dialogs move focus in, trap it,
+ * restore it and make the background inert (DialogShell, R145).
+ */
+import type { WatchedFolderFileItem, WatchedFolderSummary, WatchFolderState } from "@ao/shared";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type Ref } from "react";
+import { ApiClientError, type ApiClient } from "../api/client";
+import { isProjectLocked, libraryApi, type Collection, type LibraryState, type ProjectSummary } from "../api/library";
+import { formatSize } from "../api/tools";
+import { watchedFoldersApi, watchStatusOf } from "../api/watchedFolders";
+import { DialogShell } from "../components/ReasonDialog";
+import { UserText } from "../components/UserText";
+import "../components/library.css";
+import { desktopShell } from "../desktopShell";
+import { projectInQuery, type AppLocation } from "../navigation";
+import { SourceDetail } from "./SourceDetail";
+import { UnlockProject } from "./UnlockProject";
+import "./GovernanceScreens.css";
+import "./WatchedFolders.css";
+
+/** The state words (the plan's five, and "stopped" as "Not watched", A9). */
+export const STATE_WORDS: Record<WatchFolderState, string> = {
+  watching: "Watching",
+  paused: "Paused",
+  unreachable: "Cannot be reached",
+  locked: "Waiting for the project to be unlocked",
+  "not-set-up": "Not set up on this Mac",
+  stopped: "Not watched",
+};
+
+export const WATCH_TEXT = {
+  intro: "Files put in these folders are copied into this project by themselves while the app is open. The app only reads them: it never changes, moves or deletes anything in a folder.",
+  needsApp: "Adding a folder needs the desktop app.",
+  noProject: "Open a project in the library first, then choose “Watched folders”.",
+  readOnly: "This library is open read-only, so watched folders cannot be added, changed or removed here.",
+  none: "No folder is watched in this project yet.",
+  loading: "Reading the watched folders…",
+  scanning: " — looking through the folder…",
+  removeBody: "Nothing already in the library is removed, and nothing in the folder is touched.",
+  firstOnly: "The list holds the first 5,000 files of each kind; the counts above are of all files.",
+  noFiles: "No files to list.",
+  unnamed: "Unnamed folder",
+  chooserTitle: "Choose a folder to watch",
+} as const;
+
+/** The most files the service keeps per kind (W2's WATCH_PROBLEMS_MAX): `total` is capped there, the counts are not (A9). */
+const KIND_CAP = 5000;
+const PAGE = 200;
+const RECONNECT_MS = 2000;
+
+const num = (n: number) => n.toLocaleString("en-US");
+const files = (n: number) => (n === 1 ? "1 file" : `${num(n)} files`);
+/** Ends a sentence: no full stop after an ellipsis. */
+const end = (s: string) => (s.endsWith("…") || s.endsWith(".") ? s : `${s}.`);
+
+export const labelOf = (f: Pick<WatchedFolderSummary, "label" | "place">): string => f.label ?? f.place?.display ?? WATCH_TEXT.unnamed;
+const wordOf = (f: WatchedFolderSummary) => STATE_WORDS[f.state] ?? f.state;
+/** The state word, with the first look through the folder said beside it (A9). */
+export const stateLine = (f: WatchedFolderSummary) => `${wordOf(f)}${f.scanning ? WATCH_TEXT.scanning : ""}`;
+
+/** The count lines, only those that are not zero (the plan's exact words). */
+function countLines(f: WatchedFolderSummary): string[] {
+  const c = f.counts;
+  const out: string[] = [];
+  if (c.cameIn) out.push(`${files(c.cameIn)} came in`);
+  if (c.notDownloaded) out.push(`${files(c.notDownloaded)} here ${c.notDownloaded === 1 ? "is" : "are"} not downloaded to this Mac${c.notDownloadedBytes > 0 ? ` (${formatSize(c.notDownloadedBytes)})` : ""}`);
+  if (c.didNotComeIn) out.push(`${files(c.didNotComeIn)} did not come in`);
+  if (c.waiting) out.push(`${files(c.waiting)} ${c.waiting === 1 ? "is" : "are"} waiting to come in`);
+  if (c.changed) out.push(`${files(c.changed)} in the library ${c.changed === 1 ? "has" : "have"} changed in the folder`);
+  if (c.gone) out.push(`${files(c.gone)} ${c.gone === 1 ? "is" : "are"} no longer in the folder`);
+  return out;
+}
+
+const downloadTitle = (n: number, bytes: number) => `Download ${files(n)} (${formatSize(bytes)}) to this Mac and import them? They stay downloaded afterwards.`;
+
+/** The service's own sentence for a refusal (plain words; the service puts no path in it). */
+const sentenceOf = (err: unknown, fallback: string) => (err instanceof ApiClientError && err.message ? err.message : fallback);
+
+type Act = "pause" | "resume" | "retry" | "choose" | "leave" | "continue";
+
+type Dialog =
+  | { kind: "add"; grant: string | null; name: string; busy: boolean; error?: string }
+  | { kind: "download"; id: string; label: string; files: number; bytes: number; busy: boolean; error?: string }
+  | { kind: "remove"; id: string; label: string; busy: boolean; error?: string };
+
+interface FileList {
+  items: WatchedFolderFileItem[];
+  total: number;
+  loading: boolean;
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The route: the project named in the address.
+
+export function WatchedFoldersRoute({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+  const projectId = projectInQuery(loc.search);
+  if (!projectId) {
+    return (
+      <main className="ao-page ao-watch" aria-labelledby="ao-watch-h">
+        <h1 id="ao-watch-h">Watched folders</h1>
+        <p>{WATCH_TEXT.noProject}</p>
+      </main>
+    );
+  }
+  return <WatchedFolders key={projectId} client={client} projectId={projectId} />;
+}
+
+// ---------------------------------------------------------------------------------------------
+
+export function WatchedFolders({ client, projectId }: { client: ApiClient; projectId: string }) {
+  const api = useMemo(() => watchedFoldersApi(client), [client]);
+  const lib = useMemo(() => libraryApi(client), [client]);
+  const shell = desktopShell();
+  const ids = useId();
+
+  const [folders, setFolders] = useState<WatchedFolderSummary[] | undefined>();
+  const [loadError, setLoadError] = useState<string | undefined>();
+  const [locked, setLocked] = useState(false);
+  const [project, setProject] = useState<ProjectSummary | undefined>();
+  const [readOnly, setReadOnly] = useState(false);
+  const [collections, setCollections] = useState<Collection[]>([]);
+  const [busy, setBusy] = useState<Record<string, Act>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  /** A choice of this computer's folder was refused: the button offers the chooser again. */
+  const [chooseAgain, setChooseAgain] = useState<Record<string, boolean>>({});
+  const [lists, setLists] = useState<Record<string, FileList>>({});
+  const [dialog, setDialog] = useState<Dialog | null>(null);
+  const [picking, setPicking] = useState(false);
+  const [openSource, setOpenSource] = useState<{ sourceId: string; from: HTMLElement | null } | null>(null);
+  const [live, setLive] = useState("");
+  const [focusFolders, setFocusFolders] = useState(0);
+
+  const foldersRef = useRef<WatchedFolderSummary[]>([]);
+  const alive = useRef(true);
+  /** Moves on at a lock: anything answered for the time before is dropped. */
+  const gen = useRef(0);
+  /** Events are numbered as they arrive; per folder, the number of the last one. */
+  const tick = useRef(0);
+  const eventTick = useRef(new Map<string, number>());
+  /** Folders removed here: a late event never brings one back. */
+  const removed = useRef(new Set<string>());
+  /** Folders with an act of the researcher's in flight: its result is said, not the state change. */
+  const acting = useRef(new Map<string, number>());
+  const busyRef = useRef<Record<string, Act>>({});
+  const listGen = useRef(new Map<string, number>());
+  const relisting = useRef<{ again: boolean } | null>(null);
+  const foldersHeading = useRef<HTMLHeadingElement>(null);
+  const sourceRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  const say = useCallback((text: string) => setLive(text), []);
+
+  /** The folders shown from now on; a changed state word is said (unless the researcher's own act will say its result). */
+  const commit = useCallback(
+    (next: WatchedFolderSummary[], announce: boolean) => {
+      const prev = foldersRef.current;
+      if (announce) {
+        for (const f of next) {
+          const p = prev.find((x) => x.id === f.id);
+          if (p && p.state !== f.state && !acting.current.get(f.id)) say(`“${labelOf(f)}”: ${wordOf(f)}.`);
+        }
+      }
+      foldersRef.current = next;
+      setFolders(next);
+    },
+    [say],
+  );
+
+  const upsert = (list: WatchedFolderSummary[], s: WatchedFolderSummary) => (list.some((f) => f.id === s.id) ? list.map((f) => (f.id === s.id ? s : f)) : [...list, s]);
+
+  const markLocked = useCallback(() => {
+    gen.current++;
+    setLocked(true);
+    setDialog(null);
+    setOpenSource(null);
+    setLists({});
+    foldersRef.current = [];
+    setFolders(undefined);
+  }, []);
+
+  /**
+   * The list, merged by the rule above: a folder whose last event arrived after the list was asked for
+   * keeps that event's summary; a folder the list no longer holds goes, unless such an event names it.
+   */
+  const relist = useCallback(async (): Promise<void> => {
+    if (relisting.current) {
+      relisting.current.again = true;
+      return;
+    }
+    const mark = { again: false };
+    relisting.current = mark;
+    const g = gen.current;
+    try {
+      do {
+        mark.again = false;
+        const sentAt = tick.current;
+        try {
+          const r = await api.list(projectId);
+          if (!alive.current || g !== gen.current) return;
+          const cur = foldersRef.current;
+          const newer = (id: string) => (eventTick.current.get(id) ?? 0) > sentAt;
+          const next = r.folders.filter((f) => !removed.current.has(f.id)).map((f) => (newer(f.id) ? (cur.find((c) => c.id === f.id) ?? f) : f));
+          for (const c of cur) if (!next.some((f) => f.id === c.id) && newer(c.id)) next.push(c);
+          setLoadError(undefined);
+          commit(next, true);
+        } catch (err) {
+          if (!alive.current || g !== gen.current) return;
+          if (isProjectLocked(err)) {
+            markLocked();
+            return;
+          }
+          if (foldersRef.current.length === 0) setLoadError(sentenceOf(err, "The watched folders could not be read."));
+        }
+      } while (mark.again);
+    } finally {
+      if (relisting.current === mark) relisting.current = null;
+    }
+  }, [api, projectId, commit, markLocked]);
+
+  /** An answer to an act: applied unless an event for the folder arrived after the request was sent (then the list is asked for again). */
+  const applyAnswer = useCallback(
+    (s: WatchedFolderSummary, sentAt: number): WatchedFolderSummary => {
+      if ((eventTick.current.get(s.id) ?? 0) > sentAt) {
+        void relist();
+        return foldersRef.current.find((f) => f.id === s.id) ?? s;
+      }
+      commit(upsert(foldersRef.current, s), false);
+      return s;
+    },
+    [commit, relist],
+  );
+
+  const refreshCollections = useCallback(() => {
+    lib.collections.list(projectId).then(
+      (r) => alive.current && setCollections(r.collections),
+      () => {},
+    );
+  }, [lib, projectId]);
+
+  // ---- load: the folders, the project's name, the library's mode, the collections ----
+  useEffect(() => {
+    void relist();
+    lib.projects.list().then(
+      (r) => alive.current && setProject(r.projects.find((p) => p.id === projectId)),
+      () => {},
+    );
+    lib.libraries.list().then(
+      (r) => alive.current && r.current && setReadOnly(r.current.mode !== "read-write"),
+      () => {},
+    );
+    refreshCollections();
+  }, [lib, projectId, relist, refreshCollections]);
+
+  // ---- live updates: watch.status of this project, and the library's mode ----
+  useEffect(() => {
+    const ac = new AbortController();
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let opened = false;
+    const listen = async () => {
+      try {
+        const onOpen = () => {
+          // After a lost stream, what was published meanwhile is read from the list.
+          if (opened) void relist();
+          opened = true;
+        };
+        for await (const ev of client.events({ signal: ac.signal, onOpen })) {
+          if (!alive.current) return;
+          if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
+            const d = ev.data as LibraryState;
+            if (d.mode) setReadOnly(d.mode !== "read-write");
+            continue;
+          }
+          const e = watchStatusOf(ev, projectId);
+          if (!e || removed.current.has(e.folder.id)) continue;
+          tick.current++;
+          eventTick.current.set(e.folder.id, tick.current);
+          commit(upsert(foldersRef.current, e.folder), true);
+        }
+      } catch {
+        // the stream dropped: listen again shortly
+      }
+      if (!ac.signal.aborted) retry = setTimeout(() => void listen(), RECONNECT_MS);
+    };
+    void listen();
+    return () => {
+      ac.abort();
+      clearTimeout(retry);
+    };
+  }, [client, projectId, commit, relist]);
+
+  useEffect(() => {
+    if (focusFolders > 0) foldersHeading.current?.focus();
+  }, [focusFolders]);
+  useEffect(() => {
+    if (openSource) sourceRef.current?.focus();
+  }, [openSource]);
+
+  const setBusyFor = (id: string, act: Act | undefined) => {
+    const next = { ...busyRef.current };
+    if (act) next[id] = act;
+    else delete next[id];
+    busyRef.current = next;
+    setBusy(next);
+  };
+  const actingInc = (id: string, by: number) => {
+    const n = (acting.current.get(id) ?? 0) + by;
+    if (n > 0) acting.current.set(id, n);
+    else acting.current.delete(id);
+  };
+  const setErrorFor = (id: string, msg: string | undefined) =>
+    setErrors((e) => {
+      const next = { ...e };
+      if (msg) next[id] = msg;
+      else delete next[id];
+      return next;
+    });
+
+  /** A refusal: locked → the unlock screen; read-only → said once at the top; gone → the list again. */
+  const refused = (err: unknown) => {
+    if (isProjectLocked(err)) {
+      markLocked();
+      return true;
+    }
+    if (err instanceof ApiClientError && err.code === "READ_ONLY") setReadOnly(true);
+    if (err instanceof ApiClientError && err.status === 404) void relist();
+    return false;
+  };
+
+  /** One act on one folder: its button shows it is working and cannot be pressed twice; the rest of the screen stays usable. */
+  const run = async (f: WatchedFolderSummary, act: Act, call: () => Promise<WatchedFolderSummary>, result: (s: WatchedFolderSummary) => string, onRefused?: () => void) => {
+    if (busyRef.current[f.id] && busyRef.current[f.id] !== act) return;
+    setBusyFor(f.id, act);
+    actingInc(f.id, 1);
+    setErrorFor(f.id, undefined);
+    const sentAt = tick.current;
+    const g = gen.current;
+    try {
+      const s = await call();
+      if (!alive.current || g !== gen.current) return;
+      say(result(applyAnswer(s, sentAt)));
+    } catch (err) {
+      if (!alive.current || g !== gen.current || refused(err)) return;
+      setErrorFor(f.id, sentenceOf(err, "That could not be done. Try again."));
+      onRefused?.();
+    } finally {
+      actingInc(f.id, -1);
+      if (alive.current) setBusyFor(f.id, undefined);
+    }
+  };
+
+  const canAct = (f: WatchedFolderSummary) => !readOnly && !busyRef.current[f.id];
+
+  const pause = (f: WatchedFolderSummary, paused: boolean) => {
+    if (!canAct(f)) return;
+    void run(f, paused ? "pause" : "resume", () => api.patch(projectId, f.id, { paused }), (s) => end(`“${labelOf(s)}”: ${stateLine(s)}`));
+  };
+  const retry = (f: WatchedFolderSummary) => {
+    if (!canAct(f)) return;
+    void run(f, "retry", () => api.retry(projectId, f.id), (s) => end(`Tried again. “${labelOf(s)}”: ${stateLine(s)}`));
+  };
+  const leave = (f: WatchedFolderSummary) => {
+    if (!canAct(f)) return;
+    void run(f, "leave", () => api.patch(projectId, f.id, { notDownloaded: "leave" }), (s) => `“${labelOf(s)}”: files not downloaded to this Mac are left until you download them.`);
+  };
+  /** "Continue downloading ({size})": the button's own size is the agreement (R219). */
+  const continueDownloading = (f: WatchedFolderSummary, held: { files: number; bytes: number }) => {
+    if (!canAct(f)) return;
+    void run(f, "continue", () => api.patch(projectId, f.id, { notDownloaded: "download", confirmBytes: held.bytes }), (s) => `Agreed to download ${files(held.files)} (${formatSize(held.bytes)}) for “${labelOf(s)}”.`);
+  };
+  /** This computer's folder for a watch that is not set up here: the chooser, then the grant once. */
+  const chooseFolder = async (f: WatchedFolderSummary) => {
+    if (!canAct(f) || !shell) return;
+    setBusyFor(f.id, "choose");
+    let picked: { grantId: string; name: string } | null = null;
+    try {
+      picked = await shell.pickWatchFolder(`Choose the folder for “${labelOf(f)}”`);
+    } catch {
+      picked = null;
+    }
+    if (!alive.current) return;
+    if (!picked) {
+      setBusyFor(f.id, undefined);
+      return;
+    }
+    const grantId = picked.grantId;
+    await run(
+      f,
+      "choose",
+      () => api.setFolder(projectId, f.id, grantId),
+      (s) => {
+        setChooseAgain((m) => ({ ...m, [f.id]: false }));
+        return end(`Folder chosen. “${labelOf(s)}”: ${stateLine(s)}`);
+      },
+      () => setChooseAgain((m) => ({ ...m, [f.id]: true })),
+    );
+  };
+
+  // ---- add ----
+  const startAdd = async () => {
+    if (picking || readOnly || !shell || dialog) return;
+    setPicking(true);
+    let picked: { grantId: string; name: string } | null = null;
+    try {
+      picked = await shell.pickWatchFolder(WATCH_TEXT.chooserTitle);
+    } catch {
+      picked = null;
+    }
+    if (!alive.current) return;
+    setPicking(false);
+    if (!picked) return;
+    refreshCollections();
+    setDialog({ kind: "add", grant: picked.grantId, name: picked.name, busy: false });
+  };
+  const addStart = async (o: { label: string; recursive: boolean; collectionId: string }) => {
+    const d = dialog;
+    if (d?.kind !== "add" || d.busy || !d.grant || readOnly) return;
+    const grantId = d.grant;
+    // The grant is spent by the request whatever its answer (R233 d): never sent twice.
+    setDialog({ ...d, grant: null, busy: true, error: undefined });
+    const label = o.label.trim();
+    const body = { grantId, recursive: o.recursive, ...(label ? { label } : {}), ...(o.collectionId ? { collectionId: o.collectionId } : {}) };
+    const sentAt = tick.current;
+    const g = gen.current;
+    try {
+      const s = await api.add(projectId, body);
+      if (!alive.current || g !== gen.current) return;
+      const shown = applyAnswer(s, sentAt);
+      setDialog(null);
+      say(end(`Added. “${labelOf(shown)}”: ${stateLine(shown)}`));
+    } catch (err) {
+      if (!alive.current || g !== gen.current || refused(err)) return;
+      setDialog((cur) => (cur?.kind === "add" ? { ...cur, busy: false, error: sentenceOf(err, "The folder could not be added.") } : cur));
+    }
+  };
+  const addChooseAgain = async () => {
+    if (dialog?.kind !== "add" || dialog.busy || !shell) return;
+    let picked: { grantId: string; name: string } | null = null;
+    try {
+      picked = await shell.pickWatchFolder(WATCH_TEXT.chooserTitle);
+    } catch {
+      picked = null;
+    }
+    if (!alive.current || !picked) return;
+    const p = picked;
+    setDialog((cur) => (cur?.kind === "add" ? { kind: "add", grant: p.grantId, name: p.name, busy: false } : cur));
+  };
+
+  // ---- download, by an agreement to the size the service reported ----
+  const openDownload = (f: WatchedFolderSummary) => {
+    if (!canAct(f) || dialog) return;
+    setDialog({ kind: "download", id: f.id, label: labelOf(f), files: f.counts.notDownloaded, bytes: f.counts.notDownloadedBytes, busy: false });
+  };
+  const agreeDownload = async () => {
+    const d = dialog;
+    if (d?.kind !== "download" || d.busy || readOnly) return;
+    setDialog({ ...d, busy: true, error: undefined });
+    actingInc(d.id, 1);
+    const sentAt = tick.current;
+    const g = gen.current;
+    try {
+      const s = await api.patch(projectId, d.id, { notDownloaded: "download", confirmBytes: d.bytes });
+      if (!alive.current || g !== gen.current) return;
+      const shown = applyAnswer(s, sentAt);
+      setDialog(null);
+      say(`Agreed to download ${files(d.files)} (${formatSize(d.bytes)}) for “${labelOf(shown)}”.`);
+    } catch (err) {
+      if (!alive.current || g !== gen.current || refused(err)) return;
+      const msg = sentenceOf(err, "The download could not be agreed.");
+      // A 409 (the size changed, or nothing to download): the service's sentence, and the question again with the size it reports now.
+      if (err instanceof ApiClientError && err.status === 409) await relist();
+      if (!alive.current || g !== gen.current) return;
+      const now = foldersRef.current.find((f) => f.id === d.id);
+      setDialog((cur) => (cur?.kind === "download" && cur.id === d.id ? { ...cur, busy: false, error: msg, ...(now ? { files: now.counts.notDownloaded, bytes: now.counts.notDownloadedBytes } : {}) } : cur));
+    } finally {
+      actingInc(d.id, -1);
+    }
+  };
+
+  // ---- remove ----
+  const openRemove = (f: WatchedFolderSummary) => {
+    if (!canAct(f) || dialog) return;
+    setDialog({ kind: "remove", id: f.id, label: labelOf(f), busy: false });
+  };
+  const confirmRemove = async () => {
+    const d = dialog;
+    if (d?.kind !== "remove" || d.busy || readOnly) return;
+    setDialog({ ...d, busy: true, error: undefined });
+    const g = gen.current;
+    try {
+      await api.remove(projectId, d.id);
+      if (!alive.current || g !== gen.current) return;
+      removed.current.add(d.id);
+      listGen.current.set(d.id, (listGen.current.get(d.id) ?? 0) + 1);
+      commit(
+        foldersRef.current.filter((f) => f.id !== d.id),
+        false,
+      );
+      setDialog(null);
+      if (openSource) setOpenSource(null);
+      say(`Stopped watching “${d.label}”.`);
+      setFocusFolders((n) => n + 1);
+    } catch (err) {
+      if (!alive.current || g !== gen.current || refused(err)) return;
+      setDialog((cur) => (cur?.kind === "remove" ? { ...cur, busy: false, error: sentenceOf(err, "The folder could not be removed.") } : cur));
+    }
+  };
+
+  // ---- the files that did not come in, fetched when asked for ----
+  const fetchFiles = async (id: string, offset: number) => {
+    const n = (listGen.current.get(id) ?? 0) + 1;
+    listGen.current.set(id, n);
+    const g = gen.current;
+    setLists((m) => ({ ...m, [id]: { items: offset === 0 ? [] : (m[id]?.items ?? []), total: m[id]?.total ?? 0, loading: true } }));
+    try {
+      const r = await api.files(projectId, id, { offset, limit: PAGE });
+      if (!alive.current || g !== gen.current || listGen.current.get(id) !== n) return;
+      setLists((m) => (m[id] ? { ...m, [id]: { items: offset === 0 ? r.items : [...m[id]!.items, ...r.items], total: r.total, loading: false } } : m));
+    } catch (err) {
+      if (!alive.current || g !== gen.current || listGen.current.get(id) !== n || refused(err)) return;
+      setLists((m) => (m[id] ? { ...m, [id]: { ...m[id]!, loading: false, error: sentenceOf(err, "The list could not be read.") } } : m));
+    }
+  };
+  const toggleFiles = (id: string) => {
+    if (lists[id]) {
+      listGen.current.set(id, (listGen.current.get(id) ?? 0) + 1);
+      setLists(({ [id]: _gone, ...rest }) => rest);
+      return;
+    }
+    void fetchFiles(id, 0);
+  };
+
+  // ---- the page ----
+  const heading = (
+    <>
+      <h1 id={`${ids}-h`}>Watched folders</h1>
+      {project && (
+        <p className="ao-muted">
+          Project: <UserText>{project.name}</UserText>
+        </p>
+      )}
+    </>
+  );
+
+  if (locked) {
+    return (
+      <main className="ao-page ao-watch" aria-labelledby={`${ids}-h`}>
+        {heading}
+        <UnlockProject
+          api={lib}
+          project={project ?? { id: projectId, name: "This project" }}
+          onUnlocked={() => {
+            setLocked(false);
+            void relist();
+            refreshCollections();
+          }}
+        />
+      </main>
+    );
+  }
+
+  const liveFolder = dialog && dialog.kind !== "add" ? folders?.find((f) => f.id === dialog.id) : undefined;
+
+  return (
+    <main className="ao-page ao-watch" aria-labelledby={`${ids}-h`}>
+      {heading}
+      <p>{WATCH_TEXT.intro}</p>
+      {readOnly && <p className="ao-watch__note">{WATCH_TEXT.readOnly}</p>}
+      {shell ? (
+        <p>
+          <button type="button" disabled={readOnly} aria-disabled={picking || undefined} onClick={() => void startAdd()}>
+            Add a folder…
+          </button>
+        </p>
+      ) : (
+        <p className="ao-watch__note">{WATCH_TEXT.needsApp}</p>
+      )}
+      <p className="ao-visually-hidden" role="status" aria-live="polite" data-testid="watch-live">
+        {live}
+      </p>
+
+      <h2 id={`${ids}-folders`} ref={foldersHeading} tabIndex={-1}>
+        Folders
+      </h2>
+      {loadError && (
+        <p role="alert" className="ao-error">
+          {loadError}
+        </p>
+      )}
+      {!folders && !loadError && <p role="status">{WATCH_TEXT.loading}</p>}
+      {folders && folders.length === 0 && <p>{WATCH_TEXT.none}</p>}
+      {folders?.map((f) => (
+        <FolderCard
+          key={f.id}
+          f={f}
+          readOnly={readOnly}
+          inShell={!!shell}
+          busy={busy[f.id]}
+          error={errors[f.id]}
+          chooseAgain={!!chooseAgain[f.id]}
+          list={lists[f.id]}
+          onPause={() => pause(f, !f.choices.paused)}
+          onRetry={() => retry(f)}
+          onChoose={() => void chooseFolder(f)}
+          onLeave={() => leave(f)}
+          onDownload={() => openDownload(f)}
+          onContinue={(held) => continueDownloading(f, held)}
+          onRemove={() => openRemove(f)}
+          onToggleFiles={() => toggleFiles(f.id)}
+          onMoreFiles={() => void fetchFiles(f.id, lists[f.id]?.items.length ?? 0)}
+          onOpenSource={(sourceId, from) => setOpenSource({ sourceId, from })}
+        />
+      ))}
+
+      {openSource && (
+        <section ref={sourceRef} tabIndex={-1} aria-label="Source" className="ao-watch__source">
+          <SourceDetail
+            api={lib}
+            projectId={projectId}
+            sourceId={openSource.sourceId}
+            readOnly={readOnly}
+            onLocked={markLocked}
+            onClose={() => {
+              const from = openSource.from;
+              setOpenSource(null);
+              from?.focus();
+            }}
+          />
+        </section>
+      )}
+
+      {dialog?.kind === "add" && (
+        <AddDialog
+          d={dialog}
+          collections={collections}
+          onStart={(o) => void addStart(o)}
+          onChooseAgain={() => void addChooseAgain()}
+          onCancel={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === "download" && <DownloadDialog d={dialog} live={liveFolder} onConfirm={() => void agreeDownload()} onCancel={() => setDialog(null)} />}
+      {dialog?.kind === "remove" && <RemoveDialog d={dialog} onConfirm={() => void confirmRemove()} onCancel={() => setDialog(null)} />}
+    </main>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// One folder
+
+const BUSY_TEXT: Record<Act, string> = { pause: "Pausing…", resume: "Resuming…", retry: "Trying again…", choose: "Choosing…", leave: "Saving…", continue: "Agreeing…" };
+
+/** A button that shows it is working: it keeps focus (aria-disabled, not disabled) and ignores a second press. */
+function ActButton({ text, name, working, waiting, disabled, onPress, className, buttonRef, expanded }: { text: string; name: string; working: boolean; waiting: boolean; disabled: boolean; onPress: (el: HTMLButtonElement) => void; className?: string; buttonRef?: Ref<HTMLButtonElement>; expanded?: boolean }) {
+  return (
+    <button
+      type="button"
+      ref={buttonRef}
+      className={className}
+      aria-label={name}
+      disabled={disabled}
+      aria-disabled={working || waiting || undefined}
+      aria-busy={working || undefined}
+      aria-expanded={expanded}
+      onClick={(e) => {
+        if (working || waiting) return;
+        onPress(e.currentTarget);
+      }}
+    >
+      {text}
+    </button>
+  );
+}
+
+function FolderCard(props: {
+  f: WatchedFolderSummary;
+  readOnly: boolean;
+  inShell: boolean;
+  busy: Act | undefined;
+  error: string | undefined;
+  chooseAgain: boolean;
+  list: FileList | undefined;
+  onPause: () => void;
+  onRetry: () => void;
+  onChoose: () => void;
+  onLeave: () => void;
+  onDownload: () => void;
+  onContinue: (held: { files: number; bytes: number }) => void;
+  onRemove: () => void;
+  onToggleFiles: () => void;
+  onMoreFiles: () => void;
+  onOpenSource: (sourceId: string, from: HTMLElement) => void;
+}) {
+  const { f, readOnly, busy, error, list } = props;
+  const id = useId();
+  const label = labelOf(f);
+  const q = `“${label}”`;
+  /** Another act of this folder is in flight: this button waits (the folder's acts go one at a time). */
+  const waits = (act: Act | Act[]) => !!busy && !(Array.isArray(act) ? act : [act]).includes(busy);
+  const lines = countLines(f);
+  const pauseAct: Act = f.choices.paused ? "resume" : "pause";
+  const pauseText = busy === pauseAct ? BUSY_TEXT[pauseAct] : f.choices.paused ? "Resume" : "Pause";
+  const chooseText = busy === "choose" ? BUSY_TEXT.choose : props.chooseAgain ? "Choose the folder again…" : "Choose the folder on this Mac…";
+  const held = f.downloadHeld;
+  const many = f.counts.notDownloaded > KIND_CAP || f.counts.didNotComeIn > KIND_CAP;
+
+  return (
+    <section className="ao-card ao-watch__folder" aria-labelledby={`${id}-name`}>
+      <h3 id={`${id}-name`}>
+        <UserText>{label}</UserText>
+      </h3>
+      {f.label !== undefined && f.place && (
+        <p className="ao-muted">
+          In <UserText>{f.place.display}</UserText>
+        </p>
+      )}
+      {f.collectionName !== undefined && (
+        <p className="ao-muted">
+          Collection: <UserText>{f.collectionName}</UserText>
+        </p>
+      )}
+      {f.recursive && <p className="ao-muted">The folders inside it are watched too.</p>}
+      <p className="ao-watch__state">
+        <strong>{stateLine(f)}</strong>
+      </p>
+      {f.reason && (
+        <p>
+          <UserText>{f.reason}</UserText>
+        </p>
+      )}
+      {lines.length > 0 && (
+        <ul className="ao-watch__counts">
+          {lines.map((l) => (
+            <li key={l}>{l}</li>
+          ))}
+        </ul>
+      )}
+      {error && (
+        <p role="alert" className="ao-error">
+          <UserText>{error}</UserText>
+        </p>
+      )}
+      <div className="ao-actions">
+        <ActButton text={pauseText} name={busy === pauseAct ? `${pauseText} ${q}` : f.choices.paused ? `Resume watching ${q}` : `Pause watching ${q}`} working={busy === pauseAct} waiting={waits(pauseAct)} disabled={readOnly} onPress={props.onPause} />
+        {f.state === "unreachable" && <ActButton text={busy === "retry" ? BUSY_TEXT.retry : "Try again"} name={`${busy === "retry" ? BUSY_TEXT.retry : "Try again"} for ${q}`} working={busy === "retry"} waiting={waits("retry")} disabled={readOnly} onPress={props.onRetry} />}
+        {f.state === "not-set-up" && props.inShell && <ActButton text={chooseText} name={`${chooseText} for ${q}`} working={busy === "choose"} waiting={waits("choose")} disabled={readOnly} onPress={props.onChoose} />}
+        {held && (
+          <ActButton
+            text={busy === "continue" ? BUSY_TEXT.continue : `Continue downloading (${formatSize(held.bytes)})`}
+            name={`${busy === "continue" ? BUSY_TEXT.continue : `Continue downloading (${formatSize(held.bytes)})`} for ${q}`}
+            working={busy === "continue"}
+            waiting={waits("continue")}
+            disabled={readOnly}
+            onPress={() => props.onContinue(held)}
+          />
+        )}
+        <ActButton text="Show files that did not come in" name={`Show files that did not come in for ${q}`} working={false} waiting={false} disabled={false} expanded={!!list} onPress={props.onToggleFiles} />
+        <ActButton text="Remove…" name={`Remove ${q}…`} className="ao-danger" working={false} waiting={!!busy} disabled={readOnly} onPress={props.onRemove} />
+      </div>
+      <fieldset className="ao-watch__choice">
+        <legend>Files not downloaded to this Mac</legend>
+        <label className="ao-watch__option">
+          <input
+            type="radio"
+            name={`${id}-nd`}
+            value="leave"
+            checked={f.choices.notDownloaded === "leave"}
+            disabled={readOnly}
+            aria-disabled={!!busy || undefined}
+            onChange={() => {
+              if (!busy) props.onLeave();
+            }}
+          />
+          Leave them until I download them
+        </label>
+        <label className="ao-watch__option">
+          <input
+            type="radio"
+            name={`${id}-nd`}
+            value="download"
+            checked={f.choices.notDownloaded === "download"}
+            disabled={readOnly}
+            aria-disabled={!!busy || undefined}
+            onChange={() => {
+              if (!busy) props.onDownload();
+            }}
+          />
+          Download and import them
+        </label>
+      </fieldset>
+      {list && <FilesPanel label={label} list={list} many={many} onMore={props.onMoreFiles} onOpenSource={props.onOpenSource} />}
+    </section>
+  );
+}
+
+function FilesPanel({ label, list, many, onMore, onOpenSource }: { label: string; list: FileList; many: boolean; onMore: () => void; onOpenSource: (sourceId: string, from: HTMLElement) => void }) {
+  const q = `“${label}”`;
+  return (
+    <div className="ao-watch__files">
+      {list.error && (
+        <p role="alert" className="ao-error">
+          <UserText>{list.error}</UserText>
+        </p>
+      )}
+      {many && <p>{WATCH_TEXT.firstOnly}</p>}
+      {!list.loading && !list.error && list.items.length === 0 && <p>{WATCH_TEXT.noFiles}</p>}
+      {list.items.length > 0 && (
+        <>
+          <p>
+            Showing {num(list.items.length)} of {num(list.total)}.
+          </p>
+          <ul className="ao-watch__file-list" aria-label={`Files of ${q}`}>
+            {list.items.map((it, i) => (
+              <li key={`${i}:${it.kind}:${it.file}`}>
+                <UserText className="ao-watch__file">{it.file}</UserText>
+                {": "}
+                <UserText>{it.reason}</UserText>
+                {it.bytes !== undefined && ` (${formatSize(it.bytes)})`}
+                {it.sourceId && (
+                  <>
+                    {" "}
+                    <button type="button" aria-label={`Open the source of “${it.file}”`} onClick={(e) => onOpenSource(it.sourceId!, e.currentTarget)}>
+                      Open the source
+                    </button>
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {list.loading && <p role="status">Reading the list…</p>}
+      {!list.loading && list.items.length < list.total && (
+        <button type="button" aria-label={`Show more files of ${q}`} onClick={onMore}>
+          Show more
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dialogs (R145: DialogShell moves focus in, traps it, restores it, and makes the rest inert)
+
+function DialogError({ error }: { error: string | undefined }) {
+  return error ? (
+    <p role="alert" className="ao-error">
+      <UserText>{error}</UserText>
+    </p>
+  ) : null;
+}
+
+function AddDialog({ d, collections, onStart, onChooseAgain, onCancel }: { d: Extract<Dialog, { kind: "add" }>; collections: Collection[]; onStart: (o: { label: string; recursive: boolean; collectionId: string }) => void; onChooseAgain: () => void; onCancel: () => void }) {
+  const id = useId();
+  const [collectionId, setCollectionId] = useState("");
+  const [recursive, setRecursive] = useState(false);
+  const [label, setLabel] = useState("");
+  const start = useRef<HTMLButtonElement>(null);
+  const grant = d.grant;
+  // A new choice after a refusal: Start is the next thing to press.
+  const lastGrant = useRef(grant);
+  useEffect(() => {
+    if (grant && lastGrant.current !== grant && lastGrant.current === null) start.current?.focus();
+    lastGrant.current = grant;
+  }, [grant]);
+  const refusedChoice = !grant && !d.busy;
+  return (
+    <DialogShell labelledBy={`${id}-t`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog">
+      <h2 id={`${id}-t`}>Add a watched folder</h2>
+      <p>
+        Folder: <UserText>{d.name}</UserText>
+      </p>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (grant && !d.busy) onStart({ label, recursive, collectionId });
+        }}
+      >
+        <label className="ao-stack">
+          Collection
+          <select value={collectionId} onChange={(e) => setCollectionId(e.target.value)}>
+            <option value="">No collection</option>
+            {collections.map((c) => (
+              <option key={c.id} value={c.id} dir="auto">
+                {c.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="ao-watch__option">
+          <input type="checkbox" checked={recursive} onChange={(e) => setRecursive(e.target.checked)} />
+          Also watch the folders inside it
+        </label>
+        <label className="ao-stack">
+          Name shown here (optional)
+          <input type="text" dir="auto" maxLength={200} value={label} onChange={(e) => setLabel(e.target.value)} />
+        </label>
+        <DialogError error={d.error} />
+        <div className="ao-actions">
+          <button type="submit" ref={start} aria-disabled={!grant || d.busy || undefined}>
+            {d.busy ? "Starting…" : "Start watching"}
+          </button>
+          {refusedChoice && (
+            <button type="button" onClick={onChooseAgain}>
+              Choose the folder again…
+            </button>
+          )}
+          <button type="button" onClick={onCancel} aria-disabled={d.busy || undefined}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </DialogShell>
+  );
+}
+
+function DownloadDialog({ d, live, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "download" }>; live: WatchedFolderSummary | undefined; onConfirm: () => void; onCancel: () => void }) {
+  const id = useId();
+  const cancel = useRef<HTMLButtonElement>(null);
+  const nothing = d.files === 0 && d.bytes === 0 && !!d.error;
+  // The numbers agreed to here are the ones in the title; a change since is said, never slipped in.
+  const moved = live && !d.busy && (live.counts.notDownloaded !== d.files || live.counts.notDownloadedBytes !== d.bytes) ? live.counts : undefined;
+  useEffect(() => {
+    if (nothing) cancel.current?.focus();
+  }, [nothing]);
+  return (
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog">
+      <h2 id={`${id}-t`}>{downloadTitle(d.files, d.bytes)}</h2>
+      <p id={`${id}-d`}>
+        Folder: <UserText>{d.label}</UserText>
+      </p>
+      {moved && (
+        <p>
+          Since this opened, the folder&apos;s count has changed: {files(moved.notDownloaded)} ({formatSize(moved.notDownloadedBytes)}) {moved.notDownloaded === 1 ? "is" : "are"} not downloaded now. “Download and import” agrees only to the size above; cancel and choose again for the new size.
+        </p>
+      )}
+      <DialogError error={d.error} />
+      <div className="ao-actions">
+        {!nothing && (
+          <button type="button" aria-disabled={d.busy || undefined} onClick={() => !d.busy && onConfirm()}>
+            Download and import
+          </button>
+        )}
+        <button type="button" ref={cancel} aria-disabled={d.busy || undefined} onClick={() => !d.busy && onCancel()}>
+          Cancel
+        </button>
+      </div>
+    </DialogShell>
+  );
+}
+
+function RemoveDialog({ d, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "remove" }>; onConfirm: () => void; onCancel: () => void }) {
+  const id = useId();
+  return (
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog">
+      <h2 id={`${id}-t`}>
+        Stop watching “<UserText>{d.label}</UserText>”?
+      </h2>
+      <p id={`${id}-d`}>{WATCH_TEXT.removeBody}</p>
+      <DialogError error={d.error} />
+      <div className="ao-actions">
+        <button type="button" className="ao-danger" aria-disabled={d.busy || undefined} onClick={() => !d.busy && onConfirm()}>
+          {d.busy ? "Stopping…" : "Stop watching"}
+        </button>
+        <button type="button" aria-disabled={d.busy || undefined} onClick={() => !d.busy && onCancel()}>
+          Cancel
+        </button>
+      </div>
+    </DialogShell>
+  );
+}
+
