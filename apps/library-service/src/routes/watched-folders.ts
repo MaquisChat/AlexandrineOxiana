@@ -24,8 +24,11 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import {
+  FolderNotAnsweringError,
   WATCH_REASONS,
   WatchedFoldersUnreadableError,
+  folderCallOutstanding,
+  noteFolderCallOutstanding,
   addWatchedFolder,
   folderRuleRefusal,
   bringInNewVersion,
@@ -255,20 +258,29 @@ const stopLimit = (ctx: Ctx) => Math.min(WATCH_ROUTE_STOP_LIMIT_MS, fsLimit(ctx)
  */
 async function checkGranted(ctx: Ctx, s: Session, given: string): Promise<string> {
   const ms = fsLimit(ctx);
-  let real: string;
-  try {
-    real = await withLimit(realpath(given), ms);
-  } catch (err) {
-    throw badRequest(err instanceof NotAnswering ? WATCH_ROUTE_TEXT.notAnswering : WATCH_ROUTE_TEXT.notFound);
-  }
-  let isDir: boolean;
-  try {
-    isDir = (await withLimit(stat(real), ms)).isDirectory();
-  } catch (err) {
-    throw badRequest(err instanceof NotAnswering ? WATCH_ROUTE_TEXT.notAnswering : WATCH_ROUTE_TEXT.notFound);
-  }
-  if (!isDir) throw badRequest(WATCH_ROUTE_TEXT.notFolder);
   const env = locationEnv(ctx);
+  // A folder with a call still outstanding (the engine's, or one of ours given up on) is not asked again: one call per
+  // folder, whoever made it (R234 I-A). Said in the engine's words.
+  const outstanding = (dir: string) => {
+    if (folderCallOutstanding(dir)) throw new ApiError(409, "CONFLICT", withProvider(WATCH_REASONS.notResponding, providerOf(dir, env)));
+  };
+  /** One call on the folder, under the limit; given up on, it is recorded as outstanding until it settles. */
+  const onFolder = async <T>(dir: string, call: Promise<T>): Promise<T> => {
+    try {
+      return await withLimit(call, ms);
+    } catch (err) {
+      if (err instanceof NotAnswering) {
+        noteFolderCallOutstanding(dir, call);
+        throw badRequest(WATCH_ROUTE_TEXT.notAnswering);
+      }
+      throw badRequest(WATCH_ROUTE_TEXT.notFound);
+    }
+  };
+  outstanding(given);
+  const real = await onFolder(given, realpath(given));
+  outstanding(real);
+  const isDir = (await onFolder(real, stat(real))).isDirectory();
+  if (!isDir) throw badRequest(WATCH_ROUTE_TEXT.notFolder);
   // The library: not it, not inside it, not holding it (both as real paths).
   const libRoot = await realpath(s.lib.root).catch(() => path.resolve(s.lib.root));
   if (below(real, libRoot, env) !== null || below(libRoot, real, env) !== null) throw badRequest(WATCH_REASONS.library);
@@ -280,13 +292,16 @@ async function checkGranted(ctx: Ctx, s: Session, given: string): Promise<string
   return real;
 }
 
-/** The library's add or set-folder under the route's limit: a folder that stopped answering stores nothing (R233 I2). */
-async function governedFolderStep<T>(ctx: Ctx, step: (signal: AbortSignal) => Promise<T>): Promise<T> {
-  const ac = new AbortController();
+/**
+ * The library's add or set-folder (R234 I-B): its calls on the FOLDER run under the route's limit (FolderNotAnsweringError,
+ * nothing written); once they have passed, its governed write is awaited like every other governed write, inside the
+ * service's queue — never raced.
+ */
+async function governedFolderStep<T>(ctx: Ctx, step: (timeoutMs: number) => Promise<T>): Promise<T> {
   try {
-    return await withLimit(step(ac.signal), fsLimit(ctx), ac);
+    return await step(fsLimit(ctx));
   } catch (err) {
-    if (err instanceof NotAnswering) throw badRequest(WATCH_ROUTE_TEXT.notAnswering);
+    if (err instanceof FolderNotAnsweringError) throw badRequest(WATCH_ROUTE_TEXT.notAnswering);
     // The library's own checks of the folder (R233 M9): plain refusals, never a 500.
     if (err instanceof TypeError) {
       if (err.message === WATCH_REASONS.library) throw badRequest(WATCH_REASONS.library);
@@ -378,7 +393,11 @@ async function summaryOf(ctx: Ctx, s: Session, projectId: string, rec: Rec, coll
   let state: WatchedFolderSummary["state"];
   let reason: string | undefined;
   if (!rec.dir) state = "not-set-up";
-  else if (status) {
+  else if (status?.state === "stopped" && status.reason === WATCH_REASONS.notWhereChosen) {
+    // The stored folder is no longer the one chosen (R234 c): not set up on this computer; PUT …/folder chooses it again.
+    state = "not-set-up";
+    reason = status.reason;
+  } else if (status) {
     state = status.state;
     reason = status.reason;
   } else {
@@ -394,7 +413,7 @@ async function summaryOf(ctx: Ctx, s: Session, projectId: string, rec: Rec, coll
     recursive: rec.options.recursive ?? false,
     ...(cid !== undefined ? { collectionId: cid } : {}),
     ...(cid !== undefined && collections.has(cid) ? { collectionName: collections.get(cid)! } : {}),
-    place: rec.dir ? placeOf(rec.dir, locationEnv(ctx)) : null,
+    place: rec.dir && state !== "not-set-up" ? placeOf(rec.dir, locationEnv(ctx)) : null,
     state,
     ...(reason !== undefined ? { reason: scrubPaths(reason, roots) } : {}),
     scanning: status?.scanning ?? false,
@@ -581,7 +600,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     const options = { ...(label !== undefined ? { label } : {}), ...(b.recursive !== undefined ? { recursive: b.recursive as boolean } : {}), ...(collectionId !== undefined ? { collectionId: collectionId as string } : {}) };
     const w = await serial(state, async () => {
       const real = await checkGranted(ctx, s, given);
-      const added = await governedFolderStep(ctx, (signal) => addWatchedFolder(settingsDeps(s), projectId, real, options, { signal }));
+      const added = await governedFolderStep(ctx, (timeoutMs) => addWatchedFolder(settingsDeps(s), projectId, real, options, { timeoutMs }));
       startOne(ctx, s, projectId, added, real);
       return added;
     });
@@ -604,7 +623,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
       // Checked again inside the queue: a remove may have come first (R233 M9).
       if (!(await listWatchedFolders(settingsDeps(s), projectId)).some((w) => w.id === rec.id)) throw notFound("That watched folder");
       const real = await checkGranted(ctx, s, given);
-      await governedFolderStep(ctx, (signal) => setWatchFolder(settingsDeps(s), projectId, rec.id, real, { signal }));
+      await governedFolderStep(ctx, (timeoutMs) => setWatchFolder(settingsDeps(s), projectId, rec.id, real, { timeoutMs }));
       await stopOne(ctx, s, projectId, rec.id);
       startOne(ctx, s, projectId, rec, real);
     });
@@ -681,7 +700,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
       await stopOne(ctx, s, projectId, rec.id);
       return startOne(ctx, s, projectId, rec, dir);
     });
-    if (fresh) await Promise.race([fresh.ready.catch(() => {}), new Promise((r) => setTimeout(r, 5000).unref?.())]);
+    if (fresh) await Promise.race([fresh.ready.catch(() => {}), new Promise((r) => setTimeout(r, Math.min(5000, fsLimit(ctx))).unref?.())]);
     return summaryById(ctx, s, projectId, rec.id);
   });
 

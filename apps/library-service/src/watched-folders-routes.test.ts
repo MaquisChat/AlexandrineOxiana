@@ -7,11 +7,18 @@
 import { randomBytes } from "node:crypto";
 
 // R233 I2: `realpath` can be made never to answer for one folder (from its n-th call on), until released.
-const holdFs = vi.hoisted(() => ({ path: "", from: 1, calls: 0, held: null as Promise<void> | null }));
+const holdFs = vi.hoisted(() => ({ path: "", from: 1, calls: 0, held: null as Promise<void> | null, inFlight: 0, most: 0 }));
 vi.mock("node:fs/promises", async (orig) => {
   const real = await orig<typeof import("node:fs/promises")>();
   const realpath = (async (p: unknown, ...rest: unknown[]) => {
-    if (holdFs.path && String(p) === holdFs.path && ++holdFs.calls >= holdFs.from && holdFs.held) await holdFs.held;
+    if (holdFs.path && String(p) === holdFs.path && ++holdFs.calls >= holdFs.from && holdFs.held) {
+      holdFs.most = Math.max(holdFs.most, ++holdFs.inFlight);
+      try {
+        await holdFs.held;
+      } finally {
+        holdFs.inFlight--;
+      }
+    }
     return (real.realpath as (...a: unknown[]) => unknown)(p, ...rest);
   }) as typeof real.realpath;
   return { ...real, default: { ...real, realpath }, realpath };
@@ -151,7 +158,7 @@ async function sourceIds(pid: string): Promise<string[]> {
 }
 
 beforeEach(async () => {
-  Object.assign(holdFs, { path: "", from: 1, calls: 0, held: null });
+  Object.assign(holdFs, { path: "", from: 1, calls: 0, held: null, inFlight: 0, most: 0 });
   tmp = await mkdtemp(join(tmpdir(), "ao-wf-routes-"));
   deps = testDeps(tmp);
   answers.length = 0;
@@ -1034,5 +1041,81 @@ describe("fix round 1 (R233)", () => {
     expect((await call({ url: `/projects/${pid}/watched-folders/${wid}/files?offset=-1` })).json.error.message).toBe('"offset" must be a whole number, 0 or more.');
     expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { label: "" } })).json.error.message).toBe("The name must be 1 to 200 characters.");
     expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { confirmBytes: 1 } })).json.error.message).toBe("A size can be given only with “Download and import them”.");
+  });
+});
+
+describe("fix round 2 (R234)", () => {
+  const notResponding = WATCH_REASONS.notResponding.replace("{provider}", "the system");
+
+  it("I-A: retries and set-folder on a folder whose call is out: at most one call on it throughout; each answers quickly and truthfully; it is watched again when the call settles", async () => {
+    await start({ watchFsTimeoutMs: 400 });
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await folder("Hung");
+    const wid = (await add(pid, dir)).json.id as string;
+    await until(async () => (await summary(pid, wid)).state === "watching", 10_000, "watching");
+    let release: () => void = () => {};
+    Object.assign(holdFs, { path: await realpath(dir), from: 1, calls: 0, held: new Promise<void>((r) => (release = r)) });
+    // The first press restarts the watch, whose start then waits on the folder (nothing is known yet).
+    const first = await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` });
+    expect(first.status).toBe(200);
+    await until(async () => holdFs.inFlight === 1, 5000, "the call on the folder");
+    for (const n of [2, 5]) {
+      for (let i = 0; i < n; i++) {
+        const t0 = Date.now();
+        const r = await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` });
+        expect(Date.now() - t0).toBeLessThan(1500);
+        expect(r.json).toMatchObject({ state: "unreachable", reason: notResponding });
+      }
+    }
+    const t1 = Date.now();
+    const put = await call({ method: "PUT", url: `/projects/${pid}/watched-folders/${wid}/folder`, body: { grantId: grant(dir) } });
+    expect(Date.now() - t1).toBeLessThan(500);
+    expect([put.status, put.json.error.message]).toEqual([409, notResponding]);
+    expect(holdFs.most).toBe(1);
+    holdFs.path = "";
+    release();
+    await until(async () => (await summary(pid, wid)).state === "watching", 10_000, "watching again, with no press");
+    expect(svc!.state.session!.watches.get(pid)!.filter((w) => !w.stopped && w.status().watchId === wid)).toHaveLength(1);
+    expect(holdFs.most).toBe(1);
+  }, 60_000);
+
+  it("I-B: an add whose governed write waits behind another change longer than the limit is awaited: 201 and watched; a second add of the folder meanwhile is refused after it", async () => {
+    await start({ watchFsTimeoutMs: 300 });
+    await openNewLibrary();
+    const pid = await newProject();
+    const other = await newProject(false, "Other");
+    const dir = await folder("Queued");
+    let free: () => void = () => {};
+    const busy = svc!.state.session!.repo.mutate(other, { action: "store", store: { identifiable: false, hasLocation: false } }, () => new Promise<void>((r) => (free = r)));
+    const first = add(pid, dir);
+    const second = add(other, dir);
+    await new Promise((r) => setTimeout(r, 1000));
+    free();
+    await busy;
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.status, a.body).toBe(201);
+    expect([b.status, b.json.error.message]).toEqual([400, WATCH_REASONS.folderAlreadyWatched]);
+    await until(async () => (await summary(pid, a.json.id)).state === "watching", 10_000, "watching");
+    expect((await call({ url: `/projects/${other}/watched-folders` })).json.folders).toEqual([]);
+  }, 30_000);
+
+  it("(c) a stored folder that is no longer where it was chosen is not set up; PUT …/folder sets it up again", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await folder("Was");
+    const wid = (await add(pid, dir)).json.id as string;
+    const moved = join(tmp, "drive", "Now");
+    const { rename } = await import("node:fs/promises");
+    await rename(dir, moved);
+    await symlink(moved, dir);
+    expect((await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` })).status).toBe(200);
+    const s = await summary(pid, wid);
+    expect(s).toMatchObject({ state: "not-set-up", place: null, reason: WATCH_REASONS.notWhereChosen });
+    const put = await call({ method: "PUT", url: `/projects/${pid}/watched-folders/${wid}/folder`, body: { grantId: grant(moved) } });
+    expect(put.status, put.body).toBe(200);
+    await until(async () => (await summary(pid, wid)).state === "watching", 10_000, "watching");
+    expect((await summary(pid, wid)).place?.display).toBe(await realpath(moved));
   });
 });
