@@ -275,3 +275,8 @@ Also probed by reviewers: a source deleted in the library is not brought back (W
 - A file from a watched folder that a colleague put there is outside text like any other: its name reaches the screen only through `UserText`, and no part of a name or path reaches an audit entry (R177, R69).
 - All work for this plan is on the branch `claude/pdf-reader-highlights` (Ruling R204), beside the reader's interface tasks and the Zotero sync tasks; the off-limits list in Global Constraints binds, and files shared with the other lines get only the lines the task names.
 
+
+**A2 — after the report of W1 and W5 (2026-11-13).**
+- The **Verify** lines of every task: `pnpm --filter @ao/library test -- <name>` does NOT filter (it runs the whole suite). Run a single file with `pnpm --filter @ao/library exec vitest run <path-or-name>` (and the same form for the other packages); run the whole package suite once at the end.
+- W2: `ignoredName` moves from `watch.ts` into `watch-local.ts` and is re-exported from `watch.ts` under the same name, so that `watch.ts` can import `watch-local.ts` without the two modules importing each other.
+- W1 as built adds optional arguments for tests (`contentPresence(paths, opts)` with `statTool` and `lstatIno`; `datalessFlagsDarwin(paths, opts?)`) and exports `WATCH_LOCAL_BATCH`, `WATCH_LOCAL_ARG_BYTES`, `WATCH_LOCAL_TOOL_TIMEOUT_MS`; later tasks use these names.
