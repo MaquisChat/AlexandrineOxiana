@@ -874,8 +874,17 @@ test("two overlapping highlights are both offered where they overlap", async ({ 
   await centreOn(page, { n: 1, words: line, to: 26 });
   // "This is the text of" in Yellow, then "text of page 1" in Blue: "text of" lies under both.
   await dragSelect(page, { n: 1, words: line, i: 0 }, { n: 1, words: line, i: 18 });
-  await colourBar(page).getByRole("button", { name: "Highlight in Yellow" }).click();
+  // The toolbar by keyboard: the page took the focus with the press; Tab reaches the toolbar, the
+  // arrows move in it, Enter chooses, and the focus goes back to the page.
+  await expect(page.locator('[data-page-number="1"]')).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(colourBar(page).getByRole("button", { name: "Highlight", exact: true })).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await expect(colourBar(page).getByRole("button", { name: "Highlight in Yellow" })).toBeFocused();
+  await page.keyboard.press("Enter");
   await expect(said(page)).toHaveText("Highlight added: Yellow, page 1.");
+  await expect(colourBar(page)).toHaveCount(0);
+  await expect(page.locator('[data-page-number="1"]')).toBeFocused();
   await dragSelect(page, { n: 1, words: line, i: 12 }, { n: 1, words: line, i: 25 });
   await colourBar(page).getByRole("button", { name: "Highlight in Blue" }).click();
   await expect(said(page)).toHaveText("Highlight added: Blue, page 1.");
