@@ -24,7 +24,6 @@ import { StatusBanner, bannersFor, useNoticeDismiss, volumeOf } from "../compone
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
-import { isReadablePdf } from "../components/ReaderLink";
 import { navigate as goTo, PATHS } from "../navigation";
 import { clearPendingFind, guardPendingFind, setPendingFind } from "../reader/readerHandoff";
 import { readerHref } from "../routes/reader";
@@ -353,35 +352,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, projectId, locked, filter, reload]);
 
-  // ---- Task R12: "Show in the reader" for a hit in an annotation of a source with a readable PDF ----
+  // ---- Task R12: "Show in the reader" for a hit in an annotation (no request per row: a row does not say whether it has a PDF) ----
   /** The text of the search whose answer is shown (what the reader is handed). */
   const [searched, setSearched] = useState("");
-  /** Sources found to have a readable PDF; asked of each annotation hit only (a row does not say). */
-  const [readable, setReadable] = useState<ReadonlySet<string>>(new Set());
-  useEffect(() => {
-    if (!projectId || locked || !sources) {
-      setReadable((s) => (s.size === 0 ? s : new Set()));
-      return;
-    }
-    const hits = sources.items.filter((s) => s.matchedIn === "annotation" && !s.locked).map((s) => s.id);
-    if (hits.length === 0) return;
-    const ac = new AbortController();
-    void (async () => {
-      for (const id of hits) {
-        if (ac.signal.aborted) return;
-        let ok = false;
-        try {
-          ok = (await api.sources.get(projectId, id)).assets.some((a) => isReadablePdf(a));
-        } catch {
-          // Not offered on a guess.
-        }
-        if (ac.signal.aborted) return;
-        setReadable((s) => (s.has(id) === ok ? s : new Set(ok ? [...s, id] : [...s].filter((x) => x !== id))));
-      }
-    })();
-    return () => ac.abort();
-  }, [api, projectId, locked, sources]);
-  useEffect(() => setReadable(new Set()), [projectId]);
   /** "Show in the reader": the words searched for go to the reader in memory; the address carries ids only. */
   const showInReader = (sourceId: string) => {
     if (!projectId) return;
@@ -868,7 +841,6 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                   rebuilding={!!index && index.done < index.total}
                   reviewHref={readOnly ? undefined : (sid) => reviewQueueHref(project.id, sid)}
                   onFollow={follow}
-                  readerSources={readable}
                   onShowInReader={showInReader}
                 />
                 {sources.items.length < sources.total && (

@@ -54,32 +54,28 @@ describe("Library: a search hit found in an annotation (Task R12)", () => {
     expect(screen.getByText("Found in an annotation")).toBeTruthy();
   });
 
-  it("is offered only for a hit in an annotation, of a source with a readable PDF, that is not locked", async () => {
-    serve({
-      hits: [
-        hit("s1", "Has a PDF"),
-        hit("s2", "No PDF"),
-        { ...base, id: "s3", title: "Found by title" },
-        hit("s4", "Locked", { locked: true, title: "" }),
-        hit("s5", "Destroyed PDF"),
-        hit("s6", "An EPUB only"),
-      ],
-      files: { s2: [{ ...pdf, id: "x", mime: "image/png", kind: "image" }], s5: [{ ...pdf, status: "destroyed" }], s6: [{ ...pdf, mime: "application/epub+zip", kind: "epub" }] },
-    });
+  it("is offered for every hit in an annotation that is not locked, and for no other row", async () => {
+    serve({ hits: [hit("s1", "Has a PDF"), hit("s2", "No PDF"), { ...base, id: "s3", title: "Found by title" }, hit("s4", "Locked", { locked: true, title: "" })] });
     renderLibrary();
     await screen.findByRole("button", { name: "Show in the reader: Has a PDF" });
-    // Give the other answers time to arrive: they change nothing.
-    await new Promise((r) => setTimeout(r, 100));
-    expect(screen.getAllByRole("button", { name: /^Show in the reader/ })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: /^Show in the reader/ }).map((b) => b.getAttribute("aria-label"))).toEqual(["Show in the reader: Has a PDF", "Show in the reader: No PDF"]);
   });
 
-  it("a source whose details cannot be read offers nothing (it is never offered on a guess)", async () => {
-    serve({ hits: [hit("s1", "Ethnography at Work")] });
-    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json({ error: { code: "NOT_FOUND", message: "gone" } }, { status: 404 })));
+  it("makes no request per row: 100 annotation hits and a second answer ask for no source's details at all", async () => {
+    const user = userEvent.setup();
+    const hits = Array.from({ length: 100 }, (_, i) => hit(`s${i}`, `Hit ${i}`));
+    serve({ hits });
+    const gets: string[] = [];
+    server.events.on("request:start", ({ request }) => {
+      if (/\/projects\/[^/]+\/sources\/[^/]+$/.test(new URL(request.url).pathname)) gets.push(request.url);
+    });
     renderLibrary();
-    await screen.findByText("Ethnography at Work");
-    await new Promise((r) => setTimeout(r, 100));
-    expect(screen.queryByRole("button", { name: /^Show in the reader/ })).toBeNull();
+    await screen.findByRole("button", { name: "Show in the reader: Hit 99" });
+    await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "habitus");
+    await new Promise((r) => setTimeout(r, 600));
+    expect(screen.getAllByRole("button", { name: /^Show in the reader/ })).toHaveLength(100);
+    expect(gets).toEqual([]);
+    server.events.removeAllListeners();
   });
 
   it("pressing it hands the words searched for over in memory and opens the reader with ids only", async () => {
