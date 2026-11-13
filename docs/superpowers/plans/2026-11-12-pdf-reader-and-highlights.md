@@ -280,3 +280,13 @@
 - After R3: **R4**. After R6: **R7**. R4 and R7 can run side by side.
 - After R4 and R7: **R8**, then **R9**; then **R10** and **R12** in parallel; then **R11**; **R13** last and only if the coordinator keeps it.
 - Every UI task's end-to-end check runs in both the `chromium` and `webkit` projects; a WebKit-only failure is a failure.
+
+## Amendments (they override the task sections above; newest last)
+
+**A1 — Ruling R195 (2026-11-13, after the review of R1): the order of annotations within a page.**
+- R1: `compareAnnotations` (or whatever R1 names its comparison) orders by page first. Within one page: if EVERY annotation on that page carries a stored `sortIndex`, they are ordered by it; if any one lacks it, the whole page is ordered geometrically (top to bottom, then left to right, from the anchors' rectangles). The two rules are never mixed within a page, so the order is always total and stable.
+- R2: besides keeping Zotero's sort index for newly imported annotations, a re-import fills in the missing `sortIndex` of an annotation that was imported before this plan and is otherwise unchanged — without marking it edited, without changing its hash, and never on an annotation the researcher has changed or deleted. Test first: `a re-import back-fills the sort index of an unchanged imported annotation and reports no change`.
+- R10 and R11: every highlight and page note made in the reader stores a `sortIndex` built from its position in the page's text (the same form as Zotero's), so that reading order holds in two-column pages. Test first in R10: `a highlight made in column two sorts after one made at the foot of column one`.
+
+**A2 — Ruling R195 (same date): matching a search hit's words.**
+- R1's `matchAnnotations` splits and folds words by the SAME rules as the search index (`packages/library/src/index/text.ts`): punctuation separates words, a query word matches the beginning of a word as the index does, and Chinese, Japanese and Korean text is matched as the index matches it; accent folding never breaks Hangul apart and never makes one kana match another. The rule lives in one place: the pure function is moved to `packages/core` and the library imports it with no change of behaviour (every index test passes untouched), or, if it cannot be moved without changing behaviour, it is replicated in core with a test that holds the two equal over one shared list of examples.
