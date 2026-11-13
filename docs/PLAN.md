@@ -577,7 +577,7 @@ Update after every task; commit and push.
 | R2 Reader: the Zotero import keeps the sort index; re-import respects changes | approved and verified with R3; merge waits for GitHub's run on R5 | f784336 (worktree branch) | reviewed with probes over two rounds (R196, R197) |
 | R3 Reader: governed annotation operations in the library | approved and verified with R2; merge waits for GitHub's run on R5 | 7295e2b (worktree branch) | reviewed with twelve probes; a recolour to the same colour is no change (A5) |
 | R4 Reader: annotation routes in the service | approved; a last small round (two points) | 702a064 (worktree branch) | reviewed with probes over one fix round (R198); 44 renames each break the build |
-| R6 Reader: pdf.js in the interface, bundled, under the policy | in review | 6f64f07 (worktree branch) | end-to-end in both browsers; one policy change; the GPL-licensed Liberation Sans fonts are not to be bundled (R199) |
+| R6 Reader: pdf.js in the interface, bundled, under the policy | fix round 1 | 6f64f07 (worktree branch) | review: the worker must be created by the app (the shell's origin reads as "null"); a failure channel; no GPL fonts; notices per asset (R199, R200; plan Amendment A6) |
 | R7–R13 Reader: the remaining tasks | not started | | order: R7 after R6, then R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
