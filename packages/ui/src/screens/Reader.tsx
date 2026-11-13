@@ -549,8 +549,6 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
 
   // Task R11: highlights and page notes without a mouse (the keyboard's selection, the page note).
   const keyboard = useKeyboardMaking({
-    api: () => apiRef.current,
-    projectId,
     sourceId,
     assetId,
     handle,
@@ -561,10 +559,6 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
     count,
     pageText: (i) => pageTexts.current.get(i),
     making,
-    onCreated,
-    onStoredMeanwhile: () => setListAttempt((n) => n + 1),
-    onLocked: endLocked,
-    onProjectInDoubt: () => inDoubt.current?.(),
   });
   pickClosed.current = keyboard.onPickClosed;
   const noteDraft = keyboard.draft;
@@ -981,6 +975,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
         </div>
         {(annotations !== undefined || annotationsError !== undefined) && (
           <AnnotationList
+            {...(keyboard.readOnlyReasonId !== undefined ? { readOnlyReasonId: keyboard.readOnlyReasonId } : {})}
             annotations={annotations ?? []}
             assetId={assetId}
             {...(selectedId !== undefined ? { selectedId } : {})}

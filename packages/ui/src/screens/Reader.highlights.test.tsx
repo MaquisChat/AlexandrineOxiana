@@ -436,12 +436,19 @@ describe("ReaderScreen: making highlights with the mouse (Task R10)", () => {
     await screen.findByRole("region", { name: "Annotations (0)" });
     const line = await lineOf(1);
     select([line, 0], [line, 5]);
-    const why = "This library is read-only, so highlights cannot be made.";
-    await waitFor(() => expect(screen.getByText(why)).toBeTruthy());
+    // R240 f: the reader's one read-only sentence, shown once on the screen and said once in the live region.
+    const why = "This library is read-only, so highlights and notes cannot be added or changed.";
+    await waitFor(() => expect(live()).toBe(why));
+    expect(screen.getAllByText(why, { selector: ":not(.ao-ann-live, .ao-ann-live *)" })).toHaveLength(1);
     expect(toolbar()).toBeNull();
+    const heard: string[] = [];
+    const watch = new MutationObserver(() => heard.push(live() ?? ""));
+    watch.observe(document.querySelector(".ao-ann-live")!, { childList: true, characterData: true, subtree: true });
     select([line, 0], [line, 8]);
     await flush();
-    expect(screen.getAllByText(why)).toHaveLength(1);
+    watch.disconnect();
+    expect(heard).toEqual([]);
+    expect(screen.getAllByText(why, { selector: ":not(.ao-ann-live, .ao-ann-live *)" })).toHaveLength(1);
     expect(toolbar()).toBeNull();
     expect(creates()).toHaveLength(0);
   });

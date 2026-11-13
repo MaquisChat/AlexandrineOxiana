@@ -479,7 +479,10 @@ describe("AnnotationList (Task R9)", () => {
   it("read-only offers Go to only and says why", () => {
     list({ annotations: [rec({ id: "a", body: "n" }), rec({ id: "b" })], readOnly: true });
     expect(screen.getAllByText(ANNOTATIONS_READ_ONLY)).toHaveLength(1);
-    expect(ANNOTATIONS_READ_ONLY).toBe("This library is read-only, so highlights cannot be changed.");
+    // The reader's one read-only sentence (Ruling R240 f); the disabled controls refer to it.
+    expect(ANNOTATIONS_READ_ONLY).toBe("This library is read-only, so highlights and notes cannot be added or changed.");
+    const sentence = screen.getByText(ANNOTATIONS_READ_ONLY);
+    for (const b of screen.getAllByRole("button", { name: /^(Edit note|Add note|Colour|Delete)/ })) expect(b.getAttribute("aria-describedby")).toBe(sentence.id);
     const enabled = screen.getAllByRole("button").filter((b) => !(b as HTMLButtonElement).disabled);
     expect(enabled.map((b) => b.textContent)).toEqual(["Go to", "Go to"]);
     // The others are there, disabled, not hidden.

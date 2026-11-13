@@ -29,7 +29,8 @@ import { ANNOTATION_ANCHORS_MAX } from "@ao/shared";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { PageViewport } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { ApiClientError } from "../api/client";
-import type { AnnotationCreateRequest, AnnotationRecord, HighlightColourName, ReaderApi } from "../api/reader";
+import type { AnnotationCreateRequest, AnnotationRecord, HighlightColourName, PdfRectDto, ReaderApi } from "../api/reader";
+import { NOTE_FIRST, noteBeingWritten, READ_ONLY_READER } from "./AnnotationList";
 import { HighlightToolbar, OverlapMenu } from "./HighlightToolbar";
 import { pdfRectToBox, selectionToAnchors, type Box, type PageGeometry, type SelectionAnchor } from "./geometry";
 import type { PdfHandle } from "./pdfjs";
@@ -43,7 +44,8 @@ export const PAGE_STILL_DRAWING = "This page is still being drawn. Select the te
 export const LET_GO_ON_PAGE = "To highlight, let go of the mouse over the page.";
 /** Said through the list's live region between the press and the service's answer (R223, M3). */
 export const ADDING = "Adding the highlight…";
-export const READ_ONLY_MAKING = "This library is read-only, so highlights cannot be made.";
+/** The reader's one read-only sentence (Ruling R240 f), said once when a selection is let go. */
+export const READ_ONLY_MAKING = READ_ONLY_READER;
 const SERVICE_SILENT = "The library service did not answer, so the highlight was not made.";
 
 /** The colour "Highlight" uses: the last one chosen in this session (Yellow at first). */
@@ -88,6 +90,25 @@ export interface MakingOptions {
   onPickClosed?(made: boolean): void;
 }
 
+/** What `make` is asked to make (Task R10's highlight, Task R11's page note). */
+export interface MakeRequest {
+  kind: "highlight" | "note";
+  anchors: Array<{ page: number; rects: PdfRectDto[]; sortIndex: string }>;
+  quote?: string;
+  body?: string;
+  colour: HighlightColourName;
+  /** Said while the service is asked. */
+  adding: string;
+  /** Shown when the service did not answer with a sentence of its own. */
+  silent: string;
+  /** Said when made; `where` is ", page 7" or ", pages 4–5". */
+  added(made: AnnotationRecord, where: string): string;
+  /** Shows a refusal's sentence (R10's alert when not given). */
+  refused?(sentence: string): void;
+}
+/** How a `make` ended: made; refused (its sentence shown); the reader ended as locked; the answer dropped (A7); nothing sent. */
+export type MakeOutcome = "made" | "refused" | "locked" | "dropped" | "not-sent";
+
 interface Pick {
   anchors: SelectionAnchor[];
   /** Where the toolbar goes: the last page's (0-based) last line. */
@@ -114,7 +135,8 @@ export function useHighlightMaking(o: MakingOptions) {
   const [menu, setMenu] = useState<Menu | undefined>(undefined);
   const [drafts, setDrafts] = useState<AnnotationRecord[]>([]);
   const [alert, setAlert] = useState<string | undefined>(undefined);
-  const [readOnlySaid, setReadOnlySaid] = useState(false);
+  /** The read-only sentence was said (once a document, R240 f: it is shown on the screen already). */
+  const readOnlySaid = useRef(false);
   const [announcement, setAnnouncement] = useState<{ text: string; n: number } | undefined>(undefined);
   const [lastColour, setLastColour] = useState<HighlightColourName>(lastUsed);
   const [, setTick] = useState(0);
@@ -188,7 +210,16 @@ export function useHighlightMaking(o: MakingOptions) {
     if (anchors.length === 0 && boxes.length <= ANNOTATION_ANCHORS_MAX && !unsure) return false;
     setMenu(undefined);
     if (readOnly) {
-      setReadOnlySaid(true);
+      if (!readOnlySaid.current) say(READ_ONLY_MAKING);
+      readOnlySaid.current = true;
+      return false;
+    }
+    // One thing written or chosen at a time (R240 d): the note being written first.
+    const writing = noteBeingWritten();
+    if (writing) {
+      setPick(undefined);
+      say(NOTE_FIRST);
+      writing.focus();
       return false;
     }
     if (boxes.length > ANNOTATION_ANCHORS_MAX) {
@@ -283,62 +314,69 @@ export function useHighlightMaking(o: MakingOptions) {
   };
   const say = (text: string) => setAnnouncement((s) => ({ text, n: (s?.n ?? 0) + 1 }));
 
-  const create = async (colour: HighlightColourName) => {
-    const p = pick;
-    setPick(undefined);
-    opts.current.onPickClosed?.(true);
-    lastUsed = colour;
-    setLastColour(colour);
+  /**
+   * The one way a highlight or a page note is made (Task R10; the keyboard's page note, Task R11, calls
+   * it too): one create through the service's route, with the page label stored when it differs from
+   * the page number and the rectangles to a thousandth of a point; a draft drawn meanwhile (never
+   * chosen, never listed) and `adding` said; the service's answer replaces the draft on the page and in
+   * the list (`onCreated`) and is said (`added`). A refusal removes the draft and shows the service's
+   * sentence (R10's alert, or `refused`); a 423 ends the reader as locked; a 404 also asks whether the
+   * project is still there; an answer after the document ended, failed or was opened again is dropped
+   * (asking the list again if it was stored and the same file is open, M2). Only from a live handle,
+   * checked again now (A7).
+   */
+  const make = async (m: MakeRequest): Promise<MakeOutcome> => {
     const { api, projectId, sourceId, assetId, handle: h, isLive, readOnly } = opts.current;
-    // A7: only from a live handle, checked again now.
-    if (!p || !h || !isLive(h) || !assetId || readOnly) return;
-    window.getSelection?.()?.removeAllRanges();
-    const first = p.anchors[0]!;
+    if (!h || !isLive(h) || !assetId || readOnly || m.anchors.length === 0) return "not-sent";
+    const first = m.anchors[0]!;
     const printed = h.pageLabels?.[first.page - 1];
     const body: AnnotationCreateRequest = {
-      kind: "highlight",
+      kind: m.kind,
       assetId,
-      anchors: p.anchors.map((a) => ({ page: a.page, rects: a.rects.map((r) => ({ x: round(r.x), y: round(r.y), w: round(r.w), h: round(r.h) })), sortIndex: a.sortIndex })),
-      quote: p.anchors.map((a) => a.quote).join(" "),
-      colorName: colour,
+      anchors: m.anchors.map((a) => ({ page: a.page, rects: a.rects.map((r) => ({ x: round(r.x), y: round(r.y), w: round(r.w), h: round(r.h) })), sortIndex: a.sortIndex })),
+      ...(m.quote !== undefined ? { quote: m.quote } : {}),
+      ...(m.body !== undefined ? { body: m.body } : {}),
+      colorName: m.colour,
       ...(printed && printed !== String(first.page) && printed.length <= PAGE_LABEL_MAX && !CONTROL.test(printed) ? { pageLabel: printed } : {}),
     };
     const id = `draft:${++seq.current}`;
     const draft: AnnotationRecord = {
       id,
       sourceId,
-      kind: "highlight",
+      kind: m.kind,
       pdfAnchors: body.anchors.map((a, i) => ({ id: `${id}:${i}`, assetId, page: a.page, rects: a.rects, sortIndex: a.sortIndex ?? "", sortIndexDerived: false })),
       otherAnchorKinds: [],
-      colorName: colour,
+      colorName: m.colour,
       imported: false,
       author: "",
       createdAt: new Date().toISOString(),
     };
     setDrafts((d) => [...d, draft]);
     setAlert(undefined);
-    say(ADDING);
+    say(m.adding);
     const dropDraft = () => setDrafts((d) => d.filter((x) => x.id !== id));
     let made: AnnotationRecord;
     try {
       made = await api().createAnnotation(projectId, sourceId, body);
     } catch (e) {
       // An answer after the document ended, failed or was opened again is dropped (A7).
-      if (!isLive(h) || opts.current.handle !== h) return;
+      if (!isLive(h) || opts.current.handle !== h) return "dropped";
       dropDraft();
       if (e instanceof ApiClientError && e.status === 423) {
         opts.current.onLocked(h);
-        return;
+        return "locked";
       }
       if (e instanceof ApiClientError && e.status === 404) opts.current.onProjectInDoubt();
-      setAlert(e instanceof Error && e.message ? e.message : SERVICE_SILENT);
-      return;
+      const sentence = e instanceof Error && e.message ? e.message : m.silent;
+      if (m.refused) m.refused(sentence);
+      else setAlert(sentence);
+      return "refused";
     }
     if (!isLive(h) || opts.current.handle !== h) {
       // Dropped (A7) — but stored: if this file was opened again meanwhile, its list is asked for again (M2).
       const now = opts.current.handle;
       if (now && now !== h && opts.current.isLive(now) && opts.current.assetId === assetId) opts.current.onStoredMeanwhile();
-      return;
+      return "dropped";
     }
     dropDraft();
     opts.current.onCreated(made);
@@ -346,7 +384,29 @@ export function useHighlightMaking(o: MakingOptions) {
     const lo = Math.min(...pages);
     const hi = Math.max(...pages);
     const where = pages.length === 0 ? "" : lo === hi ? `, page ${lo}` : `, pages ${lo}–${hi}`;
-    say(`Highlight added: ${label(made.colorName)}${where}.`);
+    say(m.added(made, where));
+    return "made";
+  };
+
+  const create = async (colour: HighlightColourName) => {
+    const p = pick;
+    setPick(undefined);
+    opts.current.onPickClosed?.(true);
+    lastUsed = colour;
+    setLastColour(colour);
+    const { handle: h, isLive, assetId, readOnly } = opts.current;
+    // A7: only from a live handle, checked again now.
+    if (!p || !h || !isLive(h) || !assetId || readOnly) return;
+    window.getSelection?.()?.removeAllRanges();
+    await make({
+      kind: "highlight",
+      anchors: p.anchors,
+      quote: p.anchors.map((a) => a.quote).join(" "),
+      colour,
+      adding: ADDING,
+      silent: SERVICE_SILENT,
+      added: (made, where) => `Highlight added: ${label(made.colorName)}${where}.`,
+    });
   };
 
   /** Where a point of page `pageIndex` lies in the page area (CSS pixels), or nothing when the page is not there. */
@@ -418,11 +478,6 @@ export function useHighlightMaking(o: MakingOptions) {
 
   const notices: ReactNode = (
     <>
-      {readOnlySaid && (
-        <p role="status" className="ao-reader-making-note">
-          {READ_ONLY_MAKING}
-        </p>
-      )}
       {alert !== undefined && (
         <p role="alert" className="ao-reader-making-note">
           {alert}
@@ -442,6 +497,8 @@ export function useHighlightMaking(o: MakingOptions) {
     cancel,
     /** The keyboard's path (Task R11): its own range, read exactly as a mouse selection is (`offer`). */
     takeRange: offer,
+    /** The one way to make a highlight or a page note (R240 b). */
+    make,
     /** Says `text` in the list's live region (the one polite region of the reader). */
     say,
     /** Whether the colour toolbar is shown. */

@@ -40,28 +40,29 @@
 import { pdfSortIndex } from "@ao/core/annotations/sortIndex";
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import type { PageViewport } from "pdfjs-dist/legacy/build/pdf.mjs";
-import { ApiClientError } from "../api/client";
-import type { AnnotationCreateRequest, AnnotationRecord, PdfRectDto, ReaderApi } from "../api/reader";
-import { NOTE_BUSY, NoteEditor, Question, useNoteHold } from "./AnnotationList";
+import type { AnnotationRecord, PdfRectDto } from "../api/reader";
+import { NOTE_BUSY, NOTE_FIRST, noteBeingWritten, NoteEditor, Question, READ_ONLY_READER, useNoteHold } from "./AnnotationList";
 import { createKeyboardSelection, textItemsOf, type KeyboardSelection, type TextItemRef } from "./keyboardSelection";
 import type { TextContent } from "./PdfPages";
 import type { PdfHandle } from "./pdfjs";
 import { END_OF_CONTENT_CLASS } from "./textLayerSelection";
-import { PAGE_STILL_DRAWING, PAGES_NOT_SHOWN, READ_ONLY_MAKING } from "./useHighlightMaking";
+import { PAGE_STILL_DRAWING, PAGES_NOT_SHOWN, type MakeOutcome, type MakeRequest } from "./useHighlightMaking";
 
 export const NO_TEXT_TO_SELECT = "This page has no text to select.";
 export const SELECTION_CANCELLED = "Selection cancelled.";
 /** The stated limit (Accept 4), in the reader's "Keyboard help". */
 export const KEYBOARD_ORDER_LIMIT = "Text is selected in the order the PDF stores it, which for some two-column or unusual layouts is not the reading order.";
-export const READ_ONLY_NOTES = "This library is read-only, so notes cannot be added.";
+/** In the "Keyboard help" (R240, M10). */
+export const KEYBOARD_HELP_KEYS = "S and N work whatever the case; on a keyboard without Latin letters, use the keys where S and N are on an English keyboard. The buttons “Select text” and “Add a note to this page” do the same.";
+/** At the edge of the pages that are drawn (Ruling R240 c): said once a selection; what is selected can still be highlighted. */
+export const KEYBOARD_EDGE = "The selection stops at the pages on screen. Highlight this part, then carry on from the next page.";
 export const SELECTING_NOW = "Text is being selected. Press Escape to end the selection first.";
-export const NOTE_OPEN = "A note is being written. Save it or cancel it first.";
 export const PLACING = "Click on a page to place the note. Press Escape to stop.";
 export const PLACING_STOPPED = "The note stays where it was.";
 export const NOT_ON_A_PAGE = "Nothing was placed: the click was not on a page.";
 export const NOTE_PAGE_DRAWING = "This page is still being drawn. Add the note again in a moment.";
 export const ADDING_NOTE = "Adding the note…";
-const SERVICE_SILENT = "The library service did not answer, so the note was not added.";
+const NOTE_SILENT = "The library service did not answer, so the note was not added.";
 /** At most one "Selected: …" a this many milliseconds; the last one is always said. */
 export const ANNOUNCE_MS = 500;
 /** How many characters of the selection are said. */
@@ -72,10 +73,6 @@ export const NOTE_SIZE_PT = 22;
 const NOTE_INSET_PX = 8;
 /** How far from the view's edge the selection's moving end is kept, in CSS pixels. */
 const KEEP_IN_VIEW_PX = 24;
-const PAGE_LABEL_MAX = 64;
-// eslint-disable-next-line no-control-regex
-const CONTROL = /[\u0000-\u001F\u007F-\u009F]/u;
-const round = (v: number) => Math.round(v * 1000) / 1000;
 /** Unicode's isolate marks: the selected text keeps its own direction inside the sentence. */
 const FSI = "⁨";
 const PDI = "⁩";
@@ -98,7 +95,7 @@ export function noteRectAt(vp: PageViewport, x: number, y: number): PdfRectDto {
   const top = Math.min(Math.max(0, y), Math.max(0, vp.height - size));
   const [x0, y0] = vp.convertToPdfPoint(left, top) as [number, number];
   const [x1, y1] = vp.convertToPdfPoint(left + size, top + size) as [number, number];
-  return { x: round(Math.min(x0, x1)), y: round(Math.min(y0, y1)), w: round(Math.abs(x1 - x0)), h: round(Math.abs(y1 - y0)) };
+  return { x: Math.min(x0, x1), y: Math.min(y0, y1), w: Math.abs(x1 - x0), h: Math.abs(y1 - y0) };
 }
 
 /**
@@ -126,10 +123,13 @@ function sameSelection(now: Range, mine: Range): boolean {
 }
 
 const isComposing = (e: KeyboardEvent) => e.nativeEvent.isComposing || e.keyCode === 229;
+/**
+ * Whether `e` is the letter key `l` (R240, M10): the character typed, whatever its case; or, when the
+ * layout gives no Latin letter for the key (Cyrillic, Greek…), the key in that letter's place.
+ */
+export const isLetterKey = (e: { key: string; code: string }, l: "s" | "n"): boolean => e.key.toLowerCase() === l || (!/^[a-z]$/iu.test(e.key) && e.code === `Key${l.toUpperCase()}`);
 
 export interface KeyboardMakingOptions {
-  api: () => ReaderApi;
-  projectId: string;
   sourceId: string;
   assetId: string | undefined;
   handle: PdfHandle | undefined;
@@ -142,12 +142,11 @@ export interface KeyboardMakingOptions {
   count: number;
   /** A drawn page's text as the pages read it (0-based index), if it is still kept. */
   pageText(pageIndex: number): TextContent | undefined;
-  /** R10's making: the range reader, the live region, whether its toolbar is shown. */
-  making: { takeRange(range: Range): boolean; say(text: string): void; picking: boolean };
-  onCreated(r: AnnotationRecord): void;
-  onStoredMeanwhile(): void;
-  onLocked(h: PdfHandle): void;
-  onProjectInDoubt(): void;
+  /**
+   * R10's making: the range reader, the one way to make (`make`, R240 b), the live region, whether its
+   * toolbar is shown and how it is given up.
+   */
+  making: { takeRange(range: Range): boolean; make(m: MakeRequest): Promise<MakeOutcome>; say(text: string): void; picking: boolean; cancel(): boolean };
 }
 
 interface NoteDraft {
@@ -155,6 +154,8 @@ interface NoteDraft {
   seq: number;
   page: number;
   rect: PdfRectDto;
+  /** Worked out when the note is placed, from the page's text then (M1: it may be gone by the time it is saved). */
+  sortIndex: string;
   how: "view" | "click";
 }
 
@@ -177,8 +178,14 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
   const sending = useRef(false);
   const noteSeq = useRef(0);
   const focusToolbar = useRef(false);
-  /** The keys already refused for read-only (each said once). */
-  const saidReadOnly = useRef(new Set<string>());
+  /** The read-only sentence was said for a key (once, R240 f). */
+  const saidReadOnly = useRef(false);
+  /** The edge of the drawn pages was said for this selection (once, R240 c). */
+  const edgeSaid = useRef(false);
+  /** The drawn pages next to the current one when the selection started, with or without text. */
+  const reach = useRef({ first: 0, last: 0 });
+  /** The letter key held down (S or N): its repeats do nothing (R240, M3). */
+  const held = useRef<{ code: string; key: string } | undefined>(undefined);
   const noteRoot = useRef<HTMLElement>(null);
 
   // ---- saying, at most once every ANNOUNCE_MS, the last state always ------------------------------
@@ -203,6 +210,12 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     }
     waiting.current = text;
     timer.current ??= setTimeout(flush, Math.max(0, lastSaid.current + ANNOUNCE_MS - now));
+  };
+  /** Says now what is waiting to be said (Enter: the last state is said before the toolbar, R240 M4). */
+  const sayWaiting = () => {
+    if (timer.current === undefined) return;
+    clearTimeout(timer.current);
+    flush();
   };
   const hush = () => {
     clearTimeout(timer.current);
@@ -282,30 +295,32 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
 
   /** Why "Select text" cannot act now, or nothing. */
   const selectWhy = (): string | undefined => {
-    if (opts.current.readOnly) return READ_ONLY_MAKING;
-    if (note) return NOTE_OPEN;
+    if (opts.current.readOnly) return READ_ONLY_READER;
+    if (note) return NOTE_FIRST;
     if (selecting) return SELECTING_NOW;
     if (noText(opts.current.page)) return NO_TEXT_TO_SELECT;
     return undefined;
   };
   /** Why "Add a note to this page" cannot act now, or nothing. */
   const noteWhy = (): string | undefined => {
-    if (opts.current.readOnly) return READ_ONLY_NOTES;
-    if (selecting) return SELECTING_NOW;
+    if (opts.current.readOnly) return READ_ONLY_READER;
+    // While the colour toolbar is open, the note closes it first (R240 d).
+    if (selecting && !opts.current.making.picking) return SELECTING_NOW;
     return undefined;
   };
-  /** Says why a key cannot act (read-only: once a key). */
-  const refuse = (key: string, why: string) => {
+  /** Says why a key cannot act (read-only: once, R240 f); a note being written takes the focus (R240 d). */
+  const refuse = (why: string) => {
     if (opts.current.readOnly) {
-      if (saidReadOnly.current.has(key)) return;
-      saidReadOnly.current.add(key);
+      if (saidReadOnly.current) return;
+      saidReadOnly.current = true;
     }
     say(why);
+    if (why === NOTE_FIRST) noteBeingWritten()?.focus();
   };
 
-  const startSelection = (key: string) => {
-    const why = selectWhy();
-    if (why) return refuse(key, why);
+  const startSelection = () => {
+    const why = selectWhy() ?? (noteBeingWritten() ? NOTE_FIRST : undefined);
+    if (why) return refuse(why);
     const { handle: h, isLive, page: n } = opts.current;
     if (!h || !isLive(h)) return;
     const here = itemsOfPage(n);
@@ -315,16 +330,20 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     }
     // The drawn pages next to the current one, without a gap.
     const before: TextItemRef[][] = [];
+    let first = n;
     for (let p = n - 1; p >= 1; p--) {
       const items = itemsOfPage(p);
       if (items === undefined) break;
       before.unshift(items);
+      first = p;
     }
     const after: TextItemRef[][] = [];
+    let last = n;
     for (let p = n + 1; p <= opts.current.count; p++) {
       const items = itemsOfPage(p);
       if (items === undefined) break;
       after.push(items);
+      last = p;
     }
     const sc = scroller();
     const sel = createKeyboardSelection([...before.flat(), ...here, ...after.flat()], {
@@ -340,6 +359,8 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     }
     setAlert(undefined);
     ksel.current = sel;
+    reach.current = { first, last };
+    edgeSaid.current = false;
     setSelecting(true);
     focusArea();
     if (!show()) return;
@@ -351,8 +372,13 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     const sel = ksel.current;
     if (!sel) return;
     if (sel.extend(by, dir) === "edge") {
-      // The document's start or end: nothing to say. The edge of the drawn pages: R10's sentence.
-      if (dir > 0 ? sel.pages.last < opts.current.count : sel.pages.first > 1) setAlert(PAGES_NOT_SHOWN);
+      // The document's start or end: nothing to say. The edge of the pages drawn when it started, with
+      // pages beyond: said once (R240 c) — what is selected can still be highlighted.
+      if ((dir > 0 ? reach.current.last < opts.current.count : reach.current.first > 1) && !edgeSaid.current) {
+        edgeSaid.current = true;
+        sayWaiting();
+        say(KEYBOARD_EDGE);
+      }
       return;
     }
     setAlert(undefined);
@@ -369,7 +395,8 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       setAlert(PAGES_NOT_SHOWN);
       return;
     }
-    hush();
+    // The last state is said before the toolbar comes (M4).
+    sayWaiting();
     if (opts.current.making.takeRange(r)) focusToolbar.current = true;
   };
 
@@ -424,13 +451,16 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     return noteRectAt(vp, x, y);
   };
 
-  const openNote = (key: string) => {
-    const why = noteWhy();
-    if (why) return refuse(key, why);
-    if (note) {
-      textArea()?.focus();
-      return;
-    }
+  /** A note's sort index on page `n`, from what is known of the page now (its viewport and text). */
+  const sortIndexOn = (n: number, rect: PdfRectDto): string => {
+    const vp = viewports.current.get(n - 1);
+    return vp ? noteSortIndex(n - 1, rect, vp, opts.current.pageText(n - 1)) : pdfSortIndex(n - 1, 0, 0);
+  };
+
+  const openNote = () => {
+    // One note at a time (R240 d): a note being written, here or in the list, is finished first.
+    const why = noteWhy() ?? (noteBeingWritten() ? NOTE_FIRST : undefined);
+    if (why) return refuse(why);
     const { handle: h, isLive, page: n } = opts.current;
     if (!h || !isLive(h)) return;
     const rect = visibleTopLeft(n);
@@ -438,10 +468,12 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       setAlert(NOTE_PAGE_DRAWING);
       return;
     }
+    // The colour toolbar is given up first (R240 d).
+    if (opts.current.making.picking) opts.current.making.cancel();
     setAlert(undefined);
     setNoteError(undefined);
     setNoteDirty(false);
-    setNote({ seq: ++noteSeq.current, page: n, rect, how: "view" });
+    setNote({ seq: ++noteSeq.current, page: n, rect, sortIndex: sortIndexOn(n, rect), how: "view" });
   };
 
   const closeNote = (focus: boolean) => {
@@ -459,7 +491,7 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     const onDown = (e: MouseEvent) => {
       if (e.button !== 0) return;
       const t = e.target instanceof Element ? e.target : null;
-      if (t?.closest(".ao-reader-note")) return;
+      if (t?.closest('.ao-reader-note, [role="dialog"]')) return;
       setPlacing(false);
       const el = t?.closest<HTMLElement>("[data-page-number]");
       const n = el ? Number(el.dataset.pageNumber) : NaN;
@@ -472,12 +504,13 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       e.preventDefault();
       const b = el.getBoundingClientRect();
       const rect = noteRectAt(vp, e.clientX - b.left - el.clientLeft, e.clientY - b.top - el.clientTop);
-      setNote((d) => (d ? { ...d, page: n, rect, how: "click" } : d));
+      setNote((d) => (d ? { ...d, page: n, rect, sortIndex: sortIndexOn(n, rect), how: "click" } : d));
       say(`Note placed on page ${n}.`);
       setTimeout(() => textArea()?.focus(), 0);
     };
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      // Escape in a dialog is the dialog's (R240, M5).
+      if (e.key !== "Escape" || (e.target instanceof Element && e.target.closest('[role="dialog"]'))) return;
       e.preventDefault();
       e.stopPropagation();
       setPlacing(false);
@@ -496,51 +529,51 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
 
   const saveNote = async (text: string) => {
     const d = note;
-    const { api, projectId, sourceId, assetId, handle: h, isLive, readOnly: ro } = opts.current;
+    const { handle: h, isLive, assetId, readOnly: ro } = opts.current;
     // One request a press; only from a live handle (A7).
     if (!d || sending.current || !h || !isLive(h) || !assetId || ro) return;
-    const vp = viewports.current.get(d.page - 1);
-    const printed = h.pageLabels?.[d.page - 1];
-    const body: AnnotationCreateRequest = {
-      kind: "note",
-      assetId,
-      anchors: [{ page: d.page, rects: [d.rect], ...(vp ? { sortIndex: noteSortIndex(d.page - 1, d.rect, vp, opts.current.pageText(d.page - 1)) } : {}) }],
-      body: text,
-      colorName: "yellow",
-      ...(printed && printed !== String(d.page) && printed.length <= PAGE_LABEL_MAX && !CONTROL.test(printed) ? { pageLabel: printed } : {}),
-    };
     sending.current = true;
     setNotePending(true);
     setNoteError(undefined);
-    say(ADDING_NOTE);
-    let made: AnnotationRecord;
-    try {
-      made = await api().createAnnotation(projectId, sourceId, body);
-    } catch (e) {
-      // An answer after the document ended, failed or was opened again is dropped (A7).
-      if (!isLive(h) || opts.current.handle !== h) return;
-      sending.current = false;
-      setNotePending(false);
-      if (e instanceof ApiClientError && e.status === 423) {
-        opts.current.onLocked(h);
-        return;
-      }
-      if (e instanceof ApiClientError && e.status === 404) opts.current.onProjectInDoubt();
-      setNoteError(e instanceof Error && e.message ? e.message : SERVICE_SILENT);
-      return;
-    }
-    if (!isLive(h) || opts.current.handle !== h) {
-      // Dropped (A7) — but stored: if this file was opened again meanwhile, its list is asked for again.
-      const now = opts.current.handle;
-      if (now && now !== h && opts.current.isLive(now) && opts.current.assetId === assetId) opts.current.onStoredMeanwhile();
-      return;
-    }
+    // R10's one way of making (R240 b): what is sent, the draft, what is said, the list, the refusals.
+    const outcome = await opts.current.making.make({
+      kind: "note",
+      anchors: [{ page: d.page, rects: [d.rect], sortIndex: d.sortIndex }],
+      body: text,
+      colour: "yellow",
+      adding: ADDING_NOTE,
+      silent: NOTE_SILENT,
+      added: (_made, where) => `Note added${where}.`,
+      refused: setNoteError,
+    });
+    // The reader ended meanwhile (locked, failed, another file): everything went with it.
+    if (outcome === "locked" || outcome === "dropped") return;
     sending.current = false;
     setNotePending(false);
-    closeNote(true);
-    opts.current.onCreated(made);
-    say(`Note added, page ${d.page}.`);
+    if (outcome === "made") closeNote(true);
   };
+
+  /** "Place by clicking": the wait for a click starts or ends, said in the live region (R240 d). */
+  const togglePlacing = () => {
+    if (notePending) return;
+    if (placing) {
+      setPlacing(false);
+      say(PLACING_STOPPED);
+    } else {
+      setPlacing(true);
+      say(PLACING);
+    }
+  };
+  // A question opened (the app's own navigation asked "Discard this note?"): the wait ends (R240, M5).
+  useEffect(() => {
+    if (!discardAsk) return;
+    setPlacing((was) => {
+      if (was) say(PLACING_STOPPED);
+      return false;
+    });
+    // say reads the latest state through a ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [discardAsk]);
 
   /** "Cancel" or Escape in the note field: asked first when something was typed (R216). */
   const abandonNote = (text: string) => {
@@ -570,6 +603,8 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       hush();
       sending.current = false;
       focusToolbar.current = false;
+      held.current = undefined;
+      edgeSaid.current = false;
       setSelecting(false);
       setAlert(undefined);
       setNote(undefined);
@@ -606,17 +641,39 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       }
     }
     if (!onPages) return false;
-    if (k === "s" || k === "S") {
+    const letter = isLetterKey(e, "s") ? "s" : isLetterKey(e, "n") ? "n" : undefined;
+    if (!letter) return false;
+    // A held key acts once (R240, M3): its repeats are swallowed, here and in the note field it opened.
+    if (e.repeat) return true;
+    held.current = { code: e.code, key: letter };
+    if (letter === "s") {
       if (ksel.current) say(SELECTING_NOW);
-      else startSelection("s");
-      return true;
-    }
-    if (k === "n" || k === "N") {
-      openNote("n");
-      return true;
-    }
-    return false;
+      else startSelection();
+    } else openNote();
+    return true;
   };
+  // The repeats of the letter held down go nowhere, wherever the focus went (the note field N opened).
+  useEffect(() => {
+    const isHeld = (e: globalThis.KeyboardEvent) => {
+      const k = held.current;
+      return !!k && (k.code !== "" ? e.code === k.code : e.key.toLowerCase() === k.key);
+    };
+    const down = (e: globalThis.KeyboardEvent) => {
+      if (e.repeat && isHeld(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    const up = (e: globalThis.KeyboardEvent) => {
+      if (isHeld(e)) held.current = undefined;
+    };
+    document.addEventListener("keydown", down, true);
+    document.addEventListener("keyup", up, true);
+    return () => {
+      document.removeEventListener("keydown", down, true);
+      document.removeEventListener("keyup", up, true);
+    };
+  }, []);
 
   // ---- what the screen shows -----------------------------------------------------------------------------
   const sWhy = selectWhy();
@@ -628,8 +685,8 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
         aria-keyshortcuts="S"
         disabled={readOnly}
         aria-disabled={sWhy && !readOnly ? true : undefined}
-        aria-describedby={sWhy ? `${id}-select-why` : undefined}
-        onClick={() => (sWhy ? say(sWhy) : startSelection("button"))}
+        aria-describedby={readOnly ? `${id}-ro` : sWhy ? `${id}-select-why` : undefined}
+        onClick={() => (sWhy ? refuse(sWhy) : startSelection())}
       >
         Select text
       </button>
@@ -638,8 +695,8 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
         aria-keyshortcuts="N"
         disabled={readOnly}
         aria-disabled={nWhy && !readOnly ? true : undefined}
-        aria-describedby={nWhy ? `${id}-note-why` : undefined}
-        onClick={() => (nWhy ? say(nWhy) : openNote("button"))}
+        aria-describedby={readOnly ? `${id}-ro` : nWhy ? `${id}-note-why` : undefined}
+        onClick={() => (nWhy ? refuse(nWhy) : openNote())}
       >
         Add a note to this page
       </button>
@@ -649,13 +706,17 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     </span>
   );
 
-  const reasons: ReactNode =
-    sWhy || nWhy ? (
-      <div className="ao-reader-why">
-        {sWhy && <p id={`${id}-select-why`}>Select text: {sWhy}</p>}
-        {nWhy && <p id={`${id}-note-why`}>Add a note to this page: {nWhy}</p>}
-      </div>
-    ) : null;
+  // Read-only: the reader's one sentence, shown once (R240 f); every disabled control refers to it.
+  const reasons: ReactNode = readOnly ? (
+    <div className="ao-reader-why">
+      <p id={`${id}-ro`}>{READ_ONLY_READER}</p>
+    </div>
+  ) : sWhy || nWhy ? (
+    <div className="ao-reader-why">
+      {sWhy && <p id={`${id}-select-why`}>Select text: {sWhy}</p>}
+      {nWhy && <p id={`${id}-note-why`}>Add a note to this page: {nWhy}</p>}
+    </div>
+  ) : null;
 
   const help: ReactNode = (
     <section id={`${id}-help`} aria-label="Keyboard help" className="ao-reader-help" hidden={!helpOpen}>
@@ -685,6 +746,7 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
         <dt>Ctrl+Enter (Cmd+Enter on a Mac)</dt>
         <dd>Save the note</dd>
       </dl>
+      <p>{KEYBOARD_HELP_KEYS}</p>
       <p>{KEYBOARD_ORDER_LIMIT}</p>
     </section>
   );
@@ -696,7 +758,7 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
       <section ref={noteRoot} className="ao-reader-note" aria-label={`Note on page ${note.page}`}>
         <p className="ao-reader-note__where">{where}</p>
         <NoteEditor key={note.seq} saved="" pending={notePending} onSave={(text) => void saveNote(text)} onAbandon={abandonNote} onBusy={() => say(NOTE_BUSY)} onDraft={(_text, dirty) => setNoteDirty(dirty)} />
-        <button type="button" aria-pressed={placing} aria-disabled={notePending || undefined} onClick={() => !notePending && setPlacing((x) => !x)}>
+        <button type="button" aria-pressed={placing} aria-disabled={notePending || undefined} onClick={togglePlacing}>
           Place by clicking
         </button>
         {placing && (
@@ -739,7 +801,7 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
 
   /** The note being written, drawn on its page as a draft (never chosen, never listed). */
   const draft: AnnotationRecord | undefined =
-    note && o.assetId
+    note && o.assetId && !notePending
       ? {
           id: `note-draft:${note.seq}`,
           sourceId: o.sourceId,
@@ -764,5 +826,7 @@ export function useKeyboardMaking(o: KeyboardMakingOptions) {
     draft,
     selecting,
     placing,
+    /** The id of the read-only sentence, for the list's disabled controls (R240 f). */
+    readOnlyReasonId: readOnly ? `${id}-ro` : undefined,
   };
 }

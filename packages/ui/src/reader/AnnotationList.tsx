@@ -82,7 +82,13 @@ export const NOTE_NOT_PLACED = "This note is not placed on a page.";
 /** Said when the list of annotations could not be had (the service's own sentence follows). */
 export const ANNOTATIONS_NOT_SHOWN = "The highlights of this file could not be shown";
 /** Said once in the panel of a read-only library. */
-export const ANNOTATIONS_READ_ONLY = "This library is read-only, so highlights cannot be changed.";
+export const ANNOTATIONS_READ_ONLY = "This library is read-only, so highlights and notes cannot be added or changed.";
+/** The reader's one read-only sentence (Ruling R240 f): the list's, the making buttons' and the keys'. */
+export const READ_ONLY_READER = ANNOTATIONS_READ_ONLY;
+/** Said when a second note field or the colour toolbar is asked for while a note is being written (Ruling R240 d). */
+export const NOTE_FIRST = "Finish or cancel the note you are writing first.";
+/** The note field being written in, in the list or on the page (the reader's NoteEditor), if any: one at a time (R240 d). */
+export const noteBeingWritten = (): HTMLTextAreaElement | null => document.querySelector<HTMLTextAreaElement>('textarea[data-act="note-area"]');
 /** Said when a change found its annotation gone and the list was asked for again (A13). */
 export const LIST_BROUGHT_UP_TO_DATE = "That highlight or note was no longer there. The list has been brought up to date.";
 /** Said while a change is on its way. */
@@ -147,6 +153,11 @@ export function windowOf(offsets: readonly number[], top: number, view: number, 
 }
 
 export interface AnnotationListProps {
+  /**
+   * The id of the read-only sentence the screen shows once (R240 f): the list then shows none of its
+   * own, and its disabled controls refer to that one.
+   */
+  readOnlyReasonId?: string;
   /** The source's annotations (the list groups and sorts them itself). */
   annotations: AnnotationRecord[];
   /** The file being read. */
@@ -299,13 +310,15 @@ interface EntryViewProps {
   pending: boolean;
   error?: string;
   readOnly: boolean;
+  /** The read-only sentence's id, for the disabled controls. */
+  roId?: string;
   changed: boolean;
   /** Absolutely placed in a windowed list, at its measured offset. */
   top?: number;
   act: Actions;
 }
 
-const EntryView = memo(function EntryView({ e, active, selected, editing, menuOpen, pending, error, readOnly, changed, top, act }: EntryViewProps) {
+const EntryView = memo(function EntryView({ e, active, selected, editing, menuOpen, pending, error, readOnly, roId, changed, top, act }: EntryViewProps) {
   const { a } = e;
   const id = a.id;
   const tab = active ? 0 : -1;
@@ -322,6 +335,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
   // Its colour menu lies over the entries after it.
   if (menuOpen) classes.push("ao-ann-entry--open");
   const held = pending || undefined;
+  const why = readOnly ? roId : undefined;
   return (
     <li
       data-entry={id}
@@ -395,6 +409,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
           data-act="note"
           disabled={noChange || editing}
           aria-disabled={held}
+          aria-describedby={why}
           aria-label={a.body ? `Edit note of ${e.desc}` : `Add note to ${e.desc}`}
           onClick={() => !pending && act.edit(id)}
         >
@@ -407,6 +422,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
             data-act="colour"
             disabled={noChange}
             aria-disabled={held}
+            aria-describedby={why}
             aria-haspopup="menu"
             aria-expanded={menuOpen}
             aria-label={`Colour of ${e.desc}`}
@@ -417,7 +433,7 @@ const EntryView = memo(function EntryView({ e, active, selected, editing, menuOp
           {menuOpen && <ColourMenu label={`Colour of ${e.desc}`} current={a.colorName} onChoose={(c) => act.choose(id, c)} onClose={(restore) => act.closeMenu(id, restore)} />}
         </span>
         {e.group !== "elsewhere" && (
-          <button type="button" tabIndex={tab} data-act="delete" disabled={readOnly} aria-disabled={held} aria-label={`Delete ${e.desc}`} onClick={() => !pending && act.confirm(id)}>
+          <button type="button" tabIndex={tab} data-act="delete" disabled={readOnly} aria-disabled={held} aria-describedby={why} aria-label={`Delete ${e.desc}`} onClick={() => !pending && act.confirm(id)}>
             Delete
           </button>
         )}
@@ -598,8 +614,9 @@ export function Question({ title, yes, no, onYes, onNo }: { title: string; yes: 
 const GROUP_TITLES: Record<Exclude<Group, "here">, string> = { elsewhere: "On another file of this source", unplaced: "Not placed on a page" };
 const count = (n: number) => n.toLocaleString("en-GB");
 
-export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJump, onSaveNote, onRecolour, onDelete, changed, pageCount, loadError, onRetry, announcement, filterWords, filterIds, searchNote, focusRequest, onShowAll }: AnnotationListProps) {
+export function AnnotationList({ readOnlyReasonId, annotations, assetId, selectedId, readOnly, onJump, onSaveNote, onRecolour, onDelete, changed, pageCount, loadError, onRetry, announcement, filterWords, filterIds, searchNote, focusRequest, onShowAll }: AnnotationListProps) {
   const hid = useId();
+  const roId = readOnlyReasonId ?? `${hid}-ro`;
   // Filtered: only the matched annotations are entries at all, so groups, positions and set sizes are the filtered list's own.
   const shown = useMemo(() => (filterIds ? annotations.filter((a) => filterIds.has(a.id)) : annotations), [annotations, filterIds]);
   const { groups, flat } = useMemo(() => entriesOf(shown, assetId, pageCount), [shown, assetId, pageCount]);
@@ -912,6 +929,13 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
       },
       edit: (id) => {
         if (latest.current.readOnly || busy.current.has(id)) return;
+        // One note at a time (R240 d): a page note being written is finished or cancelled first.
+        const other = noteBeingWritten();
+        if (other) {
+          say(NOTE_FIRST);
+          other.focus();
+          return;
+        }
         clearError(id);
         setEditing(id);
       },
@@ -1053,6 +1077,7 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
       pending={pending[e.a.id] === true}
       {...(errors[e.a.id] !== undefined ? { error: errors[e.a.id] } : {})}
       readOnly={readOnly}
+      {...(roId !== undefined ? { roId } : {})}
       changed={changed?.has(e.a.id) ?? false}
       {...(top !== undefined ? { top } : {})}
       act={act}
@@ -1112,7 +1137,11 @@ export function AnnotationList({ annotations, assetId, selectedId, readOnly, onJ
       )}
       {!filtered && filterWords !== undefined && <p role="status" className="ao-ann-find">{SEARCH_LOOKING}</p>}
       {searchNote !== undefined && <p role="status" className="ao-ann-find">{searchNote}</p>}
-      {readOnly && <p className="ao-ann-readonly">{ANNOTATIONS_READ_ONLY}</p>}
+      {readOnly && readOnlyReasonId === undefined && (
+        <p id={`${hid}-ro`} className="ao-ann-readonly">
+          {ANNOTATIONS_READ_ONLY}
+        </p>
+      )}
       {loadError !== undefined && (
         <div className="ao-ann-load-error">
           <p role="alert">

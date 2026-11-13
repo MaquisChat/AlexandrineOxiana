@@ -1480,7 +1480,12 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
       openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
       screenFor({ readOnly: true });
       await waitFor(() => expect(drawnOn(1)).toEqual(["a"]));
-      expect(within(panel()).getByText("This library is read-only, so highlights cannot be changed.")).toBeTruthy();
+      // R240 f: the reader's one read-only sentence, shown once on the screen (not again in the list);
+      // the list's disabled controls refer to it.
+      const sentence = screen.getByText("This library is read-only, so highlights and notes cannot be added or changed.");
+      expect(screen.getAllByText("This library is read-only, so highlights and notes cannot be added or changed.")).toHaveLength(1);
+      expect(panel().contains(sentence)).toBe(false);
+      for (const b of within(panel()).getAllByRole("button", { name: /^(Edit note|Add note|Colour|Delete)/ })) expect(b.getAttribute("aria-describedby")).toBe(sentence.id);
       const enabled = within(panel())
         .getAllByRole("button")
         .filter((b) => !(b as HTMLButtonElement).disabled)

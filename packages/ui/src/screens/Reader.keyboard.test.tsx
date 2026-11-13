@@ -18,7 +18,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readerApi, type AnnotationCreateRequest, type AnnotationRecord } from "../api/reader";
 import { pdfRectToBox } from "../reader/geometry";
 import { PdfOpenError, type PdfHandle } from "../reader/pdfjs";
-import { KEYBOARD_ORDER_LIMIT, NO_TEXT_TO_SELECT, READ_ONLY_NOTES, selectedSentence, SELECTION_CANCELLED } from "../reader/useKeyboardMaking";
+import { NOTE_FIRST } from "../reader/AnnotationList";
+import { KEYBOARD_EDGE, KEYBOARD_HELP_KEYS, KEYBOARD_ORDER_LIMIT, NO_TEXT_TO_SELECT, NOT_ON_A_PAGE, PLACING, PLACING_STOPPED, selectedSentence, SELECTION_CANCELLED } from "../reader/useKeyboardMaking";
 import { PAGES_NOT_SHOWN, READ_ONLY_MAKING } from "../reader/useHighlightMaking";
 import { server, serviceError, testClient, url, useMockService } from "../test/service";
 import { navigate } from "../navigation";
@@ -171,6 +172,57 @@ const live = () => document.querySelector(".ao-ann-live")?.textContent ?? "";
 const selected = () => window.getSelection()?.toString() ?? "";
 const press = (target: Element, key: string, init: Partial<KeyboardEventInit> & { keyCode?: number; isComposing?: boolean } = {}) => fireEvent.keyDown(target, { key, ...init });
 const shift = (target: Element, key: string) => press(target, key, { shiftKey: true });
+/** Every text said in the live region from now on (in order, each change once). */
+function hear(): () => string[] {
+  const heard: string[] = [];
+  const region = document.querySelector(".ao-ann-live")!;
+  // Each saying is a new element in the region (the list keys it by its count): each is heard once.
+  const watch = new MutationObserver((records) => {
+    for (const r of records) for (const n of r.addedNodes) if (n.textContent) heard.push(n.textContent);
+  });
+  watch.observe(region, { childList: true });
+  return () => heard;
+}
+/** Lets what was said reach the live region (its effects and the observer's records). */
+const settle = () => act(async () => {});
+/** The listeners of the given kinds on the document now (a count of each, by kind and phase). */
+const listening = new Map<string, number>();
+function countListeners() {
+  const add = document.addEventListener.bind(document);
+  const remove = document.removeEventListener.bind(document);
+  const key = (type: string, o?: boolean | AddEventListenerOptions) => `${type}|${typeof o === "boolean" ? o : !!o?.capture}`;
+  const seen = new Set<string>();
+  const ids = new WeakMap<object, number>();
+  let next = 0;
+  const idOf = (l: unknown) => {
+    if (typeof l !== "function" && (typeof l !== "object" || l === null)) return -1;
+    if (!ids.has(l as object)) ids.set(l as object, ++next);
+    return ids.get(l as object)!;
+  };
+  vi.spyOn(document, "addEventListener").mockImplementation(((type: string, l: EventListenerOrEventListenerObject, o?: boolean | AddEventListenerOptions) => {
+    const k = `${key(type, o)}|${idOf(l)}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      listening.set(key(type, o), (listening.get(key(type, o)) ?? 0) + 1);
+      // A listener taken away by its signal (R10's text-layer guard) is gone too.
+      const signal = typeof o === "object" ? o.signal : undefined;
+      signal?.addEventListener("abort", () => {
+        if (!seen.delete(k)) return;
+        listening.set(key(type, o), (listening.get(key(type, o)) ?? 0) - 1);
+      });
+    }
+    add(type, l, o);
+  }) as typeof document.addEventListener);
+  vi.spyOn(document, "removeEventListener").mockImplementation(((type: string, l: EventListenerOrEventListenerObject, o?: boolean | EventListenerOptions) => {
+    const k = `${key(type, o)}|${idOf(l)}`;
+    if (seen.has(k)) {
+      seen.delete(k);
+      listening.set(key(type, o), (listening.get(key(type, o)) ?? 0) - 1);
+    }
+    remove(type, l, o);
+  }) as typeof document.removeEventListener);
+  return () => Object.fromEntries([...listening].filter(([k]) => /^(keydown|keyup|mousedown|selectionchange)\|/.test(k)).sort());
+}
 const flush = () =>
   act(async () => {
     for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
@@ -204,6 +256,7 @@ async function opened(f: Fake = fakeHandle(3), props: Partial<Parameters<typeof 
 }
 
 beforeEach(() => {
+  listening.clear();
   requests = [];
   placeOf.clear();
   server.events.on("request:start", record);
@@ -382,19 +435,42 @@ describe("ReaderScreen: selecting text by keyboard (Task R11)", () => {
     expect(byKeys!.anchors[0]!.sortIndex).toBe("00000|000000|00134");
   });
 
-  it("a selection into a page that is not drawn stops at the drawn pages, with R10's sentence; nothing is sent", async () => {
+  it("a selection into a page that is not drawn stops at the drawn pages and says so once, truly (R240 c); Enter highlights the part selected", async () => {
     serveAnnotations(() => []);
+    serveCreate((body) => HttpResponse.json(answerOf(body, "part"), { status: 201 }) as unknown as Response);
     await opened();
     // Pages 1 and 2 are drawn (the current page and its neighbour); page 3 is not.
     expect(pageBox(3).hasAttribute("data-rendered")).toBe(false);
+    const heard = hear();
     press(scroller(), "s");
     for (let i = 0; i < 6; i++) shift(scroller(), "ArrowDown");
     expect(selected()).toBe("Words of page 1Second line 1Words of page 2Second line 2");
-    expect(await screen.findByRole("alert")).toHaveProperty("textContent", PAGES_NOT_SHOWN);
-    // The selection is kept, and can still be highlighted.
+    await waitFor(() => expect(live()).toBe(KEYBOARD_EDGE));
+    expect(KEYBOARD_EDGE).toBe("The selection stops at the pages on screen. Highlight this part, then carry on from the next page.");
+    // Said once, not as an alarm, and never R10's "cannot be highlighted".
+    shift(scroller(), "ArrowDown");
+    await flush();
+    expect(heard().filter((t) => t === KEYBOARD_EDGE)).toHaveLength(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(document.body.textContent).not.toContain(PAGES_NOT_SHOWN);
+    // The part selected is highlighted.
     press(scroller(), "Enter");
-    await waitFor(() => expect(colourBar()).toBeTruthy());
-    expect(creates()).toHaveLength(0);
+    fireEvent.click(within(await waitFor(() => colourBar()!)).getByRole("button", { name: "Highlight in Blue" }));
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    expect(creates()[0]!.anchors.map((a) => a.page)).toEqual([1, 2]);
+    await waitFor(() => expect(live()).toBe("Highlight added: Blue, pages 1–2."));
+  });
+
+  it("the edge is not said when the pages beyond are drawn pages without text, at the document's end", async () => {
+    serveAnnotations(() => []);
+    // Two pages: page 2 has no text. Past page 1's last word there is nothing more to select.
+    await opened(fakeHandle(2, (n) => (n === 2 ? [] : linesOf(n))), {}, [1]);
+    await waitFor(() => expect(pageBox(2).querySelector(".ao-reader-no-text")).toBeTruthy());
+    const heard = hear();
+    press(scroller(), "s");
+    for (let i = 0; i < 4; i++) shift(scroller(), "ArrowDown");
+    await flush();
+    expect(heard()).not.toContain(KEYBOARD_EDGE);
   });
 
   it("never past the document's start: Shift+Left and Shift+Up on its first word say nothing", async () => {
@@ -763,29 +839,28 @@ describe("ReaderScreen: the keyboard's making ends with the reader (A7, A9, A10,
 });
 
 describe("ReaderScreen: read-only and help (Task R11)", () => {
-  it("read-only: both disabled, with the reason; S and N do nothing and say why once", async () => {
-    serveAnnotations(() => []);
+  it("read-only: both disabled, referring to the reader's one read-only sentence, shown once; S and N say it once (R240 f)", async () => {
+    serveAnnotations(() => [{ id: "h", sourceId: "s1", kind: "highlight", pdfAnchors: [{ id: "h-a", assetId: "a1", page: 1, rects: [glyphs(linesOf(1)[0]!, 0, 5)], sortIndex: "00000|000000|00134", sortIndexDerived: false }], otherAnchorKinds: [], quote: "Words", colorName: "yellow", imported: false, author: "me", createdAt: "2026-11-13T10:00:00Z" }]);
     await opened(fakeHandle(3), { readOnly: true });
     const select = screen.getByRole("button", { name: "Select text" });
     const add = screen.getByRole("button", { name: "Add a note to this page" });
     expect(select).toHaveProperty("disabled", true);
     expect(add).toHaveProperty("disabled", true);
-    expect(document.getElementById(select.getAttribute("aria-describedby")!)!.textContent).toBe(`Select text: ${READ_ONLY_MAKING}`);
-    expect(document.getElementById(add.getAttribute("aria-describedby")!)!.textContent).toBe(`Add a note to this page: ${READ_ONLY_NOTES}`);
-    const heard: string[] = [];
-    const region = document.querySelector(".ao-ann-live")!;
-    const watch = new MutationObserver(() => heard.push(region.textContent ?? ""));
-    watch.observe(region, { childList: true, characterData: true, subtree: true });
+    expect(READ_ONLY_MAKING).toBe("This library is read-only, so highlights and notes cannot be added or changed.");
+    const shown = screen.getAllByText(READ_ONLY_MAKING, { selector: ":not(.ao-ann-live, .ao-ann-live *)" });
+    expect(shown).toHaveLength(1);
+    expect(select.getAttribute("aria-describedby")).toBe(shown[0]!.id);
+    expect(add.getAttribute("aria-describedby")).toBe(shown[0]!.id);
+    // The list's disabled controls refer to the same sentence; the list shows none of its own.
+    for (const b of screen.getAllByRole("button", { name: /^(Edit note|Add note|Colour|Delete)/ })) expect(b.getAttribute("aria-describedby")).toBe(shown[0]!.id);
+    const heard = hear();
     press(scroller(), "s");
     await waitFor(() => expect(live()).toBe(READ_ONLY_MAKING));
     press(scroller(), "n");
-    await waitFor(() => expect(live()).toBe(READ_ONLY_NOTES));
     press(scroller(), "s");
     press(scroller(), "n");
     await flush();
-    watch.disconnect();
-    expect(heard.filter((t) => t === READ_ONLY_MAKING)).toHaveLength(1);
-    expect(heard.filter((t) => t === READ_ONLY_NOTES)).toHaveLength(1);
+    expect(heard().filter((t) => t === READ_ONLY_MAKING)).toHaveLength(1);
     expect(selected()).toBe("");
     expect(screen.queryByRole("textbox", { name: "Note" })).toBeNull();
     expect(creates()).toHaveLength(0);
@@ -802,5 +877,290 @@ describe("ReaderScreen: read-only and help (Task R11)", () => {
     for (const key of ["S", "N", "Shift+Right Arrow, Shift+Left Arrow", "Shift+Down Arrow, Shift+Up Arrow", "Enter", "Escape", "Page Down, Page Up", "Home, End", "Ctrl+Enter (Cmd+Enter on a Mac)"]) expect(within(help).getByText(key)).toBeTruthy();
     expect(within(help).getByText(KEYBOARD_ORDER_LIMIT)).toBeTruthy();
     expect(KEYBOARD_ORDER_LIMIT).toBe("Text is selected in the order the PDF stores it, which for some two-column or unusual layouts is not the reading order.");
+    // R240 (M10): what the letters are on other layouts, and that the buttons do the same.
+    expect(within(help).getByText(KEYBOARD_HELP_KEYS)).toBeTruthy();
+  });
+});
+
+/** A highlight on page 1 of the stand-in file, with no note yet (its list entry offers "Add note"). */
+const stored1 = (): AnnotationRecord => ({ id: "h1", sourceId: "s1", kind: "highlight", pdfAnchors: [{ id: "h1-a", assetId: "a1", page: 1, rects: [glyphs(linesOf(1)[0]!, 0, 5)], sortIndex: "00000|000000|00134", sortIndexDerived: false }], otherAnchorKinds: [], quote: "Words", colorName: "yellow", imported: false, author: "me", createdAt: "2026-11-13T10:00:00Z" });
+const FAKE = { toFake: ["setTimeout", "clearTimeout", "Date"] } as Parameters<typeof vi.useFakeTimers>[0];
+
+describe("ReaderScreen: by keyboard, fix round 1 (Ruling R240)", () => {
+  it("I1: the wait for a click goes when the reader ends and is opened again — no placing state, no listener of the earlier document, Escape works", async () => {
+    serveAnnotations(() => []);
+    const count = countListeners();
+    const f = await opened();
+    const base = count();
+    press(scroller(), "n");
+    await screen.findByRole("textbox", { name: "Note" });
+    fireEvent.click(screen.getByRole("button", { name: "Place by clicking" }));
+    expect(document.querySelector(".ao-reader-area--placing")).toBeTruthy();
+    act(() => f.fail(new PdfOpenError("other", "The file changed while it was read.")));
+    openPdf.mockResolvedValueOnce(fakeHandle(3).handle);
+    fireEvent.click(await screen.findByRole("button", { name: "Open again" }));
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    await laidOut(1);
+    await laidOut(2);
+    act(() => scroller().focus());
+    expect(document.querySelector(".ao-reader-area--placing")).toBeNull();
+    expect(count()).toEqual(base);
+    // Escape reaches the new document's selection.
+    press(scroller(), "s");
+    expect(selected()).toBe("Words");
+    press(scroller(), "Escape");
+    expect(selected()).toBe("");
+    await waitFor(() => expect(live()).toBe(SELECTION_CANCELLED));
+  });
+
+  it("I1: a 'Selected: …' waiting to be said goes when the reader ends: its timer is cleared, nothing is said later", async () => {
+    serveAnnotations(() => []);
+    const f = await opened();
+    press(scroller(), "s");
+    // The press within 500 ms of the first saying: what it selects waits to be said, on a timer.
+    const set = vi.spyOn(globalThis, "setTimeout");
+    shift(scroller(), "ArrowRight");
+    const i = set.mock.calls.findIndex((c) => typeof c[1] === "number" && c[1] > 100 && c[1] <= 500);
+    expect(i).toBeGreaterThanOrEqual(0);
+    const waiting = set.mock.results[i]!.value as ReturnType<typeof setTimeout>;
+    set.mockRestore();
+    const cleared = vi.spyOn(globalThis, "clearTimeout");
+    act(() => f.fail(new PdfOpenError("locked")));
+    await screen.findByRole("heading", { level: 2, name: "Project locked" });
+    expect(cleared.mock.calls.some((c) => c[0] === waiting)).toBe(true);
+  });
+
+  it("M6: Escape ends the selection and what was waiting to be said goes with it: nothing is said after 'Selection cancelled.'", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    const heard = hear();
+    vi.useFakeTimers(FAKE);
+    press(scroller(), "s");
+    await settle();
+    shift(scroller(), "ArrowRight");
+    press(scroller(), "Escape");
+    await settle();
+    act(() => vi.advanceTimersByTime(600));
+    await settle();
+    vi.useRealTimers();
+    expect(heard()).toEqual([selectedSentence("Words"), SELECTION_CANCELLED]);
+  });
+
+  it("M4: Enter says the selection's last state before the toolbar opens", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    const heard = hear();
+    vi.useFakeTimers(FAKE);
+    press(scroller(), "s");
+    await settle();
+    shift(scroller(), "ArrowRight");
+    shift(scroller(), "ArrowRight");
+    press(scroller(), "Enter");
+    await settle();
+    vi.useRealTimers();
+    expect(heard()).toEqual([selectedSentence("Words"), selectedSentence("Words of page")]);
+    await waitFor(() => expect(colourBar()).toBeTruthy());
+  });
+
+  it("M3: a held S or N acts once; Shift+arrows repeat as they should", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    const heard = hear();
+    press(scroller(), "s", { code: "KeyS" });
+    await settle();
+    for (let i = 0; i < 4; i++) press(scroller(), "s", { code: "KeyS", repeat: true });
+    fireEvent.keyUp(scroller(), { key: "s", code: "KeyS" });
+    await flush();
+    expect(heard()).toEqual([selectedSentence("Words")]);
+    for (let i = 0; i < 2; i++) press(scroller(), "ArrowRight", { shiftKey: true, repeat: true });
+    expect(selected()).toBe("Words of page");
+    press(scroller(), "Escape");
+    // N held: the field opens once and the repeats type nothing into it.
+    press(scroller(), "n", { code: "KeyN" });
+    const note = await screen.findByRole("textbox", { name: "Note" });
+    expect(document.activeElement).toBe(note);
+    expect(fireEvent.keyDown(note, { key: "n", code: "KeyN", repeat: true })).toBe(false);
+    fireEvent.keyUp(note, { key: "n", code: "KeyN" });
+    // Let go, a new N in the field is typed as usual.
+    expect(fireEvent.keyDown(note, { key: "n", code: "KeyN" })).toBe(true);
+    expect(screen.getAllByRole("textbox", { name: "Note" })).toHaveLength(1);
+  });
+
+  it("M10: S and N by the character typed, whatever the case, or by the key's place when the layout has no Latin letter for it", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    // A Dvorak layout: the key in S's place types "o": not S.
+    press(scroller(), "o", { code: "KeyS" });
+    expect(selected()).toBe("");
+    // Cyrillic: the key in S's place types "ы": S.
+    press(scroller(), "ы", { code: "KeyS" });
+    expect(selected()).toBe("Words");
+    press(scroller(), "Escape");
+    press(scroller(), "Т", { code: "KeyN", shiftKey: true });
+    expect(await screen.findByRole("textbox", { name: "Note" })).toBeTruthy();
+  });
+
+  it("M8: one note at a time — a note in the list being written: N, S and a selection's toolbar say so once and give it the focus", async () => {
+    serveAnnotations(() => [stored1()]);
+    await opened();
+    const list = screen.getByRole("region", { name: "Annotations (1)" });
+    fireEvent.click(within(list).getByRole("button", { name: /^Add note to/ }));
+    const listNote = await within(list).findByRole("textbox", { name: "Note" });
+    act(() => scroller().focus());
+    const heard = hear();
+    press(scroller(), "n");
+    await waitFor(() => expect(live()).toBe(NOTE_FIRST));
+    await settle();
+    expect(NOTE_FIRST).toBe("Finish or cancel the note you are writing first.");
+    expect(document.activeElement).toBe(listNote);
+    expect(screen.getAllByRole("textbox", { name: "Note" })).toHaveLength(1);
+    act(() => scroller().focus());
+    press(scroller(), "s");
+    await settle();
+    expect(selected()).toBe("");
+    expect(document.activeElement).toBe(listNote);
+    // A mouse selection on the page: no toolbar either.
+    const line = textNode(1, "Words of page 1");
+    fireEvent.mouseDown(line.parentElement!);
+    const r = document.createRange();
+    r.setStart(line, 0);
+    r.setEnd(line, 5);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(r);
+    fireEvent.mouseUp(line.parentElement!);
+    await flush();
+    expect(colourBar()).toBeNull();
+    expect(heard().filter((t) => t === NOTE_FIRST)).toHaveLength(3);
+  });
+
+  it("M8: one note at a time — a page note being written: the list's Add note says so and gives it the focus; leaving asks one question", async () => {
+    serveAnnotations(() => [stored1()]);
+    await opened();
+    press(scroller(), "n");
+    const pageNote = await screen.findByRole("textbox", { name: "Note" });
+    fireEvent.change(pageNote, { target: { value: "half" } });
+    const list = screen.getByRole("region", { name: "Annotations (1)" });
+    fireEvent.click(within(list).getByRole("button", { name: /^Add note to/ }));
+    await waitFor(() => expect(live()).toBe(NOTE_FIRST));
+    expect(document.activeElement).toBe(pageNote);
+    expect(screen.getAllByRole("textbox", { name: "Note" })).toHaveLength(1);
+    // The app's own way out: one question.
+    navigate("/elsewhere");
+    await screen.findByRole("dialog", { name: "Discard this note?" });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  });
+
+  it("M9: Add a note to this page closes the colour toolbar first; the wait for a click is said when it starts and ends", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    press(scroller(), "s");
+    press(scroller(), "Enter");
+    await waitFor(() => expect(colourBar()).toBeTruthy());
+    act(() => scroller().focus());
+    press(scroller(), "n");
+    await screen.findByRole("textbox", { name: "Note" });
+    expect(colourBar()).toBeNull();
+    const heard = hear();
+    const place = screen.getByRole("button", { name: "Place by clicking" });
+    fireEvent.click(place);
+    await waitFor(() => expect(live()).toBe(PLACING));
+    fireEvent.click(place);
+    await waitFor(() => expect(live()).toBe(PLACING_STOPPED));
+    expect(heard()).toEqual([PLACING, PLACING_STOPPED]);
+  });
+
+  it("M5: Escape in 'Discard this note?' is the dialog's: the wait for a click ends when the question opens; focus stays in the dialog under Tab and Shift+Tab (R145)", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    const user = userEvent.setup();
+    press(scroller(), "n");
+    const note = await screen.findByRole("textbox", { name: "Note" });
+    fireEvent.change(note, { target: { value: "unsaved" } });
+    fireEvent.click(screen.getByRole("button", { name: "Place by clicking" }));
+    expect(document.querySelector(".ao-reader-area--placing")).toBeTruthy();
+    act(() => navigate("/elsewhere"));
+    const dialog = await screen.findByRole("dialog", { name: "Discard this note?" });
+    expect(document.querySelector(".ao-reader-area--placing")).toBeNull();
+    const keep = within(dialog).getByRole("button", { name: "Keep editing" });
+    expect(document.activeElement).toBe(keep);
+    await user.tab();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await user.tab({ shift: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    act(() => keep.focus());
+    // A click on the dialog places nothing and says nothing of placing.
+    fireEvent.mouseDown(keep);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect((screen.getByRole("textbox", { name: "Note" }) as HTMLTextAreaElement).value).toBe("unsaved");
+    expect(live()).not.toBe(NOT_ON_A_PAGE);
+  });
+
+  it("M1: a note's sort index is worked out where it is placed, even when the page's text is no longer kept by the time it is saved", async () => {
+    serveAnnotations(() => []);
+    serveCreate((body) => HttpResponse.json(answerOf(body, "n1"), { status: 201 }) as unknown as Response);
+    await opened(fakeHandle(12));
+    // Placed below both lines of page 1 (as in the visible-top-left test): after all of its text.
+    const sc = scroller();
+    const page1 = pageBox(1);
+    const spy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const [left, top] = this === sc ? [0, 100] : this === page1 ? [20, -200] : [0, 0];
+      return { left, top, width: 800, height: 500, right: left + 800, bottom: top + 500, x: left, y: top, toJSON: () => ({}) } as DOMRect;
+    });
+    press(sc, "n");
+    await screen.findByRole("textbox", { name: "Note" });
+    spy.mockRestore();
+    // The pages read on: page 1's text is let go (at most six pages' texts are kept).
+    act(() => sc.focus());
+    press(sc, "End");
+    for (const n of [12, 11]) await laidOut(n);
+    for (const n of [10, 9, 8, 7]) {
+      press(sc, "PageUp");
+      await laidOut(n);
+    }
+    fireEvent.change(screen.getByRole("textbox", { name: "Note" }), { target: { value: "kept in its place" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save note" }));
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    expect(creates()[0]!.anchors[0]!.sortIndex).toBe(`00000|${String("Words of page 1".length + "Second line 1".length).padStart(6, "0")}|${String(Math.trunc(308 / SCALE)).padStart(5, "0")}`);
+  });
+
+  it("M6: S and N on a control of the page area outside the pages (the note's 'Place by clicking') do nothing", async () => {
+    serveAnnotations(() => []);
+    await opened();
+    press(scroller(), "n");
+    await screen.findByRole("textbox", { name: "Note" });
+    const place = screen.getByRole("button", { name: "Place by clicking" });
+    act(() => place.focus());
+    const heard = hear();
+    press(place, "s");
+    press(place, "n");
+    await flush();
+    expect(document.activeElement).toBe(place);
+    expect(heard()).toEqual([]);
+    expect(selected()).toBe("");
+  });
+
+  it("M6: a second save in the same moment sends nothing more (the one-request guard, not only the button's pending state)", async () => {
+    serveAnnotations(() => []);
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    serveCreate(async (body) => {
+      await held;
+      return HttpResponse.json(answerOf(body, "n1"), { status: 201 }) as unknown as Response;
+    });
+    await opened();
+    press(scroller(), "n");
+    const note = await screen.findByRole("textbox", { name: "Note" });
+    fireEvent.change(note, { target: { value: "once" } });
+    act(() => {
+      press(note, "Enter", { ctrlKey: true });
+      fireEvent.click(screen.getByRole("button", { name: "Save note" }));
+      press(note, "Enter", { metaKey: true });
+    });
+    await flush();
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    act(() => release());
+    await waitFor(() => expect(live()).toBe("Note added, page 1."));
+    expect(creates()).toHaveLength(1);
   });
 });
