@@ -11,7 +11,7 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PdfOpenError, type PdfHandle } from "./pdfjs";
-import { PdfPages } from "./PdfPages";
+import { MAX_RENDERED_PAGES, PdfPages, RENDER_BUDGET_BYTES } from "./PdfPages";
 
 const NO_TEXT = "This page has no text to select. It is probably a scanned image; you can still add a note to it.";
 
@@ -23,6 +23,10 @@ interface FakeOpts {
   size?: (n: number) => [number, number];
   /** Holds every render until released. */
   holdRenders?: boolean;
+  /** Each page's picture, decoded by a drawing (width, height in pixels), as pdf.js keeps it in page.objs. */
+  picture?: [number, number];
+  /** pdf.js does not let a page's pictures go (its cleanup answers false). */
+  keepsPictures?: boolean;
 }
 
 function fakeHandle(o: FakeOpts) {
@@ -34,6 +38,10 @@ function fakeHandle(o: FakeOpts) {
     fail = r;
   });
   let dead = false;
+  /** Drawings in progress now, and the most at once. */
+  let drawing = 0;
+  let mostAtOnce = 0;
+  const workerCleanups: Array<{ keepLoadedFonts: boolean; drawing: number }> = [];
   const viewportFor = (n: number, scale: number, rotation: number) => {
     const [w, h] = o.size?.(n) ?? [595, 842];
     const turned = rotation % 180 !== 0;
@@ -46,8 +54,11 @@ function fakeHandle(o: FakeOpts) {
       convertToViewportRectangle: (r: number[]) => r.map((v) => v * scale),
     };
   };
-  const page = (n: number) => ({
+  const page = (n: number) => {
+    const objs = new Map<string, unknown>();
+    return {
     pageNumber: n,
+    objs,
     rotate: 0,
     getViewport: ({ scale, rotation }: { scale: number; rotation?: number }) => viewportFor(n, scale, rotation ?? 0),
     render: (p: { canvas: HTMLCanvasElement; viewport: ReturnType<typeof viewportFor>; transform?: number[] }) => {
@@ -57,12 +68,20 @@ function fakeHandle(o: FakeOpts) {
         release = res;
         reject = rej;
       });
-      const entry = { page: n, canvas: p.canvas, viewport: p.viewport, ...(p.transform ? { transform: p.transform } : {}), cancelled: false, release: () => release() };
+      drawing++;
+      mostAtOnce = Math.max(mostAtOnce, drawing);
+      const done = () => {
+        drawing--;
+        if (o.picture) objs.set(`img_p${n}_1`, { bitmap: {}, width: o.picture[0], height: o.picture[1] });
+        release();
+      };
+      const entry = { page: n, canvas: p.canvas, viewport: p.viewport, ...(p.transform ? { transform: p.transform } : {}), cancelled: false, release: done };
       renders.push(entry);
-      if (!o.holdRenders) queueMicrotask(release);
+      if (!o.holdRenders) queueMicrotask(done);
       return {
         promise,
         cancel: () => {
+          if (!entry.cancelled) drawing--;
           entry.cancelled = true;
           // As openPdf's guard does: once the handle is dead, a call returns a rejected promise.
           if (dead) return Promise.reject(new PdfOpenError("other", "This document was closed."));
@@ -74,12 +93,19 @@ function fakeHandle(o: FakeOpts) {
     getTextContent: async () => ({ items: (o.text?.(n) ?? []).map((str) => ({ str, dir: "ltr", transform: [10, 0, 0, 10, 50, 700], width: 100, height: 10, fontName: "f1", hasEOL: false })), styles: { f1: { fontFamily: "sans-serif", ascent: 0.8, descent: -0.2, vertical: false } }, lang: null }),
     cleanup: () => {
       cleaned.push(n);
-      return dead ? Promise.reject(new PdfOpenError("other", "This document was closed.")) : true;
+      if (dead) return Promise.reject(new PdfOpenError("other", "This document was closed."));
+      if (o.keepsPictures) return false;
+      objs.clear();
+      return true;
     },
-  });
+    };
+  };
   const handle = {
     doc: {
       numPages: o.pages,
+      cleanup: async (keepLoadedFonts = false) => {
+        workerCleanups.push({ keepLoadedFonts, drawing });
+      },
       getPage: async (n: number) => {
         if (dead) throw new PdfOpenError("other", "This document was closed.");
         got.push(n);
@@ -101,6 +127,8 @@ function fakeHandle(o: FakeOpts) {
     got,
     cleaned,
     renders,
+    workerCleanups,
+    mostAtOnce: () => mostAtOnce,
     fail: (e: PdfOpenError) => {
       dead = true;
       fail(e);
@@ -288,5 +316,85 @@ describe("PdfPages (Task R7)", () => {
     scroller.dispatchEvent(new Event("scroll"));
     await flush();
     expect(onPageChange).toHaveBeenLastCalledWith(5);
+  });
+});
+
+describe("PdfPages: memory bounded by weight as well as by number (A9, Ruling R203)", () => {
+  const SCAN_600_DPI_A4: [number, number] = [4961, 7016];
+  const held = (c: HTMLElement) => [...c.querySelectorAll<HTMLElement>("[data-rendered]")].map((e) => ({ page: Number(e.dataset.pageNumber), held: Number(e.dataset.heldBytes), pictures: Number(e.dataset.pictureBytes), canvas: Number(e.dataset.canvasBytes) }));
+  /** A tall page area: many pages in view at once. */
+  const tallArea = () => vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(40_000);
+
+  it("RENDER_BUDGET_BYTES is 256 MiB and MAX_RENDERED_PAGES is 6", () => {
+    expect(RENDER_BUDGET_BYTES).toBe(268_435_456);
+    expect(MAX_RENDERED_PAGES).toBe(6);
+  });
+
+  it("heavy canvases: fewer than six pages are kept drawn, never more than the budget, the current page always", async () => {
+    tallArea();
+    Object.defineProperty(window, "devicePixelRatio", { value: 2, configurable: true });
+    // 3000 x 3000 points at 100% and dpr 2: each canvas at the cap, 64 MiB.
+    const f = fakeHandle({ pages: 20, size: () => [3000, 3000] });
+    const { container, rerender } = render(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={1} onPageChange={() => {}} renderOverlay={() => null} />);
+    for (const n of [1, 10, 20]) {
+      rerender(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={n} onPageChange={() => {}} renderOverlay={() => null} />);
+      await flush();
+      await flush();
+      const h = held(container);
+      expect(h.map((x) => x.page), `at page ${n}`).toContain(n);
+      // Six wanted at pages 1 and 10 (in view, and the neighbours), four of them fit; at the last page only 19 and 20 are wanted.
+      const fit = n === 20 ? 2 : 4;
+      expect(h.length, `at page ${n}`).toBe(fit);
+      expect(h.reduce((a, x) => a + x.held, 0)).toBeLessThanOrEqual(RENDER_BUDGET_BYTES);
+      expect(canvases(container).length).toBe(fit);
+    }
+  });
+
+  it("pages are drawn one at a time, and each lets go of its pictures once it is drawn", async () => {
+    tallArea();
+    const f = fakeHandle({ pages: 10, holdRenders: true, picture: SCAN_600_DPI_A4 });
+    const { container } = render(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={1} onPageChange={() => {}} renderOverlay={() => null} />);
+    await flush();
+    for (let i = 0; i < 6; i++) {
+      const pending = f.renders.filter((r) => !r.cancelled);
+      const open = pending.at(-1)!;
+      expect(f.renders.length, "one drawing at a time").toBe(i + 1);
+      open.release();
+      await flush();
+      // That page now holds its canvas only: its 139 MB picture was let go (page.cleanup()).
+      const mine = held(container).find((x) => x.page === open.page)!;
+      expect(mine.pictures).toBe(4961 * 7016 * 4);
+      expect(mine.held).toBe(mine.canvas);
+      expect(f.cleaned).toContain(open.page);
+    }
+    expect(f.mostAtOnce()).toBe(1);
+    expect(held(container).reduce((a, x) => a + x.held, 0)).toBeLessThanOrEqual(RENDER_BUDGET_BYTES);
+  });
+
+  it("pictures pdf.js does not let go count against the budget: then only the current page is kept", async () => {
+    tallArea();
+    const f = fakeHandle({ pages: 10, picture: SCAN_600_DPI_A4, keepsPictures: true });
+    const { container } = render(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={3} onPageChange={() => {}} renderOverlay={() => null} />);
+    await flush();
+    await flush();
+    await flush();
+    const h = held(container);
+    expect(h.reduce((a, x) => a + x.held, 0)).toBeLessThanOrEqual(RENDER_BUDGET_BYTES);
+    expect(h.map((x) => x.page)).toContain(3);
+    // 139 MB of picture and 2 MB of canvas a page: one page and the start of a second would be over 256 MiB.
+    expect(h.length).toBe(1);
+    expect(canvases(container).length).toBe(1);
+  });
+
+  it("pages that leave are cleaned up in pdf.js's worker too, once nothing is being drawn", async () => {
+    const f = fakeHandle({ pages: 200 });
+    const { rerender } = render(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={1} onPageChange={() => {}} renderOverlay={() => null} />);
+    await flush();
+    expect(f.workerCleanups).toEqual([]);
+    rerender(<PdfPages handle={f.handle} scale={1} rotation={0} currentPage={150} onPageChange={() => {}} renderOverlay={() => null} />);
+    await flush();
+    await flush();
+    expect(f.workerCleanups.length).toBeGreaterThan(0);
+    expect(f.workerCleanups.every((c) => c.drawing === 0 && c.keepLoadedFonts === true)).toBe(true);
   });
 });
