@@ -73,7 +73,8 @@ export function pdfDocumentParams(transport: PDFDataRangeTransport, password?: s
   return { ...PDF_OPTIONS, range: transport, ...(password !== undefined ? { password } : {}) };
 }
 
-export type PdfOpenErrorKind = "password-needed" | "password-wrong" | "damaged" | "too-large" | "missing" | "locked" | "other";
+/** `not-a-pdf` (A10): the asset is not a PDF (the service's 400), told by its kind, never by its sentence. */
+export type PdfOpenErrorKind = "password-needed" | "password-wrong" | "damaged" | "too-large" | "missing" | "locked" | "not-a-pdf" | "other";
 
 const MESSAGES: Record<PdfOpenErrorKind, string> = {
   "password-needed": "This PDF is protected by a password. Enter it to read it here.",
@@ -82,6 +83,7 @@ const MESSAGES: Record<PdfOpenErrorKind, string> = {
   "too-large": "This PDF is larger than 512 MB, too large to open in the app.",
   missing: "The file of this source is not where it was recorded, so it cannot be shown.",
   locked: "This project is locked. Unlock it in the library to read its files.",
+  "not-a-pdf": "This file cannot be shown here.",
   other: "This PDF could not be opened.",
 };
 const WORKER_FAILED = "The PDF reader could not start. Close the reader and open the file again.";
@@ -114,7 +116,7 @@ export function toPdfOpenError(err: unknown): PdfOpenError {
     if (err.status === 423) return new PdfOpenError("locked");
     // A 400: the asset is not a PDF (the client only ever asks well-formed ranges). A range past the
     // end (416): the file shrank.
-    if (err.status === 400) return new PdfOpenError("other", NOT_A_PDF);
+    if (err.status === 400) return new PdfOpenError("not-a-pdf", NOT_A_PDF);
     if (err.status === 416) return new PdfOpenError("other", FILE_CHANGED);
     return new PdfOpenError("other");
   }

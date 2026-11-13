@@ -7,80 +7,14 @@
  *    end earlier than asked where the service may cut it (the file's end, DOCUMENT_RANGE_MAX_BYTES).
  *  - The annotation calls over the routes of Task R4 (`/projects/:id/sources/:sid/annotations`).
  *
- * The annotation shapes are Task R4's (`@ao/shared`, packages/shared/src/api/annotations.ts). That
- * task runs beside this one and has not landed here yet, so they are declared below exactly as the
- * plan's R4 Interfaces give them; when R4 lands, these declarations are replaced by the import from
- * `@ao/shared` with no change for any caller.
+ * The annotation shapes are Task R4's, imported from `@ao/shared` (packages/shared/src/api/
+ * annotations.ts) and re-exported for the reader's modules: there is one declaration of each, so a
+ * field renamed there breaks the interface's build (ledger R184, amendment A6).
  */
+import type { AnnotationCreateRequest, AnnotationDeleteResponse, AnnotationListResponse, AnnotationRecord, AnnotationUpdateRequest } from "@ao/shared";
 import type { ApiClient } from "./client";
 
-// ---- Task R4's shapes (to come from @ao/shared once R4 lands) ----
-
-/**
- * The named highlight colours: R4's shared `HIGHLIGHT_COLOUR_NAMES`, equal to @ao/core's
- * `HIGHLIGHT_COLOURS` (the interface may not import the root of @ao/core, Task 47).
- */
-export type HighlightColourName = "yellow" | "red" | "green" | "blue" | "purple" | "magenta" | "orange" | "grey";
-
-/** A rectangle in PDF user space: points, origin bottom-left, on the unrotated page. */
-export interface PdfRectDto {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-export interface PdfAnchorRecord {
-  id: string;
-  assetId: string;
-  page: number;
-  rects: PdfRectDto[];
-  sortIndex: string;
-  sortIndexDerived: boolean;
-}
-
-export interface AnnotationRecord {
-  id: string;
-  sourceId: string;
-  kind: string;
-  pdfAnchors: PdfAnchorRecord[];
-  otherAnchorKinds: string[];
-  quote?: string;
-  body?: string;
-  colorName: HighlightColourName;
-  importedColour?: string;
-  imported: boolean;
-  pageLabel?: string;
-  author: string;
-  createdAt: string;
-  modifiedAt?: string;
-}
-
-export interface AnnotationListResponse {
-  annotations: AnnotationRecord[];
-  count: number;
-  textChars: number;
-}
-
-export interface AnnotationCreateRequest {
-  kind: "highlight" | "note";
-  assetId: string;
-  anchors: Array<{ page: number; rects: PdfRectDto[]; sortIndex?: string }>;
-  quote?: string;
-  body?: string;
-  colorName: HighlightColourName;
-  pageLabel?: string;
-}
-
-export interface AnnotationUpdateRequest {
-  body?: string | null;
-  colorName?: HighlightColourName;
-}
-
-export interface AnnotationDeleteResponse {
-  deleted: true;
-  id: string;
-}
+export type { AnnotationCreateRequest, AnnotationDeleteResponse, AnnotationKind, AnnotationListResponse, AnnotationRecord, AnnotationUpdateRequest, HighlightColourName, PdfAnchorRecord, PdfRectDto } from "@ao/shared";
 
 // ---- the calls ----
 

@@ -20,6 +20,7 @@ import { AvailabilityMark, availabilityText } from "../components/AvailabilityMa
 import { CitePanel } from "../components/CitePanel";
 import { SourceToolNotice } from "../components/MissingToolNotice";
 import { typeLabel } from "../components/SourceTable";
+import { ReaderLink } from "../components/ReaderLink";
 import { TranscriptLink } from "../components/TranscriptLink";
 import { UserText } from "../components/UserText";
 import { FieldCheck } from "../components/VerificationBadge";
@@ -420,6 +421,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
           {rechecking ? "Rechecking…" : "Recheck"}
         </button>
         {file && src && <TranscriptLink projectId={projectId} assets={file.assets} sourceId={sourceId} />}
+        {file && src && <ReaderLink projectId={projectId} sourceId={sourceId} assets={file.assets} />}
       </div>
       {error && (
         <p role="alert" className="ao-error">

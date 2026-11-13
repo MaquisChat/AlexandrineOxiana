@@ -12,6 +12,7 @@ import { BackToLibrary, normalisePath, PATHS, projectInQuery, useDropGuard, useL
 import { GovernanceRoutes, isGovernancePath } from "./routes/governance";
 import { importRoute, isImportPath } from "./routes/import";
 import { isLibraryPath, LibraryRoutes } from "./routes/library";
+import { isReaderPath, ReaderRoute } from "./routes/reader";
 import { isTranscriptPath, TranscriptRoute } from "./routes/transcript";
 import { About } from "./screens/About";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
@@ -38,6 +39,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: isImportPath, render: (loc, client) => importRoute(loc, client), back: true },
   { matches: isGovernancePath, render: (loc, client) => <GovernanceRoutes client={client} loc={loc} />, back: true },
   { matches: isTranscriptPath, render: (loc, client) => <TranscriptRoute client={client} loc={loc} />, back: true },
+  { matches: isReaderPath, render: (loc, client) => <ReaderRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.capture, render: (loc, client) => <CaptureRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.extension, render: (_loc, client, port) => <ExtensionPairingRoute client={client} port={port} />, back: true },
   { matches: (p) => p === PATHS.tools, render: (loc, client) => <ToolsSetupRoute client={client} loc={loc} />, back: true },

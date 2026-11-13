@@ -18,7 +18,7 @@ import { App, ROUTES } from "./App";
 import { normalisePath, PATHS } from "./navigation";
 import { StepReport } from "./screens/import/StepReport";
 import { SourceDetail } from "./screens/SourceDetail";
-import { CURRENT_RW, LIBRARIES, libraryHandlers, server, testApi, TOKEN, BASE, url, useMockService } from "./test/service";
+import { CURRENT_RW, LIBRARIES, libraryHandlers, server, SOURCE_FILE, testApi, TOKEN, BASE, url, useMockService } from "./test/service";
 import { sourceHandlers, TRANSCRIPT_SOURCE } from "./test/verification";
 import { DEFAULT_APPEARANCE } from "./theme/appearance";
 
@@ -40,6 +40,17 @@ const OPENED_WITH_AN_ID: Record<string, { from: string; links: () => Promise<str
       server.use(...sourceHandlers(TRANSCRIPT_SOURCE));
       render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
       await screen.findByRole("link", { name: "Open the transcript" });
+      return inAppHrefs();
+    },
+  },
+  // A source's PDF in the reader: the link in the source's details (ReaderLink, Task R7).
+  [PATHS.reader]: {
+    from: "the details of a source that has a PDF (library → a source)",
+    links: async () => {
+      server.use(...sourceHandlers(TRANSCRIPT_SOURCE));
+      server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(SOURCE_FILE)));
+      render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+      await screen.findByRole("link", { name: "Read the PDF" });
       return inAppHrefs();
     },
   },
