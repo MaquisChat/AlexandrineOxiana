@@ -164,4 +164,27 @@ describe("resuming a Zotero Web batch (Z2)", () => {
     // The key is in none of them.
     expect(JSON.stringify([projects, recs])).not.toContain(z.key);
   });
+
+  it("the resume after a library move (resumeBatches) finishes a Zotero Web batch the same way (M2)", async () => {
+    const libPath = join(tmp, "Lib");
+    expect((await call({ method: "POST", url: "/libraries", body: { path: libPath, name: "Lib" } })).status).toBe(200);
+    const pid = (await call({ method: "POST", url: "/projects", body: { name: "Study", governanceYaml: GOV, encryption: { enabled: false } } })).json.project.id as string;
+    for (const t of ["One", "Two"]) await addWithFile(t);
+    await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: ADAPTER } });
+    await svc.state.idle();
+    for (const t of ["Three", "Four", "Five"]) await addWithFile(t);
+    const held = holdBatch(1);
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: ADAPTER } })).json;
+    await held;
+    await svc.close();
+    await start();
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).status).toBe(200);
+    // The path a move takes to put its paused batches back to work.
+    svc.state.resumeBatches([{ projectId: pid, batchId }]);
+    await svc.state.idle();
+    const now = z.libraryVersion(U);
+    const projects = await Promise.all((await findFiles(libPath, "project.json")).map(async (f) => JSON.parse(await readFile(f, "utf8"))));
+    expect(projects.some((p) => p.project?.importSettings?.zoteroWeb?.[U]?.lastLibraryVersion === now)).toBe(true);
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(5);
+  });
 });
