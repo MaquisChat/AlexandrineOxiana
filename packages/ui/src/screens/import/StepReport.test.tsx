@@ -59,6 +59,35 @@ describe("the undo question", () => {
   });
 });
 
+describe("changed in Zotero and here (Z6, R236 e)", () => {
+  it("the undo question counts the Zotero values it takes off, and never says the import changed nothing when it raised one", () => {
+    expect(undoQuestion(report({}, { conflicts: 2 }))).toBe("Take the Zotero values waiting for your decision off 2 sources (your values stay as they are)?");
+    expect(undoQuestion(report({}, { conflicts: 1, updated: 1 }))).toBe("Revert 1 updated source and take the Zotero values waiting for your decision off 1 source (your values stay as they are)?");
+    // Cleared in Zotero and kept here: nothing of the sources' values to undo.
+    expect(undoQuestion(report({}, { clearedInZoteroKept: 3 }))).toBe("This import added and changed no sources. Undo it anyway?");
+  });
+
+  it("the result says what was done in the same terms", async () => {
+    const { undoneText } = await import("./StepReport");
+    expect(undoneText({ removedSources: 0, revertedMerges: 2, reverted: { merged: 0, updated: 0, unmarked: 0, remarked: 0, conflicts: 2 }, kept: [] })).toBe("Took the waiting Zotero values off 2 sources.");
+    expect(undoneText({ removedSources: 0, revertedMerges: 1, reverted: { merged: 0, updated: 1, unmarked: 0, remarked: 0, conflicts: 1 }, kept: [] })).toBe("Reverted 1 updated source and took the waiting Zotero values off 1 source.");
+  });
+
+  it("the report table has the rows for values waiting and values cleared in Zotero, each only when not zero", async () => {
+    show(report({}, { conflicts: 2, clearedInZoteroKept: 1 }));
+    const table = await screen.findByRole("table", { name: "Items by outcome" });
+    const row = (name: string) => within(table).getByRole("rowheader", { name }).closest("tr")!.textContent;
+    expect(row("Changed in Zotero and here — waiting for you")).toContain("2");
+    expect(row("Cleared in Zotero, kept here")).toContain("1");
+  });
+
+  it("no such rows when zero", async () => {
+    show(report({}, { conflicts: 0, clearedInZoteroKept: 0 }));
+    const table = await screen.findByRole("table", { name: "Items by outcome" });
+    expect(within(table).queryByText(/Zotero/)).toBeNull();
+  });
+});
+
 describe("gone from Zotero, and back (Z5, R224)", () => {
   it("the undo question counts marked and returned sources as sources it will change", () => {
     expect(undoQuestion(report({}, { goneInZotero: 1, goneInZoteroBin: 1 }))).toBe("Take the Zotero mark off 1 source?");

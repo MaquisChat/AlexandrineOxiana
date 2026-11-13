@@ -857,3 +857,43 @@ describe("bibliographic fields (R87)", () => {
     expect(r.fields["/issue"]!.reason).toMatch(/^Issue recorded here/u);
   });
 });
+
+describe("an old Zotero value is not a claim (Z6, R236 c)", () => {
+  const z = (field: string, value: unknown) => ev(field, value, "zotero", { provider: "zotero-web" });
+
+  it("only the newest Zotero value of a field counts; earlier ones are history", () => {
+    const r = verifyDraft(draft({ volume: "4" }), [z("/volume", "3"), z("/volume", "4")], {});
+    expect(r.fields["/volume"]!.status).toBe("single-source");
+    const t = verifyDraft(draft({ title: mt("A wholly different title") }), [z("/title", "Rivers of Memory"), z("/title", "A wholly different title")], {});
+    expect(t.fields["/title"]!.status).toBe("single-source");
+  });
+
+  it("the newest Zotero value disagreeing is still a conflict, naming that value only", () => {
+    const r = verifyDraft(draft({ volume: "12" }), [z("/volume", "3"), z("/volume", "4")], {});
+    expect(r.fields["/volume"]).toMatchObject({ status: "conflict", values: [{ value: "4" }] });
+    expect(r.fields["/volume"]!.reason).toContain('"4"');
+    expect(r.fields["/volume"]!.reason).not.toContain('"3"');
+  });
+
+  it("a field Zotero cleared (its newest value empty) has no Zotero claim at all", () => {
+    const r = verifyDraft(draft({ volume: "3" }), [z("/volume", "3"), z("/volume", null)], {});
+    expect(r.fields["/volume"]).toBeUndefined();
+  });
+
+  it("other kinds of evidence keep every value as a claim (a page captured twice)", () => {
+    const r = verifyDraft(draft({ volume: "4" }), [ev("/volume", "3", "page-dom"), ev("/volume", "4", "page-dom")], {});
+    expect(r.fields["/volume"]!.status).toBe("conflict");
+  });
+
+  it("a recheck keeps a Zotero conflict as recorded while its two values are unchanged", () => {
+    const sf = {
+      source: { ...draft({ volume: "12" }), id: "s" },
+      fieldEvidence: [z("/volume", "3"), z("/volume", "4")],
+      verification: { "/volume": { status: "conflict", checks: ["zotero-update"], reason: "Zotero now has a different value; you changed it here.", values: [{ value: "4", source: { kind: "zotero", provider: "zotero-web" } }], current: "12" } },
+    } as unknown as SourceFile;
+    expect(recheckSourceFile(sf, {}).verification["/volume"]).toEqual(sf.verification["/volume"]);
+    // The value here changed since: the fresh check speaks.
+    const moved = { ...sf, source: { ...sf.source, volume: "4" } } as unknown as SourceFile;
+    expect(recheckSourceFile(moved, {}).verification["/volume"]!.status).toBe("single-source");
+  });
+});

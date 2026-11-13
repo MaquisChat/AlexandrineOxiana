@@ -317,16 +317,18 @@ describe("a field changed in Zotero and here (Z6)", () => {
       expect((await bulk().batchReport(p.id, batchId)).keptFields).toEqual([{ item: `zotero:${key}`, fields: ["/volume"] }]);
     });
 
-    it("a field Zotero cleared that the researcher changed here is kept and reported, not asked", async () => {
+    it("a field Zotero cleared that the researcher changed here stays, with no conflict, and is counted as cleared in Zotero (R236 a)", async () => {
       const p = await project();
       const { key, id } = await imported(p, { volume: "3" });
       await repo.updateSource(p.id, id, { volume: "12" });
       z.editItem(U, key, { volume: undefined });
       const { r, batchId } = await run(p);
-      expect(r.counts).toMatchObject({ conflicts: 0 });
-      expect((await repo.getSource(p.id, id)).source.volume).toBe("12");
+      expect(r.counts).toMatchObject({ conflicts: 0, clearedInZoteroKept: 1 });
+      const sf = await repo.getSource(p.id, id);
+      expect(sf.source.volume).toBe("12");
+      expect(sf.verification["/volume"]?.status).not.toBe("conflict");
       expect(await pending(p, id)).toEqual([]);
-      expect((await bulk().batchReport(p.id, batchId)).keptFields).toEqual([{ item: `zotero:${key}`, fields: ["/volume"] }]);
+      expect((await bulk().batchReport(p.id, batchId)).keptFields).toEqual([]);
     });
   });
 
@@ -549,7 +551,7 @@ describe("undo of a batch that queued a conflict (R177 c)", () => {
     await confirmField(repo, p.id, id, "/title", mt("Zotero's title"));
     const decided = await repo.getSource(p.id, id);
     const res = await bulk().undoBatch(p.id, batchId);
-    expect(res.kept).toEqual([{ kind: "field", id: "/title", sourceId: id, reason: "you decided on Zotero's value after this import; your decision was kept" }]);
+    expect(res.kept).toEqual([{ kind: "field", id: "/title", sourceId: id, reason: "you chose Zotero's value after this import; your decision was kept" }]);
     expect(res.reverted.conflicts ?? 0).toBe(0);
     const sf = await repo.getSource(p.id, id);
     expect(titleOf(sf)).toBe("Zotero's title");
@@ -704,5 +706,194 @@ describe("collections (Accept 4)", () => {
     z.editItem(U, key, { collections: [a, sub] });
     await run(p);
     expect(await names(p, await sourceOf(p, key))).toEqual(["Field notes", "Fieldwork/Interviews"]);
+  });
+});
+
+describe("fix round 1 (R236)", () => {
+  const verificationBut = (sf: SourceFile, path: string) => Object.fromEntries(Object.entries(sf.verification).filter(([k]) => k !== path));
+
+  describe("(a) a field Zotero cleared is kept here and counted, not emptied", () => {
+    it("an untouched field cleared in Zotero stays and is counted once; the next run counts nothing", async () => {
+      const p = await project();
+      const { key, id } = await imported(p, { volume: "3" });
+      z.editItem(U, key, { volume: undefined });
+      const { r, batchId } = await run(p);
+      expect(r.counts).toMatchObject({ clearedInZoteroKept: 1, conflicts: 0 });
+      expect((await repo.getSource(p.id, id)).source.volume).toBe("3");
+      expect(await pending(p, id)).toEqual([]);
+      expect((await bulk().batchReport(p.id, batchId)).counts).toMatchObject({ clearedInZoteroKept: 1 });
+      expect(await reportMd(p, 2)).toContain("- Cleared in Zotero, kept here: 1");
+      // Another change in Zotero: the clearing was noticed once; nothing more is counted.
+      z.editItem(U, key, { extra: "touched" });
+      const next = await run(p);
+      expect(next.r.counts).toMatchObject({ clearedInZoteroKept: 0 });
+      expect(await reportMd(p, 3)).not.toContain("Cleared in Zotero");
+      expect((await repo.getSource(p.id, id)).source.volume).toBe("3");
+      // Zotero has a value again: the ordinary cases (untouched here, so it flows in).
+      z.editItem(U, key, { volume: "5" });
+      const again = await run(p);
+      expect(again.r.counts).toMatchObject({ clearedInZoteroKept: 0, conflicts: 0 });
+      expect((await repo.getSource(p.id, id)).source.volume).toBe("5");
+    });
+
+    it("undo of the batch takes the note off again", async () => {
+      const p = await project();
+      const { key, id } = await imported(p, { volume: "3" });
+      const before = await repo.getSource(p.id, id);
+      z.editItem(U, key, { volume: undefined });
+      const { batchId } = await run(p);
+      await bulk().undoBatch(p.id, batchId);
+      const after = await repo.getSource(p.id, id);
+      expect(after.fieldEvidence).toEqual(before.fieldEvidence);
+      expect(after.source).toEqual(before.source);
+      // The next (full) sync notices it again.
+      const { r } = await run(p);
+      expect(r.counts).toMatchObject({ clearedInZoteroKept: 1 });
+      expect((await repo.getSource(p.id, id)).source.volume).toBe("3");
+    });
+  });
+
+  describe("(b) the undo says what the researcher decided (I1)", () => {
+    for (const [label, choice, reason] of [
+      ["kept their own value", "My own title", "you kept your own value after this import; your decision was kept"],
+      ["took Zotero's value", "Zotero's title", "you chose Zotero's value after this import; your decision was kept"],
+    ] as const) {
+      it(`the researcher ${label}: the kept line says so`, async () => {
+        const p = await project();
+        const { key, id } = await imported(p);
+        await repo.updateSource(p.id, id, { title: mt("My own title") });
+        z.editItem(U, key, { title: "Zotero's title" });
+        const { batchId } = await run(p);
+        await confirmField(repo, p.id, id, "/title", mt(choice));
+        const res = await bulk().undoBatch(p.id, batchId);
+        expect(res.kept).toEqual([{ kind: "field", id: "/title", sourceId: id, reason }]);
+        expect(titleOf(await repo.getSource(p.id, id))).toBe(choice);
+      });
+    }
+  });
+
+  describe("(c) an old Zotero value is not a claim (I2)", () => {
+    it("P1: confirming one field after Zotero conflicts leaves every other field's status and reason as it was", async () => {
+      const p = await project();
+      const { key, id } = await imported(p, { volume: "3" });
+      await repo.updateSource(p.id, id, { title: mt("My own title"), volume: "12" });
+      z.editItem(U, key, { title: "Zotero's title", volume: "4" });
+      await run(p);
+      const before = await repo.getSource(p.id, id);
+      expect(before.verification["/volume"]).toMatchObject({ status: "conflict", reason: REASON });
+      const [entry] = await pending(p, id);
+      await confirmField(repo, p.id, id, "/title", mt("My own title"));
+      const after = await repo.getSource(p.id, id);
+      expect(after.verification["/title"]?.status).toBe("user-confirmed");
+      expect(verificationBut(after, "/title")).toEqual(verificationBut(before, "/title"));
+      // The entry still waits for the volume; no other entry.
+      expect((await pending(p, id)).map((e) => e.id)).toEqual([entry!.id]);
+      await queueAgrees(p, id);
+    });
+
+    it("P2: a field that flowed in from Zotero earlier is not a conflict when another field is confirmed; no entry is made", async () => {
+      const p = await project();
+      const { key, id } = await imported(p, { volume: "3" });
+      z.editItem(U, key, { volume: "4" });
+      await run(p);
+      await repo.updateSource(p.id, id, { title: mt("My own title") });
+      z.editItem(U, key, { title: "Zotero's title" });
+      await run(p);
+      const before = await repo.getSource(p.id, id);
+      expect(before.source.volume).toBe("4");
+      await confirmField(repo, p.id, id, "/title", mt("My own title"));
+      const after = await repo.getSource(p.id, id);
+      expect(after.verification["/volume"]?.status).not.toBe("conflict");
+      expect(verificationBut(after, "/title")).toEqual(verificationBut(before, "/title"));
+      expect(await pending(p, id)).toEqual([]);
+      await queueAgrees(p, id);
+    });
+  });
+
+  describe("(d) 'confirmed' is never left on a value the researcher did not confirm (I3)", () => {
+    it("P21: Zotero's value chosen, then Zotero changes again: the new value is not shown as confirmed; undo restores the confirmed value", async () => {
+      const p = await project();
+      const { key, id } = await imported(p);
+      await repo.updateSource(p.id, id, { title: mt("My own title") });
+      z.editItem(U, key, { title: "Zotero one" });
+      await run(p);
+      await confirmField(repo, p.id, id, "/title", mt("Zotero one"));
+      const confirmed = await repo.getSource(p.id, id);
+      expect(confirmed.verification["/title"]?.status).toBe("user-confirmed");
+      z.editItem(U, key, { title: "Zotero two" });
+      const { batchId } = await run(p);
+      const sf = await repo.getSource(p.id, id);
+      expect(titleOf(sf)).toBe("Zotero two");
+      expect(sf.verification["/title"]?.status).toBe("single-source");
+      await bulk().undoBatch(p.id, batchId);
+      const undone = await repo.getSource(p.id, id);
+      expect(titleOf(undone)).toBe("Zotero one");
+      expect(undone.verification["/title"]).toEqual(confirmed.verification["/title"]);
+    });
+
+    it("P22: a value confirmed as imported, then changed in Zotero: it flows in and is not shown as confirmed; undo restores both", async () => {
+      const p = await project();
+      const { key, id } = await imported(p, { volume: "3" });
+      await confirmField(repo, p.id, id, "/volume", "3");
+      const confirmed = await repo.getSource(p.id, id);
+      expect(confirmed.verification["/volume"]?.status).toBe("user-confirmed");
+      z.editItem(U, key, { volume: "4" });
+      const { batchId } = await run(p);
+      const sf = await repo.getSource(p.id, id);
+      expect(sf.source.volume).toBe("4");
+      expect(sf.verification["/volume"]?.status).not.toBe("user-confirmed");
+      await bulk().undoBatch(p.id, batchId);
+      const undone = await repo.getSource(p.id, id);
+      expect(undone.source.volume).toBe("3");
+      expect(undone.verification["/volume"]).toEqual(confirmed.verification["/volume"]);
+    });
+  });
+
+  describe("(f) renamed collections are told by Zotero's collection key", () => {
+    const rename = (ref: string, key: string, name: string) => {
+      const l = (z as unknown as { lib(r: string): { version: number; collections: Map<string, { version: number; data: Record<string, unknown> }> } }).lib(ref);
+      const c = l.collections.get(key)!;
+      const v = ++l.version;
+      c.version = v;
+      c.data = { ...c.data, name, version: v };
+    };
+
+    it("a move into a new collection beside the old one is not a rename", async () => {
+      const p = await project();
+      const a = z.addCollection(U, "Theory");
+      const key = z.addItem(U, { itemType: "journalArticle", title: "Moved", collections: [a] });
+      await run(p);
+      const b = z.addCollection(U, "Methods");
+      z.editItem(U, key, { collections: [b] });
+      const { r } = await run(p);
+      expect(r.counts).toMatchObject({ collectionsRenamed: 0, updated: 1 });
+      expect(await reportMd(p, 2)).not.toContain("Collections renamed");
+    });
+
+    it("a parent renamed in Zotero counts once, whatever lies under it", async () => {
+      const p = await project();
+      const a = z.addCollection(U, "Fieldwork");
+      const sub = z.addCollection(U, "Interviews", a);
+      z.addItem(U, { itemType: "journalArticle", title: "Nested one", collections: [sub] });
+      z.addItem(U, { itemType: "journalArticle", title: "Top one", collections: [a] });
+      await run(p);
+      rename(U, a, "Fieldwork 2024");
+      const { r } = await run(p, { full: true });
+      expect(r.counts).toMatchObject({ collectionsRenamed: 1, updated: 2 });
+    });
+  });
+
+  it("M2: after the undo of a batch that extended an entry, the entry no longer lists the field it took off", async () => {
+    const p = await project();
+    const { key, id } = await imported(p, { volume: "3" });
+    await repo.updateSource(p.id, id, { title: mt("My own title"), volume: "12" });
+    z.editItem(U, key, { title: "Zotero's title" });
+    await run(p);
+    z.editItem(U, key, { volume: "4" });
+    const second = await run(p);
+    expect(Object.keys((await pending(p, id))[0]!.fields).sort()).toEqual(["/title", "/volume"]);
+    await bulk().undoBatch(p.id, second.batchId);
+    expect(Object.keys((await pending(p, id))[0]!.fields)).toEqual(["/title"]);
+    await queueAgrees(p, id);
   });
 });
