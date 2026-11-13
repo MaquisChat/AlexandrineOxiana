@@ -1951,27 +1951,86 @@ processing:
       expect(after.annotations).toEqual(destroyed.annotations);
     });
 
-    it("a hash that matches no asset is not anchored by guess", async () => {
+    it("a hash that matches no asset of the source is not anchored by guess: the file is downloaded and its copy's hash finds the asset (I1)", async () => {
       const p = await project();
       const { p: key, att } = await withHighlightedFile("Journal disagrees");
       await run(p);
       const before = await sourceOf(p, key);
-      // The journal names a hash no asset of the source has.
+      // The journal names a hash no asset of the source has: nothing says the researcher removed anything.
       await rewriteJournal(p, 1, (e) => (e.ext?.parts ? { ...e, ext: { ...e.ext, parts: { [att]: { ...e.ext.parts[att], sha256: "0".repeat(64) } } } } : e));
       z.addItem(U, { itemType: "annotation", annotationType: "highlight", annotationText: "added in Zotero", annotationPosition: pos(4) }, { parent: att });
       z.requests.length = 0;
       const second = await run(p);
       expect(second.r.counts.failed).toBe(0);
-      expect(fileRequests(att)).toBe(0); // the journal says it was stored: not fetched, not brought back
+      expect(fileRequests(att)).toBe(1); // not known: fetched as any missing file is
       const sf = await sourceOf(p, key);
-      expect(sf.assets).toEqual(before.assets);
-      // The new highlight is kept without an anchor (its page as the label), never anchored in some other asset.
-      const added = sf.annotations.find((a) => a.quote === "added in Zotero")!;
-      expect(added.anchors).toEqual([]);
-      expect(added.pageLabel).toBe("4");
-      // The one already here keeps its anchor and is not counted as changed.
-      expect(sf.annotations.find((a) => a.quote === "informal markets")).toEqual(before.annotations[0]);
-      expect(second.report.notes).toContain(REMOVED_NOTE);
+      expect(sf.assets).toEqual(before.assets); // the copy is dropped by its hash: the asset was there all along
+      // Both highlights are anchored in the real asset, found by the downloaded copy's hash, never by the journal's.
+      expect(sf.annotations.map((a) => [a.quote, a.anchors.map((x) => (x.kind === "pdf" ? x.assetId : null))]).sort()).toEqual(
+        [
+          ["added in Zotero", [before.assets[0]!.id]],
+          ["informal markets", [before.assets[0]!.id]],
+        ].sort(),
+      );
+      expect(second.report.notes).not.toContain(REMOVED_NOTE);
+      // That run recorded the true hash: the next one skips the file.
+      z.editItem(U, key, { title: "Retitled" });
+      z.requests.length = 0;
+      await run(p);
+      expect(fileRequests(att)).toBe(0);
+    });
+
+    it("an undone batch's file comes back with its highlights anchored, even when a later sync carried its part; a file the researcher removed here does not (I1)", async () => {
+      const p = await project();
+      const undone = await withHighlightedFile("Its file was brought in by a batch later undone");
+      const removed = await withHighlightedFile("Its file the researcher removed here");
+      // 1: the first file fails, so its item comes in without it (and the version is not recorded).
+      z.failFile(U, undone.att, { api: 500 });
+      await run(p, { maxRetries: 0 });
+      z.failFile(U, undone.att, null);
+      // 2: the file is added to the existing source (an update); this is the batch that will be undone.
+      const second = await run(p);
+      expect((await sourceOf(p, undone.p)).assets).toHaveLength(1);
+      // 3: a tag changed in Zotero; the file is skipped, its part carried into this line.
+      z.editItem(U, undone.p, { tags: [{ tag: "first" }, { tag: "later" }] });
+      z.requests.length = 0;
+      await run(p);
+      expect(fileRequests(undone.att)).toBe(0);
+      // The researcher destroys the other item's file here (retention); batch 2 is undone.
+      const { destroyRaw } = await import("../retention.js");
+      await destroyRaw(repo, p.id, [(await sourceOf(p, removed.p)).assets[0]!.id], "Researcher");
+      await createBulkImport(bulkDeps()).undoBatch(p.id, second.batchId);
+      expect((await sourceOf(p, undone.p)).assets).toEqual([]);
+      // 4: a full run. The undone file is downloaded again and its highlight anchored in it; the removed one is not.
+      z.editItem(U, undone.p, { title: "Retitled in Zotero" });
+      z.requests.length = 0;
+      const fourth = await run(p, { full: true });
+      expect(fourth.r.counts.failed).toBe(0);
+      expect(fileRequests(undone.att)).toBe(1);
+      expect(fileRequests(removed.att)).toBe(0);
+      const back = await sourceOf(p, undone.p);
+      expect(back.assets).toHaveLength(1);
+      expect(back.annotations[0]!.anchors[0]).toMatchObject({ kind: "pdf", assetId: back.assets[0]!.id });
+      expect((await sourceOf(p, removed.p)).assets.map((a) => a.status)).toEqual(["destroyed"]);
+      // The run says so for the removed one only: once.
+      expect(fourth.report.notes.filter((n) => n === REMOVED_NOTE)).toHaveLength(1);
+      expect(fourth.report.fileNotes).toEqual([{ item: expect.any(String), note: "an attached file you removed here was not brought in again" }]);
+    });
+
+    it("a downloaded file the engine does not store records no part, and the next full run asks for it again (I2)", async () => {
+      const p = await project();
+      const key = z.addItem(U, { itemType: "journalArticle", title: "Its file is not a supported kind" });
+      // Zotero says PDF; the bytes are plain text: the engine leaves the file out (not supported).
+      const att = z.addItem(U, { itemType: "attachment", contentType: "application/pdf", filename: "f.pdf" }, { parent: key, file: { bytes: Buffer.from("just some words, not a PDF\n") } });
+      const first = await run(p);
+      expect(first.r.counts.failed).toBe(0);
+      expect((await sourceOf(p, key)).assets).toEqual([]);
+      expect(fileRequests(att)).toBe(1);
+      const line = (await journal(p, 1)).find((e) => e.ext?.id === `${U}/${key}`)!;
+      expect(line.ext.parts).toBeUndefined();
+      z.requests.length = 0;
+      await run(p, { full: true });
+      expect(fileRequests(att)).toBe(1);
     });
 
     it("a recoloured highlight on a known file keeps its colour after a run in which the file was skipped", async () => {
