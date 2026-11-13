@@ -10,6 +10,12 @@
   (https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nsallowslocalnetworking,
   read 2026-11-12). It widens nothing beyond local addresses; the global exception for arbitrary loads is not used.
   The content-security policy still limits the page to http://127.0.0.1:* and http://localhost:*.
+
+  NSFileProviderDomainUsageDescription: Apple lists it under protected resources as "A message that tells people
+  why the app needs access to files managed by a file provider" (Google Drive, OneDrive and Dropbox keep their
+  folders under ~/Library/CloudStorage as File Provider domains)
+  (https://developer.apple.com/documentation/bundleresources/protected-resources,
+  read 2026-11-13). macOS shows the text when the app first reads a cloud-drive folder the researcher chose to watch.
 -->
 <plist version="1.0">
 <dict>
@@ -18,5 +24,7 @@
     <key>NSAllowsLocalNetworking</key>
     <true/>
   </dict>
+  <key>NSFileProviderDomainUsageDescription</key>
+  <string>Alexandrine Oxiana reads the files in the cloud-drive folders you choose to watch, to copy them into your library. It never changes, moves or deletes them.</string>
 </dict>
 </plist>
