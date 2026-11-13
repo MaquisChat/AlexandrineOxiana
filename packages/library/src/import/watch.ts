@@ -95,6 +95,7 @@ import { WATCHED_FILE_STATES, isRegisterEntry, type WatchRegisterEntry, type Wat
 import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, WATCHED_FOLDER_TOOL, createAttach, type Attach, type AttachOutcome, type AttachStatus } from "./attach.js";
 import { proxyQueueFor, type ProxyQueue } from "./proxies.js";
 import { SIDECAR_EXTS } from "./sidecar.js";
+import { WatchedFoldersUnreadableError } from "./watch-choices.js";
 import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, fileKey, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
 
 /** Names never imported (moved to watch-local.ts so the two modules do not import each other; A2). */
@@ -2107,14 +2108,10 @@ type Store = Record<string, Record<string, Record<string, string>>>;
 
 /**
  * The list of watched folders on this computer could not be read (Task 68 fix round 1, I1; R178 a):
- * nothing was moved or written. The message carries no path.
+ * nothing was moved or written. The message carries no path. (Defined in watch-choices.ts, which uses it
+ * too, so that the two modules do not import each other; re-exported here under the same name.)
  */
-export class WatchedFoldersUnreadableError extends Error {
-  constructor() {
-    super("This computer's list of watched folders could not be read, so it was not changed. Check that the app's settings folder can be read and try again.");
-    this.name = "WatchedFoldersUnreadableError";
-  }
-}
+export { WatchedFoldersUnreadableError } from "./watch-choices.js";
 
 /**
  * The store, by the registry's rule (Task 68, R178 a): missing is empty; a read error other than
