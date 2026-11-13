@@ -588,9 +588,10 @@ Update after every task; commit and push.
 | Z4 Zotero sync: no file downloaded twice (also R215/A7: the key list before the downloads) | dispatched | — | Opus implementer; brief `task-Z4-brief.md` |
 | Z5–Z12 Zotero sync: the remaining tasks | planned | — | order: Z5 (after Z4; both touch `run.ts`); Z6; Z7; Z8; Z9; Z10 (the scheduler, only after the screen); Z11; Z12 after reader R12. Owner's questions in the ledger under R206 |
 | W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | done (GitHub's run not made, R202) | add12e3 (reader branch) | reviewed over two fix rounds; a Critical in the plan's own rule closed (R208); the real `/usr/bin/stat` never run here — owner's Mac check |
-| W2 Cloud folders: the engine reads nothing it may not | approved; in verification | ccd3dc9 (worktree branch `worktree-agent-a032c1de2a13ca354`) | reviewed twice (R213); verification with the desktop build running; then merge under R202 and dispatch W3 |
+| W2 Cloud folders: the engine reads nothing it may not | done (GitHub's run not made, R202) | 19938e4 (reader branch) | reviewed twice with real files and counted opens (R213); chokidar replaced by Node's `fs.watch` and removed; verified with the desktop build. Owner's Mac checks: pausing the cloud service's app in mid-scan; that a file not downloaded is never opened |
 | W6 Cloud folders: a folder approved only through the system's chooser | done (GitHub's run not made, R202) | cb63fb8 (reader branch) | reviewed with probes, no Critical or Important; verified with the desktop build; one e2e failure in an untouched file under load, passed alone (R173). Owner's Mac checks: the chooser, the privacy prompt |
-| W3, W4, W7–W10 Cloud folders: the remaining tasks | planned | — | order: W3 (after W2); W4; W7 (after W4 and W6; also sets the service's thread pool to 16, A3 d); W8 and W9; W10. Owner's questions in the ledger under R207 |
+| W3 Cloud folders: the register (where a source came from; what happened to its file) | dispatched | — | Opus implementer; brief `task-W3-brief.md` |
+| W4, W7–W10 Cloud folders: the remaining tasks | planned | — | order: W4 (after W3); W7 (after W4; redeems a grant after resolving its real path; sets the service's thread pool to 16); W8 and W9; W10. Owner's questions in the ledger under R207 |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
