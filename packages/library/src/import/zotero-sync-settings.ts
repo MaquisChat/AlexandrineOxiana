@@ -302,7 +302,7 @@ export async function writeZoteroSyncSettings(dir: string, libraryId: string, s:
     dir,
     ZOTERO_SYNC_FILE,
     isSettingsFile,
-    (cur) => ({ v: 1, libraries: { ...(cur?.libraries ?? {}), [libraryId]: next } }),
+    (cur) => ({ v: 1 as const, libraries: { ...(cur?.libraries ?? {}), [libraryId]: next } }),
     o,
   );
   return copySettings(next);
@@ -316,8 +316,8 @@ async function editLinks(dir: string, libraryId: string, fn: (l: ZoteroSyncLink)
     isSettingsFile,
     (cur) => {
       const s = own(cur?.libraries, libraryId);
-      if (!cur || !s) return cur ?? { v: 1, libraries: {} };
-      return { v: 1, libraries: { ...cur.libraries, [libraryId]: { ...s, links: s.links.map((l) => fn(copyLink(l))) } } };
+      if (!cur || !s) return cur ?? { v: 1 as const, libraries: {} };
+      return { v: 1 as const, libraries: { ...cur.libraries, [libraryId]: { ...s, links: s.links.map((l) => fn(copyLink(l))) } } };
     },
     o,
   );
@@ -381,7 +381,7 @@ export async function putZoteroSyncRun(dir: string, libraryId: string, run: Zote
       const at = (own(cur?.libraries, libraryId) ?? []).findIndex((r) => r.id === run.id);
       if (at >= 0 && at <= list.length) list.splice(at, 0, run);
       else list.unshift(run);
-      return { v: 1, libraries: { ...(cur?.libraries ?? {}), [libraryId]: list.slice(0, ZOTERO_SYNC_HISTORY_MAX) } };
+      return { v: 1 as const, libraries: { ...(cur?.libraries ?? {}), [libraryId]: list.slice(0, ZOTERO_SYNC_HISTORY_MAX) } };
     },
     o,
   );
