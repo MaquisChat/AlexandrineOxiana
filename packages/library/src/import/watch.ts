@@ -678,10 +678,14 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       goUnreachable(folderReason(err));
       return;
     }
+    // The watcher is set up right after the folder answered, before the folder counts as watched again.
+    if (!watchDir(realRoot, true)) {
+      goUnreachable(WATCH_REASONS.watchFailed);
+      return;
+    }
     unreachable = null;
     emit({ kind: "resumed" });
     touch();
-    await startWatcher();
     startWalk(entries);
   }
 
@@ -715,15 +719,38 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
     for (const k of [...dirInos.keys()]) if (under(k)) dirInos.delete(k);
   }
-  function watchDir(d: string): void {
-    if (!eventsOn || stopped || unreachable || gate.stuck || dirWatchers.has(d)) return;
-    if (form === "tree" && d !== realRoot) return; // the tree's one watcher already covers it
+  /**
+   * A watcher failed or closed by itself (N1). The folder's own: the folder is "Cannot be reached" (never "watching"
+   * without a watcher) and is asked again at once, inside the per-folder limit — `tryResume` checks it, sets the
+   * watcher up again right after it answers, and scans it so that nothing that arrived meanwhile is missed. A
+   * subfolder's (per-folder form): that folder is listed again at once, which watches it again after it answers.
+   */
+  function watcherLost(d: string, w: FSWatcher) {
+    if (dirWatchers.get(d) !== w) return; // closed by this module
+    dirWatchers.delete(d);
+    w.close();
+    if (stopped || unreachable) return;
+    if (d === realRoot) {
+      goUnreachable(WATCH_REASONS.watchFailed);
+      pollDue = true;
+    } else {
+      dirInos.delete(d);
+      const entry = { dir: d, depth: relName(d).split("/").length };
+      if (walk) walk.dirs.push(entry);
+      else walk = { dirs: [entry], found: new Set(), complete: false };
+    }
+    wake();
+  }
+  /** Sets up the folder's watcher; false when it could not be. `resuming`: the folder has just answered while it was "unreachable". */
+  function watchDir(d: string, resuming = false): boolean {
+    if (!eventsOn || (form === "tree" && d !== realRoot)) return true; // the tree's one watcher already covers it
+    if (stopped || (unreachable && !resuming) || gate.stuck) return false;
+    if (dirWatchers.has(d)) return true;
     let w: FSWatcher;
     try {
       w = fsWatch(d, form === "tree" ? { recursive: opts.recursive, persistent: true } : { persistent: true });
     } catch {
-      if (d === realRoot) emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
-      return; // the next scan finds what this folder holds
+      return false; // the root: "Cannot be reached" (asked again at the next poll); a subfolder: the next scan finds what it holds
     }
     dirWatchers.set(d, w);
     w.on("change", (eventType: string, name: string | Buffer | null) => {
@@ -744,15 +771,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       }
       wake();
     });
-    w.on("error", () => {
-      w.close();
-      dirWatchers.delete(d);
-      if (d === realRoot && !unreachable && !stopped) emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
-    });
-  }
-  /** Called right after the folder's listing answered. */
-  async function startWatcher(): Promise<void> {
-    watchDir(realRoot);
+    w.on("error", () => watcherLost(d, w));
+    w.on("close", () => watcherLost(d, w)); // a close this module did not make
+    return true;
   }
 
   // ---- the worker: everything this folder does, one step at a time --------------------------------------------
@@ -1310,8 +1331,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
           if (!(err instanceof FolderNotAnsweringError)) goUnreachable(folderReason(err));
         }
         if (entries && !stopped) {
-          await startWatcher();
-          startWalk(entries); // files that arrived while nothing was watching
+          if (watchDir(realRoot)) startWalk(entries); // files that arrived while nothing was watching
+          else goUnreachable(WATCH_REASONS.watchFailed); // asked again at the next poll
         }
       }
     } catch (err) {

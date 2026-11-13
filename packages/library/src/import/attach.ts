@@ -314,6 +314,9 @@ export function createAttach(deps: AttachDeps): Attach {
     if (!st.isFile()) return failed(path, REASONS.notAFile);
     // Before the first byte is read (the type sniff below), and again before EACH later open (the hash, the
     // metadata, the copy): a file that is not on this computer, or no longer as it was checked, is not read (A6).
+    // These opens (by file-type, the hash stream, the metadata worker, the copy, readSidecar) follow a symbolic link:
+    // they rely on the comparison made immediately before each (a link swapped in fails it); only the watched
+    // folder's own hash refuses a link outright (O_NOFOLLOW).
     if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON);
     let type: { ext: string; mime: string } | undefined;
     try {

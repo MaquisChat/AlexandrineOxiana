@@ -1004,6 +1004,23 @@ describe("cloud-drive folders: fix round 1 (A6, R213)", () => {
     expect(fake.calls).toEqual([[real, { recursive: true, persistent: true }]]);
   });
 
+  for (const form of ["tree", "per-folder"] as const) {
+    it(`${form} form: a watcher that fails is set up again at once and a scan follows; the status never says "watching" without one (N1)`, async () => {
+      const p = await project();
+      const fake = fakeWatch();
+      const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, rescanMs: 600_000, watcherForm: form, fsWatch: fake.fn });
+      await w.ready;
+      await sleep(200);
+      expect(fake.calls).toHaveLength(1);
+      // Written while the watcher is lost: no event will ever name it; only the scan after the new watcher finds it.
+      await writeFile(join(inbox, "between.pdf"), await buildPdf({ title: "Between", extra: "between" }));
+      fake.emitters[0]!.emit("error", new Error("watcher lost"));
+      expect(w.status().state).not.toBe("watching");
+      await until(() => fake.calls.length === 2 && w.status().state === "watching", 3000);
+      await until(() => events.some((e) => e.kind === "imported" && e.file === "between.pdf"), 5000);
+    });
+  }
+
   it("a watcher is set up only after the folder has answered, never while a call on it is stuck", async () => {
     const p = await project();
     const real = await realpath(inbox);
