@@ -149,7 +149,8 @@ afterEach(async () => {
   const seen = [logs, ...errorBodies, ...events.map((e) => JSON.stringify(e))].join("\n");
   for (const w of SECRET_WORDS) expect(seen.includes(w), `"${w}" was logged or sent`).toBe(false);
   errorBodies.length = 0;
-  await rm(tmp, { recursive: true, force: true });
+  // A lookup released after its library closed may still be writing its answer into the lookup cache.
+  await rm(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 async function start(over: Partial<ServiceOptions> = {}): Promise<LibraryService> {
