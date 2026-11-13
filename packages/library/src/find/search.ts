@@ -27,6 +27,7 @@ import { mapCrossref } from "../lookup/crossref.js";
 import { LookupHttpError, retryAfterMs, type GetOptions, type HttpClient, type RateLimitAnswer } from "../lookup/http.js";
 import { mapOpenAlex } from "../lookup/openalex.js";
 import type { WorkCandidate } from "./candidates.js";
+import { FIND_DOI_MAX } from "./types.js";
 import { cleanText, parseReference, segmentTokens, segmentsOf, tokensOf, type Reference, type Segment } from "./reference.js";
 
 export type { WorkCandidate } from "./candidates.js";
@@ -46,7 +47,7 @@ const PER_SERVICE = 5;
 const RAW_MAX = 4000;
 const CONTAINER_MAX = 1000;
 const ISBN_MAX = 20;
-const DOI_MAX = 300;
+const DOI_MAX = FIND_DOI_MAX;
 const DOI_RE = /^10\.\d{4,9}\/\S+$/u;
 const SEARCH_TTL_DAYS = 7;
 
