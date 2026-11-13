@@ -1,39 +1,42 @@
 /**
- * The runner of Find and acquire (Task F4): takes each typed line through its life.
+ * The runner of Find and acquire (Task F4; fix round 1, R237): takes each typed line through its life.
  *
- *   looking-up ──► choose            (several works fit; `choose` picks one, or none: not-found)
- *              ──► record-complete   (sure, or chosen: ONE source without a file is created; final in slice 1)
+ *   looking-up ──► choose            (several works fit, or the answer was partial; `choose` picks one, or none)
+ *              ──► record-complete   (sure on a complete answer, or chosen: ONE source without a file; final in slice 1)
  *              ──► already           (the same DOI or ISBN is in this project, or — "Check everything I have" —
  *                                     in another unlocked project: `elsewhere: true` and nothing else about it)
  *              ──► maybe-duplicate   (a likely duplicate: `confirmDuplicate` answers it)
  *              ──► not-found         (every service asked answered, and nothing scored)
- *              ──► failed            (the rules or the settings refuse; or the services stayed unreachable
- *                                     through every retry of FIND_RETRY_DELAYS_MS; `retry` starts again)
+ *              ──► failed            (the rules or the settings refuse; the services stayed unreachable or the
+ *                                     settings did not answer through every retry; or something unexpected
+ *                                     happened: reason "unexpected". `retry` starts it afresh)
  *
  * One work, one source, under every race. The duplicate check and the creation run inside the project's store
  * turn (`serialStore`, shared with drag-and-drop, watched folders and Bulk Import), with nothing awaited between
- * them that lets another creation in; every change an entry makes after a lookup is decided in such a turn
- * against the entry as it is then (an entry removed, chosen, retried or stopped meanwhile is left alone).
+ * them that lets another creation in. The check asks the index (DOI, ISBN and the fuzzy keys) inside that turn and
+ * keeps no cache of its own: a source made outside the turn (a browser capture) or changed by an edit is seen, and
+ * no entry reads every source record while it holds the turn. Every change an entry makes after a lookup is
+ * decided in a turn against the entry as it is then (removed, chosen, retried or stopped meanwhile: left alone).
  *
  * Crash safety. The source made for an entry carries the entry's id in its provenance from its creation
  * (`provenance.externalKeys["find-entry"]`; provenance is immutable). A crash between the creation and the
- * entry's line leaves the entry "looking-up" beside a source that names it: the next turn on that entry (at
- * resume: before any lookup) ADOPTS that source — "record-complete" with its id — never a second source and
- * never "Already in your library".
+ * entry's line leaves the entry "looking-up" beside a source that names it: `resume` reads the project's source
+ * records once (outside any turn, and only when some entry is "looking-up") and the entry ADOPTS that source —
+ * "record-complete" with its id, before any lookup — never a second source and never "Already in your library".
  *
- * Nothing of another project is written here: a match elsewhere stores `elsewhere: true` and the state; where
- * it is is worked out again by `elsewhere()` at request time. A locked project is not looked into (its record is
- * not in the index while it is locked, R30) and is counted by `lockedNotChecked()`.
+ * The record is stored under the project's own rules, like every other import (R237 a): `identifiable` and the
+ * legal basis come from `storeInputs` (category "reference-lookup"); where the rules refuse it, the entry is
+ * "failed" by the rules and nothing is created. Making a record is the way of acquiring `reference_lookup`
+ * (checked before anything is asked, and again, governed and audited, by the creation itself).
  *
- * The rules decide and fail closed: making a record is the way of acquiring `reference_lookup` (F1), checked
- * before anything is asked and again, governed and audited, by the creation itself; a project whose rules cannot
- * be read refuses. The "Search sources" settings only narrow. Audit entries hold ids, counts and states only;
- * the creation is audited as `source.create`. What was typed reaches no audit entry, note or error.
+ * Nothing waits for ever (R237 b). Every outside call the runner awaits is under a time limit and is let go at
+ * `stop`: the settings (FIND_SETTINGS_TIMEOUT_MS), the lookups (FIND_LOOKUP_TIMEOUT_MS overall, besides the
+ * client's own per-attempt limits). The index and `checkEverything()` are synchronous calls (they cannot be left
+ * waiting). A call that does not answer in time frees its place and the entry is tried again by the ordinary
+ * delays. `stopAll()` settles within FIND_STOP_SETTLE_MS whatever is in flight.
  *
- * Running. At most FIND_CONCURRENCY entries are worked on at once for the whole open library, the project
- * served longest ago first (one project's fifty lines do not starve another's one). `stop` (lock, close) writes
- * nothing further for the project and drops its work in flight: a late answer is not acted on. `resume` (open,
- * unlock) restarts the "looking-up" entries and nothing else; a read-only library starts nothing.
+ * When nothing can be written for a project — its rules or its queue cannot be read, or the library is read-only —
+ * the runner stops for that project and says so (`stoppedFor`), instead of leaving entries that seem to be looked up.
  */
 import {
   EdtfLite,
@@ -47,32 +50,61 @@ import {
   type DupKey,
   type FieldEvidence,
   type Provenance,
-  type Source,
 } from "@ao/core";
 import { findSourceBy, type IndexDb } from "../index/db.js";
-import { serialStore, storeTurn } from "../import/project-queue.js";
+import { storeInputs } from "../import/common.js";
+import { serialStore } from "../import/project-queue.js";
 import { lookupContextFor, providerAllowed, type LookupContext } from "../lookup/context.js";
 import type { HttpClient } from "../lookup/http.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError } from "../repo/errors.js";
-import { createSourceRefusing, projectCollectionsAndTags, repoLibrary, type Repo } from "../repo/repo.js";
-import type { RepoCore } from "../repo/state.js";
+import {
+  appendFindEntriesIn,
+  createSourceRefusing,
+  projectCollectionsAndTags,
+  projectPolicy,
+  readFindQueueDetailedIn,
+  readFindQueueIn,
+  repoLibrary,
+  type Repo,
+} from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
 import type { WorkCandidate } from "./candidates.js";
-import { FindQueueUnreadableError, appendFindEntries, readFindQueue, readFindQueueDetailed, sanitizeEntry } from "./queue-store.js";
+import { FindQueueUnreadableError, sanitizeEntry } from "./queue-store.js";
 import { parseReference, type Reference } from "./reference.js";
 import { decideMatch, scoreCandidate, searchWorks, type SearchSource } from "./search.js";
-import { FIND_LINE_MAX_BYTES, FIND_TYPED_MAX, type FindEntry, type FindReason, type FindState, type SearchSettings } from "./types.js";
+import {
+  FIND_DOI_MAX,
+  FIND_LINE_MAX_BYTES,
+  FIND_TYPED_MAX,
+  type FindEntry,
+  type FindMatch,
+  type FindReason,
+  type FindReasonCode,
+  type FindState,
+  type SearchSettings,
+} from "./types.js";
 
 /** At most this many entries are worked on at once, for the whole open library. */
 export const FIND_CONCURRENCY = 2;
-/** After a network failure the entry is tried again after each of these delays in turn, then it is "failed". */
+/** After a failure to get an answer the entry is tried again after each of these delays in turn, then it is "failed". */
 export const FIND_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000, 900_000];
+/** How long the "Search sources" settings may take to answer (a local file: a stall is a fault, retried). */
+export const FIND_SETTINGS_TIMEOUT_MS = 5_000;
+/**
+ * How long one entry's search may take in all, both services together. The lookup client's own limits are 60 s per
+ * attempt (30 s for headers and body) and up to 3 retries with back-off; this bounds the whole, however it stalls.
+ */
+export const FIND_LOOKUP_TIMEOUT_MS = 240_000;
+/** `stopAll()` settles within this time (wall clock) whatever is in flight; what is still running then writes nothing. */
+export const FIND_STOP_SETTLE_MS = 5_000;
 /** One Add holds at most this many lines. */
 export const FIND_ADD_MAX_LINES = 50;
 /** The tool a record made by Find and acquire names in its provenance. */
 export const FIND_TOOL = "find-and-acquire";
 /** The provenance external key that holds the queue entry's id (set once, at creation). */
 export const FIND_ENTRY_KEY = "find-entry";
+/** The legal-basis category of a record made from a typed reference (`consent.defaultLegalBasis`), as Bulk Import names its kinds. */
+export const FIND_LEGAL_CATEGORY = "reference-lookup";
 /** At most this many candidates are kept on an entry. */
 const CANDIDATES_KEPT = 10;
 
@@ -115,45 +147,50 @@ export interface FindRunnerDeps {
   checkEverything: () => boolean;
   now?: () => Date;
   onChange(e: { projectId: string; entryId: string; state: FindState }): void;
-  /** Beyond the plan's Interfaces: the timers of the retries (default: the process's, unref'd). Tests pass fake ones. */
+  /** Beyond the plan's Interfaces: the timers of the retries and time limits (default: the process's, unref'd). */
   timers?: FindTimers;
-  /** Beyond the plan's Interfaces: short notes (error kinds only; never what was typed). */
+  /** Beyond the plan's Interfaces: short notes (error kinds only; never what was typed, never an error's text). */
   debug?: (note: string) => void;
 }
 
+/** Why the runner does nothing for a project (R237 d): nothing can be written for it. */
+export type FindStoppedFor = { code: "rules-unreadable" | "queue-unreadable" | "read-only" };
+
 export interface FindRunner {
+  /**
+   * Adds the lines as entries. After `stop(projectId)` the entries are written (if the store allows) but no run
+   * starts until `resume(projectId)` (M1).
+   */
   add(projectId: string, lines: string[], collectionId?: string): Promise<{ added: FindEntry[]; mergedLines: number }>;
+  /** The researcher's choice; it makes the record now (in the press's own turn), also after `stop` if the store allows. */
   choose(projectId: string, entryId: string, candidateId: string | null): Promise<FindEntry>;
   confirmDuplicate(projectId: string, entryId: string, same: boolean): Promise<FindEntry>;
   addHereAsWell(projectId: string, entryId: string): Promise<FindEntry>;
+  /** Writes the entry back to "looking-up"; after `stop(projectId)` no run starts until `resume`. */
   retry(projectId: string, entryId: string): Promise<FindEntry>;
   remove(projectId: string, entryId: string): Promise<void>;
+  /** At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry (nothing else). */
   resume(projectId: string): void;
+  /** At lock (together with the lock) or close: nothing more is written for the project; its work in flight is let go. */
   stop(projectId: string): void;
+  /** At close: settles within FIND_STOP_SETTLE_MS whatever is in flight. */
   stopAll(): Promise<void>;
   elsewhere(projectId: string, entryId: string): Promise<{ projectId: string; sourceId: string } | null>;
+  /** How many projects of the open library are locked and so were not looked into: 0 while "Check everything I have" is off. */
   lockedNotChecked(): number;
+  /** Why nothing is being done for the project now, or null. */
+  stoppedFor(projectId: string): FindStoppedFor | null;
 }
-
-/** The queue store works on the repository's core; the Repo keeps it in a private field (package-internal use). */
-const coreOf = (repo: Repo): RepoCore => (repo as unknown as { core: RepoCore }).core;
 
 /**
  * The project's queue as it stands (for the service's GET, F5): the live entries, and how many lines could not be
  * read. A queue none of whose lines can be read is `FindQueueUnreadableError`; a locked project `ProjectLockedError`.
  */
 export function readFindQueueOf(repo: Repo, projectId: string): Promise<{ entries: Map<string, FindEntry>; unreadableLines: number }> {
-  return readFindQueueDetailed(coreOf(repo), projectId);
+  return readFindQueueDetailedIn(repo, projectId);
 }
 
 type Existing = DupKey & { sourceId: string };
-/** What the runner knows of a project's sources inside its store turns (rebuilt when anyone else had a turn). */
-interface Known {
-  turn: number;
-  keys: Existing[];
-  /** Entry id → the source made for it (from provenance). */
-  made: Map<string, string>;
-}
 
 interface Run {
   gen: number;
@@ -164,10 +201,15 @@ interface Run {
   timers: Map<string, unknown>;
   /** When this project was last given a place (fairness: the one served longest ago goes first). */
   served: number;
-  known?: Known;
+  /** Entry → a source made for it, found by `resume` in the project's source records (crash recovery). */
+  adoptable: Map<string, string>;
 }
 
-const STOPPED = Symbol("stopped");
+/** The run was stopped (or the project's generation moved on) while waiting: nothing more is done. */
+class Abandoned extends Error {}
+/** An outside call did not answer within its time limit. */
+class TimedOut extends Error {}
+class CollectionGone extends Error {}
 
 /** A new entry from `e`: its fields without those in `drop`, then `patch` (keys it sets to undefined are left out). */
 function evolve(e: FindEntry, patch: Partial<FindEntry>, drop: Array<keyof FindEntry>, at: string): FindEntry {
@@ -180,10 +222,10 @@ function evolve(e: FindEntry, patch: Partial<FindEntry>, drop: Array<keyof FindE
 
 const sameVersion = (a: FindEntry, b: FindEntry) => a.state === b.state && a.updatedAt === b.updatedAt && a.attempts === b.attempts;
 
-/** A candidate within what the queue keeps (F3's bounds, which are not all F2's): fields the store would refuse are left out. */
+/** A candidate within what the queue keeps (the store's bounds): fields the store would refuse are left out. */
 function boundCandidate(c: WorkCandidate): WorkCandidate {
   const isbn = (c.identifiers.isbn ?? []).filter((i) => i.length <= 20).slice(0, 20);
-  const doi = c.identifiers.doi && c.identifiers.doi.length <= 200 ? c.identifiers.doi : undefined;
+  const doi = c.identifiers.doi && c.identifiers.doi.length <= FIND_DOI_MAX ? c.identifiers.doi : undefined;
   const cut = (s: string | undefined, n: number) => (s === undefined ? undefined : s.length <= n ? s : undefined);
   const out: WorkCandidate = {
     id: c.id.slice(0, 200),
@@ -235,22 +277,6 @@ function keyOf(c: WorkCandidate): DupKey {
   };
 }
 
-/** The duplicate keys of a stored source (no files: a record made from a reference has none to compare). */
-function keyOfSource(s: Source): Existing {
-  const c = s.creators[0];
-  const family = c?.family ?? c?.literal;
-  const title = primary(s.title);
-  return {
-    sourceId: s.id,
-    sha256s: [],
-    ...(s.identifiers.doi ? { doi: s.identifiers.doi } : {}),
-    ...(s.identifiers.isbn?.length ? { isbns: s.identifiers.isbn } : {}),
-    ...(title ? { title } : {}),
-    ...(family ? { firstCreatorFamily: family } : {}),
-    ...(s.issued ? { year: s.issued.slice(0, 4) } : {}),
-  };
-}
-
 /** The source draft for a chosen or sure candidate (its fields are already mapped by F2 through mapCrossref/mapOpenAlex). */
 function draftFor(c: WorkCandidate, collectionIds: string[]): SourceDraft {
   const mt = (value: string) => ({ variants: [{ lang: "und", kind: "original" as const, value }] });
@@ -287,13 +313,25 @@ function evidenceFor(draft: SourceDraft, c: WorkCandidate, at: string): FieldEvi
   return out;
 }
 
-class CollectionGone extends Error {}
+/** The match an entry already carries, or (an entry written before R237) the rule's score again. */
+function matchOf(e: FindEntry, cand: WorkCandidate): FindMatch {
+  if (e.match) return e.match;
+  const ref = parseReference(e.typed);
+  return { method: "find-match", confidence: ref ? scoreCandidate(ref, cand).score : 0 };
+}
+
+const errName = (err: unknown) => (err instanceof Error ? err.name : "error");
 
 export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const { repo, http } = deps;
-  const core = coreOf(repo);
   const now = () => deps.now?.() ?? new Date();
-  const debug = (n: string) => deps.debug?.(n);
+  const debug = (n: string) => {
+    try {
+      deps.debug?.(n);
+    } catch {
+      // a listener's error never stops the runner
+    }
+  };
   const timers: FindTimers = deps.timers ?? {
     setTimeout: (fn, ms) => {
       const t = setTimeout(fn, ms);
@@ -309,8 +347,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const runs = new Map<string, Run>();
   const running = new Set<string>();
   const inflight = new Set<Promise<void>>();
-  /** Entry → the source this runner made for it (a creation whose entry line could not be written is adopted). */
+  /** Entry → the source this runner made for it whose entry line is not written yet (adopted, never made twice). */
   const madeHere = new Map<string, string>();
+  /** Projects for which nothing can be written now (cleared by `resume`). */
+  const blocked = new Map<string, FindStoppedFor>();
 
   const readOnly = () => repoLibrary(repo).mode !== "read-write";
   const keyOfRun = (pid: string, eid: string) => `${pid}\u0000${eid}`;
@@ -318,7 +358,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   function freshRun(): Run {
     let signalStop!: () => void;
     const stopSignal = new Promise<void>((r) => (signalStop = r));
-    return { gen: 0, stopped: false, stopSignal, signalStop, pending: [], timers: new Map(), served: -1 };
+    return { gen: 0, stopped: false, stopSignal, signalStop, pending: [], timers: new Map(), served: -1, adoptable: new Map() };
   }
   function runOf(pid: string): Run {
     let r = runs.get(pid);
@@ -327,14 +367,6 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       runs.set(pid, r);
     }
     return r;
-  }
-  /** Starts a new generation (the caller bumps `gen`): work of the old one is let go at once and writes nothing more. */
-  function restart(r: Run): void {
-    r.signalStop();
-    let signalStop!: () => void;
-    r.stopSignal = new Promise<void>((res) => (signalStop = res));
-    r.signalStop = signalStop;
-    r.stopped = false;
   }
   const alive = (pid: string, gen: number) => {
     const r = runs.get(pid);
@@ -349,7 +381,31 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     r.pending = [];
     for (const h of r.timers.values()) timers.clearTimeout(h);
     r.timers.clear();
-    r.known = undefined;
+  }
+
+  /** Nothing can be written for the project: the runner stops for it and says so. */
+  function block(pid: string, code: FindStoppedFor["code"]): void {
+    blocked.set(pid, { code });
+    stopRun(pid);
+  }
+
+  /**
+   * `p`, unless the run is stopped first (Abandoned) or `ms` passes first (TimedOut). What `p` does later is not
+   * acted on. Nothing of the race is left behind: its timer is cleared.
+   */
+  function guard<T>(r: Run, p: Promise<T>, ms?: number): Promise<T> {
+    p.catch(() => {});
+    let h: unknown;
+    const races: Array<Promise<T>> = [
+      p,
+      r.stopSignal.then(() => {
+        throw new Abandoned();
+      }),
+    ];
+    if (ms !== undefined) races.push(new Promise<T>((_, reject) => (h = timers.setTimeout(() => reject(new TimedOut()), ms))));
+    return Promise.race(races).finally(() => {
+      if (h !== undefined) timers.clearTimeout(h);
+    });
   }
 
   // ------------------------------------------------------------------------------------------------------------
@@ -383,7 +439,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     active++;
     running.add(k);
     const p = work(pid, eid, gen)
-      .catch((err: unknown) => failedUnexpectedly(pid, err))
+      .catch((err: unknown) => debug(`find: an entry's work ended unexpectedly (${errName(err)})`))
       .finally(() => {
         active--;
         running.delete(k);
@@ -393,16 +449,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     inflight.add(p);
   }
 
-  function failedUnexpectedly(pid: string, err: unknown): void {
-    if (err instanceof ProjectLockedError || err instanceof FindQueueUnreadableError || err instanceof ReadOnlyLibraryError || err instanceof RecoveryPendingError) {
-      stopRun(pid);
-      return;
-    }
-    debug(`find: an entry could not go on (${err instanceof Error ? err.name : "error"})`);
-  }
-
   function later(pid: string, eid: string, at: string): void {
     const r = runOf(pid);
+    if (r.stopped) return;
     const old = r.timers.get(eid);
     if (old !== undefined) timers.clearTimeout(old);
     const ms = Math.max(0, Date.parse(at) - now().getTime());
@@ -426,85 +475,106 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   async function write(pid: string, next: FindEntry[], op: "add" | "update" | "remove"): Promise<FindEntry[]> {
     const fitted = next.map(fit);
-    await appendFindEntries(core, pid, fitted, op);
-    if (op !== "remove") for (const e of fitted) deps.onChange({ projectId: pid, entryId: e.id, state: e.state });
+    await appendFindEntriesIn(repo, pid, fitted, op);
+    if (op !== "remove") {
+      for (const e of fitted) {
+        if (e.state !== "looking-up") madeHere.delete(e.id);
+        try {
+          deps.onChange({ projectId: pid, entryId: e.id, state: e.state });
+        } catch {
+          // a listener's error never undoes a committed change
+        }
+      }
+    }
     return fitted;
   }
   const stamp = () => now().toISOString();
 
-  /** The entry as the queue holds it now (a read refused as unreadable stops the runner for the project). */
   async function current(pid: string, eid: string): Promise<FindEntry | undefined> {
-    return (await readFindQueue(core, pid)).get(eid);
+    return (await readFindQueueIn(repo, pid)).get(eid);
   }
 
-  /** The project's store turn, with what the runner knows of its sources kept only while nobody else had a turn. */
+  /** The project's store turn (shared with every import into the project). */
   function turn<T>(pid: string, fn: () => Promise<T>): Promise<T> {
-    return serialStore(repo, pid, async () => {
-      const r = runOf(pid);
-      const t = storeTurn(repo, pid);
-      if (r.known && r.known.turn !== t - 1) r.known = undefined;
-      try {
-        return await fn();
-      } finally {
-        if (r.known) r.known.turn = t;
-      }
+    return serialStore(repo, pid, fn);
+  }
+
+  /**
+   * The runner's own work in a store turn. While it WAITS for the turn (behind an import, say) a stop lets it go at
+   * once, and when the turn comes it does nothing; once it has STARTED it is awaited to its end (internal and finite:
+   * it checks the generation before every write), so that `stopAll` never returns while a write is under way.
+   */
+  async function inTurn<T>(r: Run, pid: string, live: () => boolean, fn: () => Promise<T>): Promise<T | undefined> {
+    let started = false;
+    const p = turn(pid, async () => {
+      started = true;
+      return live() ? fn() : undefined;
     });
-  }
-
-  /** Inside a turn: the project's sources' duplicate keys and the entries they were made for. */
-  async function known(pid: string): Promise<Known> {
-    const r = runOf(pid);
-    if (r.known) return r.known;
-    const k: Known = { turn: storeTurn(repo, pid), keys: [], made: new Map() };
-    for (const id of repo.listSourceIds(pid)) {
-      let s: Source;
-      try {
-        s = await repo.getSourceRecord(pid, id);
-      } catch (err) {
-        if (err instanceof ProjectLockedError) throw err;
-        continue; // an unreadable source cannot be compared
-      }
-      k.keys.push(keyOfSource(s));
-      const tag = s.provenance.externalKeys?.[FIND_ENTRY_KEY];
-      if (tag && s.provenance.captureMethod === "reference_lookup" && s.provenance.tool.name === FIND_TOOL) k.made.set(tag, id);
-    }
-    r.known = k;
-    return k;
-  }
-
-  /** The source made for this entry earlier (a crash or a stop between its creation and the entry's line), if it still exists. */
-  async function madeFor(pid: string, eid: string): Promise<string | undefined> {
-    const live = new Set(repo.listSourceIds(pid));
-    const here = madeHere.get(eid);
-    if (here && live.has(here)) return here;
-    const k = await known(pid);
-    const id = k.made.get(eid);
-    return id && live.has(id) ? id : undefined;
-  }
-
-  /** A duplicate in this project: the runner's keys (inside the turn), and the index for a DOI or ISBN as a second net. */
-  async function matchHere(pid: string, key: DupKey): Promise<ReturnType<typeof findDuplicate>> {
-    const live = new Set(repo.listSourceIds(pid));
-    const k = await known(pid);
-    const dup = findDuplicate(key, k.keys.filter((x) => live.has(x.sourceId)));
-    if (dup?.certainty === "certain") return dup;
-    for (const row of indexRows(key)) if (row.projectId === pid && live.has(row.id)) return { sourceId: row.id, reason: "same-doi", certainty: "certain" };
-    return dup;
-  }
-
-  function indexRows(key: DupKey): Array<{ id: string; projectId: string; locked: boolean }> {
-    const out: Array<{ id: string; projectId: string; locked: boolean }> = [];
+    p.catch(() => {});
     try {
-      if (key.doi) out.push(...findSourceBy(deps.index, { doi: key.doi }));
-      for (const i of key.isbns ?? []) out.push(...findSourceBy(deps.index, { isbn: i }));
-    } catch {
-      debug("find: the index could not be asked");
+      return await guard(r, p);
+    } catch (err) {
+      if (err instanceof Abandoned && started) return await p;
+      throw err;
     }
+  }
+
+  // ------------------------------------------------------------------------------------------------------------
+  // Duplicates: asked of the index inside the store turn (it is updated by every committed change before that
+  // change returns, R30: an encrypted project's keys only while it is unlocked).
+
+  type Row = { id: string; projectId: string; locked: boolean };
+  function indexRows(key: DupKey): Row[] {
+    const out: Row[] = [];
+    if (key.doi) out.push(...findSourceBy(deps.index, { doi: key.doi }));
+    for (const i of key.isbns ?? []) out.push(...findSourceBy(deps.index, { isbn: i }));
     return out;
   }
 
+  /** The fuzzy keys (title, first family name, year ±1) of a project's indexed sources. */
+  function fuzzyRows(projectId: string, key: DupKey): Existing[] {
+    const y = key.year && /^\d{4}$/u.test(key.year) ? Number(key.year) : null;
+    if (!key.title || !key.firstCreatorFamily || y === null) return [];
+    const years = [String(y - 1), String(y), String(y + 1)];
+    const rows = deps.index
+      .prepare(
+        `SELECT id, title, creators_text, issued_year, doi FROM main.sources WHERE project_id = ? AND locked = 0 AND issued_year IN (?,?,?)
+         UNION ALL SELECT id, title, creators_text, issued_year, doi FROM temp.t_sources WHERE project_id = ? AND issued_year IN (?,?,?)`,
+      )
+      .all(projectId, ...years, projectId, ...years) as Array<{ id: string; title: string; creators_text: string; issued_year: string | null; doi: string | null }>;
+    return rows
+      .filter((r) => r.title)
+      .map((r) => {
+        const family = r.creators_text.split(";")[0]!.split(",")[0]!.trim();
+        return {
+          sourceId: r.id,
+          sha256s: [],
+          title: r.title,
+          ...(family ? { firstCreatorFamily: family } : {}),
+          ...(r.issued_year ? { year: r.issued_year } : {}),
+          ...(r.doi ? { doi: r.doi } : {}),
+        };
+      });
+  }
+
+  const liveIds = (projectId: string): Set<string> => {
+    try {
+      return new Set(repo.listSourceIds(projectId));
+    } catch {
+      return new Set();
+    }
+  };
+
+  /** A duplicate in this project (inside the turn). Certain: the same DOI or ISBN; likely: the fuzzy rule. */
+  function matchHere(pid: string, key: DupKey): { sourceId: string; certainty: "certain" | "likely" } | null {
+    const live = liveIds(pid);
+    for (const row of indexRows(key)) if (row.projectId === pid && live.has(row.id)) return { sourceId: row.id, certainty: "certain" };
+    const dup = findDuplicate(key, fuzzyRows(pid, key).filter((e) => live.has(e.sourceId)));
+    return dup ? { sourceId: dup.sourceId, certainty: dup.certainty } : null;
+  }
+
   /** Other projects of the open library that can be looked into now (unlocked), and how many are locked. */
-  function otherProjects(pid: string): { open: string[]; locked: number } {
+  function otherProjects(pid: string | null): { open: string[]; locked: number } {
     const open: string[] = [];
     let locked = 0;
     for (const p of repo.listProjects()) {
@@ -522,57 +592,33 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   function matchElsewhere(pid: string, key: DupKey, likely: boolean): { projectId: string; sourceId: string; certainty: "certain" | "likely" } | null {
     const { open } = otherProjects(pid);
     const openSet = new Set(open);
-    const exists = (projectId: string, id: string) => {
-      try {
-        return repo.listSourceIds(projectId).includes(id);
-      } catch {
-        return false;
-      }
-    };
     for (const row of indexRows(key)) {
-      if (row.projectId !== pid && openSet.has(row.projectId) && !row.locked && exists(row.projectId, row.id)) {
+      if (row.projectId !== pid && openSet.has(row.projectId) && !row.locked && liveIds(row.projectId).has(row.id)) {
         return { projectId: row.projectId, sourceId: row.id, certainty: "certain" };
       }
     }
     if (!likely) return null;
-    const y = key.year && /^\d{4}$/u.test(key.year) ? Number(key.year) : null;
-    if (!key.title || !key.firstCreatorFamily || y === null) return null;
     for (const projectId of open) {
-      let rows: Array<{ id: string; title: string; creators_text: string; issued_year: string | null; doi: string | null }>;
-      try {
-        rows = deps.index
-          .prepare(
-            `SELECT id, title, creators_text, issued_year, doi FROM main.sources WHERE project_id = ? AND locked = 0 AND issued_year IN (?,?,?)
-             UNION ALL SELECT id, title, creators_text, issued_year, doi FROM temp.t_sources WHERE project_id = ? AND issued_year IN (?,?,?)`,
-          )
-          .all(projectId, String(y - 1), String(y), String(y + 1), projectId, String(y - 1), String(y), String(y + 1)) as typeof rows;
-      } catch {
-        debug("find: the index could not be asked");
-        return null;
-      }
-      const existing: Existing[] = rows
-        .filter((r) => r.title)
-        .map((r) => {
-          const family = r.creators_text.split(";")[0]!.split(",")[0]!.trim();
-          return {
-            sourceId: r.id,
-            sha256s: [],
-            title: r.title,
-            ...(family ? { firstCreatorFamily: family } : {}),
-            ...(r.issued_year ? { year: r.issued_year } : {}),
-            ...(r.doi ? { doi: r.doi } : {}),
-          };
-        });
-      const dup = findDuplicate(key, existing);
-      if (dup && exists(projectId, dup.sourceId)) return { projectId, sourceId: dup.sourceId, certainty: dup.certainty };
+      const live = liveIds(projectId);
+      const dup = findDuplicate(key, fuzzyRows(projectId, key).filter((e) => live.has(e.sourceId)));
+      if (dup) return { projectId, sourceId: dup.sourceId, certainty: dup.certainty };
     }
     return null;
+  }
+
+  /** A source made for this entry and not yet on its line (this run's creations, and those `resume` found), if it still exists. */
+  function madeFor(pid: string, eid: string): string | undefined {
+    const live = liveIds(pid);
+    const here = madeHere.get(eid);
+    if (here && live.has(here)) return here;
+    const found = runs.get(pid)?.adoptable.get(eid);
+    return found && live.has(found) ? found : undefined;
   }
 
   // ------------------------------------------------------------------------------------------------------------
   // The rules
 
-  /** Whether the project's rules allow making a record from a reference (null rules: refused). */
+  /** Whether the project's rules allow making a record from a reference. */
   function acquireAllowed(ctx: LookupContext): boolean {
     if (!ctx.policy) return false;
     const d = evaluate(ctx.policy, {
@@ -593,8 +639,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   // Completing an entry with a candidate: the duplicate check and the creation in one store turn.
 
   interface CompleteOpts {
-    method: "find-match" | "find-chosen";
-    confidence: number;
+    match: FindMatch;
     /** The entry must be as this says (else nothing is done and null returned). */
     expect: (e: FindEntry) => boolean;
     /** A likely duplicate does not stop it (the researcher said it is not the same work). */
@@ -606,13 +651,15 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   /** Inside a turn. Returns the entry as written, or null when the entry was not as expected (nothing written). */
-  async function completeIn(pid: string, eid: string, cand: WorkCandidate, o: CompleteOpts): Promise<FindEntry | null> {
+  async function completeIn(pid: string, eid: string, given: WorkCandidate, o: CompleteOpts): Promise<FindEntry | null> {
     const live = o.live ?? (() => !closed);
     if (!live()) return null;
     const cur = await current(pid, eid);
     if (!cur || !o.expect(cur)) return null;
+    // The candidate as the queue keeps it: what is checked, stored and made is one and the same (M2).
+    const cand = boundCandidate(given);
     const at = stamp();
-    const keep = { candidates: cur.candidates?.some((c) => c.id === cand.id) ? cur.candidates : [cand], chosen: cand.id };
+    const keep = { candidates: cur.candidates?.some((c) => c.id === cand.id) ? cur.candidates : [cand], chosen: cand.id, match: o.match };
     const settle = async (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = []) => {
       if (!live()) return null;
       const [w] = await write(pid, [evolve(cur, { ...keep, ...patch }, ["reason", "nextTryAt", ...drop], at)], "update");
@@ -620,11 +667,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     };
 
     // A source made for this entry already (a crash or a stop after its creation): adopted, never made twice.
-    const adopted = await madeFor(pid, eid);
+    const adopted = madeFor(pid, eid);
     if (adopted) return settle({ state: "record-complete", sourceId: adopted }, ["duplicateOf", "elsewhere"]);
 
     const key = keyOf(cand);
-    const dup = await matchHere(pid, key);
+    const dup = matchHere(pid, key);
     if (dup?.certainty === "certain") return settle({ state: "already", duplicateOf: dup.sourceId }, ["sourceId", "elsewhere"]);
     if (dup && !o.skipLikely) return settle({ state: "maybe-duplicate", duplicateOf: dup.sourceId }, ["sourceId", "elsewhere"]);
     if (!o.skipElsewhere && deps.checkEverything()) {
@@ -635,16 +682,18 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     if (!live()) return null;
 
     // The record: one source without a file, in one governed change (capture `reference_lookup` and store,
-    // evaluated and audited as `source.create`). Its provenance names this entry from its creation.
+    // evaluated and audited as `source.create`), under the project's own rules like every other import (R237 a).
+    // Its provenance names this entry from its creation.
+    const { identifiable, legalBasis } = await storeInputs(repo, pid, FIND_LEGAL_CATEGORY, deps.debug);
     const provenance: Provenance = {
       captureMethod: "reference_lookup",
       capturedAt: at,
       tool: { name: FIND_TOOL, version: VERSION },
       fileHashes: {},
-      identification: { method: o.method, confidence: o.confidence },
+      identification: { method: o.match.method, confidence: o.match.confidence },
       externalKeys: { [FIND_ENTRY_KEY]: eid },
-      legal: { status: "public" },
-      identifiable: false,
+      legal: { status: "unknown", ...(legalBasis ? { basis: legalBasis } : {}) },
+      identifiable,
     };
     const create = (collectionIds: string[], check?: () => Promise<void>) => {
       const draft = draftFor(cand, collectionIds);
@@ -680,54 +729,139 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       throw err;
     }
     madeHere.set(eid, sourceId);
-    runOf(pid).known?.keys.push({ ...key, sourceId } as Existing);
-    runOf(pid).known?.made.set(eid, sourceId);
     seam(runnerSeams.afterCreate);
-    // Stopped meanwhile: the record stands and the entry stays "looking-up"; resume adopts it.
+    // Stopped meanwhile: the record stands and the entry stays "looking-up"; this run (madeHere) or the next
+    // resume (the source records) adopts it.
     return settle({ state: "record-complete", sourceId }, ["duplicateOf", "elsewhere", ...(collectionGone ? (["collectionId"] as const) : [])]);
   }
 
   // ------------------------------------------------------------------------------------------------------------
   // The runner's own work on one entry.
 
+  /** Is this error one that stops all work for the project (nothing can be written)? Acts on it if so. */
+  async function projectLevel(pid: string, err: unknown): Promise<boolean> {
+    if (err instanceof ProjectLockedError || err instanceof RecoveryPendingError) {
+      stopRun(pid);
+      return true;
+    }
+    if (err instanceof FindQueueUnreadableError) {
+      block(pid, "queue-unreadable");
+      return true;
+    }
+    if (err instanceof ReadOnlyLibraryError) {
+      block(pid, "read-only");
+      return true;
+    }
+    if (err instanceof PolicyDeniedError && (await projectPolicy(repo, pid).catch(() => null)) === null) {
+      block(pid, "rules-unreadable");
+      return true;
+    }
+    return false;
+  }
+
   async function work(pid: string, eid: string, gen: number): Promise<void> {
     const live = () => alive(pid, gen);
     const r = runOf(pid);
-    const entry = await current(pid, eid);
+    let entry: FindEntry | undefined;
+    try {
+      entry = await current(pid, eid);
+    } catch (err) {
+      if (!(await projectLevel(pid, err))) debug(`find: the queue could not be read (${errName(err)})`);
+      return;
+    }
     if (!live() || !entry || entry.state !== "looking-up") return;
     if (entry.nextTryAt && Date.parse(entry.nextTryAt) > now().getTime()) {
       later(pid, eid, entry.nextTryAt);
       return;
     }
+    const at0 = entry;
+
     /** Writes `patch` on the entry in a turn, if it is still the version this work started from. */
-    const finish = (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = []) =>
-      turn(pid, async () => {
-        if (!live()) return null;
+    const finish = async (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = []) =>
+      (await inTurn(r, pid, live, async () => {
         const cur = await current(pid, eid);
-        if (!cur || !sameVersion(cur, entry)) return null;
+        if (!cur || !sameVersion(cur, at0)) return null;
         const [w] = await write(pid, [evolve(cur, patch, drop, stamp())], "update");
         return w!;
-      });
+      })) ?? null;
 
+    /** No answer this time: tried again after the next delay, then "failed" with `code`. */
+    const tryLater = async (code: FindReasonCode) => {
+      const attempts = at0.attempts + 1;
+      const delay = FIND_RETRY_DELAYS_MS[attempts - 1];
+      if (delay === undefined) {
+        await finish({ state: "failed", attempts, reason: { code } }, ["nextTryAt"]);
+        return;
+      }
+      const at = new Date(now().getTime() + delay).toISOString();
+      const w = await finish({ attempts, nextTryAt: at });
+      if (w && live()) later(pid, eid, at);
+    };
+
+    try {
+      await workOn(pid, eid, at0, r, live, finish, tryLater);
+    } catch (err) {
+      if (err instanceof Abandoned || !live()) return;
+      if (err instanceof Error && err.name === "SimulatedCrash" && process.env.NODE_ENV === "test") {
+        // Tests only (R47): the process "died" here. Nothing more is done or written by this runner.
+        debug(`find: ${err.name}`);
+        closed = true;
+        for (const id of runs.keys()) stopRun(id);
+        return;
+      }
+      if (await projectLevel(pid, err)) return;
+      // Anything not foreseen: the entry says so (R237 c), with a code of its own; the error's kind goes to the note only.
+      debug(`find: unexpected failure of an entry's lookup (${errName(err)})`);
+      try {
+        await finish({ state: "failed", reason: { code: "unexpected" } }, ["nextTryAt"]);
+      } catch (err2) {
+        if (!(err2 instanceof Abandoned) && !(await projectLevel(pid, err2))) debug(`find: the failure could not be written (${errName(err2)})`);
+      }
+    }
+  }
+
+  async function workOn(
+    pid: string,
+    eid: string,
+    entry: FindEntry,
+    r: Run,
+    live: () => boolean,
+    finish: (patch: Partial<FindEntry>, drop?: Array<keyof FindEntry>) => Promise<FindEntry | null>,
+    tryLater: (code: FindReasonCode) => Promise<void>,
+  ): Promise<void> {
     // A source already made for this entry (a crash or a stop between its creation and its line): adopted
     // before anything is asked.
-    const adopted = await turn(pid, async () => {
-      if (!live()) return true;
-      const sid = await madeFor(pid, eid);
-      if (!sid) return false;
-      const cur = await current(pid, eid);
-      if (cur && sameVersion(cur, entry)) await write(pid, [evolve(cur, { state: "record-complete", sourceId: sid }, ["reason", "nextTryAt"], stamp())], "update");
-      return true;
-    });
-    if (adopted) return;
+    if (madeFor(pid, eid)) {
+      await inTurn(r, pid, live, async () => {
+        const sid = madeFor(pid, eid);
+        const cur = await current(pid, eid);
+        if (sid && cur && sameVersion(cur, entry)) await write(pid, [evolve(cur, { state: "record-complete", sourceId: sid }, ["reason", "nextTryAt"], stamp())], "update");
+      });
+      return;
+    }
 
-    const ctx = await lookupContextFor(repo, pid, http, deps.debug ? { debug: deps.debug } : {});
+    const ctx = await guard(r, lookupContextFor(repo, pid, http, deps.debug ? { debug } : {}));
     if (!live()) return;
+    if (!ctx.policy) {
+      // Rules that cannot be read: nothing is asked, and nothing can be written (the queue is governed too).
+      block(pid, "rules-unreadable");
+      return;
+    }
     if (!acquireAllowed(ctx)) {
       await finish({ state: "failed", reason: RULES }, ["nextTryAt"]);
       return;
     }
-    const s = await deps.settings();
+    let s: SearchSettings;
+    try {
+      s = await guard(r, deps.settings(), FIND_SETTINGS_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof TimedOut) {
+        debug("find: the search settings did not answer in time");
+        await tryLater("unexpected");
+        return;
+      }
+      throw err;
+    }
     if (!live()) return;
     const on = s.record.filter((x) => x.on && (x.id === "crossref" || x.id === "openalex")).map((x) => x.id as SearchSource);
     if (!on.length) {
@@ -744,53 +878,53 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       await finish({ state: "not-found" }, ["nextTryAt", "reason"]);
       return;
     }
-    const search = searchWorks(ref, ctx, { sources });
-    search.catch(() => {});
-    const res = await Promise.race([search, r.stopSignal.then((): typeof STOPPED => STOPPED)]);
+    let res: Awaited<ReturnType<typeof searchWorks>>;
+    try {
+      res = await guard(r, searchWorks(ref, ctx, { sources }), FIND_LOOKUP_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof TimedOut) {
+        debug("find: a search did not answer in time");
+        await tryLater("unreachable");
+        return;
+      }
+      throw err;
+    }
     // A late answer (after a stop or a lock) is not acted on.
-    if (res === STOPPED || !live()) return;
+    if (!live()) return;
 
     const failed = sources.filter((x) => res.notes.includes(`${x}-failed`));
     const budget = sources.includes("openalex") && res.notes.includes("openalex-budget");
     const answered = sources.length - failed.length - (budget ? 1 : 0);
+    /** Every source asked answered: the list is complete (one source left by the rules or the settings counts). */
+    const complete = failed.length === 0 && !budget;
     const decision = decideMatch(ref, res.candidates);
-    if (decision.kind === "none" && (failed.length > 0 || answered === 0)) {
-      // Nobody (or not everybody) answered: tried again later, then "failed".
-      const attempts = entry.attempts + 1;
-      const delay = FIND_RETRY_DELAYS_MS[attempts - 1];
-      if (delay === undefined) {
-        await finish({ state: "failed", attempts, reason: { code: failed.length || !budget ? "unreachable" : "budget" } }, ["nextTryAt"]);
+    if (decision.kind === "none" && !complete) {
+      if (answered === 0 || failed.length > 0) {
+        await tryLater(failed.length || !budget ? "unreachable" : "budget");
         return;
       }
-      const at = new Date(now().getTime() + delay).toISOString();
-      const w = await finish({ attempts, nextTryAt: at });
-      if (w && live()) later(pid, eid, at);
-      return;
     }
     if (decision.kind === "none") {
       await finish({ state: "not-found" }, ["nextTryAt", "reason", "candidates"]);
       return;
     }
-    if (decision.kind === "choose") {
+    if (decision.kind === "choose" || !complete) {
+      // Several works fit; or the app could be sure only on a partial answer (another edition may be in the part
+      // that did not come): the researcher chooses (M4).
       const byId = new Map(res.candidates.map((c) => [c.id, c]));
-      const candidates = decision.ids.map((id) => byId.get(id)!).filter(Boolean);
+      const ids = decision.kind === "choose" ? decision.ids : res.candidates.map((c) => c.id);
+      const candidates = ids.map((id) => byId.get(id)!).filter(Boolean);
       await finish({ state: "choose", candidates }, ["nextTryAt", "reason"]);
       return;
     }
     const cand = res.candidates.find((c) => c.id === decision.id)!;
-    await turn(pid, async () => {
-      try {
-        await completeIn(pid, eid, cand, {
-          method: "find-match",
-          confidence: scoreCandidate(ref, cand).score,
-          expect: (cur) => sameVersion(cur, entry),
-          live,
-        });
-      } catch (err) {
-        if (err instanceof PolicyDeniedError) return;
-        throw err;
-      }
-    });
+    await inTurn(r, pid, live, () =>
+      completeIn(pid, eid, cand, {
+        match: { method: "find-match", confidence: scoreCandidate(ref, cand).score },
+        expect: (cur) => sameVersion(cur, entry),
+        live,
+      }),
+    );
   }
 
   // ------------------------------------------------------------------------------------------------------------
@@ -827,11 +961,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       added.push({ id: newId(), projectId, ...(collectionId ? { collectionId } : {}), typed: ref.text, state: "looking-up", createdAt: at, updatedAt: at, attempts: 0 });
     }
     const written = await write(projectId, added, "add");
-    const r = runOf(projectId);
-    if (r.stopped) {
-      r.gen++;
-      restart(r);
-    }
+    // After `stop(projectId)` nothing runs until `resume` (M1): enqueue does nothing for a stopped run.
     for (const e of written) enqueue(projectId, e.id);
     return { added: written, mergedLines };
   }
@@ -854,7 +984,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       }
       const cand = cur.candidates?.find((c) => c.id === candidateId);
       if (!cand) throw new FindEntryStateError();
-      const done = await completeIn(projectId, entryId, cand, { method: "find-chosen", confidence: 1, expect: (e) => sameVersion(e, cur) });
+      const done = await completeIn(projectId, entryId, cand, { match: { method: "find-chosen", confidence: 1 }, expect: (e) => sameVersion(e, cur) });
       if (!done) throw new FindEntryStateError();
       return done;
     });
@@ -873,12 +1003,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       }
       const cand = cur.candidates?.find((c) => c.id === cur.chosen) ?? cur.candidates?.[0];
       if (!cand) throw new FindEntryStateError();
-      const done = await completeIn(projectId, entryId, cand, {
-        method: cur.chosen && cur.candidates!.length > 1 ? "find-chosen" : "find-match",
-        confidence: 1,
-        expect: (e) => sameVersion(e, cur),
-        skipLikely: true,
-      });
+      // The researcher answered a duplicate question: the match is what it was (M3).
+      const done = await completeIn(projectId, entryId, cand, { match: matchOf(cur, cand), expect: (e) => sameVersion(e, cur), skipLikely: true });
       if (!done) throw new FindEntryStateError();
       return done;
     });
@@ -893,12 +1019,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       if (!cur.elsewhere || (cur.state !== "already" && cur.state !== "maybe-duplicate")) throw new FindEntryStateError();
       const cand = cur.candidates?.find((c) => c.id === cur.chosen) ?? cur.candidates?.[0];
       if (!cand) throw new FindEntryStateError();
-      const done = await completeIn(projectId, entryId, cand, {
-        method: "find-chosen",
-        confidence: 1,
-        expect: (e) => sameVersion(e, cur),
-        skipElsewhere: true,
-      });
+      const done = await completeIn(projectId, entryId, cand, { match: matchOf(cur, cand), expect: (e) => sameVersion(e, cur), skipElsewhere: true });
       if (!done) throw new FindEntryStateError();
       return done;
     });
@@ -915,16 +1036,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       cancelLater(projectId, entryId);
       const [next] = await write(
         projectId,
-        [evolve(cur, { state: "looking-up", attempts: 0 }, ["reason", "nextTryAt", "candidates", "chosen", "duplicateOf", "elsewhere"], stamp())],
+        [evolve(cur, { state: "looking-up", attempts: 0 }, ["reason", "nextTryAt", "candidates", "chosen", "duplicateOf", "elsewhere", "match"], stamp())],
         "update",
       );
       return next!;
     });
-    const r = runOf(projectId);
-    if (r.stopped) {
-      r.gen++;
-      restart(r);
-    }
     enqueue(projectId, entryId);
     return w;
   }
@@ -952,21 +1068,48 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       return; // not a project of this library
     }
     if (!unlocked) return;
+    blocked.delete(projectId);
     const r = runOf(projectId);
+    r.signalStop(); // the previous generation's work is let go at once
     r.gen++;
-    restart(r);
-    r.known = undefined;
+    let signalStop!: () => void;
+    r.stopSignal = new Promise<void>((res) => (signalStop = res));
+    r.signalStop = signalStop;
+    r.stopped = false;
+    r.adoptable = new Map();
     const gen = r.gen;
     const p = (async () => {
-      const q = await readFindQueue(core, projectId);
+      if ((await projectPolicy(repo, projectId)) === null) {
+        if (alive(projectId, gen)) block(projectId, "rules-unreadable");
+        return;
+      }
+      const q = await readFindQueueIn(repo, projectId);
       if (!alive(projectId, gen)) return;
-      for (const e of q.values()) {
-        if (e.state !== "looking-up") continue;
-        if (e.nextTryAt && Date.parse(e.nextTryAt) > now().getTime()) later(projectId, e.id, e.nextTryAt);
+      const waiting = [...q.values()].filter((e) => e.state === "looking-up");
+      if (!waiting.length) return;
+      // Sources made for an entry whose line was never written (a crash or a stop in between): read once here,
+      // outside any store turn, never per entry.
+      const want = new Set(waiting.map((e) => e.id));
+      for (const id of repo.listSourceIds(projectId)) {
+        if (!alive(projectId, gen)) return;
+        try {
+          const s = await repo.getSourceRecord(projectId, id);
+          const tag = s.provenance.externalKeys?.[FIND_ENTRY_KEY];
+          if (tag && want.has(tag) && s.provenance.captureMethod === "reference_lookup" && s.provenance.tool.name === FIND_TOOL) r.adoptable.set(tag, id);
+        } catch (err) {
+          if (err instanceof ProjectLockedError) throw err;
+          // an unreadable source cannot be adopted
+        }
+      }
+      if (!alive(projectId, gen)) return;
+      for (const e of waiting) {
+        if (e.nextTryAt && Date.parse(e.nextTryAt) > now().getTime() && !r.adoptable.has(e.id)) later(projectId, e.id, e.nextTryAt);
         else enqueue(projectId, e.id);
       }
     })()
-      .catch((err: unknown) => failedUnexpectedly(projectId, err))
+      .catch(async (err: unknown) => {
+        if (!(await projectLevel(projectId, err))) debug(`find: the queue could not be resumed (${errName(err)})`);
+      })
       .finally(() => inflight.delete(p));
     inflight.add(p);
   }
@@ -978,7 +1121,13 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function stopAll(): Promise<void> {
     closed = true;
     for (const pid of runs.keys()) stopRun(pid);
-    await Promise.allSettled([...inflight]);
+    let h: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<void>((res) => {
+      h = setTimeout(res, FIND_STOP_SETTLE_MS);
+      h.unref?.();
+    });
+    await Promise.race([Promise.allSettled([...inflight]).then(() => undefined), bound]);
+    if (h) clearTimeout(h);
   }
 
   async function elsewhere(projectId: string, entryId: string): Promise<{ projectId: string; sourceId: string } | null> {
@@ -993,8 +1142,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   function lockedNotChecked(): number {
-    return repo.listProjects().filter((p) => !repo.isUnlocked(p.id)).length;
+    let on = false;
+    try {
+      on = deps.checkEverything();
+    } catch {
+      on = false;
+    }
+    return on ? otherProjects(null).locked : 0;
   }
 
-  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resume, stop, stopAll, elsewhere, lockedNotChecked };
+  function stoppedFor(projectId: string): FindStoppedFor | null {
+    if (readOnly()) return { code: "read-only" };
+    return blocked.get(projectId) ?? null;
+  }
+
+  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor };
 }

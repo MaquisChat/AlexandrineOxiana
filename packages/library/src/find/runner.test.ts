@@ -1,4 +1,6 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createBulkImport } from "../import/bulk/index.js";
+import { bibtexAdapter } from "../import/refman.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_GOVERNANCE, findDuplicate, newId, type Project, type SourceDraft } from "@ao/core";
@@ -16,12 +18,15 @@ import type { Repo } from "../repo/repo.js";
 import type { RepoCore } from "../repo/state.js";
 import { SimulatedCrash, openTestRepo, seams } from "../repo/testing.js";
 import { parseReference } from "./reference.js";
-import { decideMatch, searchWorks } from "./search.js";
+import { decideMatch, scoreCandidate, searchWorks } from "./search.js";
 import { FindQueueFullError, appendFindEntries, readFindQueue } from "./queue-store.js";
 import {
   FIND_CONCURRENCY,
   FIND_ENTRY_KEY,
+  FIND_LOOKUP_TIMEOUT_MS,
   FIND_RETRY_DELAYS_MS,
+  FIND_SETTINGS_TIMEOUT_MS,
+  FIND_STOP_SETTLE_MS,
   FIND_TOOL,
   FindEntryStateError,
   createFindRunner,
@@ -56,7 +61,11 @@ let runners: FindRunner[];
 let notes: string[];
 let changes: Array<{ projectId: string; entryId: string; state: FindState }>;
 let settings: SearchSettings;
+/** What `deps.settings()` does (default: answers `settings`). */
+let settingsFn: () => Promise<SearchSettings>;
 let everything: boolean;
+/** What `deps.checkEverything()` does (default: answers `everything`). */
+let everythingFn: () => boolean;
 /** Every search request: the service and the words it was sent. */
 let asked: Array<{ service: "crossref" | "openalex"; text: string }>;
 /** What each service answers for a text (default: nothing found). */
@@ -184,6 +193,8 @@ beforeEach(async () => {
   asked = [];
   answers = new Map();
   settings = DEFAULT_SEARCH_SETTINGS;
+  settingsFn = async () => settings;
+  everythingFn = () => everything;
   everything = false;
   mockServices();
 });
@@ -204,8 +215,8 @@ function runner(extra: Partial<FindRunnerDeps> = {}): FindRunner {
     repo,
     index: handle.db,
     http,
-    settings: async () => settings,
-    checkEverything: () => everything,
+    settings: () => settingsFn(),
+    checkEverything: () => everythingFn(),
     now: () => new Date(timers.now),
     onChange: (e) => changes.push(e),
     timers,
@@ -273,8 +284,9 @@ const auditText = (p: Project) => everythingUnder(join(lib.root, p.folder, "audi
 const txnMarkers = async () => (await readdir(join(lib.root, ".tmp")).catch(() => [] as string[])).filter((n) => /^txn-.*\.json$/u.test(n));
 
 /** A source made in the project as another way in would make it (a drag-and-drop import: its own duplicate check in its turn). */
-async function importLikeAttach(p: Project, w: Work): Promise<void> {
+async function importLikeAttach(p: Project, w: Work, holdInTurn?: () => Promise<void>): Promise<void> {
   await serialStore(repo, p.id, async () => {
+    await holdInTurn?.();
     const keys = [];
     for (const id of repo.listSourceIds(p.id)) {
       const s = await repo.getSourceRecord(p.id, id);
@@ -522,22 +534,50 @@ describe("one work, one source: under every race", () => {
     expect(states).toEqual(["already", "record-complete"]);
   });
 
-  it("an entry and a drag-and-drop import of the same DOI at the same moment: one source, and the entry tells the truth", async () => {
-    for (let round = 0; round < 3; round++) {
-      know(LINE, cr(ZORBLATT));
-      const p = await project();
-      const r = runner();
-      const [{ added }] = await Promise.all([r.add(p.id, [LINE]), importLikeAttach(p, ZORBLATT)]);
-      await settled(p, added[0]!.id);
-      const sources = await sourcesOf(p);
-      expect(sources).toHaveLength(1);
-      const e = (await entryOf(p, added[0]!.id))!;
-      if (e.state === "already") expect(e.duplicateOf).toBe(sources[0]!.source.id);
-      else {
-        expect(e.state).toBe("record-complete");
-        expect(e.sourceId).toBe(sources[0]!.source.id);
-      }
-    }
+  it("an import holding the store turn while the entry's answer comes: the import makes the source, the entry says Already (M6)", async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    let releaseImport!: () => void;
+    const importHeld = new Promise<void>((res) => (releaseImport = res));
+    let inTurn = false;
+    // The import takes the turn first and holds it (as an import does while it copies a file).
+    const imported = importLikeAttach(p, ZORBLATT, async () => {
+      inTurn = true;
+      await importHeld;
+    });
+    await until(() => inTurn, "the import to hold the turn");
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup");
+    await new Promise((res) => setTimeout(res, 50)); // the entry's answer is in and its completion waits for the turn
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
+    releaseImport();
+    await imported;
+    await settled(p, added[0]!.id);
+    const sources = await sourcesOf(p);
+    expect(sources).toHaveLength(1);
+    expect(sources[0]!.source.provenance.captureMethod).toBe("manual_upload");
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "already", duplicateOf: sources[0]!.source.id });
+  });
+
+  it("an import that starts while the entry is creating its record: the entry makes the source, the import sees it (M6)", async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    let creating!: () => void;
+    const atCreation = new Promise<void>((res) => (creating = res));
+    // Inside the runner's turn, just before the creation, the import of the same DOI starts (from outside that turn:
+    // the store's queue is re-entrant for work started inside a turn).
+    runnerSeams.beforeCreate = () => creating();
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await atCreation;
+    const imported = importLikeAttach(p, ZORBLATT);
+    await imported;
+    await settled(p, added[0]!.id);
+    const sources = await sourcesOf(p);
+    expect(sources).toHaveLength(1);
+    expect(sources[0]!.source.provenance.captureMethod).toBe("reference_lookup");
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "record-complete", sourceId: sources[0]!.source.id });
   });
 
   it("choose pressed twice: one source", async () => {
@@ -824,7 +864,7 @@ describe("the rules decide, and fail closed; settings only narrow", () => {
     await writeFile(join(lib.root, p.folder, "governance.yaml"), "acquireMethods: [downloader]\n: : not yaml\n");
     const r = runner();
     r.resume(p.id);
-    await until(() => notes.length > 0, "the refusal");
+    await until(() => r.stoppedFor(p.id) !== null, "the refusal");
     await new Promise((res) => setTimeout(res, 50));
     expect(gated.sent).toEqual([]);
     expect(await sourcesOf(p)).toEqual([]);
@@ -877,7 +917,8 @@ describe("failures are told truthfully and retried politely", () => {
     const r = runner();
     const { added } = await r.add(p.id, [LINE]);
     const id = added[0]!.id;
-    await until(async () => (await entryOf(p, id))?.attempts === 1, "the first failure");
+    // The entry's line is visible a moment before its retry timer is set: wait for both.
+    await until(async () => (await entryOf(p, id))?.attempts === 1 && timers.pending.size === 1, "the first failure");
     let e = (await entryOf(p, id))!;
     expect(e.state).toBe("looking-up");
     expect(e.nextTryAt).toBe(new Date(timers.now + FIND_RETRY_DELAYS_MS[0]!).toISOString());
@@ -887,7 +928,8 @@ describe("failures are told truthfully and retried politely", () => {
       await new Promise((res) => setTimeout(res, 30));
       expect(asked.length).toBe(before);
       timers.advance(1);
-      await until(async () => (await entryOf(p, id))!.attempts === i + 2, `attempt ${i + 2}`);
+      const last = i === FIND_RETRY_DELAYS_MS.length - 1;
+      await until(async () => (await entryOf(p, id))!.attempts === i + 2 && timers.pending.size === (last ? 0 : 1), `attempt ${i + 2}`);
     }
     e = (await entryOf(p, id))!;
     expect(e).toMatchObject({ state: "failed", reason: { code: "unreachable" } });
@@ -901,7 +943,30 @@ describe("failures are told truthfully and retried politely", () => {
     expect((await entryOf(p, id))!.state).toBe("record-complete");
   });
 
-  it("one service failing does not fail an entry that still got candidates", async () => {
+  it("one service failing does not fail an entry that still got candidates, but a partial answer never completes a record by itself: Choose (M4)", async () => {
+    know(LINE, cr(ZORBLATT), "fail");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e.state).toBe("choose");
+    expect(e.candidates!.map((c) => c.identifiers.doi)).toEqual([ZORBLATT.doi]);
+    expect(e.reason).toBeUndefined();
+    expect(await sourcesOf(p)).toEqual([]);
+  });
+
+  it("the only source the rules leave answered: the list is complete, and a sure match completes the record (M4)", async () => {
+    know(LINE, cr(ZORBLATT), "fail");
+    const p = await project({ gov: GOV().replace("[crossref, openalex]", "[crossref]") });
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
+  });
+
+  it("the only source the settings leave answered: the list is complete (M4)", async () => {
+    settings = { record: DEFAULT_SEARCH_SETTINGS.record.map((s) => (s.id === "openalex" ? { ...s, on: false } : s)) };
     know(LINE, cr(ZORBLATT), "fail");
     const p = await project();
     const r = runner();
@@ -926,7 +991,10 @@ describe("failures are told truthfully and retried politely", () => {
     const releases = lines.map((l) => gated.hold(parseReference(l)!.text));
     const r = runner();
     await r.add(a.id, lines);
-    await until(() => asked.filter((x) => x.service === "crossref").length >= 0, "start");
+    // The cap (M5): with fifty lines waiting, exactly two lines are being looked up.
+    await until(() => new Set(gated.sent.filter((x) => x.service === "openalex").map((x) => x.text)).size >= 2, "two lookups");
+    await new Promise((res) => setTimeout(res, 100));
+    expect(new Set(gated.sent.map((x) => x.text)).size).toBe(FIND_CONCURRENCY);
     know("Lindqvist, Rivers of Memory", cr());
     await r.add(b.id, ["Lindqvist, Rivers of Memory"]);
     // B's line is asked as soon as a place frees, before A's third line.
@@ -1024,5 +1092,351 @@ describe("stopping is immediate and clean", () => {
     await new Promise((res) => setTimeout(res, 50));
     expect(await readFile(join(lib.root, p.folder, "find", "queue.jsonl"), "utf8")).toBe("not json at all\n");
     expect(asked).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fix round 1 (R237)
+
+const GDPR = (basis: boolean) => `identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+encryption:
+  atRest: optional
+consent:
+  requireLegalBasis: true
+  defaultLegalBasis:
+${basis ? "    refman-import: art6-1-e\n    reference-lookup: art6-1-e\n" : "    other-category: art6-1-a\n"}processing:
+  metadata_lookup: [crossref, openalex]
+`;
+const BIB = `@article{quill1999,
+  title = {Zorblatt Grammar of Habitus},
+  author = {Quillfeather, Mirabel},
+  year = {1999},
+  journal = {Journal of Invented Studies}
+}
+`;
+
+async function bibtexImport(p: Project): Promise<{ refused: boolean; sources: Awaited<ReturnType<typeof sourcesOf>> }> {
+  const bib = join(tmp, `record-${p.id}.bib`);
+  await writeFile(bib, BIB);
+  const bulk = createBulkImport({ repo, http, index: handle });
+  let refused = false;
+  try {
+    const h = await bulk.startBatch(p.id, bibtexAdapter(bib));
+    const r = await h.done;
+    refused = r.counts.failed > 0 || r.counts.created + r.counts.needsReview === 0;
+  } catch {
+    refused = true;
+  }
+  return { refused, sources: await sourcesOf(p) };
+}
+const plainProvenance = (captureMethod: "manual_upload" | "browser_capture" = "manual_upload") => ({
+  captureMethod,
+  capturedAt: new Date(NOW).toISOString(),
+  tool: { name: "t", version: "0" },
+  fileHashes: {},
+  legal: { status: "unknown" as const },
+  identifiable: false,
+});
+
+describe("R237 (a): a record made by Find and acquire is stored under the project's own rules, like every other import", () => {
+  it("a GDPR-style project with identifiable data: the find record gets what a record-only BibTeX import of the same work gets", async () => {
+    know(LINE, cr(ZORBLATT));
+    const viaBib = await project({ gov: GDPR(true) });
+    const viaFind = await project({ gov: GDPR(true) });
+    const bib = await bibtexImport(viaBib);
+    expect(bib.refused).toBe(false);
+    const r = runner();
+    const { added } = await r.add(viaFind.id, [LINE]);
+    await settled(viaFind, added[0]!.id);
+    expect((await entryOf(viaFind, added[0]!.id))!.state).toBe("record-complete");
+    const [a] = bib.sources;
+    const [b] = await sourcesOf(viaFind);
+    expect(b!.source.provenance.identifiable).toBe(a!.source.provenance.identifiable);
+    expect(b!.source.provenance.identifiable).toBe(true);
+    expect(b!.source.provenance.legal).toEqual(a!.source.provenance.legal);
+    expect(b!.source.provenance.legal).toEqual({ status: "unknown", basis: "art6-1-e" });
+  });
+
+  it("where such an import is refused (identifiable data, no legal basis), the entry is failed by the rules and nothing is created", async () => {
+    know(LINE, cr(ZORBLATT));
+    const viaBib = await project({ gov: GDPR(false) });
+    const viaFind = await project({ gov: GDPR(false) });
+    const bib = await bibtexImport(viaBib);
+    expect(bib.refused).toBe(true);
+    expect(bib.sources).toEqual([]);
+    const r = runner();
+    const { added } = await r.add(viaFind.id, [LINE]);
+    await settled(viaFind, added[0]!.id);
+    expect((await entryOf(viaFind, added[0]!.id))!).toMatchObject({ state: "failed", reason: { code: "not-allowed", by: "rules" } });
+    expect(await sourcesOf(viaFind)).toEqual([]);
+  });
+});
+
+describe("R237 (b): nothing the runner waits on can hold it for ever", () => {
+  it("settings that never answer free their place after the time limit; the other place keeps working; stop and stopAll settle; the library can close", async () => {
+    const lines = ["Okafor, Never answered one", "Okafor, Never answered two", "Okafor, Third line goes on"];
+    let calls = 0;
+    settingsFn = () => (++calls <= 2 ? new Promise<SearchSettings>(() => {}) : Promise.resolve(settings));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, lines);
+    await until(() => calls === 2, "both places to wait on the settings");
+    await new Promise((res) => setTimeout(res, 50));
+    expect(gated.sent).toEqual([]);
+    expect((await entryOf(p, added[2]!.id))!.state).toBe("looking-up");
+    timers.advance(FIND_SETTINGS_TIMEOUT_MS);
+    // The third entry gets a place and goes on; the two that waited are tried again later.
+    await settled(p, added[2]!.id);
+    expect((await entryOf(p, added[2]!.id))!.state).toBe("not-found");
+    for (const a of added.slice(0, 2)) {
+      await until(async () => (await entryOf(p, a.id))!.attempts === 1, "the retry");
+      const e = (await entryOf(p, a.id))!;
+      expect(e.state).toBe("looking-up");
+      expect(e.nextTryAt).toBeDefined();
+    }
+    // Settings that never answer again: stop and stopAll still settle at once.
+    settingsFn = () => {
+      calls++;
+      return new Promise<SearchSettings>(() => {});
+    };
+    timers.advance(FIND_RETRY_DELAYS_MS[0]!);
+    await until(() => calls >= 5, "the retries to wait on the settings");
+    r.stop(p.id);
+    const t0 = Date.now();
+    await r.stopAll();
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(timers.pending.size).toBe(0);
+    handle.close();
+    await lib.close();
+    lib = await openLibrary(lib.root, mkDeps());
+    handle = new IndexHandle(lib.root);
+  });
+
+  it("a lookup that never answers frees its place after the time limit; the entry is retried; stopAll settles", async () => {
+    know(LINE, cr(ZORBLATT));
+    know("Lindqvist, Rivers of Memory", cr());
+    const p = await project();
+    gated.hold(parseReference(LINE)!.text, "openalex"); // never released
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await until(() => gated.sent.some((x) => x.service === "openalex"), "the lookup");
+    timers.advance(FIND_LOOKUP_TIMEOUT_MS);
+    await until(async () => (await entryOf(p, added[0]!.id))!.attempts === 1, "the retry");
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "looking-up" });
+    expect(await sourcesOf(p)).toEqual([]);
+    // The place is free: another line is looked up and settles.
+    const other = await r.add(p.id, ["Lindqvist, Rivers of Memory"]);
+    await settled(p, other.added[0]!.id);
+    // Retried and never answered again: stopAll settles at once.
+    const sentBefore = gated.sent.length;
+    timers.advance(FIND_RETRY_DELAYS_MS[0]!);
+    await until(() => gated.sent.length > sentBefore, "the retry's lookup");
+    const t0 = Date.now();
+    await r.stopAll();
+    expect(Date.now() - t0).toBeLessThan(1_000);
+  });
+
+  it(`stopAll settles within its bound (${FIND_STOP_SETTLE_MS} ms), even with the store's turn held by an import`, async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    let releaseImport!: () => void;
+    const held = new Promise<void>((res) => (releaseImport = res));
+    let inTurn = false;
+    const imported = importLikeAttach(p, { ...ZORBLATT, doi: "10.5555/ao.f4.other" }, async () => {
+      inTurn = true;
+      await held;
+    });
+    await until(() => inTurn, "the import to hold the turn");
+    const r = runner();
+    await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup");
+    await new Promise((res) => setTimeout(res, 50));
+    const t0 = Date.now();
+    await r.stopAll();
+    expect(Date.now() - t0).toBeLessThan(FIND_STOP_SETTLE_MS);
+    releaseImport();
+    await imported;
+    await new Promise((res) => setTimeout(res, 50));
+    expect((await sourcesOf(p)).map((s) => s.source.provenance.captureMethod)).toEqual(["manual_upload"]);
+  });
+});
+
+describe("R237 (c): no entry is left saying Looking it up after the runner gave up on it", () => {
+  it("settings() that reject: failed, unexpected; the error's text stays out of the entry; Try again starts afresh", async () => {
+    settingsFn = () => Promise.reject(new Error("SECRET-DETAIL-xq7 broke"));
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e).toMatchObject({ state: "failed", reason: { code: "unexpected" } });
+    expect(JSON.stringify(e)).not.toContain("SECRET-DETAIL");
+    expect(await readFile(join(lib.root, p.folder, "find", "queue.jsonl"), "utf8")).not.toContain("SECRET-DETAIL");
+    expect(notes.join("\n")).toContain("unexpected");
+    settingsFn = async () => settings;
+    await r.retry(p.id, e.id);
+    await settled(p, e.id);
+    expect((await entryOf(p, e.id))!.state).toBe("record-complete");
+  });
+
+  it("a check that throws in the store turn (checkEverything): failed, unexpected, nothing created", async () => {
+    everythingFn = () => {
+      throw new Error("boom");
+    };
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "failed", reason: { code: "unexpected" } });
+    expect(await sourcesOf(p)).toEqual([]);
+  });
+});
+
+describe("R237 (d): when nothing can be written for a project, the runner says so itself", () => {
+  it("rules that cannot be read: stoppedFor says rules-unreadable; nothing asked; resume after the rules are mended clears it", async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    const id = newId();
+    await appendFindEntries(coreOf(), p.id, [{ id, projectId: p.id, typed: LINE, state: "looking-up", createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), attempts: 0 }], "add");
+    const gov = await readFile(join(lib.root, p.folder, "governance.yaml"), "utf8");
+    await writeFile(join(lib.root, p.folder, "governance.yaml"), ": : not yaml\n");
+    const r = runner();
+    expect(r.stoppedFor(p.id)).toBeNull();
+    r.resume(p.id);
+    await until(() => r.stoppedFor(p.id) !== null, "the runner to say so");
+    expect(r.stoppedFor(p.id)).toEqual({ code: "rules-unreadable" });
+    expect(gated.sent).toEqual([]);
+    expect((await entryOf(p, id))!.state).toBe("looking-up");
+    await writeFile(join(lib.root, p.folder, "governance.yaml"), gov);
+    r.resume(p.id);
+    expect(r.stoppedFor(p.id)).toBeNull();
+    await settled(p, id);
+    expect((await entryOf(p, id))!.state).toBe("record-complete");
+  });
+
+  it("a queue that cannot be read: queue-unreadable; a read-only library: read-only", async () => {
+    const p = await project();
+    await mkdir(join(lib.root, p.folder, "find"), { recursive: true });
+    await writeFile(join(lib.root, p.folder, "find", "queue.jsonl"), "not json at all\n");
+    const r = runner();
+    r.resume(p.id);
+    await until(() => r.stoppedFor(p.id) !== null, "the runner to say so");
+    expect(r.stoppedFor(p.id)).toEqual({ code: "queue-unreadable" });
+    const q = await project();
+    const ro = await repoFor({ ...lib, mode: "read-only", readOnlyReason: "locked-by-other-device" });
+    const r2 = runner({ repo: ro });
+    r2.resume(q.id);
+    expect(r2.stoppedFor(q.id)).toEqual({ code: "read-only" });
+  });
+});
+
+describe("R237 (g): minors", () => {
+  it("M1: after stop, add writes the entry but starts no run until resume", async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    const r = runner();
+    r.stop(p.id);
+    const { added } = await r.add(p.id, [LINE]);
+    await new Promise((res) => setTimeout(res, 100));
+    expect(gated.sent).toEqual([]);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
+    r.resume(p.id);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
+  });
+
+  it("M2: a DOI of 250 characters is kept through Choose and on the record", async () => {
+    const long = `10.5555/${"x".repeat(242)}`;
+    const a: Work = { doi: long, title: "Zorblatt Grammar of Habitus", family: "Quillfeather", year: 1999 };
+    const b: Work = { doi: `${long.slice(0, -1)}y`, title: "Zorblatt Grammar of Habitus Revisited", family: "Quillfeather", year: 2001 };
+    know("Quillfeather, Zorblatt Grammar", cr(a, b));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, ["Quillfeather, Zorblatt Grammar"]);
+    await settled(p, added[0]!.id);
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e.state).toBe("choose");
+    const pick = e.candidates!.find((c) => c.identifiers.doi === long)!;
+    expect(pick).toBeDefined();
+    await r.choose(p.id, e.id, pick.id);
+    const [sf] = await sourcesOf(p);
+    expect(sf!.source.identifiers.doi).toBe(long);
+  });
+
+  it("M3: a sure match keeps find-match and its score when the researcher only answered a duplicate question or added it here as well", async () => {
+    const p = await project();
+    await repo.createSource(p.id, draftOf({ ...ZORBLATT, doi: undefined }), [], { provenance: plainProvenance() });
+    know(LINE, cr(ZORBLATT));
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("maybe-duplicate");
+    const asked1 = (await entryOf(p, added[0]!.id))!;
+    expect(asked1.match?.method).toBe("find-match");
+    const done = await r.confirmDuplicate(p.id, added[0]!.id, false);
+    const made = await repo.getSource(p.id, done.sourceId!);
+    // The score is the rule's own (it can be exactly 1 for a full title, an author and a year), kept as it was.
+    expect(made.source.provenance.identification).toEqual({ method: "find-match", confidence: asked1.match!.confidence });
+    expect(made.source.provenance.identification!.confidence).toBe(scoreCandidate(parseReference(LINE)!, asked1.candidates![0]!).score);
+
+    // Elsewhere, then "add it here as well".
+    const other = await project();
+    const q = await project();
+    know(LINE_2, cr(ZORBLATT));
+    await repo.createSource(other.id, draftOf(ZORBLATT), [], { provenance: plainProvenance() });
+    everything = true;
+    const second = await r.add(q.id, [LINE_2]);
+    await settled(q, second.added[0]!.id);
+    expect((await entryOf(q, second.added[0]!.id))!.elsewhere).toBe(true);
+    const here = await r.addHereAsWell(q.id, second.added[0]!.id);
+    const mine = await repo.getSource(q.id, here.sourceId!);
+    expect(mine.source.provenance.identification!.method).toBe("find-match");
+    expect(mine.source.provenance.identification!.confidence).toBe(scoreCandidate(parseReference(LINE_2)!, here.candidates![0]!).score);
+  });
+
+  it("M7: a likely duplicate made outside the store's turn (as a browser capture does) is seen by the next entry", async () => {
+    know(LINE, cr(ZORBLATT));
+    know("Okafor, Rivers of Memory", cr());
+    const p = await project();
+    const r = runner();
+    const first = await r.add(p.id, ["Okafor, Rivers of Memory"]);
+    await settled(p, first.added[0]!.id);
+    // Made directly, not in a store turn (as a browser capture is): no DOI, the same title, author and year.
+    await repo.createSource(p.id, draftOf({ ...ZORBLATT, doi: undefined }), [], { provenance: plainProvenance() });
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("maybe-duplicate");
+  });
+
+  it("M7: an edit that makes a source the same work is seen", async () => {
+    know(LINE, cr(ZORBLATT));
+    know("Okafor, Rivers of Memory", cr());
+    const p = await project();
+    await repo.createSource(p.id, draftOf({ ...ZORBLATT, doi: undefined }, "Something else entirely"), [], { provenance: plainProvenance() });
+    const r = runner();
+    const first = await r.add(p.id, ["Okafor, Rivers of Memory"]);
+    await settled(p, first.added[0]!.id);
+    const [s] = await sourcesOf(p);
+    await repo.updateSource(p.id, s!.source.id, { title: { variants: [{ lang: "en", kind: "original", value: ZORBLATT.title }] } });
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "maybe-duplicate", duplicateOf: s!.source.id });
+  });
+
+  it("M9: the defaults are frozen; lockedNotChecked is 0 while Check everything I have is off", async () => {
+    expect(Object.isFrozen(DEFAULT_SEARCH_SETTINGS)).toBe(true);
+    expect(Object.isFrozen(DEFAULT_SEARCH_SETTINGS.record)).toBe(true);
+    expect(Object.isFrozen(DEFAULT_SEARCH_SETTINGS.record[0])).toBe(true);
+    const other = await project({ encrypted: true });
+    repo.lockProject(other.id);
+    const r = runner();
+    everything = false;
+    expect(r.lockedNotChecked()).toBe(0);
+    everything = true;
+    expect(r.lockedNotChecked()).toBe(1);
   });
 });

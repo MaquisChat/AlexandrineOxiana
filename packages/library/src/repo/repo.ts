@@ -80,6 +80,8 @@ import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
 import { hasSettledCaptureEntries, hasUnlistedConflicts, readReviewEntries, reviewedAfterWithdrawal, type ReviewEntry } from "./review.js";
 import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegisterEntry } from "./watch-register.js";
+import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
+import type { FindEntry } from "../find/types.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
@@ -1299,6 +1301,21 @@ export function addWatchedFolderEntry(repo: Repo, projectId: string, options: un
 /** Package-internal (watched folders): removes a watch's record from project.json (governed, audited). */
 export function removeWatchedFolderEntry(repo: Repo, projectId: string, id: string): Promise<void> {
   return removeWatchedFolderRecord(cores.get(repo)!, projectId, id);
+}
+
+/** Package-internal (Find and acquire, R237 e): the project's queue, its live entries (see find/queue-store.ts). */
+export function readFindQueueIn(repo: Repo, projectId: string): Promise<Map<string, FindEntry>> {
+  return readFindQueue(cores.get(repo)!, projectId);
+}
+
+/** Package-internal (Find and acquire): the live entries and how many lines could not be read. */
+export function readFindQueueDetailedIn(repo: Repo, projectId: string): Promise<{ entries: Map<string, FindEntry>; unreadableLines: number }> {
+  return readFindQueueDetailed(cores.get(repo)!, projectId);
+}
+
+/** Package-internal (Find and acquire): one governed change of the queue (`project.find.add|update|remove`). */
+export function appendFindEntriesIn(repo: Repo, projectId: string, entries: FindEntry[], op: "add" | "update" | "remove"): Promise<void> {
+  return appendFindEntries(cores.get(repo)!, projectId, entries, op);
 }
 
 /**
