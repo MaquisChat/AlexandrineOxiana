@@ -79,6 +79,13 @@ export interface AttachDeps {
   debug?: (note: string) => void;
   /** Viewing proxies of located photos and videos (R83); default: the library's queue (proxyQueueFor, R85). */
   proxies?: ProxyQueue;
+  /**
+   * A watched folder (Task W2): asked for each file (the item, then each sidecar beside it) before a byte of
+   * it is read; false means its content is not on this computer, and reading it would download it. The item
+   * then fails with NOT_DOWNLOADED_REASON before its type is sniffed, and a sidecar is left out. Absent (drag
+   * and drop, Bulk Import): every file is read as before.
+   */
+  readable?: (path: string) => Promise<boolean>;
 }
 
 export interface Attach {
@@ -86,7 +93,10 @@ export interface Attach {
 }
 
 export const FOLDER_REASON = "Use Bulk Import for folders";
-const REASONS = {
+/** A file `readable` refused: its content is not on this computer (a cloud drive's online-only file). */
+export const NOT_DOWNLOADED_REASON = "Not downloaded to this Mac. It comes in once it is downloaded.";
+/** The plain reasons attach gives (callers tell them apart, e.g. the watched folder's file kinds). */
+export const ATTACH_REASONS = {
   missing: "The file could not be found or read.",
   notAFile: "Only files can be attached.",
   unsupported: "This kind of file cannot be attached. Attach PDFs, EPUB or Kindle books, Word documents, images, audio or video.",
@@ -96,6 +106,7 @@ const REASONS = {
   failed: "The file could not be attached.",
   ...ITEM_REASONS,
 };
+const REASONS = ATTACH_REASONS;
 
 /**
  * The sniffed (`file-type`) extensions attach accepts: documents and books, images (incl. camera
@@ -205,6 +216,9 @@ export function createAttach(deps: AttachDeps): Attach {
   }
   type Session = ReturnType<typeof session>;
 
+  /** True when `readable` is given and refuses `path` now (each open of the file asks it again). */
+  const notReadable = async (path: string) => !!deps.readable && !(await deps.readable(path).catch(() => false));
+
   const storeInputs = (projectId: string) => sharedStoreInputs(repo, projectId, undefined, deps.debug);
 
   type Stored = { ext: string; mime: string; kind: string };
@@ -216,10 +230,15 @@ export function createAttach(deps: AttachDeps): Attach {
     if (current.assets.some((a) => a.sha256 === sha256)) return { path, outcome: "duplicate", sourceId };
     // Media with GPS: location governance applies to the store (R54a).
     // Unreadable metadata counts as located (fail closed, R57); a thrown error is not swallowed.
-    const hasLocation = LOCATED_MEDIA.test(mime) && mayHaveLocation(mime, await extractMetadata(path, mime));
+    let hasLocation = false;
+    if (LOCATED_MEDIA.test(mime)) {
+      if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the metadata read
+      hasLocation = mayHaveLocation(mime, await extractMetadata(path, mime));
+    }
     const plan = locatedPlan(hasLocation, mime);
     const rule = locationRule();
     const { ext, kind } = stored;
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the copy
     await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, mime: stored.mime, label: addedLabel(kind, new Date()) }, "manual_upload", {
       hasLocation,
       refuse: rule.hook,
@@ -250,7 +269,12 @@ export function createAttach(deps: AttachDeps): Attach {
     const same = keys.find((k) => k.sha256s.includes(sha256));
     if (same) return { path, outcome: "duplicate", sourceId: same.sourceId };
 
-    const r = await resolveItem({ path, mime, sidecarPaths: await findSidecars(path) }, { projectId, patterns, lookup: await s.lookup() });
+    const sidecarPaths = await findSidecars(path, deps.readable);
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the metadata read (resolveItem's first step)
+    const r = await resolveItem(
+      { path, mime, sidecarPaths, ...(deps.readable ? { sidecarReadable: deps.readable } : {}) },
+      { projectId, patterns, lookup: await s.lookup() },
+    );
     const dup = findDuplicate(candidateKey(r, [sha256]), keys);
     if (dup?.certainty === "certain") return { path, outcome: "duplicate", sourceId: dup.sourceId };
     const reviewItem = reviewFor(r, dup);
@@ -267,6 +291,7 @@ export function createAttach(deps: AttachDeps): Attach {
     // condition (coarsen/strip) the viewing proxy is queued in the same change (R83).
     const plan = locatedPlan(r.hasLocation, mime);
     const rule = locationRule();
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the copy, perhaps long after the lookups
     const sf = await createSourceRefusing(repo, projectId, r.draft, [{ path, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind }], {
       provenance,
       fieldEvidence: r.fieldEvidence,
@@ -287,6 +312,12 @@ export function createAttach(deps: AttachDeps): Attach {
     if (!st) return failed(path, REASONS.missing);
     if (st.isDirectory()) return failed(path, FOLDER_REASON);
     if (!st.isFile()) return failed(path, REASONS.notAFile);
+    // Before the first byte is read (the type sniff below), and again before EACH later open (the hash, the
+    // metadata, the copy): a file that is not on this computer, or no longer as it was checked, is not read (A6).
+    // These opens (by file-type, the hash stream, the metadata worker, the copy, readSidecar) follow a symbolic link:
+    // they rely on the comparison made immediately before each (a link swapped in fails it); only the watched
+    // folder's own hash refuses a link outright (O_NOFOLLOW).
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON);
     let type: { ext: string; mime: string } | undefined;
     try {
       type = await fileTypeFromFile(path);
@@ -299,6 +330,7 @@ export function createAttach(deps: AttachDeps): Attach {
     if (toSourceId && !target) return failed(path, REASONS.noSource);
     const denied = await s.policy();
     if (denied) return failed(path, denied);
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the hash
     const sha256 = await sha256File(path);
     if (target) return ontoSource(projectId, path, target, type.mime, stored, sha256);
     return ontoLibrary(projectId, path, type.mime, stored, sha256, s);
