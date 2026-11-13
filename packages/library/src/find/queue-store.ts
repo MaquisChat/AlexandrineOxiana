@@ -47,6 +47,7 @@
  * line torn by an unclean stop (no newline after it); a read passes it by.
  */
 import { statSync } from "node:fs";
+import { Readable } from "node:stream";
 import * as fsp from "node:fs/promises";
 import { Creator, SourceType, isId } from "@ao/core";
 import { InvalidInputError } from "../repo/errors.js";
@@ -303,47 +304,72 @@ interface ScannedLine {
   entry: FindEntry | null;
 }
 
+/** A byte of blank space: the ONE definition of "blank" (a line of nothing but these is no line, however long). */
+const isSpaceByte = (b: number) => b === 0x20 || (b >= 0x09 && b <= 0x0d);
+
 /**
- * THE routine that reads and classifies the lines of the queue file, in order: used by the reader (`foldFile`)
- * and by compaction, so that they cannot disagree. A last line with no newline after it is a torn line: not
- * yielded. A line is never held in memory beyond `holdMax` bytes (then `text` is null); classification does not
- * depend on `holdMax`: a line over `RAW_LINE_MAX_BYTES` is unreadable and is not parsed.
+ * THE routine that reads and classifies the lines of the queue, in order, from a stream of chunks: used by the
+ * reader (`foldFile`), by compaction, and by compaction's check of what it built, so that none of them can
+ * disagree about what a line is. Nothing outside this routine decides that. A last line with no newline after it
+ * is a torn line: not yielded. A line of nothing but blank space (`isSpaceByte`) is no line at all, whatever its
+ * length and whatever `holdMax` is. A line is never held in memory beyond `holdMax` bytes (then `text` is null);
+ * classification does not depend on `holdMax`: a line over `RAW_LINE_MAX_BYTES` is unreadable and is not parsed.
  */
-async function* scanLines(abs: string, projectId: string, key: Uint8Array | null, holdMax: number): AsyncGenerator<ScannedLine> {
-  const fh = await fsp.open(abs, "r");
-  try {
-    let carry: Buffer[] = [];
-    let carryLen = 0;
-    let discarding = false;
-    const classify = (text: string | null, bytes: number): ScannedLine => ({ text, entry: text !== null && bytes <= RAW_LINE_MAX_BYTES ? parseLine(text, projectId, key) : null });
-    for await (const chunk of fh.createReadStream() as AsyncIterable<Buffer>) {
-      let start = 0;
-      for (;;) {
-        const nl = chunk.indexOf(0x0a, start);
-        if (nl < 0) {
-          if (!discarding) {
-            carryLen += chunk.length - start;
-            if (carryLen > holdMax) {
-              discarding = true;
-              carry = [];
-              carryLen = 0;
-            } else carry.push(chunk.subarray(start));
-          }
-          break;
+async function* scanChunks(source: AsyncIterable<Buffer>, projectId: string, key: Uint8Array | null, holdMax: number): AsyncGenerator<ScannedLine> {
+  let carry: Buffer[] = [];
+  let carryLen = 0;
+  let discarding = false;
+  let blank = true; // every byte of the line so far is blank space
+  const classify = (text: string | null, bytes: number): ScannedLine => ({ text, entry: text !== null && bytes <= RAW_LINE_MAX_BYTES ? parseLine(text, projectId, key) : null });
+  const looksBlank = (seg: Buffer) => {
+    if (!blank) return;
+    for (const b of seg) {
+      if (!isSpaceByte(b)) {
+        blank = false;
+        return;
+      }
+    }
+  };
+  for await (const chunk of source) {
+    let start = 0;
+    for (;;) {
+      const nl = chunk.indexOf(0x0a, start);
+      if (nl < 0) {
+        const seg = chunk.subarray(start);
+        looksBlank(seg);
+        if (!discarding) {
+          carryLen += seg.length;
+          if (carryLen > holdMax) {
+            discarding = true;
+            carry = [];
+            carryLen = 0;
+          } else carry.push(seg);
         }
-        const piece = chunk.subarray(start, nl);
+        break;
+      }
+      const piece = chunk.subarray(start, nl);
+      looksBlank(piece);
+      if (!blank) {
         if (discarding || carryLen + piece.length > holdMax) yield classify(null, Infinity);
         else {
           const bytes = Buffer.concat([...carry, piece]);
-          const text = bytes.toString("utf8");
-          if (text.trim()) yield classify(text, bytes.length);
+          yield classify(bytes.toString("utf8"), bytes.length);
         }
-        carry = [];
-        carryLen = 0;
-        discarding = false;
-        start = nl + 1;
       }
+      carry = [];
+      carryLen = 0;
+      discarding = false;
+      blank = true;
+      start = nl + 1;
     }
+  }
+}
+
+/** `scanChunks` over the queue file. */
+async function* scanLines(abs: string, projectId: string, key: Uint8Array | null, holdMax: number): AsyncGenerator<ScannedLine> {
+  const fh = await fsp.open(abs, "r");
+  try {
+    yield* scanChunks(fh.createReadStream() as AsyncIterable<Buffer>, projectId, key, holdMax);
   } finally {
     await fh.close();
   }
@@ -583,6 +609,26 @@ function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[]): P
   );
 }
 
+/**
+ * Compaction's check of what it built: scans `text` with the routine the reader uses and compares with what the
+ * reader saw. Returns what differs, or null when the new content holds exactly the live entries the reader saw
+ * (same ids, same serialised content) and every carried line, byte for byte, in the same order.
+ */
+async function checkBuilt(text: string, projectId: string, key: Uint8Array | null, folded: Folded, sameCounts: boolean, carriedLines: readonly string[]): Promise<string | null> {
+  if (!sameCounts) return "the lines counted differently";
+  const seen = new Map<string, string>();
+  const carried: string[] = [];
+  for await (const { text: t, entry } of scanChunks(Readable.from([Buffer.from(text, "utf8")]), projectId, key, CARRY_MAX_BYTES)) {
+    if (entry) seen.set(entry.id, JSON.stringify(entry));
+    else carried.push(t ?? "");
+  }
+  const live = liveOf(folded);
+  if (seen.size !== live.length) return "a different number of entries";
+  for (const e of live) if (seen.get(e.id) !== JSON.stringify(e)) return "an entry that differs";
+  if (carried.length !== carriedLines.length || carried.some((l, i) => l !== carriedLines[i])) return "lines carried over that differ";
+  return null;
+}
+
 /** THE rule: due when dead > live && dead >= 64, dead being the readable lines minus the live entries, whatever the file's size. */
 const compactionDue = (f: Folded): boolean => {
   const live = liveOf(f).length;
@@ -636,6 +682,7 @@ export async function compactFindQueue(core: RepoCore, projectId: string): Promi
         const key = seal ? seal.key : null;
         const out: string[] = [];
         const live: FindEntry[] = [];
+        const carriedLines: string[] = [];
         let carried = 0;
         let index = 0;
         // The same routine as the reader's: an entry line is kept only as its id's latest and live; every other line is carried whole.
@@ -647,6 +694,7 @@ export async function compactFindQueue(core: RepoCore, projectId: string): Promi
           }
           if (entry === null) {
             out.push(text); // unreadable: carried over whole, in its place
+            carriedLines.push(text);
             carried++;
             continue;
           }
@@ -656,7 +704,16 @@ export async function compactFindQueue(core: RepoCore, projectId: string): Promi
             out.push(seal ? sealLine(seal.key, seal.keyId, st.project.id, JSON.stringify(entry), PURPOSE) : JSON.stringify(entry));
           }
         }
-        const text = out.map((l) => `${l}\n`).join("");
+        const built = process.env.NODE_ENV === "test" && compactionSeams.mutateBuilt ? compactionSeams.mutateBuilt(out) : out;
+        const text = built.map((l) => `${l}\n`).join("");
+        // The check, before anything is written: the new content is scanned by the SAME routine and must hold exactly
+        // what the reader saw (the same live entries, equal in content) and every carried line, byte for byte and in
+        // order. If it does not, nothing is written: the file stays as it was.
+        const disagreement = await checkBuilt(text, st.project.id, key, folded, live.length === liveOf(folded).length && index === folded.lines, carriedLines);
+        if (disagreement !== null) {
+          note(core, `The Find and acquire queue was not compacted: the new file did not hold what the old one did (${disagreement}). Nothing has been changed.`, `${abs}:invariant`);
+          throw new NothingToWrite();
+        }
         details = { count: live.length, states: countStates(live), linesBefore: folded.lines, linesAfter: out.length, unreadable: carried };
         // One atomic replacement, recorded in the marker first: a crash leaves the old file or this one.
         await tx.writeFile(rel, text, { mode: CHANGE_LOG_MODE });
@@ -670,3 +727,6 @@ export async function compactFindQueue(core: RepoCore, projectId: string): Promi
     throw err;
   }
 }
+
+/** Test-only seam (honoured only under NODE_ENV=test, R47): replaces the lines the compaction built, to force a disagreement. */
+export const compactionSeams: { mutateBuilt?: (lines: string[]) => string[] } = {};

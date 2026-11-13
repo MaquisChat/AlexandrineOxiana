@@ -18,6 +18,7 @@ import {
   FindQueueUnreadableError,
   appendFindEntries,
   compactFindQueue,
+  compactionSeams,
   readFindQueue,
   readFindQueueDetailed,
 } from "./queue-store.js";
@@ -987,4 +988,85 @@ describe("fix round 2: what the reader sees and what compaction keeps cannot dif
       expect((await readFindQueueDetailed(coreOf(), p.id)).unreadableLines).toBe(before.unreadableLines);
     }, 60_000);
   }
+});
+
+describe("fix round 3: one rule for what a line is, and a check before anything is written", () => {
+  for (const encrypted of [false, true]) {
+    it(`the reviewer's probe: a whitespace-only line over 1 MiB does not make compaction lose the entries after it (${encrypted ? "sealed" : "plain"})`, async () => {
+      const p = await project(encrypted);
+      const [e1, e2, f, g] = [entry(p), entry(p), entry(p), entry(p)] as [FindEntry, FindEntry, FindEntry, FindEntry];
+      await append(p, [e1, e2]);
+      await appendFile(queueFile(p), `${" ".repeat(1024 * 1024 + 10)}\n`);
+      await append(p, [f, g]);
+      await rawAppend(p, hist(g, 70, 100));
+      const before = await readFindQueueDetailed(coreOf(), p.id);
+      expect(before.entries.size).toBe(4);
+      await compactFindQueue(coreOf(), p.id);
+      expect((await findEvents(p, FIND_QUEUE_OPS.compact)).length).toBe(1);
+      const after = await readFindQueueDetailed(coreOf(), p.id);
+      expect([...after.entries.values()]).toEqual([...before.entries.values()]);
+      // A blank line is no line at all, however long: it is not even counted.
+      expect(after.unreadableLines).toBe(before.unreadableLines);
+    });
+  }
+
+  it("blank is ONE rule whatever the length: a short whitespace line is not a line either, and a line with a non-blank byte after 2 MiB of spaces is unreadable and carried", async () => {
+    const p = await project();
+    const a = entry(p);
+    await append(p, [a]);
+    const odd = `${" ".repeat(2 * 1024 * 1024)}x`;
+    await appendFile(queueFile(p), `   \n\t\n${odd}\n`);
+    expect((await readFindQueueDetailed(coreOf(), p.id)).unreadableLines).toBe(1);
+    await rawAppend(p, hist(a, 70, 1));
+    await compactFindQueue(coreOf(), p.id);
+    const lines = await rawLines(p);
+    expect(lines).toEqual([odd, JSON.stringify({ ...a, attempts: 70 })]);
+    expect((await read(p)).get(a.id)?.attempts).toBe(70);
+  });
+
+  describe("the invariant: the new content is scanned by the same routine and compared before it is written", () => {
+    afterEach(() => {
+      compactionSeams.mutateBuilt = undefined;
+    });
+    for (const drop of ["a live entry", "a carried line", "a swap of two carried lines"]) {
+      it(`a disagreement (${drop} lost by the builder) writes NOTHING: the file stays byte for byte, the append that triggered it succeeds, the note is left once`, async () => {
+        const p = await project(true);
+        const a = entry(p);
+        const b = entry(p);
+        await append(p, [a, b]);
+        const core = coreOf();
+        const k = core.key(core.state(p.id));
+        const future1 = sealLine(k.key, k.keyId, p.id, JSON.stringify({ ...entry(p), state: "later-1" }), "ao-find-queue");
+        const future2 = sealLine(k.key, k.keyId, p.id, JSON.stringify({ ...entry(p), state: "later-2" }), "ao-find-queue");
+        await appendFile(queueFile(p), `${future1}\n${future2}\n`);
+        await rawAppend(p, hist(a, 62, 100)); // 66 lines readable of 68: dead 62
+        compactionSeams.mutateBuilt = (lines) => {
+          if (drop === "a live entry") return lines.slice(1);
+          if (drop === "a carried line") return lines.filter((l) => l !== future2);
+          return lines.map((l) => (l === future1 ? future2 : l === future2 ? future1 : l));
+        };
+        await append(p, [{ ...a, attempts: 1 }], "update"); // dead 63: not due
+        const before = await readFile(queueFile(p));
+        await append(p, [{ ...a, attempts: 2 }], "update"); // dead 64: due; the builder is wrong
+        const afterAppend = await readFile(queueFile(p));
+        expect(afterAppend.length).toBeGreaterThan(before.length); // the append is done
+        expect(afterAppend.subarray(0, before.length)).toEqual(before); // and nothing else changed: the file only grew by that line
+        expect((await read(p)).get(a.id)?.attempts).toBe(2);
+        expect(await findEvents(p, FIND_QUEUE_OPS.compact)).toEqual([]);
+        expect(await txnMarkers()).toEqual([]);
+        const notes = () => coreOf().indexErrors.filter((e) => e.op === FIND_QUEUE_OPS.compact);
+        expect(notes()).toHaveLength(1);
+        await append(p, [{ ...a, attempts: 3 }], "update"); // still due, still refused: the same note, once
+        expect(notes()).toHaveLength(1);
+        // With a correct builder the same file compacts.
+        compactionSeams.mutateBuilt = undefined;
+        await compactFindQueue(coreOf(), p.id);
+        const lines = await rawLines(p);
+        expect(lines).toHaveLength(4);
+        expect(lines).toContain(future1);
+        expect(lines).toContain(future2);
+        expect(lines.indexOf(future1)).toBeLessThan(lines.indexOf(future2));
+      });
+    }
+  });
 });
