@@ -135,7 +135,6 @@ const CONTENT_TYPES: Record<string, string> = {
   // pdf.js's bundled data (Task R6, dist/pdfjs/): read with fetch as bytes, whatever their type.
   ".bcmap": "application/octet-stream",
   ".pfb": "application/x-font-type1",
-  ".icc": "application/vnd.iccprofile",
 };
 
 /** The file in packages/ui/dist that answers `pathname`: a file when there is one, else index.html for an app path. */

@@ -347,33 +347,52 @@ export async function buildMultiPagePdf(pages) {
 }
 
 /**
- * A PDF read in many ranges (Task R6): `pages` pages, each with ~600 KB of filler and then the words
- * "Quote on page N" in its content, and all that content written AFTER the page objects, so that
- * opening it reads little and each page's text needs ranges of its own. Page `latePage` (1-based,
- * not the last) also has its page object written halfway through the content, so that even getting
- * that page needs a range. Deterministic; uncompressed.
+ * A PDF read in many ranges (Task R6): `pages` pages (an even number, at least 4), each with ~560 KB
+ * of filler and then the words "Quote on page N" in its content. The page tree has two halves (two
+ * /Pages nodes with their /Count), and the page objects of pages 2 to pages/2 are written halfway
+ * through the file, between the contents of the two halves: opening it (pdf.js reads the first and
+ * the last page) reads none of them, so that even getting one of those pages needs a range, as does
+ * every page's text. Deterministic; uncompressed. Layout: [pages 1 and pages/2+1..pages]
+ * [contents 1..pages/2] [pages 2..pages/2] [contents pages/2+1..pages].
  * @param {number} pages
- * @param {number} latePage
  */
-export async function buildRangeReadPdf(pages, latePage) {
+export async function buildRangeReadPdf(pages) {
   const { PDFName, StandardFonts } = requireLib("pdf-lib");
-  if (!(latePage >= 1 && latePage < pages)) throw new Error("latePage must be a page before the last");
+  if (!(pages >= 4 && pages % 2 === 0)) throw new Error("pages must be even and at least 4");
+  const half = pages / 2;
   const doc = await readerDoc("A document read in ranges");
   const font = await doc.embedFont(StandardFonts.Helvetica);
+  const ctx = doc.context;
   const line = `% ${"filler ".repeat(13)}\n`;
-  const content = (n) => doc.context.register(doc.context.stream(`${line.repeat(6000)}BT /FQ 14 Tf 50 700 Td (Quote on page ${n}) Tj ET\n`));
-  const withFont = (page) => {
-    page.node.setFontDictionary(PDFName.of("FQ"), font.ref);
-    return page;
+  const content = (n) => ctx.register(ctx.stream(`${line.repeat(6000)}BT /FQ 14 Tf 50 700 Td (Quote on page ${n}) Tj ET\n`));
+  const leaf = (n) => {
+    const ref = ctx.register(ctx.obj({ Type: "Page", MediaBox: [0, 0, 595, 842], Resources: { Font: { FQ: font.ref } } }));
+    return { n, ref, dict: ctx.lookup(ref) };
   };
-  const made = [];
-  for (let n = 1; n <= pages; n++) if (n !== latePage) made[n - 1] = withFont(doc.addPage([595, 842]));
-  const half = Math.floor(pages / 2);
-  for (let n = 1; n <= half; n++) if (n !== latePage) made[n - 1].node.addContentStream(content(n));
-  made[latePage - 1] = withFont(doc.insertPage(latePage - 1, [595, 842]));
-  made[latePage - 1].node.addContentStream(content(latePage));
-  for (let n = half + 1; n <= pages; n++) if (n !== latePage) made[n - 1].node.addContentStream(content(n));
-  return Buffer.from(await doc.save({ useObjectStreams: false }));
+  const leaves = [];
+  leaves[0] = leaf(1);
+  for (let n = half + 1; n <= pages; n++) leaves[n - 1] = leaf(n);
+  leaves[0].dict.set(PDFName.of("Contents"), content(1));
+  const firstHalfContents = [];
+  for (let n = 2; n <= half; n++) firstHalfContents[n] = content(n);
+  for (let n = 2; n <= half; n++) {
+    leaves[n - 1] = leaf(n);
+    leaves[n - 1].dict.set(PDFName.of("Contents"), firstHalfContents[n]);
+  }
+  for (let n = half + 1; n <= pages; n++) leaves[n - 1].dict.set(PDFName.of("Contents"), content(n));
+  // The tree: root → [first half, second half].
+  const rootRef = doc.catalog.get(PDFName.of("Pages"));
+  const halfNode = (from, to) => {
+    const ref = ctx.register(ctx.obj({ Type: "Pages", Parent: rootRef, Kids: leaves.slice(from, to).map((l) => l.ref), Count: to - from }));
+    for (const l of leaves.slice(from, to)) l.dict.set(PDFName.of("Parent"), ref);
+    return ref;
+  };
+  const a = halfNode(0, half);
+  const b = halfNode(half, pages);
+  const root = ctx.lookup(rootRef);
+  root.set(PDFName.of("Kids"), ctx.obj([a, b]));
+  root.set(PDFName.of("Count"), ctx.obj(pages));
+  return Buffer.from(await doc.save({ useObjectStreams: false, updateFieldAppearances: false, addDefaultPage: false }));
 }
 
 /**

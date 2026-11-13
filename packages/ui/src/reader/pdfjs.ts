@@ -153,7 +153,8 @@ export interface PdfHandle {
 
 /**
  * Guards pdf.js's objects for one handle: a Proxy over the document, over each page got from it and
- * over each render task, whose every method call throws once `isDead()`, and whose every promise (and
+ * over each render task: once `isDead()`, nothing of pdf.js is called any more (a read rejects, a
+ * render returns a task whose promise rejects, a size throws), and every promise (and
  * text stream) is raced against `died`, which rejects at the moment the handle dies. A result that
  * arrives after death is never handed on.
  */
@@ -202,7 +203,17 @@ function guard(isDead: () => boolean, deadError: () => Error, died: Promise<neve
         if (kind === "task" && prop === "promise") return settle(v as Promise<unknown>);
         if (typeof v !== "function") return v;
         return (...args: unknown[]) => {
-          if (isDead()) throw deadError();
+          if (isDead()) {
+            // Dead: nothing is called. A read rejects (a render's task too); a size throws.
+            if (prop === "getViewport") throw deadError();
+            if (kind === "page" && prop === "render") {
+              const promise = Promise.reject(deadError());
+              promise.catch(() => {});
+              return { promise, cancel() {} };
+            }
+            if (prop === "streamTextContent") return new ReadableStream({ start: (c) => c.error(deadError()) });
+            return Promise.reject(deadError());
+          }
           const r: unknown = (v as (...a: unknown[]) => unknown).apply(t, args);
           if (kind === "doc" && prop === "getPage") return settle((r as Promise<object>).then((page) => wrap(page, "page")));
           if (r instanceof Promise) return settle(r);

@@ -16,6 +16,12 @@
  * browsers: checked.) A second PDF uses Helvetica without embedding it: drawn with the system's face,
  * no Liberation Sans shipped or fetched from elsewhere.
  *
+ * A7: an encrypted project locked while pages are being read: every read in flight (a page, a
+ * page's text, a page drawn on a canvas) rejects, nothing is drawn or returned, the handle is dead,
+ * no range is asked for afterwards. (With round 1's blank bytes a read resolved: checked.) A 600 dpi
+ * A4 scan reaches the page at its full 4961 × 7016 pixels (with the earlier 2^27 canvas limit it
+ * came out at 2156 × 3050: checked).
+ *
  * Until the reader screen exists (Task R7) nothing in the app imports pdf.js, so the modules
  * themselves (packages/ui/src/reader/pdfjs.ts, rangeTransport.ts, api/reader.ts, api/client.ts) are
  * built for this test by Vite, as the app's build would build them (the worker emitted with `?url`),
@@ -27,8 +33,8 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { buildCjkPdf, buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
+import { buildCjkPdf, buildPdf, buildRangeReadPdf } from "../tests/fixtures/generate.mjs";
+import { APP_ORIGIN, expect, libraryWithProject, OPEN_RULES, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR, REPO_ROOT, UI_DIST } from "./paths.js";
 
 const UI = join(REPO_ROOT, "packages", "ui");
@@ -64,6 +70,8 @@ async function buildReaderModules(): Promise<string> {
                 `export { readerApi } from ${src("api/reader.ts")};`,
                 `export { createRangeTransport, onRangeFailure } from ${src("reader/rangeTransport.ts")};`,
                 `export { openPdf, PDF_OPTIONS } from ${src("reader/pdfjs.ts")};`,
+                // pdf.js's operator codes, to find a drawn picture in a page's operator list.
+                `export { OPS } from "pdfjs-dist/legacy/build/pdf.mjs";`,
               ].join("\n")
             : null,
       },
@@ -342,6 +350,195 @@ test("a PDF whose Helvetica is not embedded is drawn with the system's face, ask
   const own = seen.responses.filter((r) => r.url.startsWith(`${APP_ORIGIN}/pdfjs/`));
   for (const r of own) expect([200, 404], r.url).toContain(r.status);
   for (const r of own.filter((x) => x.status === 404)) expect(r.url).toMatch(/\/pdfjs\/standard_fonts\/LiberationSans-[\w]+\.ttf$/);
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+/** The page's handle to the reader modules, for the steps below (set by openOnly). */
+type Handle = { dead: boolean; failed: Promise<{ kind: string; message: string }>; destroy(): Promise<void>; doc: { getPage(n: number): Promise<unknown> } };
+
+/**
+ * Opens `aid` of `projectId` in the page with the reader's modules and leaves it as window.__aoHandle
+ * (nothing read but what opening reads).
+ */
+async function openOnly(page: Page, app: AppHarness, projectId: string, sid: string, aid: string): Promise<string> {
+  return page.evaluate(
+    async ({ modulePath, baseUrl, token, projectId, sid, aid }) => {
+      type Mod = {
+        createClient(b: string, t: string): unknown;
+        readerApi(c: unknown): { documentRange(p: string, s: string, a: string, start: number, end: number, signal?: AbortSignal): Promise<{ bytes: Uint8Array; total: number }> };
+        createRangeTransport(first: { bytes: Uint8Array; total: number }, f: (s: number, e: number, sig?: AbortSignal) => Promise<{ bytes: Uint8Array; total: number }>): unknown;
+        openPdf(o: { transport: unknown; signal: AbortSignal }): Promise<unknown>;
+      };
+      try {
+        const m = (await import(modulePath)) as Mod;
+        const api = m.readerApi(m.createClient(baseUrl, token));
+        const ac = new AbortController();
+        const first = await api.documentRange(projectId, sid, aid, 0, 1048575, ac.signal);
+        const transport = m.createRangeTransport({ bytes: first.bytes, total: first.total }, (s, e, sig) => api.documentRange(projectId, sid, aid, s, e, sig));
+        (window as unknown as { __aoHandle: unknown }).__aoHandle = await m.openPdf({ transport, signal: ac.signal });
+        return "";
+      } catch (e) {
+        return `${(e as Error).name}: ${(e as Error).message}`;
+      }
+    },
+    { modulePath: `${MODULE_BASE}${ENTRY}`, baseUrl: app.baseUrl, token: app.token, projectId, sid, aid },
+  );
+}
+
+test("a project locked while pages are being read: every read in flight rejects, nothing is drawn or returned, the handle is dead", async ({ page, app }) => {
+  await serveReaderModules(page, await buildReaderModules());
+  const seen = watch(page);
+  await shellLikePage(page);
+
+  const dir = join(app.root, "sources");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "ranges.pdf");
+  // 12 pages whose texts, and the objects of pages 2 to 6, lie in parts of the file not read at opening (tests/fixtures/generate.mjs).
+  writeFileSync(file, await buildRangeReadPdf(12));
+  await libraryWithProject(app, page, { library: "Reader library", project: "Open study" });
+  const sealed = await app.api<{ project: { id: string } }>("POST", "/projects", { name: "Sealed study", governanceYaml: OPEN_RULES, encryption: { enabled: true, passphrase: "correct horse battery staple" } });
+  expect(sealed.status, JSON.stringify(sealed.body)).toBe(200);
+  const projectId = sealed.body.project.id;
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  await page.goto(`${APP_ORIGIN}/`);
+  expect(await openOnly(page, app, projectId, sid, aid)).toBe("");
+
+  // The last page got (and its text read) while the project is open.
+  const before = await page.evaluate(async () => {
+    const h = (window as unknown as { __aoHandle: Handle }).__aoHandle;
+    const p = (await h.doc.getPage(12)) as { getTextContent(): Promise<{ items: Array<{ str?: string }> }> };
+    (window as unknown as { __aoPage2: unknown }).__aoPage2 = p;
+    return (await p.getTextContent()).items.map((i) => i.str ?? "").join("");
+  });
+  expect(before).toContain("Quote on page 12");
+
+  // The project is locked in the library: every range from now on answers 423.
+  const lock = await app.api("POST", `/projects/${projectId}/lock`);
+  expect(lock.status, JSON.stringify(lock.body)).toBe(200);
+  const documentCalls = () => seen.requests.filter((u) => u.includes(`/assets/${aid}/document`)).length;
+  const callsBefore = documentCalls();
+
+  // In flight together: page 4 (its object is not read yet), the text of page 9, page 8 drawn on a canvas.
+  const result = await page.evaluate(async () => {
+    const w = window as unknown as { __aoHandle: Handle; __aoCanvas?: HTMLCanvasElement };
+    const h = w.__aoHandle;
+    type P = { getViewport(o: { scale: number }): { width: number; height: number }; getTextContent(): Promise<{ items: Array<{ str?: string }> }>; render(o: object): { promise: Promise<void> } };
+    const how = (p: Promise<unknown>) =>
+      Promise.race([
+        p.then(
+          (v) => `resolved with ${v === undefined ? "nothing" : typeof v === "object" ? Object.keys(v as object).slice(0, 5).join(",") || "an object" : String(v)}`,
+          () => "rejected",
+        ),
+        new Promise<string>((r) => setTimeout(() => r("pending"), 10000)),
+      ]);
+    const canvas = document.createElement("canvas");
+    canvas.width = 595;
+    canvas.height = 842;
+    w.__aoCanvas = canvas;
+    const pageRead = h.doc.getPage(4).then(() => "a page");
+    const text = (h.doc.getPage(9) as Promise<P>).then((p) => p.getTextContent());
+    const drawing = (h.doc.getPage(8) as Promise<P>).then((p) => p.render({ canvas, viewport: p.getViewport({ scale: 1 }) }).promise);
+    const outcomes = await Promise.all([how(pageRead), how(text), how(drawing)]);
+    const failure = await h.failed;
+    // Nothing of page 9 reached the canvas.
+    const data = canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let inked = false;
+    for (let i = 0; i < data.length; i += 4) if (data[i + 3]! > 0 && (data[i]! < 250 || data[i + 1]! < 250 || data[i + 2]! < 250)) inked = true;
+    // No later call on the handle returns anything: not even the page got before.
+    const p2 = (window as unknown as { __aoPage2: P }).__aoPage2;
+    const later = await Promise.all([how(Promise.resolve().then(() => h.doc.getPage(1))), how(Promise.resolve().then(() => p2.getTextContent()))]);
+    return { outcomes, kind: failure.kind, message: failure.message, dead: h.dead, inked, later };
+  });
+
+  expect(result.outcomes).toEqual(["rejected", "rejected", "rejected"]);
+  expect(result.kind).toBe("locked");
+  expect(result.message).toBe("This project is locked. Unlock it in the library to read its files.");
+  expect(result.dead).toBe(true);
+  expect(result.inked).toBe(false);
+  expect(result.later).toEqual(["rejected", "rejected"]);
+  // The worker was ended with the document, and no range was asked for after the refusal.
+  await expect.poll(() => seen.workers.length).toBe(1);
+  const afterFailure = documentCalls();
+  expect(afterFailure).toBeGreaterThan(callsBefore);
+  await page.evaluate(async () => {
+    const h = (window as unknown as { __aoHandle: Handle }).__aoHandle;
+    await h.destroy();
+    await h.destroy();
+    await h.doc.getPage(3).catch(() => {});
+  });
+  await page.waitForTimeout(300);
+  expect(documentCalls()).toBe(afterFailure);
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+/** A one-page A4 PDF whose page is one 600 dpi bitonal scan (4961 × 7016 pixels): its left half black, its right half white. */
+async function scanA4At600Dpi(): Promise<Buffer> {
+  const { PDFDocument, PDFName } = createRequire(join(LIBRARY_DIR, "package.json"))("pdf-lib") as {
+    PDFDocument: { create(o: object): Promise<ScanDoc> };
+    PDFName: { of(n: string): unknown };
+  };
+  interface ScanDoc {
+    context: { flateStream(b: Uint8Array, d: object): unknown; register(o: unknown): unknown; obj(o: object): unknown };
+    addPage(s: [number, number]): { node: { Resources(): { set(k: unknown, v: unknown): void }; addContentStream(r: unknown): void } };
+    save(o: object): Promise<Uint8Array>;
+  }
+  const width = 4961;
+  const height = 7016;
+  const rowBytes = Math.ceil(width / 8);
+  const row = new Uint8Array(rowBytes).fill(0xff);
+  row.fill(0x00, 0, Math.floor(rowBytes / 2)); // DeviceGray, 1 bit: 0 is black
+  const pixels = new Uint8Array(rowBytes * height);
+  for (let y = 0; y < height; y++) pixels.set(row, y * rowBytes);
+  const doc = await PDFDocument.create({ updateMetadata: false });
+  const image = doc.context.register(doc.context.flateStream(pixels, { Type: "XObject", Subtype: "Image", Width: width, Height: height, BitsPerComponent: 1, ColorSpace: "DeviceGray" }));
+  const page = doc.addPage([595, 842]);
+  page.node.Resources().set(PDFName.of("XObject"), doc.context.obj({ Scan: image }));
+  page.node.addContentStream(doc.context.register(doc.context.flateStream(new TextEncoder().encode("q 595 0 0 842 0 0 cm /Scan Do Q"), {})));
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}
+
+test("a 600 dpi A4 scan is drawn at its full size, neither scaled down nor left out", async ({ page, app }) => {
+  await serveReaderModules(page, await buildReaderModules());
+  const seen = watch(page);
+  await shellLikePage(page);
+  const dir = join(app.root, "sources");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "scan-600dpi.pdf");
+  writeFileSync(file, await scanA4At600Dpi());
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Reading study" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  await page.goto(`${APP_ORIGIN}/`);
+  expect(await openOnly(page, app, projectId, sid, aid)).toBe("");
+
+  const drawn = await page.evaluate(async (modulePath) => {
+    const { OPS } = (await import(modulePath)) as { OPS: { paintImageXObject: number } };
+    type Objs = { get(id: string, callback: (data: { width: number; height: number }) => void): void };
+    type P = { getViewport(o: { scale: number }): { width: number; height: number }; render(o: object): { promise: Promise<void> }; getOperatorList(): Promise<{ fnArray: number[]; argsArray: unknown[][] }>; objs: Objs; commonObjs: Objs };
+    const h = (window as unknown as { __aoHandle: { doc: { getPage(n: number): Promise<P> }; destroy(): Promise<void> } }).__aoHandle;
+    const p = await h.doc.getPage(1);
+    const canvas = document.createElement("canvas");
+    canvas.width = 595;
+    canvas.height = 842;
+    await p.render({ canvas, viewport: p.getViewport({ scale: 1 }) }).promise;
+    const ops = await p.getOperatorList();
+    const at = ops.fnArray.indexOf(OPS.paintImageXObject);
+    const objId = at < 0 ? "" : String(ops.argsArray[at]![0]);
+    // The picture as pdf.js handed it to the page (after any scaling down in the worker).
+    const img = objId ? await new Promise<{ width: number; height: number } | undefined>((r) => { (objId.includes("_") && !objId.startsWith("img_") ? p.commonObjs : p.objs).get(objId, r); setTimeout(() => r(undefined), 10000); }) : undefined;
+    const ctx = canvas.getContext("2d")!;
+    const px = (x: number, y: number) => [...ctx.getImageData(x, y, 1, 1).data].slice(0, 3);
+    const result = { painted: at >= 0, width: img?.width ?? 0, height: img?.height ?? 0, left: px(100, 400), right: px(500, 400) };
+    await h.destroy();
+    return result;
+  }, `${MODULE_BASE}${ENTRY}`);
+
+  // Not left out (maxImageSize), and not scaled down before it reached the page (canvasMaxAreaInBytes).
+  expect(drawn.painted).toBe(true);
+  expect([drawn.width, drawn.height]).toEqual([4961, 7016]);
+  expect(drawn.left).toEqual([0, 0, 0]);
+  expect(drawn.right).toEqual([255, 255, 255]);
   expect(seen.pageErrors).toEqual([]);
   expectOnlyOwnOrigins(seen, app);
 });

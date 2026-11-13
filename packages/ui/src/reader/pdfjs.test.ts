@@ -363,11 +363,11 @@ describe("PdfHandle.failed", () => {
 
   /** Opens the range-read fixture; the `nth` range asked for after opening, and every later one, fails with `fail`. */
   async function openThenFail(fail: unknown, nth = 1) {
-    const data = new Uint8Array(await buildRangeReadPdf(PAGES, 4));
+    const data = new Uint8Array(await buildRangeReadPdf(PAGES));
     const t = memoryTransport(data, { firstBytes: 1048576, fail, failFrom: Number.POSITIVE_INFINITY });
     const handle = await openPdf({ transport: t.transport, signal: signal() });
     // A page got (and its object read) before anything fails.
-    const early = await handle.doc.getPage(2);
+    const early = await handle.doc.getPage(PAGES);
     const callsAtOpen = t.calls.length;
     t.state.failFrom = callsAtOpen + nth;
     return { handle, t, early, callsAtOpen };
@@ -398,8 +398,8 @@ describe("PdfHandle.failed", () => {
     // The worker's answers are held back, so that these are still in flight when the refusal comes:
     // a page, and the drawing of another page (its operator list; a canvas render in the end-to-end test).
     Held.on = true;
-    const page = handle.doc.getPage(PAGES - 1);
-    const drawing = handle.doc.getPage(PAGES).then((p) => p.getOperatorList());
+    const page = handle.doc.getPage(4);
+    const drawing = handle.doc.getPage(8).then((p) => p.getOperatorList());
     letFail();
     const failure = await handle.failed;
     // Now pdf.js may answer: whatever it says arrives after the refusal, and is dropped.
