@@ -1,6 +1,6 @@
 # Find and acquire — design
 
-Status: draft for the owner's approval (2026-11-13), revised after a builder's reading of it. Nothing here is built.
+Status: **approved by the owner on 2026-11-13** ("yes that sounds good"), with one addition of theirs: a switch to check everything they have, not only the entry's own project. Revised after a builder's reading of it. Nothing here is built yet.
 Marked **(owner)** where the owner said it; everything else is the coordinator's proposal and can be changed.
 
 ## What it is, and why
@@ -13,6 +13,7 @@ The researcher often has only a reference in hand — a title and an author from
 - **(owner)** "There should be a separate screen in settings in which it is possible to configure where a search goes, including Elicit."
 - **(owner)** "Let's integrate support for library logins."
 - **(owner)** For the sign-in: the window inside the app first, the researcher's own browser plus the app's extension as the fallback.
+- **(owner)** "Already in your library should have a toggle switch to search all libraries."
 
 ## Goals
 
@@ -38,7 +39,7 @@ The researcher often has only a reference in hand — a title and an author from
 - **No bulk downloading through a library login.** Through the researcher's library, the app fetches one item at a time, each started by the researcher, with the researcher present. Library licences forbid systematic downloading, and an account can be suspended for it.
 - **The app never sees or keeps the researcher's library password**, and no key or sign-in cookie is ever written into a library, a log or an audit entry.
 - **No wrong paper attached in silence.** A downloaded file is checked against the record (its DOI or title in the file's own text); a file that does not match goes to the review queue with both shown, never straight into the source.
-- **No second copy of a work already in the library.** An entry that matches an existing source says "Already in your library" and links to it.
+- **No second copy of a work already in the library.** An entry that matches an existing source says "Already in your library" and links to it. A switch on the screen, **"Check everything I have"** **(owner)**, widens that check from the entry's own project to every project that is unlocked in the open library.
 - **Nothing sent that the project forbids.** A project's governance rules decide whether online lookups and each kind of acquiring are allowed; a refusal is said in plain words on the entry.
 
 ## How it works for the researcher
@@ -60,6 +61,8 @@ Queue
 ```
 
 Each entry shows, in words (never by colour or symbol alone): what was typed; what it was matched to; and one state — Looking it up · Choose (several matches) · Choose the person · Choose works · Record complete · Looking for a copy · Fetching · In your library · Already in your library · No open copy (with "Get through my library" and "Where to get it") · Waiting for you in the sign-in window · Needs your check (the file did not match) · Not found · Could not be done (with the reason and "Try again"). An entry can be removed from the queue at any time; removing an entry never removes a source.
+
+**Check everything I have.** A switch at the top of the screen **(owner)**. Off: an entry is compared only with the project it is for. On: it is compared with every project of the open library that is unlocked; a match elsewhere says "Already in your project <name>" with "Open it there" and "Add it to this project as well". Projects that are locked are not looked into, and the screen says how many were left out ("2 locked projects were not checked"). The switch starts off and remembers how it was left (the coordinator's proposal). What the entry stores about a match in another project is only that there was one — never a title, a name or an id from the other project — so that nothing of an encrypted project is written into another. A library that is not open cannot be checked (only one library is open at a time); if the owner keeps several libraries and wants them checked too, that is a further piece.
 
 **Choosing.** "Choose" lists the candidate works with authors, year, kind, where published and an identifier, the likeliest first, with "None of these". "Choose the person" lists people with their affiliation and a few titles. "Choose works" lists that person's works, newest first, with a filter by year and kind and a text filter; the researcher ticks any number and presses "Add the chosen works".
 
@@ -87,7 +90,7 @@ The rest builds on what exists:
 
 - **Looking up** reuses the library's lookup machinery (`packages/library/src/lookup/`: Crossref, OpenAlex, Open Library, Library of Congress by title and author, with recorded fixtures for tests), which today is used only inside imports. It gains: a search by free text that returns ranked candidates with a confidence; people by name and a person's works (OpenAlex); and Elicit's paper search as one more source.
 - **The queue** is library data in the project (like the capture queue): governed, audited (kinds, counts and ids only — never the typed text, a title or a name), crash-safe, resumed at start. Lookups and free-copy fetches run by themselves, a few at a time, politely (each service's rate rules honoured); library fetches never run by themselves.
-- **A source is created when the record is complete**, without a file; the file is attached to that same source when it arrives. Duplicates are found with the existing rules (same DOI or ISBN: certain; a close title and author: the researcher is asked), **within the project the entry is for only** — what is in another project, an encrypted one above all, is never revealed by this check (the coordinator's call).
+- **A source is created when the record is complete**, without a file; the file is attached to that same source when it arrives. Duplicates are found with the existing rules (same DOI or ISBN: certain; a close title and author: the researcher is asked), within the project the entry is for by default, and across every unlocked project of the open library when the researcher has switched "Check everything I have" on **(owner)**; nothing from another project is ever written into this project's queue or audit.
 - **Free copies** are fetched by the service from a fixed list of hosts per source, with size and type limits, and only as PDF or EPUB.
 - **The sign-in window** is a second window of the desktop shell that shows remote pages and has no access to the app's own commands (no capability names it; the launch check must prove it). Corrected after the builder's reading, because the first draft could not work in macOS's web view:
   - *Catching the PDF.* The web view shows a PDF inside the window instead of downloading it, so there is no download to catch. Instead the shell watches where the window goes; when it arrives at a PDF, the shell itself fetches that address with the window's cookies, writes the file where only it can, and hands it to the service the way a chosen folder is handed over today (a single-use grant on the existing pipe) — never through the page.
@@ -118,7 +121,7 @@ The rest builds on what exists:
 
 ## Open questions for the owner
 
-1. **What projects allow by default.** Each project has governance rules that list which ways of capturing are allowed, and existing projects allow neither of the two new ways until someone says so. Proposal: *free legal copies* are allowed by default under every profile (IRB, GDPR, HIPAA, DMP), because the only thing sent is a work's identifier or title — the same kind of thing the existing lookups already send — and the services asked (arXiv, Europe PMC, Semantic Scholar, the Directory of Open Access Books, the Internet Archive, Unpaywall) are treated as public bibliographic services, like Crossref and OpenAlex today; *through my library* is allowed by default too (it is what the researcher would do in a browser); *Elicit* stays off in every project until the project's rules name it as an allowed service. Each can be switched off per project. Is that right, or should a sensitive project start with them off?
+1. **What projects allow by default** — *settled: the owner agreed to the proposal (2026-11-13).* Each project has governance rules that list which ways of capturing are allowed, and existing projects allow neither of the two new ways until someone says so. Proposal: *free legal copies* are allowed by default under every profile (IRB, GDPR, HIPAA, DMP), because the only thing sent is a work's identifier or title — the same kind of thing the existing lookups already send — and the services asked (arXiv, Europe PMC, Semantic Scholar, the Directory of Open Access Books, the Internet Archive, Unpaywall) are treated as public bibliographic services, like Crossref and OpenAlex today; *through my library* is allowed by default too (it is what the researcher would do in a browser); *Elicit* stays off in every project until the project's rules name it as an allowed service. Each can be switched off per project. Is that right, or should a sensitive project start with them off?
 2. **How you sign in to your institution's library:** a password with a code or a phone approval (works in the app's window), or a passkey, a security key or a Google sign-in (does not; the browser fallback would then be your main way)?
 3. **Which institution's library** will you use, so that the first real test is against it? Do you know its "proxy" address, or shall the app work it out from a link you paste?
 4. **Elicit:** which plan is your Elicit account on (its API needs Pro or higher)?
