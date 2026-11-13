@@ -25,3 +25,10 @@ exiftool); they contain only invented text and are not committed. There is no HE
 CC0 HEIC is available from a pinned source, and none can be generated with the project's tools
 (ImageMagick/ffmpeg here cannot write HEIF), so the camera tests use the generated TIFF (iPhone-style
 EXIF written by exiftool) and the downloaded DNG and CR3.
+
+`tests/fixtures/pdf/password-protected.pdf` (committed; Task R6) is a one-page PDF of invented text
+made once from `buildPdf()` of `tests/fixtures/generate.mjs` and encrypted with Ghostscript 10.02.1
+(`gs -dSAFER -sDEVICE=pdfwrite -dEmbedAllFonts=false -sOwnerPassword=ao-fixture-owner
+-sUserPassword=ao-fixture -dEncryptionR=3 -dKeyLength=128 -dPermissions=-4`): RC4 128-bit, user
+password `ao-fixture`, no embedded fonts. Our own work, no third-party content. sha256
+`2d50ec3424f216f288c7776bce71861b70d2f5588cbac4ee36ae448de7c0d0c3`.

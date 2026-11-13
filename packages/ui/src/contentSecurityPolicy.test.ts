@@ -33,12 +33,32 @@ const EXPECTED: Record<string, string[]> = {
   // R135 (4): the same loopback reach as connect-src, plus blob:, for media tickets.
   "media-src": ["blob:", "http://127.0.0.1:*", "http://localhost:*"],
   "font-src": ["'self'"],
-  "connect-src": ["http://127.0.0.1:*", "http://localhost:*"],
+  // R192 (b), Task R6: 'self' so that pdf.js (useWorkerFetch: false) reads its bundled character
+  // maps and standard fonts from the app's own files (/pdfjs/) with fetch. Nothing else is added.
+  "connect-src": ["'self'", "http://127.0.0.1:*", "http://localhost:*"],
   "frame-src": ["blob:"],
   "object-src": ["'none'"],
   "base-uri": ["'none'"],
   "form-action": ["'none'"],
 };
+
+/** The policy the desktop shell sets (apps/desktop/src-tauri/tauri.conf.json, app.security.csp). */
+function shellPolicy(): string {
+  const conf = JSON.parse(readFileSync(join(here, "..", "..", "..", "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8")) as { app?: { security?: { csp?: unknown } } };
+  const csp = conf.app?.security?.csp;
+  if (typeof csp !== "string") throw new Error("tauri.conf.json has no app.security.csp string");
+  return csp;
+}
+
+describe("the shell's policy and the page's policy", () => {
+  it("index.html and tauri.conf.json carry the same policy", () => {
+    const html = readFileSync(join(here, "..", "index.html"), "utf8");
+    const tags = [...html.matchAll(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"\s*\/?>/gi)];
+    expect(tags).toHaveLength(1);
+    // Character for character: the shell's header and the page's tag must never drift apart.
+    expect(shellPolicy()).toBe(tags[0]![1]);
+  });
+});
 
 describe("index.html content-security policy (exact)", () => {
   const policy = policyOf(readFileSync(join(here, "..", "index.html"), "utf8"));
