@@ -99,7 +99,7 @@ export interface ZoteroSyncDeps extends BulkImportDeps {
 
 export interface ZoteroSyncOptions {
   trigger: "manual" | "automatic";
-  /** Aborting stops the run (a batch is suspended, resumable). Abort with "app-closed" or "project-locked" to say why. */
+  /** Aborting stops the run (a batch is suspended, resumable). Abort with "app-closed", "library-closed" (R248) or "project-locked" to say why. */
   signal: AbortSignal;
   /** The back-off time the caller keeps (ms since the epoch), from the last record that carried one. */
   backoffUntil?: number;
@@ -197,7 +197,7 @@ export function zoteroSyncBackoff(backoffUntil: number | undefined, now: number)
 const askedBackoff = (asked: number | undefined, now: number): number | undefined =>
   asked === undefined ? undefined : Math.min(Math.max(asked, now + ZOTERO_SYNC_MIN_BACKOFF_MS), now + ZOTERO_SYNC_MAX_BACKOFF_MS);
 
-const STOP_REASONS: readonly ZoteroSyncReason[] = ["stopped-by-you", "app-closed", "project-locked"];
+const STOP_REASONS: readonly ZoteroSyncReason[] = ["stopped-by-you", "app-closed", "library-closed", "project-locked"];
 const stopReason = (signal: AbortSignal): ZoteroSyncReason => (typeof signal.reason === "string" && STOP_REASONS.includes(signal.reason as ZoteroSyncReason) ? (signal.reason as ZoteroSyncReason) : "stopped-by-you");
 
 const ACCOUNT_REASON: Record<ZoteroAccountReason, ZoteroSyncReason> = {

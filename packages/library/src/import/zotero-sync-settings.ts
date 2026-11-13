@@ -55,6 +55,8 @@ export type ZoteroSyncReason =
   | "too-large"
   | "stopped-by-you"
   | "app-closed"
+  /** R248: the library was closed, switched or moved during the run while the app stayed open. */
+  | "library-closed"
   | "import-running"
   | "error"
   /** R242 (b): a run refused because the link was paused after an undo of a sync batch. */
@@ -87,6 +89,7 @@ export const ZOTERO_SYNC_REASONS: readonly ZoteroSyncReason[] = [
   "too-large",
   "stopped-by-you",
   "app-closed",
+  "library-closed",
   "import-running",
   "error",
   "sync-undone",

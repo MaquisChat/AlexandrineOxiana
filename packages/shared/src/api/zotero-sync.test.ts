@@ -35,7 +35,7 @@ describe("every reason has its sentence", () => {
     // By type: a reason without a sentence does not compile (Record<ZoteroSyncReason, string>).
     const keys = Object.keys(ZOTERO_SYNC_REASON_TEXT).sort();
     expect(keys).toEqual([...ZOTERO_SYNC_REASONS_LIST].sort());
-    expect(ZOTERO_SYNC_REASONS_LIST).toHaveLength(19);
+    expect(ZOTERO_SYNC_REASONS_LIST).toHaveLength(20);
     for (const r of ZOTERO_SYNC_REASONS_LIST) expect(ZOTERO_SYNC_REASON_TEXT[r], r).toMatch(/^[A-Z].*\.$/u);
   });
 
@@ -54,6 +54,9 @@ describe("every reason has its sentence", () => {
       "sync-undone": "You undid this library's last sync, so syncing is paused until you turn it on again on this screen.",
       "deletions-unconfirmed": "This sync could not confirm which items were deleted in Zotero, so the next sync will read the whole library again.",
       "changes-incomplete": "This sync could not read everything that changed in Zotero. The next sync asks for the same changes again.",
+      // R248
+      "batch-ended": "An unfinished sync could not be continued, so it was closed. The next sync starts again from the beginning.",
+      "library-closed": "The library was closed or moved during the sync; it continues next time.",
     };
     for (const [k, v] of Object.entries(want)) expect(ZOTERO_SYNC_REASON_TEXT[k as ZoteroSyncReason], k).toBe(v);
   });

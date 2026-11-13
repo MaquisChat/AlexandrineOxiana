@@ -952,7 +952,7 @@ export class ServiceState {
     this.media.revokeAll();
     // An index rebuild stops between sources (the library at its new place checks its index again).
     await this.stopIndexRebuild(s);
-    await this.zoteroSync.stop("app-closed");
+    await this.zoteroSync.stop("library-closed");
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
     if (!(await this.drainWork(ms))) {
@@ -1055,7 +1055,7 @@ export class ServiceState {
     for (const w of stoppable) if (w.kind === "transcription") w.ctl.interrupt?.();
     await this.stopIndexRebuild(s);
     // A Zotero sync stops first, with its record, its batch suspended (Task Z8): nothing of it is written after the lock goes.
-    await this.zoteroSync.stop("app-closed");
+    await this.zoteroSync.stop(this.shuttingDown ? "app-closed" : "library-closed");
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).
     const { stuck } = await this.suspendBatches(s).catch(() => ({ paused: [], stuck: [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b })) }));

@@ -494,23 +494,39 @@ describe("running (Accept 3–5)", () => {
     expect(st.links[0]).toMatchObject({ paused: "key-refused", waitingFor: "paused" });
   });
 
-  it("a key-refused pause is cleared only by a save after a successful key check; an undone pause by any save", async () => {
-    await openLibrary();
-    const pid = await newProject();
+  it("R248: a successful key check clears the key-refused pause of every link, also after a restart; a failed one clears nothing; a save clears undone only", async () => {
+    const libPath = await openLibrary();
+    const a = await newProject(false, "A");
+    const b = await newProject(false, "B");
+    z.addGroup(9, "G");
     addItems(U, 1);
-    await saveSettings([linkOf(U, pid)]);
+    await saveSettings([linkOf(U, a), linkOf(G, b)]);
     z.revokeKey();
-    await runAndWait();
-    expect((await saveSettings([linkOf(U, pid)])).json.links[0].paused).toBe("key-refused");
+    await runAndWait({ ref: U });
+    const paused = await state();
+    expect(paused.links.map((l: { paused?: string }) => l.paused)).toEqual(["key-refused", "key-refused"]);
+    // A save does not clear it; a failed check does not either.
+    expect((await saveSettings([linkOf(U, a), linkOf(G, b)])).json.links.map((l: { paused?: string }) => l.paused)).toEqual(["key-refused", "key-refused"]);
+    expect((await call({ method: "POST", url: "/zotero/key-check", body: {} })).status).toBe(409);
+    expect((await state()).links.map((l: { paused?: string }) => l.paused)).toEqual(["key-refused", "key-refused"]);
+    // After a restart of the service (the pause is stored), a key that works again clears it for every link, in one write.
+    await svc.close();
+    await start();
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).status).toBe(200);
     z = (await z.agent.close(), new FakeZotero({ key: KEY }));
     setGlobalDispatcher(z.agent);
-    addItems(U, 1);
+    z.addGroup(9, "G");
     expect((await call({ method: "POST", url: "/zotero/key-check", body: {} })).status).toBe(200);
-    const saved = await saveSettings([linkOf(U, pid)]);
-    expect(saved.json.links[0].paused).toBeUndefined();
-    expect(saved.json.links[0].waitingFor).toBeUndefined();
+    const cleared = await state();
+    expect(cleared.links.map((l: { paused?: string; waitingFor?: string }) => [l.paused, l.waitingFor])).toEqual([
+      [undefined, undefined],
+      [undefined, undefined],
+    ]);
+    // An undone pause: cleared by the researcher's save (and not by a key check).
     await (await import("@ao/library")).pauseLink(deps.appConfigDir, svc.state.session!.lib.id, U, "undone");
-    expect((await saveSettings([linkOf(U, pid)])).json.links[0].paused).toBeUndefined();
+    expect((await call({ method: "POST", url: "/zotero/key-check", body: {} })).status).toBe(200);
+    expect((await state()).links[0].paused).toBe("undone");
+    expect((await saveSettings([linkOf(U, a), linkOf(G, b)])).json.links[0].paused).toBeUndefined();
   });
 
   it("close during a run leaves a stopped record and a paused batch, and nothing is written after the lock is released", async () => {
@@ -525,7 +541,7 @@ describe("running (Accept 3–5)", () => {
     expect(closed.status).toBe(200);
     const eventsAtClose = events.length;
     // The record was finished before the close answered, and said so last.
-    expect(finished().at(-1)!.run).toMatchObject({ outcome: "stopped", reason: "app-closed" });
+    expect(finished().at(-1)!.run).toMatchObject({ outcome: "stopped", reason: "library-closed" });
     const snap = async () => Promise.all((await filesUnder(libPath)).sort().map(async (f) => [f, await readFile(f, "base64")]));
     const before = await snap();
     await new Promise((r) => setTimeout(r, 500));
@@ -534,12 +550,12 @@ describe("running (Accept 3–5)", () => {
     expect(events.slice(eventsAtClose).filter((e) => e.type === "zotero.sync")).toEqual([]);
     const hist = await historyFile();
     const recs = Object.values(hist.libraries)[0] as Array<{ outcome: string; reason: string; finishedAt?: string; batchId?: string }>;
-    expect(recs[0]).toMatchObject({ outcome: "stopped", reason: "app-closed" });
+    expect(recs[0]).toMatchObject({ outcome: "stopped", reason: "library-closed" });
     expect(recs[0]!.finishedAt).toBeDefined();
     expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).status).toBe(200);
     const batches = (await call({ url: `/projects/${pid}/imports` })).json.batches as Array<{ batchId: string; state: string }>;
     expect(batches.find((b) => b.batchId === recs[0]!.batchId)?.state).toBe("paused");
-    expect((await state()).links[0].status).toMatch(/^Stopped syncing with Zotero at \d\d:\d\d today: The app was closed during the sync; it continues next time\. /u);
+    expect((await state()).links[0].status).toMatch(/^Stopped syncing with Zotero at \d\d:\d\d today: The library was closed or moved during the sync; it continues next time\. /u);
   });
 
   it("the app's shutdown stops a run before the lock goes", async () => {
@@ -606,6 +622,40 @@ describe("a manual import and a sync of one Zotero library never run together (A
     expect((await call({ method: "POST", url: `/imports/${started.json.batchId}/cancel` })).status).toBe(200);
     await svc.state.idle();
   });
+
+  it("R248: only an import of THE SAME Zotero library is refused while a sync runs; resuming one by hand too", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    const x = await newProject(false, "X");
+    const y = await newProject(false, "Y");
+    const w = await newProject(false, "W");
+    z.addGroup(9, "G");
+    addItems(U, 10);
+    addItems(G, 10);
+    // Two manual batches left cancelled (resumable): one of the user library, one of the group.
+    const cancelled: string[] = [];
+    for (const [project, adapter] of [
+      [x, { kind: "zotero-web", libraryType: "user", libraryId: "42" }],
+      [y, { kind: "zotero-web", libraryType: "group", libraryId: "9" }],
+    ] as const) {
+      const h = holdImport();
+      const r = await call({ method: "POST", url: `/projects/${project}/import`, body: { adapter } });
+      await h;
+      expect((await call({ method: "POST", url: `/imports/${r.json.batchId}/cancel` })).status).toBe(200);
+      await svc.state.idle();
+      cancelled.push(r.json.batchId as string);
+    }
+    await saveSettings([linkOf(U, pid)]);
+    const held = holdSync();
+    await call({ method: "POST", url: "/zotero/sync/run", body: {} });
+    await held;
+    const sameResume = await call({ method: "POST", url: `/imports/${cancelled[0]}/resume` });
+    expect([sameResume.status, sameResume.json.error?.message]).toEqual([409, "Another import from this Zotero library is running."]);
+    expect((await call({ method: "POST", url: `/imports/${cancelled[1]}/resume` })).status).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${w}/import`, body: { adapter: { kind: "zotero-web", libraryType: "group", libraryId: "9" } } })).status).toBe(200);
+    await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
+    await svc.state.idle();
+  });
 });
 
 describe("undo of a sync batch (R206, R242)", () => {
@@ -628,6 +678,8 @@ describe("undo of a sync batch (R206, R242)", () => {
     expect(plain.json).not.toHaveProperty("zoteroSync");
     expect((await state()).links[0].paused).toBeUndefined();
 
+    // R248: the batch says itself that it is the sync's: a history file set aside does not make the undo forget.
+    await writeFile(join(deps.appConfigDir, "zotero-sync-history.json"), "{ damaged");
     const undone = await call({ method: "POST", url: `/imports/${run.batchId}/undo` });
     expect(undone.status, undone.body).toBe(200);
     expect(undone.json.zoteroSync).toEqual({ paused: true, message: "Syncing this Zotero library is paused. Turn it on again on the Zotero screen." });

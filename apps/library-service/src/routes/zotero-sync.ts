@@ -102,14 +102,12 @@ interface CurrentRun {
  * The one sync in progress in this service, its abort, and the back-off Zotero asked for (Task Z8, point 4). It lives
  * in the service's state (`state.zoteroSync`); closing or switching the library, a move and the shutdown call `stop`
  * BEFORE the running batches are suspended and the library's lock is released, so the run ends with its record
- * ("stopped", "app-closed") and writes nothing after.
+ * ("stopped", "library-closed"; "app-closed" at the app's shutdown) and writes nothing after.
  */
 export class ZoteroSyncHolder {
   private current: CurrentRun | undefined;
   /** The latest moment Zotero asked this app to wait until (ms), as kept by the last record or key check. */
   private backoffUntil: number | undefined;
-  /** What the last successful key check found the key may read (in this process); what clears a key or library pause. */
-  private access: { userId: string; library: boolean; groups: Set<string> } | undefined;
 
   /** The run in progress: which link, and how far. */
   get running(): { ref: string; projectId: string; done: number; total: number } | undefined {
@@ -132,18 +130,6 @@ export class ZoteroSyncHolder {
   noteAsked(until: number, now: number): void {
     const kept = Math.min(Math.max(until, now + ZOTERO_SYNC_MIN_BACKOFF_MS), now + ZOTERO_SYNC_MAX_BACKOFF_MS);
     this.backoffUntil = Math.max(this.backoffUntil ?? 0, kept);
-  }
-
-  noteAccess(a: LibraryKeyAccess | undefined): void {
-    this.access = a ? { userId: a.userId, library: a.personal.library, groups: new Set(a.groups.map((g) => g.ref)) } : undefined;
-  }
-
-  /** Whether the last successful key check (in this process) found that the key reads `ref`. */
-  keyReads(ref: string): boolean {
-    const a = this.access;
-    if (!a) return false;
-    const [type, id] = ref.split(":");
-    return type === "user" ? a.library && a.userId === id : a.groups.has(ref);
   }
 
   /**
@@ -214,7 +200,6 @@ export class ZoteroSyncHolder {
         );
         // The runner's record carries the back-off actually in force: kept in place of ours.
         if (run.backoffUntil !== undefined) this.backoffUntil = Date.parse(run.backoffUntil);
-        if (run.reason === "key-refused" || run.reason === "library-gone") this.access = undefined;
         // The batch leaves the registry with the run (a stopped run's batch is paused on disk, resumed by the next run).
         if (run.batchId && s.batches.get(run.batchId)) s.batches.delete(run.batchId);
         const shown = await withCounts(s, run);
@@ -235,15 +220,16 @@ export class ZoteroSyncHolder {
 
   /**
    * Stops the run in progress (its batch is suspended at its next safe point, resumable by the next run) and waits for
-   * its record, at most STOP_WAIT_MS. `app-closed` (close, switch, move, shutdown) also ends its events: none after.
+   * its record, at most STOP_WAIT_MS. `library-closed` (close, switch, move) and `app-closed` (the app's shutdown) also
+   * end its events: none after.
    * Returns the record of the link that ended last, or undefined when no run was in progress.
    */
-  async stop(reason: "stopped-by-you" | "app-closed"): Promise<{ last?: ZoteroSyncRun } | undefined> {
+  async stop(reason: "stopped-by-you" | "library-closed" | "app-closed"): Promise<{ last?: ZoteroSyncRun } | undefined> {
     const cur = this.current;
     if (!cur) return undefined;
     cur.ac.abort(reason);
     await withTimeout(cur.ended, STOP_WAIT_MS);
-    if (reason === "app-closed") cur.live = false;
+    if (reason !== "stopped-by-you") cur.live = false;
     return cur.last ? { last: cur.last } : {};
   }
 }
@@ -400,6 +386,29 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     };
   }
 
+  /** Whether the key check's answer says the key reads `ref`. */
+  const reads = (a: LibraryKeyAccess, ref: string) => {
+    const [type, id] = ref.split(":");
+    return type === "user" ? a.personal.library && a.userId === id : a.groups.some((g) => g.ref === ref);
+  };
+  async function clearRefusals(s: Session, a: LibraryKeyAccess): Promise<void> {
+    const clears = (l: ZoteroSyncLink) => l.paused === "key-refused" || (l.paused === "library-gone" && reads(a, l.ref));
+    try {
+      if (!(await readZoteroSyncSettings(dir(), s.lib.id)).links.some(clears)) return;
+      await updateZoteroSyncSettings(dir(), s.lib.id, (cur) => ({
+        ...cur,
+        links: cur.links.map((l) => {
+          if (!clears(l)) return l;
+          const { paused: _p, ...rest } = l;
+          return rest;
+        }),
+      }));
+    } catch (err) {
+      // A settings file of a newer version, or one that cannot be read: left as it is; the check's answer stands.
+      state.opts.log.info({ note: err instanceof Error ? err.name : "error" }, "zotero key check: the pauses could not be cleared");
+    }
+  }
+
   const backingOff = (until: number) => new ApiError(409, "CONFLICT", zoteroSyncReasonText("backing-off", now(), new Date(until).toISOString()), "backing-off");
 
   // ---- what the saved key may read ----
@@ -423,12 +432,15 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
       }
       if (err.backoffUntil !== undefined) holder.noteAsked(err.backoffUntil, now().getTime());
       const a = ACCOUNT[err.reason];
-      if (err.reason === "key-refused") holder.noteAccess(undefined);
       const message = a.reason === "backing-off" ? zoteroSyncReasonText("backing-off", now(), err.backoffUntil !== undefined ? new Date(err.backoffUntil).toISOString() : undefined) : ZOTERO_SYNC_REASON_TEXT[a.reason];
       throw new ApiError(a.status, a.code, message, a.reason);
     }
     if (access.backoffUntil !== undefined) holder.noteAsked(access.backoffUntil, now().getTime());
-    holder.noteAccess(access);
+    // R248: a key that works again clears the pauses Zotero's refusals set, for every link of the open library at once
+    // (one settings write): `key-refused` everywhere, `library-gone` where the key now reads the library. A failed
+    // check (above) clears nothing; `undone` is the researcher's own and only a settings save clears it.
+    const open = state.session;
+    if (open && open.lib.mode === "read-write") await clearRefusals(open, access);
     const out: ZoteroKeyAccess = {
       userId: access.userId,
       personal: { library: access.personal.library, files: access.personal.files, notes: access.personal.notes, write: access.personal.write },
@@ -448,15 +460,14 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     const stored = await readSettings(dir(), s.lib.id);
     const r = settingsRequest(bodyOf(req), s, stored);
     try {
-      // Only this computer's file, in the runner's serialised turn; what clears each pause is Z7's table: the
-      // researcher's save clears `undone`; `key-refused` and `library-gone` only once a key check (in this process)
-      // found that the key reads the library again.
+      // Only this computer's file, in the runner's serialised turn.
       await updateZoteroSyncSettings(dir(), s.lib.id, (cur) => ({
         automatic: r.automatic,
         everyMinutes: r.everyMinutes,
         links: r.links.map((l) => {
           const was = cur.links.find((x) => x.ref === l.ref && x.projectId === l.projectId);
-          const keep = was?.paused && was.paused !== "undone" && !holder.keyReads(l.ref) ? was.paused : undefined;
+          // A save clears `undone`; `key-refused` and `library-gone` are cleared only by a successful key check (R248).
+          const keep = was?.paused && was.paused !== "undone" ? was.paused : undefined;
           return { ref: l.ref, projectId: l.projectId, fullDone: was?.fullDone ?? false, options: { structure: l.structure, duplicates: l.duplicates }, ...(keep ? { paused: keep } : {}) };
         }),
       }));

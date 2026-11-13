@@ -9,7 +9,6 @@ import type { ImportOptionsInput } from "@ao/core";
 import {
   adapterFor,
   pauseLink,
-  readZoteroSyncHistory,
   researcherName,
   researcherNameOk,
   resumeZoteroWebImport,
@@ -124,8 +123,8 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
       const shown = listed?.state;
       if (action !== "resume") throw new ApiError(409, "CONFLICT", "This import is not running.", shown);
       if (shown === "finished" || shown === "undone") throw new ApiError(409, "CONFLICT", "This import has already finished.", shown);
-      // Not while a sync runs (the batch list does not say which Zotero library a batch is of: none is resumed by hand meanwhile; Z8).
-      if (listed?.kind === "zotero-web" && state.zoteroSync.running) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.importRunning);
+      // Not while a sync of the same Zotero library runs (Z8, R248).
+      if (listed?.ref && zoteroSyncRunning(s.lib.id, listed.ref)) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.importRunning);
       // A Zotero Web batch resumes with the version it started from and records the new one when done (Z2).
       const h =
         listed?.kind === "zotero-web"
@@ -140,13 +139,14 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const batchId = paramsOf(req).batchId ?? "";
     const projectId = await batchProject(state, batchId);
+    // The batch says itself whether it is the sync's, and of which Zotero library (its own record, R248).
+    const listed = (await s.bulk.listBatches(projectId)).find((b) => b.batchId === batchId);
     const r = await s.bulk.undoBatch(projectId, batchId);
     s.batches.delete(batchId);
     state.publishState();
     // An undo of a sync's batch pauses its link in the same request, so the next sync does not at once bring back what
-    // was undone (R206 4, R242 b). The sync's batch is known by its record in this computer's history (the batch list
-    // does not carry its origin).
-    const run = (await readZoteroSyncHistory(state.deps.appConfigDir, s.lib.id).catch(() => [])).find((x) => x.batchId === batchId && x.projectId === projectId);
+    // was undone (R206 4, R242 b).
+    const run = listed?.origin === "zotero-sync" && listed.ref ? { ref: listed.ref } : undefined;
     if (!run) return r;
     let note: ZoteroSyncUndoNote = { paused: true, message: ZOTERO_SYNC_SENTENCES.undonePaused };
     try {

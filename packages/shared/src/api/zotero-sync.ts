@@ -6,7 +6,11 @@
  *
  *   POST /zotero/key-check         {} → ZoteroKeyCheckResponse        checks the key SAVED in this computer's password
  *                                                                     store (it is stored only through
- *                                                                     PUT /secrets/zotero-api-key); never answers the key
+ *                                                                     PUT /secrets/zotero-api-key); never answers the key.
+ *                                                                     No body: no key ever travels in it (R248). A
+ *                                                                     successful check clears every link's `key-refused`
+ *                                                                     pause (and `library-gone` where the key reads it
+ *                                                                     again); a failed one clears nothing.
  *   GET  /zotero/sync              → ZoteroSyncStateResponse
  *   PUT  /zotero/sync/settings     ZoteroSyncSettingsRequest → ZoteroSyncStateResponse   (writes this computer's file only)
  *   POST /zotero/sync/run          ZoteroSyncRunRequest → 202 ZoteroSyncRunResponse
@@ -36,6 +40,7 @@ export type ZoteroSyncReason =
   | "too-large"
   | "stopped-by-you"
   | "app-closed"
+  | "library-closed"
   | "import-running"
   | "error"
   | "sync-undone"
@@ -167,6 +172,7 @@ export const ZOTERO_SYNC_REASONS_LIST: readonly ZoteroSyncReason[] = [
   "too-large",
   "stopped-by-you",
   "app-closed",
+  "library-closed",
   "import-running",
   "error",
   "sync-undone",
@@ -178,8 +184,8 @@ export const ZOTERO_SYNC_REASONS_LIST: readonly ZoteroSyncReason[] = [
 /**
  * One sentence for every reason. `backing-off` holds `{until}`: zoteroSyncReasonText fills in the time Zotero asked
  * for. `zotero-error`, `no-store`, `too-large` and `error` follow the Web import's sentences (ZOTERO_WEB_REASONS)
- * without their "so nothing was imported" (the status line says what was changed); `batch-ended` follows the runner's
- * note (ZOTERO_SYNC_ENDED_NOTE).
+ * without their "so nothing was imported" (the status line says what was changed). `batch-ended` and `library-closed`
+ * are the coordinator's (R248).
  */
 export const ZOTERO_SYNC_REASON_TEXT: Readonly<Record<ZoteroSyncReason, string>> = {
   offline: "Zotero could not be reached; check the internet connection.",
@@ -195,12 +201,13 @@ export const ZOTERO_SYNC_REASON_TEXT: Readonly<Record<ZoteroSyncReason, string>>
   "too-large": "Zotero sent a response that is too large or holds too many items.",
   "stopped-by-you": "You stopped it.",
   "app-closed": "The app was closed during the sync; it continues next time.",
+  "library-closed": "The library was closed or moved during the sync; it continues next time.",
   "import-running": "Another import from this Zotero library is running.",
   error: "Something went wrong during the sync.",
   "sync-undone": "You undid this library's last sync, so syncing is paused until you turn it on again on this screen.",
   "deletions-unconfirmed": "This sync could not confirm which items were deleted in Zotero, so the next sync will read the whole library again.",
   "changes-incomplete": "This sync could not read everything that changed in Zotero. The next sync asks for the same changes again.",
-  "batch-ended": "This sync could not be resumed, so it was ended; what it brought in stays. The next sync reads the whole Zotero library again.",
+  "batch-ended": "An unfinished sync could not be continued, so it was closed. The next sync starts again from the beginning.",
 };
 
 /** The service's own sentences about syncing. */
