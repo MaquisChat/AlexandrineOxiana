@@ -740,6 +740,16 @@ describe("cloud-drive folders: the engine reads nothing it may not (Task W2)", (
     expect(await snapshot(inbox)).toEqual(before);
   });
 
+  it("a folder put into a recursive watch is watched, and a file put in it later comes in", async () => {
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, recursive: true });
+    await w.ready;
+    await mkdir(join(inbox, "New folder"));
+    await sleep(500);
+    await writeFile(join(inbox, "New folder", "later.pdf"), await buildPdf({ title: "In a new folder", extra: "newdir" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "New folder/later.pdf"));
+  });
+
   it("a Google pointer file is listed with its sentence", async () => {
     const p = await project();
     const real = await realpath(inbox);

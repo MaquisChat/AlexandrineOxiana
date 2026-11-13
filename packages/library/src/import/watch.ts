@@ -50,11 +50,10 @@
  * never silently emptied.
  */
 import { createHash } from "node:crypto";
-import type { BigIntStats } from "node:fs";
+import { watch as fsWatch, type BigIntStats, type FSWatcher } from "node:fs";
 import fsp, { type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { watch as chokidarWatch, type FSWatcher } from "chokidar";
 import { WatchedFolderOptions, type WatchedFolder, type WatchedFolderOptions as WatchedFolderOptionsT } from "@ao/core";
 import { raiseDeviceNotice } from "../device-notices.js";
 import { writeSmallFileAtomic } from "../fs/atomic.js";
@@ -404,7 +403,6 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let unreachable: string | null = null;
   /** Paused because the project is locked: a full scan follows the unlock. */
   let locked = false;
-  let watcher: FSWatcher | undefined;
   /** SHA-256 of every file already in the project (read when first needed, kept up to date). */
   let known: Set<string> | null = null;
 
@@ -616,50 +614,51 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
 
   // ---- the watcher ------------------------------------------------------------------------------------------
+  // Events come from Node's own `fs.watch`, one per watched FOLDER (the folder itself, and each folder inside it
+  // when the watch is recursive), never one per file. It does not poll, makes no `stat`/`lstat`/`readdir` of its
+  // own and opens no file: an event only names a file to look at (the steps below decide everything, through the
+  // gate). chokidar 5.0.0 is not used here: it keeps one fs.watch per FILE (on macOS a kqueue handle opens each
+  // file; ~2.2 KB of heap per file, 88 MB at 40,000 files, measured in watch.scale.test.ts), `lstat`s every entry
+  // at start and lists and `lstat`s a whole folder again on each of its events — all outside this folder's gate.
+  // What remains outside the gate: creating each folder's watch is one synchronous system call (inotify on
+  // Linux, FSEvents on macOS) made on the main thread when the folder is (re)listed. On the owner's Mac list.
+  const dirWatchers = new Map<string, FSWatcher>();
   async function closeWatcher(): Promise<void> {
-    const w = watcher;
-    watcher = undefined;
-    await w?.close().catch(() => {});
+    for (const w of dirWatchers.values()) w.close();
+    dirWatchers.clear();
+  }
+  function watchDir(d: string): void {
+    if (!eventsOn || stopped || unreachable || dirWatchers.has(d)) return;
+    let w: FSWatcher;
+    try {
+      w = fsWatch(d, { persistent: true });
+    } catch {
+      if (d === realRoot) emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
+      return; // the next scan finds what this folder holds
+    }
+    dirWatchers.set(d, w);
+    w.on("change", (eventType, name) => {
+      if (stopped || unreachable) return;
+      if (name === null || name === undefined) {
+        if (!walk) startWalk(); // the system lost track of names: the folder is listed again
+      } else {
+        const abs = resolve(d, String(name));
+        if (!within(realRoot, abs)) return;
+        const rel = relName(abs);
+        if (rel.split("/").some((s) => nameRule(s)?.skip === "silent")) return;
+        // A new or renamed name is told (an "add"); a change of content is quiet (already-known content is skipped silently).
+        addPending(rel, eventType === "change" ? QUIET : 0);
+      }
+      wake();
+    });
+    w.on("error", () => {
+      w.close();
+      dirWatchers.delete(d);
+      if (d === realRoot && !unreachable && !stopped) emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
+    });
   }
   async function startWatcher(): Promise<void> {
-    if (!eventsOn || stopped || watcher) return;
-    // chokidar is told not to poll (`usePolling: false`) and not to wait for writes to finish (no
-    // `awaitWriteFinish`): stability is this module's own rule, and its events only name files to look at.
-    // What chokidar still does by itself, outside this folder's gate (R208 d, f; on the owner's Mac list):
-    //   - at start, it lists the folder (and each subfolder, when recursive) and `lstat`s every entry, and it
-    //     opens one file-system watch per file and per folder (fs.watch);
-    //   - on each event of a folder it lists that folder again and `lstat`s its entries (at most once a second
-    //     per folder), and on each event of a file it `stat`s that file;
-    //   - it reads no file's content (it opens a file only on Windows, to tell an EPERM apart).
-    // A folder that stops answering closes the watcher (no further events, so none of these calls).
-    const w = chokidarWatch(realRoot, {
-      ignoreInitial: true,
-      persistent: true,
-      followSymlinks: false,
-      usePolling: false,
-      alwaysStat: false,
-      depth: opts.recursive ? MAX_DEPTH : 0,
-      // The folder itself is never ignored; anything below it with a name skipped in silence (or in such a folder) is.
-      ignored: (p: string) => {
-        const abs = resolve(p);
-        return abs !== realRoot && relName(abs).split("/").some((s) => nameRule(s)?.skip === "silent");
-      },
-    });
-    watcher = w;
-    const onPath = (flags: number) => (p: string) => {
-      if (stopped) return;
-      const abs = resolve(realRoot, p);
-      if (!within(realRoot, abs)) return;
-      addPending(relName(abs), flags);
-      wake();
-    };
-    w.on("add", onPath(0));
-    w.on("change", onPath(QUIET));
-    w.on("unlink", onPath(QUIET));
-    w.on("error", () => {
-      if (!unreachable) emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
-    });
-    await new Promise<void>((r) => w.once("ready", () => r()));
+    watchDir(realRoot);
   }
 
   // ---- the worker: everything this folder does, one step at a time --------------------------------------------
@@ -691,7 +690,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       if (nameRule(e.name)?.skip === "silent") continue;
       const p = join(d, e.name);
       if (e.isDirectory()) {
-        if (opts.recursive && depth < MAX_DEPTH) w.dirs.push({ dir: p, depth: depth + 1 });
+        if (opts.recursive && depth < MAX_DEPTH) {
+          watchDir(p);
+          w.dirs.push({ dir: p, depth: depth + 1 });
+        }
       } else if (e.isFile() || e.isSymbolicLink()) {
         const rel = relName(p);
         w.found.add(rel);
@@ -753,6 +755,16 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
     if (st.isSymbolicLink()) {
       await linkOne(rel, abs, r, flags);
+      return;
+    }
+    if (st.isDirectory()) {
+      // A folder put in a recursive watch: watched, and listed (what it holds goes through the same steps).
+      const depth = rel.split("/").length;
+      if (opts.recursive && depth <= MAX_DEPTH && !dirWatchers.has(abs)) {
+        watchDir(abs);
+        if (walk) walk.dirs.push({ dir: abs, depth });
+        else walk = { dirs: [{ dir: abs, depth }], found: new Set(), complete: false };
+      }
       return;
     }
     if (!st.isFile()) return;
