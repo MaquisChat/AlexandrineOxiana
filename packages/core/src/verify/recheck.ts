@@ -179,11 +179,17 @@ export function recheckSourceFile(sf: SourceFile, ctx: VerifyContext): SourceFil
     if (v.status === "conflict" && v.checks.includes(ZOTERO_CONFLICT_CHECK)) {
       // Z6 (R236 c): a field changed in Zotero and here stays as the update recorded it (its reason, the value Zotero
       // gave) while both of its values are still what it recorded: the value here, and Zotero's newest. Settled by the
-      // researcher's own evidence (the fresh check says user-confirmed), or by either value moving on: then the fresh
-      // check speaks.
+      // researcher's own evidence, or by either value moving on: then the fresh check speaks.
+      // I5 (fix round 2): the researcher's evidence settles it only when it is NEWER than Zotero's newest evidence for
+      // the field — later in `fieldEvidence`, the order in which every change appends (a confirm takes its own earlier
+      // evidence out and appends the new one). Position, never time: two entries recorded in the same second are still
+      // ordered. An older "keep mine" does not answer the question Zotero raised after it.
       const zotero = [...claims].reverse().find((e) => e.field === k && e.source.kind === "zotero");
       const still = zotero && isDeepStrictEqual(zotero.value, v.values?.[0]?.value) && isDeepStrictEqual(getByPointer(sf.source as unknown as Record<string, unknown>, k), v.current);
-      if (still && report.fields[k]?.status !== "user-confirmed") verification[k] = structuredClone(v);
+      const all = validEvidence(sf.fieldEvidence);
+      const lastAt = (kind: (e: FieldEvidence) => boolean) => all.reduce((at, e, i) => (e.field === k && kind(e) ? i : at), -1);
+      const userNewer = lastAt((e) => e.source.kind === "user") > lastAt((e) => e.source.kind === "zotero");
+      if (still && !(userNewer && report.fields[k]?.status === "user-confirmed")) verification[k] = structuredClone(v);
       continue;
     }
     if (v.status !== "user-confirmed") continue;

@@ -82,7 +82,7 @@ export interface UpdatePlan {
    */
   conflicts: Array<{ path: string; value: unknown }>;
   /**
-   * R236 a (with `conflicts`): fields the source no longer has a value for that have one here: kept here, edited or
+   * R236 a (with `keepCleared`: both Zotero importers): fields the source no longer has a value for that have one here: kept here, edited or
    * not; the clearing is in `evidence` as an empty value (`null`), so it is noticed once. Not emptied, not asked.
    */
   cleared: string[];
@@ -113,10 +113,10 @@ export function conflictVerification(cur: SourceFile, c: { path: string; value: 
  * Task Z6 (`opts.conflicts`): changed on both sides to different values, both present → `conflicts`; the same value
  * on both sides is no conflict (the value is recorded as evidence only); the researcher cleared it here → `kept`, as
  * before (the existing confirm cannot record an empty value, so such an entry could not be settled as the researcher
- * chose); the source cleared it while it has a value here (edited or not) → `cleared` (R236 a: kept here, noted once,
+ * chose); the source cleared it while it has a value here (edited or not) → `cleared` (`opts.keepCleared`, R236 a: kept here, noted once,
  * counted; never emptied).
  */
-export function planUpdate(cur: SourceFile, ref: Partial<SourceDraft>, source: FieldEvidence["source"], at: string, opts: { conflicts?: boolean } = {}): UpdatePlan {
+export function planUpdate(cur: SourceFile, ref: Partial<SourceDraft>, source: FieldEvidence["source"], at: string, opts: { conflicts?: boolean; keepCleared?: boolean } = {}): UpdatePlan {
   const next = referenceValues(ref);
   const plan: UpdatePlan = { filled: [], evidence: [], kept: [], conflicts: [], cleared: [] };
   const s = cur.source;
@@ -132,15 +132,15 @@ export function planUpdate(cur: SourceFile, ref: Partial<SourceDraft>, source: F
         recorded = true;
       }
     }
-    // "What the last import brought", for telling a change here: with the Zotero sync rules (`conflicts`), the last
+    // "What the last import brought", for telling a change here: with `keepCleared`, the last
     // VALUE the source gave (a clearing noted since is not a value here's field can have kept); otherwise, as before.
-    const prev = opts.conflicts ? lastValue : seen;
+    const prev = opts.keepCleared ? lastValue : seen;
     const nv = next.get(path);
     if (recorded && isDeepStrictEqual(nv, seen)) continue; // unchanged at the source (a clearing noticed once)
     const now = asEvidence(path, getAt(s, path));
     // R236 a (Zotero Web): the source no longer has a value that this field has here: the value here stays, edited or
     // not; the clearing is recorded as the source's evidence (an empty value), so it is noticed once, and counted.
-    if (opts.conflicts && recorded && nv === undefined && now !== undefined) {
+    if (opts.keepCleared && recorded && nv === undefined && now !== undefined) {
       plan.cleared.push(path);
       plan.evidence.push({ field: path, value: null, source, at });
       continue;

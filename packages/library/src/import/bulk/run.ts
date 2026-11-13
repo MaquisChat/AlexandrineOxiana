@@ -1841,7 +1841,10 @@ class Run {
     const newInputs = inputs.filter((f) => !haveSha.has(prep.shaOf.get(f.path) ?? ""));
     // Z6 (Zotero Web): a field changed in Zotero and here becomes a conflict for the researcher, not a kept field.
     const conflicts = this.zoteroWeb;
-    const pre = planUpdate(target, ref, evSource, new Date().toISOString(), { conflicts });
+    // R236 a (fix round 2): a field Zotero cleared is kept here (noted once, counted) by BOTH Zotero importers; the
+    // conflicts above are the account sync's alone, as the plan says.
+    const keepCleared = this.zoteroWeb || this.rec.source.kind === "zotero-local";
+    const pre = planUpdate(target, ref, evSource, new Date().toISOString(), { conflicts, keepCleared });
     const preAnn = this.annotationPlan(item, target, prep, "");
     this.projectTags ??= await projectCollectionsAndTags(this.repo, this.projectId);
     const known = this.projectTags.tags;
@@ -1893,7 +1896,7 @@ class Run {
       async (ops, cur) => {
         const back = cur.source.availability.zotero !== undefined ? this.restoreFor(cur.source.id, cur.source.availability) : undefined;
         const backTo = back?.to;
-        const plan = planUpdate(cur, ref, evSource, ops.tx.at, { conflicts });
+        const plan = planUpdate(cur, ref, evSource, ops.tx.at, { conflicts, keepCleared });
         const added = await this.addFiles(ops, cur, inputs);
         const merged = applyMerge(cur, added, plan.filled, plan.evidence, ops.tx.at, ops.tx.actor, tagIds);
         // Z6: the conflicts' own evidence (Zotero's value) is recorded with them, and taken off with them by undo.
