@@ -183,7 +183,8 @@ describe("this computer's choices for a watched folder (Task W4)", () => {
     expect(CHOICES_SET_ASIDE_WARNING).toBe(
       "This computer's choices for its watched folders were damaged and were set aside. Folders whose choices could not be kept went back to the defaults.",
     );
-    const other = (await addWatchedFolder(d, projectId, join(tmp, "Inbox"))).id;
+    await mkdir(join(tmp, "Inbox2"));
+    const other = (await addWatchedFolder(d, projectId, join(tmp, "Inbox2"))).id; // one folder feeds one project (I6)
     await setWatchChoices(d, projectId, other, { paused: true });
     const text = JSON.parse(await readFile(join(config, WATCH_CHOICES_FILE), "utf8")) as Record<string, Record<string, Record<string, unknown>>>;
     text[lib.id]![projectId]![watchId] = { paused: "no" };

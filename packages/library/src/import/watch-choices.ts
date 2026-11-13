@@ -226,7 +226,8 @@ export async function reserveWatchDownload(deps: WatchSettingsDeps, projectId: s
   if (!count(bytes) || !count(confirmation)) throw new InvalidInputError("Not a number of bytes.");
   return update<WatchDownloadReservation>(deps, (s) => {
     const cur = recordOf(s, deps, projectId, watchId);
-    if (!cur || cur.confirmation === 0 || confirmation === 0) return { write: false, out: { reserved: false, reason: "held" } };
+    // No confirmation, or a confirmation of 0 bytes: nothing is agreed, so nothing at all (fix round 2).
+    if (!cur || cur.confirmation === 0 || confirmation === 0 || cur.confirmedBytes === 0) return { write: false, out: { reserved: false, reason: "held" } };
     if (cur.confirmation !== confirmation) return { write: false, out: { reserved: false, reason: "stale" } };
     const limit = cur.confirmedBytes + (later ? LATER_ARRIVALS_BYTES : 0);
     const total = cur.fetchedBytes + bytes;

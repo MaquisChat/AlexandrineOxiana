@@ -74,6 +74,7 @@ const appendFile = tracked(fsp.appendFile);
 const mkdir = tracked(fsp.mkdir);
 const rename = tracked(fsp.rename);
 const rm = tracked(fsp.rm);
+const unlink = tracked(fsp.unlink);
 const symlink = tracked(fsp.symlink);
 const truncate = tracked(fsp.truncate);
 const chmod = tracked(fsp.chmod);
@@ -2710,7 +2711,7 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 100 });
 
     // Another regular file put in its place at the same moment (another inode): opened, compared, and nothing read.
-    await rm(x);
+    await unlink(x);
     await sparse(join(inbox, "y.pdf"), 100);
     await sparse(join(tmp, "other.pdf"), 100);
     const y = join(real, "y.pdf");
@@ -2722,6 +2723,7 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     const { w: w2 } = start(q2, { ...FASTW, watchId: qid, fetchContent: undefined, watchEvents: false, rescanMs: 600_000, fs: { lstat: hookedY.lstat, open } });
     await w2.ready;
     await until(() => w2.status().counts.notDownloaded === 1);
+    await until(() => w2.status().downloadHeld !== undefined); // the first confirmation is used up: nothing runs now
     hookedY.arm(async (n) => {
       if (n === 3) await rename(join(tmp, "other.pdf"), y);
     });
@@ -2990,7 +2992,10 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await mkdir(join(tmp, "Other"));
     const bw = await watched(b, join(tmp, "Other"));
     await expect(setWatchFolder({ repo, lib }, b.id, bw, join(tmp, "Alias"))).rejects.toThrow(sentence);
-    const err = await addWatchedFolder({ repo, lib }, b.id, inbox).catch((e: unknown) => e as Error);
+    const err = await addWatchedFolder({ repo, lib }, b.id, inbox).then(
+      () => new Error("added"),
+      (e: unknown) => e as Error,
+    );
     expect(err.message).not.toContain(a.name); // no project is named
     expect(err.message).not.toContain(tmp);
     expect((await listWatchedFolders({ repo, lib }, b.id)).map((x) => x.id)).toEqual([bw]); // nothing was added for b

@@ -225,6 +225,14 @@ export const WATCH_REASONS = {
   choicesUnreadableNow: "This computer's choices for this folder could not be read just now, so nothing is downloaded until they can be.",
   /** W4 fix round 1, I1 (proposed wording): a second watch of the same watch id, or of the same folder, in this process. */
   alreadyWatched: "This folder is already being watched here, so it is not watched a second time.",
+  /** Fix round 2, I6 (ruled): adding a folder that is already watched for a project of this library on this computer. */
+  folderAlreadyWatched: "This folder is already watched. A folder can be watched for one project at a time.",
+  /** Fix round 2, I6 (ruled): an older record of a folder another project's watch (added earlier) keeps. */
+  folderOfAnotherProject: "This folder is already watched for another project. A folder can be watched for one project at a time.",
+  /** Fix round 2 (ruled): a file not downloaded whose size reads 0 — its true size is not known, so it is never fetched. */
+  sizeUnknown: "The size of this file is not known until it is downloaded, so it is left for you to download yourself.",
+  /** Fix round 2, N1 (proposed wording): "download" chosen, and no size agreed yet (or 0 bytes). */
+  nothingAgreed: "Nothing is downloaded until you agree to a size. {files} files ({size}) are waiting for your word.",
 } as const;
 
 /** A reason with `{provider}` filled: the cloud service's name, or "the system" for a plain folder. */
@@ -235,6 +243,11 @@ export function withProvider(reason: string, provider: CloudProvider | null): st
 /** A reason about a download with `{provider}` filled: the cloud service's name, or "the cloud service". */
 export function withService(reason: string, provider: CloudProvider | null): string {
   return reason.replaceAll("{provider}", provider ? PROVIDER_NAMES[provider] : "the cloud service");
+}
+
+/** `{files} files` filled in the en-US number style, "1 file" for one (N3). */
+export function filesText(reason: string, n: number): string {
+  return reason.replace("{files} files", n === 1 ? "1 file" : `${n.toLocaleString("en-US")} files`);
 }
 
 /** A size in the interface's style (packages/ui `formatSize`): "300 bytes", "4 kB", "12 MB", "3.2 GB". */
@@ -386,7 +399,10 @@ export interface FolderWatch {
   status(): WatchStatus;
   /** Files that did not come in, newest first (at most WATCH_PROBLEMS_MAX are kept). */
   problems(o: { kind?: WatchFileKind; offset: number; limit: number }): { total: number; items: WatchFileProblem[] };
-  /** Reads this computer's choices for the folder now (after the researcher changed them; W7). Never throws. */
+  /**
+   * Reads this computer's choices for the folder now. Never throws. W7 calls it after each change it makes
+   * (`setWatchChoices`); otherwise a running watch reads them by itself only every WATCH_CHOICES_POLL_MS (N4).
+   */
   refreshChoices(): Promise<void>;
 }
 
@@ -692,7 +708,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     return true;
   };
   const idKey = `id\u0000${deps.lib.id}\u0000${projectId}\u0000${String(watchId)}`;
-  const refused = activeWatches.has(idKey) || activeWatches.has(`dir\u0000${root}`) || !claim(idKey) || !claim(`dir\u0000${root}`);
+  // The folder itself is claimed in `ready`, once it is known which watch keeps it (I6): never by who starts first.
+  const refused = activeWatches.has(idKey) || !claim(idKey);
   /** Why the folder cannot be used now (missing, not permitted, not responding), or null. */
   let unreachable: string | null = null;
   /** Paused because the project is locked: a full scan follows the unlock. */
@@ -743,9 +760,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   /** A complete listing has been made (a confirmation seen after it knows which files the researcher saw). */
   let listedOnce = false;
   /**
-   * The download allowed by the researcher's last confirmation: `fetched` bytes counted so far (also in the device
-   * file); `seen` the files not downloaded when this watch saw the confirmation (null: not known — every file is
-   * then held to `confirmedBytes`, the tighter limit); `held` once a file would pass the allowance.
+   * The download allowed by the researcher's last confirmation (the bytes reserved are counted ONLY in the device
+   * record, which decides): `seen` the files not downloaded when this watch saw the confirmation (null: not known —
+   * every file is then held to `confirmedBytes`, the tighter limit); `held` once the record refused a reservation, or
+   * while nothing was agreed (no confirmation, or 0 bytes).
    */
   let dl: { identity: string; confirmation: number; confirmedBytes: number; seen: Set<string> | null; held: boolean } | null = null;
   /** Files that could not be downloaded: not tried again before this time. */
@@ -1173,7 +1191,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
                 : choicesFailed && choices?.notDownloaded === "download"
                   ? WATCH_REASONS.choicesUnreadableNow
                   : held
-                  ? WATCH_REASONS.downloadHeld.replace("{files}", heldFiles.toLocaleString("en-US")).replace("{size}", sizeText(ndBytes))
+                  ? filesText(dl!.confirmation === 0 || dl!.confirmedBytes === 0 ? WATCH_REASONS.nothingAgreed : WATCH_REASONS.downloadHeld, heldFiles).replace("{size}", sizeText(ndBytes))
                   : massGone
                     ? withProvider(WATCH_REASONS.massGone, provider)
                     : noCollection
@@ -1900,7 +1918,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         // complete listing; otherwise every file is held to the confirmed size, the tighter limit.
         const live = before !== null && listedOnce && !pausedNow();
         // No confirmation on record: nothing at all is downloaded, 0 bytes included (I4); held for the researcher's word.
-        dl = { identity, confirmation: count.confirmation, confirmedBytes: c.confirmedBytes, seen: live ? new Set(ndOrder) : null, held: count.confirmation === 0 };
+        dl = { identity, confirmation: count.confirmation, confirmedBytes: c.confirmedBytes, seen: live ? new Set(ndOrder) : null, held: count.confirmation === 0 || c.confirmedBytes === 0 };
         dlNextAt = 0;
       }
     }
@@ -1930,6 +1948,11 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     startWalk();
   }
   const downloadDue = () => downloading() && !dl!.held && fetching === null && Date.now() >= dlNextAt && ndOrder.size > 0 && !locked && !unreachable && regReady && registerProblem === null;
+  /** A file not here whose size reads 0: listed with its sentence (once), never fetched. */
+  function sizeNotKnown(rel: string) {
+    if (problemList.get(rel)?.reason === WATCH_REASONS.sizeUnknown) return;
+    setProblem(rel, { file: rel, kind: "not-downloaded", reason: WATCH_REASONS.sizeUnknown, bytes: 0 });
+  }
   /** A file the service did not download: listed (still counted as not downloaded), and tried again after `downloadRetryMs`. */
   function couldNotDownload(rel: string, r: Reading) {
     setRec(rel, r, records.get(rel)?.kind === "unknown" ? "unknown" : "nd");
@@ -1963,6 +1986,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     let soonest = now + pollMs;
     for (const rel of ndOrder) {
       if (pending.has(rel) || settling.has(rel) || busy.has(rel)) continue;
+      // A size of 0 says nothing about a file that is not here (a provider may show a placeholder as empty): it is
+      // never fetched under an allowance; it is left for the researcher to download.
+      if (records.get(rel)?.size === 0) {
+        sizeNotKnown(rel);
+        continue;
+      }
       const at = dlRetry.get(rel) ?? 0;
       if (at > now) {
         soonest = Math.min(soonest, at);
@@ -2002,6 +2031,11 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       return;
     }
     if (!(await insideRoot(abs))) return report(rel, a, "could-not-import", WATCH_REASONS.outside);
+    if (a.size === 0) {
+      setRec(rel, a, records.get(rel)?.kind === "unknown" ? "unknown" : "nd");
+      sizeNotKnown(rel);
+      return;
+    }
     const c = (await judge([abs])).get(abs);
     if (c?.presence === "local") {
       addPending(rel, QUIET | FORCE); // downloaded meanwhile: the ordinary steps take it
@@ -2361,6 +2395,19 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       await stopWith(WATCH_REASONS.noWatchId, true);
       return;
     }
+    // One folder feeds one project (I6): an older record of a folder that an earlier-added watch keeps is not started.
+    const keeper = await folderKeeper(deps, projectId, watchId);
+    if (keeper) {
+      const reason = keeper.projectId === projectId ? WATCH_REASONS.alreadyWatched : WATCH_REASONS.folderOfAnotherProject;
+      emit({ kind: "error", reason });
+      await stopWith(reason, true);
+      return;
+    }
+    if (!claim(`dir\u0000${root}`)) {
+      emit({ kind: "error", reason: WATCH_REASONS.alreadyWatched });
+      await stopWith(WATCH_REASONS.alreadyWatched, true);
+      return;
+    }
     // The researcher's choices before any call on the folder: a pause chosen earlier holds from the start (Task W4).
     await refreshChoices();
     if (pausedNow()) {
@@ -2696,6 +2743,61 @@ async function checkedFolder(deps: WatchSettingsDeps, dir: string): Promise<stri
   return real;
 }
 
+/**
+ * The watches of this library on this computer whose folder is `real` (any project, locked ones included), with when
+ * each was added; a record whose project or watch is gone is left out. A project whose file cannot be read counts as
+ * holding its folder (the safe side).
+ */
+async function watchesOfFolder(deps: WatchSettingsDeps, real: string): Promise<Array<{ projectId: string; id: string; createdAt: string | null }>> {
+  const { store } = await readStore(deps.lib.appConfigDir);
+  const out: Array<{ projectId: string; id: string; createdAt: string | null }> = [];
+  for (const [projectId, watches] of Object.entries(own(store, deps.lib.id) ?? {})) {
+    for (const [id, dir] of Object.entries(watches)) {
+      if (dir !== real) continue;
+      let createdAt: string | null = null;
+      try {
+        const w = (deps.repo.getProject(projectId).watchedFolders ?? []).find((x) => x.id === id);
+        if (!w) continue; // removed from its project: not a watch any more
+        createdAt = w.createdAt;
+      } catch (err) {
+        if ((err as Error)?.name === "NotFoundError") continue;
+      }
+      out.push({ projectId, id, createdAt });
+    }
+  }
+  return out;
+}
+
+/** Refuses a folder that a watch of this library already has on this computer (I6), other than `except`. */
+async function refuseWatchedFolder(deps: WatchSettingsDeps, real: string, except?: string): Promise<void> {
+  if ((await watchesOfFolder(deps, real)).some((w) => w.id !== except)) throw new InvalidInputError(WATCH_REASONS.folderAlreadyWatched);
+}
+
+/**
+ * For records made before one folder fed one project (I6): of the watches whose stored folder is this watch's, the one
+ * added first keeps it — by `createdAt` in project.json, then (equal or unknown) the smaller watch id (UUIDv7 ids grow
+ * with time) — the same answer on every start, whatever the order. Returns that keeper when it is another watch.
+ */
+async function folderKeeper(deps: WatchDeps, projectId: string, watchId: string): Promise<{ projectId: string; id: string } | null> {
+  let all: Array<{ projectId: string; id: string; createdAt: string | null }>;
+  try {
+    const mine = own(own((await readStore(deps.lib.appConfigDir)).store, deps.lib.id) ?? {}, projectId);
+    const dir = mine ? own(mine, watchId) : undefined;
+    if (!dir) return null; // not a recorded watch (or none here): the in-process guard applies
+    all = await watchesOfFolder(deps, dir);
+  } catch {
+    return null; // the list cannot be read now: the in-process guard applies
+  }
+  if (all.length < 2) return null;
+  const key = (w: { createdAt: string | null; id: string }) => [Number.isFinite(Date.parse(w.createdAt ?? "")) ? Date.parse(w.createdAt!) : Number.POSITIVE_INFINITY, w.id] as const;
+  const first = all.reduce((a, b) => {
+    const [ta, ia] = key(a);
+    const [tb, ib] = key(b);
+    return tb < ta || (tb === ta && ib < ia) ? b : a;
+  });
+  return first.id === watchId ? null : { projectId: first.projectId, id: first.id };
+}
+
 function putFolder(deps: WatchSettingsDeps, projectId: string, id: string, real: string): Promise<void> {
   return updateStore(deps, (s) => {
     const projects = own(s, deps.lib.id) ?? (Object.create(null) as Record<string, Record<string, string>>);
@@ -2710,8 +2812,10 @@ function putFolder(deps: WatchSettingsDeps, projectId: string, id: string, real:
 export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}): Promise<WatchedFolder> {
   const real = await checkedFolder(deps, dir);
   deps.repo.getProject(projectId); // NotFoundError for an unknown project
-  // A list that cannot be read refuses before the project is changed (Task 68, R178 a).
+  // A list that cannot be read refuses before the project is changed (Task 68, R178 a); so does a folder already
+  // watched for a project of this library (I6: one folder feeds one project).
   await readStore(deps.lib.appConfigDir);
+  await refuseWatchedFolder(deps, real);
   const wf = await addWatchedFolderEntry(deps.repo, projectId, options);
   await putFolder(deps, projectId, wf.id, real);
   return wf;
@@ -2720,7 +2824,9 @@ export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: strin
 /** Chooses this computer's folder for a watch the project already has (e.g. one added on another computer). */
 export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string, id: string, dir: string): Promise<void> {
   if (!(deps.repo.getProject(projectId).watchedFolders ?? []).some((w) => w.id === id)) throw new TypeError("This project has no such watched folder.");
-  await putFolder(deps, projectId, id, await checkedFolder(deps, dir));
+  const real = await checkedFolder(deps, dir);
+  await refuseWatchedFolder(deps, real, id);
+  await putFolder(deps, projectId, id, real);
 }
 
 /** Removes a watched folder from project.json and from this device's settings. */
