@@ -2,7 +2,9 @@
 // the helpers' environments. (The check itself needs a display and the built shell: launch-check.mjs.)
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { appProcesses, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, helperProblems, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf } from "./launch-check.mjs";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { appProcesses, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, helperProblems, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -51,6 +53,67 @@ describe("probeProblems", () => {
     assert.match(p.join("\n"), /video: not reported/);
     assert.match(p.join("\n"), /fs\.readFile is allowed, expected denied/);
     assert.deepEqual(probeProblems(null, { media: false }), ["the probe reported nothing readable"]);
+  });
+});
+
+describe("what the page may ask of the shell (capabilities/main-window.json; Task W6, R207)", () => {
+  const read = () => ({
+    files: readdirSync(CAPABILITIES_DIR),
+    capability: JSON.parse(readFileSync(join(CAPABILITIES_DIR, "main-window.json"), "utf8")),
+    conf: JSON.parse(readFileSync(TAURI_CONF, "utf8")),
+  });
+
+  it("the page may pick a watched folder and nothing more", () => {
+    // The expected table changes by exactly this one entry.
+    assert.equal(EXPECTED_IPC["watch.pick"], "allowed");
+    assert.deepEqual(
+      Object.keys(EXPECTED_IPC).sort(),
+      ["app.version", "dialog.message", "dialog.save", "event.emit", "event.listen", "fs.readFile", "path.resolveDirectory", "watch.pick", "webview.print", "window.close"],
+    );
+    // The probe does not call it (it would open the chooser); the capability file is read instead.
+    assert.deepEqual(NOT_PROBED_IPC, { "watch.pick": "allow-pick-watch-folder" });
+    const { files, capability, conf } = read();
+    assert.deepEqual(capabilityProblems({ files, capability, conf }), []);
+    assert.deepEqual(capability.permissions, ["core:event:allow-listen", "core:event:allow-unlisten", "dialog:allow-open", "allow-pick-watch-folder"]);
+
+    const { "watch.pick": _w, ...probed } = EXPECTED_IPC;
+    assert.deepEqual(probeProblems({ ...GOOD, ipc: probed }, { media: true }), []);
+    // Should a probe ever report it, its answer must still be the expected one.
+    assert.match(probeProblems({ ...GOOD, ipc: { ...EXPECTED_IPC, "watch.pick": "denied" } }, { media: true }).join("\n"), /watch\.pick is denied, expected allowed/);
+  });
+
+  it("flags a capability that grants more, reaches another window or a remote page, or loses the chooser", () => {
+    const { files, capability, conf } = read();
+    const with_ = (over) => capabilityProblems({ files, capability: { ...capability, ...over }, conf });
+    for (const extra of ["fs:default", "dialog:allow-save", "dialog:default", "core:window:allow-close", "shell:allow-open"]) {
+      assert.match(with_({ permissions: [...capability.permissions, extra] }).join("\n"), new RegExp(`grants ${extra.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), extra);
+    }
+    assert.match(with_({ permissions: capability.permissions.filter((p) => p !== "allow-pick-watch-folder") }).join("\n"), /does not grant allow-pick-watch-folder/);
+    assert.match(with_({ windows: ["main", "second"] }).join("\n"), /windows/);
+    assert.match(with_({ windows: ["*"] }).join("\n"), /windows/);
+    assert.match(with_({ webviews: ["other"] }).join("\n"), /webviews/);
+    assert.match(with_({ local: false }).join("\n"), /local/);
+    assert.match(with_({ remote: { urls: ["https://example.org/*"] } }).join("\n"), /remote/);
+    assert.match(with_({ platforms: ["macOS"], extra: 1 }).join("\n"), /extra/);
+    assert.match(capabilityProblems({ files: [...files, "second.json"], capability, conf }).join("\n"), /second\.json/);
+    assert.match(capabilityProblems({ files, capability, conf: { ...conf, app: { ...conf.app, security: { ...conf.app.security, capabilities: ["main-window", "other"] } } } }).join("\n"), /tauri\.conf\.json/);
+  });
+
+  it("reads the platform files Tauri merges over the configuration, and refuses any security setting or capability in them", () => {
+    const { files, capability, conf } = read();
+    // The real files as they are: tauri.macos.conf.json is read and passes.
+    assert.ok(platformConfFiles().includes("tauri.macos.conf.json"));
+    assert.deepEqual(capabilityFileProblems(), []);
+    const macos = JSON.parse(readFileSync(join(dirname(TAURI_CONF), "tauri.macos.conf.json"), "utf8"));
+    const check = (platform) => capabilityProblems({ files, capability, conf, platform });
+    assert.deepEqual(check([{ name: "tauri.macos.conf.json", conf: macos }]), []);
+    for (const security of [{ capabilities: ["main-window", "other"] }, { capabilities: [{ identifier: "x", windows: ["*"], permissions: ["fs:default"] }] }, { csp: null }, {}]) {
+      const p = check([{ name: "tauri.macos.conf.json", conf: { ...macos, app: { security } } }]);
+      assert.match(p.join("\n"), /tauri\.macos\.conf\.json sets app\.security/, JSON.stringify(security));
+    }
+    assert.match(check([{ name: "tauri.linux.conf.json", conf: { app: { security: { capabilities: [] } } } }]).join("\n"), /tauri\.linux\.conf\.json/);
+    // A platform file that cannot be read as JSON cannot be checked: it fails.
+    assert.match(check([{ name: "tauri.windows.conf.toml", conf: null }]).join("\n"), /tauri\.windows\.conf\.toml could not be checked/);
   });
 });
 

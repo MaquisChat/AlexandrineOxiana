@@ -13,6 +13,8 @@ const onDragDropEvent = vi.fn(async (h: (e: { payload: unknown }) => void) => {
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: (...a: unknown[]) => open(...a) }));
 vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ onDragDropEvent }) }));
+const invoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 
 async function load() {
   vi.resetModules();
@@ -23,6 +25,7 @@ const g = globalThis as { isTauri?: unknown };
 
 beforeEach(() => {
   open.mockReset();
+  invoke.mockReset();
   onDragDropEvent.mockClear();
   dragHandler = undefined;
 });
@@ -142,5 +145,61 @@ describe("desktopShell", () => {
     expect(h.onOver.mock.calls).toEqual([[true], [false]]);
     dragHandler!({ payload: { type: "drop", paths: [], position: { x: 1, y: 1 } } });
     expect(h.onPaths).not.toHaveBeenCalled();
+  });
+});
+
+describe("pickWatchFolder (Task W6, R207): the shell's chooser hands the service a grant; the page gets only its id and the folder's name", () => {
+  const GRANT = "0123456789abcdef0123456789abcdef";
+
+  it("pickWatchFolder returns the grant and the name", async () => {
+    g.isTauri = true;
+    const m = await load();
+    invoke.mockResolvedValueOnce({ grantId: GRANT, name: "Fieldwork <b>2026</b>" });
+    expect(await m.desktopShell()!.pickWatchFolder("Choose a folder to watch")).toEqual({ grantId: GRANT, name: "Fieldwork <b>2026</b>" });
+    expect(invoke).toHaveBeenLastCalledWith("pick_watch_folder", { title: "Choose a folder to watch" });
+    // The same through the module's own function.
+    invoke.mockResolvedValueOnce({ grantId: GRANT, name: "x" });
+    expect(await m.pickWatchFolder("t")).toEqual({ grantId: GRANT, name: "x" });
+    // The plain dialog is not used: a path never reaches the page.
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("answers null when cancelled, when the shell fails, or when the answer is not exactly a grant and a name", async () => {
+    g.isTauri = true;
+    const m = await load();
+    for (const answer of [null, undefined, "/Users/r/x", { grantId: GRANT }, { grantId: GRANT.toUpperCase(), name: "x" }, { grantId: "abc", name: "x" }, { grantId: GRANT, name: "" }, { grantId: GRANT, name: 3 }, [GRANT, "x"]]) {
+      invoke.mockResolvedValueOnce(answer);
+      expect(await m.pickWatchFolder("t"), JSON.stringify(answer)).toBeNull();
+    }
+    invoke.mockRejectedValueOnce(new Error("pick_watch_folder not allowed"));
+    expect(await m.pickWatchFolder("t")).toBeNull();
+    // Only the grant and the name are passed on, whatever else the answer carries.
+    invoke.mockResolvedValueOnce({ grantId: GRANT, name: "x", path: "/Users/r/x" });
+    expect(await m.pickWatchFolder("t")).toEqual({ grantId: GRANT, name: "x" });
+  });
+
+  it("answers null in a plain browser, without throwing and without loading Tauri", async () => {
+    const m = await load();
+    expect(await m.pickWatchFolder("Choose a folder to watch")).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("sends a bounded title", async () => {
+    g.isTauri = true;
+    const m = await load();
+    invoke.mockResolvedValueOnce(null);
+    await m.pickWatchFolder("t".repeat(5000));
+    expect((invoke.mock.calls.at(-1)![1] as { title: string }).title.length).toBeLessThanOrEqual(200);
+  });
+
+  it("cuts the title by characters, never inside one (250 emoji)", async () => {
+    g.isTauri = true;
+    const m = await load();
+    invoke.mockResolvedValueOnce(null);
+    await m.pickWatchFolder("📁".repeat(250));
+    const sent = (invoke.mock.calls.at(-1)![1] as { title: string }).title;
+    expect(sent).toBe("📁".repeat(200));
+    // No lone surrogate (which serde_json would refuse).
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(sent)).toBe(false);
   });
 });

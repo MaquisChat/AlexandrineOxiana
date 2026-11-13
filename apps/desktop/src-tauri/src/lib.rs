@@ -16,6 +16,7 @@
 //! worker (R155 rule 3).
 
 pub mod connection;
+pub mod grant;
 pub mod helper_env;
 pub mod paths;
 #[cfg(debug_assertions)]
@@ -60,6 +61,24 @@ struct Shell {
     relaunch: AtomicBool,
     /// Start-up failed: the program exits non-zero however its error window is closed.
     failed: AtomicBool,
+    /// The watched-folder chooser: one at a time.
+    picker: grant::Picker,
+}
+
+impl grant::GrantTarget for Shell {
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst)
+    }
+
+    /// The running service's standard input; None once a stop has taken the service or it has exited.
+    fn service_input(&self) -> Option<service::ServiceInput> {
+        let mut guard = self.service.lock().unwrap_or_else(|p| p.into_inner());
+        let svc = guard.as_mut()?;
+        if svc.has_exited() {
+            return None;
+        }
+        Some(svc.input())
+    }
 }
 
 /// Debug builds only: with NODE_ENV=test the shell reports what the launch check needs on its
@@ -207,6 +226,28 @@ fn focus_main(app: &AppHandle, shell: &Shell) {
     }
 }
 
+/// The watched-folder chooser (Task W6, R207): the system's own folder chooser, ONE folder, started
+/// here (the page passes only a title). The chosen path goes to the service as a grant line on its
+/// standard input (grant.rs), written under the lock the shutdown closes that pipe under; the page
+/// receives only `{grantId, name}`, or null when the choice was cancelled, the window is not the main
+/// window, the chooser is already open, the app is closing, the service has exited, the folder is a
+/// root or cannot be put in a grant line, or the write failed (see `grant::pick_with`). Granted to the main window only (capabilities/main-window.json); the browser
+/// extension's token is the service's affair and reaches no shell command (it is not a window of
+/// this app and has no IPC).
+#[tauri::command]
+async fn pick_watch_folder(app: AppHandle, window: tauri::WebviewWindow, title: String) -> Option<serde_json::Value> {
+    let shell = app.try_state::<Arc<Shell>>()?.inner().clone();
+    let label = window.label().to_string();
+    let dialog = app.dialog().file().set_title(grant::chooser_title(&title)).set_parent(&window);
+    // The checks, the chooser and the hand-over (grant::pick_with, tested there), off the main thread.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        grant::pick_with(&shell.picker, &label, &*shell, || dialog.blocking_pick_folder().and_then(|p| p.into_path().ok()))
+    })
+    .await
+    .ok()??;
+    Some(picked.to_json())
+}
+
 /// SIGTERM, SIGINT and SIGHUP end the app the same way closing the window does.
 #[cfg(unix)]
 fn on_termination_signals(app: AppHandle) {
@@ -268,7 +309,9 @@ pub fn run() {
         // First, so that a second launch hands over to the first before it starts anything.
         .plugin(tauri_plugin_single_instance::init(move |app, _argv, _cwd| focus_main(app, &instance_shell)))
         .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![pick_watch_folder])
         .setup(move |app| {
+            app.manage(setup_shell.clone());
             let handle = app.handle().clone();
             #[cfg(unix)]
             on_termination_signals(handle.clone());

@@ -91,7 +91,79 @@ export const EXPECTED_IPC = {
   "webview.print": "denied",
   "app.version": "denied",
   "event.emit": "denied",
+  "watch.pick": "allowed",
 };
+
+/**
+ * Commands of the table the probe does not call, with the permission that grants them: the
+ * watched-folder chooser (Task W6, R207) would open a dialog and wait for a person. They are judged
+ * from the capability file instead (`capabilityProblems`).
+ */
+export const NOT_PROBED_IPC = { "watch.pick": "allow-pick-watch-folder" };
+
+export const CAPABILITIES_DIR = join(REPO, "apps", "desktop", "src-tauri", "capabilities");
+export const TAURI_CONF = join(REPO, "apps", "desktop", "src-tauri", "tauri.conf.json");
+/** Exactly what the main window is granted, in this order. */
+const MAIN_WINDOW_PERMISSIONS = ["core:event:allow-listen", "core:event:allow-unlisten", "dialog:allow-open", "allow-pick-watch-folder"];
+const CAPABILITY_KEYS = new Set(["$schema", "identifier", "description", "windows", "local", "permissions"]);
+
+/**
+ * What is wrong with the shell's capabilities (empty when all is well): one capability file, the one
+ * tauri.conf.json names, for the main window only, local pages only (no remote origin), granting
+ * exactly MAIN_WINDOW_PERMISSIONS; and no platform file Tauri merges over the configuration
+ * (`platform`: tauri.macos.conf.json and the like) sets anything under app.security.
+ */
+export function capabilityProblems({ files, capability, conf, platform = [] }) {
+  const out = [];
+  // Tauri merges tauri.<platform>.conf.* over tauri.conf.json on that platform: none may touch security.
+  for (const { name, conf: pc } of platform) {
+    if (!pc || typeof pc !== "object") out.push(`${name} could not be checked (not readable as JSON), and Tauri would merge it over the configuration`);
+    else if (pc.app && typeof pc.app === "object" && "security" in pc.app) out.push(`${name} sets app.security, which Tauri would merge over the main window's capability`);
+  }
+  const others = files.filter((f) => f !== "main-window.json");
+  if (others.length) out.push(`the capabilities folder holds more than main-window.json: ${others.join(", ")}`);
+  const listed = conf?.app?.security?.capabilities;
+  if (JSON.stringify(listed) !== JSON.stringify(["main-window"])) out.push(`tauri.conf.json names the capabilities ${JSON.stringify(listed)}, not only "main-window"`);
+  if (!capability || typeof capability !== "object") return [...out, "the main window's capability file is not readable"];
+  for (const k of Object.keys(capability)) if (!CAPABILITY_KEYS.has(k)) out.push(`the main window's capability has the key ${k} (${k === "remote" ? "a remote origin" : k === "webviews" ? "webviews" : "extra"})`);
+  if (capability.identifier !== "main-window") out.push(`the capability's identifier is ${capability.identifier}`);
+  if (JSON.stringify(capability.windows) !== JSON.stringify(["main"])) out.push(`the capability applies to the windows ${JSON.stringify(capability.windows)}, not only "main"`);
+  if (capability.local !== true) out.push("the capability is not limited to the app's local pages");
+  const perms = Array.isArray(capability.permissions) ? capability.permissions : [];
+  for (const p of perms) if (!MAIN_WINDOW_PERMISSIONS.includes(typeof p === "string" ? p : p?.identifier)) out.push(`the main window's capability grants ${typeof p === "string" ? p : JSON.stringify(p)}`);
+  for (const p of MAIN_WINDOW_PERMISSIONS) if (!perms.includes(p)) out.push(`the main window's capability does not grant ${p}`);
+  return out;
+}
+
+/** The platform configuration files Tauri merges over tauri.conf.json (any format), present beside it. */
+export function platformConfFiles() {
+  return readdirSync(dirname(TAURI_CONF)).filter((f) => /^tauri\.(macos|linux|windows|android|ios)\.conf\.(json|json5|toml)$/i.test(f) || /^Tauri\.(macos|linux|windows|android|ios)\.toml$/i.test(f));
+}
+
+/** The capability check on the files as they are (see `capabilityProblems`). */
+export function capabilityFileProblems() {
+  try {
+    const platform = platformConfFiles().map((name) => {
+      let conf = null;
+      if (name.endsWith(".json")) {
+        try {
+          conf = JSON.parse(readFileSync(join(dirname(TAURI_CONF), name), "utf8"));
+        } catch {
+          conf = null;
+        }
+      }
+      return { name, conf };
+    });
+    return capabilityProblems({
+      files: readdirSync(CAPABILITIES_DIR),
+      capability: JSON.parse(readFileSync(join(CAPABILITIES_DIR, "main-window.json"), "utf8")),
+      conf: JSON.parse(readFileSync(TAURI_CONF, "utf8")),
+      platform,
+    });
+  } catch (err) {
+    return [`the capability files could not be read: ${err.message}`];
+  }
+}
 
 /** What is wrong with the probe's result (empty when all is well). */
 export function probeProblems(result, { media }) {
@@ -106,6 +178,7 @@ export function probeProblems(result, { media }) {
   }
   for (const [cmd, want] of Object.entries(EXPECTED_IPC)) {
     const got = result.ipc?.[cmd];
+    if (got === undefined && cmd in NOT_PROBED_IPC) continue;
     if (got !== want) out.push(`the page's command ${cmd} is ${got ?? "not reported"}, expected ${want}`);
   }
   if (result.error) out.push(`the probe failed: ${result.error}`);
@@ -557,6 +630,10 @@ async function main() {
   for (const [what, p] of [[MAC ? "the app's program" : "the built shell (pnpm --filter @ao/desktop run build:linux)", SHELL], ...(PACKAGED ? [] : [["the built service folder", join(SERVICE_DIR, "service.mjs")]])]) {
     if (!existsSync(p)) throw new Error(`Missing ${what}.`);
   }
+  // The watched-folder chooser is not called by the probe (it would open a dialog): its grant is
+  // judged from the capability files the shell was built with.
+  const caps = capabilityFileProblems();
+  report("the main window's capability grants exactly the expected commands, the watched-folder chooser included", caps.length === 0, caps.join("; ")) || problems.push(...caps);
   const root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
   if (!(await leftoverSearchWorks(root))) {
     report("the search for leftover processes can see a process by its environment", false, "it could not; every 'no process is left' check would be blind");
