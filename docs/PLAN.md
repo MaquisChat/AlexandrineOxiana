@@ -572,13 +572,17 @@ Update after every task; commit and push.
 | 71 The extension remembers the downloader choice (D18) | complete | 3e41550 (merge) | R189; read by the controller; D18 closed |
 | 72 A later conflict enters the review queue (D19) | complete | 3fd15df (merge) | R190, R193, R194; reviewed with probes over two fix rounds; D19 closed |
 | 73 The audit says which field was confirmed (D20) | complete | 0e890cd (merge) | R191; reviewed with 18 probes; D20 closed |
-| R1 Reader: anchor, annotation and colour model | approved; verification running | 74bbdd3 (worktree branch) | reviewed with probes over one fix round (R195; plan Amendments A1–A4); the search index's word splitting moved to core with no change of behaviour |
-| R5 Reader: ranged PDF route and the client's range reader | fix round 1 | c047738 (worktree branch) | review: the page could not read `Content-Range` cross-origin; a file handle left open on an early abort; both to fix, with an end-to-end test in both browsers |
-| R2–R4, R6–R13 Reader: the remaining tasks | not started | | see the plan on the reader branch; order: R2 and R3 after R1, R6 after R5, R4 after R3, R7 after R6, then R8, R9, R10 and R12, R11, R13 (optional) |
+| R1 Reader: anchor, annotation and colour model | complete (on the reader branch) | e188c3c (merge) | reviewed with probes over one fix round (R195; plan Amendments A1–A4); verification clean |
+| R5 Reader: ranged PDF route and the client's range reader | complete (on the reader branch) | 4f4c7c6 (merge) | reviewed with probes over one fix round; end-to-end in both browsers; for the owner's Mac check: the Range preflight in the macOS web view |
+| R2 Reader: the Zotero import keeps the sort index; re-import respects changes | complete (on the reader branch) | cd2af4d (merge) | reviewed with probes over two rounds (R196, R197); verified with R3 |
+| R3 Reader: governed annotation operations in the library | complete (on the reader branch) | 0062c5b (merge) | reviewed with twelve probes; verified with R2 |
+| R4 Reader: annotation routes in the service | complete (on the reader branch) | f9949a0 (merge) | reviewed with probes over one fix round and a last round read by the controller (R198); verification clean |
+| R6 Reader: pdf.js in the interface, bundled, under the policy | approved after two fix rounds; a last small round, then verification | ffef5db (worktree branch) | the Critical finding closed under probe (R201; A7); R199, R200 |
+| R7–R13 Reader: the remaining tasks | not started | | order: R7 after R6, then R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
-| 55 Owner hands-on tests | the owner reports no errors found (2026-11-12, Mac build 3) | | the build is run 3 of "Desktop (macOS)" (id 43271302338, commit 4a7255b); the owner goes on to the review pages (Task 53) |
+| 55 Owner hands-on tests | the owner reports no errors found (2026-11-12, Mac build 3); build 4 available (2026-11-13) | | the current download is run 4 of "Desktop (macOS)" (id 43348805951, commit 14da33e): build 3 plus the fixes of D18, D19 and D20; the owner goes on to the review pages (Task 53) |
 | 56 Close out | not started | | |
 
 ## 9. What needs the owner
