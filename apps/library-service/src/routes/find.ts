@@ -20,6 +20,7 @@ import {
   FindEntryStateError,
   FindEntryTooLargeError,
   FindIndexNotReadyError,
+  FindProjectStoppedError,
   FindQueueFullError,
   FindQueueUnreadableError,
   FindQueueUnwritableError,
@@ -32,6 +33,7 @@ import {
   ReadOnlyLibraryError,
   readAppSettingStrict,
   readFindQueueOf,
+  setAppSettingAside,
   updateAppSettingStrict,
   type FindEntry,
   type FindMatch as LibraryMatch,
@@ -147,23 +149,6 @@ async function inWords<T>(p: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Entries removed through this service, per open library and project: a press on one is a 409 in words, not a 404. */
-const removedHere = new WeakMap<Session, Map<string, Set<string>>>();
-const REMOVED_KEPT = 5000;
-function noteRemoved(s: Session, projectId: string, entryId: string): void {
-  let m = removedHere.get(s);
-  if (!m) removedHere.set(s, (m = new Map()));
-  let ids = m.get(projectId);
-  if (!ids) m.set(projectId, (ids = new Set()));
-  ids.add(entryId);
-  // Bounded: the oldest are forgotten first (a press on one of those is then a 404).
-  for (const old of ids) {
-    if (ids.size <= REMOVED_KEPT) break;
-    ids.delete(old);
-  }
-}
-const wasRemoved = (s: Session, projectId: string, entryId: string) => removedHere.get(s)?.get(projectId)?.has(entryId) === true;
-
 export function registerFind(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
   const limit = { bodyLimit: FIND_BODY_MAX_BYTES };
@@ -194,29 +179,30 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
   };
 
   /**
-   * A press on the runner. It is counted in the session's presses, which a close waits for before the library's lock
-   * is released; a press that fails because Find and acquire stopped for the library meanwhile is a 503 in words.
+   * A press on the runner. The runner itself refuses a press that reaches its store turn after `stopAll()` or
+   * `stop(projectId)` and writes nothing, and `stopAll()` waits for presses already in their turn (R245): the service
+   * no longer counts presses. A press refused because Find and acquire stopped for the library meanwhile is a 503 in
+   * words; one refused because the project was stopped is 423 when the project is locked now, else a 409 in words.
    */
-  const pressed = async <T>(s: Session, fn: () => Promise<T>): Promise<T> => {
-    const p = fn();
-    const presses = (s.findPresses ??= new Set());
-    presses.add(p);
+  const pressed = async <T>(s: Session, projectId: string, fn: () => Promise<T>): Promise<T> => {
     try {
-      return await p;
+      return await fn();
     } catch (err) {
-      if (state.session !== s || !s.find) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
+      if (state.session !== s || !s.find || err instanceof FindRunnerClosedError) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
+      if (err instanceof FindProjectStoppedError) {
+        if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
+        const why = s.find.stoppedFor(projectId)?.code;
+        throw new ApiError(409, "CONFLICT", why ? FIND_STOPPED_TEXT[why] : FIND_ROUTE_TEXT.projectStopped, "stopped");
+      }
       throw said(err);
-    } finally {
-      presses.delete(p);
     }
   };
 
-  /** The entry of THIS project: 404 when it is not in its queue (409 in words when it was removed here). */
+  /** The entry of THIS project: 404 when its queue does not hold it (never there, another project's, or removed by anyone; R245). */
   const entryOf = async (s: Session, projectId: string, entryId: string): Promise<FindEntry> => {
     const q = await inWords(() => readFindQueueOf(s.repo, projectId));
     const e = q.entries.get(entryId);
     if (e) return e;
-    if (wasRemoved(s, projectId, entryId)) throw new ApiError(409, "CONFLICT", "This entry was removed from the queue. Nothing was changed.", "entry-state");
     throw new ApiError(404, "NOT_FOUND", FIND_ROUTE_TEXT.entryNotFound);
   };
 
@@ -255,7 +241,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     });
     const collectionId = b.collectionId;
     if (collectionId !== undefined && (typeof collectionId !== "string" || !isId(collectionId))) throw badRequest("The collection is not one of this project's.");
-    const r = await pressed(s, () => runner.add(projectId, lines, collectionId));
+    const r = await pressed(s, projectId, () => runner.add(projectId, lines, collectionId));
     return { added: r.added.map(entryView), mergedLines: r.mergedLines };
   });
 
@@ -269,7 +255,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     // Only an entry waiting for a choice: a second press, or a press on any other state, is a 409 in words.
     if (cur.state !== "choose") throw new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
     if (candidateId !== null && !cur.candidates?.some((c) => c.id === candidateId)) throw new ApiError(400, "VALIDATION", FIND_ROUTE_TEXT.unknownCandidate, "unknown-candidate");
-    return entryView(await pressed(s, () => runner.choose(projectId, entryId, candidateId)));
+    return entryView(await pressed(s, projectId, () => runner.choose(projectId, entryId, candidateId)));
   });
 
   app.post("/projects/:id/find/:eid/duplicate", limit, async (req): Promise<FindEntryView> => {
@@ -278,7 +264,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const same = bodyAs<FindDuplicateRequest>(req).same;
     if (typeof same !== "boolean") throw badRequest('"same" must be true or false.');
     await entryOf(s, projectId, entryId);
-    return entryView(await pressed(s, () => runner.confirmDuplicate(projectId, entryId, same)));
+    return entryView(await pressed(s, projectId, () => runner.confirmDuplicate(projectId, entryId, same)));
   });
 
   app.post("/projects/:id/find/:eid/add-here", limit, async (req): Promise<FindEntryView> => {
@@ -286,7 +272,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const runner = runnerOf(s);
     bodyOf(req);
     await entryOf(s, projectId, entryId);
-    return entryView(await pressed(s, () => runner.addHereAsWell(projectId, entryId)));
+    return entryView(await pressed(s, projectId, () => runner.addHereAsWell(projectId, entryId)));
   });
 
   app.post("/projects/:id/find/:eid/retry", limit, async (req): Promise<FindEntryView> => {
@@ -294,15 +280,14 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const runner = runnerOf(s);
     bodyOf(req);
     await entryOf(s, projectId, entryId);
-    return entryView(await pressed(s, () => runner.retry(projectId, entryId)));
+    return entryView(await pressed(s, projectId, () => runner.retry(projectId, entryId)));
   });
 
   app.delete("/projects/:id/find/:eid", limit, async (req): Promise<FindRemoveResponse> => {
     const { s, projectId, entryId } = addressed(req, true);
     const runner = runnerOf(s);
     await entryOf(s, projectId, entryId);
-    await pressed(s, () => runner.remove(projectId, entryId));
-    noteRemoved(s, projectId, entryId);
+    await pressed(s, projectId, () => runner.remove(projectId, entryId));
     return { removed: true };
   });
 
@@ -333,11 +318,16 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     if (typeof b.checkEverything !== "boolean") throw badRequest('"checkEverything" must be true or false.');
     for (const k of ["projectId", "collectionId"]) if (b[k] !== undefined && (typeof b[k] !== "string" || !isId(b[k]))) throw badRequest(`"${k}" must be an id.`);
     const next = screenOf(b as unknown as FindScreenSettings);
+    const dir = state.deps.appConfigDir;
     try {
-      await updateAppSettingStrict(state.deps.appConfigDir, FIND_SCREEN_FILE, isScreen, () => next);
+      await updateAppSettingStrict(dir, FIND_SCREEN_FILE, isScreen, () => next);
     } catch (err) {
-      if (err instanceof AppSettingUnreadableError) throw new ApiError(503, "UNAVAILABLE", "This computer's Find and acquire settings could not be read, so they were not changed.");
-      throw err;
+      if (!(err instanceof AppSettingUnreadableError)) throw err;
+      // R245: a file that cannot be read never locks the researcher out of the switch. It is set aside, as the
+      // other settings files of this computer are (`find-screen.json.unreadable-<stamp>`, never deleted), and the new
+      // settings are written. (Set aside only while it still cannot be read; a write in between is then kept.)
+      await setAppSettingAside(dir, FIND_SCREEN_FILE, isScreen, state.opts.now()).catch(() => undefined);
+      await updateAppSettingStrict(dir, FIND_SCREEN_FILE, isScreen, () => next);
     }
     state.findCheckEverything = next.checkEverything;
     return next;

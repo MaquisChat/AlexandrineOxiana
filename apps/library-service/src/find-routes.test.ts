@@ -6,7 +6,7 @@
  * lock, a close, a move or an index rebuild with it. Every log line, error answer and event of this file is kept and
  * searched for the typed words.
  */
-import { mkdtemp, readFile, rm, stat, writeFile, appendFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -229,6 +229,18 @@ const settled = (pid: string, eid: string) => until(async () => ((e) => (e && FI
 const asked = (text: string) => gated.sent.filter((s) => s.service === "crossref" && s.text === text).length;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Every file of the library (but its lookup cache) with its content, for "nothing changed". */
+async function snapshot(dir: string, rel = ""): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const d of await readdir(join(dir, rel), { withFileTypes: true })) {
+    const r = rel ? `${rel}/${d.name}` : d.name;
+    if (r === ".cache") continue;
+    if (d.isDirectory()) Object.assign(out, await snapshot(dir, r));
+    else out[r] = (await readFile(join(dir, r))).toString("base64");
+  }
+  return out;
+}
+
 async function pairExtension(): Promise<string> {
   const p = await call({ method: "POST", url: "/extension/pair" });
   const c = await svc!.app.inject({ method: "POST", url: "/extension/pair/confirm", headers: { origin: EXT, "content-type": "application/json" }, payload: JSON.stringify({ code: p.json.code }) });
@@ -365,7 +377,7 @@ describe("adding lines", () => {
 });
 
 describe("choosing and the other presses", () => {
-  it("choose: an unknown candidate is 400; choose twice: the second is a 409 in words; after a remove 409", async () => {
+  it("choose: an unknown candidate is 400; choose twice: the second is a 409 in words; after a remove 404 (R245)", async () => {
     await start();
     await openNewLibrary();
     const pid = await newProject();
@@ -393,14 +405,17 @@ describe("choosing and the other presses", () => {
       expect(r.json.error.message).toBe(FIND_ROUTE_TEXT.entryState);
     }
     expect((await call({ method: "POST", url: `/projects/${pid}/find/${e!.id}/duplicate`, body: { same: "yes" } })).status).toBe(400);
-    // Remove keeps the record; afterwards the entry's presses are 409 in words.
+    // Remove keeps the record; afterwards the entry is not in the queue: 404, whoever removed it (R245).
     const rm1 = await call({ method: "DELETE", url: `/projects/${pid}/find/${e!.id}` });
     expect(rm1.status).toBe(200);
     expect(rm1.json).toEqual({ removed: true });
     expect((await call({ url: `/projects/${pid}/sources?limit=10` })).json.total).toBe(1);
-    const after = await call({ method: "POST", url: `/projects/${pid}/find/${e!.id}/choose`, body: { candidateId: null } });
-    expect(after.status).toBe(409);
-    expect(after.json.error.message).toMatch(/removed/);
+    for (const [path, body] of [["choose", { candidateId: null }], ["duplicate", { same: true }], ["add-here", undefined], ["retry", undefined]] as const) {
+      const after = await call({ method: "POST", url: `/projects/${pid}/find/${e!.id}/${path}`, ...(body ? { body } : {}) });
+      expect(after.status, path).toBe(404);
+      expect(after.json.error).toMatchObject({ code: "NOT_FOUND", message: "That entry is no longer in the queue." });
+    }
+    expect((await call({ method: "DELETE", url: `/projects/${pid}/find/${e!.id}` })).status).toBe(404);
   });
 
   it("None of these, and Try again", async () => {
@@ -579,40 +594,28 @@ describe("the runner's life in the service", () => {
     expect((await settled(pid, e!.id)).state).toBe("record-complete");
   });
 
-  it("close in the middle of a choose: the press answers 503 in words, and nothing of it lands after the lock is released", async () => {
+  it("close during a held choose: the press answers 503 in words, and the library's files are unchanged after the lock is released (R245)", async () => {
     await start();
     const path = await openNewLibrary();
     const pid = await newProject();
     const s = svc!.state.session!;
     const [c] = await add(pid, [AMBIGUOUS]);
     const waiting = await settled(pid, c!.id);
-    const file = join(path, await folderOf(pid), "find", "queue.jsonl");
     // The choose waits for the project's turn, held by another way in (an import, say).
     let free!: () => void;
     const turn = serialStore(s.repo, pid, () => new Promise<void>((r) => (free = r)));
-    const order: string[] = [];
-    const runner = s.find!;
-    const choose = runner.choose;
-    runner.choose = (...a: Parameters<typeof choose>) => choose(...a).finally(() => order.push("choose settled"));
     const choosing = call({ method: "POST", url: `/projects/${pid}/find/${c!.id}/choose`, body: { candidateId: waiting.candidates![0]!.id } });
     await sleep(50);
-    const close = s.lib.close.bind(s.lib);
-    s.lib.close = async () => {
-      order.push("lib.close");
-      return close();
-    };
-    const closing = call({ method: "POST", url: "/libraries/close" });
-    await sleep(100);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    // The lock is released: what the library's files hold now must not change.
+    const before = await snapshot(path);
     free();
     await turn;
-    expect((await closing).status).toBe(200);
     const chose = await choosing;
     expect(chose.status).toBe(503);
     expect(chose.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.closed, reason: "closed" });
-    expect(order).toEqual(["choose settled", "lib.close"]);
-    const bytes = await readFile(file);
     await sleep(200);
-    expect((await readFile(file)).equals(bytes)).toBe(true);
+    expect(await snapshot(path)).toEqual(before);
     // Reopened: nothing was half-done.
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
     await svc!.state.idle();
@@ -731,8 +734,14 @@ describe("other projects and the screen's settings", () => {
     await writeFile(file, "{ not json");
     expect((await call({ url: "/find/screen" })).json).toEqual({ checkEverything: false });
     expect(await readFile(file, "utf8")).toBe("{ not json");
-    const refused = await call({ method: "PUT", url: "/find/screen", body: { checkEverything: true } });
-    expect(refused.status).toBe(503);
-    expect(await readFile(file, "utf8")).toBe("{ not json");
+    // R245: the researcher's next change sets the damaged file aside and writes the new settings.
+    const replaced = await call({ method: "PUT", url: "/find/screen", body: { checkEverything: true } });
+    expect(replaced.status, replaced.body).toBe(200);
+    expect(replaced.json).toEqual({ checkEverything: true });
+    expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ checkEverything: true });
+    const aside = (await readdir(deps.appConfigDir)).filter((n) => n.startsWith("find-screen.json.unreadable-"));
+    expect(aside).toHaveLength(1);
+    expect(await readFile(join(deps.appConfigDir, aside[0]!), "utf8")).toBe("{ not json");
+    expect((await call({ url: "/find/screen" })).json).toEqual({ checkEverything: true });
   });
 });

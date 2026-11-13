@@ -17,9 +17,11 @@
  * Refusals (`{ error: { code, message, reason } }`, the message always a plain sentence, `reason` one of
  * FIND_REFUSAL_REASONS where the screen may act on it): 400 VALIDATION (a malformed body or id; a line outside the
  * bounds — the WHOLE add is refused and the line is named by its number, never by its text; an unknown candidate),
- * 403 FORBIDDEN (not the desktop app), 404 NOT_FOUND (an unknown project, or an entry that is not this project's),
+ * 403 FORBIDDEN (not the desktop app), 404 NOT_FOUND (an unknown project; an entry id the project's queue does not
+ * hold — never there, another project's, or removed by anyone: "That entry is no longer in the queue.", R245),
  * 409 READ_ONLY (a read-only library, on every changing route), 409 CONFLICT (the queue is full; the entry is not
- * waiting for that; the queue cannot be read; the index is being prepared), 423 PROJECT_LOCKED, 503 UNAVAILABLE
+ * waiting for that; the queue cannot be read; the index is being prepared; the project's queue is paused, reason
+ * "stopped"), 423 PROJECT_LOCKED, 503 UNAVAILABLE
  * (Find and acquire has stopped for the library: it is closing or being moved).
  *
  * Live updates: the server-sent event `find.progress` with a FindProgressEvent and nothing else.
@@ -81,7 +83,7 @@ export const FIND_STOPPED_TEXT: Record<FindStoppedCode, string> = {
 };
 
 /** The `reason` of the refusals the screen may act on. */
-export const FIND_REFUSAL_REASONS = ["read-only", "locked", "queue-full", "queue-unreadable", "entry-state", "index-not-ready", "closed", "unknown-candidate", "line"] as const;
+export const FIND_REFUSAL_REASONS = ["read-only", "locked", "queue-full", "queue-unreadable", "entry-state", "index-not-ready", "closed", "stopped", "unknown-candidate", "line"] as const;
 export type FindRefusalReason = (typeof FIND_REFUSAL_REASONS)[number];
 
 /** The routes' own sentences (besides FIND_REASON_TEXT and FIND_STOPPED_TEXT). */
@@ -93,7 +95,10 @@ export const FIND_ROUTE_TEXT = {
   indexNotReady: "The library's index is still being prepared. Try again in a moment. Nothing was changed.",
   closed: "Find and acquire has stopped for this library. Nothing was changed.",
   unknownCandidate: "That is not one of the works offered for this entry. Nothing was changed.",
-  entryNotFound: "That entry is not in this project's queue.",
+  /** Any act on an id the queue does not hold (never there, or removed by anyone): 404 (R245). */
+  entryNotFound: "That entry is no longer in the queue.",
+  /** Find and acquire is stopped for the project (unlocked, but not yet resumed). */
+  projectStopped: "Find and acquire is paused for this project. Try again in a moment. Nothing was changed.",
   noLines: "Type at least one reference.",
   tooManyLines: "At most 50 lines can be added at once. Nothing was added.",
   /** Elsewhere: the other project was locked meanwhile (the screen's sentence). */
