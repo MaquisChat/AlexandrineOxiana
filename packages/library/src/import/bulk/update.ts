@@ -125,7 +125,7 @@ export function toAnnotation(a: ScanAnnotation, sourceId: string, actor: string,
   const asset = a.file ? assetFor(a.file) : undefined;
   const anchors =
     asset && a.anchor
-      ? [a.anchor.kind === "pdf" ? { kind: "pdf" as const, id: newId(), assetId: asset.id, page: a.anchor.page, rects: a.anchor.rects } : { kind: "epub-cfi" as const, id: newId(), assetId: asset.id, cfi: a.anchor.cfi }]
+      ? [a.anchor.kind === "pdf" ? { kind: "pdf" as const, id: newId(), assetId: asset.id, page: a.anchor.page, rects: a.anchor.rects, ...(a.anchor.sortIndex ? { sortIndex: a.anchor.sortIndex } : {}) } : { kind: "epub-cfi" as const, id: newId(), assetId: asset.id, cfi: a.anchor.cfi }]
       : [];
   // A page number with no asset to anchor in is kept as the label.
   const pageLabel = a.pageLabel ?? (a.anchor?.kind === "pdf" && !anchors.length ? String(a.anchor.page) : undefined);
@@ -175,9 +175,29 @@ export function capAnnotations<T extends { body?: string; quote?: string }>(
 export interface AnnotationPlan {
   added: Annotation[];
   updated: Array<{ before: Annotation; after: Annotation }>;
+  /**
+   * Annotations imported before Zotero's sort index was kept, unchanged since: they gain it (R195). Not a
+   * change to report, nor an edit (the hash ignores it), but written and recorded so undo puts it back.
+   */
+  backfilled: Array<{ before: Annotation; after: Annotation }>;
   /** External keys of annotations changed at the source but edited here: kept. */
   kept: string[];
   dropped: number;
+  /** Annotations the researcher deleted here that the source still has: not added again. */
+  deletedHere: number;
+}
+
+/** `ex` with the sort index of `next`'s anchors where it has none (same place, same rectangles); undefined when there is nothing to add. */
+function withSortIndex(ex: Annotation, next: Annotation): Annotation | undefined {
+  if (ex.anchors.length !== next.anchors.length) return undefined;
+  let any = false;
+  const anchors = ex.anchors.map((x, i) => {
+    const n = next.anchors[i]!;
+    if (x.kind !== "pdf" || n.kind !== "pdf" || x.sortIndex || !n.sortIndex || x.page !== n.page) return x;
+    any = true;
+    return { ...x, sortIndex: n.sortIndex };
+  });
+  return any ? { ...ex, anchors } : undefined;
 }
 
 /**
@@ -187,19 +207,31 @@ export interface AnnotationPlan {
  */
 export function planAnnotations(sf: SourceFile, scanned: ScanAnnotation[], make: (a: ScanAnnotation) => Annotation): AnnotationPlan {
   const byKey = new Map(sf.annotations.filter((a) => a.externalKey).map((a) => [a.externalKey!, a]));
-  const plan: AnnotationPlan = { added: [], updated: [], kept: [], dropped: 0 };
+  const plan: AnnotationPlan = { added: [], updated: [], backfilled: [], kept: [], dropped: 0, deletedHere: 0 };
+  const deleted = new Set(sf.deletedAnnotationKeys ?? []);
   const fresh: Annotation[] = [];
   const seen = new Set<string>();
   for (const s of scanned) {
     if (seen.has(s.key)) continue;
     seen.add(s.key);
     const ex = byKey.get(s.key);
+    if (!ex && deleted.has(s.key.slice(0, 256))) {
+      plan.deletedHere++; // the researcher deleted it here: not brought back
+      continue;
+    }
     const next = make(s);
     if (!ex) {
       fresh.push(next);
       continue;
     }
-    if (ex.externalHash === next.externalHash) continue; // unchanged at the source
+    if (ex.externalHash === next.externalHash) {
+      // Unchanged at the source. One imported before the sort index was kept, and not changed here, gains it.
+      if (ex.externalHash && unedited(ex)) {
+        const after = withSortIndex(ex, next);
+        if (after) plan.backfilled.push({ before: ex, after });
+      }
+      continue;
+    }
     if (!unedited(ex)) {
       plan.kept.push(s.key);
       continue;
@@ -223,6 +255,33 @@ export function planAnnotations(sf: SourceFile, scanned: ScanAnnotation[], make:
   plan.added = capped.kept;
   plan.dropped += capped.dropped;
   return plan;
+}
+
+/**
+ * The sort-index back-fills alone (R196), for an item Zotero did not change: no files are read or hashed.
+ * Only an annotation that has no index yet, is as last imported and whose scanned content (anchored in the
+ * asset it is already anchored in) hashes the same is touched; a source with none costs one pass over its list.
+ */
+export function planBackfill(sf: SourceFile, scanned: ScanAnnotation[]): Array<{ before: Annotation; after: Annotation }> {
+  const out: Array<{ before: Annotation; after: Annotation }> = [];
+  const byKey = new Map<string, Annotation>();
+  for (const a of sf.annotations) {
+    if (a.externalKey && a.externalHash && a.anchors.some((x) => x.kind === "pdf" && !x.sortIndex)) byKey.set(a.externalKey, a);
+  }
+  if (!byKey.size) return out;
+  const seen = new Set<string>();
+  for (const s of scanned) {
+    const ex = byKey.get(s.key);
+    if (!ex || seen.has(s.key) || s.anchor?.kind !== "pdf" || !s.anchor.sortIndex) continue;
+    seen.add(s.key);
+    const home = ex.anchors.find((x) => x.kind === "pdf");
+    if (!home || !unedited(ex)) continue;
+    const next = toAnnotation(s, sf.source.id, "", () => ({ id: home.assetId }) as Asset);
+    if (next.externalHash !== ex.externalHash) continue;
+    const after = withSortIndex(ex, next);
+    if (after) out.push({ before: ex, after });
+  }
+  return out;
 }
 
 /** `key`, or `key` + a, b, … z, aa, ab … — the first one not in `taken` (then taken). */

@@ -614,6 +614,7 @@ function annotationOf(a: WebItem, file: string | undefined): ScanAnnotation | un
       comment: cut(d.annotationComment),
       color: cut(d.annotationColor),
       pageLabel: cut(d.annotationPageLabel),
+      sortIndex: str(d.annotationSortIndex).slice(0, 64),
       position: typeof d.annotationPosition === "string" ? d.annotationPosition.slice(0, 65536) : d.annotationPosition ? JSON.stringify(d.annotationPosition).slice(0, 65536) : null,
       dateAdded: cut(d.dateAdded),
     },
@@ -892,7 +893,9 @@ export function zoteroWebSince(repo: Repo, projectId: string, ref: string): numb
  * Starts a Zotero Web API batch: refused up front (BatchRefusedError) when no key is saved or there
  * is no keyring; incremental from the project's recorded library version unless `full`. When the
  * batch finishes, the library version Zotero reported is recorded (governed, audited), so the next
- * run asks only for later changes. `done` settles after that.
+ * run asks only for later changes. `done` settles after that. An incremental run does not fetch
+ * unchanged items, so it does not back-fill the sort index of annotations imported before it was kept
+ * (R196); a `full` run does (the reader orders such a page geometrically until then).
  */
 export async function startZoteroWebImport(
   deps: BulkImportDeps,

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "undici";
@@ -392,6 +392,42 @@ describe("zoteroWebAdapter", () => {
     expect(items.find((i) => i.key === "zotero:PARENT03")!.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.redirectRefused]);
     expect(items.find((i) => i.key === "zotero:PARENT04")!.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.tooLarge]);
     expect(await readdir(join(tmp, "work"), { recursive: true }).then((l) => l.filter((n) => n.endsWith(".pdf")))).toEqual([]);
+  });
+
+  it("annotationSortIndex is carried", async () => {
+    const parent = article("PARENT07", "Sorted", 4);
+    const att: WebItem = { key: "ATTACH07", version: 4, data: { key: "ATTACH07", version: 4, itemType: "attachment", parentItem: "PARENT07", linkMode: "imported_file", contentType: "application/pdf", filename: "z.pdf", tags: [] } };
+    const mk = (key: string, sortIndex: unknown): WebItem => ({
+      key, version: 21,
+      data: { key, version: 21, itemType: "annotation", parentItem: "ATTACH07", annotationType: "highlight", annotationText: "t", annotationSortIndex: sortIndex, annotationPosition: JSON.stringify({ pageIndex: 2, rects: [[1, 2, 3, 4]] }), tags: [] },
+    });
+    const anns = [mk("ANNO0071", "00002|000120|00300"), mk("ANNO0072", "not a sort index")];
+    const reply = (items: WebItem[], v = 21) => ({ statusCode: 200, data: JSON.stringify(items), responseOptions: { headers: { ...JSON_HEADERS, "total-results": String(items.length), "last-modified-version": String(v) } } });
+    agent
+      .get(API)
+      .intercept({ path: (p) => p.startsWith("/users/42/"), method: "GET" })
+      .reply((req) => {
+        const q = page(req.path);
+        const path = req.path.split("?")[0]!;
+        if (path === "/users/42/items" && q.get("since") === "20") return reply(anns);
+        if (path === "/users/42/items" && q.get("itemKey") === "ATTACH07") return reply([att]);
+        if (path === "/users/42/items" && q.get("itemKey") === "PARENT07") return reply([parent]);
+        if (path === "/users/42/items/PARENT07/children") return reply([att]);
+        if (path === "/users/42/items/ATTACH07/children") return reply(anns);
+        if (path === "/users/42/items/ATTACH07/file") return { statusCode: 404, data: "Not found" };
+        if (path === "/users/42/collections") return reply([]);
+        if (path === "/users/42/deleted") return { statusCode: 200, data: JSON.stringify({ items: [] }), responseOptions: { headers: JSON_HEADERS } };
+        return { statusCode: 404, data: "Not found" };
+      })
+      .persist();
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: agent, sleep: async () => {}, since: 20 });
+    const out: ScanItem[] = [];
+    const work = join(tmp, "work");
+    await mkdir(work, { recursive: true });
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work, note: () => {} })) out.push(i);
+    const byKey = new Map((out[0]!.annotations ?? []).map((x) => [x.key, x]));
+    expect(byKey.get("zotero:ANNO0071")?.anchor).toEqual({ kind: "pdf", page: 3, rects: [{ x: 1, y: 2, w: 2, h: 2 }], sortIndex: "00002|000120|00300" });
+    expect(byKey.get("zotero:ANNO0072")?.anchor).toEqual({ kind: "pdf", page: 3, rects: [{ x: 1, y: 2, w: 2, h: 2 }] });
   });
 
   it("incremental: a changed annotation brings in its whole item (parents fetched by key, children listed)", async () => {
@@ -815,6 +851,75 @@ processing:
     const r = await (await startZoteroWebImport(bulkDeps(), p.id, { ...web, full: true })).done;
     expect(r.counts).toMatchObject({ created: 0, deletedHere: 1 });
     expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  /** A Zotero item with a stored PDF and one highlight carrying a sort index, served in full (R196 b). */
+  async function serveHighlighted(): Promise<void> {
+    const pdf = await buildPdf({ extra: "sort index" });
+    const items: WebItem[] = [
+      article("SORT0001", "Sorted", 7),
+      { key: "SORTATT1", version: 7, data: { key: "SORTATT1", version: 7, itemType: "attachment", parentItem: "SORT0001", linkMode: "imported_file", contentType: "application/pdf", filename: "s.pdf", tags: [] } },
+      { key: "SORTANN1", version: 7, data: { key: "SORTANN1", version: 7, itemType: "annotation", parentItem: "SORTATT1", annotationType: "highlight", annotationText: "informal markets", annotationSortIndex: "00000|000100|00200", annotationPosition: JSON.stringify({ pageIndex: 0, rects: [[10, 20, 110, 40]] }), dateAdded: "2024-02-02T09:00:00Z", tags: [] } },
+    ];
+    serveItems(items, 30, { times: 20 });
+    serveCollections([]);
+    serveTagColors();
+    agent.get(API).intercept({ path: "/users/42/items/SORTATT1/file", method: "GET" }).reply(302, "", { headers: { location: `${STORAGE}/sorted` } }).persist();
+    agent.get(STORAGE).intercept({ path: "/sorted", method: "GET" }).reply(200, pdf, { headers: { "content-type": "application/pdf", "content-length": String(pdf.length) } }).persist();
+  }
+  const sortedSource = async (p: Project) => (await sources(p)).find((s) => s.source.provenance.externalKeys?.zoteroKey === "SORT0001")!;
+  const stripIndex = async (p: Project, id: string) => {
+    const { importChange } = await import("../repo/repo.js");
+    await importChange(repo, p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, async (ops) => {
+      const cur = await ops.readSource(id);
+      await ops.writeSource(cur, { ...cur, annotations: cur.annotations.map((a) => ({ ...a, anchors: a.anchors.map((x) => (x.kind === "pdf" ? { id: x.id, kind: x.kind, assetId: x.assetId, page: x.page, rects: x.rects } : x)) })) });
+    }, { op: "test.strip-sort-index" });
+  };
+
+  it("R196 (b): a FULL run back-fills the sort index of an unchanged item, writes nothing the second time, and reports no change", async () => {
+    const p = await project();
+    await serveHighlighted();
+    await (await startZoteroWebImport(bulkDeps(), p.id, { ...web, full: true })).done;
+    const s0 = await sortedSource(p);
+    expect(s0.annotations[0]!.anchors[0]).toMatchObject({ sortIndex: "00000|000100|00200" });
+    await stripIndex(p, s0.source.id);
+    const before = await sortedSource(p);
+    expect(before.annotations[0]!.anchors[0]).not.toHaveProperty("sortIndex");
+    const h = await startZoteroWebImport(bulkDeps(), p.id, { ...web, full: true });
+    const r = await h.done;
+    expect(r.counts).toMatchObject({ updated: 0, created: 0, failed: 0, unchanged: 1 });
+    const after = await sortedSource(p);
+    expect(after.annotations[0]!.anchors[0]).toMatchObject({ sortIndex: "00000|000100|00200" });
+    expect(after.annotations[0]!.externalHash).toBe(before.annotations[0]!.externalHash);
+    expect(after.source.modifiedAt).toBe(before.source.modifiedAt);
+    const folder = join(lib.root, after.source.folder);
+    const m1 = (await stat(join(folder, "annotations.json"))).mtimeMs;
+    await new Promise((res) => setTimeout(res, 30));
+    await (await startZoteroWebImport(bulkDeps(), p.id, { ...web, full: true })).done;
+    expect((await stat(join(folder, "annotations.json"))).mtimeMs).toBe(m1);
+    await createBulkImport(bulkDeps()).undoBatch(p.id, h.batchId);
+    expect((await sortedSource(p)).annotations[0]!.anchors[0]).not.toHaveProperty("sortIndex");
+  });
+
+  it("R196 (b): an INCREMENTAL run does not fetch unchanged items, back-fills nothing and breaks nothing", async () => {
+    const p = await project();
+    await serveHighlighted();
+    await (await startZoteroWebImport(bulkDeps(), p.id, { ...web, full: true })).done;
+    await stripIndex(p, (await sortedSource(p)).source.id);
+    agent
+      .get(API)
+      .intercept({ path: (q) => q.startsWith("/users/42/items?") && page(q).get("since") === "30", method: "GET" })
+      .reply(200, "[]", { headers: { ...JSON_HEADERS, "total-results": "0", "last-modified-version": "30" } })
+      .persist();
+    agent
+      .get(API)
+      .intercept({ path: (q) => q.startsWith("/users/42/deleted?"), method: "GET" })
+      .reply(200, JSON.stringify({ collections: [], items: [], searches: [], tags: [], settings: [] }), { headers: { ...JSON_HEADERS, "last-modified-version": "30" } })
+      .persist();
+    const r = await (await startZoteroWebImport(bulkDeps(), p.id, web)).done;
+    expect(r.state).toBe("finished");
+    expect(r.counts.failed).toBe(0);
+    expect((await sortedSource(p)).annotations[0]!.anchors[0]).not.toHaveProperty("sortIndex");
   });
 
   it("the API key is never written anywhere: library, batch records, reports, journal, audit, app settings", async () => {
