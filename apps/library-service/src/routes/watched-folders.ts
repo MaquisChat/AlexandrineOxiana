@@ -384,8 +384,21 @@ async function choicesOf(s: Session, projectId: string, wid: string): Promise<Wa
   }
 }
 
-/** A folder's summary, built from the engine's status (`st`: given, or the watch's now). */
-async function summaryOf(ctx: Ctx, s: Session, projectId: string, rec: Rec, collections: Map<string, string>, st?: WatchStatus): Promise<WatchedFolderSummary> {
+/**
+ * The order of readings (R241): one counter per open library (its session), drawn when a summary or a list is built,
+ * BEFORE anything is read for it. A change of a folder is followed by a reading drawn after it (the act's answer, or
+ * the `watch.status` its push causes, which reads the folder when it is sent), so the highest number a reader holds
+ * for a folder is never an older reading than any it has seen.
+ */
+const seqs = new WeakMap<Session, { n: number }>();
+export function nextSeq(s: Session): number {
+  let c = seqs.get(s);
+  if (!c) seqs.set(s, (c = { n: 0 }));
+  return ++c.n;
+}
+
+/** A folder's summary under the number `seq` (drawn before `rec` and `collections` were read), from the engine's status (`st`: given, or the watch's now). */
+async function summaryOf(ctx: Ctx, s: Session, projectId: string, rec: Rec, collections: Map<string, string>, seq: number, st?: WatchStatus): Promise<WatchedFolderSummary> {
   const roots = ctx.state.roots;
   const watch = rec.dir ? watchOf(s, projectId, rec.id) : undefined;
   const status = rec.dir ? (st ?? watch?.status()) : undefined;
@@ -409,6 +422,7 @@ async function summaryOf(ctx: Ctx, s: Session, projectId: string, rec: Rec, coll
   // Exactly the plan's eight counts.
   const counts: WatchedFolderSummary["counts"] = { cameIn: c.cameIn, alreadyInLibrary: c.alreadyInLibrary, notDownloaded: c.notDownloaded, notDownloadedBytes: c.notDownloadedBytes, waiting: c.waiting, didNotComeIn: c.didNotComeIn, changed: c.changed, gone: c.gone };
   return {
+    seq,
     id: rec.id,
     ...(rec.options.label !== undefined ? { label: rec.options.label } : {}),
     recursive: rec.options.recursive ?? false,
@@ -429,9 +443,10 @@ async function collectionsOf(s: Session, projectId: string): Promise<Map<string,
 }
 
 async function summaryById(ctx: Ctx, s: Session, projectId: string, wid: string, st?: WatchStatus): Promise<WatchedFolderSummary> {
+  const seq = nextSeq(s); // first: everything below is read after it (R241)
   const rec = (await listWatchedFolders(settingsDeps(s), projectId)).find((w) => w.id === wid);
   if (!rec) throw notFound("That watched folder");
-  return summaryOf(ctx, s, projectId, rec, await collectionsOf(s, projectId), st);
+  return summaryOf(ctx, s, projectId, rec, await collectionsOf(s, projectId), seq, st);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -552,7 +567,9 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
   const coalescer = new WatchStatusCoalescer<{ s: Session; projectId: string; st: WatchStatus }>(WATCH_STATUS_INTERVAL_MS, (key, { s, projectId, st }, n) => {
     const live = () => state.session === s && !state.shuttingDown && s.repo.isUnlocked(projectId) && coalescer.latest(key, n);
     if (!live()) return;
-    void summaryById(ctx, s, projectId, st.watchId!, st).then(
+    // Read from the folder's watch NOW, under a number drawn now (R241): the pushed status can be older than an act's
+    // answer drawn meanwhile, and a higher number must never carry an older reading.
+    void summaryById(ctx, s, projectId, st.watchId!).then(
       (folder) => {
         // Built after awaits: published only if nothing closed, locked, removed or overtook it meanwhile.
         if (live()) state.events.publish("watch.status", { projectId, folder } satisfies WatchStatusEvent as unknown as Record<string, unknown>);
@@ -577,9 +594,10 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
     requireUnlocked(s, projectId);
+    const seq = nextSeq(s); // first: the list and its summaries are read after it (R241)
     const recs = await listWatchedFolders(settingsDeps(s), projectId);
     const cols = await collectionsOf(s, projectId);
-    return { folders: await Promise.all(recs.map((r) => summaryOf(ctx, s, projectId, r, cols))) };
+    return { seq, folders: await Promise.all(recs.map((r) => summaryOf(ctx, s, projectId, r, cols, seq))) };
   });
 
   // ---- add, by grant ----
