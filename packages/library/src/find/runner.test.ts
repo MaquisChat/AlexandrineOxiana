@@ -31,6 +31,8 @@ import {
   FIND_INDEX_WAIT_MS,
   FindEntryStateError,
   FindIndexNotReadyError,
+  FindProjectStoppedError,
+  FindRunnerClosedError,
   createFindRunner,
   runnerSeams,
   type FindRunner,
@@ -211,6 +213,7 @@ afterEach(async () => {
   seams.failUndo = undefined;
   runnerSeams.beforeCreate = undefined;
   runnerSeams.afterCreate = undefined;
+  runnerSeams.inAct = undefined;
   await agent.close();
   handle.close();
   await lib.close();
@@ -545,18 +548,21 @@ describe("one work, one source: under every race", () => {
   it("an import holding the store turn while the entry's answer comes: the import makes the source, the entry says Already (M6)", async () => {
     know(LINE, cr(ZORBLATT));
     const p = await project();
+    const r = runner();
+    // (R245: an add takes the store's turn, so it is made before the import holds it; the lookup waits meanwhile.)
+    const releaseLookup = gated.hold(parseReference(LINE)!.text);
+    const { added } = await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup");
     let releaseImport!: () => void;
     const importHeld = new Promise<void>((res) => (releaseImport = res));
     let inTurn = false;
-    // The import takes the turn first and holds it (as an import does while it copies a file).
+    // The import takes the turn and holds it (as an import does while it copies a file).
     const imported = importLikeAttach(p, ZORBLATT, async () => {
       inTurn = true;
       await importHeld;
     });
     await until(() => inTurn, "the import to hold the turn");
-    const r = runner();
-    const { added } = await r.add(p.id, [LINE]);
-    await until(() => gated.sent.length >= 2, "the lookup");
+    releaseLookup();
     await new Promise((res) => setTimeout(res, 50)); // the entry's answer is in and its completion waits for the turn
     expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
     releaseImport();
@@ -1250,6 +1256,11 @@ describe("R237 (b): nothing the runner waits on can hold it for ever", () => {
   it(`stopAll settles within its bound (${FIND_STOP_SETTLE_MS} ms), even with the store's turn held by an import`, async () => {
     know(LINE, cr(ZORBLATT));
     const p = await project();
+    const r = runner();
+    // (R245: an add takes the store's turn, so it is made before the import holds it; the lookup waits meanwhile.)
+    const releaseLookup = gated.hold(parseReference(LINE)!.text);
+    await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup");
     let releaseImport!: () => void;
     const held = new Promise<void>((res) => (releaseImport = res));
     let inTurn = false;
@@ -1258,9 +1269,7 @@ describe("R237 (b): nothing the runner waits on can hold it for ever", () => {
       await held;
     });
     await until(() => inTurn, "the import to hold the turn");
-    const r = runner();
-    await r.add(p.id, [LINE]);
-    await until(() => gated.sent.length >= 2, "the lookup");
+    releaseLookup();
     await new Promise((res) => setTimeout(res, 50));
     const t0 = Date.now();
     await r.stopAll();
@@ -1344,16 +1353,17 @@ describe("R237 (d): when nothing can be written for a project, the runner says s
 });
 
 describe("R237 (g): minors", () => {
-  it("M1: after stop, add writes the entry but starts no run until resume", async () => {
+  it("M1 (as changed by R245): after stop, an add is refused and writes nothing; after resume it writes and runs", async () => {
     know(LINE, cr(ZORBLATT));
     const p = await project();
     const r = runner();
     r.stop(p.id);
-    const { added } = await r.add(p.id, [LINE]);
+    await expect(r.add(p.id, [LINE])).rejects.toBeInstanceOf(FindProjectStoppedError);
     await new Promise((res) => setTimeout(res, 100));
     expect(gated.sent).toEqual([]);
-    expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
+    expect((await queue(p)).size).toBe(0);
     r.resume(p.id);
+    const { added } = await r.add(p.id, [LINE]);
     await settled(p, added[0]!.id);
     expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
   });
@@ -1600,5 +1610,111 @@ describe("last round", () => {
     await until(async () => [...(await queue(p)).values()][0]!.state === "failed", "the entry to be worked on");
     expect(read.mock.calls.map((c) => c[1])).not.toContain(older!.source.id);
     read.mockRestore();
+  });
+});
+
+describe("R245: nothing of the runner writes after the library's lock is released", () => {
+  const fileOf = (p: Project) => join(lib.root, p.folder, "find", "queue.jsonl");
+  const bytesOf = (p: Project) => readFile(fileOf(p)).catch(() => Buffer.alloc(0));
+  /** Holds the project's store turn (as an import would) until the returned function is called. */
+  async function holdTurn(p: Project): Promise<{ free: () => void; done: Promise<void> }> {
+    let free!: () => void;
+    let inTurn = false;
+    const done = serialStore(repo, p.id, async () => {
+      inTurn = true;
+      await new Promise<void>((res) => (free = res));
+    });
+    await until(() => inTurn, "the turn to be held");
+    return { free, done };
+  }
+  /** An entry in "not-found" and one in "choose". */
+  async function twoEntries(r: FindRunner, p: Project): Promise<{ none: FindEntry; choose: FindEntry }> {
+    know("Zorblatt Variants of Habitus", cr({ ...ZORBLATT, doi: "10.5555/ao.f4.v1" }, { ...ZORBLATT, doi: "10.5555/ao.f4.v2", year: 2003 }));
+    const { added } = await r.add(p.id, ["Nothing Matches Vorpalwick", "Zorblatt Variants of Habitus"]);
+    await settled(p, added[0]!.id);
+    await settled(p, added[1]!.id);
+    const none = (await entryOf(p, added[0]!.id))!;
+    const choose = (await entryOf(p, added[1]!.id))!;
+    expect([none.state, choose.state]).toEqual(["not-found", "choose"]);
+    return { none, choose };
+  }
+
+  it("acts held before their turn, stopAll called, released: nothing is written and every act is refused", async () => {
+    const p = await project();
+    const r = runner();
+    const { none, choose } = await twoEntries(r, p);
+    const before = await bytesOf(p);
+    const turn = await holdTurn(p);
+    const acts = [
+      r.add(p.id, ["Another Line Entirely"]),
+      r.choose(p.id, choose.id, choose.candidates![0]!.id),
+      r.retry(p.id, none.id),
+      r.remove(p.id, none.id),
+    ].map((a) => a.then(() => "done", (err: unknown) => err));
+    await new Promise((res) => setTimeout(res, 30));
+    const stopping = r.stopAll();
+    turn.free();
+    await turn.done;
+    await stopping;
+    for (const a of await Promise.all(acts)) expect(a).toBeInstanceOf(FindRunnerClosedError);
+    await new Promise((res) => setTimeout(res, 50));
+    expect((await bytesOf(p)).equals(before)).toBe(true);
+    expect(await sourcesOf(p)).toEqual([]);
+  });
+
+  it("acts held before their turn, stop(projectId) called, released: nothing is written and every act is refused", async () => {
+    const p = await project();
+    const r = runner();
+    const { none, choose } = await twoEntries(r, p);
+    const before = await bytesOf(p);
+    const turn = await holdTurn(p);
+    const acts = [
+      r.add(p.id, ["Another Line Entirely"]),
+      r.choose(p.id, choose.id, null),
+      r.confirmDuplicate(p.id, choose.id, true),
+      r.addHereAsWell(p.id, choose.id),
+      r.retry(p.id, none.id),
+      r.remove(p.id, none.id),
+    ].map((a) => a.then(() => "done", (err: unknown) => err));
+    await new Promise((res) => setTimeout(res, 30));
+    r.stop(p.id);
+    turn.free();
+    await turn.done;
+    for (const a of await Promise.all(acts)) expect(a).toBeInstanceOf(FindProjectStoppedError);
+    expect((await bytesOf(p)).equals(before)).toBe(true);
+    // After resume the researcher can act again.
+    r.resume(p.id);
+    await r.retry(p.id, none.id);
+  });
+
+  it("an act inside its turn when stopAll is called: stopAll settles after it, within its bound", async () => {
+    const p = await project();
+    const r = runner();
+    const { choose } = await twoEntries(r, p);
+    let release!: () => void;
+    let entered = false;
+    runnerSeams.inAct = async () => {
+      entered = true;
+      await new Promise<void>((res) => (release = res));
+    };
+    const order: string[] = [];
+    const act = r.choose(p.id, choose.id, choose.candidates![0]!.id).then(
+      () => order.push("act done"),
+      () => order.push("act refused"),
+    );
+    await until(() => entered, "the act to be inside its turn");
+    const t0 = Date.now();
+    const stopping = r.stopAll().then(() => order.push("stopAll settled"));
+    await new Promise((res) => setTimeout(res, 50));
+    expect(order).toEqual([]);
+    release();
+    await Promise.all([act, stopping]);
+    expect(Date.now() - t0).toBeLessThan(FIND_STOP_SETTLE_MS);
+    expect(order[order.length - 1]).toBe("stopAll settled");
+    expect(order).toHaveLength(2);
+    // Whatever the act did, it did before stopAll settled: nothing changes afterwards.
+    const after = await bytesOf(p);
+    await new Promise((res) => setTimeout(res, 50));
+    expect((await bytesOf(p)).equals(after)).toBe(true);
   });
 });

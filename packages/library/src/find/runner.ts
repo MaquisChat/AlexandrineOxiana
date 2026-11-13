@@ -144,8 +144,22 @@ export class FindIndexNotReadyError extends Error {
   }
 }
 
-/** Test seams (R47: honoured only under NODE_ENV=test): run just before and just after a record's creation. */
-export const runnerSeams: { beforeCreate?: () => void; afterCreate?: () => void } = {};
+/**
+ * Find and acquire is stopped for this project now (`stop(projectId)`: its lock, or a stop the runner made itself),
+ * so the researcher's act was not carried out (R245). Nothing was changed.
+ */
+export class FindProjectStoppedError extends Error {
+  override name = "FindProjectStoppedError";
+  constructor() {
+    super("Find and acquire is stopped for this project now. Nothing was changed.");
+  }
+}
+
+/**
+ * Test seams (R47: honoured only under NODE_ENV=test): run just before and just after a record's creation; and
+ * `inAct`, awaited inside a researcher's act, in its store turn, right after its check (R245).
+ */
+export const runnerSeams: { beforeCreate?: () => void; afterCreate?: () => void; inAct?: () => Promise<void> } = {};
 const seam = (f: (() => void) | undefined) => {
   if (f && process.env.NODE_ENV === "test") f();
 };
@@ -183,22 +197,23 @@ export type FindStoppedFor = {
 
 export interface FindRunner {
   /**
-   * Adds the lines as entries. After `stop(projectId)` the entries are written (if the store allows) but no run
-   * starts until `resume(projectId)` (M1).
+   * Adds the lines as entries. Like every act of the researcher (choose, confirmDuplicate, addHereAsWell, retry,
+   * remove), it is refused and writes nothing once `stopAll()` (FindRunnerClosedError) or `stop(projectId)`
+   * (FindProjectStoppedError, until `resume`) has been called, whatever it was waiting on (R245, replacing M1).
    */
   add(projectId: string, lines: string[], collectionId?: string): Promise<{ added: FindEntry[]; mergedLines: number }>;
-  /** The researcher's choice; it makes the record now (in the press's own turn), also after `stop` if the store allows. */
+  /** The researcher's choice; it makes the record now, in the press's own turn (refused after `stop` or `stopAll`, R245). */
   choose(projectId: string, entryId: string, candidateId: string | null): Promise<FindEntry>;
   confirmDuplicate(projectId: string, entryId: string, same: boolean): Promise<FindEntry>;
   addHereAsWell(projectId: string, entryId: string): Promise<FindEntry>;
-  /** Writes the entry back to "looking-up"; after `stop(projectId)` no run starts until `resume`. */
+  /** Writes the entry back to "looking-up" (refused after `stop` or `stopAll`, R245). */
   retry(projectId: string, entryId: string): Promise<FindEntry>;
   remove(projectId: string, entryId: string): Promise<void>;
   /** At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry (nothing else). */
   resume(projectId: string): void;
   /** At lock (together with the lock) or close: nothing more is written for the project; its work in flight is let go. */
   stop(projectId: string): void;
-  /** At close: settles within FIND_STOP_SETTLE_MS whatever is in flight. */
+  /** At close: settles within FIND_STOP_SETTLE_MS whatever is in flight, acts already inside their turn included (R245). */
   stopAll(): Promise<void>;
   elsewhere(projectId: string, entryId: string): Promise<{ projectId: string; sourceId: string } | null>;
   /** How many projects of the open library are locked and so were not looked into: 0 while "Check everything I have" is off. */
@@ -548,6 +563,30 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   /** The project's store turn (shared with every import into the project). */
   function turn<T>(pid: string, fn: () => Promise<T>): Promise<T> {
     return serialStore(repo, pid, fn);
+  }
+
+  /**
+   * A researcher's act in the project's store turn (R245). INSIDE the turn and before anything is written it checks
+   * that the runner is not closed (`stopAll`) and the project not stopped (`stop`, or a stop the runner made itself):
+   * whatever the act waited on, after either has been called it writes nothing and is refused. An act that has passed
+   * its check is counted in flight, so that `stopAll` waits for it (bounded, FIND_STOP_SETTLE_MS).
+   */
+  function act<T>(pid: string, fn: () => Promise<T>): Promise<T> {
+    return turn(pid, async () => {
+      if (closed) throw new FindRunnerClosedError();
+      if (runs.get(pid)?.stopped) throw new FindProjectStoppedError();
+      const p = (async () => {
+        if (runnerSeams.inAct && process.env.NODE_ENV === "test") await runnerSeams.inAct();
+        return fn();
+      })();
+      const settled = p.then(
+        () => undefined,
+        () => undefined,
+      );
+      inflight.add(settled);
+      void settled.finally(() => inflight.delete(settled));
+      return p;
+    });
   }
 
   /**
@@ -1052,8 +1091,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       seen.add(norm);
       added.push({ id: newId(), projectId, ...(collectionId ? { collectionId } : {}), typed: ref.text, state: "looking-up", createdAt: at, updatedAt: at, attempts: 0 });
     }
-    const written = await write(projectId, added, "add");
-    // After `stop(projectId)` nothing runs until `resume` (M1): enqueue does nothing for a stopped run.
+    const written = await act(projectId, () => write(projectId, added, "add"));
+    // A stop that comes after the write: nothing runs until `resume` (enqueue does nothing for a stopped run).
     for (const e of written) enqueue(projectId, e.id);
     return { added: written, mergedLines };
   }
@@ -1067,7 +1106,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     assertOpen();
     assertId(entryId);
     assertIndexReady();
-    return turn(projectId, async () => {
+    return act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       if (cur.state !== "choose") {
@@ -1092,7 +1131,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     assertOpen();
     assertId(entryId);
     assertIndexReady();
-    return turn(projectId, async () => {
+    return act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       if (cur.state !== "maybe-duplicate") throw new FindEntryStateError();
@@ -1113,7 +1152,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     assertOpen();
     assertId(entryId);
     assertIndexReady();
-    return turn(projectId, async () => {
+    return act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       if (!cur.elsewhere || (cur.state !== "already" && cur.state !== "maybe-duplicate")) throw new FindEntryStateError();
@@ -1128,7 +1167,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function retry(projectId: string, entryId: string): Promise<FindEntry> {
     assertOpen();
     assertId(entryId);
-    const w = await turn(projectId, async () => {
+    const w = await act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       const waiting = cur.state === "looking-up" && !!cur.nextTryAt;
@@ -1148,7 +1187,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function remove(projectId: string, entryId: string): Promise<void> {
     assertOpen();
     assertId(entryId);
-    await turn(projectId, async () => {
+    await act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       cancelLater(projectId, entryId);
