@@ -1,7 +1,7 @@
 // Task 47: the constants both the service and the interface used to keep their own copy of, now
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
-import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE } from "../index.js";
+import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, ZOTERO_SYNC_EVERY_MINUTES } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
   it("the service's error codes, each once", () => {
@@ -30,5 +30,9 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect([...WATCHED_FILE_LIST_KINDS]).toEqual([...WATCH_FILE_KINDS, "changed", "gone"]);
     expect(WATCHED_FILES_LIMIT_MAX).toBe(200);
     expect([...WATCHED_FILE_ACTION_DONE]).toEqual(["attached", "settled", "already-there"]);
+  });
+
+  it("Zotero sync: the intervals offered (Task Z8)", () => {
+    expect([...ZOTERO_SYNC_EVERY_MINUTES]).toEqual([30, 60, 240]);
   });
 });
