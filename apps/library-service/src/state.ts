@@ -142,6 +142,8 @@ export interface Session {
   find?: FindRunner;
   /** The index errors already seen when the index was last known good (Task F5): a new one means it cannot be trusted. */
   findIndexErrors?: number;
+  /** The researcher's presses on Find and acquire being answered now (Task F5): a close waits for them before the lock goes. */
+  findPresses?: Set<Promise<unknown>>;
 }
 
 /**
@@ -1083,6 +1085,8 @@ export class ServiceState {
     await disposeProxyQueue(s.repo).catch(() => {});
     await disposeOcrQueue(s.repo).catch(() => {});
     await withTimeout(Promise.allSettled([...this.tasks]), this.opts.closeGraceMs ?? CLOSE_GRACE_MS).catch(() => {});
+    // The researcher's Find and acquire presses still being answered end before the lock is released (Task F5).
+    await withTimeout(Promise.allSettled([...(s.findPresses ?? [])]), this.opts.closeGraceMs ?? CLOSE_GRACE_MS).catch(() => {});
     // Abandoned now (they stay pending in their journals and run again at the next open) ...
     const left = [...this.work.values()].filter((w) => STOPPED_AT_CLOSE.has(w.kind));
     for (const w of left) w.ctl.interrupt?.();

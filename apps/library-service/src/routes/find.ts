@@ -193,6 +193,24 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     return s.find;
   };
 
+  /**
+   * A press on the runner. It is counted in the session's presses, which a close waits for before the library's lock
+   * is released; a press that fails because Find and acquire stopped for the library meanwhile is a 503 in words.
+   */
+  const pressed = async <T>(s: Session, fn: () => Promise<T>): Promise<T> => {
+    const p = fn();
+    const presses = (s.findPresses ??= new Set());
+    presses.add(p);
+    try {
+      return await p;
+    } catch (err) {
+      if (state.session !== s || !s.find) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
+      throw said(err);
+    } finally {
+      presses.delete(p);
+    }
+  };
+
   /** The entry of THIS project: 404 when it is not in its queue (409 in words when it was removed here). */
   const entryOf = async (s: Session, projectId: string, entryId: string): Promise<FindEntry> => {
     const q = await inWords(() => readFindQueueOf(s.repo, projectId));
@@ -237,7 +255,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     });
     const collectionId = b.collectionId;
     if (collectionId !== undefined && (typeof collectionId !== "string" || !isId(collectionId))) throw badRequest("The collection is not one of this project's.");
-    const r = await inWords(() => runner.add(projectId, lines, collectionId));
+    const r = await pressed(s, () => runner.add(projectId, lines, collectionId));
     return { added: r.added.map(entryView), mergedLines: r.mergedLines };
   });
 
@@ -251,7 +269,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     // Only an entry waiting for a choice: a second press, or a press on any other state, is a 409 in words.
     if (cur.state !== "choose") throw new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
     if (candidateId !== null && !cur.candidates?.some((c) => c.id === candidateId)) throw new ApiError(400, "VALIDATION", FIND_ROUTE_TEXT.unknownCandidate, "unknown-candidate");
-    return entryView(await inWords(() => runner.choose(projectId, entryId, candidateId)));
+    return entryView(await pressed(s, () => runner.choose(projectId, entryId, candidateId)));
   });
 
   app.post("/projects/:id/find/:eid/duplicate", limit, async (req): Promise<FindEntryView> => {
@@ -260,7 +278,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const same = bodyAs<FindDuplicateRequest>(req).same;
     if (typeof same !== "boolean") throw badRequest('"same" must be true or false.');
     await entryOf(s, projectId, entryId);
-    return entryView(await inWords(() => runner.confirmDuplicate(projectId, entryId, same)));
+    return entryView(await pressed(s, () => runner.confirmDuplicate(projectId, entryId, same)));
   });
 
   app.post("/projects/:id/find/:eid/add-here", limit, async (req): Promise<FindEntryView> => {
@@ -268,7 +286,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const runner = runnerOf(s);
     bodyOf(req);
     await entryOf(s, projectId, entryId);
-    return entryView(await inWords(() => runner.addHereAsWell(projectId, entryId)));
+    return entryView(await pressed(s, () => runner.addHereAsWell(projectId, entryId)));
   });
 
   app.post("/projects/:id/find/:eid/retry", limit, async (req): Promise<FindEntryView> => {
@@ -276,14 +294,14 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const runner = runnerOf(s);
     bodyOf(req);
     await entryOf(s, projectId, entryId);
-    return entryView(await inWords(() => runner.retry(projectId, entryId)));
+    return entryView(await pressed(s, () => runner.retry(projectId, entryId)));
   });
 
   app.delete("/projects/:id/find/:eid", limit, async (req): Promise<FindRemoveResponse> => {
     const { s, projectId, entryId } = addressed(req, true);
     const runner = runnerOf(s);
     await entryOf(s, projectId, entryId);
-    await inWords(() => runner.remove(projectId, entryId));
+    await pressed(s, () => runner.remove(projectId, entryId));
     noteRemoved(s, projectId, entryId);
     return { removed: true };
   });

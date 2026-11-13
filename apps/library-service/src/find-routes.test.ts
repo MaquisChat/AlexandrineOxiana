@@ -578,6 +578,47 @@ describe("the runner's life in the service", () => {
     expect((await settled(pid, e!.id)).state).toBe("record-complete");
   });
 
+  it("close in the middle of a choose: the press answers 503 in words, and nothing of it lands after the lock is released", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const s = svc!.state.session!;
+    const [c] = await add(pid, [AMBIGUOUS]);
+    const waiting = await settled(pid, c!.id);
+    const file = join(path, await folderOf(pid), "find", "queue.jsonl");
+    // The choose waits for the project's turn, held by another way in (an import, say).
+    let free!: () => void;
+    const turn = serialStore(s.repo, pid, () => new Promise<void>((r) => (free = r)));
+    const order: string[] = [];
+    const runner = s.find!;
+    const choose = runner.choose;
+    runner.choose = (...a: Parameters<typeof choose>) => choose(...a).finally(() => order.push("choose settled"));
+    const choosing = call({ method: "POST", url: `/projects/${pid}/find/${c!.id}/choose`, body: { candidateId: waiting.candidates![0]!.id } });
+    await sleep(50);
+    const close = s.lib.close.bind(s.lib);
+    s.lib.close = async () => {
+      order.push("lib.close");
+      return close();
+    };
+    const closing = call({ method: "POST", url: "/libraries/close" });
+    await sleep(100);
+    free();
+    await turn;
+    expect((await closing).status).toBe(200);
+    const chose = await choosing;
+    expect(chose.status).toBe(503);
+    expect(chose.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.closed, reason: "closed" });
+    expect(order).toEqual(["choose settled", "lib.close"]);
+    const bytes = await readFile(file);
+    await sleep(200);
+    expect((await readFile(file)).equals(bytes)).toBe(true);
+    // Reopened: nothing was half-done.
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await svc!.state.idle();
+    expect((await entry(pid, c!.id))!.state).toBe("choose");
+    expect((await call({ url: `/projects/${pid}/sources?limit=10` })).json.total).toBe(0);
+  });
+
   it("close awaits stopAll before the library's lock is released", async () => {
     await start();
     await openNewLibrary();
