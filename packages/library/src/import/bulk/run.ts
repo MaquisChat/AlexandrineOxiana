@@ -683,6 +683,17 @@ class Run {
           total = Math.max(total, done);
           continue;
         }
+        if (this.cancelled) break;
+        this.feed.emit({ done, total: Math.max(total, done + 1), current: item.key });
+        const entry = await this.item(item, dedupe, watchdog);
+        if (entry) this.latest.set(entry.key, entry); // queued items are recorded when their group is stored
+        done++;
+        total = Math.max(total, done);
+        this.feed.emit({ done, total });
+        if (this.pending.length >= 200) await this.checkpoint("running");
+        // A pause or suspend takes effect here, after the item in hand and BEFORE the next is asked of the
+        // adapter: an item the adapter already fetched (a Zotero file downloaded for it, Z4) is never dropped
+        // and fetched again by the resumed run.
         if (this.paused) {
           await this.checkpoint("paused");
           if (!this.suspending) {
@@ -696,16 +707,9 @@ class Run {
             state = "paused";
             break;
           }
-          if (!this.cancelled) await this.checkpoint("running");
+          if (this.cancelled) break;
+          await this.checkpoint("running");
         }
-        if (this.cancelled) break;
-        this.feed.emit({ done, total: Math.max(total, done + 1), current: item.key });
-        const entry = await this.item(item, dedupe, watchdog);
-        if (entry) this.latest.set(entry.key, entry); // queued items are recorded when their group is stored
-        done++;
-        total = Math.max(total, done);
-        this.feed.emit({ done, total });
-        if (this.pending.length >= 200) await this.checkpoint("running");
         await sleepTurn();
       }
       if (state !== "paused") {

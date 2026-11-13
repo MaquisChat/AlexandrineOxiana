@@ -27,11 +27,20 @@
  * (ScanContext.knownIds, this library only) as `{ gone: "deleted" }`; child keys are counted only. A
  * full run yields a known item as `{ gone: "deleted" }` by absence only when the scan was complete
  * AND the key is missing from the library's complete key list, whole by its own evidence (A6:
- * Total-Results, exactly that many keys, every key the scan saw), at whatever version. If that list
- * cannot be had whole in 3 tries, the full run is not finished: nobody is gone by absence and the
- * version is not recorded. Gone items are yielded last, after a check that the key may still read the
- * library; any failure first yields none. ScanContext.skip lets the engine pass an item by before
- * anything under it is fetched.
+ * Total-Results, exactly that many keys, every key the scan saw). The list is taken right after the
+ * read, pinned to the scan's version and again after every restart, before any file is downloaded
+ * (A7, R215). If it cannot be had whole in 3 tries, the full run is not finished: nobody is gone by
+ * absence, the version is not recorded, and the run's notes say so once (ZOTERO_WEB_NOTES.notConfirmed).
+ * Gone items are yielded last, after a check that the key may still read the library; any failure first
+ * yields none. ScanContext.skip lets the engine pass an item by before anything under it is fetched.
+ *
+ * No file downloaded twice (Task Z4): before an attachment's file is asked for, ScanContext.fileKnown
+ * says whether an earlier import stored this attachment at this very version (the engine's journal,
+ * `ext.parts`, with the hash of the asset it became). Then nothing is requested for it (not even the
+ * redirect), its annotations carry `assetSha256` and are anchored in that asset, and it counts as brought
+ * in (the version token is the one a successful download gives, exactly as before this task). Each item
+ * reports its stored files in `version.parts` (attachment version and file hash; a failed download has
+ * no part); the engine journals only those the source holds.
  *
  * A complete scan: every paged listing carried Total-Results and added up to it, no page failed or
  * was cut for good (a page cut in mid-body is asked for again), the tag colours came in or are not

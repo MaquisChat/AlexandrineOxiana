@@ -796,7 +796,7 @@ describe("unattended scans against the stand-in (Z2)", () => {
   it("a key list taken after the library changed still decides: the deleted item is gone, the added one is not content (A6)", async () => {
     const a = z.addItem(U, art("Here"));
     let added: string | undefined;
-    // Called in the content loop, after the scan read the library and before the key list is asked for.
+    // Called in the content loop, after the scan read the library (since A7 the key list is asked for before that loop).
     const skip = () => {
       added ??= z.addItem(U, art("Added after the read"));
       return false;
