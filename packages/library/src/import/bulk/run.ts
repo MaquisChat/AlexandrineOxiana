@@ -24,7 +24,18 @@
  * location coarsened or removed (R83, ../proxies.ts); without a media worker those stay pending
  * (LOCATION_REASON in the item's notes and the report). Journal lines of items that stored nothing
  * (duplicates, failures) are written with the next store or at the next checkpoint; after a crash
- * such an item is simply processed again, with the same result.
+ * such an item is simply processed again, with the same result. A pause or suspend takes effect
+ * between items, after the item in hand and before the adapter is asked for the next one. So a suspend
+ * that arrives while the adapter fetches an item waits until that item is stored too (the service bounds
+ * the wait, then cancels; the batch stays resumable), and a pause asked for during the last item holds the
+ * finished run paused until it is resumed.
+ *
+ * Incremental adapters (R72) are told what the journals of the batches of their kind that were not
+ * undone know: `knownIds`, and (Z4) `fileKnown`, from the parts of each item's newest line (attachment
+ * version and stored file hash), while the source still holds an asset entry with that hash (I1). A
+ * journal line records a part only when its source holds an asset entry with the file's hash (partsFor). A
+ * known file whose entries the researcher destroyed here (retention) is never brought back and is noted
+ * (`removedHere`); a file whose entry is simply gone (an undo) is downloaded again.
  *
  * Linking (`fileHandling: 'link'`) stores the file's absolute path and its path relative to the
  * library (LinkedRelativePath, R24) and copies nothing; it is refused in projects whose governance
@@ -100,6 +111,7 @@ import {
   latestByKey,
   readBatchAt,
   readJournal,
+  readParts,
   writeBatchRecord,
   type BatchRecord,
   type BatchState,
@@ -126,7 +138,19 @@ export const ENGINE_FILE_NOTES = {
   changed: "attached file changed during import",
   /** A file the source links in place (a Zotero linked attachment) was copied: the project keeps files encrypted (R24, R72). */
   linkedCopied: "linked file copied into the library, because this project keeps its files encrypted",
+  /**
+   * Z4: a file an earlier import stored (the journal says so) whose asset the researcher destroyed here
+   * (retention; the asset entry says so): it is not downloaded and not brought back.
+   */
+  removedHere: "an attached file you removed here was not brought in again",
 } as const;
+
+/** The run's note on files removed here and not brought back (Z4), counted over the batch's lines. */
+const removedNote = (n: number) => (n === 1 ? "An attached file you removed here was not brought in again." : `${n} attached files you removed here were not brought in again.`);
+const REMOVED_NOTE = /^(?:An attached file you removed here was|\d+ attached files you removed here were) not brought in again\.$/u;
+
+/** A stored file's parts as journaled (Z4). */
+type Parts = Record<string, { v: number; sha256?: string }>;
 
 export const REASONS = {
   missing: "The file could not be found or read.",
@@ -468,7 +492,7 @@ class Run {
   private fileOwners = new Map<string, string>();
   private readonly workName: string;
   /** Incremental import (R72): identity → the source and version token the newest journal line recorded. */
-  private known = new Map<string, { sourceId: string; version: string }>();
+  private known = new Map<string, { sourceId: string; version: string; parts?: Parts }>();
   /** Whether a Zotero item's source was deleted here (R73); re-read for each group and whenever a known source is gone (R74 M4). */
   private deletedHere: (zoteroKey: string) => boolean = () => false;
   private async refreshDeleted(): Promise<void> {
@@ -482,7 +506,7 @@ class Run {
   /** Item key → annotations left out over the per-source caps (journaled with its outcome). */
   private annotationsDropped = new Map<string, number>();
   /** Item key → its identity and version token (journaled with its outcome). */
-  private versions = new Map<string, { id: string; version: string }>();
+  private versions = new Map<string, NonNullable<ScanItem["version"]>>();
   private structureCache = new Map<string, { collectionIds: string[]; tagIds: string[] }>();
   private projectTags: { collections: Array<{ id: string; name: string; parentId?: string }>; tags: Array<{ id: string; name: string }> } | null = null;
   private snapshots = 0;
@@ -653,7 +677,7 @@ class Run {
         note: (t) => this.note(t),
         // An item already in this batch's journal is passed by below: the adapter need not fetch it (Z2).
         skip: (key) => this.latest.has(key),
-        ...(this.adapter.incremental ? { knownIds: () => (knownIds ??= new Set(this.known.keys())) } : {}),
+        ...(this.adapter.incremental ? { knownIds: () => (knownIds ??= new Set(this.known.keys())), fileKnown: (id, att, v) => this.fileKnown(id, att, v) } : {}),
       });
       for await (const item of scan) {
         if (seenKeys.has(item.key)) continue;
@@ -670,6 +694,17 @@ class Run {
           total = Math.max(total, done);
           continue;
         }
+        if (this.cancelled) break;
+        this.feed.emit({ done, total: Math.max(total, done + 1), current: item.key });
+        const entry = await this.item(item, dedupe, watchdog);
+        if (entry) this.latest.set(entry.key, entry); // queued items are recorded when their group is stored
+        done++;
+        total = Math.max(total, done);
+        this.feed.emit({ done, total });
+        if (this.pending.length >= 200) await this.checkpoint("running");
+        // A pause or suspend takes effect here, after the item in hand and BEFORE the next is asked of the
+        // adapter: an item the adapter already fetched (a Zotero file downloaded for it, Z4) is never dropped
+        // and fetched again by the resumed run.
         if (this.paused) {
           await this.checkpoint("paused");
           if (!this.suspending) {
@@ -683,16 +718,9 @@ class Run {
             state = "paused";
             break;
           }
-          if (!this.cancelled) await this.checkpoint("running");
+          if (this.cancelled) break;
+          await this.checkpoint("running");
         }
-        if (this.cancelled) break;
-        this.feed.emit({ done, total: Math.max(total, done + 1), current: item.key });
-        const entry = await this.item(item, dedupe, watchdog);
-        if (entry) this.latest.set(entry.key, entry); // queued items are recorded when their group is stored
-        done++;
-        total = Math.max(total, done);
-        this.feed.emit({ done, total });
-        if (this.pending.length >= 200) await this.checkpoint("running");
         await sleepTurn();
       }
       if (state !== "paused") {
@@ -727,6 +755,10 @@ class Run {
     const deleted = [...this.latest.values()].filter((e) => e.outcome === "deleted-here").length;
     this.rec.notes = this.rec.notes.filter((n) => !DELETED_NOTE.test(n));
     if (deleted) this.note(deletedNote(deleted));
+    // Z4: files removed here that a later run did not bring back, over every line of the batch (a resume too).
+    const removed = [...this.latest.values()].reduce((n, e) => n + (e.notes?.filter((x) => x === ENGINE_FILE_NOTES.removedHere).length ?? 0), 0);
+    this.rec.notes = this.rec.notes.filter((n) => !REMOVED_NOTE.test(n));
+    if (removed) this.note(removedNote(removed));
     for (const id of watchdog.disabled) {
       this.note(`The file-name pattern "${id}" took too long on a file name and was switched off for the rest of this import.`);
     }
@@ -754,7 +786,13 @@ class Run {
         const k = this.known.get(item.version.id);
         if (k && !hasSource(this.repo, this.projectId, k.sourceId)) await this.refreshDeleted(); // deleted meanwhile?
         if (k && hasSource(this.repo, this.projectId, k.sourceId)) {
-          if (k.version === item.version.version) return (await this.backfillOnly(item, k.sourceId)) ?? this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId });
+          if (k.version === item.version.version) {
+            // Z4: with stored files, the source's assets decide which parts are journaled and whether a known
+            // file was removed here (one read; an item without files costs none, as before).
+            const target = item.version.parts && Object.keys(item.version.parts).length ? await this.repo.getSource(this.projectId, k.sourceId) : undefined;
+            if (target) this.noteRemoved(item, k.sourceId, target.assets);
+            return (await this.backfillOnly(item, k.sourceId, target)) ?? this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId }, target?.assets);
+          }
           await this.flush(); // the source may be in the current group
           return await this.update(item, k.sourceId);
         }
@@ -786,19 +824,106 @@ class Run {
     return failed(REASONS.failed);
   }
 
-  private queue(e: JournalEntry): JournalEntry {
-    const line = this.withNotes(e);
+  private queue(e: JournalEntry, assets?: Asset[]): JournalEntry {
+    const line = this.withNotes(e, assets);
     this.pending.push(line);
     return line;
   }
 
-  /** The journal line with the item's file notes, if it has any (R66). */
-  private withNotes(e: JournalEntry): JournalEntry {
+  /**
+   * The journal line with the item's file notes, if it has any (R66), and its version (R72) with the parts of
+   * its stored files (Z4; `assets`: the line's source as it stands after the change, see partsFor).
+   */
+  private withNotes(e: JournalEntry, assets?: Asset[]): JournalEntry {
     const notes = this.fileNotes.get(e.key);
     const v = WITH_VERSION.has(e.outcome) && e.sourceId ? this.versions.get(e.key) : undefined;
-    if (v) this.known.set(v.id, { sourceId: e.sourceId!, version: v.version });
+    const parts = v ? this.partsFor(v, e.sourceId!, assets) : undefined;
+    const ext = v ? { id: v.id, version: v.version, ...(parts ? { parts } : {}) } : undefined;
+    if (ext) this.known.set(ext.id, { sourceId: e.sourceId!, version: ext.version, ...(parts ? { parts } : {}) });
     const dropped = e.outcome === "created" || e.outcome === "needs-review" ? this.annotationsDropped.get(e.key) : undefined;
-    return { ...e, ...(notes?.length ? { notes } : {}), ...(v ? { ext: { id: v.id, version: v.version } } : {}), ...(dropped ? { annotationsDropped: dropped } : {}) };
+    return { ...e, ...(notes?.length ? { notes } : {}), ...(ext ? { ext } : {}), ...(dropped ? { annotationsDropped: dropped } : {}) };
+  }
+
+  /**
+   * Z4: the parts a journal line keeps (`ext.parts`). A part is kept only when the source holds an asset
+   * entry with its hash: a file downloaded and stored, or dropped by its hash as already there, or a known file
+   * not downloaded again; a file the researcher destroyed here (retention) keeps its entry, so its part is
+   * carried and it is never brought back. A download the engine did not store (an unsupported file, the same
+   * file as another item), a part whose asset entry is gone (the batch that added it was undone, I1) and a known
+   * part under another source are left out: the next run downloads that file. Without `assets` (no caller
+   * today), only parts carried unchanged for the same source are kept.
+   */
+  private partsFor(v: NonNullable<ScanItem["version"]>, sourceId: string, assets: Asset[] | undefined): Parts | undefined {
+    if (!v.parts) return undefined;
+    const prev = this.known.get(v.id);
+    const carried = prev && prev.sourceId === sourceId ? prev.parts : undefined;
+    const out: Parts = {};
+    let any = false;
+    for (const [att, p] of Object.entries(v.parts)) {
+      if (!p || !Number.isInteger(p.v) || typeof p.sha256 !== "string") continue;
+      const was = carried && Object.hasOwn(carried, att) ? carried[att] : undefined;
+      const keep = assets ? assets.some((a) => a.sha256 === p.sha256) : was !== undefined && was.v === p.v && was.sha256 === p.sha256;
+      if (!keep) continue;
+      out[att] = { v: p.v, sha256: p.sha256 };
+      any = true;
+    }
+    return any ? out : undefined;
+  }
+
+  /**
+   * Z4 (ScanContext.fileKnown): the stored file's hash when (1) the newest journal line of this kind (batches
+   * not undone) says the attachment was stored at this version, (2) the line's source is still here, and (3)
+   * that source still holds an asset entry with that hash (the index's assets table: every asset entry, a file
+   * destroyed here included; I1). A line of an undone batch is never read; a part that a later line carried
+   * after the batch that added the file was undone names an entry that is gone, so the file is downloaded as
+   * any missing file is. A source deleted here is not known, unless the item is to stay deleted (R73, no
+   * `includeDeleted`): then its file is not needed either. Anything the index cannot confirm downloads.
+   */
+  private fileKnown(versionId: string, attKey: string, attVersion: number): { sha256: string } | undefined {
+    const k = this.known.get(versionId);
+    const p = k?.parts && Object.hasOwn(k.parts, attKey) ? k.parts[attKey] : undefined;
+    if (!k || !p || p.v !== attVersion || typeof p.sha256 !== "string") return undefined;
+    if (!hasSource(this.repo, this.projectId, k.sourceId)) {
+      // M1: an item deleted here that this run will report as deleted-here needs no file (its Zotero key is the
+      // last segment of its version id, `<ref>/<key>`, as the adapter makes it).
+      const zk = versionId.slice(versionId.lastIndexOf("/") + 1);
+      return zk && !this.rec.options.includeDeleted && this.deletedHere(zk) ? { sha256: p.sha256 } : undefined;
+    }
+    return this.hasAssetEntry(k.sourceId, p.sha256) ? { sha256: p.sha256 } : undefined;
+  }
+
+  /** Whether the index holds an asset entry (any status) of this source with this hash (Z4, I1); false when it cannot say. */
+  private hasAssetEntry(sourceId: string, sha256: string): boolean {
+    try {
+      this.assetEntry ??= this.deps.index.db.prepare(
+        "SELECT 1 FROM main.assets WHERE source_id = ? AND sha256 = ? UNION ALL SELECT 1 FROM temp.t_assets WHERE source_id = ? AND sha256 = ? LIMIT 1",
+      );
+      return this.assetEntry.get(sourceId, sha256, sourceId, sha256) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+  private assetEntry: { get(...params: unknown[]): unknown } | undefined;
+
+  /**
+   * Z4: a known file (its part carried from the previous line, not downloaded in this run) whose asset entries
+   * in the source are all destroyed (retention): the researcher took it away here (I1: the source's own record
+   * says so). It was not downloaded and is not brought back; the item says so (a file note) and the run counts
+   * it. A part whose entry is simply absent is not a removal (only an undo removes an entry): that file is
+   * downloaded, and this says nothing.
+   */
+  private noteRemoved(item: ScanItem, sourceId: string, assets: Asset[]): void {
+    const v = item.version;
+    const prev = v ? this.known.get(v.id) : undefined;
+    if (!v?.parts || !prev?.parts || prev.sourceId !== sourceId) return;
+    let n = 0;
+    for (const [att, p] of Object.entries(v.parts)) {
+      const was = Object.hasOwn(prev.parts, att) ? prev.parts[att] : undefined;
+      if (!was || was.v !== p.v || was.sha256 !== p.sha256) continue; // not the known part
+      const entries = assets.filter((a) => a.sha256 === p.sha256);
+      if (entries.length && entries.every((a) => a.status === "destroyed")) n++;
+    }
+    if (n) this.fileNotes.set(item.key, [...(this.fileNotes.get(item.key) ?? []), ...Array<string>(n).fill(ENGINE_FILE_NOTES.removedHere)]);
   }
 
   /** Clears the deletion records of items imported again with includeDeleted (one bookkeeping change). */
@@ -1177,7 +1302,7 @@ class Run {
           inTx: async (tx, sf) => {
             this.notePending(q.item.key, sf, rule.mode());
             const files = fileCounts(q.inputs.map((f) => f.handling === "link"));
-            const entry: JournalEntry = this.withNotes({ key: q.item.key, outcome: q.reviewItem ? "needs-review" : "created", sourceId: sf.source.id, ...(files ? { files } : {}) });
+            const entry: JournalEntry = this.withNotes({ key: q.item.key, outcome: q.reviewItem ? "needs-review" : "created", sourceId: sf.source.id, ...(files ? { files } : {}) }, sf.assets);
             entries[i] = entry;
             await appendJournal(tx, this.projectRel, this.rec.dir, i === 0 ? [...this.pending.slice(0, flushLines), entry] : [entry]);
           },
@@ -1250,7 +1375,7 @@ class Run {
       async (tx, created) => {
         this.notePending(item.key, created, rule.mode());
         const files = fileCounts(inputs.map((f) => f.handling === "link"));
-        entry = this.withNotes({ key: item.key, outcome, sourceId: created.source.id, ...(files ? { files } : {}) });
+        entry = this.withNotes({ key: item.key, outcome, sourceId: created.source.id, ...(files ? { files } : {}) }, created.assets);
         await appendJournal(tx, this.projectRel, this.rec.dir, [...this.pending.slice(0, flush), entry]);
       },
     );
@@ -1332,11 +1457,17 @@ class Run {
         ? {
             annotations: (sourceId: string, assets: Asset[], actor: string) =>
               item.annotations!.map((a) =>
-                toAnnotation(a, sourceId, actor, (file) => {
-                  const real = prep.realOf.get(file);
-                  const i = real ? inputs.findIndex((f) => f.path === real) : -1;
-                  return i >= 0 ? assets[i] : undefined;
-                }),
+                toAnnotation(
+                  a,
+                  sourceId,
+                  actor,
+                  (file) => {
+                    const real = prep.realOf.get(file);
+                    const i = real ? inputs.findIndex((f) => f.path === real) : -1;
+                    return i >= 0 ? assets[i] : undefined;
+                  },
+                  (sha) => assets.find((x) => x.sha256 === sha),
+                ),
               ),
           }
         : {}),
@@ -1425,13 +1556,13 @@ class Run {
    * refused (the item then stays "unchanged"). The source is not marked modified; it is reported as unchanged; the
    * batch's undo restores the earlier anchors.
    */
-  private async backfillOnly(item: ScanItem, sourceId: string): Promise<JournalEntry | null> {
+  private async backfillOnly(item: ScanItem, sourceId: string, read?: SourceFile): Promise<JournalEntry | null> {
     // Cost (R197, accepted for now): every Zotero highlight has a sort index, so this guard cannot tell a source that
     // still needs the back-fill from one that has had it; each unchanged, highlighted item costs one source read per
-    // re-import. To be revisited when the automatic Zotero sync is planned.
+    // re-import. To be revisited when the automatic Zotero sync is planned. (`read`: the source already read, Z4.)
     if (!item.annotations?.some((a) => a.anchor?.kind === "pdf" && a.anchor.sortIndex)) return null;
     try {
-      const target = await this.repo.getSource(this.projectId, sourceId);
+      const target = read ?? (await this.repo.getSource(this.projectId, sourceId));
       if (!planBackfill(target, item.annotations).length) return null;
       await this.flush(); // the source may be in the current group
       const out = await this.changeSource(
@@ -1461,6 +1592,7 @@ class Run {
     const v = await this.revalidate(item, prep.inputs);
     const inputs = v.inputs;
     const target = await this.repo.getSource(this.projectId, sourceId);
+    this.noteRemoved(item, sourceId, target.assets);
     const evSource = item.referenceSource ?? { kind: "refman" as const, ref: "reference" };
     const ref = item.referenceMetadata ?? {};
     const haveSha = new Set(target.assets.map((a) => a.sha256));
@@ -1476,7 +1608,7 @@ class Run {
     const kept = [...pre.kept, ...keptLabels(target, preAnn.kept)];
     const anything = pre.filled.length || pre.evidence.length || newInputs.length || preAnn.added.length || preAnn.updated.length || newTags;
     if (!anything && !preAnn.backfilled.length) {
-      return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(kept.length ? { merge: emptyRecord(kept) } : {}), ...(preAnn.dropped ? { annotationsDropped: preAnn.dropped } : {}), ...(preAnn.deletedHere ? { annotationsDeletedHere: preAnn.deletedHere } : {}) });
+      return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(kept.length ? { merge: emptyRecord(kept) } : {}), ...(preAnn.dropped ? { annotationsDropped: preAnn.dropped } : {}), ...(preAnn.deletedHere ? { annotationsDeletedHere: preAnn.deletedHere } : {}) }, target.assets);
     }
     const tagIds = await this.namedTags(item.tags, item.tagColors);
     // New files may carry a location: location governance applies to them (R57; R74 I1; R83).
@@ -1574,9 +1706,9 @@ class Run {
           await ops.writeSource(cur, r.next);
           const added = new Set(r.record.addedAssetIds);
           const files = fileCounts(r.next.assets.filter((a) => added.has(a.id)).map((a) => a.linked !== undefined));
-          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: r.record, ...(files ? { files } : {}), ...extra() });
+          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: r.record, ...(files ? { files } : {}), ...extra() }, r.next.assets);
         } else {
-          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, ...(r.record.kept?.length ? { merge: r.record } : {}), ...extra() });
+          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, ...(r.record.kept?.length ? { merge: r.record } : {}), ...extra() }, cur.assets);
         }
         await appendJournal(tx, projectRel, this.rec.dir, [...this.pending.slice(0, flush), entry]);
         return r.next ?? cur;
@@ -1605,11 +1737,18 @@ class Run {
   /** The item's annotations against the source (new, changed at the source, kept), anchored in its assets by file hash. */
   private annotationPlan(item: ScanItem, sf: SourceFile, prep: Prepared, actor: string): AnnotationPlan {
     return planAnnotations(sf, item.annotations ?? [], (a) =>
-      toAnnotation(a, sf.source.id, actor, (file) => {
-        const real = prep.realOf.get(file);
-        const sha = real ? prep.shaOf.get(real) : undefined;
-        return sha ? sf.assets.find((x) => x.sha256 === sha) : undefined;
-      }),
+      toAnnotation(
+        a,
+        sf.source.id,
+        actor,
+        (file) => {
+          const real = prep.realOf.get(file);
+          const sha = real ? prep.shaOf.get(real) : undefined;
+          return sha ? sf.assets.find((x) => x.sha256 === sha) : undefined;
+        },
+        // Z4: a file not downloaded again is found by its stored hash, exactly as a downloaded copy's hash finds it.
+        (sha) => sf.assets.find((x) => x.sha256 === sha),
+      ),
     );
   }
 }
@@ -1639,8 +1778,8 @@ const WITH_VERSION = new Set(["created", "needs-review", "merged", "updated", "u
  * Incremental import (R72): for each item identity, the source and version token recorded by the
  * newest journal line of the project's batches of this kind that were not undone.
  */
-async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"]): Promise<Map<string, { sourceId: string; version: string }>> {
-  const out = new Map<string, { sourceId: string; version: string }>();
+async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"]): Promise<Map<string, { sourceId: string; version: string; parts?: Parts }>> {
+  const out = new Map<string, { sourceId: string; version: string; parts?: Parts }>();
   for (const d of await batchDirs(repo, projectId)) {
     let rec: BatchRecord | undefined;
     try {
@@ -1649,7 +1788,12 @@ async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["s
       continue;
     }
     if (!rec || rec.source.kind !== kind || rec.state === "undone") continue;
-    for (const e of await readJournal(repo, projectId, rec.dir)) if (e.ext && e.sourceId) out.set(e.ext.id, { sourceId: e.sourceId, version: e.ext.version });
+    for (const e of await readJournal(repo, projectId, rec.dir)) {
+      if (!e.ext || !e.sourceId) continue;
+      // The newest line decides, its parts too (Z4): a line without parts (written before Z4) knows no file.
+      const parts = readParts(e.ext.parts);
+      out.set(e.ext.id, { sourceId: e.sourceId, version: e.ext.version, ...(parts ? { parts } : {}) });
+    }
   }
   return out;
 }

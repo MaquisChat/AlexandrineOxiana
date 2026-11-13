@@ -72,6 +72,13 @@ export interface ScanAnnotation {
   file?: string;
   /** A pdf anchor carries Zotero's sort index ("PPPPP|OOOOOO|TTTTT") when it has a well-formed one. */
   anchor?: { kind: "pdf"; page: number; rects: ScanRect[]; sortIndex?: string } | { kind: "epub-cfi"; cfi: string };
+  /**
+   * Instead of `file` (Zotero Web, Task Z4): the anchor is in the source's asset with this SHA-256, a file
+   * stored by an earlier import and not downloaded again (ScanContext.fileKnown). An asset is never
+   * guessed: when the source has none with this hash, a new annotation is stored without an anchor (its
+   * page kept as the label), and one already stored keeps the anchor it has.
+   */
+  assetSha256?: string;
 }
 
 export interface ScanItem {
@@ -100,7 +107,17 @@ export interface ScanItem {
    * that changes whenever the item (or anything under it) changes. Re-running skips an item whose
    * token is unchanged and updates one whose token changed (R72).
    */
-  version?: { id: string; version: string };
+  version?: {
+    id: string;
+    version: string;
+    /**
+     * Zotero Web (Task Z4): the item's stored files by attachment key: the attachment's version and the
+     * SHA-256 of the file (downloaded in this run, or known from the journal through ScanContext.fileKnown).
+     * The engine journals (`ext.parts`) only the parts whose file the source holds and the known ones it
+     * carries forward; a download that failed has no part. Not part of the version token.
+     */
+    parts?: Record<string, { v: number; sha256?: string }>;
+  };
   /** Recorded in the source's provenance (e.g. a Zotero item key). */
   externalKeys?: Record<string, string>;
   /**
@@ -144,6 +161,15 @@ export interface ScanContext {
    * libraries of the kind: an adapter keeps to its own). Incremental adapters only.
    */
   knownIds?(): ReadonlySet<string>;
+  /**
+   * Zotero Web (Task Z4): the stored file's hash when the attachment `attKey` of the item `versionId` was
+   * stored at version `attVersion` by an earlier import (the newest journal line of a batch of this kind
+   * that was not undone says so, `ext.parts`, with the hash of the asset it became) and the item's source
+   * still holds an asset entry with that hash (I1; or the source was deleted here and the item stays deleted,
+   * R73); otherwise undefined. A known file is not downloaded (no request at all) and its
+   * annotations are anchored by `assetSha256`. Incremental adapters only; one that ignores it downloads.
+   */
+  fileKnown?(versionId: string, attKey: string, attVersion: number): { sha256: string } | undefined;
 }
 
 export interface ImportSourceAdapter {

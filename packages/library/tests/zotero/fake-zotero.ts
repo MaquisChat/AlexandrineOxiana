@@ -545,6 +545,22 @@ export class FakeZotero {
   }
 
   /**
+   * A new file uploaded for an attachment in Zotero: its bytes, its md5 (and mtime) and the attachment's version
+   * change, as an upload does (Z4's "a new file version"). Storage and redirect settings are kept.
+   */
+  replaceFile(ref: string, key: string, bytes: Uint8Array): void {
+    const lib = this.lib(ref);
+    const it = this.item(lib, key);
+    if (!it.file) throw new Error(`FakeZotero: ${key} has no file`);
+    const v = ++lib.version;
+    it.file.bytes = bytes;
+    delete it.file.stale;
+    it.data.md5 = md5Hex(bytes);
+    it.data.mtime = Date.UTC(2024, 0, 1) + v * 1000;
+    this.touch(it, v);
+  }
+
+  /**
    * One file (an attachment) fails by itself, until cleared with `null` or after `times` answers (default
    * for ever). `api`: the answer on `/items/<key>/file` (403, 404, 500). `storage`: what the file host answers
    * for it (403, 404, 500, "drop" the connection, "cut" in mid-body). Everything else keeps working.
@@ -802,7 +818,19 @@ export class FakeZotero {
     if (scope === "trash") items = items.filter((it) => it.data.deleted);
     else if (trashed !== "1") items = items.filter((it) => !it.data.deleted);
     if (wanted) items = items.filter((it) => wanted.includes(it.key));
-    const rows = items.map((it) => ({ key: it.key, version: it.version, obj: this.itemJson(lib, it) }));
+    // The JSON of an item is built only if the page holds it (a getter), with the child counts taken once per
+    // request: building every item's JSON, each counting its children over the whole library, made a page cost
+    // O(n²) (Task Z4's 24,000-object scale test). The answers are the same.
+    let counts: Map<string, number> | undefined;
+    const countsOf = () => (counts ??= this.childCounts(lib));
+    const self = this;
+    const rows: Row[] = items.map((it) => ({
+      key: it.key,
+      version: it.version,
+      get obj() {
+        return self.itemJson(lib, it, countsOf());
+      },
+    }));
     const format = url.searchParams.get("format") ?? "json";
     let cut = false;
     const dp = this.dropPage;
@@ -917,9 +945,21 @@ export class FakeZotero {
 
   // ---- helpers -----------------------------------------------------------------------------------
 
-  private itemJson(lib: Library, it: Item): unknown {
+  /** Children per parent key, notes this key cannot see left out (as itemJson counts them). */
+  private childCounts(lib: Library): Map<string, number> {
+    const m = new Map<string, number>();
+    for (const x of lib.items.values()) {
+      const p = x.data.parentItem;
+      if (p === undefined || this.hidden(lib, x)) continue;
+      const k = p as string;
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return m;
+  }
+
+  private itemJson(lib: Library, it: Item, counts?: Map<string, number>): unknown {
     // UNCONFIRMED: notes this key cannot see are not counted.
-    const children = [...lib.items.values()].filter((x) => x.data.parentItem === it.key && !this.hidden(lib, x)).length;
+    const children = counts ? (counts.get(it.key) ?? 0) : [...lib.items.values()].filter((x) => x.data.parentItem === it.key && !this.hidden(lib, x)).length;
     return {
       key: it.key,
       version: it.version,
