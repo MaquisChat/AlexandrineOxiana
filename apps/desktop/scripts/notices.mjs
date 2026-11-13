@@ -18,7 +18,8 @@
 //    NOTICE*, COPYRIGHT*, third-party lists, a root licenses/ folder) from its source in the cargo
 //    registry, and its Cargo.toml license-file;
 //  - interface-npm-LICENCES.txt: each production npm package's own licence and notice files, and
-//    the components its own SBOM lists;
+//    the components its own SBOM lists, and the licence files of the data the interface copies out
+//    of a package (pdf.js's asset folders: packages/ui/scripts/pdfjs-assets.mjs);
 //  - node-LICENCES.txt: the LICENSE of the Node.js release shipped beside the service (ADR 0013),
 //    which also carries the licences of what Node bundles (V8, OpenSSL, ICU, libuv, ...). It is the
 //    release of the Node that runs this script, unless --node <program> names another: the service
@@ -33,6 +34,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { pdfjsBundledComponents, pdfjsLicenceFiles } from "../../../packages/ui/scripts/pdfjs-assets.mjs";
 import { collectLicenceTexts, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts, sbomIn, seeLicenceIn, sourceList, verifyVerbatim } from "../../../scripts/notices/licence-texts.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -85,9 +87,9 @@ export function crateNotices(crates) {
 
 const crateSource = (c) => `${c.repository ?? "(no repository stated)"} (version ${c.version}; also https://crates.io/crates/${c.name}/${c.version})`;
 
-/** One entry per production npm package of `pnpm list --json` output; workspace packages are left out. */
+/** One entry per production npm package of `pnpm list --json` output (and what one bundles without its text); workspace packages are left out. */
 export function npmNotices(list, readPackage) {
-  return npmPackages(list, readPackage).map(({ name, version, licence }) => ({ name, version, licence }));
+  return npmPackages(list, readPackage).map(({ name, version, licence, bundledIn }) => ({ name, version, licence, ...(bundledIn ? { bundledIn } : {}) }));
 }
 
 const fail = (part, problems) => {
@@ -135,11 +137,20 @@ export function crateLicenceTexts(crates, standard = loadStandardTexts()) {
 /** The licence texts of the interface's npm packages (from each package's folder), as one file. Throws on a problem. */
 export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts()) {
   const dirs = new Map();
-  const packages = npmPackages(list, readPackage).map(({ name, version, licence, path, pkg }) => {
+  const packages = npmPackages(list, readPackage).map(({ name, version, licence, path, pkg, bundledIn, copyright }) => {
+    if (bundledIn) {
+      // A component bundled inside another package that ships no text for it (core-js in pdf.js):
+      // the standard text of its identifier, and the copyright line the bundle itself states.
+      return { name, version, licence, files: [], note: `bundled inside ${bundledIn}, which ships no licence text for it; the bundle states: ${copyright}` };
+    }
     const repo = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
     const see = seeLicenceIn(licence);
     const names = licenceFilesIn(path);
     if (see && existsSync(join(path, see)) && !names.includes(see)) names.push(see);
+    // The licences of data files the interface copies out of a package beside its own code (pdf.js's
+    // character maps, standard fonts, decoder fallbacks and colour profile: Task R6, R192), which lie
+    // in the package's sub-folders, not at its top.
+    for (const extra of bundledLicenceFiles(name, path)) if (!names.includes(extra)) names.push(extra);
     const components = sbomIn(path);
     const entry = {
       name,
@@ -158,6 +169,22 @@ export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts(
     intro: "The production npm packages the app's interface is built from, and the licence and notice files each package ships, each shown whole.",
   });
 }
+
+/** Licence files inside a package's sub-folders that the interface ships with files copied from those folders. */
+const bundledLicenceFiles = (name, path) => (name === "pdfjs-dist" ? pdfjsLicenceFiles(path) : []);
+
+/**
+ * Dependencies a package carries only for Node, which the interface's browser bundle never contains,
+ * left out of the interface's list with everything they bring (Task R6, round 4). pdf.js loads
+ * @napi-rs/canvas (a native canvas, with one optional package per platform) only when it runs under
+ * Node (`process.getBuiltinModule("module").createRequire(...)("@napi-rs/canvas")` behind
+ * `isNodeJS`): no code of it is bundled for the web view. The library service, which runs pdf.js in
+ * Node, ships and lists its own installed canvas package in its own notices (its build, not this).
+ */
+export const NODE_ONLY_DEPENDENCIES = { "pdfjs-dist": ["@napi-rs/canvas"] };
+
+/** Components a package bundles without shipping their licence texts (core-js inside pdf.js's legacy build). */
+const bundledComponents = (name, path) => (name === "pdfjs-dist" ? pdfjsBundledComponents(path) : []);
 
 /** Where an MPL-2.0 npm package's source is: its repository and its npm page. */
 export const npmSource = (name, version, repo) => `${repo ?? "(no repository stated)"} (version ${version}; also https://www.npmjs.com/package/${name}/v/${version})`;
@@ -182,23 +209,47 @@ export function nodeLicenceText(exe, version) {
 /** The production npm packages of `pnpm list --json` output, once each: { name, version, licence, path, pkg }. */
 function npmPackages(list, readPackage) {
   const found = new Map();
-  const walk = (deps) => {
+  // `readPackage` answers undefined (or throws ENOENT) for a package that is not installed here.
+  const read = (path) => {
+    try {
+      return readPackage(path);
+    } catch (e) {
+      if (e?.code === "ENOENT") return undefined;
+      throw e;
+    }
+  };
+  const walk = (deps, parent) => {
     for (const [name, d] of Object.entries(deps ?? {})) {
+      // A dependency the interface's browser bundle never contains (Node-only helpers): left out with all it brings.
+      if (parent && (NODE_ONLY_DEPENDENCIES[parent.name] ?? []).includes(name)) continue;
       const workspace = String(d.version).startsWith("link:");
+      const pkg = read(d.path) ?? (workspace ? {} : undefined);
+      if (pkg === undefined) {
+        // `pnpm list` names every optional dependency, also those for other platforms, which are
+        // not installed here and so not shipped: skipped. A required one that is missing is an error.
+        if (parent?.pkg?.optionalDependencies?.[name] !== undefined) continue;
+        throw new Error(`${name} ${d.version}, a required dependency of ${parent ? `${parent.name} ${parent.version}` : "the interface"}, is not installed (no package.json at ${d.path})`);
+      }
       if (!workspace) {
         const key = `${name}@${d.version}`;
         if (!found.has(key)) {
-          const pkg = readPackage(d.path) ?? {};
           const licence =
             typeof pkg.license === "string" ? pkg.license : typeof pkg.license?.type === "string" ? pkg.license.type : Array.isArray(pkg.licenses) ? pkg.licenses.map((l) => l?.type).filter(Boolean).join(" OR ") : "";
           if (!licence) throw new Error(`${name} ${d.version} has no licence entry in its package.json`);
           found.set(key, { name, version: d.version, licence, path: d.path, pkg });
         }
       }
-      walk(d.dependencies);
+      walk(d.dependencies, { name, version: d.version, pkg });
     }
   };
-  for (const root of list) walk(root.dependencies);
+  for (const root of list) walk(root.dependencies, root.path ? { name: root.name, version: root.version ?? "", pkg: read(root.path) } : undefined);
+  // What a package bundles without shipping its licence text, as the bundle records it (Task R6, A6).
+  for (const p of [...found.values()]) {
+    for (const c of bundledComponents(p.name, p.path)) {
+      const key = `${c.name}@${c.version}`;
+      if (!found.has(key)) found.set(key, { name: c.name, version: c.version, licence: c.licence, path: null, pkg: {}, bundledIn: `${p.name} ${p.version}`, copyright: c.copyright });
+    }
+  }
   return [...found.values()].sort(byName);
 }
 

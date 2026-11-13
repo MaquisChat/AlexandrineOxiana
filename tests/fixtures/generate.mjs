@@ -248,6 +248,190 @@ async function pdfWithJavaScript() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// PDFs for the reader (Task R6 onwards): deterministic, invented text, standard fonts only (not
+// embedded: pdf.js draws them from its bundled standard fonts).
+
+/** A new document with the fixtures' fixed dates and producer. */
+async function readerDoc(title) {
+  const { PDFDocument } = requireLib("pdf-lib");
+  const doc = await PDFDocument.create({ updateMetadata: false });
+  if (title) doc.setTitle(title);
+  doc.setCreationDate(FIXED_DATE);
+  doc.setModificationDate(FIXED_DATE);
+  doc.setProducer("ao-fixtures");
+  return doc;
+}
+
+const COLUMN_ONE = [
+  "Market days in the upland villages begin before dawn,",
+  "when traders carry baskets down the river path and",
+  "set out their goods beneath the old plane trees.",
+  "The elders remember when the river ran further east,",
+  "and they measure the years by the floods that came.",
+  "At the foot of this column the sentence continues",
+];
+const COLUMN_TWO = [
+  "into the head of the second column, where the story",
+  "of the bridge is told by those who built it in 1962.",
+  "Children learn the names of the fields from songs,",
+  "and the songs change a little with every harvest.",
+  "Nobody writes the songs down; they are sung instead.",
+  "This is the last line of the second column.",
+];
+
+/**
+ * A two-column article on A4 (columns at x 50-280 and 315-545, a 35-point gutter), two pages, so
+ * that a selection can run from the foot of column one to the head of column two, and from page 1
+ * into page 2.
+ */
+export async function buildTwoColumnPdf() {
+  const { StandardFonts } = requireLib("pdf-lib");
+  const doc = await readerDoc("Rivers and Markets: a two-column article");
+  const font = await doc.embedFont(StandardFonts.TimesRoman);
+  for (let n = 1; n <= 2; n++) {
+    const page = doc.addPage([595, 842]);
+    page.drawText(`Rivers and Markets, page ${n}`, { x: 50, y: 790, size: 14, font });
+    COLUMN_ONE.forEach((l, i) => page.drawText(l, { x: 50, y: 740 - i * 16, size: 9, font }));
+    COLUMN_TWO.forEach((l, i) => page.drawText(l, { x: 315, y: 740 - i * 16, size: 9, font }));
+  }
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}
+
+/**
+ * A scanned book: `pages` pages that are each one picture and no text at all (one shared image
+ * object, so even 900 pages stay small).
+ * @param {number} pages
+ */
+export async function buildScanPdf(pages) {
+  const doc = await readerDoc("A scanned book");
+  const img = await doc.embedPng(tinyPng());
+  for (let i = 0; i < pages; i++) doc.addPage([595, 842]).drawImage(img, { x: 40, y: 40, width: 515, height: 762 });
+  return Buffer.from(await doc.save({ useObjectStreams: true }));
+}
+
+/**
+ * One page turned by the file itself (/Rotate 90) whose crop box is offset from the media box
+ * (MediaBox 0 0 700 900, CropBox 50 60 645 880), with text inside the crop box: highlights must land
+ * on their words whatever the rotation and the crop.
+ */
+export async function buildRotatedCropPdf() {
+  const { StandardFonts, degrees } = requireLib("pdf-lib");
+  const doc = await readerDoc("A rotated page with a crop box");
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const page = doc.addPage([700, 900]);
+  page.setCropBox(50, 60, 595, 820);
+  page.setRotation(degrees(90));
+  ["The ferry timetable was rewritten every spring.", "Passengers argued about it on the quay.", "The ledger of crossings survives in the archive."].forEach((l, i) =>
+    page.drawText(l, { x: 100, y: 800 - i * 20, size: 12, font }),
+  );
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}
+
+/**
+ * `pages` pages, each saying which it is ("Page n of N" and a sentence). Its page labels are
+ * printed like a book's: the first two pages "i" and "ii", the rest "1", "2" … from page 3.
+ * @param {number} pages
+ */
+export async function buildMultiPagePdf(pages) {
+  const { PDFName, StandardFonts } = requireLib("pdf-lib");
+  const doc = await readerDoc(`A document of ${pages} pages`);
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  for (let n = 1; n <= pages; n++) {
+    const page = doc.addPage([595, 842]);
+    page.drawText(`Page ${n} of ${pages}`, { x: 50, y: 790, size: 14, font });
+    page.drawText(`This is the text of page ${n}, written for the reader's tests.`, { x: 50, y: 760, size: 11, font });
+  }
+  const nums = pages > 2 ? [0, { S: "r" }, 2, { S: "D", St: 1 }] : [0, { S: "r" }];
+  doc.catalog.set(PDFName.of("PageLabels"), doc.context.obj({ Nums: nums }));
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}
+
+/**
+ * A PDF read in many ranges (Task R6): `pages` pages (an even number, at least 4), each with ~560 KB
+ * of filler and then the words "Quote on page N" in its content. The page tree has two halves (two
+ * /Pages nodes with their /Count), and the page objects of pages 2 to pages/2 are written halfway
+ * through the file, between the contents of the two halves: opening it (pdf.js reads the first and
+ * the last page) reads none of them, so that even getting one of those pages needs a range, as does
+ * every page's text. Deterministic; uncompressed. Layout: [pages 1 and pages/2+1..pages]
+ * [contents 1..pages/2] [pages 2..pages/2] [contents pages/2+1..pages].
+ * @param {number} pages
+ */
+export async function buildRangeReadPdf(pages) {
+  const { PDFName, StandardFonts } = requireLib("pdf-lib");
+  if (!(pages >= 4 && pages % 2 === 0)) throw new Error("pages must be even and at least 4");
+  const half = pages / 2;
+  const doc = await readerDoc("A document read in ranges");
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const ctx = doc.context;
+  const line = `% ${"filler ".repeat(13)}\n`;
+  const content = (n) => ctx.register(ctx.stream(`${line.repeat(6000)}BT /FQ 14 Tf 50 700 Td (Quote on page ${n}) Tj ET\n`));
+  const leaf = (n) => {
+    const ref = ctx.register(ctx.obj({ Type: "Page", MediaBox: [0, 0, 595, 842], Resources: { Font: { FQ: font.ref } } }));
+    return { n, ref, dict: ctx.lookup(ref) };
+  };
+  const leaves = [];
+  leaves[0] = leaf(1);
+  for (let n = half + 1; n <= pages; n++) leaves[n - 1] = leaf(n);
+  leaves[0].dict.set(PDFName.of("Contents"), content(1));
+  const firstHalfContents = [];
+  for (let n = 2; n <= half; n++) firstHalfContents[n] = content(n);
+  for (let n = 2; n <= half; n++) {
+    leaves[n - 1] = leaf(n);
+    leaves[n - 1].dict.set(PDFName.of("Contents"), firstHalfContents[n]);
+  }
+  for (let n = half + 1; n <= pages; n++) leaves[n - 1].dict.set(PDFName.of("Contents"), content(n));
+  // The tree: root → [first half, second half].
+  const rootRef = doc.catalog.get(PDFName.of("Pages"));
+  const halfNode = (from, to) => {
+    const ref = ctx.register(ctx.obj({ Type: "Pages", Parent: rootRef, Kids: leaves.slice(from, to).map((l) => l.ref), Count: to - from }));
+    for (const l of leaves.slice(from, to)) l.dict.set(PDFName.of("Parent"), ref);
+    return ref;
+  };
+  const a = halfNode(0, half);
+  const b = halfNode(half, pages);
+  const root = ctx.lookup(rootRef);
+  root.set(PDFName.of("Kids"), ctx.obj([a, b]));
+  root.set(PDFName.of("Count"), ctx.obj(pages));
+  return Buffer.from(await doc.save({ useObjectStreams: false, updateFieldAppearances: false, addDefaultPage: false }));
+}
+
+/**
+ * A file that starts like a PDF and is not one: the header, then nothing a PDF reader can recover
+ * (no objects, no cross-reference table, no trailer). pdf.js answers InvalidPDFException.
+ */
+export function buildDamagedPdf() {
+  return Buffer.concat([Buffer.from("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n", "latin1"), Buffer.from("This file was damaged in transit; nothing of the document is left.\n".repeat(40), "latin1")]);
+}
+
+/**
+ * Japanese text in a font the file does not embed, with a predefined character map
+ * (UniJIS-UCS2-H, Adobe-Japan1): pdf.js reads it only with its bundled character maps. The page
+ * says "日本語のテキスト" (Japanese text) and, in Helvetica, "Japanese text".
+ */
+export async function buildCjkPdf() {
+  const { PDFName, PDFString, StandardFonts } = requireLib("pdf-lib");
+  const doc = await readerDoc("Japanese text");
+  const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+  const ctx = doc.context;
+  const descriptor = ctx.register(
+    ctx.obj({ Type: "FontDescriptor", FontName: "KozMinPr6N-Regular", Flags: 6, FontBBox: [-195, -272, 1110, 1075], ItalicAngle: 0, Ascent: 880, Descent: -120, CapHeight: 740, StemV: 80 }),
+  );
+  const cidFont = ctx.register(
+    ctx.obj({ Type: "Font", Subtype: "CIDFontType0", BaseFont: "KozMinPr6N-Regular", CIDSystemInfo: { Registry: PDFString.of("Adobe"), Ordering: PDFString.of("Japan1"), Supplement: 6 }, FontDescriptor: descriptor, DW: 1000 }),
+  );
+  const type0 = ctx.register(ctx.obj({ Type: "Font", Subtype: "Type0", BaseFont: "KozMinPr6N-Regular-UniJIS-UCS2-H", Encoding: "UniJIS-UCS2-H", DescendantFonts: [cidFont] }));
+  const page = doc.addPage([595, 842]);
+  page.drawText("Japanese text", { x: 50, y: 790, size: 12, font: helvetica });
+  const fonts = page.node.Resources().lookup(PDFName.of("Font"));
+  fonts.set(PDFName.of("FJ"), type0);
+  const text = "日本語のテキスト";
+  const hex = [...text].map((c) => c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")).join("");
+  const content = ctx.register(ctx.flateStream(`BT /FJ 24 Tf 50 720 Td <${hex}> Tj ET`));
+  page.node.addContentStream(content);
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}
+
+// ---------------------------------------------------------------------------------------------
 // EPUB / DOCX
 
 const CONTAINER = `<?xml version="1.0"?>
