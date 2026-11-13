@@ -25,6 +25,9 @@ function listen(t: ReturnType<typeof createRangeTransport>) {
   return got;
 }
 
+/** What the transport handed pdf.js, as [begin, length, blank?] (blank: every byte zero, nothing from the file). */
+const shape = (got: Array<{ begin: number; chunk: Uint8Array }>) => got.map((g) => [g.begin, g.chunk.length, g.chunk.every((b) => b === 0)]);
+
 describe("createRangeTransport", () => {
   it("requestDataRange answers with the bytes fetched for that range", async () => {
     const total = 10 * MiB + 7;
@@ -107,7 +110,7 @@ describe("createRangeTransport", () => {
     expect(failures).toEqual([]);
   });
 
-  it("a failed range is reported once, never handed to pdf.js, and stops further ranges", async () => {
+  it("a failed range is reported once, stops further ranges, and pdf.js gets blank bytes for what it waits for", async () => {
     const failure = Object.assign(new Error("This project is locked."), { status: 423 });
     const fetchRange = vi.fn(async () => {
       throw failure;
@@ -120,8 +123,13 @@ describe("createRangeTransport", () => {
     await vi.waitFor(() => expect(failures).toEqual([failure]));
     t.requestDataRange(2 * MiB, 3 * MiB);
     await tick();
+    // Nothing more is fetched; the range that failed and the one asked for afterwards are answered
+    // blank (never from the file), so that no read in pdf.js waits for ever.
     expect(fetchRange).toHaveBeenCalledTimes(1);
-    expect(got).toEqual([]);
+    expect(shape(got)).toEqual([
+      [MiB, MiB, true],
+      [2 * MiB, MiB, true],
+    ]);
     stop();
     // A listener added after the failure hears of it at once.
     const late: unknown[] = [];
@@ -129,7 +137,7 @@ describe("createRangeTransport", () => {
     expect(late).toEqual([failure]);
   });
 
-  it("an answer of the wrong length is a failure, not data", async () => {
+  it("an answer of the wrong length is a failure, never handed on as data", async () => {
     const fetchRange = vi.fn(async () => new Uint8Array(0));
     const t = createRangeTransport({ bytes: fileBytes(0, MiB - 1), total: 4 * MiB }, fetchRange);
     const got = listen(t);
@@ -137,7 +145,25 @@ describe("createRangeTransport", () => {
     onRangeFailure(t, (e) => failures.push(e));
     t.requestDataRange(MiB, 2 * MiB);
     await vi.waitFor(() => expect(failures).toHaveLength(1));
-    expect(got).toEqual([]);
+    expect(shape(got)).toEqual([[MiB, MiB, true]]);
+  });
+
+  it("an answer that gives the file another length is a failure: the file changed while it was read", async () => {
+    const total = 4 * MiB;
+    const fetchRange = vi.fn(async (start: number, end: number) => ({ bytes: fileBytes(start, end), total: total + 518 }));
+    const t = createRangeTransport({ bytes: fileBytes(0, MiB - 1), total }, fetchRange);
+    const got = listen(t);
+    const failures: unknown[] = [];
+    onRangeFailure(t, (e) => failures.push(e));
+    t.requestDataRange(MiB, 2 * MiB);
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+    expect(failures[0]).toMatchObject({ name: "FileChangedError" });
+    expect(shape(got)).toEqual([[MiB, MiB, true]]);
+    // The same length is fine.
+    const ok = createRangeTransport({ bytes: fileBytes(0, MiB - 1), total }, async (start, end) => ({ bytes: fileBytes(start, end), total }));
+    const got2 = listen(ok);
+    ok.requestDataRange(MiB, 2 * MiB);
+    await vi.waitFor(() => expect(got2).toHaveLength(1));
   });
 
   it("refuses a first part that is not the start of a file of that length", () => {
