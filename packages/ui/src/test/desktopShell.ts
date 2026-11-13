@@ -14,6 +14,8 @@ import type { DesktopShell, DropHandlers } from "../desktopShell";
 export interface FakeShell extends DesktopShell {
   pickFolder: ReturnType<typeof vi.fn<DesktopShell["pickFolder"]>>;
   pickFiles: ReturnType<typeof vi.fn<DesktopShell["pickFiles"]>>;
+  /** The watched-folder chooser: resolves null (cancelled) unless a test says otherwise. */
+  pickWatchFolder: ReturnType<typeof vi.fn<DesktopShell["pickWatchFolder"]>>;
   /** Registered drop targets (element and handlers), in order. */
   targets: Array<{ el: HTMLElement; handlers: DropHandlers }>;
   drop(paths: string[]): void;
@@ -30,6 +32,7 @@ export function fakeShell(): FakeShell {
   return {
     pickFolder: vi.fn<DesktopShell["pickFolder"]>(async () => null),
     pickFiles: vi.fn<DesktopShell["pickFiles"]>(async () => []),
+    pickWatchFolder: vi.fn<DesktopShell["pickWatchFolder"]>(async () => null),
     targets,
     dropTarget(el, handlers) {
       const entry = { el, handlers };
