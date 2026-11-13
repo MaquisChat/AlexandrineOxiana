@@ -5,7 +5,7 @@
  * and compared with the quote after folding what differs between two readings of the same words:
  * spacing, a word broken with a hyphen at a line's end, ligatures, letter case.
  */
-import { getDocument, type PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildRotatedCropPdf } from "../../../../tests/fixtures/generate.mjs";
 import { quoteStillMatches, textUnderRects, type TextContent } from "./textCheck";
@@ -53,13 +53,12 @@ const content = (...items: ReturnType<typeof item>[]): TextContent => ({ items, 
 
 describe("textUnderRects", () => {
   it("reads the words whose glyphs lie under the rectangles, line by line", () => {
-    // Monospaced stand-in: 10 points a character at size 10 would make every glyph equal; the
-    // reader estimates each glyph's share of the item's width, so use letters of one width class.
-    const text = content(item("aaaa bbbb cccc", 100, 700, 10, 140, true), item("dddd eeee ffff", 100, 686, 10, 140));
-    // "bbbb" (x 150–190) on the first line and "dddd" (x 100–140) on the second.
+    // Two lines of 10-point Helvetica (each item as long as Helvetica makes it): "bbbb" at x 125.02–147.26
+    // on the first, "dddd" at x 100–122.24 on the second, each rectangle a little wider than its word.
+    const text = content(item("aaaa bbbb cccc", 100, 700, 10, 70.04, true), item("dddd eeee gggg", 100, 686, 10, 72.28));
     const rects = [
-      { x: 150, y: 698, w: 40, h: 10 },
-      { x: 100, y: 684, w: 40, h: 10 },
+      { x: 124.5, y: 698, w: 23.5, h: 10 },
+      { x: 99.5, y: 684, w: 23.5, h: 10 },
     ];
     expect(textUnderRects(text, rects).replace(/\s+/g, " ").trim()).toBe("bbbb dddd");
   });
@@ -70,14 +69,14 @@ describe("textUnderRects", () => {
   });
 
   describe("on a real page (the rotated, offset-crop fixture)", () => {
-    let doc: PDFDocumentProxy;
+    let task: ReturnType<typeof getDocument>;
     let text: TextContent;
     beforeAll(async () => {
-      doc = await getDocument({ data: new Uint8Array(await buildRotatedCropPdf()), isEvalSupported: false, useSystemFonts: false, verbosity: 0 }).promise;
-      text = await (await doc.getPage(1)).getTextContent();
+      task = getDocument({ data: new Uint8Array(await buildRotatedCropPdf()), isEvalSupported: false, useSystemFonts: false, verbosity: 0 });
+      text = await (await (await task.promise).getPage(1)).getTextContent();
     });
     afterAll(async () => {
-      await doc?.destroy();
+      await task?.destroy();
     });
 
     it("finds the quoted words of a line and of two lines", () => {

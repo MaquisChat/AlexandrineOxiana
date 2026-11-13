@@ -10,24 +10,24 @@
  * itself. The expected places are worked out by hand from the crop box and the rotation, not by the
  * viewport, so that the test does not merely repeat the code.
  */
-import { getDocument, type PDFDocumentProxy, type PDFPageProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { getDocument, type PDFPageProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildRotatedCropPdf } from "../../../../tests/fixtures/generate.mjs";
 import { pdfRectToBox, type Box } from "./geometry";
 
-let doc: PDFDocumentProxy;
+let task: ReturnType<typeof getDocument>;
 let page: PDFPageProxy;
 /** The first line's text item, as pdf.js reads it from the page. */
 let line: { str: string; transform: number[]; width: number; height: number };
 
 beforeAll(async () => {
-  doc = await getDocument({ data: new Uint8Array(await buildRotatedCropPdf()), isEvalSupported: false, useSystemFonts: false, verbosity: 0 }).promise;
-  page = await doc.getPage(1);
+  task = getDocument({ data: new Uint8Array(await buildRotatedCropPdf()), isEvalSupported: false, useSystemFonts: false, verbosity: 0 });
+  page = await (await task.promise).getPage(1);
   const text = await page.getTextContent();
   line = text.items.find((i) => "str" in i && i.str.startsWith("The ferry")) as typeof line;
 });
 afterAll(async () => {
-  await doc?.destroy();
+  await task?.destroy();
 });
 
 /** Crop box of the fixture: x 50–645, y 60–880. */

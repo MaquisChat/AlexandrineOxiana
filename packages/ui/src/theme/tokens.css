@@ -14,6 +14,11 @@
  *     pnpm --filter @ao/ui fit:palette --theme dark --seeds 4 --restarts 8 --iterations 120000 --write
  *   Codes are never shown by colour alone (CodeSwatch adds a shape and the name).
  *   Checked by src/theme/palette.test.ts.
+ * --hl-yellow ... --hl-grey: the eight highlight colours of the PDF reader (Task R8), Zotero's reference
+ *   values at half opacity (#RRGGBBAA), drawn with mix-blend-mode: multiply over the page. The page
+ *   is paper (white) in every theme, so they are the same in all four themes; each, laid over
+ *   white, keeps black text at 4.5:1 or more (src/theme/highlightTokens.test.ts). --hl-edge: the
+ *   dark line on paper round a chosen or changed highlight and a note mark, also the same everywhere.
  * light-hc and dark-hc: generated from light and dark (src/theme/tokenFile.ts) so that every text
  *   token reaches 7:1 on the backgrounds it is drawn on.
  */
@@ -66,6 +71,15 @@
   --code-10: #5A2E7B;
   --code-11: #F43091;
   --code-12: #5A322C;
+  --hl-yellow: #FFD40080;
+  --hl-red: #FF666680;
+  --hl-green: #5FB23680;
+  --hl-blue: #2EA8E580;
+  --hl-purple: #A28AE580;
+  --hl-magenta: #E56EEE80;
+  --hl-orange: #F1983780;
+  --hl-grey: #AAAAAA80;
+  --hl-edge: #1C1B19;
 }
 
 [data-theme="dark"] {
@@ -116,6 +130,15 @@
   --code-10: #AB6BFF;
   --code-11: #CB497C;
   --code-12: #9B7352;
+  --hl-yellow: #FFD40080;
+  --hl-red: #FF666680;
+  --hl-green: #5FB23680;
+  --hl-blue: #2EA8E580;
+  --hl-purple: #A28AE580;
+  --hl-magenta: #E56EEE80;
+  --hl-orange: #F1983780;
+  --hl-grey: #AAAAAA80;
+  --hl-edge: #1C1B19;
 }
 
 /* BEGIN GENERATED: high-contrast themes, derived from light and dark by `pnpm --filter @ao/ui gen:tokens`. Do not edit by hand. */
@@ -167,6 +190,15 @@
   --code-10: #5A2E7B;
   --code-11: #F43091;
   --code-12: #5A322C;
+  --hl-yellow: #FFD40080;
+  --hl-red: #FF666680;
+  --hl-green: #5FB23680;
+  --hl-blue: #2EA8E580;
+  --hl-purple: #A28AE580;
+  --hl-magenta: #E56EEE80;
+  --hl-orange: #F1983780;
+  --hl-grey: #AAAAAA80;
+  --hl-edge: #1C1B19;
 }
 
 [data-theme="dark-hc"] {
@@ -217,5 +249,14 @@
   --code-10: #AB6BFF;
   --code-11: #CB497C;
   --code-12: #9B7352;
+  --hl-yellow: #FFD40080;
+  --hl-red: #FF666680;
+  --hl-green: #5FB23680;
+  --hl-blue: #2EA8E580;
+  --hl-purple: #A28AE580;
+  --hl-magenta: #E56EEE80;
+  --hl-orange: #F1983780;
+  --hl-grey: #AAAAAA80;
+  --hl-edge: #1C1B19;
 }
 /* END GENERATED */
