@@ -22,18 +22,25 @@
  * A4 scan reaches the page at its full 4961 × 7016 pixels (with the earlier 2^27 canvas limit it
  * came out at 2156 × 3050: checked).
  *
- * Until the reader screen exists (Task R7) nothing in the app imports pdf.js, so the modules
- * themselves (packages/ui/src/reader/pdfjs.ts, rangeTransport.ts, api/reader.ts, api/client.ts) are
- * built for this test by Vite, as the app's build would build them (the worker emitted with `?url`),
- * and served to the page from the app's own origin under /__e2e__/reader/; nothing is added to the
- * product for it. The pdfjs/ folder the page reads is the real build's (packages/ui/dist/pdfjs/).
+ * The R6 scenarios drive the reader's modules directly (packages/ui/src/reader/pdfjs.ts,
+ * rangeTransport.ts, api/reader.ts, api/client.ts), built for this test by Vite, as the app's build
+ * would build them (the worker emitted with `?url`), and served to the page from the app's own
+ * origin under /__e2e__/reader/; nothing is added to the product for it. The pdfjs/ folder the page
+ * reads is the real build's (packages/ui/dist/pdfjs/).
+ *
+ * R7: the reader screen of the built app itself, reached by clicking as a person would (library ->
+ * the source -> "Read the PDF"): an unlocked encrypted project's PDF opens, pages, zooms and rotates;
+ * a 900-page scan opens, jumps to page 900, says it has no text and never holds more than 6 canvases;
+ * a damaged PDF; a password-protected PDF (the password never sent to the service); a missing linked
+ * file outside the library; a read-only library; Page Down; a project locked while it is being read
+ * (A7). Each under the app's policy, with nothing fetched from elsewhere.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { buildCjkPdf, buildPdf, buildRangeReadPdf } from "../tests/fixtures/generate.mjs";
+import { buildCjkPdf, buildDamagedPdf, buildMultiPagePdf, buildPdf, buildRangeReadPdf, buildScanPdf } from "../tests/fixtures/generate.mjs";
 import { APP_ORIGIN, expect, libraryWithProject, OPEN_RULES, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR, REPO_ROOT, UI_DIST } from "./paths.js";
 
@@ -539,6 +546,367 @@ test("a 600 dpi A4 scan is drawn at its full size, neither scaled down nor left 
   expect([drawn.width, drawn.height]).toEqual([4961, 7016]);
   expect(drawn.left).toEqual([0, 0, 0]);
   expect(drawn.right).toEqual([255, 255, 255]);
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+// ---- Task R7: the reader screen ----------------------------------------------------------------
+
+const NO_TEXT = "This page has no text to select. It is probably a scanned image; you can still add a note to it.";
+const PASSPHRASE = "correct horse battery staple";
+
+/** Writes `bytes` as `name` in a folder of the test's own, outside every library. */
+function sourceFile(app: AppHarness, name: string, bytes: Uint8Array): string {
+  const dir = join(app.root, "sources");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, name);
+  writeFileSync(file, bytes);
+  return file;
+}
+
+/** The library with the project selected, then the source opened and "Read the PDF" followed, all by clicking. */
+async function readFromLibrary(page: Page, app: AppHarness, projectId: string, sid: string): Promise<void> {
+  const stored = await app.api<{ source: { title: { variants: Array<{ value: string }> } } }>("GET", `/projects/${projectId}/sources/${sid}`);
+  const title = stored.body.source.title.variants[0]!.value;
+  await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(projectId)}`);
+  await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: title, exact: true }).click();
+  await page.getByRole("region", { name: "Source details" }).getByRole("link", { name: "Read the PDF" }).click();
+  await expect(page).toHaveURL(`${APP_ORIGIN}/reader?project=${encodeURIComponent(projectId)}&source=${encodeURIComponent(sid)}`);
+  await expect(page.getByRole("heading", { level: 1, name: title })).toBeVisible();
+}
+
+const region = (page: Page, n: number, of: number) => page.getByRole("region", { name: `Page ${n} of ${of}`, exact: true });
+const toolbar = (page: Page) => page.getByRole("toolbar", { name: "Reader" });
+const pageField = (page: Page) => toolbar(page).getByRole("spinbutton", { name: "Page" });
+const zoomValue = (page: Page) => toolbar(page).getByRole("status", { name: "Zoom" });
+
+/** Whether page `n`'s canvas has ink (dark pixels) on it. */
+async function inked(page: Page, n: number): Promise<boolean> {
+  return page.evaluate((n) => {
+    const c = document.querySelector<HTMLCanvasElement>(`[data-page-number="${n}"] canvas`);
+    if (!c || c.width === 0) return false;
+    const d = c.getContext("2d")!.getImageData(0, 0, c.width, c.height).data;
+    for (let i = 0; i < d.length; i += 4) if (d[i]! < 100 && d[i + 1]! < 100 && d[i + 2]! < 100 && d[i + 3]! > 0) return true;
+    return false;
+  }, n);
+}
+
+/** The canvases in the page area now: how many, of which pages, and their pixels in all. */
+async function canvasesNow(page: Page): Promise<{ count: number; pages: number[]; pixels: number; elsewhere: number }> {
+  return page.evaluate(() => {
+    const list = [...document.querySelectorAll<HTMLCanvasElement>(".ao-reader-scroll canvas")];
+    return {
+      count: list.length,
+      pages: list.map((c) => Number(c.closest<HTMLElement>("[data-page-number]")?.dataset.pageNumber)),
+      pixels: list.reduce((a, c) => a + c.width * c.height, 0),
+      // Any other canvas holding pixels (pdf.js's own text-measuring canvases are 0 by 0 or hidden).
+      elsewhere: [...document.querySelectorAll("canvas")].filter((c) => !c.closest(".ao-reader-scroll") && c.width * c.height > 300 * 150).length,
+    };
+  });
+}
+
+async function violations(page: Page): Promise<string[]> {
+  return page.evaluate(() => [...((window as unknown as { __aoViolations?: string[] }).__aoViolations ?? [])]);
+}
+
+test("an encrypted project's PDF opens, pages and zooms", async ({ page, app }) => {
+  const seen = watch(page);
+  await shellLikePage(page);
+  const file = sourceFile(app, "twelve-pages.pdf", await buildMultiPagePdf(12));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Sealed reading", passphrase: PASSPHRASE });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+
+  await test.step("page 1 is drawn, with its text to select, and the printed label", async () => {
+    await expect(region(page, 1, 12)).toBeVisible();
+    await expect(region(page, 1, 12).locator(".ao-reader-text-layer")).toContainText("Page 1 of 12");
+    await expect.poll(() => inked(page, 1)).toBe(true);
+    await expect(region(page, 1, 12)).not.toContainText(NO_TEXT);
+    await expect(pageField(page)).toHaveValue("1");
+    await expect(toolbar(page)).toContainText("of 12 (i)");
+    // Focus is in the page area once the document is open.
+    await expect(page.getByRole("group", { name: "Pages" })).toBeFocused();
+  });
+
+  await test.step("Next page twice: page 3, printed 1; focus stays on the button", async () => {
+    const next = toolbar(page).getByRole("button", { name: "Next page" });
+    await next.click();
+    await expect(pageField(page)).toHaveValue("2");
+    await expect(toolbar(page)).toContainText("of 12 (ii)");
+    await next.click();
+    await expect(pageField(page)).toHaveValue("3");
+    await expect(toolbar(page)).toContainText("of 12 (1)");
+    await expect(next).toBeFocused();
+    await expect(region(page, 3, 12).locator(".ao-reader-text-layer")).toContainText("This is the text of page 3");
+    await expect.poll(() => inked(page, 3)).toBe(true);
+  });
+
+  await test.step("Zoom in: 125%, the page and its canvas larger (at the screen's pixel ratio); Rotate view turns the page", async () => {
+    await expect(zoomValue(page)).toHaveText("100%");
+    await toolbar(page).getByRole("button", { name: "Zoom in" }).click();
+    await expect(zoomValue(page)).toHaveText("125%");
+    await expect(region(page, 3, 12)).toHaveCSS("width", `${Math.floor(595 * 1.25)}px`);
+    const dpr = await page.evaluate(() => window.devicePixelRatio);
+    await expect.poll(() => page.evaluate(() => document.querySelector<HTMLCanvasElement>('[data-page-number="3"] canvas')?.width ?? 0)).toBe(Math.floor(595 * 1.25 * dpr));
+    await expect(pageField(page)).toHaveValue("3");
+    await toolbar(page).getByRole("button", { name: "Rotate view" }).click();
+    await expect(region(page, 3, 12)).toHaveCSS("width", `${Math.floor(842 * 1.25)}px`);
+    await expect(region(page, 3, 12)).toHaveCSS("height", `${Math.floor(595 * 1.25)}px`);
+    await expect.poll(() => inked(page, 3)).toBe(true);
+    await expect(pageField(page)).toHaveValue("3");
+  });
+
+  expect(await violations(page)).toEqual([]);
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+  // The worker is the bundled one, a real one, and pdf.js's code never ran on the page's own thread.
+  expect(seen.workers.map((w) => w.url().replace(/-[\w-]+\.mjs$/, "-*.mjs"))).toEqual([`${APP_ORIGIN}/assets/pdf.worker.min-*.mjs`]);
+  expect(await page.evaluate(() => "pdfjsWorker" in globalThis)).toBe(false);
+
+  await test.step("leaving the screen ends the document and its worker", async () => {
+    const closed = new Promise<void>((r) => seen.workers[0]!.once("close", () => r()));
+    await page.getByRole("link", { name: "Back to library" }).click();
+    await closed;
+  });
+});
+
+test("a 900-page scan opens, jumps to page 900 and says it has no text", async ({ page, app }) => {
+  test.setTimeout(240_000);
+  const seen = watch(page);
+  await shellLikePage(page);
+  const file = sourceFile(app, "scanned-book.pdf", await buildScanPdf(900));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Scans" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  const at = (n: number) => region(page, n, 900);
+  const figures: string[] = [];
+  const check = async (where: string) => {
+    const c = await canvasesNow(page);
+    expect(c.count, `${where}: canvases ${JSON.stringify(c)}`).toBeLessThanOrEqual(6);
+    expect(c.elsewhere, where).toBe(0);
+    const heap = await page.evaluate(() => (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? -1);
+    figures.push(`${where}: ${c.count} canvases (pages ${c.pages.join(", ")}), ${(c.pixels / 1e6).toFixed(2)} Mpx${heap >= 0 ? `, JS heap ${(heap / 1048576).toFixed(1)} MiB` : ""}`);
+  };
+
+  await expect(at(1)).toBeVisible();
+  await expect(at(1)).toContainText(NO_TEXT);
+  await expect(page.getByRole("region", { name: /^Page \d+ of 900$/ })).toHaveCount(900);
+  await check("opened");
+
+  await test.step("type 900 in the Page field: page 900 has focus and says it has no text", async () => {
+    await pageField(page).fill("900");
+    await pageField(page).press("Enter");
+    await expect(at(900)).toBeFocused();
+    await expect(at(900)).toBeInViewport();
+    await expect(at(900)).toContainText(NO_TEXT);
+    await expect.poll(async () => (await canvasesNow(page)).pages.includes(900)).toBe(true);
+    await check("at page 900");
+  });
+
+  await test.step("back and forth through the book: never more than 6 canvases", async () => {
+    for (let i = 0; i < 4; i++) await page.keyboard.press("PageUp");
+    await expect(pageField(page)).toHaveValue("896");
+    await expect(at(896)).toBeFocused();
+    await check("after four Page Ups");
+    await page.keyboard.press("Home");
+    await expect(at(1)).toBeFocused();
+    await expect.poll(async () => (await canvasesNow(page)).pages.includes(1)).toBe(true);
+    await check("back at page 1");
+    await pageField(page).fill("450");
+    await pageField(page).press("Enter");
+    await expect(at(450)).toBeFocused();
+    await expect.poll(async () => (await canvasesNow(page)).pages.includes(450)).toBe(true);
+    const box = (await page.getByRole("group", { name: "Pages" }).boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    for (let i = 0; i < 10; i++) await page.mouse.wheel(0, 1200);
+    await expect.poll(async () => Number(await pageField(page).inputValue())).toBeGreaterThan(450);
+    await expect.poll(async () => (await canvasesNow(page)).pages.includes(Number(await pageField(page).inputValue()))).toBe(true);
+    await check("after scrolling down from page 450");
+    const zoomIn = toolbar(page).getByRole("button", { name: "Zoom in" });
+    while (await zoomIn.isEnabled()) await zoomIn.click();
+    await expect(zoomValue(page)).toHaveText("400%");
+    await expect.poll(async () => (await canvasesNow(page)).count).toBeGreaterThan(0);
+    await check("at 400%");
+    const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
+    while (await zoomOut.isEnabled()) await zoomOut.click();
+    await expect(zoomValue(page)).toHaveText("50%");
+    await check("at 50%");
+  });
+  test.info().annotations.push({ type: "memory", description: figures.join("; ") });
+  console.log(`[${test.info().project.name}] 900-page scan: ${figures.join("; ")}`);
+
+  expect(await violations(page)).toEqual([]);
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+test("a damaged PDF says so", async ({ page, app }) => {
+  const seen = watch(page);
+  const file = sourceFile(app, "damaged.pdf", buildDamagedPdf());
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Damage" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  await expect(page.getByRole("heading", { level: 2, name: "Damaged PDF" })).toBeFocused();
+  await expect(page.getByText("This PDF is damaged and cannot be shown. The file itself has not been changed.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("group", { name: "Pages" })).toHaveCount(0);
+  await expect(page.locator("canvas")).toHaveCount(0);
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+test("a password-protected PDF opens with its password", async ({ page, app }) => {
+  const seen = watch(page);
+  await shellLikePage(page);
+  const file = join(app.root, "sources", "protected.pdf");
+  mkdirSync(dirname(file), { recursive: true });
+  copyFileSync(join(REPO_ROOT, "tests", "fixtures", "pdf", "password-protected.pdf"), file);
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Protected" });
+  const { sid } = await attachPdf(app, projectId, file);
+  const sent: string[] = [];
+  page.on("request", (r) => sent.push(`${r.url()}\n${JSON.stringify(r.headers())}\n${r.postData() ?? ""}`));
+  await readFromLibrary(page, app, projectId, sid);
+
+  await expect(page.getByRole("heading", { level: 2, name: "Password needed" })).toBeFocused();
+  await expect(page.getByText("This PDF is protected by a password. Enter it to read it here.", { exact: true })).toBeVisible();
+  await page.getByLabel("Password").fill("not-the-one");
+  await page.getByRole("button", { name: "Open" }).click();
+  await expect(page.getByText("That password did not open this PDF.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 2, name: "Password needed" })).toBeFocused();
+  await expect(page.getByLabel("Password")).toHaveValue("");
+  await page.getByLabel("Password").fill("ao-fixture");
+  await page.getByLabel("Password").press("Enter");
+  await expect(region(page, 1, 1)).toBeVisible();
+  await expect.poll(() => inked(page, 1)).toBe(true);
+  await expect(page.getByLabel("Password")).toHaveCount(0);
+  // Neither password went to the service, nor anywhere else: not in an address, a header or a body.
+  expect(sent.length).toBeGreaterThan(0);
+  for (const r of sent) {
+    expect(r).not.toContain("ao-fixture");
+    expect(r).not.toContain("not-the-one");
+  }
+  expect(await page.evaluate(() => document.documentElement.outerHTML.includes("ao-fixture"))).toBe(false);
+  expect(await violations(page)).toEqual([]);
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+test("a missing linked file says so", async ({ page, app }) => {
+  const seen = watch(page);
+  const folder = join(app.root, "outside", "papers");
+  mkdirSync(folder, { recursive: true });
+  const linked = join(folder, "linked-paper.pdf");
+  writeFileSync(linked, await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Linked" });
+  const started = await app.api<{ batchId: string }>("POST", `/projects/${projectId}/import`, { adapter: { kind: "folder", path: folder }, options: { fileHandling: "link" } });
+  expect(started.status, JSON.stringify(started.body)).toBe(200);
+  await expect
+    .poll(async () => (await app.api<{ batches: Array<{ batchId: string; state: string }> }>("GET", `/projects/${projectId}/imports`)).body.batches.find((b) => b.batchId === started.body.batchId)?.state, { timeout: 60_000 })
+    .toBe("finished");
+  const listed = await app.api<{ items: Array<{ id: string }> }>("GET", `/projects/${projectId}/sources`);
+  const sid = listed.body.items[0]!.id;
+  const sf = await app.api<{ assets: Array<{ linked?: unknown; mime: string }> }>("GET", `/projects/${projectId}/sources/${sid}`);
+  expect(sf.body.assets.find((a) => a.mime === "application/pdf")?.linked, "the PDF is linked in place, outside the library").toBeTruthy();
+
+  await test.step("while the linked file is there, it opens", async () => {
+    await readFromLibrary(page, app, projectId, sid);
+    await expect(region(page, 1, 3)).toBeVisible();
+    await expect(region(page, 1, 3).locator(".ao-reader-text-layer")).toContainText("Page 1 of 3");
+  });
+
+  await test.step("once it is gone, the reader says so", async () => {
+    unlinkSync(linked);
+    await readFromLibrary(page, app, projectId, sid);
+    await expect(page.getByRole("heading", { level: 2, name: "File not found" })).toBeFocused();
+    await expect(page.getByText("The file of this source is not where it was recorded, so it cannot be shown.", { exact: true })).toBeVisible();
+    await expect(page.locator("canvas")).toHaveCount(0);
+  });
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+test("a read-only library shows the PDF and the notice", async ({ page, app }) => {
+  const seen = watch(page);
+  const file = sourceFile(app, "read-only.pdf", await buildMultiPagePdf(4));
+  const { projectId, libraryPath } = await libraryWithProject(app, page, { library: "Reader library", project: "Read only" });
+  const { sid } = await attachPdf(app, projectId, file);
+  // Another computer holds the library: this one opens it read-only.
+  expect((await app.api("POST", "/libraries/close")).status).toBe(200);
+  const now = new Date().toISOString();
+  writeFileSync(join(libraryPath, ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+  const opened = await app.api<{ mode: string }>("POST", "/libraries/open", { path: libraryPath });
+  expect(opened.body.mode, JSON.stringify(opened.body)).toBe("read-only");
+
+  await readFromLibrary(page, app, projectId, sid);
+  await expect(page.getByText("This library is open read-only: you can read and see annotations, but not change them.", { exact: true })).toBeVisible();
+  await expect(region(page, 1, 4)).toBeVisible();
+  await expect(region(page, 1, 4).locator(".ao-reader-text-layer")).toContainText("Page 1 of 4");
+  await expect.poll(() => inked(page, 1)).toBe(true);
+  // Reading controls only.
+  const enabled = await page.locator("main button:enabled").allTextContents();
+  expect(enabled.sort()).toEqual(["Fit width", "Next page", "Rotate view", "Zoom in", "Zoom out"].sort());
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+test("Page Down moves to the next page", async ({ page, app }) => {
+  const seen = watch(page);
+  const file = sourceFile(app, "pages.pdf", await buildMultiPagePdf(6));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Keys" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  await expect(page.getByRole("group", { name: "Pages" })).toBeFocused();
+  await page.keyboard.press("PageDown");
+  await expect(pageField(page)).toHaveValue("2");
+  await expect(region(page, 2, 6)).toBeFocused();
+  await expect(region(page, 2, 6)).toBeInViewport();
+  await page.keyboard.press("PageDown");
+  await expect(region(page, 3, 6)).toBeFocused();
+  await page.keyboard.press("End");
+  await expect(pageField(page)).toHaveValue("6");
+  await expect(region(page, 6, 6)).toBeFocused();
+  await page.keyboard.press("+");
+  await expect(zoomValue(page)).toHaveText("125%");
+  await expect(region(page, 6, 6)).toBeFocused();
+  await page.keyboard.press("Home");
+  await expect(region(page, 1, 6)).toBeFocused();
+  await expect(region(page, 1, 6)).toBeInViewport();
+  // The controls are reached by Tab, with a visible focus.
+  await pageField(page).focus();
+  await page.keyboard.press("Tab");
+  const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
+  await expect(zoomOut).toBeFocused();
+  expect(await zoomOut.evaluate((b) => getComputedStyle(b).outlineStyle)).not.toBe("none");
+  expect(seen.pageErrors).toEqual([]);
+  expectOnlyOwnOrigins(seen, app);
+});
+
+test("a project locked while its PDF is being read: the document ends, nothing drawn is left, and it opens again once unlocked", async ({ page, app }) => {
+  const seen = watch(page);
+  // Pages 2 to 6 are not read at opening: reaching one needs a range.
+  const file = sourceFile(app, "ranges.pdf", await buildRangeReadPdf(12));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Sealed while reading", passphrase: PASSPHRASE });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  await expect(region(page, 1, 12).locator(".ao-reader-text-layer")).toContainText("Quote on page 1");
+  const documentCalls = () => seen.requests.filter((u) => u.includes(`/assets/${aid}/document`)).length;
+
+  expect((await app.api("POST", `/projects/${projectId}/lock`)).status).toBe(200);
+  await pageField(page).fill("4");
+  await pageField(page).press("Enter");
+  await expect(page.getByRole("heading", { level: 2, name: "Project locked" })).toBeFocused();
+  await expect(page.getByText("This project is locked. Unlock it in the library to read its files.", { exact: true })).toBeVisible();
+  await expect(page.locator("canvas, .ao-reader-text-layer, [data-page-number]")).toHaveCount(0);
+  await expect(page.getByText("Quote on page")).toHaveCount(0);
+  // No range is asked for afterwards.
+  const after = documentCalls();
+  await page.waitForTimeout(500);
+  expect(documentCalls()).toBe(after);
+
+  // Unlocked in the library: "Open again" opens it from the start, with a new worker.
+  expect((await app.api("POST", `/projects/${projectId}/unlock`, { secret: PASSPHRASE })).status).toBe(200);
+  await page.getByRole("button", { name: "Open again" }).click();
+  await expect(region(page, 1, 12).locator(".ao-reader-text-layer")).toContainText("Quote on page 1");
+  expect(seen.workers.length).toBe(2);
   expect(seen.pageErrors).toEqual([]);
   expectOnlyOwnOrigins(seen, app);
 });
