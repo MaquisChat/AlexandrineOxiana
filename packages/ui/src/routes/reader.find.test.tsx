@@ -14,14 +14,16 @@ import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { routeFor } from "../App";
 import type { AnnotationRecord } from "../api/reader";
-import { clearPendingFind, setPendingFind, takePendingFind } from "../reader/readerHandoff";
+import { clearPendingFind, hasPendingFind, setPendingFind, takePendingFind } from "../reader/readerHandoff";
 const DROPPED = "Your search was not carried over, so all annotations are shown.";
 import { CURRENT_RW, LIBRARIES, PROJECTS, server, SOURCE_FILE, sse, testClient, url, useMockService } from "../test/service";
 
+const seenProps = vi.hoisted(() => [] as number[]);
 vi.mock("../screens/Reader", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../screens/Reader")>()),
   ReaderScreen: (p: { assetId?: string; annotationId?: string; findWords?: string; onFindDone?: () => void; preloadedAnnotations?: unknown[] }) => (
     <div>
+      {(seenProps.push(p.preloadedAnnotations ? p.preloadedAnnotations.length : 0), null)}
       <p data-testid="preloaded">{p.preloadedAnnotations ? String(p.preloadedAnnotations.length) : "-"}</p>
       <p data-testid="reader-screen">{`${p.assetId ?? "-"}|${p.annotationId ?? "-"}|${p.findWords ?? "-"}`}</p>
       <button type="button" onClick={() => p.onFindDone?.()}>
@@ -34,6 +36,7 @@ vi.mock("../screens/Reader", async (importOriginal) => ({
 useMockService();
 
 beforeEach(() => {
+  seenProps.length = 0;
   clearPendingFind();
   window.history.replaceState(null, "", "/");
 });
@@ -255,6 +258,74 @@ describe("what the route hands on (R12 fix round 1)", () => {
     expect(await screen.findByText("This project is locked. Unlock it in the library to read its files.")).toBeTruthy();
     release();
     await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByTestId("reader-screen")).toBeNull();
+  });
+});
+
+describe("R222: nothing of the list is kept by the route; no words are held without a file", () => {
+  /** An event stream the test feeds, so that the mounted route can be made to render again. */
+  function liveEvents() {
+    const open: ReadableStreamDefaultController<Uint8Array>[] = [];
+    const enc = new TextEncoder();
+    server.use(
+      http.get(url("/events"), () => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(c) {
+            open.push(c);
+          },
+        });
+        return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
+      }),
+    );
+    return (data: unknown) => open.forEach((c) => c.enqueue(enc.encode(`event: library.state\ndata: ${JSON.stringify(data)}\n\n`)));
+  }
+
+  it("the list is handed on with the first render of the screen and is not kept: the route's later renders, and the screen's own, pass none", async () => {
+    serve(TWO, list([rec("n2", "a2", "zeppelin quote-secret")]));
+    const push = liveEvents();
+    setPendingFind("p1", "s1", "zeppelin");
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    expect(await shownScreen()).toBe("a2|-|zeppelin");
+    expect(seenProps[0]).toBe(1);
+    // The library's mode changes: the mounted route renders again, its screen with it.
+    push({ open: true, ...CURRENT_RW, mode: "read-only" });
+    await waitFor(() => expect(seenProps.length).toBeGreaterThan(1));
+    expect(seenProps.slice(1).every((n) => n === 0)).toBe(true);
+  });
+
+  it("a lock after the route chose the file: the locked view shows and nothing of the annotations is anywhere in it", async () => {
+    serve(TWO, list([rec("n2", "a2", "zeppelin quote-secret")]));
+    const push = liveEvents();
+    setPendingFind("p1", "s1", "zeppelin");
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    expect(await shownScreen()).toBe("a2|-|zeppelin");
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === "p1" ? { ...p, unlocked: false } : p)) })));
+    push({ open: true, ...CURRENT_RW });
+    expect(await screen.findByText("This project is locked. Unlock it in the library to read its files.")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("quote-secret");
+    expect(screen.queryByTestId("reader-screen")).toBeNull();
+  });
+
+  it("the words are taken only when there is a file to open: while the source is read they wait; a source with no PDF drops them at once", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    serve([{ ...pdf("x1", "scan.png"), mime: "image/png", kind: "image" }], list([]));
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), async () => {
+        await gate;
+        return HttpResponse.json({ ...SOURCE_FILE, assets: [{ ...pdf("x1", "scan.png"), mime: "image/png", kind: "image" }] });
+      }),
+    );
+    setPendingFind("p1", "s1", "habitus");
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    await screen.findByText("Opening the source…");
+    expect(hasPendingFind()).toBe(true);
+    release();
+    expect(await screen.findByText("This source has no PDF that can be shown here.")).toBeTruthy();
+    expect(hasPendingFind()).toBe(false);
     expect(screen.queryByTestId("reader-screen")).toBeNull();
   });
 });

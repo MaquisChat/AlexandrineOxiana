@@ -36,7 +36,7 @@ import { isReadablePdf } from "../components/ReaderLink";
 import { UserText } from "../components/UserText";
 import { takeFindDropped, takePendingFind } from "../reader/readerHandoff";
 import { navigate, normalisePath, PATHS, type AppLocation } from "../navigation";
-import { LibraryLink, offerFor, READER_STATES, ReaderScreen, ReaderStateView, type ReaderStateKind } from "../screens/Reader";
+import { FIND_NOT_CARRIED, LibraryLink, offerFor, READER_STATES, ReaderScreen, ReaderStateView, type ReaderStateKind } from "../screens/Reader";
 
 export const isReaderPath = (path: string): boolean => normalisePath(path) === PATHS.reader;
 
@@ -89,9 +89,6 @@ export function fileOfFind(list: readonly AnnotationRecord[], files: readonly { 
   return undefined;
 }
 
-/** Said once when a search's words were dropped on the way (expired, a lock, a change of state). */
-export const FIND_NOT_CARRIED = "Your search was not carried over, so all annotations are shown.";
-
 const fileName = (a: Asset): string => a.path.split(/[\\/]/).pop() || a.path;
 
 function failureOf(err: unknown): ReaderStateKind | "no-source" {
@@ -117,7 +114,13 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
   /** Task R12: the words of a search hit, held until the screen has them. */
   const [find, setFind] = useState<{ key: string; words: string } | undefined>(undefined);
   /** Task R12: the file that holds the first match or the annotation asked for, once asked (none: the first file). */
-  const [located, setLocated] = useState<{ key: string; assetId: string | undefined; annotations?: AnnotationRecord[] } | undefined>(undefined);
+  const [located, setLocated] = useState<{ key: string; assetId: string | undefined } | undefined>(undefined);
+  /**
+   * The source's annotations as asked for to choose the file, held only from the answer to the screen's
+   * first render (a ref, read once and emptied: R222). Emptied too when the reader ends or fails and
+   * with the route, so that nothing of them (decrypted quotes and notes) is kept here.
+   */
+  const handed = useRef<{ key: string; annotations: AnnotationRecord[] } | undefined>(undefined);
   /** The reader was reached by "Show in the reader" but its words were dropped on the way: said once. */
   const [notCarried, setNotCarried] = useState<string | undefined>(undefined);
   const words = find?.key === key ? find.words : undefined;
@@ -126,20 +129,23 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
   /** Asks, while the reader is shown, whether its project is still there and unlocked (R8: the screen's list answered 404). */
   const askNow = useRef<(() => void) | undefined>(undefined);
 
-  // Task R12: taken once (an idempotent take: a second run of the effect keeps what the first took).
+  // Nothing of the words or of the list outlives the reader ending or failing, nor the route.
   useEffect(() => {
-    const taken = takePendingFind(projectId, sourceId);
-    const k = `${projectId}\n${sourceId}`;
-    setFind((cur) => (taken !== undefined ? { key: k, words: taken } : cur?.key === k ? cur : undefined));
-    // Idempotent like the take: a second run of the effect must not forget what the first found.
-    const dropped = taken === undefined && takeFindDropped(projectId, sourceId);
-    setNotCarried((cur) => (dropped ? k : cur === k ? cur : undefined));
-  }, [projectId, sourceId]);
-
-  // Nothing of the words outlives the reader ending or failing.
-  useEffect(() => {
-    if (ended || loaded.kind === "failed") setFind(undefined);
+    if (ended || loaded.kind === "failed") {
+      setFind(undefined);
+      handed.current = undefined;
+    }
   }, [ended, loaded.kind]);
+  useEffect(
+    () => () => {
+      handed.current = undefined;
+    },
+    [],
+  );
+  // Once the screen has been rendered with the list (it keeps its own, once), the route lets go of it.
+  useEffect(() => {
+    if (handed.current && loaded.kind === "ready" && !wantsLocating) handed.current = undefined;
+  });
 
   // Task R12: which file holds the first matching annotation (or the annotation named)? Only when there
   // is a choice to make: several PDFs and no file named in the address.
@@ -149,7 +155,9 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
     if (!wantsLocating || !files) return;
     const ac = new AbortController();
     const done = (assetId: string | undefined, annotations?: AnnotationRecord[]) => {
-      if (!ac.signal.aborted) setLocated({ key, assetId, ...(annotations ? { annotations } : {}) });
+      if (ac.signal.aborted) return;
+      handed.current = annotations ? { key, annotations } : undefined;
+      setLocated({ key, assetId });
     };
     const timer = setTimeout(() => {
       ac.abort();
@@ -176,6 +184,19 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
       .then(([file, libs]) => {
         if (!live) return;
         const files = file.assets.filter((a) => isReadablePdf(a)).map((a) => ({ id: a.id, name: fileName(a) }));
+        // Task R12: the words are taken only when there is a file to open; with none they are dropped at
+        // once, so that nothing holds them while "No PDF" is shown. An idempotent take (a second read of
+        // the source keeps what the first took).
+        const k = `${projectId}\n${sourceId}`;
+        const taken = takePendingFind(projectId, sourceId);
+        if (files.length === 0) {
+          setFind(undefined);
+          setNotCarried(undefined);
+        } else {
+          setFind((cur) => (taken !== undefined ? { key: k, words: taken } : cur?.key === k ? cur : undefined));
+          const dropped = taken === undefined && takeFindDropped(projectId, sourceId);
+          setNotCarried((cur) => (dropped ? k : cur === k ? cur : undefined));
+        }
         const title = file.source.title?.variants?.[0]?.value ?? "";
         setLoaded({
           kind: "ready",
@@ -370,7 +391,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
                   // A file chosen by hand: the search's words were for the file that opened.
                   setFind(undefined);
                   setNotCarried(undefined);
-                  setLocated((l) => (l && l.annotations ? { key: l.key, assetId: l.assetId } : l));
+                  handed.current = undefined;
                   navigate(readerHref(projectId, sourceId, { assetId: f.id }), { replace: true });
                 }}
               />
@@ -393,7 +414,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
           assetId={assetId}
           {...(annotationId ? { annotationId } : {})}
           {...(words !== undefined ? { findWords: words, onFindDone: () => setFind(undefined) } : {})}
-          {...(located?.key === key && located.annotations && assetId === (located.assetId ?? pdfs[0]?.id) ? { preloadedAnnotations: located.annotations } : {})}
+          {...(handed.current?.key === key ? { preloadedAnnotations: handed.current.annotations } : {})}
           readOnly={readOnly}
           {...(availability ? { availability } : {})}
           onProjectInDoubt={() => askNow.current?.()}

@@ -195,6 +195,8 @@ const typing = (t: EventTarget | null) => t instanceof HTMLInputElement || t ins
 
 /** Said when a search's words are in none of this file's annotations exactly (Task R12). */
 export const FIND_NO_EXACT_MATCH = "None of this source's annotations contains all of these words exactly; the search may have matched another form of a word.";
+/** Said once when a search's words were dropped on the way (expired, a lock, a change of state, a list that could not be had). */
+export const FIND_NOT_CARRIED = "Your search was not carried over, so all annotations are shown.";
 /** Said when the annotation the address names is not in the source (Task R12). */
 export const ANNOTATION_GONE = "That highlight or note is no longer there.";
 
@@ -260,6 +262,8 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   const findDone = useRef(onFindDone);
   findDone.current = onFindDone;
   const findHandedBack = useRef(false);
+  /** The words were dropped because the list could not be had: said once the list is shown (after "Try again"). */
+  const [searchLost, setSearchLost] = useState(false);
   const preloaded = useRef(preloadedAnnotations);
   /** The words are no longer held here: whoever handed them over is told, once. */
   const releaseFind = useCallback(() => {
@@ -630,9 +634,16 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   // Task R12: a document or a list that could not be had lets go of the words and of the place asked for.
   useEffect(() => {
     if (phase.kind !== "failed" && annotationsError === undefined) return;
+    // A list that could not be had: the search is lost, and the researcher is told once the list is shown.
+    if (annotationsError !== undefined && finding !== undefined) setSearchLost(true);
     releaseFind();
     setWantId(undefined);
-  }, [phase.kind, annotationsError, releaseFind]);
+  }, [phase.kind, annotationsError, finding, releaseFind]);
+  useEffect(() => {
+    if (!searchLost || !annotations) return;
+    setSearchLost(false);
+    setSearchNote(FIND_NOT_CARRIED);
+  }, [searchLost, annotations]);
   // A different annotation named while the reader stays open (a link within the app) is opened at.
   const lastWanted = useRef(annotationId);
   useEffect(() => {

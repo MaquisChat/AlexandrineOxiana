@@ -14,7 +14,7 @@ import { http, HttpResponse } from "msw";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readerApi, type AnnotationRecord } from "../api/reader";
-import type { PdfHandle } from "../reader/pdfjs";
+import { PdfOpenError, type PdfHandle } from "../reader/pdfjs";
 import { server, testClient, url, useMockService } from "../test/service";
 import { ReaderScreen } from "./Reader";
 
@@ -100,6 +100,7 @@ const shown = () => [...document.querySelectorAll<HTMLElement>("[data-entry]")].
 const entry = (id: string) => document.querySelector<HTMLElement>(`[data-entry="${id}"]`)!;
 const pageField = () => (screen.getByLabelText("Page") as HTMLInputElement).value;
 const NONE = "None of this source's annotations contains all of these words exactly; the search may have matched another form of a word.";
+const NOT_CARRIED = "Your search was not carried over, so all annotations are shown.";
 const GONE = "That highlight or note is no longer there.";
 const storages = () => JSON.stringify([...Object.entries(localStorage), ...Object.entries(sessionStorage)]);
 
@@ -313,7 +314,7 @@ describe("the list handed over by the route, the researcher's focus, a failed do
     const done = vi.fn();
     reader({ findWords: "habitus", onFindDone: done });
     await screen.findByRole("button", { name: "Open again" });
-    expect(done).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(done).toHaveBeenCalledTimes(1));
   });
 
   it("an annotation id that changes while the reader is open is opened at", async () => {
@@ -323,5 +324,44 @@ describe("the list handed over by the route, the researcher's focus, a failed do
     view.rerender(<ReaderScreen api={readerApi(testClient())} projectId="p1" sourceId="s1" assetId="a1" readOnly={false} annotationId="t" />);
     await waitFor(() => expect(document.activeElement).toBe(entry("t")));
     expect(pageField()).toBe("6");
+  });
+});
+
+describe("R222: the list handed over is used once; a lost search is said", () => {
+  it("the handed-over list serves the first opening only: 'Open again' after a failure asks the service again", async () => {
+    let asked = 0;
+    server.use(http.get(url("/projects/:id/sources/:sid/annotations"), () => (asked++, HttpResponse.json({ annotations: [rec("fresh", "from the service", { page: 1 })], count: 1, textChars: 0 }))));
+    let fail: (e: PdfOpenError) => void = () => {};
+    const first = fakeHandle();
+    (first as unknown as { failed: Promise<PdfOpenError> }).failed = new Promise<PdfOpenError>((r) => (fail = r));
+    openPdf.mockReset();
+    openPdf.mockResolvedValueOnce(first).mockResolvedValue(fakeHandle());
+    reader({ preloadedAnnotations: [rec("handed", "handed over", { page: 1 })] });
+    await screen.findByRole("heading", { level: 2, name: "Annotations (1)" });
+    expect(shown()).toEqual(["handed"]);
+    expect(asked).toBe(0);
+    act(() => fail(new PdfOpenError("other", "The file changed while it was being read. Open it again to read it as it is now.")));
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Open again" }));
+    await waitFor(() => expect(shown()).toEqual(["fresh"]));
+    expect(asked).toBe(1);
+  });
+
+  it("when the list cannot be had the words go, and once it is shown after Try again the researcher is told the search was not carried over", async () => {
+    const user = userEvent.setup();
+    let ok = false;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/annotations"), () => (ok ? HttpResponse.json({ annotations: [rec("m", "habitus", { page: 2 }), rec("z", "zeta", { page: 3 })], count: 2, textChars: 0 }) : HttpResponse.json({ error: { code: "INTERNAL", message: "It broke." } }, { status: 500 }))),
+    );
+    const done = vi.fn();
+    reader({ findWords: "habitus", onFindDone: done });
+    await screen.findByRole("button", { name: "Try again" });
+    expect(done).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(NOT_CARRIED)).toBeNull();
+    ok = true;
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("heading", { level: 2, name: "Annotations (2)" });
+    expect(screen.getByText(NOT_CARRIED).getAttribute("role")).toBe("status");
+    expect(shown()).toEqual(["m", "z"]);
+    expect(screen.queryByRole("button", { name: "Show all" })).toBeNull();
   });
 });
