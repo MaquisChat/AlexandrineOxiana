@@ -352,3 +352,61 @@ describe("deciding entries that have no batch (Task 67)", () => {
     }
   });
 });
+
+describe("a conflict found by a later check enters the queue (Task 72, D19, R190)", () => {
+  /** An existing source whose stored evidence now disagrees (data a later check added), not yet rechecked and with no entry. */
+  async function existingWithNewEvidence(pid: string): Promise<string> {
+    const at = new Date().toISOString();
+    const sf = await svc.state.session!.repo.createSource(pid, draft("Rivers and Memory"), [], {
+      provenance: provenance(),
+      fieldEvidence: [
+        { field: "/title", value: "Rivers and Memory", source: { kind: "page-dom" }, at },
+        { field: "/title", value: "Rivers and Memories", source: { kind: "platform-json" }, at },
+      ],
+    });
+    return sf.source.id;
+  }
+
+  it("the recheck that finds the conflict queues it: the list row needs review and the queue shows a capture entry naming the field, its cause a later check", async () => {
+    const pid = await newProject();
+    const sid = await existingWithNewEvidence(pid);
+    expect((await queue(pid)).total).toBe(0);
+    expect(await badge(pid, sid)).toBe(false);
+    const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/recheck` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.verification["/title"].status).toBe("conflict");
+    expect(await badge(pid, sid)).toBe(true);
+    const q = await queue(pid);
+    expect(q.total).toBe(1);
+    expect(q.items[0]).toMatchObject({ sourceId: sid, kind: "verification", group: "capture", fields: { "/title": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" }, title: "Rivers and Memory" });
+    // Settled by confirming the field (R176 1): it leaves the queue and the badge clears.
+    const c = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/title", value: { variants: [{ lang: "en", kind: "original", value: "Rivers and Memories" }] } } });
+    expect(c.status, c.body).toBe(200);
+    expect((await queue(pid)).total).toBe(0);
+    expect(await badge(pid, sid)).toBe(false);
+  });
+
+  it("R194: accepting an imported item that keeps a conflict (plain accept) leaves the row needing review, with the conflict under From captures", async () => {
+    const pid = await newProject();
+    const at = new Date().toISOString();
+    const page = { kind: "page-dom" as const };
+    const platform = { kind: "platform-json" as const };
+    const sf = await svc.state.session!.repo.createSource(pid, draft("An imported item", { issued: "2014" }), [], {
+      provenance: provenance(),
+      fieldEvidence: [
+        { field: "/issued", value: "2014", source: page, at },
+        { field: "/issued", value: "2018", source: platform, at },
+      ],
+      verification: { "/issued": { status: "conflict", checks: ["cross-source"], reason: "Two sources disagree about the date.", values: [{ value: "2014", source: page }, { value: "2018", source: platform }] } },
+      reviewItem: { kind: "import", fields: { "/issued": "conflict" }, reasons: ["The file and the platform disagree."] },
+    });
+    const sid = sf.source.id;
+    const [item] = (await queue(pid)).items;
+    expect(item).toMatchObject({ kind: "import", group: "attach" });
+    const r = await decide(pid, item!.id, { action: "accept" });
+    expect(r.status, r.body).toBe(200);
+    expect(await badge(pid, sid)).toBe(true);
+    const q = await queue(pid);
+    expect(q.items).toEqual([expect.objectContaining({ sourceId: sid, group: "capture", fields: { "/issued": "conflict" } })]);
+  });
+});

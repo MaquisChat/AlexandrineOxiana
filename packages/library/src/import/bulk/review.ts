@@ -166,6 +166,9 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
       let line: Omit<JournalEntry, "key"> = { outcome: "created", sourceId: cur.source.id };
       if (d.action === "accept" && d.draft) {
         await ops.writeSource(cur, applyFields(cur, d.draft, { kind: "user" }, tx.at, tx.actor));
+      } else if ((d.action === "accept" && !d.draft) || d.action === "keep-both") {
+        // The source stays as it is, unwritten: its conflicts are listed in a capture entry all the same (R194).
+        await ops.keepConflictsListed(cur.source.id);
       } else if (d.action === "accept-candidate") {
         const c = entry.candidates![d.index] as LookupResult;
         const lookups: LookupEvidence[] = [{ provider: c.provider, title: c.title, ...(c.creators.length ? { creators: c.creators } : {}), ...(c.issued ? { issued: c.issued } : {}) }];

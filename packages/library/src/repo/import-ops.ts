@@ -10,7 +10,7 @@ import { NotFoundError } from "./errors.js";
 import { decryptBytes, foldName, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
-import { appendReviewEntry, appendReviewUpdate, readReviewEntries, resolveSettledCaptureEntries, type ReviewEntry, type ReviewInput } from "./review.js";
+import { appendReviewEntry, appendReviewUpdate, queueUnlistedConflicts, readReviewEntries, resolveSettledCaptureEntries, type ReviewEntry, type ReviewInput } from "./review.js";
 import { deleteSourceInTx, fileMode, readSourceFile, writeSourceFile } from "./sources.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
 import { addDeletions, clearDeletions, releaseDeletions, resetDeletions } from "./tombstones.js";
@@ -43,6 +43,11 @@ export interface ImportOps {
   deleteTags(tagIds: string[], sourceIds: Iterable<string>): Promise<string[]>;
   /** Reads a project file written by this repo (decrypted when the project is encrypted). */
   readText(rel: string): Promise<string | null>;
+  /**
+   * For a decision that leaves a source in place without writing it (a plain accept): every field of
+   * its stored report in conflict is listed in a pending capture entry, in this change (R194).
+   */
+  keepConflictsListed(sourceId: string): Promise<void>;
 }
 
 export function runImportChange<T>(
@@ -55,6 +60,8 @@ export function runImportChange<T>(
   core.assertWritable();
   /** Capture entries resolved by this change, because a write gave an existing source a new report (R176 1). */
   const resolved: string[] = [];
+  /** Fields an existing source's new report put newly in conflict, queued by this change (R190 a). */
+  const queued: Array<{ entry: string; fields: string[] }> = [];
   return runMutation(
     core,
     projectId,
@@ -81,9 +88,14 @@ export function runImportChange<T>(
           const nowAnn = new Set(parsed.annotations.map((a) => a.id));
           for (const a of before?.annotations ?? []) if (!nowAnn.has(a.id)) tx.record("annotation", a.id, a, null);
           if (!st.sources.has(parsed.source.id)) tx.onCommit(() => st.sources.set(parsed.source.id, parsed.source.folder));
-          // An existing source given a new report (a review decision's fields, a merge, an incremental
-          // update): its capture entries are re-examined in this change. A new source has none yet.
-          if (before && !isDeepStrictEqual(before.verification, parsed.verification)) resolved.push(...(await resolveSettledCaptureEntries(core, tx, parsed, "recheck")));
+          // An existing source written with its report: every field in conflict is listed in a pending
+          // capture entry, whether or not the report changed (R193 b, R194), and first, so an entry it
+          // extends is not resolved under it. A new source has none yet (its creation queued its own).
+          if (before) queued.push(...(await queueUnlistedConflicts(core, tx, parsed)));
+          // Given a new report (a review decision's fields): its capture entries are re-examined (R176 1).
+          if (before && !isDeepStrictEqual(before.verification, parsed.verification)) {
+            resolved.push(...(await resolveSettledCaptureEntries(core, tx, parsed, "recheck")));
+          }
           tx.index((sink) => sink.indexSource(parsed));
         },
         deleteSource: (id, o) => deleteSourceInTx(core, tx, id, o),
@@ -153,6 +165,9 @@ export function runImportChange<T>(
           const { key, keyId } = tx.key();
           return (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
         },
+        async keepConflictsListed(sourceId) {
+          queued.push(...(await queueUnlistedConflicts(core, tx, await readSourceFile(core, st, sourceId))));
+        },
       };
       if (opts.entity) tx.entity(opts.entity.type, opts.entity.id);
       return fn(ops);
@@ -161,7 +176,7 @@ export function runImportChange<T>(
       op: opts.op,
       ...(opts.entity ? { entity: opts.entity } : {}),
       ...(opts.refuse ? { refuse: opts.refuse } : {}),
-      auditDetails: () => (resolved.length ? { reviewResolved: { entries: [...resolved], by: "recheck" } } : {}),
+      auditDetails: () => ({ ...(resolved.length ? { reviewResolved: { entries: [...resolved], by: "recheck" } } : {}), ...(queued.length ? { reviewQueued: [...queued] } : {}) }),
     },
   );
 }

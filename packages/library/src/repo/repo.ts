@@ -76,7 +76,7 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
-import { hasSettledCaptureEntries, readReviewEntries, reviewedAfterWithdrawal, type ReviewEntry } from "./review.js";
+import { hasSettledCaptureEntries, hasUnlistedConflicts, readReviewEntries, reviewedAfterWithdrawal, type ReviewEntry } from "./review.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
@@ -259,13 +259,15 @@ export class Repo {
    * The "Recheck" action: recomputes the source's field verification from its stored evidence and,
    * when it changed, saves it as a governed, audited and change-logged update of the source.
    * Returns the source file as stored afterwards. A source whose verification is unchanged is not
-   * written, unless one of its capture review entries is settled by it: such entries are resolved in
-   * the recheck's own governed change (R176 1).
+   * written, unless one of its capture review entries is settled by it (R176 1), or a field of it in
+   * conflict is listed in no pending capture-conflict entry (R193 b: a source D19 left behind): the
+   * recheck's own governed change resolves or queues them.
    */
   async recheckSource(projectId: string, id: string, ctx: VerifyContext = {}): Promise<SourceFile> {
     const cur = await this.getSource(projectId, id);
     const next = recheckSourceFile(cur, ctx);
-    if (isDeepStrictEqual(next.verification, cur.verification) && !(await hasSettledCaptureEntries(this.core, this.core.state(projectId), next))) return cur;
+    const st = this.core.state(projectId);
+    if (isDeepStrictEqual(next.verification, cur.verification) && !(await hasSettledCaptureEntries(this.core, st, next)) && !(await hasUnlistedConflicts(this.core, st, next))) return cur;
     return updateSource(this.core, projectId, id, {}, { verification: (n) => recheckSourceFile(n, ctx).verification, resolveReview: "recheck" });
   }
   deleteSource(projectId: string, id: string): Promise<void> {
