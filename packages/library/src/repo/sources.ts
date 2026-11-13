@@ -32,7 +32,7 @@ import { readFullData, writeProjectData } from "./projects.js";
 import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
-import { appendReviewEntry, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type ReexaminedBy, type ReviewInput } from "./review.js";
+import { appendReviewEntry, queueUnlistedConflicts, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type QueuedConflicts, type ReexaminedBy, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 
@@ -650,10 +650,18 @@ export async function updateSource(
      * field in conflict or unconfirmed are resolved in this same change, and the audit event says so (R176 1).
      */
     resolveReview?: "confirmation" | "recheck";
+    /**
+     * A confirmation (R191): the fields the researcher confirmed in this change, as the verification
+     * report names them (`/title`, `/identifiers/doi`). The audit entry names each and whether the
+     * recorded value was kept or another chosen; never the value.
+     */
+    confirmed?: readonly string[];
   } = {},
 ): Promise<SourceFile> {
   let resolved: string[] = [];
+  let confirmed: FieldConfirmation[] = [];
   let by: ReexaminedBy | undefined;
+  let queued: QueuedConflicts[] = [];
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
@@ -701,8 +709,13 @@ export async function updateSource(
       if (extra.verification) sf = { ...sf, verification: extra.verification(sf) };
       await writeSourceFile(core, tx, sf);
       tx.record("source", id, cur.source, source);
+      confirmed = (extra.confirmed ?? []).map((field) => ({ field, choice: deepEqual(atPointer(cur.source, field), atPointer(source, field)) ? "kept" : "changed" }));
       // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
       if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
+      // Every field the recomputed report has in conflict is listed in a pending capture-conflict entry,
+      // in this change (R193 b: new or left without one by D19), before the entries are re-examined, so
+      // an entry it extends is not resolved under it.
+      if (extra.verification) queued = await queueUnlistedConflicts(core, tx, sf);
       // The source's capture entries are re-examined in this change (R176 1): against the new report
       // when one was computed; after an ordinary edit, against the stored report and the source as edited.
       by = extra.resolveReview ?? (extra.verification ? "recheck" : "edit");
@@ -716,9 +729,31 @@ export async function updateSource(
     {
       op: "source.update",
       entity: { type: "source", id },
-      auditDetails: () => (resolved.length ? { reviewResolved: { entries: resolved, by } } : {}),
+      auditDetails: () => ({
+        ...(confirmed.length ? { confirmed } : {}),
+        ...(resolved.length ? { reviewResolved: { entries: resolved, by } } : {}),
+        // One shape in every audit event that carries it: an array of { entry, fields } (here one element).
+        ...(queued.length ? { reviewQueued: queued } : {}),
+      }),
     },
   );
+}
+
+/**
+ * One field a confirmation settled, as its audit entry records it (R191): the field as the
+ * verification report names it, and whether the researcher kept the value recorded or chose
+ * another. Never the value, an alternative or anything the researcher typed.
+ */
+export interface FieldConfirmation {
+  field: string;
+  choice: "kept" | "changed";
+}
+
+/** The value at a `/a/b` pointer of a source (undefined when absent). */
+function atPointer(source: Source, pointer: string): unknown {
+  let v: unknown = source;
+  for (const part of pointer.split("/").slice(1)) v = v && typeof v === "object" ? (v as Record<string, unknown>)[part] : undefined;
+  return v;
 }
 
 /** Rewrites one source inside a running mutation (membership, fieldwork links). */

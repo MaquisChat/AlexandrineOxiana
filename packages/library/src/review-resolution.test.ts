@@ -59,8 +59,12 @@ async function capturedWithConflicts(fields: Record<string, string> = { "/title"
   const conflict = (current: unknown, a: unknown, b: unknown): FieldVerification => ({ status: "conflict", checks: ["sources-agree"], current, values: [{ value: a, source: page }, { value: b, source: platform }] });
   const sf = await kit.repo.createSource(p.id, draft("Rivers and Memory", { issued: "2019" }), [], {
     provenance: provenance(),
-    fieldEvidence: evidence,
-    verification: { "/title": conflict("Rivers and Memory", "Rivers and Memory", "Rivers and Memories"), "/issued": conflict("2019", "2019", "2020") },
+    // The evidence and the stored report have in conflict exactly the fields the entry lists (R193 b: a
+    // conflict no entry lists is queued by the next change that writes the report).
+    fieldEvidence: evidence.filter((e) => e.field in fields || e.source.kind === "page-dom"),
+    verification: Object.fromEntries(
+      Object.entries({ "/title": conflict("Rivers and Memory", "Rivers and Memory", "Rivers and Memories"), "/issued": conflict("2019", "2019", "2020") }).filter(([f]) => f in fields),
+    ),
     reviewItem: { fields, reasons: ["The page and the platform disagree."], ...(extra.cause === false ? {} : { cause: { kind: "capture-conflict" as const } }) },
   });
   return sf.source.id;

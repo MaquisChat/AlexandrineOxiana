@@ -172,3 +172,62 @@ test("scenario 11 (the review queue step): a planted DOI and title conflict appe
     expect(stored.fields.filter((f) => f.field === "/title" || f.field === "/identifiers/doi").map((f) => f.status)).toEqual(["user-confirmed", "user-confirmed"]);
   });
 });
+
+/**
+ * Plants an existing source whose stored evidence now disagrees on the title, as data a later check
+ * added (a browser capture with the downloader ticked adds the platform's values), with no review
+ * entry and no conflict in its stored report yet; with the library's own code, while the service is
+ * stopped. No capture through the fake tools gives a page and a platform that disagree.
+ */
+function plantLaterEvidence(app: AppHarness, o: { library: string; projectId: string }): void {
+  const code = [
+    'import { KeyRing, createIndexSink, deviceDeps, openIndexChecked, openLibrary, openRepo } from "./src/index.ts";',
+    "const o = JSON.parse(process.env.AO_E2E_PLANT);",
+    "const lib = await openLibrary(o.library, deviceDeps(o.configDir));",
+    "const checked = await openIndexChecked(lib.root);",
+    "const ring = new KeyRing();",
+    "const repo = await openRepo(lib, ring, { index: createIndexSink(checked.handle, { root: lib.root, keyRing: ring }) });",
+    "const at = new Date().toISOString();",
+    "await repo.createSource(o.projectId, {",
+    "  projectIds: [], type: 'webpage', title: { variants: [{ lang: 'en', kind: 'original', value: 'Harbour Songs' }] }, creators: [], identifiers: {},",
+    "  caseAttributes: {}, availability: { status: 'available' }, collectionIds: [], tagIds: [], participantIds: [],",
+    "}, [], {",
+    "  provenance: { captureMethod: 'manual_upload', capturedAt: at, tool: { name: 'e2e-plant', version: '1' }, fileHashes: {}, legal: { status: 'public' }, identifiable: false },",
+    "  fieldEvidence: [{ field: '/title', value: 'Harbour Songs', source: { kind: 'page-dom' }, at }, { field: '/title', value: 'Harbour Songs of the North Coast', source: { kind: 'platform-json' }, at }],",
+    "});",
+    "checked.handle.close();",
+    "await lib.close();",
+  ].join("\n");
+  const env = { ...process.env, AO_E2E_PLANT: JSON.stringify({ library: o.library, projectId: o.projectId, configDir: app.configDir }) };
+  const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], { cwd: LIBRARY_DIR, env, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) throw new Error(`Planting the evidence failed (status ${r.status}): ${r.stderr}`);
+}
+
+test("D19 (R190): a conflict a later check finds on an existing source puts it in the review queue: the row needs review, the entry is under From captures", async ({ page, app }) => {
+  await test.step("set-up: an existing source whose stored evidence now disagrees on the title, with no entry", async () => {
+    const { projectId, libraryPath } = await libraryWithProject(app, page, { library: "Later library", project: "Coast study" });
+    await app.restart(async () => plantLaterEvidence(app, { library: libraryPath, projectId }));
+    await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(projectId)}`);
+    await expect(page.getByRole("heading", { level: 1, name: "Later library" })).toBeVisible();
+  });
+
+  const row = () => page.getByRole("table", { name: "Sources" }).getByRole("row").filter({ hasText: "Harbour Songs" });
+  await test.step("before the check, the row does not need review", async () => {
+    await expect(row().getByRole("button", { name: "Harbour Songs", exact: true })).toBeVisible();
+    await expect(row().getByRole("link", { name: /^Needs review/ })).toHaveCount(0);
+  });
+
+  await test.step("the source's Recheck finds the conflict: the title shows Conflict and the row now needs review", async () => {
+    await row().getByRole("button", { name: "Harbour Songs", exact: true }).click();
+    await page.getByRole("button", { name: "Recheck", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Title: Conflict" })).toBeVisible();
+    await expect(row().getByRole("link", { name: /^Needs review/ })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Review queue (1 waiting)" })).toBeVisible();
+  });
+
+  await test.step("the queue holds the entry under From captures", async () => {
+    await page.getByRole("link", { name: "Review queue (1 waiting)" }).click();
+    await expect(page.getByRole("heading", { level: 2, name: "From captures" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Title: Conflict" })).toBeVisible();
+  });
+});

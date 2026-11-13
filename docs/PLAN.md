@@ -414,6 +414,13 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
 
+### After Phase 1 — taking over what Zotero does (the owner's request of 2026-11-12)
+Not part of Phase 1's close-out. Four pieces, each with its own plan, in this order (ledger 2026-11-12 and 13):
+1. **Reading and highlighting PDFs in the app** — branch `claude/pdf-reader-highlights`; plan `docs/superpowers/plans/2026-11-12-pdf-reader-and-highlights.md` ON THAT BRANCH (tasks R1–R13; rulings R192). Status is kept in the table below, rows R1 onward.
+2. **Staying in step with the owner's Zotero account** — the existing one-way import made automatic ("Sync with Zotero now" and a schedule). Not planned yet.
+3. **Files in Drive, OneDrive or Dropbox** — watched folders (engine and routes exist, no screen) pointed at the drive's local folder, with care for files not yet downloaded. Not planned yet.
+4. **The library across the owner's own devices** — the specification's sync model (SPEC 2.3). Waits for the owner's answer on which devices. Not planned yet.
+
 ### Milestone N — Finish Phase 1
 
 **Task 52 — Review pages for the owner**
@@ -499,9 +506,9 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by Task 49's fourth round (for Task 50b): D15 (high): a deleted `backups-manifest.json` is read as "no backups", so a destruction lists none, its certificate says "none", and a backup that holds the destroyed file stays. **CLOSED by Task 50b (merge 00d2b53, 2026-11-12).**
 - Defect found by Task 66's fix round (for Task 68): D16: when the fonts index or the appearance settings cannot be read at the moment of a change, the change is written over defaults — the other fonts' entries are dropped (their files stay, unlisted), or the other appearance settings are reset.
 - Defect found by the accuracy review of Task 37k (for Task 69): D17 (medium): a captured post that has disappeared at its source is kept and recorded as no longer available (`availability: unavailable-on-platform`), but no library screen shows it; only the capture queue's one-line count says so. Scenario 10 promises the item is flagged (R183 a). **CLOSED by Task 69 (merge 0e12b9e, 2026-11-12).**
-- Defect found by the accuracy review of Task 37k (not fixed in this build, R183 b): D18 (low): the browser extension's popup ticks "Also download media with the downloader" again every time it opens (`apps/browser-extension/src/popup/Popup.tsx`, `useState(true)`), so the choice is not remembered. For after the owner's tests.
-- Defect found by the re-check of Task 37k (not fixed in this build): D19 (medium): a conflict found when a later check adds data to an existing source (a browser-extension capture with the downloader ticked) shows as a "Conflict" badge on the source but writes no review-queue entry, so the source carries no "Needs review" (R172). Entries are written only when a source is created (`packages/library/src/sources.ts`). For after the owner's tests.
-- Defect found by the review of Task 34f (not fixed in this build): D20 (medium): the audit entry of a field confirmation is a generic `source.update` that names no field, and the change log does not hold the verification report; confirming the value already there leaves no trace of which field was confirmed (R176, R149). For after the owner's tests.
+- Defect found by the accuracy review of Task 37k (not fixed in this build, R183 b): D18 (low): the browser extension's popup ticks "Also download media with the downloader" again every time it opens (`apps/browser-extension/src/popup/Popup.tsx`, `useState(true)`), so the choice is not remembered. For after the owner's tests. **CLOSED by Task 71 (merge 3e41550, 2026-11-13).**
+- Defect found by the re-check of Task 37k (not fixed in this build): D19 (medium): a conflict found when a later check adds data to an existing source (a browser-extension capture with the downloader ticked) shows as a "Conflict" badge on the source but writes no review-queue entry, so the source carries no "Needs review" (R172). Entries are written only when a source is created (`packages/library/src/sources.ts`). For after the owner's tests. **CLOSED by Task 72 (merge 3fd15df, 2026-11-13).**
+- Defect found by the review of Task 34f (not fixed in this build): D20 (medium): the audit entry of a field confirmation is a generic `source.update` that names no field, and the change log does not hold the verification report; confirming the value already there leaves no trace of which field was confirmed (R176, R149). For after the owner's tests. **CLOSED by Task 73 (merge 0e890cd, 2026-11-13).**
 - Defect found by the review of Task 69 (for Task 70): D21 (high): a read of a source that falls between the two files of a write in progress (`readSourceFile` reads outside the write queue; `writeSourceFile` writes the annotations file, then `source.json`) records a false integrity warning, shown as "Some annotations … were changed outside the app" until restart. In the code before Task 69; the source's own view could already meet it. **CLOSED by Task 70 (merge a916b20, 2026-11-12).**
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
@@ -562,9 +569,9 @@ Update after every task; commit and push.
 | 37k Revise the guide and checklist | done | cabc4d3 (merge) and the last edit | accuracy-reviewed line by line; scenario 10 quotes the mark of Task 69; it found D17, D18 and D19 |
 | 69 Show that a captured item is no longer available (D17) | complete | 0e12b9e (merge) | reviewed with probes over one fix round (R185, R186); D17 closed |
 | 70 A read never mistakes a write in progress for tampering (D21) | complete | a916b20 (merge) | reviewed with probes (R188); D21 closed; four minors on the final review's list |
-| 71 The extension remembers the downloader choice (D18) | built; read and accepted by the controller; waits to be verified with 72 and 73 | 7ca77e0 (worktree branch) | R189 |
-| 72 A later conflict enters the review queue (D19) | fix round 1 | 06ee7b4 (worktree branch; it holds 71 and 73 too) | R190 as amended by R193: only capture-conflict entries count; the rule is an invariant that also heals old cases |
-| 73 The audit says which field was confirmed (D20) | approved; goes in with 71 and 72 | fb78744 (worktree branch) | R191; reviewed with 18 probes |
+| 71 The extension remembers the downloader choice (D18) | complete | 3e41550 (merge) | R189; read by the controller; D18 closed |
+| 72 A later conflict enters the review queue (D19) | complete | 3fd15df (merge) | R190, R193, R194; reviewed with probes over two fix rounds; D19 closed |
+| 73 The audit says which field was confirmed (D20) | complete | 0e890cd (merge) | R191; reviewed with 18 probes; D20 closed |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |

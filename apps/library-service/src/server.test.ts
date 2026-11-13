@@ -239,6 +239,15 @@ describe("libraries, projects, sources", () => {
     const f = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/issued", value: "2001" } });
     expect(f.status, f.body).toBe(200);
     expect(f.json.verification["/issued"].status).toBe("user-confirmed");
+    // The audit entry names the field and says the value was changed, then kept; never the value (R191).
+    type Ev = { entity?: { id: string }; details?: Record<string, unknown> };
+    const confirmations = async () =>
+      ((await call({ url: `/projects/${pid}/audit?limit=1000` })).json.events as Ev[]).filter((e) => e.entity?.id === sid && e.details?.op === "source.update" && e.details.confirmed);
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/publisher", value: "Marmot Quokka Press" } })).status).toBe(200);
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/publisher", value: "Marmot Quokka Press" } })).status).toBe(200);
+    const named = (await confirmations()).reverse(); // the route lists the newest first
+    expect(named.map((e) => e.details!.confirmed)).toEqual([[{ field: "/issued", choice: "changed" }], [{ field: "/publisher", choice: "changed" }], [{ field: "/publisher", choice: "kept" }]]);
+    expect(JSON.stringify(named)).not.toContain("Marmot");
 
     const t1 = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcripts`, body: { text: "WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n", format: "vtt" } });
     expect(t1.status, t1.body).toBe(200);
