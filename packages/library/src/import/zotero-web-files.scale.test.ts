@@ -173,9 +173,9 @@ describe("Zotero Web files at scale (Z4)", () => {
       );
       // R64 / the task's bound: heap under 300 MB (the process runs with its old space capped, vitest.scale.config.ts).
       expect(peakHeap).toBeLessThan(300 * MB);
-      // RSS is reported, not bounded here: this process also holds the stand-in (24,000 Zotero objects, 12,000 files,
-      // its log of every request), which the app's process does not. (Measured 527 MB on 13 November 2026, reported
-      // to the coordinator with the task's report.)
+      // The resident size is printed above, not bounded (the coordinator's ruling after Z4's review): it depends on the
+      // allocator and the runner, and this process also holds the stand-in (24,000 Zotero objects, 12,000 files, its
+      // log of every request), which the app's process does not. The task's bound is the heap.
     } finally {
       clearInterval(timer);
       await z.agent.close();
