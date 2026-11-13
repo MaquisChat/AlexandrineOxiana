@@ -71,20 +71,30 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
     abs = absPath(root, asset.path);
     await assertContained(root, abs);
   }
+  const unsafe = () => new InvalidInputError("this file could not be opened safely");
   let fh: fsp.FileHandle;
   try {
-    // Never through a symbolic link put in the file's place after the check above.
-    fh = await fsp.open(abs, fsc.O_RDONLY | (fsc.O_NOFOLLOW ?? 0));
+    // Never through a symbolic link put in the file's place after the check above; never waiting
+    // on a FIFO put there (O_NONBLOCK changes nothing for a regular file; anything else is refused
+    // below, before a byte is read).
+    fh = await fsp.open(abs, fsc.O_RDONLY | (fsc.O_NOFOLLOW ?? 0) | (fsc.O_NONBLOCK ?? 0));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ELOOP") throw new InvalidInputError("this file could not be opened safely");
-    throw new NotFoundError("Asset", assetId);
+    if (code === "ELOOP") throw unsafe();
+    if (code === "ENOENT" || code === "ENOTDIR") throw new NotFoundError("Asset", assetId);
+    // Something other than a regular file that cannot even be opened (a socket): refused as unsafe.
+    const st = await fsp.lstat(abs).catch(() => undefined);
+    if (st && !st.isFile()) throw unsafe();
+    // There, but unreadable (permission, too many open files, an I/O error): never "missing", and
+    // the error carries only its code, never the path.
+    throw Object.assign(new Error("this file could not be opened"), { code });
   }
   let dec: DecryptedFile | undefined;
   let size: number;
   try {
     const st = await fh.stat();
-    if (!st.isFile()) throw new NotFoundError("Asset", assetId);
+    // A FIFO, a device or a folder put in the file's place: refused, never read.
+    if (!st.isFile()) throw unsafe();
     if (key) {
       // One decrypted chunk cached: reads for display are sequential (R140 review M8).
       dec = await openDecryptedHandle(fh, (id) => (id === key.keyId ? key.key : undefined), { cacheChunks: 1 });
