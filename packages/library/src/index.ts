@@ -256,6 +256,9 @@ export {
   watchFolder,
 } from "./import/watch.js";
 export type { FolderWatch, WatchDeps, WatchEvent, WatchSettingsDeps } from "./import/watch.js";
+export { WatchFileNotLocalError, bringInNewVersion, settleWatchedFile } from "./import/watch.js";
+export type { WatchRegisterEntry, WatchedFileState } from "./repo/watch-register.js";
+export type { AttachOpts } from "./import/attach.js";
 export { ARCHIVE_LIMITS } from "./extract/zip.js";
 export * from "./lookup/index.js";
 export {

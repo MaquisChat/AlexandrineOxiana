@@ -90,7 +90,7 @@ import { isClosed, type Library } from "../library.js";
 import type { LocationEnv } from "../location.js";
 import type { HttpClient } from "../lookup/index.js";
 import { InvalidInputError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
-import { addWatchedFolderEntry, projectCollectionsAndTags, projectEncrypted, removeWatchedFolderEntry, type Repo } from "../repo/repo.js";
+import { addWatchedFolderEntry, hasSource, projectCollectionsAndTags, projectEncrypted, removeWatchedFolderEntry, type Repo } from "../repo/repo.js";
 import { WATCHED_FILE_STATES, isRegisterEntry, type WatchRegisterEntry, type WatchedFileState } from "../repo/watch-register.js";
 import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, WATCHED_FOLDER_TOOL, createAttach, type Attach, type AttachOutcome, type AttachStatus } from "./attach.js";
 import { proxyQueueFor, type ProxyQueue } from "./proxies.js";
@@ -795,9 +795,11 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     if (!sameEntry(settledShape(prev), settledShape(clean)) || prev.newSha256 !== clean.newSha256 || prev.newSize !== clean.newSize) note({ ...clean, at: new Date().toISOString() });
   }
 
+  /** A registered file came in here; its content counts as already in the library once its source was deleted here (Accept 5). */
+  const registeredKind = (e: WatchRegisterEntry): Kind => (hasSource(deps.repo, projectId, e.sourceId) ? "in" : "known");
   /** A registered file whose size and exact time are as when its content was last known: not read. */
   async function registeredUnchanged(rel: string, e: WatchRegisterEntry, b: Reading): Promise<void> {
-    setRec(rel, b, "in");
+    setRec(rel, b, registeredKind(e));
     dropProblem(rel);
     let next: WatchRegisterEntry = { ...e, file: rel };
     if (e.state === "gone") {
@@ -811,7 +813,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
   /** A registered file whose size or time changed and which is not on this computer: noted, never read. */
   function registeredNotLocal(rel: string, e: WatchRegisterEntry, b: Reading) {
-    setRec(rel, b, "in");
+    setRec(rel, b, registeredKind(e));
     dropProblem(rel);
     if (e.state === "may-have-changed" && e.newSize === b.size && e.file === rel) return;
     const { newSha256: _n, renamedFrom: _r, ...rest } = e;
@@ -819,7 +821,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
   /** A registered file whose size or time changed, read through the whole order: what its content is now. */
   async function registeredHashed(rel: string, e: WatchRegisterEntry, b: Reading, sha: string): Promise<void> {
-    setRec(rel, b, "in");
+    setRec(rel, b, registeredKind(e));
     dropProblem(rel);
     const reading = { file: rel, size: b.size, mtimeNs: b.mtimeNs.toString() };
     let next: WatchRegisterEntry;
@@ -1478,7 +1480,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       const reading = { key, file: rel, size: b.size, mtimeNs: b.mtimeNs.toString(), renamedFrom: moved.key, at: new Date().toISOString() };
       const state: WatchedFileState = sha === moved.sha256 ? "in-library" : moved.state === "gone" || moved.state === "may-have-changed" ? "changed" : moved.state;
       note(state === "in-library" ? { ...settledShape(moved), ...reading, state } : { ...moved, ...reading, state, newSha256: sha, newSize: b.size });
-      setRec(rel, b, "in");
+      setRec(rel, b, registeredKind(moved));
       dropProblem(rel);
       return;
     }
