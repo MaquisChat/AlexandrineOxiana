@@ -2,29 +2,23 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MockAgent, getGlobalDispatcher, request, setGlobalDispatcher, type Dispatcher } from "undici";
+import { request } from "undici";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { useMemorySecrets } from "../../src/secrets-testing.js";
 import { setSecret } from "../../src/secrets.js";
 import type { ScanContext, ScanItem } from "../../src/import/bulk/index.js";
 import { zoteroWebAdapter } from "../../src/import/zotero-web.js";
-import { FakeZotero, KEY_MARKER, fakeZoteroHandler } from "./fake-zotero.js";
+import { FakeZotero, KEY_MARKER, fakeZoteroHandler, guardNetwork } from "./fake-zotero.js";
 
 const API = "https://api.zotero.org";
 const U = "user:42";
 
 // Guard: nothing in this file may reach the network, even through a forgotten dispatcher option.
-let previous: Dispatcher;
-const guard = new MockAgent();
-guard.disableNetConnect();
+let unguard: () => void;
 beforeAll(() => {
-  previous = getGlobalDispatcher();
-  setGlobalDispatcher(guard);
+  unguard = guardNetwork();
 });
-afterAll(async () => {
-  setGlobalDispatcher(previous);
-  await guard.close();
-});
+afterAll(() => unguard());
 
 let z: FakeZotero;
 beforeEach(() => {
@@ -367,7 +361,7 @@ describe("FakeZotero: containment", () => {
   it("an unknown path is an error, not a 200", async () => {
     const r = await get("/users/42/searches");
     expect(r.status).toBeGreaterThanOrEqual(400);
-    expect(r.text).toMatch(/not served/iu);
+    expect(r.text).toMatch(/not modelled by the stand-in/iu);
     expect((await get("/nowhere")).status).toBeGreaterThanOrEqual(400);
     expect((await get("/users/42/items?sort=title")).status).toBe(400);
     // and the real network stays shut: a host nobody mounted cannot be reached
@@ -472,5 +466,250 @@ describe("the existing client against the stand-in", () => {
     const gone = await scan({ since: v2 });
     expect(gone.items).toEqual([]);
     expect(gone.notes.join(" ")).toMatch(/1 item was deleted in Zotero/u);
+  });
+});
+
+describe("fix round 1: groups (I1, M8)", () => {
+  it("lists public groups the key has no permission for, whose library still answers 403", async () => {
+    z.addGroup(7, "Reading group");
+    z.addGroup(8, "Closed private group");
+    z.addGroup(9, "Open public group", { type: "PublicOpen" });
+    z.addGroup(10, "Closed public group", { type: "PublicClosed" });
+    z.setKeyAccess({ groups: {} });
+    const rows = (await get("/users/42/groups")).json() as Array<{ id: number; data: { type: string; libraryReading: string } }>;
+    expect(rows.map((g) => [g.id, g.data.type])).toEqual([
+      [9, "PublicOpen"],
+      [10, "PublicClosed"],
+    ]);
+    expect(rows[0]!.data.libraryReading).toBe("all");
+    expect((await get("/groups/9/items")).status).toBe(403); // listed, but the key may not read it
+    expect((await get("/groups/7/items")).status).toBe(403);
+    z.setKeyAccess({ groups: "all" });
+    expect(((await get("/users/42/groups")).json() as Array<{ id: number }>).map((g) => g.id)).toEqual([7, 8, 9, 10]);
+  });
+
+  it("renames and removes groups; the version moves; a removed group is 404", async () => {
+    z.addGroup(7, "Old name");
+    const v1 = ((await get("/users/42/groups")).json() as Array<{ version: number }>)[0]!.version;
+    z.renameGroup(7, "New name");
+    const g = ((await get("/users/42/groups")).json() as Array<{ version: number; data: { name: string; version: number } }>)[0]!;
+    expect(g.data.name).toBe("New name");
+    expect(g.version).toBeGreaterThan(v1);
+    expect(g.data.version).toBe(g.version);
+    expect((await get("/users/42/groups?format=versions")).json()).toEqual({ "7": g.version });
+    z.removeGroup(7);
+    expect((await get("/groups/7/items")).status).toBe(404);
+    expect((await get("/users/42/groups")).json()).toEqual([]);
+  });
+});
+
+describe("fix round 1: where the redirect points (I2)", () => {
+  const bytes = Buffer.from("%PDF-1.4 redirect me");
+  const add = (redirect?: string) => z.addItem(U, { itemType: "attachment", linkMode: "imported_file", filename: "a.pdf" }, { file: { bytes, ...(redirect ? { redirect } : {}) } });
+  const locationOf = async (att: string) => (await get(`/users/42/items/${att}/file`)).headers["location"]!;
+
+  it("defaults to the bucket host; the account's base can be path-style, another bucket, files.zotero.net or an unlisted host", async () => {
+    const att = add();
+    expect(await locationOf(att)).toMatch(/^https:\/\/zoterofilestorage\.s3\.amazonaws\.com\/zoterofilestorage\/[0-9a-f]{32}\?sig=x$/u);
+    for (const base of ["https://s3.amazonaws.com/zoterofilestorage/", "https://s3.amazonaws.com/otherbucket/", "https://files.zotero.net/", "https://unlisted.example.net/files/"]) {
+      z.redirectBase = base;
+      const loc = new URL(await locationOf(att));
+      expect(loc.href.startsWith(base)).toBe(true);
+      const file = await get(loc.pathname + loc.search, { key: null, origin: loc.origin });
+      expect([base, file.status, file.text]).toEqual([base, 200, bytes.toString()]);
+    }
+  });
+
+  it("a single file can have its own redirect, and an http loopback origin is served by the agent and by the handler", async () => {
+    const own = add("http://127.0.0.1:8123/blobs/");
+    const other = add();
+    expect((await locationOf(own)).startsWith("http://127.0.0.1:8123/blobs/")).toBe(true);
+    expect((await locationOf(other)).startsWith("https://zoterofilestorage.s3.amazonaws.com/")).toBe(true);
+    const loc = new URL(await locationOf(own));
+    expect((await get(loc.pathname + loc.search, { key: null, origin: loc.origin })).text).toBe(bytes.toString());
+    // the pure handler, one origin for both, finds storage by the configured path
+    const h = fakeZoteroHandler(z);
+    expect(h({ method: "GET", path: loc.pathname + loc.search, headers: {} })).toMatchObject({ status: 200 });
+    z.redirectBase = "http://127.0.0.1:9000/zoterofilestorage/";
+    const loc2 = new URL(await locationOf(other));
+    expect(loc2.protocol).toBe("http:");
+    expect(loc2.port).toBe("9000");
+    expect(h({ method: "GET", path: loc2.pathname + loc2.search, headers: {} })).toMatchObject({ status: 200 });
+    expect(h({ method: "GET", path: "/users/42/items?format=keys", headers: { "zotero-api-key": z.key } }).status).toBe(200);
+  });
+});
+
+describe("fix round 1: WebDAV, both ways (I3)", () => {
+  const bytes = Buffer.from("current file");
+  const md5 = createHash("md5").update(bytes).digest("hex");
+
+  it("a WebDAV attachment keeps its md5 and mtime and answers 404 on /file", async () => {
+    const dav = z.addItem(U, { itemType: "attachment", linkMode: "imported_file", filename: "d.pdf" }, { file: { bytes, storage: "webdav" } });
+    const data = ((await get(`/users/42/items/${dav}`)).json() as { data: { md5: string; mtime: number } }).data;
+    expect(data.md5).toBe(md5);
+    expect(typeof data.mtime).toBe("number");
+    expect((await get(`/users/42/items/${dav}/file`)).status).toBe(404);
+  });
+
+  it("an older copy can be served whose bytes do not match the item's md5 (ETag of those bytes)", async () => {
+    const old = Buffer.from("an older copy in Zotero storage");
+    const att = z.addItem(U, { itemType: "attachment", linkMode: "imported_file", filename: "d.pdf" }, { file: { bytes, storage: "webdav", stale: old } });
+    expect(((await get(`/users/42/items/${att}`)).json() as { data: { md5: string } }).data.md5).toBe(md5);
+    const r = await get(`/users/42/items/${att}/file`);
+    expect(r.status).toBe(302);
+    const loc = new URL(r.headers["location"]!);
+    const body = await get(loc.pathname + loc.search, { key: null, origin: loc.origin });
+    expect(body.text).toBe(old.toString());
+    expect(body.headers["etag"]).toBe(`"${createHash("md5").update(old).digest("hex")}"`);
+    expect(body.headers["etag"]).not.toContain(md5);
+  });
+});
+
+describe("fix round 1: one file or the storage host failing (I4)", () => {
+  const bytes = Buffer.from("0123456789".repeat(20));
+  const att = () => z.addItem(U, { itemType: "attachment", linkMode: "imported_file", filename: "a.pdf" }, { file: { bytes } });
+  const fetchFile = async (k: string) => {
+    const r = await get(`/users/42/items/${k}/file`);
+    if (r.status !== 302) return { api: r.status };
+    const loc = new URL(r.headers["location"]!);
+    const f = await get(loc.pathname + loc.search, { key: null, origin: loc.origin });
+    return { api: 302, storage: f.status, text: f.text };
+  };
+
+  it("fails one file on the API side (403, 404, 500) and leaves the others alone", async () => {
+    const a = att();
+    const b = att();
+    for (const status of [403, 404, 500] as const) {
+      z.failFile(U, a, { api: status });
+      expect(await fetchFile(a)).toEqual({ api: status });
+      expect(await fetchFile(b)).toMatchObject({ api: 302, storage: 200 });
+    }
+    z.failFile(U, a, null);
+    expect(await fetchFile(a)).toMatchObject({ storage: 200 });
+  });
+
+  it("fails one file on the storage host (403, 404, 500), once when asked", async () => {
+    const a = att();
+    const b = att();
+    for (const status of [403, 404, 500] as const) {
+      z.failFile(U, a, { storage: status, times: 1 });
+      expect(await fetchFile(a)).toMatchObject({ api: 302, storage: status });
+      expect(await fetchFile(a)).toMatchObject({ storage: 200 }); // times: 1 has run out
+      expect(await fetchFile(b)).toMatchObject({ storage: 200 });
+    }
+  });
+
+  it("cuts a file in mid-body or drops the connection, for one file or the whole host", async () => {
+    const a = att();
+    const b = att();
+    const via = async (k: string) => {
+      const loc = new URL((await get(`/users/42/items/${k}/file`)).headers["location"]!);
+      return get(loc.pathname + loc.search, { key: null, origin: loc.origin });
+    };
+    z.failFile(U, a, { storage: "cut" });
+    await expect(via(a)).rejects.toThrow();
+    expect((await via(b)).text).toBe(bytes.toString());
+    z.failFile(U, a, { storage: "drop" });
+    await expect(via(a)).rejects.toThrow();
+    z.failFile(U, a, null);
+    z.failStorage("cut");
+    await expect(via(b)).rejects.toThrow();
+    z.failStorage(500);
+    expect((await via(b)).status).toBe(500);
+    z.failStorage(null);
+    expect((await via(b)).status).toBe(200);
+    expect(await fetchFile(a)).toMatchObject({ api: 302, storage: 200 }); // the API side was never affected
+  });
+
+  it("cuts a JSON page in mid-body, and counts pages only on the path asked for", async () => {
+    for (let i = 0; i < 150; i++) z.addItem(U, article(`Item ${i}`));
+    z.dropConnectionOnPage(2, { mode: "midBody" });
+    expect((await get("/users/42/items?limit=100&start=0")).status).toBe(200);
+    await expect(get("/users/42/items?limit=100&start=100")).rejects.toThrow();
+    expect((await get("/users/42/items?limit=100&start=100")).status).toBe(200);
+    z.dropConnectionOnPage(1, { path: "/users/42/items/top" });
+    expect((await get("/users/42/items?limit=100")).status).toBe(200); // a different path
+    await expect(get("/users/42/items/top?limit=100")).rejects.toThrow();
+  });
+});
+
+describe("fix round 1: If-Unmodified-Since-Version on reads (M2)", () => {
+  it("can be ignored; the existing client still restarts through Last-Modified-Version", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "ao-fakez-"));
+    const secrets = useMemorySecrets();
+    try {
+      await setSecret("zotero-api-key", z.key);
+      z.honourIfUnmodifiedSince = false;
+      const keys = Array.from({ length: 250 }, (_, i) => z.addItem(U, article(`Article ${i}`)));
+      expect((await get("/users/42/items", { headers: { "if-unmodified-since-version": "0" } })).status).toBe(200);
+      let edited = false;
+      z.backoffOnce(1); // after page 1 the client calls sleep(): the library changes there
+      const work = join(tmp, "work");
+      await mkdir(work, { recursive: true, mode: 0o700 });
+      const a = zoteroWebAdapter({
+        libraryType: "user",
+        libraryId: "42",
+        dispatcher: z.agent,
+        sleep: async () => {
+          if (!edited) {
+            edited = true;
+            z.editItem(U, keys[0]!, { title: "Revised" });
+          }
+        },
+      });
+      const items: ScanItem[] = [];
+      for await (const i of a.scan(new AbortController().signal, { workDir: async () => work })) items.push(i);
+      expect(edited).toBe(true);
+      expect(a.scanResult().completed).toBe(true);
+      expect(new Set(items.map((i) => i.key)).size).toBe(250);
+      expect(JSON.stringify(items.find((i) => i.key === `zotero:${keys[0]!}`)!.referenceMetadata)).toContain("Revised");
+      expect(z.requests.filter((q) => q.path.includes("start=0")).length).toBeGreaterThanOrEqual(2); // it restarted
+      expect(a.scanResult().libraryVersion).toBe(z.libraryVersion(U));
+    } finally {
+      secrets.restore();
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("fix round 1: the key never leaks (M5, M6, M7) and what is not modelled (M4, M9)", () => {
+  it("a path holding the key is redacted in the log and in the error body", async () => {
+    const r = await get(`/keys/${z.key}`);
+    expect(r.status).toBeGreaterThanOrEqual(400);
+    expect(r.text).not.toContain(z.key);
+    expect(JSON.stringify(z.requests)).not.toContain(z.key);
+    expect(z.requests[0]!.path).toBe(`/keys/${KEY_MARKER}`);
+    const bad = await get(`/users/42/items?q=${z.key}`);
+    expect(bad.status).toBe(400);
+    expect(bad.text).not.toContain(z.key);
+    expect(bad.text).toMatch(/not modelled by the stand-in/u);
+  });
+
+  it("an unmounted host with the key in its URL fails without the key in the message or stack", async () => {
+    let err: unknown;
+    try {
+      await request(new URL(`https://example.org/x?key=${z.key}`), { dispatcher: z.agent });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).not.toContain(z.key);
+    expect(String((err as Error).stack)).not.toContain(z.key);
+  });
+
+  it("guardNetwork refuses a request that bypasses the stand-in, and puts the old dispatcher back", async () => {
+    const restore = guardNetwork();
+    try {
+      await expect(request(new URL("https://api.zotero.org/users/42/items"))).rejects.toThrow();
+    } finally {
+      restore();
+    }
+  });
+
+  it("numChildren does not count notes the key cannot see", async () => {
+    const a = z.addItem(U, article("A"));
+    z.addItem(U, { itemType: "note", note: "<p>n</p>" }, { parent: a });
+    z.setKeyAccess({ notes: false });
+    expect(((await get(`/users/42/items/${a}`)).json() as { meta: Record<string, unknown> }).meta.numChildren).toBeUndefined();
   });
 });

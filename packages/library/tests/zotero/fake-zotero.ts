@@ -19,11 +19,44 @@
  *
  * Safety: every request is recorded in `requests` with the key's value replaced by KEY_MARKER; any
  * method but GET answers 405 and changes nothing; a path the model does not serve answers 501 with a
- * plain message, never a 200.
+ * plain message, never a 200 ("not modelled by the stand-in": the real API may well accept it).
+ *
+ * EVERY TEST FILE THAT USES THE STAND-IN MUST CALL `guardNetwork()` (in beforeAll, restoring in afterAll):
+ * it makes the global dispatcher refuse every connection, so a request made without `fake.agent` fails
+ * instead of reaching the real network.
+ *
+ * The key's value is redacted (KEY_MARKER) in the recorded path and headers, in every answer body, and in
+ * the message and stack of an error that comes out of this agent (an unmounted host, a dropped connection).
+ * What it cannot prevent: an error raised by undici outside this agent (another dispatcher, the global one
+ * when guardNetwork is not used) puts the full request path in its own message; and only the configured key
+ * is known to the redactor, so a different key value in a path is redacted only where it was sent as a
+ * credential (header, `key=`).
+ *
+ * Known disagreements between the documents (kept as the documents leave them):
+ *   - single-object `If-Modified-Since-Version`: [basics] says it is not supported, [syncing] says the object's
+ *     own 304 applies. The stand-in ignores it (follows [basics]).
+ *   - `If-Unmodified-Since-Version` is documented for WRITES only ([syncing]); applying it to reads is
+ *     INFERRED from the client. `honourIfUnmodifiedSince = false` ignores it on reads (the client must stay
+ *     correct through Last-Modified-Version either way).
+ * NOT MODELLED (unconfirmed or out of scope): collections in the bin, `links.enclosure` on attachments,
+ * `meta.numItems` on collections, the 60-second expiry of the file URL, `rel="alternate"` links, sort/q/tag
+ * and other documented query parameters, `/collections/<k>`, `/searches`, `/tags`, `/keys/<key>`.
  */
 import { createHash } from "node:crypto";
-import { MockAgent } from "undici";
+import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { buildZip } from "../../../../tests/fixtures/generate.mjs";
+
+/** Makes the global dispatcher refuse every connection; the returned function restores the old one. */
+export function guardNetwork(): () => void {
+  const previous = getGlobalDispatcher();
+  const guard = new MockAgent();
+  guard.disableNetConnect();
+  setGlobalDispatcher(guard);
+  return () => {
+    setGlobalDispatcher(previous);
+    void guard.close();
+  };
+}
 
 export const KEY_MARKER = "[key]";
 const API_ORIGIN = "https://api.zotero.org";
@@ -58,7 +91,13 @@ export interface FakeResponse {
   body: Uint8Array | string;
   /** Extension for servers: break the connection instead of answering (see dropConnectionOnPage). */
   drop?: true;
+  /** Extension for servers: send the status, headers and the first half of the body, then break the connection. */
+  cut?: true;
 }
+
+/** How a file or the file host fails: an HTTP status, a connection dropped before any answer, or cut in mid-body. */
+export type StorageFailure = 403 | 404 | 500 | "drop" | "cut";
+export type FileFailure = { api?: 403 | 404 | 500; storage?: StorageFailure; times?: number };
 
 type Host = "api" | "storage" | undefined;
 
@@ -66,6 +105,11 @@ interface StoredFile {
   bytes: Uint8Array;
   compressed: boolean;
   storage: "zotero" | "webdav";
+  /** An older copy that /file serves although it does not match the item's md5. */
+  stale?: Uint8Array;
+  /** A redirect base for this file alone (absolute URL ending in "/"). */
+  redirect?: string;
+  fail?: FileFailure & { left: number };
 }
 interface Item {
   key: string;
@@ -83,6 +127,9 @@ interface Library {
   type: "user" | "group";
   id: number;
   name?: string;
+  /** Group only: the group's own version (moves when it is renamed) and its type. */
+  groupVersion: number;
+  groupType: "Private" | "PublicClosed" | "PublicOpen";
   version: number;
   items: Map<string, Item>;
   collections: Map<string, Collection>;
@@ -105,7 +152,7 @@ const json = (status: number, body: unknown, headers: Record<string, string> = {
   headers: { "content-type": "application/json", "zotero-api-version": "3", ...headers },
   body: JSON.stringify(body),
 });
-const notServed = (what: string): FakeResponse => text(501, `FakeZotero: ${what} is not served by this stand-in.`);
+const notServed = (what: string): FakeResponse => text(501, `FakeZotero: ${what} is not modelled by the stand-in (the real API may serve it).`);
 
 /** Deterministic timestamps: one second per library version from 2024-01-01. */
 const stamp = (version: number): string => new Date(Date.UTC(2024, 0, 1) + version * 1000).toISOString().replace(".000Z", "Z");
@@ -134,11 +181,60 @@ const keyAt = (n: number): string => {
 
 const md5Hex = (b: Uint8Array | string): string => createHash("md5").update(b).digest("hex");
 
+/** A MockAgent that can cut a response in mid-body (the reply callback calls `markCut`) and scrubs secrets from its errors. */
+class StandInAgent extends MockAgent {
+  private current: { cut: boolean } | undefined;
+  constructor(private readonly scrub: (s: string) => string) {
+    super();
+  }
+  markCut(): void {
+    if (this.current) this.current.cut = true;
+  }
+  private clean<T>(e: T): T {
+    if (e instanceof Error) {
+      e.message = this.scrub(e.message);
+      if (e.stack) e.stack = this.scrub(e.stack);
+    }
+    return e;
+  }
+  override dispatch(opts: any, handler: any): boolean {
+    const ctx = { cut: false };
+    this.current = ctx;
+    let sent = 0;
+    const wrapped = {
+      onRequestStart: (...a: unknown[]) => handler.onRequestStart?.(...a),
+      onRequestUpgrade: (...a: unknown[]) => handler.onRequestUpgrade?.(...a),
+      onResponseStart: (...a: unknown[]) => handler.onResponseStart?.(...a),
+      onResponseData: (c: unknown, d: Buffer) => {
+        if (!ctx.cut) return handler.onResponseData?.(c, d);
+        handler.onResponseData?.(c, d.subarray(0, Math.max(1, Math.floor(d.length / 2))));
+        sent++;
+        return handler.onResponseError?.(c, new Error("FakeZotero: the connection was cut in the middle of the body"));
+      },
+      onResponseEnd: (...a: unknown[]) => (ctx.cut && sent ? undefined : handler.onResponseEnd?.(...a)),
+      onResponseError: (c: unknown, e: unknown) => handler.onResponseError?.(c, this.clean(e)),
+    };
+    try {
+      return super.dispatch(opts, wrapped as never);
+    } catch (e) {
+      throw this.clean(e);
+    } finally {
+      this.current = undefined;
+    }
+  }
+}
+
 export class FakeZotero {
   /** The API key this account accepts. */
   readonly key: string;
   readonly userId: number;
   readonly agent: MockAgent;
+  /**
+   * Whether a GET honours If-Unmodified-Since-Version (412 when the library moved on). Default true. The
+   * documents give the header for writes only, so a test can switch it off to prove the client still
+   * notices a change through Last-Modified-Version.
+   */
+  honourIfUnmodifiedSince = true;
   /** Every request seen (API and storage), key values replaced by KEY_MARKER. */
   readonly requests: Array<{ method: string; path: string; headers: Record<string, string> }> = [];
 
@@ -154,28 +250,63 @@ export class FakeZotero {
   };
   private pendingBackoff: number | undefined;
   private failing: { left: number; status: 429 | 500 | 503; retryAfter?: number } | undefined;
-  private dropPage: number | undefined;
-  private host = DEFAULT_REDIRECT_HOST;
+  private dropPage: { n: number; path?: string; mode: "before" | "midBody" } | undefined;
+  private storageFailure: { mode: StorageFailure; left: number } | undefined;
+  /** The redirect base of the account: scheme, host and path prefix, ending in "/". */
+  private base = `https://${DEFAULT_REDIRECT_HOST}${STORAGE_PREFIX}`;
   private readonly mounted = new Set<string>();
+  /** Path prefixes that mean "file storage" on a server that serves API and storage on one origin. */
+  private readonly prefixes = new Set<string>([STORAGE_PREFIX]);
   private readonly tokens = new Map<string, { ref: string; key: string }>();
 
-  constructor(o: { userId?: number; key?: string } = {}) {
+  constructor(o: { userId?: number; key?: string; honourIfUnmodifiedSince?: boolean } = {}) {
     this.userId = o.userId ?? 42;
     this.key = o.key ?? DEFAULT_KEY;
-    this.agent = new MockAgent();
+    this.honourIfUnmodifiedSince = o.honourIfUnmodifiedSince ?? true;
+    const agent = new StandInAgent((s) => this.scrub(s));
+    this.agent = agent;
     this.agent.disableNetConnect();
     this.libs.set(`user:${this.userId}`, this.newLib("user", this.userId));
     this.mount(API_ORIGIN, "api");
-    this.mount(`https://${this.host}`, "storage");
+    this.mountBase(this.base);
   }
 
-  /** The host the 302 from `/items/<key>/file` points at. Changing it mounts the new host on the agent. */
+  /** The host (and port) the 302 from `/items/<key>/file` points at; the scheme and path stay as they were (https and "/zoterofilestorage/" by default). */
   get redirectHost(): string {
-    return this.host;
+    return new URL(this.base).host;
   }
   set redirectHost(h: string) {
-    this.host = h;
-    this.mount(`https://${h}`, "storage");
+    const u = new URL(this.base);
+    this.redirectBase = `${u.protocol}//${h}${u.pathname}`;
+  }
+
+  /**
+   * Where the 302 points: scheme, host, port and path prefix; the file's token and `?sig=x` follow it.
+   * Default `https://zoterofilestorage.s3.amazonaws.com/zoterofilestorage/`. Setting it mounts that origin on
+   * the agent and teaches the handler the path prefix (a prefix of "/" is served by the agent only, because a
+   * single-origin server could not tell it from the API). A file can override it (addItem `file.redirect`).
+   */
+  get redirectBase(): string {
+    return this.base;
+  }
+  set redirectBase(b: string) {
+    this.base = this.mountBase(b);
+  }
+
+  private mountBase(b: string): string {
+    const u = new URL(b);
+    if (!u.pathname.endsWith("/")) u.pathname += "/";
+    u.search = "";
+    u.hash = "";
+    if (/^\/(users|groups|keys)\//u.test(u.pathname)) throw new Error("FakeZotero: a storage path may not overlap the API's paths");
+    this.mount(u.origin, "storage");
+    this.prefixes.add(u.pathname);
+    return u.href;
+  }
+
+  /** Redacts the key's value from any text (never the marker itself). */
+  private scrub(s: string): string {
+    return s.split(this.key).join(KEY_MARKER);
   }
 
   private mount(origin: string, host: "api" | "storage"): void {
@@ -191,6 +322,7 @@ export class FakeZotero {
         else if (raw) for (const [k, v] of Object.entries(raw)) h[k] = Array.isArray(v) ? String(v[0]) : String(v);
         const r = this.serve({ method: String(opts.method), path: opts.path, headers: h }, host);
         if (r.drop) throw new Error("FakeZotero: the connection was dropped on purpose");
+        if (r.cut) (this.agent as StandInAgent).markCut();
         return { statusCode: r.status, data: typeof r.body === "string" ? r.body : Buffer.from(r.body), responseOptions: { headers: r.headers } };
       })
       .persist();
@@ -206,7 +338,19 @@ export class FakeZotero {
   addItem(
     ref: string,
     item: Partial<ZoteroItemData> & { itemType: string },
-    opts: { parent?: string; file?: { bytes: Uint8Array; md5?: string; compressed?: boolean; storage?: "zotero" | "webdav" } } = {},
+    opts: {
+      parent?: string;
+      file?: {
+        bytes: Uint8Array;
+        md5?: string;
+        compressed?: boolean;
+        storage?: "zotero" | "webdav";
+        /** /file serves these older bytes (ETag of them) although the item's md5 is that of `bytes`. */
+        stale?: Uint8Array;
+        /** A redirect base for this file alone, as for `redirectBase`. */
+        redirect?: string;
+      };
+    } = {},
   ): string {
     const lib = this.lib(ref);
     if (opts.parent && !lib.items.has(opts.parent)) throw new Error(`FakeZotero: no parent item ${opts.parent} in ${ref}`);
@@ -229,10 +373,19 @@ export class FakeZotero {
     const stored: Item = { key, version: v, data };
     if (opts.file) {
       const storage = opts.file.storage ?? "zotero";
-      stored.file = { bytes: opts.file.bytes, compressed: opts.file.compressed ?? false, storage };
+      stored.file = {
+        bytes: opts.file.bytes,
+        compressed: opts.file.compressed ?? false,
+        storage,
+        ...(opts.file.stale ? { stale: opts.file.stale } : {}),
+        ...(opts.file.redirect ? { redirect: this.mountBase(opts.file.redirect) } : {}),
+      };
       data.mtime = Date.UTC(2024, 0, 1) + v * 1000;
-      // INFERRED: a file kept on a WebDAV server has no md5 in Zotero's own record of the item.
-      if (storage === "zotero") data.md5 = opts.file.md5 ?? md5Hex(opts.file.bytes);
+      // [upload] "md5 and mtime can be edited directly in personal libraries for WebDAV-based file syncing":
+      // a WebDAV attachment carries md5 and mtime too. Its /file answers 404 (INFERRED), or, with `stale`,
+      // an older copy in Zotero storage whose checksum differs ([upload]: "the latest version of the file
+      // may be available only via WebDAV").
+      data.md5 = opts.file.md5 ?? md5Hex(opts.file.bytes);
     }
     lib.items.set(key, stored);
     return key;
@@ -335,10 +488,47 @@ export class FakeZotero {
     lib.tagColors = colors;
   }
 
-  addGroup(id: number, name: string): void {
+  /**
+   * Adds a group library the account belongs to. A public group (`type` PublicClosed or PublicOpen) is listed
+   * by /users/<id>/groups even when the key has no permission for it ([basics]); whether its /items then
+   * answers without that permission is UNCONFIRMED here: the stand-in answers 403.
+   */
+  addGroup(id: number, name: string, opts: { type?: "Private" | "PublicClosed" | "PublicOpen" } = {}): void {
     const ref = `group:${id}`;
     if (this.libs.has(ref)) throw new Error(`FakeZotero: ${ref} exists`);
-    this.libs.set(ref, this.newLib("group", id, name));
+    const lib = this.newLib("group", id, name);
+    lib.groupType = opts.type ?? "Private";
+    this.libs.set(ref, lib);
+  }
+
+  /** Renames a group; the group's own version moves (it is not the library version). */
+  renameGroup(id: number, name: string): void {
+    const lib = this.lib(`group:${id}`);
+    lib.name = name;
+    lib.groupVersion++;
+  }
+
+  /** The group is gone: its library answers 404 (UNCONFIRMED; the documents do not say) and it is no longer listed. */
+  removeGroup(id: number): void {
+    this.lib(`group:${id}`);
+    this.libs.delete(`group:${id}`);
+  }
+
+  /**
+   * One file (an attachment) fails by itself, until cleared with `null` or after `times` answers (default
+   * for ever). `api`: the answer on `/items/<key>/file` (403, 404, 500). `storage`: what the file host answers
+   * for it (403, 404, 500, "drop" the connection, "cut" in mid-body). Everything else keeps working.
+   */
+  failFile(ref: string, key: string, f: FileFailure | null): void {
+    const it = this.item(this.lib(ref), key);
+    if (!it.file) throw new Error(`FakeZotero: ${key} has no file`);
+    if (f === null) delete it.file.fail;
+    else it.file.fail = { ...f, left: f.times ?? Infinity };
+  }
+
+  /** The file host fails for every file (see failFile for the modes), `times` answers or until `null`. */
+  failStorage(mode: StorageFailure | null, times?: number): void {
+    this.storageFailure = mode === null ? undefined : { mode, left: times ?? Infinity };
   }
 
   /** What the key may do (merged into what it could do before). Defaults: read everything, no write, all groups. */
@@ -361,9 +551,14 @@ export class FakeZotero {
     this.failing = { left: n, status, ...(retryAfter !== undefined ? { retryAfter } : {}) };
   }
 
-  /** The connection breaks, once, on the request for page `n` (1-based: start / limit + 1) of a JSON item listing. */
-  dropConnectionOnPage(n: number): void {
-    this.dropPage = n;
+  /**
+   * The connection breaks, once, on the request for page `n` of a JSON item listing. A "page" is
+   * start / limit + 1 of any item list request (/items, /items/top, /items/trash, .../children) with
+   * format=json; `o.path` restricts it to listings whose path (without the query) equals it; `o.mode`
+   * "before" (default) breaks before any answer, "midBody" sends the headers and half the JSON, then breaks.
+   */
+  dropConnectionOnPage(n: number, o: { path?: string; mode?: "before" | "midBody" } = {}): void {
+    this.dropPage = { n, ...(o.path ? { path: o.path } : {}), mode: o.mode ?? "before" };
   }
 
   // ---- serving -------------------------------------------------------------------------------------
@@ -371,24 +566,32 @@ export class FakeZotero {
   /** Answers one request. `host` says which host the request reached; undefined (a loopback server) serves both. */
   serve(req: FakeRequest, host: Host): FakeResponse {
     const headers = lower(req.headers);
-    this.requests.push({ method: req.method, path: redactPath(req.path), headers: redactHeaders(headers) });
+    this.requests.push({ method: req.method, path: this.scrub(redactPath(req.path)), headers: this.scrubHeaders(redactHeaders(headers)) });
     let url: URL;
     try {
       url = new URL(req.path, "https://fake.invalid");
     } catch {
       return text(400, "FakeZotero: the path could not be read.");
     }
-    const onStorage = url.pathname.startsWith(STORAGE_PREFIX);
+    // Storage is told apart by host when the agent says so, otherwise by the configured path prefixes.
+    const onStorage = host === "storage" || (host === undefined && [...this.prefixes].some((p) => p !== "/" && url.pathname.startsWith(p)));
+    const apiHostStoragePath = host === "api" && [...this.prefixes].some((p) => p !== "/" && url.pathname.startsWith(p));
     let res: FakeResponse;
     if (req.method !== "GET") res = text(405, "FakeZotero: only GET is served; the app must never write to Zotero.", { allow: "GET" });
-    else if (onStorage) res = host === "api" ? notServed(`${url.pathname} on the API host`) : this.storage(url);
-    else if (host === "storage") res = notServed(`${url.pathname} on the file host`);
+    else if (apiHostStoragePath) res = notServed(`${url.pathname} on the API host`);
+    else if (onStorage) res = this.storage(url);
     else res = this.api(url, headers);
     if (!onStorage && this.pendingBackoff !== undefined && !res.drop) {
       res.headers["backoff"] = String(this.pendingBackoff);
       this.pendingBackoff = undefined;
     }
+    // The key's value never leaves in a body or a header (an unknown path is echoed in the 501 message).
+    if (typeof res.body === "string") res.body = this.scrub(res.body);
     return res;
+  }
+
+  private scrubHeaders(h: Record<string, string>): Record<string, string> {
+    return Object.fromEntries(Object.entries(h).map(([k, v]) => [k, this.scrub(v)]));
   }
 
   private api(url: URL, h: Record<string, string>): FakeResponse {
@@ -434,17 +637,34 @@ export class FakeZotero {
     if (Number(userId) !== this.userId) return text(403, "Forbidden");
     const rows: Row[] = [];
     for (const lib of this.libs.values()) {
-      if (lib.type !== "group" || !this.mayRead(lib)) continue;
-      // [basics] /users/<id>/groups returns the groups the current key can access.
+      if (lib.type !== "group") continue;
+      // [basics] /users/<id>/groups: "the set of groups the current API key has access to, including public
+      // groups the key owner belongs to even if the key doesn't have explicit permissions for them".
+      const isPublic = lib.groupType !== "Private";
+      if (!isPublic && !this.mayRead(lib)) continue;
+      const v = lib.groupVersion;
       rows.push({
         key: String(lib.id),
-        version: 1,
+        version: v,
         obj: {
           id: lib.id,
-          version: 1,
+          version: v,
           links: {},
           meta: {},
-          data: { id: lib.id, version: 1, name: lib.name ?? `Group ${lib.id}`, owner: this.userId, type: "Private", description: "", url: "", hasImage: 0, libraryEditing: "members", libraryReading: "members", fileEditing: "members", members: [] },
+          data: {
+            id: lib.id,
+            version: v,
+            name: lib.name ?? `Group ${lib.id}`,
+            owner: this.userId,
+            type: lib.groupType,
+            description: "",
+            url: "",
+            hasImage: 0,
+            libraryEditing: "members",
+            libraryReading: lib.groupType === "PublicOpen" ? "all" : "members",
+            fileEditing: "members",
+            members: [],
+          },
         },
       });
     }
@@ -465,7 +685,7 @@ export class FakeZotero {
     // INFERRED from the client (which pins every read with it); the page documents it for writes.
     const unmod = this.intHeader(h, "if-unmodified-since-version");
     if (unmod instanceof Object) return unmod;
-    if (unmod !== undefined && lib.version > unmod) return stamped(text(412, "Precondition Failed"));
+    if (this.honourIfUnmodifiedSince && unmod !== undefined && lib.version > unmod) return stamped(text(412, "Precondition Failed"));
     // [basics][syncing] If-Modified-Since-Version: 304 when "data has not changed in the library since the
     // specified version". Library-wide, whatever the query; multi-object requests only (single-object
     // conditional requests are "not supported", so a single object ignores it).
@@ -549,16 +769,20 @@ export class FakeZotero {
     if (wanted) items = items.filter((it) => wanted.includes(it.key));
     const rows = items.map((it) => ({ key: it.key, version: it.version, obj: this.itemJson(lib, it) }));
     const format = url.searchParams.get("format") ?? "json";
-    if (format === "json" && this.dropPage !== undefined) {
+    let cut = false;
+    const dp = this.dropPage;
+    if (format === "json" && dp !== undefined && (dp.path === undefined || dp.path === url.pathname)) {
       const limit = Math.min(Number(url.searchParams.get("limit") ?? DEFAULT_LIMIT) || DEFAULT_LIMIT, MAX_LIMIT);
       const page = Math.floor(Number(url.searchParams.get("start") ?? 0) / limit) + 1;
-      if (page === this.dropPage) {
+      if (page === dp.n) {
         this.dropPage = undefined;
-        return { status: 0, headers: {}, body: "", drop: true };
+        if (dp.mode === "before") return { status: 0, headers: {}, body: "", drop: true };
+        cut = true;
       }
     }
     const res = this.list(url, rows, allowed, { sinceFilter: true });
     res.headers["last-modified-version"] = String(lib.version);
+    if (cut) res.cut = true;
     return res;
   }
 
@@ -585,7 +809,7 @@ export class FakeZotero {
     let rows = all;
     if (o.sinceFilter && since !== undefined) rows = rows.filter((r) => r.version > since);
     // INFERRED: newest first (the documented default sort is dateModified; here a version is its stand-in).
-    rows = [...rows].sort((x, y) => y.version - x.version || (x.key < y.key ? -1 : 1));
+    rows = [...rows].sort((x, y) => y.version - x.version || (/^\d+$/u.test(x.key) && /^\d+$/u.test(y.key) ? Number(x.key) - Number(y.key) : x.key < y.key ? -1 : 1));
     const total = rows.length;
     const start = startP ?? 0;
     const unlimited = format !== "json" && limitP === undefined;
@@ -615,11 +839,14 @@ export class FakeZotero {
     if (!it || !it.file) return text(404, "Not Found");
     // UNCONFIRMED (a key's privileges for files): the key's `files` flag is enforced for the user library only.
     if (lib.type === "user" && !this.access.files) return text(403, "Forbidden");
-    // INFERRED (plan: what only a real account proves): a WebDAV-stored attachment answers 404.
-    if (it.file.storage === "webdav") return text(404, "Not Found");
+    const f = it.file;
+    if (f.fail?.api !== undefined && this.spend(f.fail)) return text(f.fail.api, `FakeZotero: this file fails on purpose (${f.fail.api}).`);
+    // INFERRED (plan: what only a real account proves): a WebDAV-stored attachment answers 404, unless an
+    // older copy is set (`stale`), which is then served from Zotero storage.
+    if (f.storage === "webdav" && !f.stale) return text(404, "Not Found");
     const token = md5Hex(`${lib.ref}/${key}/${it.version}`);
     this.tokens.set(token, { ref: lib.ref, key });
-    const location = `https://${this.host}${STORAGE_PREFIX}${token}?sig=x`;
+    const location = `${f.redirect ?? this.base}${token}?sig=x`;
     // INFERRED: the live service answers 302 with a signed storage URL. The compressed marker is put on the
     // 302 (where the client reads it) and again on the file answer.
     return { status: 302, headers: { location, "last-modified-version": String(it.version), ...(it.file.compressed ? { "zotero-file-compressed": "Yes" } : {}) }, body: "" };
@@ -627,22 +854,37 @@ export class FakeZotero {
 
   /** The file host: no key needed (and none expected). The ETag is the md5 the item states ([upload]: compare ETag with the item's md5). */
   private storage(url: URL): FakeResponse {
-    const ref = this.tokens.get(url.pathname.slice(STORAGE_PREFIX.length));
+    const ref = this.tokens.get(url.pathname.split("/").filter(Boolean).pop() ?? "");
     const it = ref ? this.libs.get(ref.ref)?.items.get(ref.key) : undefined;
     if (!it || !it.file) return text(404, "Not Found");
-    const body = it.file.compressed ? buildZip([{ name: String(it.data.filename ?? it.key), data: Buffer.from(it.file.bytes) }]) : it.file.bytes;
-    const md5 = typeof it.data.md5 === "string" ? it.data.md5 : "";
+    const f = it.file;
+    // A failure of this file, then of the whole host.
+    const mode = f.fail?.storage !== undefined && this.spend(f.fail) ? f.fail.storage : this.storageFailure && this.spend(this.storageFailure) ? this.storageFailure.mode : undefined;
+    if (mode === "drop") return { status: 0, headers: {}, body: "", drop: true };
+    if (typeof mode === "number") return text(mode, `FakeZotero: the file host fails on purpose (${mode}).`);
+    const served = f.stale ?? f.bytes;
+    const body = f.compressed ? buildZip([{ name: String(it.data.filename ?? it.key), data: Buffer.from(served) }]) : served;
+    // The ETag is the md5 the item states ([upload]), unless an older copy is served: then that copy's own.
+    const md5 = f.stale ? md5Hex(f.stale) : typeof it.data.md5 === "string" ? it.data.md5 : "";
     return {
       status: 200,
-      headers: { "content-type": "application/octet-stream", etag: `"${md5}"`, ...(it.file.compressed ? { "zotero-file-compressed": "Yes" } : {}) },
+      headers: { "content-type": "application/octet-stream", etag: `"${md5}"`, ...(f.compressed ? { "zotero-file-compressed": "Yes" } : {}) },
       body,
+      ...(mode === "cut" ? { cut: true as const } : {}),
     };
+  }
+
+  private spend(f: { left: number }): boolean {
+    if (f.left <= 0) return false;
+    f.left--;
+    return true;
   }
 
   // ---- helpers -----------------------------------------------------------------------------------
 
   private itemJson(lib: Library, it: Item): unknown {
-    const children = [...lib.items.values()].filter((x) => x.data.parentItem === it.key).length;
+    // UNCONFIRMED: notes this key cannot see are not counted.
+    const children = [...lib.items.values()].filter((x) => x.data.parentItem === it.key && !this.hidden(lib, x)).length;
     return {
       key: it.key,
       version: it.version,
@@ -664,7 +906,7 @@ export class FakeZotero {
   }
 
   private badParams(url: URL, allowed: string[]): FakeResponse | undefined {
-    for (const k of url.searchParams.keys()) if (!allowed.includes(k)) return text(400, `FakeZotero: the parameter "${k.slice(0, 30)}" is not served by this stand-in.`);
+    for (const k of url.searchParams.keys()) if (!allowed.includes(k)) return text(400, `FakeZotero: the parameter "${k.slice(0, 30)}" is not modelled by the stand-in (the real API may accept it).`);
     return undefined;
   }
 
@@ -685,7 +927,7 @@ export class FakeZotero {
   }
 
   private newLib(type: "user" | "group", id: number, name?: string): Library {
-    return { ref: `${type}:${id}`, type, id, ...(name ? { name } : {}), version: 0, items: new Map(), collections: new Map(), deletions: [] };
+    return { ref: `${type}:${id}`, type, id, ...(name ? { name } : {}), groupVersion: 1, groupType: "Private", version: 0, items: new Map(), collections: new Map(), deletions: [] };
   }
 
   private lib(ref: string): Library {
