@@ -473,3 +473,151 @@ test("Go to from the list lands on the page with the highlight outlined", async 
   await expect(page3).toBeFocused();
   expect(errors).toEqual([]);
 });
+
+/** "This is the text" on page 1 of the three-page fixture (11-point Helvetica from x 50 on baseline 760). */
+const LINE_ONE = { x: 50, y: 760 - 0.207 * 11, w: 70.917, h: 0.925 * 11 };
+
+test("a note of only spaces is refused by the service, its sentence shown and nothing changed", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Refused" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  const made = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, { kind: "highlight", assetId: aid, anchors: [{ page: 1, rects: [LINE_ONE] }], quote: "This is the text", body: "first note", colorName: "blue" });
+  expect(made.status, JSON.stringify(made.body)).toBe(201);
+  await readFromLibrary(page, app, projectId, sid);
+  const entry = annotationList(page).locator(`[data-entry="${made.body.id}"]`);
+  await tabTo(page, entry);
+  await tabTo(page, entry.getByRole("button", { name: /^Edit note of/ }));
+  await page.keyboard.press("Enter");
+  const area = entry.getByRole("textbox", { name: "Note" });
+  await expect(area).toBeFocused();
+  await area.fill("   ");
+  await page.keyboard.press("Control+Enter");
+  await expect(entry.getByRole("alert")).toHaveText("A note cannot be only spaces.");
+  // Nothing changed: the editor keeps what was typed, the service keeps the note.
+  await expect(area).toHaveValue("   ");
+  await expect(area).toBeFocused();
+  const listed = await app.api<{ annotations: Array<{ id: string; body?: string }> }>("GET", `/projects/${projectId}/sources/${sid}/annotations`);
+  expect(listed.body.annotations.find((a) => a.id === made.body.id)?.body).toBe("first note");
+  // Abandoning the changed text asks first; once discarded, the note is as it was.
+  await page.keyboard.press("Escape");
+  const dialog = page.getByRole("dialog", { name: "Discard this note?" });
+  await expect(dialog.getByRole("button", { name: "Keep editing" })).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await page.keyboard.press("Enter");
+  await expect(dialog).toHaveCount(0);
+  await expect(entry).toContainText("first note");
+  await expect(entry.getByRole("button", { name: /^Edit note of/ })).toBeFocused();
+  expect(errors).toEqual([]);
+});
+
+test("past the five-hundredth entry nothing is cut off: a long note, an entry being edited, larger text", async ({ page, app }) => {
+  test.setTimeout(240_000);
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Many highlights" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  const COUNT = 520;
+  const LONG = Array.from({ length: 60 }, (_, i) => `Line ${i + 1} of a long note about the market rules.`).join("\n");
+  const ids: string[] = [];
+  await test.step(`${COUNT} highlights made through the service, in a known order`, async () => {
+    for (let i = 0; i < COUNT; i++) {
+      const body = i === 505 ? LONG : i % 2 === 0 ? `A short note, number ${i}.` : undefined;
+      const r = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, {
+        kind: "highlight",
+        assetId: aid,
+        anchors: [{ page: 1, rects: [LINE_ONE], sortIndex: `00000|${String(i).padStart(6, "0")}|00100` }],
+        quote: "This is the text",
+        ...(body !== undefined ? { body } : {}),
+        colorName: "green",
+      });
+      expect(r.status, JSON.stringify(r.body)).toBe(201);
+      ids.push(r.body.id);
+    }
+  });
+  await readFromLibrary(page, app, projectId, sid);
+  const list = annotationList(page);
+  await expect(list.getByRole("heading", { level: 2 })).toHaveText(`Annotations (${COUNT})`);
+  // Windowed: far fewer entries in the page than in the list.
+  expect(await list.locator("[data-entry]").count()).toBeLessThan(120);
+
+  // By keyboard to the end of the list, then up to entry 508, whose note is opened for editing.
+  await tabTo(page, list.locator("[data-entry]").first());
+  await page.keyboard.press("End");
+  await expect(list.locator(`[data-entry="${ids[COUNT - 1]}"]`)).toBeFocused();
+  await expect(list.locator(`[data-entry="${ids[COUNT - 1]}"]`)).toHaveAttribute("aria-posinset", String(COUNT));
+  for (let i = COUNT - 1; i > 508; i--) await page.keyboard.press("ArrowUp");
+  const editing = list.locator(`[data-entry="${ids[508]}"]`);
+  await expect(editing).toBeFocused();
+  await tabTo(page, editing.getByRole("button", { name: /^(Add|Edit) note/ }));
+  await page.keyboard.press("Enter");
+  await expect(editing.getByRole("textbox", { name: "Note" })).toBeFocused();
+
+  /**
+   * For those of entries 500 to 515 in the page (`must` among them): every button inside its entry's
+   * box and seen at its centre once scrolled into the list's view, no content beyond its entry's box,
+   * and no entry over the next.
+   */
+  const problems = (must: string) =>
+    page.evaluate(([check, must]: [string[], string]) => {
+      const out: string[] = [];
+      if (!document.querySelector(`[data-entry="${must}"]`)) out.push(`${must}: not in the page`);
+      const scroller = document.querySelector<HTMLElement>(".ao-ann-scroll")!;
+      let lastBottom = -Infinity;
+      for (const id of check) {
+        const li = [...document.querySelectorAll<HTMLElement>("[data-entry]")].find((e) => e.dataset.entry === id);
+        if (!li) continue;
+        const top = li.offsetTop;
+        if (top < lastBottom - 0.5) out.push(`${id}: starts at ${top}, over the one before (ends ${lastBottom})`);
+        lastBottom = top + li.offsetHeight;
+        if (li.scrollHeight > li.clientHeight + 1) out.push(`${id}: content ${li.scrollHeight} px in a box of ${li.clientHeight}`);
+        if (id !== must) continue;
+        for (const b of li.querySelectorAll<HTMLElement>("button")) {
+          b.scrollIntoView({ block: "center" });
+          const r = b.getBoundingClientRect();
+          const box = li.getBoundingClientRect();
+          const view = scroller.getBoundingClientRect();
+          if (r.top < box.top - 0.5 || r.bottom > box.bottom + 0.5 || r.left < box.left - 0.5 || r.right > box.right + 0.5) out.push(`${id}: ${b.textContent} outside its entry`);
+          const hit = document.elementFromPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+          if (!hit || !(hit === b || b.contains(hit))) out.push(`${id}: ${b.textContent} not seen at its centre (${hit?.className ?? "nothing"}) view ${Math.round(view.top)}-${Math.round(view.bottom)} button ${Math.round(r.top)}-${Math.round(r.bottom)}`);
+        }
+      }
+      return out;
+    }, [ids.slice(500, 516), must] as [string[], string]);
+  /** Scrolls the list a little at a time, up or down, until entry number `at` (0-based) is in the page. */
+  const bringIn = async (at: number) => {
+    await expect
+      .poll(() =>
+        page.evaluate(
+          ([id, at]) => {
+            if (document.querySelector(`[data-entry="${id}"]`)) return true;
+            const shown = [...document.querySelectorAll<HTMLElement>("[data-entry]")].map((e) => Number(e.getAttribute("aria-posinset")) - 1);
+            document.querySelector<HTMLElement>(".ao-ann-scroll")!.scrollTop += at < Math.min(...shown) ? -150 : 150;
+            return false;
+          },
+          [ids[at]!, at] as [string, number],
+        ),
+      )
+      .toBe(true);
+  };
+  /** The checks on entry number `at`, brought into the page first each time. */
+  const checked = (at: number) => async () => {
+    await bringIn(at);
+    return problems(ids[at]!);
+  };
+
+  await test.step("at the default text size: the entry being edited, the long note, the one after it", async () => {
+    for (const at of [508, 505, 506]) await expect.poll(checked(at), { timeout: 20_000 }).toEqual([]);
+  });
+  await test.step("at a larger text size", async () => {
+    await page.evaluate(() => (document.documentElement.style.fontSize = "150%"));
+    for (const at of [505, 508]) await expect.poll(checked(at), { timeout: 20_000 }).toEqual([]);
+  });
+  // The long note is there whole.
+  await expect(list.locator(`[data-entry="${ids[505]}"]`)).toContainText("Line 60 of a long note about the market rules.");
+  // The editor kept its place and focus throughout.
+  await expect(editing.getByRole("textbox", { name: "Note" })).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
