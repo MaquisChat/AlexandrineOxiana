@@ -16,7 +16,7 @@
  * to the library. The library's mode is followed too (read-only from then on). A lost stream is
  * listened to again after a pause; losing it ends nothing (a range refused still would).
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { libraryApi, type Asset, type LibraryState, type ProjectSummary, type SourceAvailability } from "../api/library";
 import { readerApi } from "../api/reader";
@@ -81,6 +81,8 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
   const [ended, setEnded] = useState<Ended | undefined>(undefined);
   /** Moves on with "Open again" on the route's own failure: the source is read again. */
   const [attempt, setAttempt] = useState(0);
+  /** Asks, while the reader is shown, whether its project is still there and unlocked (R8: the screen's list answered 404). */
+  const askNow = useRef<(() => void) | undefined>(undefined);
 
   useEffect(() => {
     if (!projectId || !sourceId) return;
@@ -204,7 +206,11 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
       }
     };
     void listen();
-    return () => ac.abort();
+    askNow.current = () => void ask();
+    return () => {
+      askNow.current = undefined;
+      ac.abort();
+    };
   }, [client, library, projectId, watching]);
 
   if (!projectId || !sourceId) {
@@ -286,6 +292,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
           {...(annotationId ? { annotationId } : {})}
           readOnly={readOnly}
           {...(availability ? { availability } : {})}
+          onProjectInDoubt={() => askNow.current?.()}
         />
       ) : (
         <ReaderStateView heading="No PDF" sentence="This source has no PDF that can be shown here." />

@@ -736,6 +736,21 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
     expectNothingLeft(container);
   });
 
+  it("the annotation list answering 404 makes the route ask, and a project that is gone ends the reader with Project not found (R8, A11)", async () => {
+    const svc = serveRoute({ unlocked: () => true, projects: () => HttpResponse.json({ projects: [] }) as unknown as Response });
+    serveAnnotations([], () => serviceError(404, "NOT_FOUND", "That project was not found.") as unknown as Response);
+    const f = textHandle();
+    openPdf.mockResolvedValueOnce(f.handle);
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    const { container } = render(<ReaderRoute client={testClient()} loc={{ pathname: "/reader", search: "?project=p1&source=s1" }} />);
+    // No state event at all: the list's 404 alone makes the route ask.
+    const heading = await screen.findByRole("heading", { level: 2, name: "Project not found" });
+    expect(svc.projectReads.length).toBe(1);
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    expect(f.destroy).toHaveBeenCalled();
+    expectNothingLeft(container);
+  });
+
   describe("the lock question never fails open (A10, Ruling R205)", () => {
     beforeEach(() => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
@@ -1113,5 +1128,77 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
     expect(alert.textContent).toBe("The highlights of this file could not be shown: This project's rules do not allow it.");
     expect(requests.filter((r) => r.url.endsWith("/annotations")).map((r) => new URL(r.url).pathname)).toEqual(["/projects/p1/sources/s1/annotations"]);
     expect(screen.getByRole("region", { name: "Page 1 of 2" })).toBeTruthy();
+  });
+
+  it("a 423 answered to the list ends the reader as locked at once, by the same path as a refused range (A11)", async () => {
+    serveDocument();
+    serveAnnotations([], () => serviceError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.") as unknown as Response);
+    const f = fakeHandle(3, { text: words });
+    openPdf.mockResolvedValueOnce(f.handle);
+    const { container } = screenFor();
+    await expectState("Project locked", SENTENCES.locked);
+    expect(f.destroy).toHaveBeenCalled();
+    expect(container.querySelectorAll("canvas, .ao-reader-text-layer, [data-page-number], .ao-hl").length).toBe(0);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("link", { name: "Go to the library" }).getAttribute("href")).toBe("/?project=p1");
+    expect(screen.queryByRole("button", { name: "Open again" })).toBeNull();
+  });
+
+  it("any other failure of the list leaves the PDF reading, says so, and Try again asks once more, once a press (A11, M5)", async () => {
+    serveDocument();
+    let calls = 0;
+    serveAnnotations([], () => {
+      calls++;
+      return (calls === 1 ? serviceError(503, "UNAVAILABLE", "The library is busy. Try again in a moment.") : HttpResponse.json({ annotations: [rec({ id: "back" })], count: 1, textChars: 15 })) as unknown as Response;
+    });
+    const f = fakeHandle(2, { text: words });
+    openPdf.mockResolvedValueOnce(f.handle);
+    const user = userEvent.setup();
+    screenFor();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("The highlights of this file could not be shown: The library is busy. Try again in a moment.");
+    expect(await screen.findByRole("region", { name: "Page 1 of 2" })).toBeTruthy();
+    expect(f.destroy).not.toHaveBeenCalled();
+    await user.dblClick(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(drawnOn(1)).toEqual(["back"]));
+    expect(calls).toBe(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("the list request is aborted when the document ends (A11, M5)", async () => {
+    serveDocument();
+    let signal: AbortSignal | undefined;
+    serveAnnotations([], () => new Promise<Response>(() => {}));
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/annotations"), ({ request }) => {
+        signal = request.signal;
+        return new Promise<Response>(() => {});
+      }),
+    );
+    const f = fakeHandle(2, { text: words });
+    openPdf.mockResolvedValueOnce(f.handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 2" });
+    await waitFor(() => expect(signal).toBeDefined());
+    expect(signal!.aborted).toBe(false);
+    act(() => f.fail(new PdfOpenError("other", "The file changed while it was being read.")));
+    await screen.findByRole("heading", { level: 2, name: "PDF not shown" });
+    await waitFor(() => expect(signal!.aborted).toBe(true));
+  });
+
+  it("no verdict for a quote under four letters or for an annotation that also lies on another file (A11, M1, M6)", async () => {
+    serveDocument();
+    const both = rec({ id: "two-files", quote: "Not these words at all" });
+    both.pdfAnchors.push({ id: "two-files-b", assetId: "a2", page: 1, rects: onWords, sortIndex: "00000|000000|00000", sortIndexDerived: true });
+    serveAnnotations([rec({ id: "short", quote: "Wor" }), both, rec({ id: "really-changed", quote: "Not these words at all" })]);
+    openPdf.mockResolvedValueOnce(fakeHandle(2, { text: words }).handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Page 1 of 2" });
+    // The control: a judged one is said to have changed, so the page's text was looked at.
+    await waitFor(() => expect(document.querySelector('[data-annotation="really-changed"]')?.classList.contains("ao-hl--changed")).toBe(true));
+    expect(drawnOn(1)).toEqual(["short", "two-files", "really-changed"]);
+    expect(document.querySelector('[data-annotation="short"]')!.classList.contains("ao-hl--changed")).toBe(false);
+    expect(document.querySelector('[data-annotation="two-files"]')!.classList.contains("ao-hl--changed")).toBe(false);
+    expect(within(screen.getByRole("region", { name: "Highlights to check" })).getAllByRole("listitem")).toHaveLength(1);
   });
 });
