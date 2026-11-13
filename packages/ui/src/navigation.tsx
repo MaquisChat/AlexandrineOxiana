@@ -15,6 +15,7 @@ export const PATHS = {
   appearance: "/settings/appearance",
   extension: "/settings/extension",
   tools: "/settings/tools",
+  watchedFolders: "/settings/watched-folders",
   importWizard: "/import",
   reviewQueue: "/import/review",
   governance: "/governance",
