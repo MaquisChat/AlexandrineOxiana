@@ -19,7 +19,10 @@
  *    relaunch of the app), with a new port and token that the page is handed on its next load;
  *  - with `test.use({ fakeControl: true })`, `app.fakes` tells the fake downloaders what to answer
  *    (a synthetic profile, a held download) and speech recognition is a fake inside the real worker
- *    (FakeControl).
+ *    (FakeControl);
+ *  - `app.grantFolder(dir)` approves a folder for watching as the desktop shell does (a grant line on the
+ *    service's open standard input, R207); with `test.use({ shellStub: true })` the page believes it runs in the
+ *    shell, whose folder chooser is `app.chooser` (ShellChooser; see the end of this file).
  *
  * Per test, `page`: the built UI (packages/ui/dist) under the desktop shell's own origin,
  * http://tauri.localhost, answered from disk by Playwright (pushState paths fall back to index.html),
@@ -39,7 +42,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, extname, join, resolve, sep } from "node:path";
+import { basename, delimiter, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { test as base, expect, type Page } from "@playwright/test";
 import { FAKE_SPEECH, FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
@@ -81,6 +84,15 @@ export interface AppHarness {
   onRestart(listener: () => Promise<void>): void;
   /** What the fake tools answer: only in a test that sets `test.use({ fakeControl: true })`, else undefined. */
   fakes: FakeControl | undefined;
+  /**
+   * Approves `dir` for watching exactly as the desktop shell does after its folder chooser closes (Task W10; R207,
+   * W6): one grant line, `{"type":"folder-grant","id":<32 hex>,"path":<absolute>}\n`, written on the running
+   * service's open standard input (the pipe that carried the token, kept open for the service's life). Returns the
+   * grant id, which is all the page is ever given. No route, variable or file of the service is involved.
+   */
+  grantFolder(dir: string): Promise<string>;
+  /** The stand-in for the shell's folder chooser: only in a test that sets `test.use({ shellStub: true })`, else undefined. */
+  chooser: ShellChooser | undefined;
 }
 
 /** The fake downloaders the worker runs. */
@@ -442,11 +454,13 @@ async function stopService(child: ChildProcess): Promise<string[]> {
   return problems;
 }
 
-export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl: boolean }>({
+export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl: boolean; shellStub: boolean }>({
   /** `test.use({ fakeControl: true })`: the test tells the fakes what to answer (app.fakes, FakeControl). */
   fakeControl: [false, { option: true }],
+  /** `test.use({ shellStub: true })`: the page believes it runs in the desktop app, whose folder chooser is `app.chooser` (ShellChooser). */
+  shellStub: [false, { option: true }],
 
-  app: async ({ fakeControl }, use, testInfo) => {
+  app: async ({ fakeControl, shellStub }, use, testInfo) => {
     const root = await mkdtemp(join(tmpdir(), "ao-e2e-"));
     const configDir = join(root, "config");
     const librariesDir = join(root, "libraries");
@@ -504,7 +518,10 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl
         },
         onRestart: (listener) => void restartListeners.push(listener),
         fakes: fakes?.control,
+        grantFolder: (dir) => writeGrantLine(svc, dir),
+        chooser: undefined,
       };
+      if (shellStub) harness.chooser = shellChooserFor(harness);
       await use(harness);
     } finally {
       try {
@@ -531,8 +548,9 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl
     { auto: true },
   ],
 
-  page: async ({ page, app, blocked, browserName }, use) => {
+  page: async ({ page, app, blocked, browserName, shellStub }, use) => {
     const context = page.context();
+    if (shellStub) await installShellStub(page, app.chooser!);
     // Read at each request: a restart moves the service to another port (and the old one is refused).
     const service = () => new URL(app.baseUrl).host;
     // Chromium's Local Network Access treats a page Playwright answers itself as public, so its
@@ -719,6 +737,84 @@ export function decryptStoredFile(app: AppHarness, o: { projectRoot: string; fil
   const env = { ...process.env, AO_E2E_DECRYPT: JSON.stringify({ keyFile: join(o.projectRoot, "keys", "project-key.json"), passphrase: o.passphrase, file: o.file, output: o.output }) };
   const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], { cwd: LIBRARY_DIR, env, encoding: "utf8", timeout: 60_000 });
   if (r.status !== 0) throw new Error(`Decrypting a stored file failed (status ${r.status}): ${r.stderr}`);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Watched folders (Task W10; R207, W6): the shell's grant line, and a stand-in for the shell's folder chooser.
+
+/**
+ * The stand-in for the desktop shell's folder chooser (`pick_watch_folder`), in a test that sets
+ * `test.use({ shellStub: true })`. The test says beforehand what the person picks; when the page opens the chooser,
+ * the harness writes the grant line for that folder (`app.grantFolder`, as the shell does once its chooser closes)
+ * and the page receives only `{ grantId, name }` — the folder's last name, never its path.
+ */
+export interface ShellChooser {
+  /** What the next opening of the chooser picks: `dir` (absolute), or null for "Cancel". Used once; after it the chooser is cancelled. */
+  willPick(dir: string | null): void;
+  /** The title the page gave each opening of the chooser, oldest first. */
+  readonly titles: string[];
+  /** The grant ids handed to the page, oldest first. */
+  readonly grants: string[];
+}
+
+/** One grant line on the running service's standard input, byte for byte as the shell writes it (grant.rs `grant_line`). */
+async function writeGrantLine(svc: { child: ChildProcess } | undefined, dir: string): Promise<string> {
+  if (!svc) throw new Error("No service is running to hand a folder to.");
+  if (!isAbsolute(dir)) throw new Error("A grant names an absolute folder, as the shell's chooser gives it.");
+  const stdin = svc.child.stdin!;
+  if (stdin.destroyed || stdin.writableEnded) throw new Error("The service's standard input is closed.");
+  const id = randomBytes(16).toString("hex");
+  const line = `${JSON.stringify({ type: "folder-grant", id, path: dir })}\n`;
+  await new Promise<void>((done, fail) => stdin.write(line, (err) => (err ? fail(err) : done())));
+  return id;
+}
+
+function shellChooserFor(app: AppHarness): ShellChooser & { pick(title: string): Promise<{ grantId: string; name: string } | null> } {
+  let next: string | null = null;
+  const titles: string[] = [];
+  const grants: string[] = [];
+  return {
+    willPick: (dir) => void (next = dir),
+    titles,
+    grants,
+    async pick(title) {
+      titles.push(String(title));
+      const dir = next;
+      next = null;
+      if (dir === null) return null;
+      const grantId = await app.grantFolder(dir);
+      grants.push(grantId);
+      return { grantId, name: basename(dir) };
+    },
+  };
+}
+
+/**
+ * Makes this test's page believe it runs in the desktop shell, before any app code: `isTauri`, and a
+ * `__TAURI_INTERNALS__.invoke` that answers ONLY `pick_watch_folder` (through `app.chooser`) and refuses every other
+ * command as the shell refuses one it does not know. In the app's own top-level document only. A test without
+ * `shellStub` never reaches here, so its page is a plain browser.
+ */
+async function installShellStub(page: Page, chooser: ShellChooser): Promise<void> {
+  const context = page.context();
+  await context.exposeBinding("__aoShellStubPick", (_source, title: unknown) => (chooser as ReturnType<typeof shellChooserFor>).pick(String(title ?? "")));
+  await context.addInitScript(
+    ({ origin }) => {
+      if (window !== window.top || window.location.origin !== origin) return;
+      const w = window as unknown as Record<string, unknown> & { __aoShellStubPick: (title: string) => Promise<unknown> };
+      let callbacks = 0;
+      w.isTauri = true;
+      w.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: { title?: unknown }) => {
+          if (cmd === "pick_watch_folder") return w.__aoShellStubPick(String(args?.title ?? ""));
+          throw `Command ${cmd} not found`;
+        },
+        transformCallback: () => ++callbacks,
+        unregisterCallback: () => {},
+      };
+    },
+    { origin: APP_ORIGIN },
+  );
 }
 
 export { expect, type Page };
