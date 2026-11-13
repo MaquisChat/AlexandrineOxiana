@@ -78,6 +78,7 @@ import {
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
 import { hasSettledCaptureEntries, hasUnlistedConflicts, readReviewEntries, reviewedAfterWithdrawal, type ReviewEntry } from "./review.js";
+import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegisterEntry } from "./watch-register.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
@@ -406,6 +407,18 @@ export class Repo {
   }
   setMembership(projectId: string, sourceId: string, m: { collectionIds?: string[]; tagIds?: string[] }): Promise<void> {
     return setMembership(this.core, projectId, sourceId, m);
+  }
+  /** A watched folder's register, folded by key (Task W3; sealed in encrypted projects: refused while locked). */
+  watchRegister(projectId: string, watchId: string): Promise<Map<string, WatchRegisterEntry>> {
+    return readWatchRegister(this.core, projectId, watchId);
+  }
+  /** Appends entries to a watched folder's register: one governed, audited change (counts only in the audit). */
+  recordWatchedFiles(projectId: string, watchId: string, entries: WatchRegisterEntry[]): Promise<void> {
+    return recordWatchedFiles(this.core, projectId, watchId, entries);
+  }
+  /** Which watched folders, and which file in each, a source came from. */
+  watchOrigins(projectId: string, sourceId: string): Promise<Array<{ watchId: string; entry: WatchRegisterEntry }>> {
+    return readWatchOrigins(this.core, projectId, sourceId);
   }
 
   createParticipant(projectId: string, input: ParticipantInput): Promise<Participant> {

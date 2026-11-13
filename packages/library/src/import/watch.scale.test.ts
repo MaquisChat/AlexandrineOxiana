@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import v8 from "node:v8";
 import vm from "node:vm";
+import { newId } from "@ao/core";
 import { MockAgent } from "undici";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
@@ -103,12 +104,14 @@ describe("watched folders at scale", () => {
     const openedInDrive = () => spies.flatMap((s) => s.mock.calls as unknown[][]).map((a) => String(a[0])).filter((q) => q.startsWith(`${real}/`));
 
     const stored: string[] = [];
-    const attach: Attach = { attachFiles: async (_p, ps) => ps.map((path) => (stored.push(path), { path, outcome: "created" as const, sourceId: `s${stored.length}` })) };
+    const attach: Attach = { attachFiles: async (_p, ps) => ps.map((path) => (stored.push(path), { path, outcome: "created" as const, sourceId: newId() })) };
     const statuses: Array<WatchStatus & { at: number }> = [];
 
     const before = heap();
     const t0 = Date.now();
-    const w = watchFolder({ repo, http, lib, attach, onStatus: (s) => statuses.push({ ...structuredClone(s), at: Date.now() }) }, p.id, drive, {}, "scale-watch");
+    // A real watch id: the register is written as in the service (A8; review M9).
+    const watchId = newId();
+    const w = watchFolder({ repo, http, lib, attach, onStatus: (s) => statuses.push({ ...structuredClone(s), at: Date.now() }) }, p.id, drive, {}, watchId);
     cleanups.push(() => w.stop());
     await w.ready;
     const done = () => {
@@ -131,7 +134,7 @@ describe("watched folders at scale", () => {
     expect(stored).toHaveLength(N_LOCAL);
 
     // The counts and their bytes; the list is capped, newest first.
-    expect(w.status()).toMatchObject({ watchId: "scale-watch", state: "watching", provider: null, counts: { notDownloaded: N_ONLINE, notDownloadedBytes: expectedBytes, cameIn: N_LOCAL, didNotComeIn: 0 } });
+    expect(w.status()).toMatchObject({ watchId, state: "watching", provider: null, counts: { notDownloaded: N_ONLINE, notDownloadedBytes: expectedBytes, cameIn: N_LOCAL, didNotComeIn: 0 } });
     const page = w.problems({ kind: "not-downloaded", offset: 0, limit: 200 });
     expect(page.total).toBe(WATCH_PROBLEMS_MAX);
     expect(page.items).toHaveLength(200);
@@ -142,7 +145,9 @@ describe("watched folders at scale", () => {
     expect(elapsed).toBeLessThan(20_000);
     expect(growth).toBeLessThan(64 * 1024 * 1024);
     for (let i = 1; i < statuses.length; i++) {
-      if (statuses[i]!.state === statuses[i - 1]!.state) expect(statuses[i]!.at - statuses[i - 1]!.at).toBeGreaterThanOrEqual(WATCH_STATUS_INTERVAL_MS - 5);
+      // The engine keeps the interval by its own clock (N6); the stamps here are taken in the listener, after a clone, so
+      // they may lag by the time a busy turn of the event loop takes (about 50 ms under load). The count below is the rate bound.
+      if (statuses[i]!.state === statuses[i - 1]!.state) expect(statuses[i]!.at - statuses[i - 1]!.at).toBeGreaterThanOrEqual(WATCH_STATUS_INTERVAL_MS - 50);
     }
     expect(statuses.length).toBeLessThanOrEqual(Math.ceil(elapsed / WATCH_STATUS_INTERVAL_MS) + 3);
 

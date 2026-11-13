@@ -1383,6 +1383,25 @@ describe("review round 1: smaller route fixes (R99 minors)", () => {
     expect((await finished).data).toMatchObject({ jobId: r.json.jobId, done: 1, total: 1 });
   });
 
+  it("a folder added through the route registers what it brings in (A8: no watch without its register)", async () => {
+    await svc.close();
+    await start({ watchStabilityMs: 50 });
+    await openNewLibrary();
+    const pid = await newProject();
+    const { mkdir } = await import("node:fs/promises");
+    const folder = join(tmp, "watch-registered");
+    await mkdir(folder);
+    const w = (await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { dir: folder } })).json as { id: string };
+    const seen = nextEvent((e) => e.type === "job.progress" && e.data.kind === "watch" && e.data.event?.kind === "imported");
+    await writeFile(join(folder, "registered.pdf"), await buildPdf({ title: "Registered Through The Route" }));
+    const sid = (await seen).data.event.sourceId as string;
+    const repo = svc.state.session!.repo;
+    const deadline = Date.now() + 20_000;
+    while ((await repo.watchRegister(pid, w.id)).size === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    expect((await repo.watchRegister(pid, w.id)).get("registered.pdf")).toMatchObject({ sourceId: sid, state: "in-library" });
+    expect((await repo.getSource(pid, sid)).source.provenance.externalKeys).toEqual({ "watched-folder": w.id });
+  }, 60_000);
+
   it("watches restarted after removing one keep reporting events", async () => {
     await svc.close();
     await start({ watchStabilityMs: 50 });

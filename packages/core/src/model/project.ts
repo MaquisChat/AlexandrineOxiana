@@ -7,6 +7,11 @@ export const WatchedFolderOptions = z.object({
   label: z.string().max(200).optional(),
   /** Also watch subfolders (default: only files directly in the folder). */
   recursive: z.boolean().default(false),
+  /**
+   * The collection new sources from this folder go into (cloud-drive folders, Task W3). Optional: an
+   * old project.json has none; a collection that no longer exists means no collection.
+   */
+  collectionId: Id.optional(),
 });
 export type WatchedFolderOptions = z.infer<typeof WatchedFolderOptions>;
 
