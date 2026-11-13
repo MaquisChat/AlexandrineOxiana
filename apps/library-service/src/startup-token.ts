@@ -7,10 +7,17 @@
  *
  * The launcher writes the token as one line (`<token>\n`) and keeps standard input open for as long
  * as it wants the service to run. `readStartupToken` reads that one line and then stops reading:
- * its listeners are removed and the stream is paused, but it is NOT closed. The entry point then
- * hands the stream to `onEndOfInput`: anything after the first line is discarded unread, and the end
- * of standard input (the launcher closed its end, or crashed, or was force-quit) means "shut down
- * cleanly" (R155).
+ * its listeners are removed and the stream is paused, but it is NOT closed (bytes that arrived in
+ * the same read after the token's line end are put back on the stream). The entry point then hands
+ * the stream to `onInputLines`, and the end of standard input (the launcher closed its end, or
+ * crashed, or was force-quit) means "shut down cleanly" (R155).
+ *
+ * After the token line, R207 changes R98/R155's "discarded, never interpreted" for exactly ONE line
+ * shape: a folder grant from the shell's folder chooser (folder-grants.ts `parseGrantLine`). Lines
+ * are cut at line ends with a bounded buffer (`InputLines`: a line longer than INPUT_LINE_MAX_BYTES
+ * is dropped as it arrives, so a line that never ends cannot grow memory), lines that are not UTF-8
+ * are dropped, and each remaining line is handed to the entry point's callback, which keeps it only
+ * if it is exactly a grant. Nothing read after the token is logged, echoed or answered.
  *
  * Refused, with a plain message that never repeats the token or any part of it:
  *  - a token variable (AO_SERVICE_TOKEN, in any letter case) present in the environment, even empty:
@@ -118,7 +125,11 @@ function readFirstLine(input: Readable, timeoutMs: number): Promise<string> {
         finish(new StartupTokenError("What arrived on standard input is not a valid access token: the first line is far too long."));
         return;
       }
-      if (nl !== -1) finish(null, Buffer.concat(chunks).toString("utf8").replace(/\r$/, ""));
+      if (nl !== -1) {
+        finish(null, Buffer.concat(chunks).toString("utf8").replace(/\r$/, ""));
+        // What followed the token in the same read is the start of the lines after it (onInputLines).
+        if (nl + 1 < buf.length) input.unshift(buf.subarray(nl + 1));
+      }
     };
     const onEnd = () => {
       if (size === 0) finish(new StartupTokenError("Standard input closed before an access token arrived. The service is started with its access token written on standard input, as one line."));
@@ -150,20 +161,94 @@ export async function readStartupToken(src: StartupTokenSource): Promise<string>
   return token;
 }
 
+/** The longest line read after the token, in bytes without its line end (a grant line is at most this). */
+export const INPUT_LINE_MAX_BYTES = 8192;
+
 /**
- * After the token line: calls `onEnd` once when standard input ends, closes or fails (R155: the
- * launcher's end of the pipe is gone, so the service shuts down cleanly; a launcher that crashed or
- * was force-quit leaves no stray service). Anything written after the token line is read and
- * discarded, never interpreted.
+ * Cuts the bytes after the token into lines, holding at most INPUT_LINE_MAX_BYTES (+1 for a `\r`):
+ * a line that grows past that is dropped as it arrives, with everything up to its line end, and never
+ * kept. A line that is not valid UTF-8 is dropped. One `\r` before the line end is removed.
  */
-export function onEndOfInput(input: Readable, onEnd: () => void): void {
+export class InputLines {
+  #parts: Buffer[] = [];
+  #size = 0;
+  /** Inside a line that is already too long: drop until its line end. */
+  #dropping = false;
+  readonly #decoder = new TextDecoder("utf-8", { fatal: true });
+
+  /** The complete lines in `chunk` (joined to what came before it). */
+  push(chunk: Buffer): string[] {
+    const out: string[] = [];
+    let rest = chunk;
+    while (rest.length > 0) {
+      const nl = rest.indexOf(0x0a);
+      const part = nl === -1 ? rest : rest.subarray(0, nl);
+      if (!this.#dropping) {
+        if (this.#size + part.length > INPUT_LINE_MAX_BYTES + 1) {
+          this.#parts = [];
+          this.#size = 0;
+          this.#dropping = true;
+        } else if (part.length > 0) {
+          // A copy: the reader never keeps a reference into a large chunk it was handed.
+          this.#parts.push(Buffer.from(part));
+          this.#size += part.length;
+        }
+      }
+      if (nl === -1) break;
+      if (!this.#dropping) {
+        const line = this.#line();
+        if (line !== null) out.push(line);
+      }
+      this.#parts = [];
+      this.#size = 0;
+      this.#dropping = false;
+      rest = rest.subarray(nl + 1);
+    }
+    return out;
+  }
+
+  /** Bytes held for the line not yet ended. */
+  get bufferedBytes(): number {
+    return this.#size;
+  }
+
+  #line(): string | null {
+    let bytes = this.#parts.length === 1 ? this.#parts[0]! : Buffer.concat(this.#parts);
+    if (bytes.length > 0 && bytes[bytes.length - 1] === 0x0d) bytes = bytes.subarray(0, bytes.length - 1);
+    if (bytes.length > INPUT_LINE_MAX_BYTES) return null;
+    try {
+      return this.#decoder.decode(bytes);
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * After the token line: hands each complete line to `onLine` (see `InputLines`; the entry point keeps
+ * only an exact folder grant and drops everything else uninterpreted, R207), and calls `onEnd` once
+ * when standard input ends, closes or fails (R155: the launcher's end of the pipe is gone, so the
+ * service shuts down cleanly; a launcher that crashed or was force-quit leaves no stray service). A
+ * last line without a line end is not a line. If `onLine` throws, the line is dropped in silence.
+ */
+export function onInputLines(input: Readable, onLine: (line: string) => void, onEnd: () => void): void {
   let called = false;
   const once = () => {
     if (called) return;
     called = true;
     onEnd();
   };
-  input.on("data", () => {});
+  const lines = new InputLines();
+  input.on("data", (chunk: Buffer | string) => {
+    if (called) return;
+    for (const line of lines.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk)) {
+      try {
+        onLine(line);
+      } catch {
+        // Dropped: never interpreted further, never echoed.
+      }
+    }
+  });
   input.once("end", once);
   input.once("close", once);
   input.on("error", once);

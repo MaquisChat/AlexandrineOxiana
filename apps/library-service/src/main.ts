@@ -16,7 +16,9 @@
  * AO_SERVICE_TOKEN is set, if it is given any argument, if standard input is a terminal (a typed
  * token would be echoed: pipe it in), if the token does not arrive within
  * TOKEN_STDIN_TIMEOUT_MS, or if it is not 32–512 characters from `A–Z a–z 0–9 . _ ~ + / = -`. After
- * the one line, anything more on standard input is discarded, and the END of standard input means
+ * the one line, anything more on standard input is discarded — except a line that is exactly a
+ * folder grant from the shell's folder chooser (R207; folder-grants.ts), which is kept in memory for
+ * one use and never logged — and the END of standard input means
  * "shut down cleanly", exactly as SIGTERM does (R155): the launcher keeps its end open while it wants
  * the service, so a launcher that exits, crashes or is force-quit leaves no stray service. A plain
  * `printf ... | node ...` therefore stops the service again at once; keep the pipe open, e.g.
@@ -41,7 +43,8 @@
 import { openLibrary } from "@ao/library";
 import { listenOnRememberedPort } from "./port-memory.js";
 import { createService } from "./server.js";
-import { onEndOfInput, readStartupToken, startupErrorMessage } from "./startup-token.js";
+import { FolderGrants, grantLineHandler } from "./folder-grants.js";
+import { onInputLines, readStartupToken, startupErrorMessage } from "./startup-token.js";
 
 /** Exceeds the worst-case graceful close (R99): SUSPEND_TIMEOUT_MS for imports plus closing the rest. */
 export const FORCE_EXIT_MS = 90_000;
@@ -55,7 +58,8 @@ async function main(): Promise<void> {
   const rawPort = process.env.AO_SERVICE_PORT ?? "0";
   const port = Number(rawPort);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("AO_SERVICE_PORT must be a port number");
-  const svc = await createService({ token, ...(process.env.AO_NO_WORKER === "1" ? { worker: null } : {}) });
+  const folderGrants = new FolderGrants();
+  const svc = await createService({ token, folderGrants, ...(process.env.AO_NO_WORKER === "1" ? { worker: null } : {}) });
 
   let stopping = false;
   const stop = (signal: string) => {
@@ -72,7 +76,8 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => stop("SIGTERM"));
   process.on("SIGINT", () => stop("SIGINT"));
   // R155: the launcher's end of standard input is gone (closed, crashed, force-quit): shut down.
-  onEndOfInput(process.stdin, () => stop("end of standard input"));
+  // R207: a line that is exactly a folder grant is kept; every other line is dropped unread.
+  onInputLines(process.stdin, grantLineHandler(folderGrants), () => stop("end of standard input"));
 
   if (process.env.AO_LIBRARY) {
     const lib = await openLibrary(process.env.AO_LIBRARY, svc.state.deps, { onLockLost: () => svc.state.publishState() });
