@@ -480,6 +480,8 @@ function numberValue(word: string, prev: string | undefined): number | undefined
   return undefined;
 }
 
+const isYearWord = (w: string) => /^\d{4}$/u.test(w) && Number(w) >= 1000 && Number(w) <= 2099;
+
 /** The numbers among a text's words, each with the word it was read from. */
 function numbersIn(segments: Segment[]): Array<{ word: string; value: number }> {
   const out: Array<{ word: string; value: number }> = [];
@@ -536,7 +538,8 @@ function titleInfo(c: WorkCandidate): TitleInfo {
     mainTokens: main ? tokensOf(main) : null,
     runs: segs.flatMap((s) => ("chars" in s ? [s.chars.join("")] : [])).join(" "),
     numbers: new Set(numbersIn(segs).map((n) => n.value)),
-    subtitleNumbers: new Set(subtitle ? numbersIn(segmentsOf(subtitle)).map((n) => n.value) : []),
+    // A 4-digit number from 1000 to 2099 in a subtitle is a year, not a volume (M1).
+    subtitleNumbers: new Set(subtitle ? numbersIn(segmentsOf(subtitle)).filter((n) => !isYearWord(n.word)).map((n) => n.value) : []),
   };
 }
 
@@ -619,6 +622,8 @@ export function scoreCandidate(ref: Reference, c: WorkCandidate): CandidateScore
 
 /** Words that contradict a title when typed beside it and left unexplained (R228 c). "un-" is not one. */
 const NEGATIONS: ReadonlySet<string> = new Set(["no", "not", "non", "without", "against", "anti"]);
+/** Role words typed beside a name (M2), with or without a full stop: not a person, not counted. */
+const ROLE_WORDS: ReadonlySet<string> = new Set(["ed", "eds", "editor", "editors", "edited", "prof", "professor", "dr", "trans", "transl", "translated", "translator", "tr", "hrsg", "dir"]);
 
 /**
  * Rule 3: the typed tokens explained by none of the title, the creators' names, a 4-digit number
@@ -642,9 +647,12 @@ function unexplained(p: Prepared, c: WorkCandidate, t: TitleInfo): { count: numb
       }
     }
   }
+  // The word beside a name: "and", role words and family-name particles are stepped over (I5:
+  // "Hélène de Beauvoir" stands beside "beauvoir", not beside "de").
   const besideFamily = (k: number, dir: -1 | 1): Creator[] => {
-    let seg = p.segments[k + dir];
-    if (seg && "word" in seg && seg.word === "and") seg = p.segments[k + 2 * dir];
+    let j = k + dir;
+    for (let seg = p.segments[j]; seg && "word" in seg && (seg.word === "and" || PARTICLES.has(seg.word) || ROLE_WORDS.has(seg.word)); seg = p.segments[j]) j += dir;
+    const seg = p.segments[j];
     return seg && "word" in seg ? (byFamily.get(seg.word) ?? []) : [];
   };
   let count = 0;
@@ -652,6 +660,8 @@ function unexplained(p: Prepared, c: WorkCandidate, t: TitleInfo): { count: numb
   for (let k = 0; k < p.segments.length; k++) {
     const seg = p.segments[k]!;
     if ("word" in seg) {
+      // A role word ("ed.", "Prof", "trans.") is neither another person nor the one allowed word (M2).
+      if (ROLE_WORDS.has(seg.word)) continue;
       if (!known.has(seg.word) && !/^\d{4}$/u.test(seg.word)) {
         count++;
         if (NEGATIONS.has(seg.word)) contradiction = true;
@@ -708,8 +718,10 @@ type Scored = { c: WorkCandidate; i: number; s: CandidateScore; t: TitleInfo };
  *  - a typed number (digits; a digit ordinal such as "2nd"; a bare roman numeral ii–xx; any roman
  *    numeral right after volume, vol, part, book, edition, ed, band, tome or tomo) asks unless the
  *    candidate's title holds a number of the same value, or it is the typed year and rule 4 holds;
- *  - an unexplained typed word directly beside a matched family name that is not an initial of
- *    that creator's given name asks (see unexplained).
+ *  - an unexplained typed word directly beside a matched family name (only punctuation, "&",
+ *    "and", role words or the name's particles between) that is not an initial of that creator's
+ *    given name asks (see unexplained); role words (ed, eds, editor, editors, edited, prof,
+ *    professor, dr, trans, transl, translated, translator, tr, hrsg, dir) are not counted at all.
  * The main-title guard: when rule 1's 90% is reached only through the title before the subtitle
  * (the whole title's cover is below 0.9), the candidate is sure only if, besides rules 2–6,
  *  (1) no typed word is unexplained;
@@ -717,7 +729,8 @@ type Scored = { c: WorkCandidate; i: number; s: CandidateScore; t: TitleInfo };
  *      edited-book and reference-book, and OpenAlex's book, all map to it);
  *  (3) the main title has at least two words other than the small words, or else a year was typed
  *      and it matches (rule 4's ±1);
- *  (4) every number in the subtitle (as counted above) has the same value as a typed number.
+ *  (4) every number in the subtitle (as counted above, except a 4-digit year from 1000 to 2099)
+ *      has the same value as a typed number.
  * Otherwise "choose", with that candidate first.
  */
 const BOOK_TYPES: ReadonlySet<string> = new Set(["book"]);

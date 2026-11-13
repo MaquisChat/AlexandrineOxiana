@@ -263,7 +263,7 @@ describe("searchWorks and decideMatch (the confidence rule)", () => {
       expect(decideMatch(ref("Smith, Collected Works 4"), [v3]).kind).toBe("choose");
     });
     it("roman numerals after a volume word and digit ordinals in the subtitle count too", () => {
-      for (const sub of ["Band IV", "Tome II", "Tomo III", "Part ii", "Book XII", "Edition V", "2nd edition", "1950-1960"]) {
+      for (const sub of ["Band IV", "Tome II", "Tomo III", "Part ii", "Book XII", "Edition V", "2nd edition", "Volume 12"]) {
         const c = { ...v3, title: `Collected Works: ${sub}` };
         expect([sub, decideMatch(ref("Smith, Collected Works"), [c]).kind]).toEqual([sub, "choose"]);
       }
@@ -292,6 +292,40 @@ describe("searchWorks and decideMatch (the confidence rule)", () => {
     ] as const)("%s", (line, c, kind) => {
       expect(decideMatch(ref(line), [c]).kind).toBe(kind);
     });
+
+    const simone = cand({ id: "ss", title: "The Second Sex", creators: [{ given: "Simone", family: "de Beauvoir", role: "author" }], issued: "1949", identifiers: { isbn: ["9780000000194"] } });
+    const theo = cand({ id: "lt", title: "Letters", creators: [{ given: "Theo", family: "van Gogh", role: "author" }], issued: "1914", identifiers: { isbn: ["9780000000200"] } });
+    it.each([
+      ["Hélène de Beauvoir, The Second Sex", simone, "choose"],
+      ["Simone de Beauvoir, The Second Sex", simone, "sure"],
+      ["S. de Beauvoir, The Second Sex", simone, "sure"],
+      ["de Beauvoir, Simone, The Second Sex", simone, "sure"],
+      ["Beauvoir, The Second Sex", simone, "sure"],
+      ["Vincent van Gogh Letters", theo, "choose"],
+      ["Theo van Gogh Letters", theo, "sure"],
+    ] as const)("a particle does not hide another given name (I5): %s", (line, c, kind) => {
+      expect(decideMatch(ref(line), [c]).kind).toBe(kind);
+    });
+
+    it.each([
+      ["ed. Smith, The Wealth of Nations", "sure"],
+      ["Prof Smith, The Wealth of Nations", "sure"],
+      ["Dr. Smith, The Wealth of Nations", "sure"],
+      ["Smith (eds.), The Wealth of Nations", "sure"],
+      ["Smith, trans., The Wealth of Nations, Glasgow", "sure"], // the role word does not use up the one allowed word
+      ["Smith hrsg, The Wealth of Nations", "sure"],
+      ["Dr. John Smith, The Wealth of Nations", "choose"],
+    ] as const)("a role word beside the name is not another person (M2): %s", (line, kind) => {
+      expect(decideMatch(ref(line), [adam]).kind).toBe(kind);
+    });
+  });
+
+  it("a year or a range of years in a subtitle does not make a main-title citation ask (M1)", () => {
+    const j = [{ given: "Ann", family: "Jones", role: "author" as const }];
+    const ht = cand({ id: "ht", title: "Hard Times: Essays 1970–1980", creators: j, issued: "1981", identifiers: { isbn: ["9780000000217"] } });
+    expect(decideMatch(ref("Jones, Hard Times"), [ht])).toEqual({ kind: "sure", id: "ht" });
+    // A volume number in the subtitle still asks (R231 a).
+    expect(decideMatch(ref("Jones, Hard Times"), [{ ...ht, title: "Hard Times: Essays, Volume 2" }]).kind).toBe("choose");
   });
 
   describe("rules 5 and 6 each decide on their own (M8)", () => {
