@@ -457,10 +457,23 @@ async function editLinks(dir: string, libraryId: string, fn: (l: ZoteroSyncLink)
  * Pauses one link (`library-gone`: Zotero says the key can no longer read it; `undone`: the researcher undid one of
  * its sync batches — Z8 calls this, so the sync does not at once bring back what was undone; `key-refused`: see
  * pauseAllZoteroSyncLinks). A paused link refuses every run until the settings are written with it un-paused.
+ * Returns how many links it paused (0 or 1: one link per Zotero library; 0 when it is not linked).
  */
-export async function pauseLink(dir: string, libraryId: string, ref: string, reason: ZoteroSyncPause, o: ZoteroSyncFileOptions = {}): Promise<void> {
+export async function pauseLink(dir: string, libraryId: string, ref: string, reason: ZoteroSyncPause, o: ZoteroSyncFileOptions = {}): Promise<number> {
   if (!PAUSES.includes(reason)) throw new TypeError("not a pause");
-  await editLinks(dir, libraryId, (l) => (l.ref === ref ? { ...l, paused: reason } : l), o);
+  // R250 d: how many links are paused by it (0: this Zotero library is not linked in this library).
+  let paused = 0;
+  await editLinks(
+    dir,
+    libraryId,
+    (l) => {
+      if (l.ref !== ref) return l;
+      paused = 1; // one link per Zotero library (a retried edit counts it once)
+      return { ...l, paused: reason };
+    },
+    o,
+  );
+  return paused;
 }
 
 /** Zotero refused the key: every link of the library is paused (`key-refused`). */

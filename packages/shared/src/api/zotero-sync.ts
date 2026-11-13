@@ -220,6 +220,7 @@ export const ZOTERO_SYNC_SENTENCES = {
   undonePaused: "Syncing this Zotero library is paused. Turn it on again on the Zotero screen.",
   undoNotPaused: "Syncing this Zotero library could not be paused, so the next sync may bring back what you undid. Turn it off on the Zotero screen.",
   importRunning: "Another import from this Zotero library is running.",
+  belongsToSync: "This import belongs to a Zotero sync. Stop it or run it again from the Zotero screen.",
   keyNotChecked: "Only the saved key can be checked. Save the key first, then check it.",
   settingsUnreadable: "This computer's Zotero sync settings could not be read, so nothing was changed. Try again in a moment.",
 } as const;
@@ -248,31 +249,55 @@ export function zoteroSyncReasonText(reason: ZoteroSyncReason | undefined, now: 
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-/** The counts the researcher understands, each only when not zero. */
+/** The counts the researcher understands, each only when not zero, in this order (R250 e). */
 function countParts(c: ZoteroSyncCounts): string[] {
   const parts: string[] = [];
   if (c.new) parts.push(`${c.new} new`);
   if (c.changed) parts.push(`${c.changed} changed`);
   if (c.waiting) parts.push(`${c.waiting} waiting for your review`);
-  if (c.conflicts) parts.push(`${c.conflicts} changed both in Zotero and here for you to decide`);
-  if (c.goneMarked) parts.push(`${c.goneMarked} marked as no longer in Zotero`);
+  if (c.conflicts) parts.push(`${c.conflicts} changed in Zotero and here (waiting for your decision)`);
+  if (c.goneMarked) parts.push(`${c.goneMarked} deleted or binned in Zotero (kept here)`);
   if (c.back) parts.push(`${c.back} back in Zotero`);
-  if (c.clearedKept) parts.push(`${c.clearedKept} cleared in Zotero and kept here`);
+  if (c.clearedKept) parts.push(`${c.clearedKept} cleared in Zotero (kept here)`);
   return parts;
 }
 
-/** What a run that did not finish left behind. */
+/**
+ * What a run that did not finish left behind (R250 f). With no batch, nothing was written. With a batch, its counts
+ * cover the whole batch (a resumed one too): "had already come in" when they show writes; "Nothing here was changed."
+ * only when they show none; "may already have come in" when they are not known (an encrypted project while locked).
+ */
 function leftBehind(run: ZoteroSyncRun): string {
   if (!run.batchId) return "Nothing here was changed.";
   const c = run.counts;
-  if (!c) return "Some items may have come in before it stopped.";
+  if (!c) return "Some items may already have come in.";
   const wrote = c.new + c.changed + c.waiting + c.conflicts + c.goneMarked + c.back + c.clearedKept;
-  return wrote > 0 ? "Some items came in before it stopped." : "Nothing here was changed.";
+  return wrote > 0 ? "Some items had already come in." : "Nothing here was changed.";
+}
+
+/**
+ * Why a run finished with problems, only as far as its record shows (R250 c). Z7 makes a run "finished-with-problems"
+ * in exactly five ways, each mapped to its sentence here:
+ *   1. items that could not be brought in (counts.failed)       → "N items could not be brought in."
+ *   2. redirects to a host this app does not use (refusedHosts) → the refused-host sentence
+ *   3. attached files to download again (no field of its own)   → the attached-files sentence, said only when the
+ *      counts are known and show no failed item, no host and no reason (then it is the only cause Z7 has left)
+ *   4. reason `deletions-unconfirmed`, 5. reason `changes-incomplete` → their reason sentences
+ * With no counts (an encrypted project while it is locked) causes 1 and 3 cannot be told apart, so neither is said.
+ */
+function problemsOf(run: ZoteroSyncRun, now: Date): { known: string[]; unknown: boolean } {
+  const known: string[] = [];
+  const c = run.counts;
+  if (c?.failed) known.push(`${plural(c.failed, "item", "items")} could not be brought in.`);
+  if (run.refusedHosts?.length) known.push(`Some attached files were not fetched, because Zotero sent them from a server this app does not use (${run.refusedHosts.join(", ")}).`);
+  if (run.reason === "deletions-unconfirmed" || run.reason === "changes-incomplete") known.push(zoteroSyncReasonText(run.reason, now));
+  if (c && !known.length) known.push("Some attached files could not be downloaded; the next sync tries again.");
+  return { known, unknown: !c };
 }
 
 /**
  * The one line that says how a link's last sync went (plan Z8 Accept 1). A failure always names itself; "nothing has
- * changed" is said only for a run whose outcome is `up-to-date`.
+ * changed" is said only for a run whose outcome is `up-to-date`; a line names a cause only when its record shows it.
  */
 export function zoteroSyncStatusLine(run: ZoteroSyncRun | undefined, now: Date): string {
   if (!run) return "Not synced yet.";
@@ -287,19 +312,19 @@ export function zoteroSyncStatusLine(run: ZoteroSyncRun | undefined, now: Date):
       return `Last synced with Zotero ${at}: ${parts.length ? parts.join(", ") : "no items were new or changed"}.`;
     }
     case "finished-with-problems": {
-      const problems: string[] = [];
-      if (run.counts?.failed) problems.push(`${plural(run.counts.failed, "item", "items")} could not be brought in.`);
-      if (run.refusedHosts?.length) problems.push(`Some attached files were not fetched, because Zotero sent them from a server this app does not use (${run.refusedHosts.join(", ")}).`);
-      if (run.reason === "deletions-unconfirmed" || run.reason === "changes-incomplete") problems.push(reason());
-      if (!problems.length) problems.push("Some attached files could not be downloaded; the next sync tries again.");
+      const { known, unknown } = problemsOf(run, now);
+      if (!known.length) return `Synced with Zotero ${at}, with problems. Unlock the project to see what they were.`;
       const parts = run.counts ? countParts({ ...run.counts, failed: 0 }) : [];
-      return `Synced with Zotero ${at}, with problems: ${problems.join(" ")}${parts.length ? ` Came in: ${parts.join(", ")}.` : ""}`;
+      const tail = unknown ? " Unlock the project to see if there were others." : parts.length ? ` Came in: ${parts.join(", ")}.` : "";
+      return `Synced with Zotero ${at}, with problems: ${known.join(" ")}${tail}`;
     }
     case "stopped":
       return `Stopped syncing with Zotero ${at}: ${reason()} ${leftBehind(run)}`;
     case "failed":
-    default:
       return `Could not sync with Zotero ${at}: ${reason()} ${leftBehind(run)}`;
+    default:
+      // An outcome this build does not know (R250 f).
+      return `A sync ${at} was recorded by a newer version of this app.`;
   }
 }
 

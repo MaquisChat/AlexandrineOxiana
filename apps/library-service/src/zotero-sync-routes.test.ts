@@ -337,27 +337,37 @@ describe("settings (Accept 3)", () => {
     expect(await readFile(path, "utf8")).toBe(newer);
   });
 
-  it("nothing runs by itself after a settings write with automatic on, an unlock or a library open", async () => {
-    const libPath = await openLibrary();
-    const pid = await newProject(true);
-    addItems(U, 2);
-    expect((await saveSettings([linkOf(U, pid)], { automatic: true, everyMinutes: 30 })).status).toBe(200);
-    expect((await state()).automatic).toBe(true);
-    expect((await state()).nextRunAt).toBeUndefined();
-    await new Promise((r) => setTimeout(r, 400));
-    await svc.state.idle();
-    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
-    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
-    await new Promise((r) => setTimeout(r, 200));
-    await svc.state.idle();
-    await svc.close();
-    await start();
-    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).status).toBe(200);
-    await new Promise((r) => setTimeout(r, 400));
-    await svc.state.idle();
-    expect(z.requests).toEqual([]);
-    expect(syncEvents()).toEqual([]);
-    expect(await historyFile()).toBeUndefined();
+  it("nothing runs by itself after a settings write with automatic on, an unlock or a library open (the clock moved a day on each time)", async () => {
+    // Every timer the service makes from here on is a fake one (the clock also moves on with real time, so the
+    // service works): a start delayed by minutes or hours would fire when the clock is moved on.
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const aDayOn = async () => {
+        await vi.advanceTimersByTimeAsync(24 * 3_600_000);
+        await svc.state.idle();
+      };
+      await svc.close();
+      await start();
+      const libPath = await openLibrary();
+      const pid = await newProject(true);
+      addItems(U, 2);
+      expect((await saveSettings([linkOf(U, pid)], { automatic: true, everyMinutes: 30 })).status).toBe(200);
+      expect((await state()).automatic).toBe(true);
+      expect((await state()).nextRunAt).toBeUndefined();
+      await aDayOn();
+      expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+      expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+      await aDayOn();
+      await svc.close();
+      await start();
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).status).toBe(200);
+      await aDayOn();
+      expect(z.requests).toEqual([]);
+      expect(syncEvents()).toEqual([]);
+      expect(await historyFile()).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -566,9 +576,82 @@ describe("running (Accept 3–5)", () => {
     const held = holdSync();
     await call({ method: "POST", url: "/zotero/sync/run", body: {} });
     await held;
+    // R250 g: when the close comes to suspend the running batches (and then release the lock), the sync has already
+    // been stopped by the holder: no run, and its batch no longer among them.
+    const atSuspend: Array<{ running: unknown; batches: number }> = [];
+    const suspend = svc.state.suspendBatches.bind(svc.state);
+    svc.state.suspendBatches = async (s) => {
+      atSuspend.push({ running: svc.state.zoteroSync.running, batches: s.batches.size });
+      return suspend(s);
+    };
     await svc.close();
+    expect(atSuspend).toEqual([{ running: undefined, batches: 0 }]);
     const hist = await historyFile();
     expect((Object.values(hist.libraries)[0] as Array<{ outcome: string; reason: string }>)[0]).toMatchObject({ outcome: "stopped", reason: "app-closed" });
+  });
+
+  it("R250 g: two run requests sent together: one starts, one is refused", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    addItems(U, 3);
+    await saveSettings([linkOf(U, pid)]);
+    const both = await Promise.all([call({ method: "POST", url: "/zotero/sync/run", body: {} }), call({ method: "POST", url: "/zotero/sync/run", body: {} })]);
+    expect(both.map((r) => r.status).sort()).toEqual([202, 409]);
+    expect(both.find((r) => r.status === 409)!.json.error.message).toBe("A sync is already running.");
+    await svc.state.zoteroSync.idle();
+    expect(finished()).toHaveLength(1);
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(3);
+  });
+
+  it("R250 b: the run in progress is left out of the history", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    addItems(U, 3);
+    await saveSettings([linkOf(U, pid)]);
+    const [first] = await runAndWait();
+    addItems(U, 8, "More");
+    const held = holdSync();
+    await call({ method: "POST", url: "/zotero/sync/run", body: {} });
+    await held;
+    const runs = (await call({ url: "/zotero/sync/history" })).json.runs as Array<{ id: string; finishedAt?: string }>;
+    expect(runs.map((r) => r.id)).toEqual([first.id]);
+    expect((await state()).running).toMatchObject({ ref: U });
+    await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
+    expect((await call({ url: "/zotero/sync/history" })).json.runs).toHaveLength(2);
+  });
+
+  it("R250 j: a run that throws still ends with a finished event, a failed record with reason error", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    await saveSettings([linkOf(U, pid)]);
+    svc.state.zoteroSync.runner = async () => {
+      throw new Error("unexpected");
+    };
+    const [run] = await runAndWait();
+    expect(run).toMatchObject({ ref: U, projectId: pid, trigger: "manual", outcome: "failed", reason: "error" });
+    expect(syncEvents().at(-1)).toMatchObject({ state: "finished", run: { outcome: "failed", reason: "error" } });
+    expect(svc.state.zoteroSync.running).toBeUndefined();
+  });
+
+  it("R250 k: a sync's batch cannot be paused or resumed through the import routes", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    addItems(U, 8);
+    await saveSettings([linkOf(U, pid)]);
+    const held = holdSync();
+    await call({ method: "POST", url: "/zotero/sync/run", body: {} });
+    await held;
+    const batchId = [...svc.state.session!.batches.keys()][0]!;
+    const SENTENCE = "This import belongs to a Zotero sync. Stop it or run it again from the Zotero screen.";
+    const paused = await call({ method: "POST", url: `/imports/${batchId}/pause` });
+    expect([paused.status, paused.json.error.code, paused.json.error.message]).toEqual([409, "CONFLICT", SENTENCE]);
+    const r = await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
+    expect(r.json.run.batchId).toBe(batchId);
+    const resumed = await call({ method: "POST", url: `/imports/${batchId}/resume` });
+    expect([resumed.status, resumed.json.error.message]).toEqual([409, SENTENCE]);
+    expect((await call({ method: "POST", url: `/imports/${batchId}/pause` })).json.error.message).toBe(SENTENCE);
+    // The next sync resumes it.
+    expect((await runAndWait())[0]).toMatchObject({ outcome: "finished", batchId });
   });
 
   it("a read-only library refuses every changing route with 409 READ_ONLY", async () => {
@@ -623,6 +706,71 @@ describe("a manual import and a sync of one Zotero library never run together (A
     await svc.state.idle();
   });
 
+  it("R250 a: an import and a sync of one Zotero library sent together, in both orders and repeatedly: one runs, the project holds each item once", async () => {
+    await openLibrary();
+    addItems(U, 6);
+    const importOf = (pid: string) => call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "zotero-web", libraryType: "user", libraryId: "42" } } });
+    const runSync = () => call({ method: "POST", url: "/zotero/sync/run", body: {} });
+    for (let i = 0; i < 6; i++) {
+      const pid = await newProject(false, `P${i}`);
+      await saveSettings([linkOf(U, pid)]);
+      const before = finished().length;
+      const [imp, syn] = i % 2 === 0 ? await Promise.all([importOf(pid), runSync()]) : await Promise.all([runSync(), importOf(pid)]).then(([a, b]) => [b, a] as const);
+      expect(syn.status, syn.body).toBe(202);
+      await svc.state.zoteroSync.idle();
+      await svc.state.idle();
+      const run = finished().slice(before)[0]!.run;
+      // Exactly one of the two ran.
+      expect([imp.status === 200, run.outcome === "finished"].filter(Boolean), `round ${i}: import ${imp.status}, sync ${run.outcome}/${run.reason}`).toHaveLength(1);
+      if (imp.status !== 200) expect(imp.json.error.message).toBe("Another import from this Zotero library is running.");
+      else expect(run).toMatchObject({ outcome: "failed", reason: "import-running" });
+      expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total, `round ${i}`).toBe(6);
+    }
+  });
+
+  it("R250 a: a sync into project P while an import of the same Zotero library runs into project X is refused", async () => {
+    await openLibrary();
+    const x = await newProject(false, "X");
+    const p = await newProject(false, "P");
+    addItems(U, 10);
+    const heldImport = holdImport();
+    const started = await call({ method: "POST", url: `/projects/${x}/import`, body: { adapter: { kind: "zotero-web", libraryType: "user", libraryId: "42" } } });
+    expect(started.status).toBe(200);
+    await heldImport;
+    await saveSettings([linkOf(U, p)]);
+    const [run] = await runAndWait();
+    expect(run).toMatchObject({ outcome: "failed", reason: "import-running" });
+    expect((await call({ url: `/projects/${p}/imports` })).json.batches).toEqual([]);
+    expect((await call({ method: "POST", url: `/imports/${started.json.batchId}/cancel` })).status).toBe(200);
+    await svc.state.idle();
+  });
+
+  it("R250 a: two manual imports of one Zotero library sent together make one batch; 042 is library 42; a failed start leaves no claim", async () => {
+    await openLibrary();
+    const x = await newProject(false, "X");
+    const y = await newProject(false, "Y");
+    const sealed = await newProject(true, "Sealed");
+    addItems(U, 4);
+    const importOf = (pid: string, libraryId = "42") => call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "zotero-web", libraryType: "user", libraryId } } });
+    const both = await Promise.all([importOf(x), importOf(y, "042")]);
+    expect(both.map((r) => r.status).sort()).toEqual([200, 409]);
+    await svc.state.idle();
+    const batches = [...(await call({ url: `/projects/${x}/imports` })).json.batches, ...(await call({ url: `/projects/${y}/imports` })).json.batches];
+    expect(batches).toHaveLength(1);
+    // "042" is library 42: its batch says so.
+    const z42 = await importOf(y, "0042");
+    expect(z42.status, z42.body).toBe(200);
+    await svc.state.idle();
+    const yb = (await call({ url: `/projects/${y}/imports` })).json.batches as Array<{ batchId: string; ref?: string }>;
+    expect(yb.find((b) => b.batchId === z42.json.batchId)?.ref).toBe(U);
+    expect((await importOf(y, "000")).status).toBe(400);
+    // A start that fails (a locked project) gives its claim up: the next start works.
+    expect((await call({ method: "POST", url: `/projects/${sealed}/lock` })).status).toBe(200);
+    expect((await importOf(sealed)).status).toBe(423);
+    expect((await importOf(x)).status).toBe(200);
+    await svc.state.idle();
+  });
+
   it("R248: only an import of THE SAME Zotero library is refused while a sync runs; resuming one by hand too", async () => {
     await openLibrary();
     const pid = await newProject();
@@ -652,7 +800,8 @@ describe("a manual import and a sync of one Zotero library never run together (A
     const sameResume = await call({ method: "POST", url: `/imports/${cancelled[0]}/resume` });
     expect([sameResume.status, sameResume.json.error?.message]).toEqual([409, "Another import from this Zotero library is running."]);
     expect((await call({ method: "POST", url: `/imports/${cancelled[1]}/resume` })).status).toBe(200);
-    expect((await call({ method: "POST", url: `/projects/${w}/import`, body: { adapter: { kind: "zotero-web", libraryType: "group", libraryId: "9" } } })).status).toBe(200);
+    // The group library is now being read by its resumed batch: one more import of it, into any project, is refused (R250 a).
+    expect((await call({ method: "POST", url: `/projects/${w}/import`, body: { adapter: { kind: "zotero-web", libraryType: "group", libraryId: "9" } } })).status).toBe(409);
     await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
     await svc.state.idle();
   });
@@ -691,6 +840,19 @@ describe("undo of a sync batch (R206, R242)", () => {
     expect(next).toMatchObject({ outcome: "failed", reason: "sync-undone" });
     expect(z.requests).toEqual([]);
     expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(0);
+  });
+
+  it("R250 d: the undo says paused only when a link was in fact paused", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    addItems(U, 2);
+    await saveSettings([linkOf(U, pid)]);
+    const [run] = await runAndWait();
+    // The researcher removed the link before undoing: nothing is paused, and the answer does not say so.
+    await saveSettings([]);
+    const undone = await call({ method: "POST", url: `/imports/${run.batchId}/undo` });
+    expect(undone.status, undone.body).toBe(200);
+    expect(undone.json).not.toHaveProperty("zoteroSync");
   });
 });
 

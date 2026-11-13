@@ -10,6 +10,7 @@
  * `PUT /secrets/zotero-api-key`'s work), and answers what it may read, never the key. Errors are our own sentences:
  * whatever Zotero's servers said goes nowhere but a bounded debug note.
  */
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import {
   SecretStoreUnavailableError,
@@ -108,6 +109,36 @@ export class ZoteroSyncHolder {
   private current: CurrentRun | undefined;
   /** The latest moment Zotero asked this app to wait until (ms), as kept by the last record or key check. */
   private backoffUntil: number | undefined;
+  /**
+   * R250 a: the ONE place that says which Zotero libraries (canonical ref, `user:42`) are being read by an import or a
+   * sync in the open library, whatever the project. Taken in the same synchronous step as its check (claim), given up
+   * when its batch or run has ended. A claim of another session (a library since closed, switched or moved) counts
+   * for nothing and is replaced.
+   */
+  private readonly claims = new Map<string, { session: Session; token: object }>();
+  /** The batches the sync runs now (R250 k: not paused or resumed through the import routes). */
+  private readonly syncBatches = new Set<string>();
+  /** The runner (a test seam). */
+  runner: typeof syncZoteroLibrary = syncZoteroLibrary;
+
+  /**
+   * Claims the Zotero library `ref` for one import or sync of the session's library: the function that gives it up,
+   * or undefined when it is taken. Synchronous: no wait comes between the check and the claim.
+   */
+  claim(ref: string, session: Session): (() => void) | undefined {
+    const held = this.claims.get(ref);
+    if (held && held.session === session) return undefined;
+    const token = {};
+    this.claims.set(ref, { session, token });
+    return () => {
+      if (this.claims.get(ref)?.token === token) this.claims.delete(ref);
+    };
+  }
+
+  /** Whether the batch is one the sync runs now. */
+  ownsBatch(batchId: string): boolean {
+    return this.syncBatches.has(batchId);
+  }
 
   /** The run in progress: which link, and how far. */
   get running(): { ref: string; projectId: string; done: number; total: number } | undefined {
@@ -157,9 +188,20 @@ export class ZoteroSyncHolder {
         let linkEnded = false;
         let lastProgress = -Infinity;
         publish({ ref: link.ref, projectId: link.projectId, state: "checking" });
+        const at = new Date(now()).toISOString();
+        const failed = (reason: ZoteroSyncReason): ZoteroSyncRun => ({ id: randomUUID(), ref: link.ref, projectId: link.projectId, trigger: "manual", startedAt: at, finishedAt: at, outcome: "failed", reason });
+        // R250 a: this Zotero library, claimed before anything is awaited; taken by an import, the link is refused.
+        const release = this.claim(link.ref, s);
+        if (!release) {
+          const refused = failed("import-running");
+          cur.last = refused;
+          publish({ ref: link.ref, projectId: link.projectId, state: "finished", run: refused });
+          continue;
+        }
         const follow = (projectId: string, h: BatchHandle) => {
           // In the service's batch registry too: GET /jobs lists it, and a close suspends it if all else failed.
           s.batches.set(h.batchId, { projectId, handle: h });
+          this.syncBatches.add(h.batchId);
           state.track(
             (async () => {
               try {
@@ -179,7 +221,11 @@ export class ZoteroSyncHolder {
             "zotero sync",
           );
         };
-        const run = await syncZoteroLibrary(
+        // R250 j: whatever throws, the link's run ends with a "finished" event: the runner's record when it returned one
+        // (without counts if they could not be read), else a failed record with the reason "error".
+        let run: LibraryRun | undefined;
+        try {
+          run = await this.runner(
           {
             repo: s.repo,
             http: s.http,
@@ -197,16 +243,28 @@ export class ZoteroSyncHolder {
           },
           link,
           { trigger: "manual", signal: cur.ac.signal, ...(this.backoffUntil !== undefined ? { backoffUntil: this.backoffUntil } : {}) },
-        );
-        // The runner's record carries the back-off actually in force: kept in place of ours.
-        if (run.backoffUntil !== undefined) this.backoffUntil = Date.parse(run.backoffUntil);
-        // The batch leaves the registry with the run (a stopped run's batch is paused on disk, resumed by the next run).
-        if (run.batchId && s.batches.get(run.batchId)) s.batches.delete(run.batchId);
-        const shown = await withCounts(s, run);
+          );
+        } catch (err) {
+          state.opts.log.info({ note: err instanceof Error ? err.name : "error" }, "zotero sync: the run stopped on an unexpected error");
+        } finally {
+          release();
+        }
+        let shown: ZoteroSyncRun;
+        if (run) {
+          // The runner's record carries the back-off actually in force: kept in place of ours.
+          if (run.backoffUntil !== undefined) this.backoffUntil = Date.parse(run.backoffUntil);
+          // The batch leaves the registry with the run (a stopped run's batch is paused on disk, resumed by the next run).
+          if (run.batchId) {
+            this.syncBatches.delete(run.batchId);
+            if (s.batches.get(run.batchId)) s.batches.delete(run.batchId);
+          }
+          const { counts: _c, recordSaved: _r, ...bare } = run;
+          shown = await withCounts(s, run).catch(() => bare);
+        } else shown = failed("error");
         cur.last = shown;
         linkEnded = true;
         publish({ ref: link.ref, projectId: link.projectId, state: "finished", run: shown });
-        if (run.outcome === "stopped" || run.reason === "key-refused" || this.backoffInForce(now()) !== undefined) break;
+        if (shown.outcome === "stopped" || shown.reason === "key-refused" || this.backoffInForce(now()) !== undefined) break;
       }
     };
     state.track(
@@ -517,7 +575,9 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
   app.get("/zotero/sync/history", async (req): Promise<ZoteroSyncHistoryResponse> => {
     uiOnly(req.caller);
     const s = state.requireSession();
-    const runs = await readHistory(dir(), s.lib.id);
+    // R250 b: the run in progress is left out (the state's `running` and the events say it).
+    const running = holder.running;
+    const runs = (await readHistory(dir(), s.lib.id)).filter((r) => !(r.finishedAt === undefined && running?.ref === r.ref));
     // An encrypted project's counts come from its batch while it is unlocked: for the newest 20 (what the screen shows).
     const out: ZoteroSyncRun[] = [];
     for (const [i, r] of runs.entries()) out.push(await withCounts(s, r, i < 20));

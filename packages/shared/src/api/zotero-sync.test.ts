@@ -80,11 +80,11 @@ describe("status lines (plan Z8 Accept 1)", () => {
 
   it("a failure after partial work says some items came in; one whose counts are unknown says they may have", () => {
     expect(zoteroSyncStatusLine(run({ outcome: "failed", reason: "offline", batchId: "b1", counts: { ...ZERO, new: 4 } }), NOW)).toBe(
-      "Could not sync with Zotero at 14:32 today: Zotero could not be reached; check the internet connection. Some items came in before it stopped.",
+      "Could not sync with Zotero at 14:32 today: Zotero could not be reached; check the internet connection. Some items had already come in.",
     );
     expect(zoteroSyncStatusLine(run({ outcome: "failed", reason: "offline", batchId: "b1", counts: { ...ZERO, unchanged: 9 } }), NOW)).toContain("Nothing here was changed.");
-    expect(zoteroSyncStatusLine(run({ outcome: "failed", reason: "offline", batchId: "b1" }), NOW)).toContain("Some items may have come in before it stopped.");
-    expect(zoteroSyncStatusLine(run({ outcome: "stopped", reason: "stopped-by-you", batchId: "b1", counts: { ...ZERO, changed: 1 } }), NOW)).toBe("Stopped syncing with Zotero at 14:32 today: You stopped it. Some items came in before it stopped.");
+    expect(zoteroSyncStatusLine(run({ outcome: "failed", reason: "offline", batchId: "b1" }), NOW)).toContain("Some items may already have come in.");
+    expect(zoteroSyncStatusLine(run({ outcome: "stopped", reason: "stopped-by-you", batchId: "b1", counts: { ...ZERO, changed: 1 } }), NOW)).toBe("Stopped syncing with Zotero at 14:32 today: You stopped it. Some items had already come in.");
     expect(zoteroSyncStatusLine(run({ outcome: "failed", reason: "backing-off", backoffUntil: "2027-03-12T15:40:00.000Z" }), NOW)).toBe(
       "Could not sync with Zotero at 14:32 today: Zotero asked this app to wait until 15:40. Nothing here was changed.",
     );
@@ -107,7 +107,7 @@ describe("status lines (plan Z8 Accept 1)", () => {
   it("the other counts appear only when not zero, in the researcher's words", () => {
     const c = { ...ZERO, new: 1, conflicts: 2, goneMarked: 3, back: 1, clearedKept: 4 };
     expect(zoteroSyncStatusLine(run({ counts: c }), NOW)).toBe(
-      "Last synced with Zotero at 14:32 today: 1 new, 2 changed both in Zotero and here for you to decide, 3 marked as no longer in Zotero, 1 back in Zotero, 4 cleared in Zotero and kept here.",
+      "Last synced with Zotero at 14:32 today: 1 new, 2 changed in Zotero and here (waiting for your decision), 3 deleted or binned in Zotero (kept here), 1 back in Zotero, 4 cleared in Zotero (kept here).",
     );
     expect(zoteroSyncStatusLine(run({ counts: { ...ZERO, unchanged: 12 } }), NOW)).toBe("Last synced with Zotero at 14:32 today: no items were new or changed.");
     // An encrypted project's counts while it is locked: none are said.
@@ -123,6 +123,30 @@ describe("status lines (plan Z8 Accept 1)", () => {
     );
     expect(zoteroSyncStatusLine(run({ outcome: "finished-with-problems", counts: { ...ZERO, failed: 1 } }), NOW)).toContain("1 item could not be brought in.");
     expect(zoteroSyncStatusLine(run({ outcome: "finished-with-problems", counts: ZERO }), NOW)).toBe("Synced with Zotero at 14:32 today, with problems: Some attached files could not be downloaded; the next sync tries again.");
+  });
+
+  it("R250 c: a line names a cause only when its record shows it, one sentence for each way Z7 ends a run with problems", () => {
+    const fwp = (o: Partial<ZoteroSyncRun>) => zoteroSyncStatusLine(run({ outcome: "finished-with-problems", batchId: "b1", ...o }), NOW);
+    // 1. items that could not be brought in (counts.failed)
+    expect(fwp({ counts: { ...ZERO, failed: 2 } })).toBe("Synced with Zotero at 14:32 today, with problems: 2 items could not be brought in.");
+    // 2. refused redirect hosts
+    expect(fwp({ counts: ZERO, refusedHosts: ["a.example", "b.example"] })).toBe(
+      "Synced with Zotero at 14:32 today, with problems: Some attached files were not fetched, because Zotero sent them from a server this app does not use (a.example, b.example).",
+    );
+    // 3. downloads to retry: Z7's only remaining cause when the counts show no failed item, no host and no reason
+    expect(fwp({ counts: { ...ZERO, new: 1 } })).toBe("Synced with Zotero at 14:32 today, with problems: Some attached files could not be downloaded; the next sync tries again. Came in: 1 new.");
+    // 4. and 5. the two incomplete-scan reasons
+    expect(fwp({ counts: ZERO, reason: "deletions-unconfirmed" })).toBe(`Synced with Zotero at 14:32 today, with problems: ${ZOTERO_SYNC_REASON_TEXT["deletions-unconfirmed"]}`);
+    expect(fwp({ counts: ZERO, reason: "changes-incomplete" })).toBe(`Synced with Zotero at 14:32 today, with problems: ${ZOTERO_SYNC_REASON_TEXT["changes-incomplete"]}`);
+    // No counts (an encrypted project while it is locked): nothing is guessed.
+    expect(fwp({})).toBe("Synced with Zotero at 14:32 today, with problems. Unlock the project to see what they were.");
+    expect(fwp({ reason: "changes-incomplete" })).toBe(`Synced with Zotero at 14:32 today, with problems: ${ZOTERO_SYNC_REASON_TEXT["changes-incomplete"]} Unlock the project to see if there were others.`);
+    expect(fwp({})).not.toMatch(/attached files|could not be brought in/u);
+  });
+
+  it("R250 f: an outcome this build does not know is said as recorded by a newer version, and nothing more", () => {
+    expect(zoteroSyncStatusLine(run({ outcome: "merged-later" as ZoteroSyncRun["outcome"] }), NOW)).toBe("A sync at 14:32 today was recorded by a newer version of this app.");
+    expect(zoteroSyncStatusLine(run({ outcome: "merged-later" as ZoteroSyncRun["outcome"] }), new Date("2027-04-01T10:00:00Z"))).toBe("A sync on 12 March 2027 at 14:32 was recorded by a newer version of this app.");
   });
 });
 

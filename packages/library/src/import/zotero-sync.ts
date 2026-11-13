@@ -584,7 +584,7 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     // Pauses (Accept 3): a refused key pauses every link of the library; a library gone, this link. Not for a refusal
     // that only read a pause already there.
     if (started && run.reason === "key-refused") await settingsChange("the pause", () => pauseAllZoteroSyncLinks(deps.appConfigDir, deps.libraryId, fileOpts));
-    if (started && run.reason === "library-gone") await settingsChange("the pause", () => pauseLink(deps.appConfigDir, deps.libraryId, link.ref, "library-gone", fileOpts));
+    if (started && run.reason === "library-gone") await settingsChange("the pause", async () => void (await pauseLink(deps.appConfigDir, deps.libraryId, link.ref, "library-gone", fileOpts)));
     const saved = await save(2);
     // M3: a record the history could not take says so; the started record on disk then reads stopped / app-closed
     // in every later read (this run no longer runs), which says less than happened, never more.
