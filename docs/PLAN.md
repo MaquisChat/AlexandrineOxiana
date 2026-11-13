@@ -582,7 +582,7 @@ Update after every task; commit and push.
 | R8–R13 Reader: the remaining tasks | not started | | order: R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
 | Z1 Zotero sync: a stand-in for Zotero's servers | in review | 60eddc5 (worktree branch `worktree-agent-a262efde0a50e5b62`) | test files only; 24 tests; fix to come: `tests` in the library's tsconfig include (A2) |
 | Z2–Z12 Zotero sync: the remaining tasks | planned | — | order: Z2; Z3 and Z4; Z5; Z6; Z7; Z8; Z9; Z10 (the scheduler, only after the screen); Z11; Z12 after reader R12. Owner's questions in the ledger under R206 |
-| W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | in review | 7c44fea (worktree branch `worktree-agent-a375d680f9f00695a`) | 36 tests; the real `/usr/bin/stat` never run here (owner's Mac check) |
+| W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | fix round 1 | 7c44fea (worktree branch `worktree-agent-a375d680f9f00695a`) | review: W5 passes; W1 Critical in the plan's own rule (a placeholder could be judged local) — R208/A3: on macOS "local" rests only on the flag; then a scoped re-review by the same reviewer (`a0fc6186601fb5050`) |
 | W2–W10 Cloud folders: the remaining tasks | planned | — | order: W2; W6 beside it; W3; W4; W7; W8 and W9; W10. Owner's questions in the ledger under R207 |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
