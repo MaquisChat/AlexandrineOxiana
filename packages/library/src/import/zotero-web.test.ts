@@ -708,8 +708,10 @@ describe("unattended scans against the stand-in (Z2)", () => {
   it("incremental runs ask with includeTrashed=1 and yield a binned item as gone", async () => {
     const a = z.addItem(U, art("Binned"));
     const b = z.addItem(U, art("Edited"));
+    const never = z.addItem(U, art("Never imported here, binned"));
     const since = z.libraryVersion(U);
     z.trash(U, a);
+    z.trash(U, never); // not known here: neither content nor gone
     z.editItem(U, b, { title: "Edited again" });
     const { items, result } = await scanFake({ since }, { knownIds: known(a, b) });
     expect(goneOf(items)).toEqual([[`zotero:${a}`, "bin"]]);

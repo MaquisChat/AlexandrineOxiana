@@ -22,7 +22,7 @@
  *     instead (R66). A dry run, or `files: false`, downloads nothing.
  *
  * Unattended runs (Task Z2): every item request asks with `includeTrashed=1`, so an item in Zotero's
- * bin is seen; a top-level one is yielded as `{ gone: "bin" }` and never as content. An incremental
+ * bin is seen and never yielded as content; a top-level one known here is yielded as `{ gone: "bin" }`. An incremental
  * run yields each key of `/deleted?since=` that is known here (ScanContext.knownIds, this library
  * only) as `{ gone: "deleted" }`; child keys are counted only. A full run yields each known item it
  * did not see as `{ gone: "deleted" }` ONLY when its picture is whole: every page read, no restart
@@ -998,10 +998,11 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
     return;
   }
 
-  // Gone from Zotero. Only from a picture that is whole: every page read (a failure has returned above).
+  // Gone from Zotero: only items known here (an item never imported is neither content nor gone), and
+  // only from a picture that is whole: every page read (a failure has returned above).
   const knownHere = knownOf(ctx, ref);
   const gone = new Map<string, { gone: "deleted" | "bin"; version: string }>();
-  for (const t of tree.trashed.values()) if (!tree.parentOf(t)) gone.set(t.key, { gone: "bin", version: `bin:${t.version}` });
+  for (const t of tree.trashed.values()) if (!tree.parentOf(t) && knownHere.has(t.key)) gone.set(t.key, { gone: "bin", version: `bin:${t.version}` });
   // A run that restarted, was asked to back off, or dropped something from a page has no whole picture of what is missing.
   const whole = !restarted && result.backoffUntil === undefined && !api.lossy;
   let heldBack = false;

@@ -156,14 +156,7 @@ afterEach(async () => {
   await rm(tmp, { recursive: true, force: true });
 });
 
-// Guard (the Zotero stand-in is used below): a request made without a mock agent fails instead of reaching the network.
-let unguard: () => void;
-beforeAll(() => {
-  unguard = guardNetwork();
-});
-
 afterAll(async () => {
-  unguard();
   await shutdownExtractors();
 });
 
@@ -1649,6 +1642,12 @@ processing:
   let z: FakeZotero;
   let secrets: ReturnType<typeof useMemorySecrets>;
   let restoreDispatcher: () => void;
+  // Guard (this part only: other tests here talk to a loopback media worker through the global dispatcher).
+  let unguard: () => void;
+  beforeAll(() => {
+    unguard = guardNetwork();
+  });
+  afterAll(() => unguard());
   beforeEach(async () => {
     z = new FakeZotero();
     secrets = useMemorySecrets();
