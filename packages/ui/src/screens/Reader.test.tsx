@@ -9,6 +9,7 @@
  * stand-in handle (pdf.js's shapes), so each state can be reached exactly.
  */
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useLayoutEffect, useState } from "react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -374,6 +375,31 @@ describe("ReaderScreen (Task R7)", () => {
     release(late.handle);
     await flush();
     expect(late.destroy).toHaveBeenCalled();
+  });
+
+  it("the document is destroyed in the same commit that takes the screen away, before anything shown in its place is drawn (A9)", async () => {
+    serveDocument();
+    const f = fakeHandle(3);
+    openPdf.mockResolvedValueOnce(f.handle);
+    /** How many times the handle was destroyed when the screen shown in the reader's place was laid out. */
+    const seen: number[] = [];
+    function Ended() {
+      useLayoutEffect(() => {
+        seen.push(f.destroy.mock.calls.length);
+      }, []);
+      return <h2>Library closed</h2>;
+    }
+    let end: () => void = () => {};
+    function Host() {
+      const [shown, setShown] = useState(true);
+      end = () => setShown(false);
+      return shown ? <ReaderScreen api={readerApi(testClient())} projectId="p1" sourceId="s1" assetId="a1" readOnly={false} /> : <Ended />;
+    }
+    render(<Host />);
+    await screen.findByRole("region", { name: "Page 1 of 3" });
+    act(() => end());
+    expect(seen).toEqual([1]);
+    expect(screen.queryByRole("region", { name: "Page 1 of 3" })).toBeNull();
   });
 
   it("read-only shows the notice and no making control", async () => {

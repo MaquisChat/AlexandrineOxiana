@@ -300,14 +300,20 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     [assetId, projectId, sourceId, close, fail],
   );
 
-  useEffect(() => {
-    void open();
-    return () => {
+  // Letting go of the document (the screen goes, the file changes) happens in a LAYOUT effect's
+  // clean-up: in the same commit that takes the pages away, before whatever is shown in their place
+  // is laid out (A9: the reader ends at once). Opening stays a passive effect.
+  useLayoutEffect(
+    () => () => {
       gen.current++;
       abort.current?.abort();
       close();
-    };
-  }, [open, close]);
+    },
+    [open, close],
+  );
+  useEffect(() => {
+    void open();
+  }, [open]);
 
   useLayoutEffect(() => {
     const b = focusedPair.current;
