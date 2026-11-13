@@ -165,7 +165,8 @@ export interface ScanContext {
    * Zotero Web (Task Z4): the stored file's hash when the attachment `attKey` of the item `versionId` was
    * stored at version `attVersion` by an earlier import (the newest journal line of a batch of this kind
    * that was not undone says so, `ext.parts`, with the hash of the asset it became) and the item's source
-   * is still here; otherwise undefined. A known file is not downloaded (no request at all) and its
+   * still holds an asset entry with that hash (I1; or the source was deleted here and the item stays deleted,
+   * R73); otherwise undefined. A known file is not downloaded (no request at all) and its
    * annotations are anchored by `assetSha256`. Incremental adapters only; one that ignores it downloads.
    */
   fileKnown?(versionId: string, attKey: string, attVersion: number): { sha256: string } | undefined;

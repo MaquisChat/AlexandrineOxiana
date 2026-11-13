@@ -1801,12 +1801,8 @@ processing:
       const lines = await journal(p, n);
       await writeFile(journalPath(p, n), lines.map((e) => JSON.stringify(change(e))).join("\n") + "\n");
     };
-    /** Replaces an attachment's file in the stand-in (a new file version uploaded in Zotero): new bytes, md5 and version. */
-    const uploadNewFile = (att: string, bytes: Uint8Array) => {
-      const libOf = (z as unknown as { lib(ref: string): { items: Map<string, { file?: { bytes: Uint8Array } }> } }).lib.bind(z);
-      libOf(U).items.get(att)!.file!.bytes = bytes;
-      z.editItem(U, att, { md5: createHash("md5").update(bytes).digest("hex") });
-    };
+    /** A new file version uploaded in Zotero: new bytes, md5 and version (the stand-in's public replaceFile, M7). */
+    const uploadNewFile = (att: string, bytes: Uint8Array) => z.replaceFile(U, att, bytes);
 
     it("a tag added in Zotero does not download the PDF again", async () => {
       const p = await project();

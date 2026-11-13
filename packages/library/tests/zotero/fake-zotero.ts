@@ -545,6 +545,22 @@ export class FakeZotero {
   }
 
   /**
+   * A new file uploaded for an attachment in Zotero: its bytes, its md5 (and mtime) and the attachment's version
+   * change, as an upload does (Z4's "a new file version"). Storage and redirect settings are kept.
+   */
+  replaceFile(ref: string, key: string, bytes: Uint8Array): void {
+    const lib = this.lib(ref);
+    const it = this.item(lib, key);
+    if (!it.file) throw new Error(`FakeZotero: ${key} has no file`);
+    const v = ++lib.version;
+    it.file.bytes = bytes;
+    delete it.file.stale;
+    it.data.md5 = md5Hex(bytes);
+    it.data.mtime = Date.UTC(2024, 0, 1) + v * 1000;
+    this.touch(it, v);
+  }
+
+  /**
    * One file (an attachment) fails by itself, until cleared with `null` or after `times` answers (default
    * for ever). `api`: the answer on `/items/<key>/file` (403, 404, 500). `storage`: what the file host answers
    * for it (403, 404, 500, "drop" the connection, "cut" in mid-body). Everything else keeps working.

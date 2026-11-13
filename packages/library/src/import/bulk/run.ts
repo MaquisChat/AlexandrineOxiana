@@ -25,13 +25,17 @@
  * (LOCATION_REASON in the item's notes and the report). Journal lines of items that stored nothing
  * (duplicates, failures) are written with the next store or at the next checkpoint; after a crash
  * such an item is simply processed again, with the same result. A pause or suspend takes effect
- * between items, after the item in hand and before the adapter is asked for the next one.
+ * between items, after the item in hand and before the adapter is asked for the next one. So a suspend
+ * that arrives while the adapter fetches an item waits until that item is stored too (the service bounds
+ * the wait, then cancels; the batch stays resumable), and a pause asked for during the last item holds the
+ * finished run paused until it is resumed.
  *
  * Incremental adapters (R72) are told what the journals of the batches of their kind that were not
  * undone know: `knownIds`, and (Z4) `fileKnown`, from the parts of each item's newest line (attachment
- * version and stored file hash). A journal line records its stored files' parts only for files its
- * source holds, or known parts carried forward for the same source (partsFor); a known file the source
- * no longer holds (removed or destroyed here) is never brought back and is noted (`removedHere`).
+ * version and stored file hash), while the source still holds an asset entry with that hash (I1). A
+ * journal line records a part only when its source holds an asset entry with the file's hash (partsFor). A
+ * known file whose entries the researcher destroyed here (retention) is never brought back and is noted
+ * (`removedHere`); a file whose entry is simply gone (an undo) is downloaded again.
  *
  * Linking (`fileHandling: 'link'`) stores the file's absolute path and its path relative to the
  * library (LinkedRelativePath, R24) and copies nothing; it is refused in projects whose governance
@@ -135,8 +139,8 @@ export const ENGINE_FILE_NOTES = {
   /** A file the source links in place (a Zotero linked attachment) was copied: the project keeps files encrypted (R24, R72). */
   linkedCopied: "linked file copied into the library, because this project keeps its files encrypted",
   /**
-   * Z4: a file an earlier import stored (the journal says so) that the source no longer holds (removed or
-   * destroyed here): it is not downloaded and not brought back.
+   * Z4: a file an earlier import stored (the journal says so) whose asset the researcher destroyed here
+   * (retention; the asset entry says so): it is not downloaded and not brought back.
    */
   removedHere: "an attached file you removed here was not brought in again",
 } as const;
