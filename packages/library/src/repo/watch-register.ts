@@ -18,11 +18,12 @@
  * a settle), never one per scan. Reading folds the lines by key, streaming them (memory: one entry per key,
  * not per line).
  */
+import { statSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { isId } from "@ao/core";
 import { InvalidInputError } from "./errors.js";
-import { openLine, sealLine } from "./io.js";
+import { openLine, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation } from "./mutate.js";
 import type { RepoCore } from "./state.js";
 
@@ -115,48 +116,97 @@ function clean(e: WatchRegisterEntry): WatchRegisterEntry {
   };
 }
 
-/** Folds one line into the map (the later line wins; a rename drops the old key). False when the line is unreadable. */
+/** Applies one entry to a folded map (the later wins; a rename drops the old key). */
+function apply(map: Map<string, WatchRegisterEntry>, e: WatchRegisterEntry): void {
+  if (e.renamedFrom !== undefined && e.renamedFrom !== e.key) map.delete(e.renamedFrom);
+  map.delete(e.key); // re-inserted last: the map's order is the order of the latest lines
+  map.set(e.key, Object.freeze(e));
+}
+
+/** Folds one line into the map. False when the line is unreadable (torn, damaged, of another project). */
 function fold(map: Map<string, WatchRegisterEntry>, line: string, projectId: string, key: Uint8Array | null): boolean {
   try {
     const e = JSON.parse(key ? openLine(key, projectId, line, PURPOSE) : line) as unknown;
     if (!isRegisterEntry(e)) return false;
-    if (e.renamedFrom !== undefined && e.renamedFrom !== e.key) map.delete(e.renamedFrom);
-    map.delete(e.key); // re-inserted last: the map's order is the order of the latest lines
-    map.set(e.key, e);
+    apply(map, e);
     return true;
   } catch {
     return false;
   }
 }
 
+/** The register could not be read (A8, review I4). The message carries no path. */
+export class WatchRegisterUnreadableError extends Error {
+  constructor() {
+    super("The record of which files in this folder are already in the library could not be read.");
+    this.name = "WatchRegisterUnreadableError";
+  }
+}
+/** The register could not be written because of the file system (A8, review I4). The message carries no path. */
+export class WatchRegisterUnwritableError extends Error {
+  constructor() {
+    super("The record of which files in this folder are in the library could not be saved.");
+    this.name = "WatchRegisterUnwritableError";
+  }
+}
+const isSystemError = (err: unknown) => typeof (err as NodeJS.ErrnoException | null)?.code === "string" && typeof (err as NodeJS.ErrnoException).syscall === "string";
+
+/**
+ * The folded registers kept in memory (A8: not read whole again and again), per repository and file, with the
+ * file's identity when they were read (size, time, inode). A read whose file is unchanged returns the folded map
+ * without reading the file; a governed write updates the kept map in its commit.
+ */
+const caches = new WeakMap<RepoCore, Map<string, { sig: string; map: Map<string, WatchRegisterEntry> }>>();
+const sigOf = (st: { size: bigint; mtimeNs: bigint; ino: bigint }) => `${st.size}:${st.mtimeNs}:${st.ino}`;
+function cacheOf(core: RepoCore): Map<string, { sig: string; map: Map<string, WatchRegisterEntry> }> {
+  let c = caches.get(core);
+  if (!c) caches.set(core, (c = new Map()));
+  return c;
+}
+
 /**
  * The register of a watch, folded by key. Refuses a locked encrypted project (ProjectLockedError) before
- * anything is read. Missing → empty. Unreadable lines (a line torn by a crash the marker could not take back,
- * a line of another project) are skipped.
+ * anything is read. Missing → empty. Unreadable lines — a last line torn by an unclean stop, a damaged line, a
+ * line of another project — are skipped. A file that cannot be read at all → WatchRegisterUnreadableError.
+ * The caller gets its own Map (the entries are frozen).
  */
 export async function readWatchRegister(core: RepoCore, projectId: string, watchId: string): Promise<Map<string, WatchRegisterEntry>> {
   checkWatchId(watchId);
   const st = core.state(projectId);
   core.assertUnlocked(st);
   const key = core.encrypted(st) ? core.key(st).key : null;
-  const map = new Map<string, WatchRegisterEntry>();
   const abs = core.abs(registerRel(st.rel, watchId));
-  let stream;
+  const cache = cacheOf(core);
+  let sig: string;
   try {
-    const fh = await fsp.open(abs, "r");
-    stream = fh.createReadStream({ encoding: "utf8" });
+    sig = sigOf(await fsp.stat(abs, { bigint: true }));
+  } catch (err) {
+    cache.delete(abs);
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+    throw new WatchRegisterUnreadableError();
+  }
+  const kept = cache.get(abs);
+  if (kept && kept.sig === sig) return new Map(kept.map);
+  const map = new Map<string, WatchRegisterEntry>();
+  let fh: fsp.FileHandle;
+  try {
+    fh = await fsp.open(abs, "r");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return map;
-    throw err;
+    throw new WatchRegisterUnreadableError();
   }
+  const stream = fh.createReadStream({ encoding: "utf8" });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   try {
     for await (const line of lines) if (line.trim()) fold(map, line, st.project.id, key);
+  } catch {
+    throw new WatchRegisterUnreadableError();
   } finally {
     lines.close();
     stream.destroy();
   }
-  return map;
+  cache.set(abs, { sig, map });
+  return new Map(map);
 }
 
 /** Counts by state, every state present (the audit's `states`). */
@@ -178,13 +228,42 @@ export async function recordWatchedFiles(core: RepoCore, projectId: string, watc
   if (entries.length === 0) return;
   for (const e of entries) if (!isRegisterEntry(e)) throw new InvalidInputError("A register entry is not well formed.");
   const lines = entries.map(clean);
-  await runMutation(
+  try {
+    await write(core, projectId, watchId, lines);
+  } catch (err) {
+    // A file-system error's message names the file: never passed on (R96, review I4).
+    if (isSystemError(err)) throw new WatchRegisterUnwritableError();
+    throw err;
+  }
+}
+
+function write(core: RepoCore, projectId: string, watchId: string, lines: WatchRegisterEntry[]): Promise<void> {
+  return runMutation(
     core,
     projectId,
     REQ,
     async (tx) => {
       const st = tx.state;
       const rel = registerRel(st.rel, watchId);
+      const abs = core.abs(rel);
+      // A last line torn by an unclean stop (not by this app's own writes, which the marker takes back) is removed
+      // in this change, so that the register can be appended to again (A8, review I4).
+      const raw = await readMaybe(abs);
+      if (raw && raw.length > 0 && raw[raw.length - 1] !== 0x0a) {
+        const end = raw.lastIndexOf(0x0a) + 1;
+        await tx.writeFile(rel, raw.subarray(0, end), { mode: CHANGE_LOG_MODE });
+      }
+      tx.onCommit(() => {
+        const cache = cacheOf(core);
+        const kept = cache.get(abs);
+        if (!kept) return;
+        try {
+          for (const e of lines) apply(kept.map, { ...e });
+          kept.sig = sigOf(statSync(abs, { bigint: true }));
+        } catch {
+          cache.delete(abs);
+        }
+      });
       if (tx.encrypted) {
         const { key, keyId } = tx.key();
         for (const e of lines) await tx.appendLine(rel, sealLine(key, keyId, st.project.id, JSON.stringify(e), PURPOSE));
@@ -205,7 +284,7 @@ export async function readWatchOrigins(core: RepoCore, projectId: string, source
     names = await fsp.readdir(core.abs(`${st.rel}/${DIR}`));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw err;
+    throw new WatchRegisterUnreadableError();
   }
   const out: Array<{ watchId: string; entry: WatchRegisterEntry }> = [];
   for (const n of names.sort()) {

@@ -1,9 +1,10 @@
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import fsp, { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type AuditEvent, type Project } from "@ao/core";
 import { MockAgent } from "undici";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -15,7 +16,7 @@ import { HttpClient } from "../lookup/index.js";
 import { InvalidInputError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import type { Repo } from "./repo.js";
 import { SimulatedCrash, openTestRepo, seams, type CrashPoint } from "./testing.js";
-import { WATCH_REGISTER_OP, type WatchRegisterEntry } from "./watch-register.js";
+import { WATCH_REGISTER_OP, WatchRegisterUnreadableError, WatchRegisterUnwritableError, type WatchRegisterEntry } from "./watch-register.js";
 
 const GOV = `identifiability:
   containsIdentifiable: false
@@ -228,6 +229,72 @@ describe("the register of a watched folder (Task W3)", () => {
     await expect(ro.recordWatchedFiles(p.id, watchId, [entry("b.pdf")])).rejects.toBeInstanceOf(ReadOnlyLibraryError);
     expect(await readFile(registerFile(p, watchId))).toEqual(before);
     expect([...(await ro.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf"]);
+  });
+
+  for (const encrypted of [false, true]) {
+    it(`a torn last line is survived: read without it, removed by the next governed write (${encrypted ? "sealed" : "plain"})`, async () => {
+      const p = await project(encrypted);
+      const watchId = newId();
+      const a = entry("a.pdf");
+      await repo.recordWatchedFiles(p.id, watchId, [a]);
+      await appendFile(registerFile(p, watchId), '{"key":"half'); // an unclean stop by something else (no newline)
+      expect([...(await repo.watchRegister(p.id, watchId)).values()]).toEqual([a]);
+      const b = entry("b.pdf");
+      await repo.recordWatchedFiles(p.id, watchId, [b]);
+      const raw = await readFile(registerFile(p, watchId), "utf8");
+      expect(raw).not.toContain("half");
+      expect(raw.endsWith("\n")).toBe(true);
+      expect(raw.trim().split("\n")).toHaveLength(2);
+      expect([...(await repo.watchRegister(p.id, watchId)).values()]).toEqual([a, b]);
+    });
+  }
+
+  it("a register that cannot be read or written says so in plain words, never with a path", async () => {
+    const p = await project();
+    const watchId = newId();
+    await mkdir(registerFile(p, watchId), { recursive: true }); // a folder where the file should be
+    const read = await repo.watchRegister(p.id, watchId).catch((e: unknown) => e as Error);
+    expect(read).toBeInstanceOf(WatchRegisterUnreadableError);
+    const write = await repo.recordWatchedFiles(p.id, watchId, [entry("a.pdf")]).catch((e: unknown) => e as Error);
+    expect(write).toBeInstanceOf(WatchRegisterUnwritableError);
+    for (const e of [read as Error, write as Error]) {
+      expect(e.message).not.toContain(tmp);
+      expect(e.message).not.toContain("/");
+    }
+    expect(await txnMarkers()).toEqual([]);
+  });
+
+  it("the register is not read whole again and again: kept folded, refreshed by its own writes", async () => {
+    const p = await project(true);
+    const watchId = newId();
+    const a = entry("a.pdf");
+    await repo.recordWatchedFiles(p.id, watchId, [a]);
+    const opens = vi.spyOn(fsp, "open");
+    syncBuiltinESMExports();
+    try {
+      const file = registerFile(p, watchId);
+      const reads = () => opens.mock.calls.filter((c) => String(c[0]) === file).length;
+      for (let i = 0; i < 3; i++) expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf"]);
+      for (let i = 0; i < 2; i++) expect(await repo.watchOrigins(p.id, a.sourceId)).toEqual([{ watchId, entry: a }]);
+      expect(reads()).toBeLessThanOrEqual(1);
+      const n = reads();
+      const b = entry("b.pdf");
+      await repo.recordWatchedFiles(p.id, watchId, [b]);
+      expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf", "b.pdf"]);
+      expect(await repo.watchOrigins(p.id, b.sourceId)).toEqual([{ watchId, entry: b }]);
+      expect(reads()).toBe(n);
+      // A change made by something else is seen (the file's identity changed): read once more.
+      await appendFile(file, "\n");
+      expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf", "b.pdf"]);
+      expect(reads()).toBe(n + 1);
+      // The caller's map is its own.
+      const m = await repo.watchRegister(p.id, watchId);
+      m.delete("a.pdf");
+      expect((await repo.watchRegister(p.id, watchId)).has("a.pdf")).toBe(true);
+    } finally {
+      vi.restoreAllMocks();
+      syncBuiltinESMExports();
+    }
   });
 });
 
