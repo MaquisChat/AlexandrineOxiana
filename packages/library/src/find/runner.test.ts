@@ -214,6 +214,7 @@ afterEach(async () => {
   runnerSeams.beforeCreate = undefined;
   runnerSeams.afterCreate = undefined;
   runnerSeams.inAct = undefined;
+  runnerSeams.inCreate = undefined;
   await agent.close();
   handle.close();
   await lib.close();
@@ -548,21 +549,18 @@ describe("one work, one source: under every race", () => {
   it("an import holding the store turn while the entry's answer comes: the import makes the source, the entry says Already (M6)", async () => {
     know(LINE, cr(ZORBLATT));
     const p = await project();
-    const r = runner();
-    // (R245: an add takes the store's turn, so it is made before the import holds it; the lookup waits meanwhile.)
-    const releaseLookup = gated.hold(parseReference(LINE)!.text);
-    const { added } = await r.add(p.id, [LINE]);
-    await until(() => gated.sent.length >= 2, "the lookup");
     let releaseImport!: () => void;
     const importHeld = new Promise<void>((res) => (releaseImport = res));
     let inTurn = false;
-    // The import takes the turn and holds it (as an import does while it copies a file).
+    // The import takes the turn first and holds it (as an import does while it copies a file).
     const imported = importLikeAttach(p, ZORBLATT, async () => {
       inTurn = true;
       await importHeld;
     });
     await until(() => inTurn, "the import to hold the turn");
-    releaseLookup();
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup");
     await new Promise((res) => setTimeout(res, 50)); // the entry's answer is in and its completion waits for the turn
     expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
     releaseImport();
@@ -1256,11 +1254,6 @@ describe("R237 (b): nothing the runner waits on can hold it for ever", () => {
   it(`stopAll settles within its bound (${FIND_STOP_SETTLE_MS} ms), even with the store's turn held by an import`, async () => {
     know(LINE, cr(ZORBLATT));
     const p = await project();
-    const r = runner();
-    // (R245: an add takes the store's turn, so it is made before the import holds it; the lookup waits meanwhile.)
-    const releaseLookup = gated.hold(parseReference(LINE)!.text);
-    await r.add(p.id, [LINE]);
-    await until(() => gated.sent.length >= 2, "the lookup");
     let releaseImport!: () => void;
     const held = new Promise<void>((res) => (releaseImport = res));
     let inTurn = false;
@@ -1269,7 +1262,9 @@ describe("R237 (b): nothing the runner waits on can hold it for ever", () => {
       await held;
     });
     await until(() => inTurn, "the import to hold the turn");
-    releaseLookup();
+    const r = runner();
+    await r.add(p.id, [LINE]);
+    await until(() => gated.sent.length >= 2, "the lookup");
     await new Promise((res) => setTimeout(res, 50));
     const t0 = Date.now();
     await r.stopAll();
@@ -1646,7 +1641,6 @@ describe("R245: nothing of the runner writes after the library's lock is release
     const before = await bytesOf(p);
     const turn = await holdTurn(p);
     const acts = [
-      r.add(p.id, ["Another Line Entirely"]),
       r.choose(p.id, choose.id, choose.candidates![0]!.id),
       r.retry(p.id, none.id),
       r.remove(p.id, none.id),
@@ -1657,6 +1651,8 @@ describe("R245: nothing of the runner writes after the library's lock is release
     await turn.done;
     await stopping;
     for (const a of await Promise.all(acts)) expect(a).toBeInstanceOf(FindRunnerClosedError);
+    // (R247 M4: an add takes no turn; after stopAll it is refused at once.)
+    await expect(r.add(p.id, ["Another Line Entirely"])).rejects.toBeInstanceOf(FindRunnerClosedError);
     await new Promise((res) => setTimeout(res, 50));
     expect((await bytesOf(p)).equals(before)).toBe(true);
     expect(await sourcesOf(p)).toEqual([]);
@@ -1669,7 +1665,6 @@ describe("R245: nothing of the runner writes after the library's lock is release
     const before = await bytesOf(p);
     const turn = await holdTurn(p);
     const acts = [
-      r.add(p.id, ["Another Line Entirely"]),
       r.choose(p.id, choose.id, null),
       r.confirmDuplicate(p.id, choose.id, true),
       r.addHereAsWell(p.id, choose.id),
@@ -1681,6 +1676,7 @@ describe("R245: nothing of the runner writes after the library's lock is release
     turn.free();
     await turn.done;
     for (const a of await Promise.all(acts)) expect(a).toBeInstanceOf(FindProjectStoppedError);
+    await expect(r.add(p.id, ["Another Line Entirely"])).rejects.toBeInstanceOf(FindProjectStoppedError);
     expect((await bytesOf(p)).equals(before)).toBe(true);
     // After resume the researcher can act again.
     r.resume(p.id);
@@ -1710,11 +1706,140 @@ describe("R245: nothing of the runner writes after the library's lock is release
     release();
     await Promise.all([act, stopping]);
     expect(Date.now() - t0).toBeLessThan(FIND_STOP_SETTLE_MS);
-    expect(order[order.length - 1]).toBe("stopAll settled");
-    expect(order).toHaveLength(2);
+    expect(order.sort()).toEqual(["act done", "stopAll settled"]);
     // Whatever the act did, it did before stopAll settled: nothing changes afterwards.
     const after = await bytesOf(p);
     await new Promise((res) => setTimeout(res, 50));
     expect((await bytesOf(p)).equals(after)).toBe(true);
+  });
+});
+
+describe("R247: a creation under way finishes before the lock goes; a half-made record is healed; adds never wait behind an import", () => {
+  const held = () => {
+    let release!: () => void;
+    let entered = false;
+    const gate = new Promise<void>((res) => (release = res));
+    return {
+      seam: async () => {
+        entered = true;
+        await gate;
+      },
+      entered: () => entered,
+      release: () => release(),
+    };
+  };
+
+  it(`(d) a creation held inside its turn when stopAll is called: stopAll waits past its bound (${FIND_STOP_SETTLE_MS} ms); the record and the entry's line are both there`, async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    const r = runner();
+    const h = held();
+    runnerSeams.inCreate = h.seam;
+    const { added } = await r.add(p.id, [LINE]);
+    await until(h.entered, "the creation to be under way");
+    let settledAt = 0;
+    const t0 = Date.now();
+    const stopping = r.stopAll().then(() => (settledAt = Date.now()));
+    await new Promise((res) => setTimeout(res, FIND_STOP_SETTLE_MS + 300));
+    expect(settledAt).toBe(0);
+    h.release();
+    await stopping;
+    expect(settledAt - t0).toBeGreaterThan(FIND_STOP_SETTLE_MS);
+    const e = (await entryOf(p, added[0]!.id))!;
+    const sources = await sourcesOf(p);
+    expect(sources).toHaveLength(1);
+    expect(e).toMatchObject({ state: "record-complete", sourceId: sources[0]!.source.id });
+  }, 20_000);
+
+  it("(d) an act held inside its turn when stopAll is called: stopAll waits past its bound; the act finishes", async () => {
+    const p = await project();
+    const r = runner();
+    know("Zorblatt Variants of Habitus", cr({ ...ZORBLATT, doi: "10.5555/ao.f4.v1" }, { ...ZORBLATT, doi: "10.5555/ao.f4.v2", year: 2003 }));
+    const { added } = await r.add(p.id, ["Zorblatt Variants of Habitus"]);
+    await settled(p, added[0]!.id);
+    const c = (await entryOf(p, added[0]!.id))!;
+    expect(c.state).toBe("choose");
+    const h = held();
+    runnerSeams.inAct = h.seam;
+    const act = r.choose(p.id, c.id, c.candidates![0]!.id);
+    await until(h.entered, "the act to be inside its turn");
+    let settledAt = 0;
+    const stopping = r.stopAll().then(() => (settledAt = Date.now()));
+    await new Promise((res) => setTimeout(res, FIND_STOP_SETTLE_MS + 300));
+    expect(settledAt).toBe(0);
+    h.release();
+    expect((await act).state).toBe("record-complete");
+    await stopping;
+    expect(await sourcesOf(p)).toHaveLength(1);
+  }, 20_000);
+
+  for (const how of ["choose", "a duplicate answer"] as const) {
+    it(`(e) M1: a lock between the record's creation and the entry's line, after ${how}, is healed at resume by a new runner`, async () => {
+      const p = await project({ encrypted: true });
+      let r = runner();
+      let e: FindEntry;
+      if (how === "choose") {
+        know("Zorblatt Variants of Habitus", cr({ ...ZORBLATT, doi: "10.5555/ao.f4.v1" }, { ...ZORBLATT, doi: "10.5555/ao.f4.v2", year: 2003 }));
+        const { added } = await r.add(p.id, ["Zorblatt Variants of Habitus"]);
+        await settled(p, added[0]!.id);
+        e = (await entryOf(p, added[0]!.id))!;
+        expect(e.state).toBe("choose");
+      } else {
+        await repo.createSource(p.id, draftOf({ ...ZORBLATT, doi: undefined }), [], { provenance: plainProvenance() });
+        know(LINE, cr(ZORBLATT));
+        const { added } = await r.add(p.id, [LINE]);
+        await settled(p, added[0]!.id);
+        e = (await entryOf(p, added[0]!.id))!;
+        expect(e.state).toBe("maybe-duplicate");
+      }
+      runnerSeams.afterCreate = () => {
+        r.stop(p.id);
+        repo.lockProject(p.id);
+      };
+      const press = how === "choose" ? r.choose(p.id, e.id, e.candidates![0]!.id) : r.confirmDuplicate(p.id, e.id, false);
+      await expect(press).rejects.toBeTruthy();
+      runnerSeams.afterCreate = undefined;
+      await r.stopAll();
+      await repo.unlockProject(p.id, "pw");
+      const before = await sourcesOf(p);
+      const made = before.filter((x) => x.source.provenance.captureMethod === "reference_lookup");
+      expect(made).toHaveLength(1);
+      expect((await entryOf(p, e.id))!.state).toBe(e.state);
+      // A new runner (as after a close and reopen) heals it at resume.
+      r = runner();
+      r.resume(p.id);
+      await until(async () => (await entryOf(p, e.id))!.state === "record-complete", "the entry to be healed");
+      expect((await entryOf(p, e.id))!.sourceId).toBe(made[0]!.source.id);
+      expect(await sourcesOf(p)).toHaveLength(before.length);
+    });
+  }
+
+  it("(e) M2: a line the parser refuses is named by its number and its true cause, never by its text", async () => {
+    const p = await project();
+    const r = runner();
+    const err = await r.add(p.id, ["Zorblatt Grammar of Habitus", "\u0000\u0007\u202e"]).catch((x: unknown) => x);
+    expect(err).toBeInstanceOf(InvalidInputError);
+    expect((err as Error).message).toContain("Line 2");
+    expect((err as Error).message).toMatch(/cannot be shown/);
+    expect((err as Error).message).not.toContain("Zorblatt");
+    expect((await queue(p)).size).toBe(0);
+  });
+
+  it("(e) M4: an add while an import holds the project's store turn is written at once; stopAll waits for an add already writing", async () => {
+    const p = await project();
+    let releaseImport!: () => void;
+    const importHeld = new Promise<void>((res) => (releaseImport = res));
+    let inTurn = false;
+    const imported = importLikeAttach(p, { ...ZORBLATT, doi: "10.5555/ao.f4.other" }, async () => {
+      inTurn = true;
+      await importHeld;
+    });
+    await until(() => inTurn, "the import to hold the turn");
+    const r = runner();
+    gated.hold(parseReference(LINE)!.text);
+    const { added } = await r.add(p.id, [LINE]);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
+    releaseImport();
+    await imported;
   });
 });

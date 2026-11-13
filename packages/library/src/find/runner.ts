@@ -156,10 +156,11 @@ export class FindProjectStoppedError extends Error {
 }
 
 /**
- * Test seams (R47: honoured only under NODE_ENV=test): run just before and just after a record's creation; and
- * `inAct`, awaited inside a researcher's act, in its store turn, right after its check (R245).
+ * Test seams (R47: honoured only under NODE_ENV=test): run just before and just after a record's creation; `inAct`,
+ * awaited inside a researcher's act, in its store turn, right after its check (R245); and `inCreate`, awaited inside
+ * the store turn just before a record is made (R247 d).
  */
-export const runnerSeams: { beforeCreate?: () => void; afterCreate?: () => void; inAct?: () => Promise<void> } = {};
+export const runnerSeams: { beforeCreate?: () => void; afterCreate?: () => void; inAct?: () => Promise<void>; inCreate?: () => Promise<void> } = {};
 const seam = (f: (() => void) | undefined) => {
   if (f && process.env.NODE_ENV === "test") f();
 };
@@ -390,6 +391,21 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const runs = new Map<string, Run>();
   const running = new Set<string>();
   const inflight = new Set<Promise<void>>();
+  /**
+   * What is inside a store turn now: a researcher's act past its check, an add writing its entries, the runner's own
+   * work that has started its turn (R247 d). `stopAll` waits for these without a time limit, like every governed write
+   * (they do no network); the FIND_STOP_SETTLE_MS bound is for what the runner does outside a turn.
+   */
+  const inTurnNow = new Set<Promise<void>>();
+  function holdUntilDone<T>(p: Promise<T>): Promise<T> {
+    const done = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    inTurnNow.add(done);
+    void done.finally(() => inTurnNow.delete(done));
+    return p;
+  }
   /** Entry → the source this runner made for it whose entry line is not written yet (adopted, never made twice). */
   const madeHere = new Map<string, string>();
   /** Projects for which nothing can be written now (cleared by `resume`). */
@@ -569,23 +585,18 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    * A researcher's act in the project's store turn (R245). INSIDE the turn and before anything is written it checks
    * that the runner is not closed (`stopAll`) and the project not stopped (`stop`, or a stop the runner made itself):
    * whatever the act waited on, after either has been called it writes nothing and is refused. An act that has passed
-   * its check is counted in flight, so that `stopAll` waits for it (bounded, FIND_STOP_SETTLE_MS).
+   * its check is finished, and `stopAll` waits for it without a time limit (R247 d: it does no network).
    */
   function act<T>(pid: string, fn: () => Promise<T>): Promise<T> {
     return turn(pid, async () => {
       if (closed) throw new FindRunnerClosedError();
       if (runs.get(pid)?.stopped) throw new FindProjectStoppedError();
-      const p = (async () => {
-        if (runnerSeams.inAct && process.env.NODE_ENV === "test") await runnerSeams.inAct();
-        return fn();
-      })();
-      const settled = p.then(
-        () => undefined,
-        () => undefined,
+      return holdUntilDone(
+        (async () => {
+          if (runnerSeams.inAct && process.env.NODE_ENV === "test") await runnerSeams.inAct();
+          return fn();
+        })(),
       );
-      inflight.add(settled);
-      void settled.finally(() => inflight.delete(settled));
-      return p;
     });
   }
 
@@ -598,7 +609,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     let started = false;
     const p = turn(pid, async () => {
       started = true;
-      return live() ? fn() : undefined;
+      return holdUntilDone(live() ? fn() : Promise.resolve(undefined));
     });
     p.catch(() => {});
     try {
@@ -766,8 +777,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     const cand = boundCandidate(given);
     const at = stamp();
     const keep = { candidates: cur.candidates?.some((c) => c.id === cand.id) ? cur.candidates : [cand], chosen: cand.id, match: o.match };
-    const settle = async (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = []) => {
-      if (!live()) return null;
+    // Once the record is made, its entry's line is written whatever happened meanwhile (`force`): a stop or a close
+    // waits for this turn (R247 d), and a lock in between is healed at `resume` (R247 e).
+    const settle = async (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = [], force = false) => {
+      if (!force && !live()) return null;
       const [w] = await write(pid, [evolve(cur, { ...keep, ...patch }, ["reason", "nextTryAt", ...drop], at)], "update");
       return w!;
     };
@@ -792,6 +805,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // The record: one source without a file, in one governed change (capture `reference_lookup` and store,
     // evaluated and audited as `source.create`), under the project's own rules like every other import (R237 a).
     // Its provenance names this entry from its creation.
+    if (runnerSeams.inCreate && process.env.NODE_ENV === "test") await runnerSeams.inCreate();
     const { identifiable, legalBasis } = await storeInputs(repo, pid, FIND_LEGAL_CATEGORY, deps.debug);
     const provenance: Provenance = {
       captureMethod: "reference_lookup",
@@ -838,9 +852,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     madeHere.set(eid, sourceId);
     seam(runnerSeams.afterCreate);
-    // Stopped meanwhile: the record stands and the entry stays "looking-up"; this run (madeHere) or the next
-    // resume (the source records) adopts it.
-    return settle({ state: "record-complete", sourceId }, ["duplicateOf", "elsewhere", ...(collectionGone ? (["collectionId"] as const) : [])]);
+    // A lock meanwhile: the line cannot be written; the record stands, and this run (madeHere) or the next resume
+    // (the source records) adopts it, whatever state the entry is in (R247 e).
+    return settle({ state: "record-complete", sourceId }, ["duplicateOf", "elsewhere", ...(collectionGone ? (["collectionId"] as const) : [])], true);
   }
 
   // ------------------------------------------------------------------------------------------------------------
@@ -1073,16 +1087,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     repo.getProject(projectId); // NotFoundError for an unknown project
     if (!Array.isArray(lines)) throw new InvalidInputError("The lines to add are not a list.");
     if (collectionId !== undefined && (typeof collectionId !== "string" || !isId(collectionId))) throw new InvalidInputError("The collection is not one of this project's.");
-    const given = lines.filter((l) => typeof l === "string" && l.trim() !== "");
+    const given = lines.map((l, i) => ({ l, n: i + 1 })).filter((x): x is { l: string; n: number } => typeof x.l === "string" && x.l.trim() !== "");
     if (given.length === 0) throw new InvalidInputError("Type at least one reference.");
     if (given.length > FIND_ADD_MAX_LINES) throw new InvalidInputError(`At most ${FIND_ADD_MAX_LINES} lines can be added at once.`);
     const seen = new Set<string>();
     const at = stamp();
     const added: FindEntry[] = [];
     let mergedLines = 0;
-    for (const line of given) {
+    for (const { l: line, n } of given) {
       const ref = parseReference(line);
-      if (!ref || ref.text.length > FIND_TYPED_MAX) throw new InvalidInputError("Each line must be 2 to 500 characters.");
+      // Named by its number with the true cause, never by its text (R247 M2).
+      if (!ref || ref.text.length > FIND_TYPED_MAX) {
+        throw new InvalidInputError(`Line ${n} is not 2 to 500 characters long once characters that cannot be shown (such as control characters) are left out. Nothing was added.`);
+      }
       const norm = ref.tokens.length ? ref.tokens.join(" ") : ref.text.toLowerCase();
       if (seen.has(norm)) {
         mergedLines++;
@@ -1091,7 +1108,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       seen.add(norm);
       added.push({ id: newId(), projectId, ...(collectionId ? { collectionId } : {}), typed: ref.text, state: "looking-up", createdAt: at, updatedAt: at, attempts: 0 });
     }
-    const written = await act(projectId, () => write(projectId, added, "add"));
+    // Not in the project's store turn (R247 M4: an import holds it for a whole file, lookups included): the check is
+    // made here, at once, and an add past it is waited for by `stopAll` like an act in its turn.
+    if (closed) throw new FindRunnerClosedError();
+    if (runs.get(projectId)?.stopped) throw new FindProjectStoppedError();
+    const written = await holdUntilDone(write(projectId, added, "add"));
     // A stop that comes after the write: nothing runs until `resume` (enqueue does nothing for a stopped run).
     for (const e of written) enqueue(projectId, e.id);
     return { added: written, mergedLines };
@@ -1121,7 +1142,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       }
       const cand = cur.candidates?.find((c) => c.id === candidateId);
       if (!cand) throw new FindEntryStateError();
-      const done = await completeIn(projectId, entryId, cand, { match: { method: "find-chosen", confidence: 1 }, expect: (e) => sameVersion(e, cur) });
+      const done = await completeIn(projectId, entryId, cand, { match: { method: "find-chosen", confidence: 1 }, expect: (e) => sameVersion(e, cur), live: () => true });
       if (!done) throw new FindEntryStateError();
       return done;
     });
@@ -1142,7 +1163,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const cand = cur.candidates?.find((c) => c.id === cur.chosen) ?? cur.candidates?.[0];
       if (!cand) throw new FindEntryStateError();
       // The researcher answered a duplicate question: the match is what it was (M3).
-      const done = await completeIn(projectId, entryId, cand, { match: matchOf(cur, cand), expect: (e) => sameVersion(e, cur), skipLikely: true });
+      const done = await completeIn(projectId, entryId, cand, { match: matchOf(cur, cand), expect: (e) => sameVersion(e, cur), live: () => true, skipLikely: true });
       if (!done) throw new FindEntryStateError();
       return done;
     });
@@ -1158,7 +1179,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       if (!cur.elsewhere || (cur.state !== "already" && cur.state !== "maybe-duplicate")) throw new FindEntryStateError();
       const cand = cur.candidates?.find((c) => c.id === cur.chosen) ?? cur.candidates?.[0];
       if (!cand) throw new FindEntryStateError();
-      const done = await completeIn(projectId, entryId, cand, { match: matchOf(cur, cand), expect: (e) => sameVersion(e, cur), skipElsewhere: true });
+      const done = await completeIn(projectId, entryId, cand, { match: matchOf(cur, cand), expect: (e) => sameVersion(e, cur), live: () => true, skipElsewhere: true });
       if (!done) throw new FindEntryStateError();
       return done;
     });
@@ -1230,27 +1251,48 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const q = await readFindQueueIn(repo, projectId);
       if (!alive(projectId, gen)) return;
       const waiting = [...q.values()].filter((e) => e.state === "looking-up");
-      if (!waiting.length) return;
+      // R247 (e): a record can be made for an entry in other states too (a choose, a duplicate answer, "add it here as
+      // well"); a lock or a crash between its creation and the entry's line leaves the entry as it was, without a
+      // `sourceId`. Such an entry is healed here, whatever its state.
+      const unmade = [...q.values()].filter((e) => e.state !== "looking-up" && e.state !== "record-complete" && !e.sourceId);
+      if (!waiting.length && !unmade.length) return;
       // Sources made for an entry whose line was never written (a crash or a stop in between): read once here,
       // outside any store turn, never per entry. Ids are UUIDv7, ordered by the time they were made, and such a
       // source was made after its entry: only the sources whose id time is at or after the oldest waiting entry's
-      // `createdAt`, less FIND_ADOPT_MARGIN_MS for clock steps, are read (Q8). An id that is not a UUIDv7 is read.
-      const want = new Set(waiting.map((e) => e.id));
-      const oldest = Math.min(...waiting.map((e) => Date.parse(e.createdAt)).filter((t) => Number.isFinite(t)));
+      // `createdAt` (for any other entry: its last line, `updatedAt`), less FIND_ADOPT_MARGIN_MS for clock steps, are
+      // read (Q8). An id that is not a UUIDv7 is read.
+      const want = new Set([...waiting, ...unmade].map((e) => e.id));
+      const oldest = Math.min(...waiting.map((e) => Date.parse(e.createdAt)), ...unmade.map((e) => Date.parse(e.updatedAt)));
       const from = Number.isFinite(oldest) ? oldest - FIND_ADOPT_MARGIN_MS : -Infinity;
+      const madeHow = new Map<string, FindMatch>();
       for (const id of repo.listSourceIds(projectId)) {
         if (!alive(projectId, gen)) return;
         if (isId(id) && idTime(id) < from) continue;
         try {
           const s = await repo.getSourceRecord(projectId, id);
           const tag = s.provenance.externalKeys?.[FIND_ENTRY_KEY];
-          if (tag && want.has(tag) && s.provenance.captureMethod === "reference_lookup" && s.provenance.tool.name === FIND_TOOL) r.adoptable.set(tag, id);
+          if (tag && want.has(tag) && s.provenance.captureMethod === "reference_lookup" && s.provenance.tool.name === FIND_TOOL) {
+            r.adoptable.set(tag, id);
+            const how = s.provenance.identification;
+            if (how && (how.method === "find-match" || how.method === "find-chosen") && typeof how.confidence === "number") madeHow.set(tag, { method: how.method, confidence: how.confidence });
+          }
         } catch (err) {
           if (err instanceof ProjectLockedError) throw err;
           // an unreadable source cannot be adopted
         }
       }
       if (!alive(projectId, gen)) return;
+      for (const e of unmade) {
+        if (!r.adoptable.has(e.id)) continue;
+        await inTurn(r, projectId, () => alive(projectId, gen), async () => {
+          const sid = madeFor(projectId, e.id);
+          const cur = await current(projectId, e.id);
+          if (!sid || !cur || cur.sourceId || !sameVersion(cur, e)) return;
+          const how = madeHow.get(e.id);
+          await write(projectId, [evolve(cur, { state: "record-complete", sourceId: sid, ...(how ? { match: how } : {}) }, ["reason", "nextTryAt", "duplicateOf", "elsewhere"], stamp())], "update");
+        });
+        if (!alive(projectId, gen)) return;
+      }
       for (const e of waiting) {
         if (e.nextTryAt && Date.parse(e.nextTryAt) > now().getTime() && !r.adoptable.has(e.id)) later(projectId, e.id, e.nextTryAt);
         else enqueue(projectId, e.id);
@@ -1284,6 +1326,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     });
     await Promise.race([Promise.allSettled([...inflight]).then(() => undefined), bound]);
     if (h) clearTimeout(h);
+    // What is inside a store turn finishes: no time limit (R247 d), so nothing of it lands after the lock is released.
+    while (inTurnNow.size) await Promise.allSettled([...inTurnNow]);
   }
 
   async function elsewhere(projectId: string, entryId: string): Promise<{ projectId: string; sourceId: string } | null> {
