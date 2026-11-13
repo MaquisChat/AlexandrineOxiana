@@ -314,3 +314,8 @@ Also probed by reviewers: a source deleted in the library is not brought back (W
 - A file the system refuses to open (`EACCES`, `EPERM` on the open itself) is a problem of kind "not-permitted" with "The app was not allowed to read this file.", counted in `didNotComeIn`, not "could not import".
 - A renamed file that already came in is not counted or announced as a duplicate import (it stays counted as it was).
 - On the owner's Mac list, the decisive checks for this design: quit or pause the cloud service's app in the middle of a scan — does the app's window stay responsive, and does watching go on when the service is back; does opening a file that is not downloaded download it (it must never be opened); does a file being open stop the service from removing its local copy.
+
+**A7 — for Task W3 (2026-11-13).**
+- `WatchRegisterEntry` stores the file's time exactly, as a decimal string: `mtimeNs: string` in place of `mtimeMs: number` (A4: the engine compares the exact time; a JSON line cannot hold a bigint).
+- Accept 9 is read with Accept 2 and 3: when a file in the folder changed or went away, the note in the register is the ONLY write; no source, file or `annotations.json` changes.
+- Every read W3 adds (hashing a registered file that changed, adopting after a crash, recognising a rename, bringing in a new version) goes through W2's whole order and its guard before every open.
