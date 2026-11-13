@@ -417,8 +417,8 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 ### After Phase 1 — taking over what Zotero does (the owner's request of 2026-11-12)
 Not part of Phase 1's close-out. Four pieces, each with its own plan, in this order (ledger 2026-11-12 and 13). All four are built on the one branch `claude/pdf-reader-highlights` (R204):
 1. **Reading and highlighting PDFs in the app** — branch `claude/pdf-reader-highlights`; plan `docs/superpowers/plans/2026-11-12-pdf-reader-and-highlights.md` ON THAT BRANCH (tasks R1–R13; rulings R192). Status is kept in the table below, rows R1 onward.
-2. **Staying in step with the owner's Zotero account** — the existing one-way import made automatic ("Sync with Zotero now" and a schedule). **Plan being drafted** (2026-11-13; brief `plan-zotero-sync-brief.md` in the working files; decisions in R204); it will be `docs/superpowers/plans/2026-11-13-zotero-account-sync.md` on the reader branch, tasks Z1 onward.
-3. **Files in Drive, OneDrive or Dropbox** — watched folders (engine and routes exist, no screen) pointed at the drive's local folder, with care for files not yet downloaded. **Plan being drafted** (2026-11-13; brief `plan-cloud-folders-brief.md`; decisions in R204); it will be `docs/superpowers/plans/2026-11-13-cloud-drive-folders.md` on the reader branch, tasks W1 onward.
+2. **Staying in step with the owner's Zotero account** — the existing one-way import made automatic ("Sync with Zotero now" and a schedule). **Planned and accepted** (R206): `docs/superpowers/plans/2026-11-13-zotero-account-sync.md` ON THE READER BRANCH, tasks Z1–Z12; implementers read `impl-common-zotero.md`, reviewers `review-common-zotero.md` (working files). Status in the table below, rows Z1 onward.
+3. **Files in Drive, OneDrive or Dropbox** — watched folders given a screen and made safe for a cloud-drive folder (a file that is not downloaded is never read). **Planned and accepted** (R207): `docs/superpowers/plans/2026-11-13-cloud-drive-folders.md` ON THE READER BRANCH, tasks W1–W10; implementers read `impl-common-watch.md`, reviewers `review-common-watch.md`. Status in the table below, rows W1 onward.
 4. **The library across the owner's own devices** — the specification's sync model (SPEC 2.3). Waits for the owner's answer on which devices. Not planned yet.
 
 ### Milestone N — Finish Phase 1
@@ -580,6 +580,10 @@ Update after every task; commit and push.
 | R6 Reader: pdf.js in the interface, bundled, under the policy | complete (on the reader branch); GitHub's run not made (R202) | beeee22 (merge) | reviewed with probes over two fix rounds; a Critical finding found and closed (R199–R201; A6–A8); the desktop build fixed |
 | R7 Reader: the reader screen | approved; fix round 2 (minors) | 97c8d41 (worktree branch) | re-review: R203 closed, quality Approved, no Critical or Important; R205/A10 (regions only where drawn; the lock question never fails open; wording; focus); then the controller's verification and the merge |
 | R8–R13 Reader: the remaining tasks | not started | | order: R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
+| Z1 Zotero sync: a stand-in for Zotero's servers | dispatched | — | test files only; Sonnet |
+| Z2–Z12 Zotero sync: the remaining tasks | planned | — | order: Z2; Z3 and Z4; Z5; Z6; Z7; Z8; Z9; Z10 (the scheduler, only after the screen); Z11; Z12 after reader R12. Owner's questions in the ledger under R206 |
+| W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | dispatched | — | one Sonnet implementer |
+| W2–W10 Cloud folders: the remaining tasks | planned | — | order: W2; W6 beside it; W3; W4; W7; W8 and W9; W10. Owner's questions in the ledger under R207 |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
