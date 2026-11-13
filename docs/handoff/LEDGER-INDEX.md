@@ -125,3 +125,4 @@ R119 (Task 36, line 271): detached consent assets never relinked silently; no at
 
 Unnumbered carry-overs still open (line 260/267/270/272): secrets route for Zotero web key; Zotero data-folder auto-detect route; review-queue file preview route; @ao/core subpath exports for governance; consent-form detach button (verify); tx.copyFile streaming byte cap. [OPEN]
 Final-review flags: line 111 (completeMove re-hash), line 134 (Task 16 verification minors), line 212 (Task 27 minors). [OPEN]
+R204 (2026-11-13): Zotero sync and cloud-drive folders planned beside the reader; one-way, nothing deleted here, off until turned on; local folder only, never read a file not downloaded; one branch for all of it.

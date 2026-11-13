@@ -415,10 +415,10 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Model: Sonnet, then an accuracy review.
 
 ### After Phase 1 — taking over what Zotero does (the owner's request of 2026-11-12)
-Not part of Phase 1's close-out. Four pieces, each with its own plan, in this order (ledger 2026-11-12 and 13):
+Not part of Phase 1's close-out. Four pieces, each with its own plan, in this order (ledger 2026-11-12 and 13). All four are built on the one branch `claude/pdf-reader-highlights` (R204):
 1. **Reading and highlighting PDFs in the app** — branch `claude/pdf-reader-highlights`; plan `docs/superpowers/plans/2026-11-12-pdf-reader-and-highlights.md` ON THAT BRANCH (tasks R1–R13; rulings R192). Status is kept in the table below, rows R1 onward.
-2. **Staying in step with the owner's Zotero account** — the existing one-way import made automatic ("Sync with Zotero now" and a schedule). Not planned yet.
-3. **Files in Drive, OneDrive or Dropbox** — watched folders (engine and routes exist, no screen) pointed at the drive's local folder, with care for files not yet downloaded. Not planned yet.
+2. **Staying in step with the owner's Zotero account** — the existing one-way import made automatic ("Sync with Zotero now" and a schedule). **Plan being drafted** (2026-11-13; brief `plan-zotero-sync-brief.md` in the working files; decisions in R204); it will be `docs/superpowers/plans/2026-11-13-zotero-account-sync.md` on the reader branch, tasks Z1 onward.
+3. **Files in Drive, OneDrive or Dropbox** — watched folders (engine and routes exist, no screen) pointed at the drive's local folder, with care for files not yet downloaded. **Plan being drafted** (2026-11-13; brief `plan-cloud-folders-brief.md`; decisions in R204); it will be `docs/superpowers/plans/2026-11-13-cloud-drive-folders.md` on the reader branch, tasks W1 onward.
 4. **The library across the owner's own devices** — the specification's sync model (SPEC 2.3). Waits for the owner's answer on which devices. Not planned yet.
 
 ### Milestone N — Finish Phase 1
