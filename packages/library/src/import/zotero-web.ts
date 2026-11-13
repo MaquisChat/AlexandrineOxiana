@@ -614,6 +614,7 @@ function annotationOf(a: WebItem, file: string | undefined): ScanAnnotation | un
       comment: cut(d.annotationComment),
       color: cut(d.annotationColor),
       pageLabel: cut(d.annotationPageLabel),
+      sortIndex: str(d.annotationSortIndex).slice(0, 64),
       position: typeof d.annotationPosition === "string" ? d.annotationPosition.slice(0, 65536) : d.annotationPosition ? JSON.stringify(d.annotationPosition).slice(0, 65536) : null,
       dateAdded: cut(d.dateAdded),
     },

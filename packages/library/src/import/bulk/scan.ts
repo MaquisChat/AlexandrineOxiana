@@ -70,7 +70,8 @@ export interface ScanAnnotation {
   createdAt?: string;
   /** The item file (ScanFile.path) the anchor is in. */
   file?: string;
-  anchor?: { kind: "pdf"; page: number; rects: ScanRect[] } | { kind: "epub-cfi"; cfi: string };
+  /** A pdf anchor carries Zotero's sort index ("PPPPP|OOOOOO|TTTTT") when it has a well-formed one. */
+  anchor?: { kind: "pdf"; page: number; rects: ScanRect[]; sortIndex?: string } | { kind: "epub-cfi"; cfi: string };
 }
 
 export interface ScanItem {

@@ -1379,15 +1379,17 @@ class Run {
     const rule = locationRule();
     const zk = item.externalKeys?.zoteroKey;
     let dropped = 0;
+    let deletedHere = 0;
     const out = await this.changeSource(item, targetId, [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance, located)], "import.merge", async (ops, cur) => {
       const added = await this.addFiles(ops, cur, v.inputs);
       // The Zotero item merged in is remembered on the target (R74 M5).
       const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, ops.tx.at, ops.tx.actor, tagIds, zk ? [zk] : []);
       const ann = this.annotationPlan(item, merged.next, prep, ops.tx.actor);
       dropped = ann.dropped;
+      deletedHere = ann.deletedHere;
       const next = this.withPendingProxies(item.key, ann.added.length ? { ...merged.next, annotations: [...merged.next.annotations, ...ann.added] } : merged.next, this.pendingForAdded(plan, newInputs, prep.shaOf, added, rule.mode()), rule.mode());
       return { next, record: ann.added.length ? { ...merged.record, addedAnnotationIds: ann.added.map((a) => a.id) } : merged.record, outcome: "merged" };
-    }, () => (dropped ? { annotationsDropped: dropped } : {}), rule.hook);
+    }, () => ({ ...(dropped ? { annotationsDropped: dropped } : {}), ...(deletedHere ? { annotationsDeletedHere: deletedHere } : {}) }), rule.hook);
     dedupe.add(out.sf);
     this.startProxies(out.sf);
     return out.entry;
@@ -1425,8 +1427,8 @@ class Run {
     });
     const kept = [...pre.kept, ...preAnn.kept.map((k) => `annotation ${k}`)];
     const anything = pre.filled.length || pre.evidence.length || newInputs.length || preAnn.added.length || preAnn.updated.length || newTags;
-    if (!anything) {
-      return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(kept.length ? { merge: emptyRecord(kept) } : {}), ...(preAnn.dropped ? { annotationsDropped: preAnn.dropped } : {}) });
+    if (!anything && !preAnn.backfilled.length) {
+      return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(kept.length ? { merge: emptyRecord(kept) } : {}), ...(preAnn.dropped ? { annotationsDropped: preAnn.dropped } : {}), ...(preAnn.deletedHere ? { annotationsDeletedHere: preAnn.deletedHere } : {}) });
     }
     const tagIds = await this.namedTags(item.tags, item.tagColors);
     // New files may carry a location: location governance applies to them (R57; R74 I1; R83).
@@ -1434,6 +1436,7 @@ class Run {
     const located = proxyPlan.located;
     const rule = locationRule();
     let dropped = 0;
+    let deletedHere = 0;
     const out = await this.changeSource(
       item,
       sourceId,
@@ -1447,16 +1450,18 @@ class Run {
         const extraEvidence = plan.evidence.filter((e) => !plan.filled.some((f) => f.path === e.field));
         const ann = this.annotationPlan(item, merged.next, prep, ops.tx.actor);
         dropped = ann.dropped;
+        deletedHere = ann.deletedHere;
         const keptAll = [...plan.kept, ...ann.kept.map((k) => `annotation ${k}`)];
         const record: MergeRecord = {
           ...merged.record,
           ...(ann.added.length ? { addedAnnotationIds: ann.added.map((a) => a.id) } : {}),
-          ...(ann.updated.length ? { updatedAnnotations: ann.updated } : {}),
+          ...(ann.updated.length || ann.backfilled.length ? { updatedAnnotations: [...ann.updated, ...ann.backfilled] } : {}),
           ...(keptAll.length ? { kept: keptAll } : {}),
         };
         const changed = plan.filled.length > 0 || added.length > 0 || ann.added.length > 0 || ann.updated.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0;
-        if (!changed) return { next: null, record, outcome: "unchanged" };
-        const replaced = new Map(ann.updated.map((u) => [u.after.id, u.after]));
+        // Only a back-filled sort index (R195): written and recorded for undo, but reported as unchanged.
+        if (!changed && !ann.backfilled.length) return { next: null, record, outcome: "unchanged" };
+        const replaced = new Map([...ann.updated, ...ann.backfilled].map((u) => [u.after.id, u.after]));
         const next: SourceFile = this.withPendingProxies(
           item.key,
           {
@@ -1467,9 +1472,9 @@ class Run {
           this.pendingForAdded(proxyPlan, newInputs, prep.shaOf, added, rule.mode()),
           rule.mode(),
         );
-        return { next, record, outcome: "updated" };
+        return { next, record, outcome: changed ? "updated" : "unchanged" };
       },
-      () => (dropped ? { annotationsDropped: dropped } : {}),
+      () => ({ ...(dropped ? { annotationsDropped: dropped } : {}), ...(deletedHere ? { annotationsDeletedHere: deletedHere } : {}) }),
       rule.hook,
     );
     this.startProxies(out.sf);

@@ -369,7 +369,7 @@ function itemQueries(db: Database.Database) {
   const note = db.prepare(`SELECT ${tN("note", "note", MAX_NOTE_CHARS + 1)} FROM itemNotes WHERE itemID = ?`);
   const annotation = db.prepare(
     `SELECT ${int("type", "type")}, ${t64("authorName", "authorName")}, ${t64("text", "text")}, ${t64("comment", "comment")}, ${t64("color", "color")},
-            ${t64("pageLabel", "pageLabel")}, ${t64("position", "position")} FROM itemAnnotations WHERE itemID = ?`,
+            ${t64("pageLabel", "pageLabel")}, ${t64("sortIndex", "sortIndex")}, ${t64("position", "position")} FROM itemAnnotations WHERE itemID = ?`,
   );
   return {
     fields: (id: number) => {

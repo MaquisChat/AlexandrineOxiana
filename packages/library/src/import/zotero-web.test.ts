@@ -394,6 +394,42 @@ describe("zoteroWebAdapter", () => {
     expect(await readdir(join(tmp, "work"), { recursive: true }).then((l) => l.filter((n) => n.endsWith(".pdf")))).toEqual([]);
   });
 
+  it("annotationSortIndex is carried", async () => {
+    const parent = article("PARENT07", "Sorted", 4);
+    const att: WebItem = { key: "ATTACH07", version: 4, data: { key: "ATTACH07", version: 4, itemType: "attachment", parentItem: "PARENT07", linkMode: "imported_file", contentType: "application/pdf", filename: "z.pdf", tags: [] } };
+    const mk = (key: string, sortIndex: unknown): WebItem => ({
+      key, version: 21,
+      data: { key, version: 21, itemType: "annotation", parentItem: "ATTACH07", annotationType: "highlight", annotationText: "t", annotationSortIndex: sortIndex, annotationPosition: JSON.stringify({ pageIndex: 2, rects: [[1, 2, 3, 4]] }), tags: [] },
+    });
+    const anns = [mk("ANNO0071", "00002|000120|00300"), mk("ANNO0072", "not a sort index")];
+    const reply = (items: WebItem[], v = 21) => ({ statusCode: 200, data: JSON.stringify(items), responseOptions: { headers: { ...JSON_HEADERS, "total-results": String(items.length), "last-modified-version": String(v) } } });
+    agent
+      .get(API)
+      .intercept({ path: (p) => p.startsWith("/users/42/"), method: "GET" })
+      .reply((req) => {
+        const q = page(req.path);
+        const path = req.path.split("?")[0]!;
+        if (path === "/users/42/items" && q.get("since") === "20") return reply(anns);
+        if (path === "/users/42/items" && q.get("itemKey") === "ATTACH07") return reply([att]);
+        if (path === "/users/42/items" && q.get("itemKey") === "PARENT07") return reply([parent]);
+        if (path === "/users/42/items/PARENT07/children") return reply([att]);
+        if (path === "/users/42/items/ATTACH07/children") return reply(anns);
+        if (path === "/users/42/items/ATTACH07/file") return { statusCode: 404, data: "Not found" };
+        if (path === "/users/42/collections") return reply([]);
+        if (path === "/users/42/deleted") return { statusCode: 200, data: JSON.stringify({ items: [] }), responseOptions: { headers: JSON_HEADERS } };
+        return { statusCode: 404, data: "Not found" };
+      })
+      .persist();
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: agent, sleep: async () => {}, since: 20 });
+    const out: ScanItem[] = [];
+    const work = join(tmp, "work");
+    await mkdir(work, { recursive: true });
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work, note: () => {} })) out.push(i);
+    const byKey = new Map((out[0]!.annotations ?? []).map((x) => [x.key, x]));
+    expect(byKey.get("zotero:ANNO0071")?.anchor).toEqual({ kind: "pdf", page: 3, rects: [{ x: 1, y: 2, w: 2, h: 2 }], sortIndex: "00002|000120|00300" });
+    expect(byKey.get("zotero:ANNO0072")?.anchor).toEqual({ kind: "pdf", page: 3, rects: [{ x: 1, y: 2, w: 2, h: 2 }] });
+  });
+
   it("incremental: a changed annotation brings in its whole item (parents fetched by key, children listed)", async () => {
     const parent = article("PARENT06", "Changed below", 4);
     const att: WebItem = { key: "ATTACH06", version: 4, data: { key: "ATTACH06", version: 4, itemType: "attachment", parentItem: "PARENT06", linkMode: "imported_file", contentType: "application/pdf", filename: "z.pdf", tags: [] } };

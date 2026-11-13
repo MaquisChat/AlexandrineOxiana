@@ -12,11 +12,17 @@ import { createHash } from "node:crypto";
 import { BIBLIO_FIELDS, type Annotation, type Asset, type FieldEvidence, type Source, type SourceDraft, type SourceFile } from "@ao/core";
 
 /** Hash of an annotation's content (kind, text, colour, page label, anchors without their ids): what Annotation.externalHash records. */
-export function annotationHash(a: Pick<Annotation, "kind" | "body" | "quote" | "color" | "pageLabel" | "anchors">): string {
-  const anchors = a.anchors.map(({ id: _id, ...rest }) => rest);
-  return createHash("sha256")
-    .update(JSON.stringify([a.kind, a.body ?? null, a.quote ?? null, a.color ?? null, a.pageLabel ?? null, anchors]))
-    .digest("hex");
+export function annotationHash(a: Pick<Annotation, "kind" | "body" | "quote" | "color" | "pageLabel" | "anchors"> & { colorName?: string }): string {
+  // The sort index is ordering, not content (R195): giving an annotation one, or a newer one, must not make it read as edited here.
+  const anchors = a.anchors.map((x) => {
+    const { id: _id, ...rest } = x;
+    if ("sortIndex" in rest) delete (rest as { sortIndex?: string }).sortIndex;
+    return rest;
+  });
+  // The colour chosen here is content, but appended only when present: every hash made before it existed stays as it was.
+  const parts: unknown[] = [a.kind, a.body ?? null, a.quote ?? null, a.color ?? null, a.pageLabel ?? null, anchors];
+  if (a.colorName) parts.push(a.colorName);
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 
 /** Whether an imported annotation is still as it was imported (nobody edited it here). */

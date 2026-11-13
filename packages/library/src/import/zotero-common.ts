@@ -4,7 +4,7 @@
  * metadata, dates, citation keys in Extra, and reader annotations (anchors in PDFs and EPUBs). Both
  * adapters read Zotero's own field names (the Web API's `data` uses the same names as zotero.sqlite).
  */
-import { biblioOf, type Creator, type SourceType } from "@ao/core";
+import { SORT_INDEX_PATTERN, biblioOf, type Creator, type SourceType } from "@ao/core";
 import type { ScanAnnotation, ScanRect } from "./bulk/scan.js";
 import { arxivOf, doiOf, isbnsOf, issnOf, tagList, text, type RecordFields } from "./refman.js";
 
@@ -139,6 +139,11 @@ function anchorOf(position: string | null | undefined): ScanAnnotation["anchor"]
   return { kind: "pdf", page: pi + 1, rects };
 }
 
+/** Zotero's sort index when it has the documented form, else undefined (a malformed one is dropped silently). */
+function sortIndexOf(v: unknown): string | undefined {
+  return typeof v === "string" && SORT_INDEX_PATTERN.test(v) ? v : undefined;
+}
+
 export interface ZoteroAnnotationRow {
   key: string;
   type: number;
@@ -148,6 +153,8 @@ export interface ZoteroAnnotationRow {
   color?: string | null;
   pageLabel?: string | null;
   position?: string | null;
+  /** Zotero's sort index ("PPPPP|OOOOOO|TTTTT"): reading order within the document. */
+  sortIndex?: string | null;
   dateAdded?: string | null;
 }
 
@@ -163,7 +170,9 @@ export function zoteroAnnotation(row: ZoteroAnnotationRow, file: string | undefi
   const pageLabel = text(row.pageLabel).slice(0, 64);
   const author = text(row.authorName).slice(0, 200);
   const createdAt = zoteroTimestamp(row.dateAdded);
-  const anchor = anchorOf(row.position);
+  const found = anchorOf(row.position);
+  const sortIndex = sortIndexOf(row.sortIndex);
+  const anchor = found?.kind === "pdf" && sortIndex ? { ...found, sortIndex } : found;
   return {
     key: `zotero:${row.key}`,
     kind,
