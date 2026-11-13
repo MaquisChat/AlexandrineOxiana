@@ -307,6 +307,10 @@ describe("openPdf", () => {
     expect(err(423, "PROJECT_LOCKED")).toBe("locked");
     expect(err(502, "INTERNAL")).toBe("other");
     expect(err(0, "UNAVAILABLE")).toBe("other");
+    // The service's other answers in their own plain words (review M7): an asset that is not a PDF,
+    // and a range past the end (the file shrank since it was opened).
+    expect(toPdfOpenError(new ApiClientError(400, { code: "VALIDATION", message: "This file cannot be shown here." }))).toMatchObject({ kind: "other", message: "This file cannot be shown here." });
+    expect(toPdfOpenError(new ApiClientError(416, { code: "VALIDATION", message: "x" }))).toMatchObject({ kind: "other", message: "The file changed while it was being read. Open it again to read it as it is now." });
     expect(toPdfOpenError(new Error("anything")).kind).toBe("other");
     const same = new PdfOpenError("damaged");
     expect(toPdfOpenError(same)).toBe(same);

@@ -101,6 +101,9 @@ export function toPdfOpenError(err: unknown): PdfOpenError {
     if (err.status === 413) return new PdfOpenError("too-large");
     if (err.status === 404) return new PdfOpenError("missing");
     if (err.status === 423) return new PdfOpenError("locked");
+    // An asset that is not a PDF: the service's own sentence. A range past the end: the file shrank.
+    if (err.status === 400 && err.message === "This file cannot be shown here.") return new PdfOpenError("other", err.message);
+    if (err.status === 416) return new PdfOpenError("other", FILE_CHANGED);
     return new PdfOpenError("other");
   }
   const name = err instanceof Error ? err.name : undefined;
