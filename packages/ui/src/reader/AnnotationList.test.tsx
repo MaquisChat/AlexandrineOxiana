@@ -8,7 +8,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnnotationRecord, HighlightColourName } from "../api/reader";
 import {
   ANNOTATIONS_NOT_SHOWN,
@@ -653,12 +653,16 @@ describe("AnnotationList, fix round 1 (A13, Ruling R216)", () => {
     expect(window.location.search).toBe("?project=p1&source=s1&asset=a2");
     act(() => window.history.replaceState(null, "", "/reader?project=p1&source=s1"));
     await user.type(screen.getByRole("textbox", { name: "Note" }), "!");
+    // The way out taken from elsewhere (the focus no longer in the note), as a link in another part of the app would be.
+    act(() => (document.activeElement as HTMLElement).blur());
     act(() => navigate("/"));
     expect(window.location.pathname).toBe("/reader");
     expect(document.activeElement).toBe(within(discardDialog()).getByRole("button", { name: "Keep editing" }));
     await user.click(screen.getByRole("button", { name: "Keep editing" }));
     expect(window.location.pathname).toBe("/reader");
     expect((screen.getByRole("textbox", { name: "Note" }) as HTMLTextAreaElement).value).toBe("old note!");
+    // "Keep editing" puts the focus back in the note (M-c).
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Note" })));
     act(() => navigate("/"));
     await user.click(within(discardDialog()).getByRole("button", { name: "Discard" }));
     expect(window.location.pathname).toBe("/");
@@ -801,6 +805,141 @@ describe("AnnotationList, fix round 1 (A13, Ruling R216)", () => {
     expect(entry("n001").style.top).toBe("120px");
     expect(entry("n001").style.height).toBe("");
     expect(getComputedStyle(entry("n001")).overflow).not.toBe("hidden");
+    spy.mockRestore();
+  });
+});
+
+describe("AnnotationList, fix round 2", () => {
+  const discardDialog = () => screen.queryByRole("dialog", { name: "Discard this note?" });
+  /** Whether the way out is free: in-app navigation goes, a reload is not held, and nothing is asked. */
+  function expectFree() {
+    act(() => navigate("/elsewhere"));
+    expect(window.location.pathname).toBe("/elsewhere");
+    const unload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(false);
+    expect(discardDialog()).toBeNull();
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+  }
+  /** Opens the note of entry `id` and changes it: the way out is held. */
+  async function changeNote(user: ReturnType<typeof userEvent.setup>, id: string) {
+    await user.click(within(entry(id)).getByRole("button", { name: /^(Edit|Add) note/ }));
+    await user.type(screen.getByRole("textbox", { name: "Note" }), " changed");
+    const unload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(true);
+  }
+  beforeEach(() => window.history.replaceState(null, "", "/reader?project=p1&source=s1"));
+  afterEach(() => window.history.replaceState(null, "", "/"));
+
+  it("I5: the entry being edited deleted by its own Delete frees the way out", async () => {
+    const user = userEvent.setup();
+    render(<Harness initial={[rec({ id: "a", body: "old" }), rec({ id: "b" })]} />);
+    await changeNote(user, "a");
+    await user.click(within(entry("a")).getByRole("button", { name: /^Delete/ }));
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(document.querySelector('[data-entry="a"]')).toBeNull());
+    expectFree();
+  });
+
+  it("I5: the entry being edited gone from a list fetched again (deleted elsewhere, a 404) frees the way out", async () => {
+    const user = userEvent.setup();
+    const both = [rec({ id: "a", body: "old" }), rec({ id: "b" })];
+    const props = { assetId: "a1", readOnly: false, pageCount: 20, onJump: () => {}, onSaveNote: () => Promise.reject(new ListBroughtUpToDate()), onRecolour: noop, onDelete: noop };
+    const r = render(<AnnotationList annotations={both} {...props} />);
+    await changeNote(user, "a");
+    await user.click(screen.getByRole("button", { name: "Save note" }));
+    await screen.findByText(LIST_BROUGHT_UP_TO_DATE);
+    // The list as the service now gives it: without "a".
+    r.rerender(<AnnotationList annotations={[both[1]!]} {...props} />);
+    expect(screen.queryByRole("textbox", { name: "Note" })).toBeNull();
+    expectFree();
+    // And if it came back, its editor does not reopen with the lost text.
+    r.rerender(<AnnotationList annotations={both} {...props} />);
+    expect(screen.queryByRole("textbox", { name: "Note" })).toBeNull();
+  });
+
+  it("I5: a change of file frees the way out", async () => {
+    const user = userEvent.setup();
+    const list = [rec({ id: "a", body: "old" })];
+    const props = { annotations: list, readOnly: false, pageCount: 20, onJump: () => {}, onSaveNote: noop, onRecolour: noop, onDelete: noop };
+    const r = render(<AnnotationList assetId="a1" {...props} />);
+    await changeNote(user, "a");
+    r.rerender(<AnnotationList assetId="a2" {...props} />);
+    expectFree();
+  });
+
+  it("I5: the list going (the reader ended) frees the way out", async () => {
+    const user = userEvent.setup();
+    const r = render(<Harness initial={[rec({ id: "a", body: "old" })]} />);
+    await changeNote(user, "a");
+    r.unmount();
+    expectFree();
+  });
+
+  it("Back and Forward are held for a changed note, as the transcript holds unsaved edits; Discard then goes where Back went", async () => {
+    const user = userEvent.setup();
+    render(<Harness initial={[rec({ id: "a", body: "old" })]} />);
+    await changeNote(user, "a");
+    // Back from the browser: the address it lands on is put back, and the question is asked.
+    act(() => {
+      window.history.replaceState(null, "", "/?project=p1");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(window.location.pathname).toBe("/reader");
+    expect(window.location.search).toBe("?project=p1&source=s1");
+    expect(document.activeElement).toBe(within(discardDialog()!).getByRole("button", { name: "Keep editing" }));
+    await user.click(within(discardDialog()!).getByRole("button", { name: "Keep editing" }));
+    expect(window.location.pathname).toBe("/reader");
+    expect((screen.getByRole("textbox", { name: "Note" }) as HTMLTextAreaElement).value).toBe("old changed");
+    act(() => {
+      window.history.replaceState(null, "", "/?project=p1");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await user.click(within(discardDialog()!).getByRole("button", { name: "Discard" }));
+    expect(window.location.pathname).toBe("/");
+    expect(window.location.search).toBe("?project=p1");
+  });
+
+  it("Escape during a pending save says why nothing happens", async () => {
+    let release: () => void = () => {};
+    const user = userEvent.setup();
+    render(<Harness initial={[rec({ id: "a", body: "old" })]} answer={() => new Promise<void>((r) => (release = r))} />);
+    await user.click(within(entry("a")).getByRole("button", { name: /^Edit note of/ }));
+    await user.type(screen.getByRole("textbox", { name: "Note" }), " new");
+    await user.click(screen.getByRole("button", { name: "Save note" }));
+    expect(live().textContent).toBe("Saving…");
+    const before = live().firstElementChild;
+    await user.click(screen.getByRole("textbox", { name: "Note" }));
+    await user.keyboard("{Escape}");
+    expect(live().textContent).toBe("The note is being saved. It can be closed once it is saved.");
+    expect(live().firstElementChild).not.toBe(before);
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(live().textContent).toBe("The note is being saved. It can be closed once it is saved.");
+    await act(async () => release());
+    await waitFor(() => expect(live().textContent).toBe("Note saved."));
+  });
+
+  it("a height measured late above the view keeps the entries in view where they were (the list does not jump)", async () => {
+    const many = Array.from({ length: 600 }, (_, i) => rec({ id: `n${String(i).padStart(3, "0")}`, quote: `Quote ${i}` }));
+    let tall = "";
+    const spy = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.dataset.entry ? (this.dataset.entry === tall ? 416 : 136) : 0;
+    });
+    list({ annotations: many });
+    const scroller = document.querySelector<HTMLElement>(".ao-ann-scroll")!;
+    act(() => {
+      scroller.scrollTop = 300 * 136;
+      fireEvent.scroll(scroller);
+    });
+    await waitFor(() => expect(entry("n300").style.top).toBe("40800px"));
+    const at = () => parseFloat(entry("n300").style.top) - scroller.scrollTop;
+    expect(at()).toBe(0);
+    // An entry above the view grows (an alert, larger text) and is measured again.
+    tall = "n297";
+    act(() => fireEvent.scroll(scroller));
+    await waitFor(() => expect(entry("n300").style.top).toBe("41080px"));
+    expect(at()).toBe(0);
     spy.mockRestore();
   });
 });
