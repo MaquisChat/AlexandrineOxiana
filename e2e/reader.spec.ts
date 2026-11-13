@@ -863,9 +863,14 @@ test("a read-only library shows the PDF and the notice", async ({ page, app }) =
   await expect(region(page, 1, 4)).toBeVisible();
   await expect(region(page, 1, 4).locator(".ao-reader-text-layer")).toContainText("Page 1 of 4");
   await expect.poll(() => inked(page, 1)).toBe(true);
-  // Reading controls only.
+  // Reading controls only (and the reader's "Keyboard help", Task R11).
   const enabled = await page.locator("main button:enabled").allTextContents();
-  expect(enabled.sort()).toEqual(["Fit width", "Next page", "Rotate view", "Zoom in", "Zoom out"].sort());
+  expect(enabled.sort()).toEqual(["Fit width", "Keyboard help", "Next page", "Rotate view", "Zoom in", "Zoom out"].sort());
+  // Task R11: the two making buttons are there, disabled, each with its reason shown.
+  await expect(toolbar(page).getByRole("button", { name: "Select text" })).toBeDisabled();
+  await expect(toolbar(page).getByRole("button", { name: "Add a note to this page" })).toBeDisabled();
+  await expect(page.getByText("Select text: This library is read-only, so highlights cannot be made.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Add a note to this page: This library is read-only, so notes cannot be added.", { exact: true })).toBeVisible();
   expect(seen.pageErrors).toEqual([]);
   expectOnlyOwnOrigins(seen, app);
 });
