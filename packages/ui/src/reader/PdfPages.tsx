@@ -210,7 +210,9 @@ export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, r
     const s = slots.current.get(n);
     if (!s) return;
     s.gen++;
-    s.task?.cancel();
+    // On a dead handle the guarded call does nothing and returns a rejected promise: caught here.
+    const cancelled: unknown = s.task?.cancel();
+    if (cancelled instanceof Promise) cancelled.catch(() => {});
     s.task = undefined;
     s.textLayer?.cancel();
     s.textLayer = undefined;

@@ -64,14 +64,17 @@ function fakeHandle(o: FakeOpts) {
         promise,
         cancel: () => {
           entry.cancelled = true;
+          // As openPdf's guard does: once the handle is dead, a call returns a rejected promise.
+          if (dead) return Promise.reject(new PdfOpenError("other", "This document was closed."));
           reject(Object.assign(new Error("Rendering cancelled"), { name: "RenderingCancelledException" }));
+          return undefined;
         },
       };
     },
     getTextContent: async () => ({ items: (o.text?.(n) ?? []).map((str) => ({ str, dir: "ltr", transform: [10, 0, 0, 10, 50, 700], width: 100, height: 10, fontName: "f1", hasEOL: false })), styles: { f1: { fontFamily: "sans-serif", ascent: 0.8, descent: -0.2, vertical: false } }, lang: null }),
     cleanup: () => {
       cleaned.push(n);
-      return true;
+      return dead ? Promise.reject(new PdfOpenError("other", "This document was closed.")) : true;
     },
   });
   const handle = {
