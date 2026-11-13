@@ -615,6 +615,12 @@ test("past the five-hundredth entry nothing is cut off: a long note, an entry be
     await page.evaluate(() => (document.documentElement.style.fontSize = "150%"));
     for (const at of [505, 508]) await expect.poll(checked(at), { timeout: 20_000 }).toEqual([]);
   });
+  await test.step("in the narrowest panel the layout allows (15rem), at the larger text size", async () => {
+    // Set through the style object (allowed by the page's policy, unlike a style element).
+    await page.evaluate(() => (document.querySelector<HTMLElement>(".ao-reader-body")!.style.gridTemplateColumns = "minmax(0, 1fr) 15rem"));
+    await expect.poll(() => page.evaluate(() => Math.round(document.querySelector<HTMLElement>(".ao-ann")!.getBoundingClientRect().width / parseFloat(getComputedStyle(document.documentElement).fontSize)))).toBe(15);
+    for (const at of [505, 508, 506]) await expect.poll(checked(at), { timeout: 20_000 }).toEqual([]);
+  });
   // The long note is there whole.
   await expect(list.locator(`[data-entry="${ids[505]}"]`)).toContainText("Line 60 of a long note about the market rules.");
   // The editor kept its place and focus throughout.
