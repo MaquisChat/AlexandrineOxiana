@@ -24,7 +24,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { buildZoteroFixture } from "../packages/library/tests/fixtures/zotero/build-fixture.mjs";
-import { buildMultiPagePdf, buildPdf, buildRotatedCropPdf } from "../tests/fixtures/generate.mjs";
+import { buildMultiPagePdf, buildPdf, buildRotatedCropPdf, buildScanPdf } from "../tests/fixtures/generate.mjs";
 import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR } from "./paths.js";
 
@@ -292,5 +292,33 @@ test("a highlight whose text no longer matches says so", async ({ page, app }) =
   await expect(page.locator(`.ao-hl[data-annotation="${same}"]`)).not.toHaveClass(/ao-hl--changed/);
   // The one on a page the file does not have is drawn nowhere.
   await expect(page.locator(`.ao-hl[data-annotation="${far}"]`)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a highlight on a scanned page with no text is drawn, and nothing is said of its text", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "scan.pdf", await buildScanPdf(2));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Scans" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  // A highlight made where the scan's words were recognised (Zotero, say): the page here has no text.
+  const made = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, {
+    kind: "highlight",
+    assetId: aid,
+    anchors: [{ page: 1, rects: [{ x: 100, y: 600, w: 200, h: 14 }] }],
+    quote: "Words a scan cannot be asked about",
+    colorName: "orange",
+  });
+  expect(made.status, JSON.stringify(made.body)).toBe(201);
+  await readFromLibrary(page, app, projectId, sid);
+  const page1 = page.locator('[data-page-number="1"]');
+  await expect(page1).toContainText("This page has no text to select. It is probably a scanned image; you can still add a note to it.");
+  const mark = page1.locator(`.ao-hl[data-annotation="${made.body.id}"]`);
+  await expect(mark).toHaveClass(/ao-hl--orange/);
+  // No verdict: drawn plain, and no notice (the page's text, none, has been handed on by now).
+  await page.waitForTimeout(300);
+  await expect(mark).not.toHaveClass(/ao-hl--changed/);
+  await expect(page.getByRole("region", { name: "Highlights to check" })).toHaveCount(0);
+  await expect(page.getByText(CHANGED)).toHaveCount(0);
   expect(errors).toEqual([]);
 });
