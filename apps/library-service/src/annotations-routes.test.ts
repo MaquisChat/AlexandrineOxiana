@@ -192,7 +192,7 @@ describe("annotation routes (Task R4)", () => {
 
   it("a page note needs its words", async () => {
     const f = await fixture();
-    const blank = await call({ method: "POST", url: f.base, body: make(f.assetId, { kind: "note", quote: undefined, body: "   " }) });
+    const blank = await call({ method: "POST", url: f.base, body: make(f.assetId, { kind: "note", quote: undefined, body: "" }) });
     expect(blank.status).toBe(400);
     expect(blank.json.error).toMatchObject({ code: "VALIDATION", message: "Write the note first." });
     const ok = await call({ method: "POST", url: f.base, body: make(f.assetId, { kind: "note", quote: undefined, body: "page note" }) });
@@ -235,7 +235,7 @@ describe("annotation routes (Task R4)", () => {
   it("a quote, a note or a page label with control characters is refused; a line break and a tab are kept", async () => {
     const f = await fixture();
     const msg = "A note cannot contain control characters.";
-    for (const over of [{ quote: "a\u0000b" }, { quote: "a\u001bb" }, { body: "n\u0007" }, { pageLabel: "i\u0008" }, { quote: "a\u007fb" }, { body: "x\u0085y" }]) {
+    for (const over of [{ quote: "a\u0000b" }, { quote: "a\u001bb" }, { body: "n\u0007" }, { pageLabel: "i\u0008" }, { quote: "a\u007fb" }, { body: "x\u0085y" }, { body: "a\rb" }, { body: "a\r\nb" }, { quote: "a\rb" }, { pageLabel: "i\tv" }, { pageLabel: "i\nv" }]) {
       const r = await call({ method: "POST", url: f.base, body: make(f.assetId, over) });
       expect(r.status, JSON.stringify(over)).toBe(400);
       expect(r.json.error).toMatchObject({ code: "VALIDATION", message: msg });
@@ -244,7 +244,7 @@ describe("annotation routes (Task R4)", () => {
     expect(fine.status, fine.body).toBe(201);
     // Nothing is trimmed silently.
     expect(fine.json).toMatchObject({ quote: "line one\nline two\tend", body: " keep my spaces " });
-    for (const body of [{ body: "n\u0000" }, { body: "n\u001f" }]) {
+    for (const body of [{ body: "n\u0000" }, { body: "n\u001f" }, { body: "n\r" }, { body: "n\r\nm" }]) {
       const r = await call({ method: "PATCH", url: `${f.base}/${fine.json.id}`, body });
       expect(r.status).toBe(400);
       expect(r.json.error.message).toBe(msg);
@@ -437,5 +437,102 @@ describe("annotation routes (Task R4)", () => {
     expect(bad.status).toBe(404);
     expect(JSON.stringify(bad.json)).not.toContain(tmp);
     expect(Object.keys(bad.json)).toEqual(["error"]);
+  });
+
+  it("a note of only spaces is refused with its own sentence, never removes a note; an explicit empty value removes it", async () => {
+    const f = await fixture();
+    const sentence = "A note cannot be only spaces.";
+    const bad = await call({ method: "POST", url: f.base, body: make(f.assetId, { body: "   " }) });
+    expect(bad.status).toBe(400);
+    expect(bad.json.error).toMatchObject({ code: "VALIDATION", message: sentence });
+    expect((await call({ method: "POST", url: f.base, body: make(f.assetId, { kind: "note", quote: undefined, body: " \n\t " }) })).json.error.message).toBe(sentence);
+    expect(((await call({ url: f.base })).json as AnnotationListResponse).count).toBe(0);
+
+    const made = (await call({ method: "POST", url: f.base, body: make(f.assetId, { body: " real note " }) })).json as AnnotationRecord;
+    expect(made.body).toBe(" real note ");
+    for (const body of ["   ", "\n", "\t "]) {
+      const r = await call({ method: "PATCH", url: `${f.base}/${made.id}`, body: { body } });
+      expect(r.status, JSON.stringify(body)).toBe(400);
+      expect(r.json.error.message).toBe(sentence);
+    }
+    expect((await call({ url: f.base })).json.annotations[0].body).toBe(" real note ");
+    // The explicit empty value, as null or as "", removes it.
+    expect((await call({ method: "PATCH", url: `${f.base}/${made.id}`, body: { body: "" } })).json.body).toBeUndefined();
+    await call({ method: "PATCH", url: `${f.base}/${made.id}`, body: { body: "again" } });
+    const gone = await call({ method: "PATCH", url: `${f.base}/${made.id}`, body: { body: null } });
+    expect(gone.status).toBe(200);
+    expect(gone.json.body).toBeUndefined();
+    // A page note cannot have its words removed.
+    const pn = (await call({ method: "POST", url: f.base, body: make(f.assetId, { kind: "note", quote: undefined, body: "page note" }) })).json as AnnotationRecord;
+    expect((await call({ method: "PATCH", url: `${f.base}/${pn.id}`, body: { body: "" } })).json.error.message).toBe("Write the note first.");
+  });
+
+  it("a source with two PDFs: listed document by document, in reading order within each (A4); documents in the order they first appear; anchorless last", async () => {
+    const pr = await call({ method: "POST", url: "/projects", body: { name: "Two", governanceYaml: GOV, encryption: { enabled: false } } });
+    const pid = pr.json.project.id as string;
+    const files: Array<{ path: string; role: "original"; handling: "copy" }> = [];
+    for (const n of ["a", "b"]) {
+      const dir = join(tmp, "in", newId());
+      await mkdir(dir, { recursive: true });
+      const path = join(dir, `${n}.pdf`);
+      await writeFile(path, await buildPdf({ title: `Doc ${n}`, author: "X", lines: [n] }));
+      files.push({ path, role: "original", handling: "copy" });
+    }
+    const sf = await svc.state.session!.repo.createSource(
+      pid,
+      { projectIds: [pid], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: "Two PDFs" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      files,
+      {
+        provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+        annotations: (sid: string, _a: unknown, actor: string) => [{ id: newId(), sourceId: sid, kind: "highlight" as const, anchors: [], quote: "adrift", author: actor, createdAt: new Date().toISOString() }],
+      },
+    );
+    const [A, B] = [sf.assets[0]!.id, sf.assets[1]!.id];
+    const base = `/projects/${pid}/sources/${sf.source.id}/annotations`;
+    const mk = async (asset: string, page: number, y: number) =>
+      ((await call({ method: "POST", url: base, body: make(asset, { quote: `${asset === A ? "A" : "B"}${page}@${y}`, anchors: [{ page, rects: [{ x: 50, y, w: 50, h: 10 }] }] }) })).json as AnnotationRecord).id;
+    // Interleaved: a plain sort over the whole source would give p1 of both documents before any p2.
+    const a2 = await mk(A, 2, 400);
+    const b1l = await mk(B, 1, 100);
+    const a1 = await mk(A, 1, 300);
+    const b2 = await mk(B, 2, 500);
+    const b1h = await mk(B, 1, 600);
+    const list = (await call({ url: base })).json as AnnotationListResponse;
+    const ids = list.annotations.map((x) => x.id);
+    // Documents in first-seen (stored) order: the anchorless one was stored first but has no document, so it is last.
+    expect(ids.slice(0, 5)).toEqual([a1, a2, b1h, b1l, b2]);
+    expect(list.annotations[5]).toMatchObject({ quote: "adrift", pdfAnchors: [] });
+    expect(list.count).toBe(6);
+  });
+
+  it("extra fields inside an anchor or a rectangle are refused, not ignored", async () => {
+    const f = await fixture();
+    for (const anchors of [
+      [{ page: 1, rects: [rect], id: "forced" }],
+      [{ page: 1, rects: [rect], assetId: "x", kind: "text-range" }],
+      [{ page: 1, rects: [{ ...rect, extra: 1 }] }],
+    ]) {
+      const r = await call({ method: "POST", url: f.base, body: make(f.assetId, { anchors }) });
+      expect(r.status, JSON.stringify(anchors)).toBe(400);
+      expect(r.json.error.code).toBe("VALIDATION");
+    }
+  });
+
+  it("a not-found answer is a plain sentence that never echoes what was typed in the address", async () => {
+    const f = await fixture();
+    const made = (await call({ method: "POST", url: f.base, body: make(f.assetId) })).json as AnnotationRecord;
+    const odd = "%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+    const cases: Array<[Method, string, unknown, string]> = [
+      ["PATCH", `${f.base}/${odd}`, { colorName: "red" }, "That highlight or note was not found."],
+      ["DELETE", `${f.base}/${odd}`, undefined, "That highlight or note was not found."],
+      ["GET", `/projects/${f.pid}/sources/${odd}/annotations`, undefined, "That source was not found."],
+      ["POST", f.base, make(`<b>x</b>`), "That file is not part of this source."],
+    ];
+    for (const [method, url, body, message] of cases) {
+      const r = await call({ method, url, ...(body ? { body } : {}) });
+      expect(r.status, url).toBe(404);
+      expect(r.json.error).toEqual({ code: "NOT_FOUND", message });
+    }
+    expect(made.id).toBeTruthy();
   });
 });
