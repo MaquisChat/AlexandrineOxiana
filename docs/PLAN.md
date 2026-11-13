@@ -578,11 +578,11 @@ Update after every task; commit and push.
 | R3 Reader: governed annotation operations in the library | complete (on the reader branch) | 0062c5b (merge) | reviewed with twelve probes; verified with R2 |
 | R4 Reader: annotation routes in the service | complete (on the reader branch); GitHub's run not made (R202) | f9949a0 (merge) | reviewed with probes over one fix round and a last round read by the controller (R198); verification clean |
 | R6 Reader: pdf.js in the interface, bundled, under the policy | complete (on the reader branch); GitHub's run not made (R202) | beeee22 (merge) | reviewed with probes over two fix rounds; a Critical finding found and closed (R199–R201; A6–A8); the desktop build fixed |
-| R7 Reader: the reader screen | approved; fix round 2 (minors) | 97c8d41 (worktree branch) | re-review: R203 closed, quality Approved, no Critical or Important; R205/A10 (regions only where drawn; the lock question never fails open; wording; focus); then the controller's verification and the merge |
+| R7 Reader: the reader screen | approved; in verification | d6b9a26 (worktree branch) | fix round 2 done (R205/A10) and read by the controller; verification with the desktop build running; then merge under R202 |
 | R8–R13 Reader: the remaining tasks | not started | | order: R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
-| Z1 Zotero sync: a stand-in for Zotero's servers | dispatched | — | test files only; Sonnet |
+| Z1 Zotero sync: a stand-in for Zotero's servers | in review | 60eddc5 (worktree branch `worktree-agent-a262efde0a50e5b62`) | test files only; 24 tests; fix to come: `tests` in the library's tsconfig include (A2) |
 | Z2–Z12 Zotero sync: the remaining tasks | planned | — | order: Z2; Z3 and Z4; Z5; Z6; Z7; Z8; Z9; Z10 (the scheduler, only after the screen); Z11; Z12 after reader R12. Owner's questions in the ledger under R206 |
-| W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | dispatched | — | one Sonnet implementer |
+| W1 + W5 Cloud folders: the local-content check and name rules; the macOS privacy sentence | in review | 7c44fea (worktree branch `worktree-agent-a375d680f9f00695a`) | 36 tests; the real `/usr/bin/stat` never run here (owner's Mac check) |
 | W2–W10 Cloud folders: the remaining tasks | planned | — | order: W2; W6 beside it; W3; W4; W7; W8 and W9; W10. Owner's questions in the ledger under R207 |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
