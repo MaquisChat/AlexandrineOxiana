@@ -49,6 +49,8 @@ export interface ImportReport {
      */
     conflicts?: number;
     collectionsRenamed?: number;
+    /** R236 a: items with a field Zotero cleared that keeps its value here. */
+    clearedInZoteroKept?: number;
   };
   /** Files this import stored: copied into the library, and left as links where they were (R136). Always given. */
   files: { copied: number; linked: number };
@@ -122,6 +124,7 @@ function markdown(r: ImportReport): string {
     ...(r.counts.backInZotero ? [`- Back in Zotero: ${r.counts.backInZotero}`] : []),
     // Task Z6: the researcher's value was kept; Zotero's waits beside it in the review queue.
     ...(r.counts.conflicts ? [`- Changed in Zotero and here — waiting for you: ${r.counts.conflicts}`] : []),
+    ...(r.counts.clearedInZoteroKept ? [`- Cleared in Zotero, kept here: ${r.counts.clearedInZoteroKept}`] : []),
     ...(r.counts.collectionsRenamed ? [`- Collections renamed in Zotero arrive under their new name; the old one is kept here: ${r.counts.collectionsRenamed}`] : []),
     ...(r.annotationsDeletedHere ? [`- Annotations deleted here — not re-imported: ${r.annotationsDeletedHere}`] : []),
     `- Failed: ${r.counts.failed}`,

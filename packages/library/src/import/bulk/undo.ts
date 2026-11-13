@@ -31,7 +31,9 @@ import { zoteroKeysOf } from "../../repo/tombstones.js";
 import type { ImportOps } from "../../repo/import-ops.js";
 import { reviewCauseOf } from "../../repo/review.js";
 import { BOOKKEEPING, PRIVATE_MODE, activeBatches, batchDirs, findBatch, readBatchAt, readJournal, writeBatchRecord } from "./batch.js";
-import { revertMerge } from "./merge.js";
+import { getAt, revertMerge } from "./merge.js";
+import { asEvidence } from "./update.js";
+import { isDeepStrictEqual } from "node:util";
 import { BatchRefusedError } from "./run.js";
 
 const CREATED = new Set(["created", "needs-review", "incomplete"]);
@@ -92,7 +94,13 @@ async function resolveUndoneConflicts(ops: ImportOps, sourceId: string, paths: s
     if (en.status !== "pending" || en.sourceId !== sourceId || reviewCauseOf(en)?.kind !== "capture-conflict") continue;
     const listed = Object.keys(en.fields ?? {});
     if (!listed.some((f) => paths.includes(f))) continue;
-    if (listed.some((f) => UNSETTLED.has(verification[f]?.status ?? ""))) continue;
+    if (listed.some((f) => UNSETTLED.has(verification[f]?.status ?? ""))) {
+      // M2: an entry that still waits for another field no longer lists the one this undo took off (its reasons, which
+      // name no field, are left as they are).
+      const off = listed.filter((f) => paths.includes(f) && !UNSETTLED.has(verification[f]?.status ?? ""));
+      if (off.length) await ops.updateReview({ ...en, fields: Object.fromEntries(Object.entries(en.fields).filter(([f]) => !off.includes(f))) });
+      continue;
+    }
     await ops.updateReview({ ...en, status: "resolved", resolvedAt: ops.tx.at, decision: "undone" });
   }
 }
@@ -155,9 +163,18 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
         // the write's own re-examination finds it decided and does not call it "rechecked".
         if (r.conflictsReverted.length) await resolveUndoneConflicts(ops, e.mergedInto!, r.conflictsReverted, r.next.verification);
         // One the researcher decided after the import is theirs: kept, with its evidence, and said.
+        // I1 (R236 b): what they decided is said as it is — their own value kept, or Zotero's taken — by comparing the
+        // field's value now with the Zotero value this batch asked about.
         for (const path of r.keptConflicts) {
           const decided = r.next.verification[path]?.status === "user-confirmed";
-          kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: decided ? "you decided on Zotero's value after this import; your decision was kept" : "changed after the import; kept" });
+          const asked = e.merge!.conflicts?.find((c) => c.path === path)?.after.values?.[0]?.value;
+          const tookZotero = asked !== undefined && isDeepStrictEqual(asEvidence(path, getAt(r.next.source, path)), asked);
+          const reason = !decided
+            ? "changed after the import; kept"
+            : tookZotero
+              ? "you chose Zotero's value after this import; your decision was kept"
+              : "you kept your own value after this import; your decision was kept";
+          kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason });
         }
         conflictsOff = r.conflictsReverted.length > 0;
         for (const id of r.keptAnnotations) kept.push({ kind: "annotation", id, sourceId: e.mergedInto!, reason: "edited after the import; kept" });

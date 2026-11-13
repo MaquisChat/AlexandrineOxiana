@@ -66,6 +66,7 @@ import {
   evaluate,
   findDuplicate,
   newId,
+  recheckSourceFile,
   vetFileNamePattern,
   type DupMatch,
   type ImportBatch,
@@ -126,6 +127,7 @@ import {
   readJournal,
   readParts,
   readCols,
+  readColKeys,
   collectionHash,
   writeBatchRecord,
   type BatchRecord,
@@ -167,7 +169,17 @@ const REMOVED_NOTE = /^(?:An attached file you removed here was|\d+ attached fil
 /** A stored file's parts as journaled (Z4). */
 type Parts = Record<string, { v: number; sha256?: string }>;
 /** What the newest journal line of an item says (R72; Z4 parts; Z6 the collections Zotero had it in, as name hashes). */
-type Known = { sourceId: string; version: string; parts?: Parts; cols?: string[][] };
+type Known = { sourceId: string; version: string; parts?: Parts; cols?: string[][]; colKeys?: string[][] };
+/** A verification report with these fields' entries set (or removed, when `after` is absent). */
+function withEntries(v: SourceFile["verification"], entries: Array<{ path: string; after?: SourceFile["verification"][string] }>): SourceFile["verification"] {
+  const out = { ...v };
+  for (const e of entries) {
+    if (e.after) out[e.path] = e.after;
+    else delete out[e.path];
+  }
+  return out;
+}
+
 /** Task Z6: an item's collection paths (names), and the same as name hashes, as journaled. */
 const itemPaths = (item: ScanItem): string[][] => [item.folderPath ?? [], ...(item.moreFolderPaths ?? [])].filter((p) => p.length > 0);
 const hashPath = (p: string[]): string[] => p.map(collectionHash);
@@ -268,8 +280,10 @@ export interface BatchCounts {
    * other changes is counted in `updated` as well; one whose only change was the conflict is in `items` and here only.
    */
   conflicts: number;
-  /** Task Z6: collections renamed in Zotero that arrived as new collections under the new name (the old one kept), each once. */
+  /** Task Z6: collections renamed in Zotero (the same collection KEY under another name) that arrived under the new name (the old one kept), each once. */
   collectionsRenamed: number;
+  /** R236 a: ITEMS with a field Zotero cleared that keeps its value here (noted once; neither emptied nor asked). */
+  clearedInZoteroKept: number;
 }
 
 export interface BatchResult {
@@ -537,6 +551,8 @@ class Run {
   private known = new Map<string, Known>();
   /** Task Z6 (Zotero Web): item key → the collections Zotero has it in now, as name hashes (journaled with its outcome). */
   private cols = new Map<string, string[][]>();
+  /** R236 f: item key → the Zotero collection keys along those paths (journaled beside them). */
+  private colKeys = new Map<string, string[][]>();
   /**
    * Task Z6: conflicts (a field changed in Zotero and here) and memberships added on update are the account sync's
    * alone (the plan: Zotero Web). Every other adapter, the local Zotero import included, behaves as before.
@@ -691,8 +707,8 @@ class Run {
     }
     // Z6: items waiting for the researcher's decision, and renamed collections, counted apart in the record too (only
     // when there are any; the report's `conflicts` and `collectionsRenamed` are the same numbers).
-    if (c.conflicts || c.collectionsRenamed) {
-      this.rec.countsDetail = { ...(this.rec.countsDetail ?? {}), conflicts: c.conflicts, collectionsRenamed: c.collectionsRenamed };
+    if (c.conflicts || c.collectionsRenamed || c.clearedInZoteroKept) {
+      this.rec.countsDetail = { ...(this.rec.countsDetail ?? {}), conflicts: c.conflicts, collectionsRenamed: c.collectionsRenamed, clearedInZoteroKept: c.clearedInZoteroKept };
     }
     this.rec.createdSourceIds = [...this.createdIds];
     this.rec.governance = [
@@ -866,7 +882,14 @@ class Run {
       if (item.unreadable) return this.queue({ key: item.key, outcome: "failed", reason: item.unreadable });
       if (this.adapter.incremental && item.version) {
         this.versions.set(item.key, item.version);
-        if (this.zoteroWeb) this.cols.set(item.key, itemPaths(item).map(hashPath));
+        if (this.zoteroWeb) {
+          const paths = itemPaths(item);
+          this.cols.set(item.key, paths.map(hashPath));
+          // The keys only when they match the paths name for name (an adapter's mistake leaves them out, never misread).
+          const keys = item.folderKeys;
+          if (keys && keys.length === paths.length && keys.every((k, i) => Array.isArray(k) && k.length === paths[i]!.length)) this.colKeys.set(item.key, keys);
+          else this.colKeys.delete(item.key);
+        }
         const k = this.known.get(item.version.id);
         if (k && !hasSource(this.repo, this.projectId, k.sourceId)) await this.refreshDeleted(); // deleted meanwhile?
         if (k && hasSource(this.repo, this.projectId, k.sourceId)) {
@@ -940,6 +963,7 @@ class Run {
     this.versions.set(item.key, { id: v.id, version: v.version, ...(k.parts ? { parts: k.parts } : {}) });
     // Z6: the collections the item was last seen in are carried over too (a gone item has none of its own).
     if (k.cols) this.cols.set(item.key, k.cols);
+    if (k.colKeys) this.colKeys.set(item.key, k.colKeys);
     const same = (a: Availability) => a.status === "unavailable-on-platform" && a.zotero === g;
     if (same(target.source.availability)) return this.queue({ key: item.key, outcome: "zotero-gone", sourceId: k.sourceId, gone: g }, target.assets);
     await this.flush();
@@ -1019,8 +1043,9 @@ class Run {
     const v = WITH_VERSION.has(e.outcome) && e.sourceId ? this.versions.get(e.key) : undefined;
     const parts = v ? this.partsFor(v, e.sourceId!, assets) : undefined;
     const cols = v ? this.cols.get(e.key) : undefined;
-    const ext = v ? { id: v.id, version: v.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}) } : undefined;
-    if (ext) this.known.set(ext.id, { sourceId: e.sourceId!, version: ext.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}) });
+    const colKeys = cols ? this.colKeys.get(e.key) : undefined;
+    const ext = v ? { id: v.id, version: v.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}), ...(colKeys ? { colKeys } : {}) } : undefined;
+    if (ext) this.known.set(ext.id, { sourceId: e.sourceId!, version: ext.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}), ...(colKeys ? { colKeys } : {}) });
     const dropped = e.outcome === "created" || e.outcome === "needs-review" ? this.annotationsDropped.get(e.key) : undefined;
     return { ...e, ...(notes?.length ? { notes } : {}), ...(ext ? { ext } : {}), ...(dropped ? { annotationsDropped: dropped } : {}) };
   }
@@ -1121,28 +1146,25 @@ class Run {
   }
 
   /**
-   * Task Z6: the collections a rename in Zotero made here, as far as this item shows it: a new path that differs from
-   * a path the item lost (one in its last line, not in Zotero now) by exactly one name, at the same depth, names the
-   * collection at that place under its new name. Counted (once per collection, by the hashes of its path) only when
-   * this batch made it; the old one is kept. Collections mode only. A move to a new sibling collection in Zotero reads
-   * the same and is counted too: the sentence stays true of what happened here (a new collection beside the old one).
+   * Task Z6 (R236 f): the collections renamed in Zotero, as this item shows them: a Zotero collection KEY on one of its
+   * paths now that the item's last line knew under another name. Each by the hash of its key (the journal holds no
+   * name), counted once over the batch. A move to a new collection beside the old one is a new key: not a rename. Only
+   * when this run adds a membership (the new name arrives as a new collection here; the old one is kept), collections
+   * mode only, and only when both lines carry keys.
    */
-  private async renamedBy(item: ScanItem, k: Known | undefined, added: string[][]): Promise<string[]> {
-    if (this.rec.options.structure !== "collections" || !k?.cols || !added.length) return [];
-    const now = new Set(itemPaths(item).map((p) => pathKey(hashPath(p))));
-    const lost = k.cols.filter((h) => !now.has(pathKey(h)));
+  private renamedBy(item: ScanItem, k: Known | undefined, added: string[][]): string[] {
+    const nowKeys = this.colKeys.get(item.key);
+    if (this.rec.options.structure !== "collections" || !k?.cols || !k.colKeys || !nowKeys || !added.length) return [];
+    const had = new Map<string, string>();
+    k.colKeys.forEach((path, i) => path.forEach((key, j) => had.set(key, k.cols![i]![j]!)));
     const out = new Set<string>();
-    for (const p of added) {
-      const h = hashPath(p);
-      for (const l of lost) {
-        if (l.length !== h.length) continue;
-        const diff = h.map((x, i) => (x === l[i] ? -1 : i)).filter((i) => i >= 0);
-        if (diff.length !== 1) continue;
-        const at = diff[0]!;
-        const { collectionIds } = await this.structure(p.slice(0, at + 1));
-        if (collectionIds[0] && this.rec.createdCollectionIds.includes(collectionIds[0])) out.add(pathKey(h.slice(0, at + 1)));
-      }
-    }
+    itemPaths(item).forEach((path, i) =>
+      path.forEach((name, j) => {
+        const key = nowKeys[i]![j]!;
+        const before = had.get(key);
+        if (before !== undefined && before !== collectionHash(name)) out.add(collectionHash(`key:${key}`));
+      }),
+    );
     return [...out];
   }
 
@@ -1838,7 +1860,7 @@ class Run {
       structCols.push(...s.collectionIds);
       structTags.push(...s.tagIds);
     }
-    const renamed = await this.renamedBy(item, prevKnown, newPaths);
+    const renamed = this.renamedBy(item, prevKnown, newPaths);
     const newStructure = structCols.some((c) => !target.source.collectionIds.includes(c)) || structTags.some((t) => !target.source.tagIds.includes(t));
     const kept = [...pre.kept, ...keptLabels(target, preAnn.kept)];
     const anything = pre.filled.length || pre.evidence.length || newInputs.length || preAnn.added.length || preAnn.updated.length || newTags || newStructure;
@@ -1860,6 +1882,8 @@ class Run {
     let contentUpdated = false;
     /** Z6: fields this change put in conflict (journaled as `conflictsQueued`). */
     let conflicted = 0;
+    /** R236 a: fields Zotero cleared, kept here (journaled as `clearedKept`). */
+    let cleared = 0;
     const out = await this.changeSource(
       item,
       sourceId,
@@ -1874,8 +1898,11 @@ class Run {
         const merged = applyMerge(cur, added, plan.filled, plan.evidence, ops.tx.at, ops.tx.actor, tagIds);
         // Z6: the conflicts' own evidence (Zotero's value) is recorded with them, and taken off with them by undo.
         const inConflict = new Set(plan.conflicts.map((c) => c.path));
+        const inCleared = new Set(plan.cleared);
         // Evidence of values that were already current is recorded too (not reverted by undo: it is true either way).
-        const extraEvidence = plan.evidence.filter((e) => !plan.filled.some((f) => f.path === e.field) && !inConflict.has(e.field));
+        const extraEvidence = plan.evidence.filter((e) => !plan.filled.some((f) => f.path === e.field) && !inConflict.has(e.field) && !inCleared.has(e.field));
+        // R236 a: a field Zotero cleared stays here; the clearing is noted (its own evidence, taken off by undo) and counted.
+        const clearedKept = plan.cleared.map((path) => ({ path, evidence: plan.evidence.filter((e) => e.field === path) }));
         const conflictRecords = plan.conflicts.map((c) => ({
           path: c.path,
           ...(cur.verification[c.path] ? { before: cur.verification[c.path] } : {}),
@@ -1898,12 +1925,14 @@ class Run {
           ...(back ? { availability: { before: cur.source.availability, after: back.to, preMark: back.to, marks: back.marks } } : {}),
           ...(conflictRecords.length ? { conflicts: conflictRecords } : {}),
           ...(addedCollectionIds.length ? { addedCollectionIds } : {}),
+          ...(clearedKept.length ? { clearedKept } : {}),
         };
         const changed =
           plan.filled.length > 0 || added.length > 0 || ann.added.length > 0 || ann.updated.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0 || addedCollectionIds.length > 0;
         conflicted = conflictRecords.length;
+        cleared = clearedKept.length;
         // Only a back-filled sort index (R195): written and recorded for undo, but reported as unchanged.
-        if (!changed && !ann.backfilled.length && !backTo && !conflicted) return { next: null, record, outcome: "unchanged" };
+        if (!changed && !ann.backfilled.length && !backTo && !conflicted && !cleared) return { next: null, record, outcome: "unchanged" };
         const replaced = new Map([...ann.updated, ...ann.backfilled].map((u) => [u.after.id, u.after]));
         // A back-fill alone, or a conflict alone, leaves the source as it is (not marked modified, R196; Z6: the value
         // here is untouched, only Zotero's is recorded beside it).
@@ -1914,7 +1943,7 @@ class Run {
             ...base,
             ...(addedCollectionIds.length ? { source: { ...base.source, collectionIds: [...base.source.collectionIds, ...addedCollectionIds] } } : {}),
             annotations: [...merged.next.annotations.map((a) => replaced.get(a.id) ?? a), ...ann.added],
-            fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence, ...conflictRecords.flatMap((c) => c.evidence)],
+            fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence, ...conflictRecords.flatMap((c) => c.evidence), ...clearedKept.flatMap((c) => c.evidence)],
             // Z6: each field in conflict is marked; writeSource then lists it in a pending capture-conflict entry in this
             // same change (R190, R193 b, R194) and the audit says which entry and field (`reviewQueued`), never a value.
             ...(conflicted ? { verification: { ...cur.verification, ...Object.fromEntries(conflictRecords.map((c) => [c.path, c.after])) } } : {}),
@@ -1922,8 +1951,14 @@ class Run {
           this.pendingForAdded(proxyPlan, newInputs, prep.shaOf, added, rule.mode()),
           rule.mode(),
         );
+        // R236 d (R38): a filled field whose entry said "confirmed by you" for a value the researcher's own evidence no
+        // longer matches gets its fresh status from the evidence (Zotero's newest value alone counts, R236 c); recorded so
+        // that undo gives back the confirmed entry with the value.
+        const reverified = this.reverify(cur, updated, plan.filled.map((f) => f.path));
+        if (reverified.length) record.reverified = reverified;
+        const verified: SourceFile = reverified.length ? { ...updated, verification: withEntries(updated.verification, reverified) } : updated;
         // Z5: the availability before the mark, and nothing more of its own (not a modification of the source).
-        const next: SourceFile = backTo ? { ...updated, source: { ...updated.source, availability: backTo } } : updated;
+        const next: SourceFile = backTo ? { ...verified, source: { ...verified.source, availability: backTo } } : verified;
         contentUpdated = !!backTo && changed;
         return { next, record, outcome: backTo ? "zotero-back" : changed ? "updated" : conflicted ? "zotero-conflict" : "unchanged" };
       },
@@ -1932,6 +1967,7 @@ class Run {
         ...(deletedHere ? { annotationsDeletedHere: deletedHere } : {}),
         ...(contentUpdated ? { contentUpdated: true as const } : {}),
         ...(conflicted ? { conflictsQueued: conflicted } : {}),
+        ...(cleared ? { clearedKept: cleared } : {}),
         ...(renamed.length ? { renamedCollections: renamed } : {}),
       }),
       rule.hook,
@@ -1939,6 +1975,24 @@ class Run {
     );
     this.startProxies(out.sf);
     return out.entry;
+  }
+
+  /**
+   * R236 d (R38): of the fields an update filled, those whose stored entry is `user-confirmed` while the fresh check of
+   * the updated source does not reach user-confirmed (the researcher's own evidence names another value): each with its
+   * entry before and the fresh one after (absent when the fresh check has none). Any adapter: "confirmed" is never left
+   * on a value the researcher did not confirm.
+   */
+  private reverify(cur: SourceFile, next: SourceFile, filled: string[]): NonNullable<MergeRecord["reverified"]> {
+    const stale = filled.filter((p) => cur.verification[p]?.status === "user-confirmed");
+    if (!stale.length) return [];
+    const fresh = recheckSourceFile(next, {}).verification;
+    const out: NonNullable<MergeRecord["reverified"]> = [];
+    for (const path of stale) {
+      if (fresh[path]?.status === "user-confirmed") continue;
+      out.push({ path, before: cur.verification[path]!, ...(fresh[path] ? { after: fresh[path] } : {}) });
+    }
+    return out;
   }
 
   /** `next` with more pending viewing proxies (inside the change; the item noted when they must wait for a worker). */
@@ -2091,7 +2145,8 @@ async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["s
       const parts = readParts(e.ext.parts);
       // Z6: and the collections Zotero had it in (a line written before Z6, or of another kind, has none: unknown).
       const cols = readCols(e.ext.cols);
-      out.set(e.ext.id, { sourceId: e.sourceId, version: e.ext.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}) });
+      const colKeys = readColKeys(e.ext.colKeys, cols);
+      out.set(e.ext.id, { sourceId: e.sourceId, version: e.ext.version, ...(parts ? { parts } : {}), ...(cols ? { cols } : {}), ...(colKeys ? { colKeys } : {}) });
     }
   }
   return out;

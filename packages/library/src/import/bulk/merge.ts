@@ -64,6 +64,13 @@ export interface MergeRecord {
   conflicts?: Array<{ path: string; before?: FieldVerification; after: FieldVerification; evidence: FieldEvidence[] }>;
   /** Task Z6: collections an update put the source in (memberships new in Zotero); undo takes them off while still there. */
   addedCollectionIds?: string[];
+  /** R236 a: fields Zotero cleared that were kept here, with the evidence that notes the clearing; undo takes it off. */
+  clearedKept?: Array<{ path: string; evidence: FieldEvidence[] }>;
+  /**
+   * R236 d (R38): fields the update filled whose entry said `user-confirmed` for a value the researcher's own evidence
+   * no longer matches: the entry before and the fresh one after (absent: none). Undo puts `before` back with the value.
+   */
+  reverified?: Array<{ path: string; before?: FieldVerification; after?: FieldVerification }>;
 }
 
 /**
@@ -219,6 +226,18 @@ export function revertMerge(
       conflictsReverted.push(c.path);
     } else keptConflicts.push(c.path);
   }
+  // R236 a: the note that Zotero cleared a field comes off (the value here was never touched).
+  for (const c of rec.clearedKept ?? []) for (const e of c.evidence) drop.add(JSON.stringify(e));
+  const clearedOff = (rec.clearedKept ?? []).some((c) => c.evidence.some((e) => cur.fieldEvidence.some((x) => JSON.stringify(x) === JSON.stringify(e))));
+  // R236 d: a field whose value this undo put back gets back the entry it had (user-confirmed), while the entry is
+  // still the one the update gave it.
+  let reverifiedBack = false;
+  for (const r of rec.reverified ?? []) {
+    if (!reverted.has(r.path) || !isDeepStrictEqual(verification[r.path], r.after)) continue;
+    const { [r.path]: _x, ...rest } = verification;
+    verification = r.before ? { ...rest, [r.path]: r.before } : rest;
+    reverifiedBack = true;
+  }
   // Annotations: added ones go and updated ones are put back — unless edited here since (kept, R74 M3).
   const keptAnnotations: string[] = [];
   const annIds = new Set<string>();
@@ -266,7 +285,7 @@ export function revertMerge(
   }
   const droppedAnnotations = annIds.size > 0 || restore.size > 0;
   const droppedPending = pendingLeft.length !== (cur.pendingProxies ?? []).length;
-  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || dropCollections.size > 0 || droppedAnnotations || dropKeys.size > 0 || droppedPending || availabilityRestored || conflictsReverted.length > 0;
+  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || dropCollections.size > 0 || droppedAnnotations || dropKeys.size > 0 || droppedPending || availabilityRestored || conflictsReverted.length > 0 || clearedOff || reverifiedBack;
   const { mergedExternalKeys: _m, pendingProxies: _p, ...base } = cur;
   return {
     next: {

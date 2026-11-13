@@ -786,9 +786,11 @@ describe("fix round 1 (R236)", () => {
       const after = await repo.getSource(p.id, id);
       expect(after.verification["/title"]?.status).toBe("user-confirmed");
       expect(verificationBut(after, "/title")).toEqual(verificationBut(before, "/title"));
-      // The entry still waits for the volume; no other entry.
-      expect((await pending(p, id)).map((e) => e.id)).toEqual([entry!.id]);
-      await queueAgrees(p, id);
+      // The entry still waits for the volume (the confirmed title stays listed and counts as settled, R177 a); no other entry.
+      const left = await pending(p, id);
+      expect(left.map((e) => e.id)).toEqual([entry!.id]);
+      expect(left[0]!.fields["/volume"]).toBe("conflict");
+      expect(Object.keys(after.verification).filter((f) => after.verification[f]!.status === "conflict")).toEqual(["/volume"]);
     });
 
     it("P2: a field that flowed in from Zotero earlier is not a conflict when another field is confirmed; no entry is made", async () => {
