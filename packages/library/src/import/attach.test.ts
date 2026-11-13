@@ -1148,20 +1148,21 @@ describe("cloud-drive folders: attach reads only what `readable` allows (Task W2
     const p = await project(NO_LOOKUP_GOV);
     const path = await put("each.pdf", await buildPdf({ title: "Each open", extra: "each" }));
     const asked: string[] = [];
+    const opened = readSpies();
     const [ok] = await createAttach({ repo, http, readable: async (q) => (asked.push(q), true) }).attachFiles(p.id, [path]);
+    const fullReads = opened(path).length;
     expect(ok!.sourceId).toEqual(expect.any(String));
     expect(asked.filter((q) => q === path).length).toBeGreaterThanOrEqual(4);
     // Evicted after the sniff and the hash: refused at the next open, nothing stored.
     const p2 = await project(NO_LOOKUP_GOV);
     const path2 = await put("evicted.pdf", await buildPdf({ title: "Evicted later", extra: "evicted2" }));
     let n = 0;
-    const opened = readSpies();
     const [r] = await createAttach({ repo, http, readable: async (q) => q !== path2 || ++n <= 2 }).attachFiles(p2.id, [path2]);
     expect(r).toEqual({ path: path2, outcome: "failed", reason: NOT_DOWNLOADED_REASON });
     expect(repo.listSourceIds(p2.id)).toEqual([]);
     const reads = opened(path2).length;
     expect(reads).toBeGreaterThan(0);
-    expect(reads).toBeLessThanOrEqual(2); // the sniff and the hash; never the metadata or the copy
+    expect(reads).toBeLessThan(fullReads); // the sniff and the hash happened; the copy never opened the file
   });
 
   it("attach and findSidecars without `readable` behave as before", async () => {

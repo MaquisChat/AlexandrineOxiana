@@ -216,6 +216,9 @@ export function createAttach(deps: AttachDeps): Attach {
   }
   type Session = ReturnType<typeof session>;
 
+  /** True when `readable` is given and refuses `path` now (each open of the file asks it again). */
+  const notReadable = async (path: string) => !!deps.readable && !(await deps.readable(path).catch(() => false));
+
   const storeInputs = (projectId: string) => sharedStoreInputs(repo, projectId, undefined, deps.debug);
 
   type Stored = { ext: string; mime: string; kind: string };
@@ -227,10 +230,15 @@ export function createAttach(deps: AttachDeps): Attach {
     if (current.assets.some((a) => a.sha256 === sha256)) return { path, outcome: "duplicate", sourceId };
     // Media with GPS: location governance applies to the store (R54a).
     // Unreadable metadata counts as located (fail closed, R57); a thrown error is not swallowed.
-    const hasLocation = LOCATED_MEDIA.test(mime) && mayHaveLocation(mime, await extractMetadata(path, mime));
+    let hasLocation = false;
+    if (LOCATED_MEDIA.test(mime)) {
+      if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the metadata read
+      hasLocation = mayHaveLocation(mime, await extractMetadata(path, mime));
+    }
     const plan = locatedPlan(hasLocation, mime);
     const rule = locationRule();
     const { ext, kind } = stored;
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the copy
     await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, mime: stored.mime, label: addedLabel(kind, new Date()) }, "manual_upload", {
       hasLocation,
       refuse: rule.hook,
@@ -261,7 +269,12 @@ export function createAttach(deps: AttachDeps): Attach {
     const same = keys.find((k) => k.sha256s.includes(sha256));
     if (same) return { path, outcome: "duplicate", sourceId: same.sourceId };
 
-    const r = await resolveItem({ path, mime, sidecarPaths: await findSidecars(path, deps.readable) }, { projectId, patterns, lookup: await s.lookup() });
+    const sidecarPaths = await findSidecars(path, deps.readable);
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the metadata read (resolveItem's first step)
+    const r = await resolveItem(
+      { path, mime, sidecarPaths, ...(deps.readable ? { sidecarReadable: deps.readable } : {}) },
+      { projectId, patterns, lookup: await s.lookup() },
+    );
     const dup = findDuplicate(candidateKey(r, [sha256]), keys);
     if (dup?.certainty === "certain") return { path, outcome: "duplicate", sourceId: dup.sourceId };
     const reviewItem = reviewFor(r, dup);
@@ -278,6 +291,7 @@ export function createAttach(deps: AttachDeps): Attach {
     // condition (coarsen/strip) the viewing proxy is queued in the same change (R83).
     const plan = locatedPlan(r.hasLocation, mime);
     const rule = locationRule();
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the copy, perhaps long after the lookups
     const sf = await createSourceRefusing(repo, projectId, r.draft, [{ path, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind }], {
       provenance,
       fieldEvidence: r.fieldEvidence,
@@ -298,8 +312,9 @@ export function createAttach(deps: AttachDeps): Attach {
     if (!st) return failed(path, REASONS.missing);
     if (st.isDirectory()) return failed(path, FOLDER_REASON);
     if (!st.isFile()) return failed(path, REASONS.notAFile);
-    // Before the first byte is read (the type sniff below): a file that is not on this computer is not read.
-    if (deps.readable && !(await deps.readable(path).catch(() => false))) return failed(path, NOT_DOWNLOADED_REASON);
+    // Before the first byte is read (the type sniff below), and again before EACH later open (the hash, the
+    // metadata, the copy): a file that is not on this computer, or no longer as it was checked, is not read (A6).
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON);
     let type: { ext: string; mime: string } | undefined;
     try {
       type = await fileTypeFromFile(path);
@@ -312,6 +327,7 @@ export function createAttach(deps: AttachDeps): Attach {
     if (toSourceId && !target) return failed(path, REASONS.noSource);
     const denied = await s.policy();
     if (denied) return failed(path, denied);
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the hash
     const sha256 = await sha256File(path);
     if (target) return ontoSource(projectId, path, target, type.mime, stored, sha256);
     return ontoLibrary(projectId, path, type.mime, stored, sha256, s);
