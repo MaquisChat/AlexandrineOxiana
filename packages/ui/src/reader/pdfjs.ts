@@ -37,6 +37,10 @@
  *    never a URL pdf.js fetches itself, never the token in a URL.
  * pdf.js's annotation layer (links, forms), its editor and XFA layers and its scripting sandbox are
  * never imported or rendered anywhere in the interface (pdfjs.test.ts checks the whole source).
+ *
+ * The pdf.js objects reachable through a `PdfHandle` (the document proxy and whatever hangs off it:
+ * its pages, render tasks, text and image objects) are for the reader's own modules only, and every
+ * read of them is always raced against the handle's `failed`.
  */
 import { READER_PDF_MAX_BYTES } from "@ao/shared";
 import { getDocument, InvalidPDFException, PasswordException, PasswordResponses, PDFWorker, type PDFDataRangeTransport, type PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";

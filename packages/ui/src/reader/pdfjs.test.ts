@@ -120,16 +120,16 @@ afterEach(() => {
 function memoryTransport(data: Uint8Array, opts: { firstBytes?: number; fail?: unknown; failFrom?: number } = {}) {
   const first = data.subarray(0, Math.min(opts.firstBytes ?? 1048576, data.length));
   const calls: Array<[number, number]> = [];
-  // `failFrom` may be moved later (state.failFrom), e.g. once the document is open.
-  // `failFrom` may be moved later, and a failure may wait for `gate` before it is thrown.
-  const state: { failFrom: number; gate?: Promise<void> } = { failFrom: opts.failFrom ?? 1 };
+  // `failFrom` may be moved later, a failure may wait for `gate` before it is thrown, and `total` (the
+  // length each answer gives the file) may be changed, as when the file is replaced meanwhile.
+  const state: { failFrom: number; gate?: Promise<void>; total?: number } = { failFrom: opts.failFrom ?? 1 };
   const fetchRange: FetchRange = async (start, end) => {
     calls.push([start, end]);
     if (opts.fail !== undefined && calls.length >= state.failFrom) {
       await state.gate;
       throw opts.fail;
     }
-    return data.slice(start, end + 1);
+    return { bytes: data.slice(start, end + 1), total: state.total ?? data.length };
   };
   return { transport: createRangeTransport({ bytes: first.slice(), total: data.length }, fetchRange), calls, state };
 }
@@ -302,7 +302,7 @@ describe("openPdf", () => {
   });
 
   it("a file over 512 MB is too large before pdf.js is given it", async () => {
-    const t = createRangeTransport({ bytes: new Uint8Array(1024), total: READER_PDF_MAX_BYTES + 1 }, async () => new Uint8Array(1));
+    const t = createRangeTransport({ bytes: new Uint8Array(1024), total: READER_PDF_MAX_BYTES + 1 }, async () => ({ bytes: new Uint8Array(1), total: READER_PDF_MAX_BYTES + 1 }));
     expect(await kindOf(openPdf({ transport: t, signal: signal() }))).toBe("too-large");
     expect(getDocument).not.toHaveBeenCalled();
     expect(LoopbackWorker.made).toEqual([]);
@@ -344,8 +344,8 @@ describe("openPdf", () => {
     let release: (() => void) | undefined;
     const fetchRange = vi.fn<FetchRange>(
       (start, end) =>
-        new Promise<Uint8Array>((resolve) => {
-          release = () => resolve(data.slice(start, end + 1));
+        new Promise<{ bytes: Uint8Array; total: number }>((resolve) => {
+          release = () => resolve({ bytes: data.slice(start, end + 1), total: data.length });
         }),
     );
     const transport = createRangeTransport({ bytes: data.slice(0, 1024), total: data.length }, fetchRange);
@@ -417,6 +417,15 @@ describe("PdfHandle.failed", () => {
     expect(await later(() => handle.doc.getPageLabels())).toBe("rejected");
     expect(() => early.getViewport({ scale: 1 })).toThrow();
     expect(t.calls.length).toBe(callsAtOpen + 1);
+  });
+
+  it("a file whose length changes after opening: the handle dies with the plain sentence, the read in flight rejects", async () => {
+    const { handle, t, early } = await openThenFail(undefined);
+    t.state.total = t.transport.length + 4096; // the file was replaced by a longer one meanwhile
+    expect(await outcome(early.getTextContent())).toBe("rejected");
+    const failure = await handle.failed;
+    expect(failure).toMatchObject({ kind: "other", message: "The file changed while it was being read. Open it again to read it as it is now." });
+    expect(handle.dead).toBe(true);
   });
 
   it("a network failure after opening: failed says other, the handle is dead, the page read in flight rejects", async () => {

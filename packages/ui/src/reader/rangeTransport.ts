@@ -23,11 +23,12 @@
 import { PDFDataRangeTransport } from "pdfjs-dist/legacy/build/pdf.mjs";
 
 /**
- * Bytes `start` to `end` (inclusive) of the document, or fewer from `start`; `signal` aborts when the
- * transport stops. Answering `{ bytes, total }` (as `documentRange` does) also gives the file's length
- * now: a length other than the document's means the file changed while it was being read, a failure.
+ * Bytes `start` to `end` (inclusive) of the document, or fewer from `start`, with the file's length
+ * now (`total`): the answer of `readerApi().documentRange` passed on as it is. `signal` aborts when
+ * the transport stops. A `total` other than the first answer's means the file changed while it was
+ * being read, and an answer without a whole-number `total` is refused: both are failures of the range.
  */
-export type FetchRange = (start: number, end: number, signal?: AbortSignal) => Promise<Uint8Array | { bytes: Uint8Array; total: number }>;
+export type FetchRange = (start: number, end: number, signal?: AbortSignal) => Promise<{ bytes: Uint8Array; total: number }>;
 
 /** The file's length changed between two ranges: it was replaced or edited while it was being read. */
 export class FileChangedError extends Error {
@@ -96,8 +97,12 @@ class ServiceRangeTransport extends PDFDataRangeTransport {
       while (at < end) {
         const answer = await this.#fetchRange(at, end - 1, signal);
         if (signal.aborted) return;
-        const bytes = answer instanceof Uint8Array ? answer : answer?.bytes;
-        if (!(answer instanceof Uint8Array) && answer?.total !== this.length) throw new FileChangedError();
+        const total: unknown = answer?.total;
+        if (typeof answer !== "object" || answer instanceof Uint8Array || !Number.isSafeInteger(total)) {
+          throw new RangeError("The library service answered without the length of the file.");
+        }
+        if (total !== this.length) throw new FileChangedError();
+        const bytes = answer.bytes;
         if (!(bytes instanceof Uint8Array) || bytes.length === 0 || bytes.length > end - at) {
           throw new RangeError("The library service answered with another part of the file than was asked for.");
         }

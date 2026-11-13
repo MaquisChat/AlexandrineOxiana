@@ -32,7 +32,7 @@ describe("createRangeTransport", () => {
     // The service cuts every answer at 4 MiB (DOCUMENT_RANGE_MAX_BYTES).
     const fetchRange = vi.fn(async (start: number, end: number) => {
       calls.push([start, end]);
-      return fileBytes(start, Math.min(end, start + 4 * MiB - 1, total - 1));
+      return { bytes: fileBytes(start, Math.min(end, start + 4 * MiB - 1, total - 1)), total };
     });
     const first = { bytes: fileBytes(0, MiB - 1), total };
     const t = createRangeTransport(first, fetchRange);
@@ -67,8 +67,8 @@ describe("createRangeTransport", () => {
     const signals: AbortSignal[] = [];
     const fetchRange = vi.fn((start: number, end: number, signal?: AbortSignal) => {
       if (signal) signals.push(signal);
-      return new Promise<Uint8Array>((resolve) => {
-        release = () => resolve(fileBytes(start, end));
+      return new Promise<{ bytes: Uint8Array; total: number }>((resolve) => {
+        release = () => resolve({ bytes: fileBytes(start, end), total });
       });
     });
     const t = createRangeTransport({ bytes: fileBytes(0, MiB - 1), total }, fetchRange);
@@ -92,7 +92,7 @@ describe("createRangeTransport", () => {
     const failures: unknown[] = [];
     const fetch2 = vi.fn(async (start: number, end: number) => {
       if (ac.signal.aborted) throw new DOMException("The range was no longer wanted.", "AbortError");
-      return fileBytes(start, end);
+      return { bytes: fileBytes(start, end), total };
     });
     const t2 = createRangeTransport({ bytes: fileBytes(0, MiB - 1), total }, fetch2);
     onRangeFailure(t2, (e) => failures.push(e));
@@ -132,7 +132,7 @@ describe("createRangeTransport", () => {
   });
 
   it("an answer of the wrong length is a failure, never handed on as data", async () => {
-    const fetchRange = vi.fn(async () => new Uint8Array(0));
+    const fetchRange = vi.fn(async () => ({ bytes: new Uint8Array(0), total: 4 * MiB }));
     const t = createRangeTransport({ bytes: fileBytes(0, MiB - 1), total: 4 * MiB }, fetchRange);
     const got = listen(t);
     const failures: unknown[] = [];
@@ -162,9 +162,23 @@ describe("createRangeTransport", () => {
     await vi.waitFor(() => expect(got2).toHaveLength(1));
   });
 
+  it("an answer that does not say the file's length (bare bytes, or no whole-number total) is a failure, never data", async () => {
+    for (const bad of [fileBytes(MiB, 2 * MiB - 1), { bytes: fileBytes(MiB, 2 * MiB - 1) }, { bytes: fileBytes(MiB, 2 * MiB - 1), total: "4194304" }]) {
+      const fetchRange = vi.fn(async () => bad as unknown as { bytes: Uint8Array; total: number });
+      const t = createRangeTransport({ bytes: fileBytes(0, MiB - 1), total: 4 * MiB }, fetchRange);
+      const got = listen(t);
+      const failures: unknown[] = [];
+      onRangeFailure(t, (e) => failures.push(e));
+      t.requestDataRange(MiB, 2 * MiB);
+      await vi.waitFor(() => expect(failures).toHaveLength(1));
+      await tick();
+      expect(got).toEqual([]);
+    }
+  });
+
   it("refuses a first part that is not the start of a file of that length", () => {
-    expect(() => createRangeTransport({ bytes: new Uint8Array(10), total: 5 }, async () => new Uint8Array(0))).toThrow();
-    expect(() => createRangeTransport({ bytes: new Uint8Array(10), total: 0 }, async () => new Uint8Array(0))).toThrow();
-    expect(() => createRangeTransport({ bytes: new Uint8Array(10), total: 1.5 }, async () => new Uint8Array(0))).toThrow();
+    expect(() => createRangeTransport({ bytes: new Uint8Array(10), total: 5 }, async () => ({ bytes: new Uint8Array(0), total: 10 }))).toThrow();
+    expect(() => createRangeTransport({ bytes: new Uint8Array(10), total: 0 }, async () => ({ bytes: new Uint8Array(0), total: 10 }))).toThrow();
+    expect(() => createRangeTransport({ bytes: new Uint8Array(10), total: 1.5 }, async () => ({ bytes: new Uint8Array(0), total: 10 }))).toThrow();
   });
 });
