@@ -552,6 +552,14 @@ class FolderGate {
   abandon(kind: CallKind): void {
     if (this.inFlight?.kind === kind) this.inFlight.giveUp();
   }
+  /**
+   * The watch stops (R234 I-A): the call in flight, of whatever kind, is given up at once, exactly as one that did not
+   * answer — so the folder is recorded as having a call outstanding before the stop returns, and the next watch of the
+   * folder adopts it instead of issuing a second call beside it.
+   */
+  giveUpNow(): void {
+    this.inFlight?.giveUp();
+  }
   /** The watch stops: nobody waits for the stuck call any longer (it is still not followed by another). */
   release(): void {
     for (const f of this.freeWaiters.splice(0)) f();
@@ -607,6 +615,45 @@ const isRefusal = (err: unknown) => errCode(err) === "EACCES" || errCode(err) ==
  * no call until that one settles — the thread it holds is not joined by another.
  */
 const outstandingFolders = new Map<string, { settled: Promise<void>; kind: CallKind }>();
+
+/** Whether a call on this folder (as given, or its real path) is still outstanding in this process (A6, R234 I-A). */
+export function folderCallOutstanding(dir: string): boolean {
+  return outstandingFolders.has(resolve(dir));
+}
+
+/**
+ * Records a call on `dir` that its caller stopped waiting for (the service's own checks of a chosen folder, R234 I-A):
+ * until it settles, a watch of the folder adopts it and issues nothing, and the folder is not asked again.
+ */
+export function noteFolderCallOutstanding(dir: string, call: Promise<unknown>): void {
+  const key = resolve(dir);
+  const entry = { settled: call.then(() => {}, () => {}), kind: "fs" as const };
+  outstandingFolders.set(key, entry);
+  void entry.settled.then(() => {
+    if (outstandingFolders.get(key) === entry) outstandingFolders.delete(key);
+  });
+}
+
+/** The folder checks of an add or a set-folder under a time limit (R234 I-B): past it, FolderNotAnsweringError, nothing written. */
+async function checkedFolderWithin(deps: WatchSettingsDeps, dir: string, timeoutMs: number | undefined): Promise<string> {
+  if (timeoutMs === undefined) return checkedFolder(deps, dir);
+  if (folderCallOutstanding(dir)) throw new FolderNotAnsweringError();
+  const check = checkedFolder(deps, dir);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_r, reject) => {
+    timer = setTimeout(() => {
+      noteFolderCallOutstanding(dir, check);
+      reject(new FolderNotAnsweringError());
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  check.catch(() => {});
+  try {
+    return await Promise.race([check, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** The watches running in this process, by watch id and by folder (as given and as its real path): one each (I1). */
 const activeWatches = new Map<string, symbol>();
@@ -2332,7 +2379,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       clearInterval(timer);
       // A download in hand is not waited for (it may take an hour): the folder counts as not answering until it settles,
       // so nothing further is issued on it — by this watch or a new one (Task W4).
-      if (fetching !== null) gate.abandon("fetch");
+      // ... and so is any other call in flight (R234 I-A): it is recorded as outstanding before the stop returns.
+      gate.giveUpNow();
       gate.release();
       for (const k of ownKeys.splice(0)) if (activeWatches.get(k) === me) activeWatches.delete(k);
       if (persist && liveWatches.get(deps.repo)?.get(liveKey(projectId, watchId!)) === live) liveWatches.get(deps.repo)!.delete(liveKey(projectId, watchId!));
@@ -2835,28 +2883,25 @@ function putFolder(deps: WatchSettingsDeps, projectId: string, id: string, real:
 }
 
 /** Adds a watched folder: its id and options to project.json (governed, audited), its folder to this device's settings. */
-export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}, o: { signal?: AbortSignal } = {}): Promise<WatchedFolder> {
-  const real = await checkedFolder(deps, dir);
-  // A caller that stopped waiting (its time limit passed while the folder did not answer, R233 I2): nothing is stored.
-  o.signal?.throwIfAborted();
+export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}, o: { timeoutMs?: number } = {}): Promise<WatchedFolder> {
+  // Only the calls on the folder are under the caller's limit (R234 I-B); the governed write below is awaited.
+  const real = await checkedFolderWithin(deps, dir, o.timeoutMs);
   deps.repo.getProject(projectId); // NotFoundError for an unknown project
   // A list that cannot be read refuses before the project is changed (Task 68, R178 a); so does a folder already
   // watched for a project of this library (I6: one folder feeds one project).
   await readStore(deps.lib.appConfigDir);
   await refuseWatchedFolder(deps, real);
-  o.signal?.throwIfAborted();
   const wf = await addWatchedFolderEntry(deps.repo, projectId, options);
   await putFolder(deps, projectId, wf.id, real);
   return wf;
 }
 
 /** Chooses this computer's folder for a watch the project already has (e.g. one added on another computer). */
-export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string, id: string, dir: string, o: { signal?: AbortSignal } = {}): Promise<void> {
+export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string, id: string, dir: string, o: { timeoutMs?: number } = {}): Promise<void> {
   if (!(deps.repo.getProject(projectId).watchedFolders ?? []).some((w) => w.id === id)) throw new TypeError("This project has no such watched folder.");
-  const real = await checkedFolder(deps, dir);
+  // Only the calls on the folder are under the caller's limit (R234 I-B).
+  const real = await checkedFolderWithin(deps, dir, o.timeoutMs);
   await refuseWatchedFolder(deps, real, id);
-  // A caller that stopped waiting (R233 I2): nothing is stored.
-  o.signal?.throwIfAborted();
   await putFolder(deps, projectId, id, real);
 }
 

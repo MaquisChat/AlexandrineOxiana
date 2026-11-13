@@ -266,7 +266,7 @@ export {
   watchFolder,
 } from "./import/watch.js";
 export type { FolderWatch, WatchDeps, WatchEvent, WatchSettingsDeps } from "./import/watch.js";
-export { FolderNotAnsweringError, WatchFileNotLocalError, bringInNewVersion, settleWatchedFile } from "./import/watch.js";
+export { FolderNotAnsweringError, WatchFileNotLocalError, bringInNewVersion, folderCallOutstanding, noteFolderCallOutstanding, settleWatchedFile } from "./import/watch.js";
 export { updateWatchedFolderEntry } from "./repo/repo.js";
 export { WHOLE_DRIVE_REASON, WINDOWS_CLOUD_REASON, folderRuleRefusal } from "./import/watch-local.js";
 export { WATCH_DOWNLOAD_CONFIRM_BYTES, WATCH_DOWNLOAD_RETRY_MS, WATCH_FETCH_TIMEOUT_MS, sizeText, withProvider, withService } from "./import/watch.js";
