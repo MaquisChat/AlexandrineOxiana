@@ -244,6 +244,9 @@ export async function fetchFile(
   let release: (() => void) | undefined;
 
   try {
+    // The first place is asked for before anything else waits, so callers are served in the order they called.
+    release = await place(first.hostname, ac.signal);
+    deadline = setTimeout(() => ac.abort(refuse("deadline", SENTENCES.deadline)), deadlineMs);
     if (await exists(into)) throw refuse("write-failed", SENTENCES.write);
     try {
       await privateFolder(folder);
@@ -252,8 +255,7 @@ export async function fetchFile(
     }
     let current = first;
     for (let hop = 0; ; hop++) {
-      release = await place(current.hostname, ac.signal);
-      deadline ??= setTimeout(() => ac.abort(refuse("deadline", SENTENCES.deadline)), deadlineMs);
+      release ??= await place(current.hostname, ac.signal);
       headersTimer = setTimeout(() => ac.abort(refuse("headers-timeout", SENTENCES.headers)), FETCH_FILE_HEADERS_MS);
       let res: Awaited<ReturnType<typeof request>>;
       try {

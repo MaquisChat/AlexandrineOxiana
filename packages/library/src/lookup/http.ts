@@ -22,6 +22,10 @@
  *    `; mailto:<email>` is added inside the parentheses only when the user set a contact email.
  *  - Under NODE_ENV=test only, AO_LOOKUP_FIXTURES replays recorded answers and fetches nothing
  *    (recorded.ts, R47/R130).
+ *  - `GetOptions.query` (F10: the e-mail Unpaywall requires) is added to the address of the first request only. It is
+ *    never part of the cache key (the caller's `cacheKey` names the request without it), a cached entry, an error's
+ *    message or any property of an error, and a recorded answer is looked up by the address without it.
+ *  - arXiv's export host: one request every 3 seconds (its API terms; F10; one at a time is kept by find/free-copy.ts).
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -44,6 +48,7 @@ export const DEFAULT_RATE_LIMITS: Readonly<Record<string, number>> = {
   "lx2.loc.gov": 1,
   "www.loc.gov": 1,
   "lccn.loc.gov": 1,
+  "export.arxiv.org": 1 / 3,
 };
 const DEFAULT_RATE = 1;
 /** Requests open at once, per host; a host not listed is unlimited. */
@@ -61,7 +66,7 @@ const MAX_REDIRECTS = 3;
 const MEMORY_ENTRIES = 2000;
 // A deliberately simple shape check; anything with whitespace, control characters, brackets or
 // semicolons is refused so the address can never change the header's structure.
-const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+export const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 
 /**
  * A 429 answer, shown to `GetOptions.final429` for that one decision and then dropped: the header
@@ -142,6 +147,12 @@ export interface GetOptions {
   sensitive?: boolean;
   /** Consulted on a 429: true means retrying cannot help (e.g. a daily budget spent), so it is not retried. */
   final429?: (answer: RateLimitAnswer) => boolean;
+  /**
+   * Parameters added to the address when it is requested (F10: Unpaywall's `email`), percent-encoded. Never part of
+   * the cache key, a cached entry, a log line, an error's message or any property of an error: the same answer is
+   * served from the cache whatever their values. Not sent again after a redirect.
+   */
+  query?: Readonly<Record<string, string>>;
 }
 
 interface CacheEntry {
@@ -241,7 +252,7 @@ export class HttpClient {
       }
     }
 
-    const res = await this.fetchWithRetries(url, opts.final429);
+    const res = await this.fetchWithRetries(url, opts.final429, opts.query);
     if (res.body !== null) validate?.(res.body); // throws: nothing is cached
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
     this.remember(name, entry, sensitive);
@@ -374,16 +385,24 @@ export class HttpClient {
     return this.backoffMs * 2 ** attempt;
   }
 
-  private async fetchWithRetries(url: string, final429?: (a: RateLimitAnswer) => boolean): Promise<{ status: 200 | 404; body: string | null }> {
+  private async fetchWithRetries(
+    url: string,
+    final429?: (a: RateLimitAnswer) => boolean,
+    query?: Readonly<Record<string, string>>,
+  ): Promise<{ status: 200 | 404; body: string | null }> {
     if (this.recorded) return this.recorded.answer(url);
+    const params = query ? Object.entries(query) : [];
+    const target = params.length ? `${url}${url.includes("?") ? "&" : "?"}${params.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&")}` : url;
     let lastError: LookupHttpError | undefined;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
-        res = await this.fetchFollowingRedirects(url);
+        res = await this.fetchFollowingRedirects(target);
       } catch (e) {
         if (e instanceof LookupHttpError) throw e; // refused redirect or oversized body: not retryable
-        lastError = new LookupHttpError(`The metadata service could not be reached: ${e instanceof Error ? e.message : String(e)}`);
+        // The library's own words can hold the address it was asked; with a query (an e-mail) they are not passed on.
+        const why = params.length ? "" : `: ${e instanceof Error ? e.message : String(e)}`;
+        lastError = new LookupHttpError(`The metadata service could not be reached${why}`);
       }
       if (res) {
         if (res.status === 200) return { status: 200, body: res.body };

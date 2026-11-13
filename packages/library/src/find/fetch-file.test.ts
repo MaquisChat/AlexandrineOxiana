@@ -76,9 +76,13 @@ const interceptor: Dispatcher.DispatcherComposeInterceptor = (dispatch) => (opts
   return true;
 };
 
-/** Lets pending I/O and promises run (never a timer: time is fake in some tests). */
-async function settle(cond: () => boolean = () => false, rounds = 2000): Promise<void> {
-  for (let i = 0; i < rounds && !cond(); i++) await new Promise((r) => setImmediate(r));
+/**
+ * Lets pending I/O and promises run (never a timer: time is fake in some tests): until `cond` holds (at most 10 s of
+ * real time, measured without timers), or for `rounds` turns of the event loop when no condition is given.
+ */
+async function settle(cond?: () => boolean, rounds = 200): Promise<void> {
+  const start = performance.now();
+  for (let i = 0; cond ? !cond() && performance.now() - start < 10_000 : i < rounds; i++) await new Promise((r) => setImmediate(r));
 }
 
 function reply(origin: string, path: string, status: number, data: Buffer | string, headers: Record<string, string> = {}) {
@@ -321,8 +325,13 @@ describe("fetchFile: time and abort", () => {
     p.catch(() => {}).finally(() => (settled = true));
     await settle(() => held.length === 1);
     held[0]!.respond(200, { "content-type": "application/pdf" }, [PDF], false);
-    await settle(() => false, 200);
-    expect((await readdir(dir)).some((n) => n.endsWith(".part"))).toBe(true);
+    let parts: string[] = [];
+    const start = performance.now();
+    while (!parts.some((n) => n.endsWith(".part")) && performance.now() - start < 10_000) {
+      await settle();
+      parts = await readdir(dir);
+    }
+    expect(parts.some((n) => n.endsWith(".part"))).toBe(true);
     await vi.advanceTimersByTimeAsync(FETCH_FILE_DEADLINE_MS - 1000);
     expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(2000);
@@ -364,7 +373,7 @@ describe("fetchFile: time and abort", () => {
     p.catch(() => {});
     await settle(() => held.length === 1);
     held[0]!.respond(200, {}, [PDF], false);
-    await settle(() => false, 200);
+    await settle();
     const reason = new Error("stopped by the runner");
     ac.abort(reason);
     await expect(p).rejects.toBe(reason);
@@ -424,13 +433,13 @@ describe("fetchFile: one download at a time per host, two in all, across callers
     const ps = [run("https://arxiv.org/1", "1"), run("https://arxiv.org/2", "2"), run("https://archive.org/3", "3"), run("https://europepmc.org/4", "4")];
     ps.forEach((p) => p.catch(() => {}));
     await settle(() => held.length >= 2);
-    await settle(() => false, 200);
+    await settle();
     // arxiv.org/2 waits for its host; europepmc waits for an overall place.
     expect(held.map((h) => `${h.origin}${h.path}`)).toEqual(["https://arxiv.org/1", "https://archive.org/3"]);
     held[0]!.respond(200, {}, [PDF], true);
     await ps[0];
     await settle(() => held.length >= 3);
-    await settle(() => false, 200);
+    await settle();
     expect(held.map((h) => `${h.origin}${h.path}`)).toEqual(["https://arxiv.org/1", "https://archive.org/3", "https://arxiv.org/2"]);
     held[1]!.respond(404, {}, [], true);
     await refusal(ps[2]!);
