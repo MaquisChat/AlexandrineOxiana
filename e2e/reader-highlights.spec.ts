@@ -72,6 +72,17 @@ async function readFromLibrary(page: Page, app: AppHarness, projectId: string, s
 
 const toolbar = (page: Page) => page.getByRole("toolbar", { name: "Reader" });
 const zoomValue = (page: Page) => toolbar(page).getByRole("status", { name: "Zoom" });
+/** The annotation list beside the pages (Task R9). */
+const annotationList = (page: Page) => page.getByRole("region", { name: /^Annotations \(/ });
+
+/** Presses Tab (at most `max` times) until `target` has the focus: the keyboard's own way there. */
+async function tabTo(page: Page, target: ReturnType<Page["locator"]>, max = 40): Promise<void> {
+  for (let i = 0; i < max; i++) {
+    if (await target.evaluate((el) => el === document.activeElement).catch(() => false)) return;
+    await page.keyboard.press("Tab");
+  }
+  await expect(target).toBeFocused();
+}
 
 /** Zoom in with the toolbar until the zoom reads `pct`. */
 async function zoomTo(page: Page, pct: string): Promise<void> {
@@ -172,14 +183,12 @@ interface Listed {
   annotations: Array<{ id: string; kind: string; quote?: string; imported: boolean; colorName: string; pdfAnchors: Array<{ assetId: string; page: number; rects: Array<{ x: number; y: number; w: number; h: number }> }> }>;
 }
 
-test("an imported Zotero highlight sits on its words at two zooms", async ({ page, app }) => {
-  const errors: string[] = [];
-  page.on("pageerror", (e) => errors.push(String(e)));
+/** The Zotero fixture's data folder imported through the service, Okafor's article with its highlight and note. */
+async function importOkafor(app: AppHarness, page: Page, project: string): Promise<{ projectId: string; sid: string; aid: string; listed: Listed }> {
   const dataDir = join(app.root, "sources", "Zotero");
   const linkedDir = join(app.root, "sources", "linked");
   buildZoteroFixture(dataDir, { pdf: await okaforPdf(), linkedPdf: await buildPdf({ extra: "adebayo linked" }), linkedDir });
-  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Market studies" });
-
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project });
   await test.step("the Zotero data folder is imported through the service, its highlight with it", async () => {
     const started = await app.api<{ batchId: string }>("POST", `/projects/${projectId}/import`, {
       adapter: { kind: "zotero-local", dataDir },
@@ -194,7 +203,14 @@ test("an imported Zotero highlight sits on its words at two zooms", async ({ pag
   const sid = sources.body.items.find((i) => i.title === "Feeding the City: Informal Markets in Lagos")!.id;
   const aid = await pdfAsset(app, projectId, sid);
   const listed = await app.api<Listed>("GET", `/projects/${projectId}/sources/${sid}/annotations`);
-  const highlight = listed.body.annotations.find((a) => a.kind === "highlight")!;
+  return { projectId, sid, aid, listed: listed.body };
+}
+
+test("an imported Zotero highlight sits on its words at two zooms", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const { projectId, sid, aid, listed } = await importOkafor(app, page, "Market studies");
+  const highlight = listed.annotations.find((a) => a.kind === "highlight")!;
   // As the importer stored it: page index 0 is page 1; [x1, y1, x2, y2] became {x, y, w, h}, y the lower edge.
   expect(highlight).toMatchObject({ quote: "informal markets", imported: true, colorName: "yellow" });
   expect(highlight.pdfAnchors).toEqual([expect.objectContaining({ assetId: aid, page: 1, rects: [{ x: 100.5, y: 200, w: 199.5, h: 15.25 }] })]);
@@ -285,8 +301,14 @@ test("a highlight whose text no longer matches says so", async ({ page, app }) =
   const far = await create("A page this file lacks", 7);
   await readFromLibrary(page, app, projectId, sid);
 
-  const notices = page.getByRole("region", { name: "Highlights to check" });
-  await expect(notices.getByRole("listitem")).toHaveText([`Page 1, “Words this page never held”: ${CHANGED}`, "Page 7, “A page this file lacks”: This highlight is on page 7, which this file does not have."]);
+  // R9 (A11): each entry of the list says it; the temporary region is gone.
+  const list = annotationList(page);
+  await expect(list.locator(`[data-entry="${changed}"]`)).toContainText(CHANGED);
+  await expect(list.locator(`[data-entry="${far}"]`)).toContainText("This highlight is on page 7, which this file does not have.");
+  await expect(list.locator(`[data-entry="${far}"]`).getByRole("button", { name: /^Go to/ })).toBeDisabled();
+  await expect(list.locator(`[data-entry="${same}"]`)).not.toContainText(CHANGED);
+  await expect(list.getByText(CHANGED)).toHaveCount(1);
+  await expect(page.getByRole("region", { name: "Highlights to check" })).toHaveCount(0);
   await expect(page.locator(`.ao-hl[data-annotation="${changed}"]`)).toHaveClass(/ao-hl--changed/);
   expect(await page.locator(`.ao-hl[data-annotation="${changed}"]`).evaluate((m) => getComputedStyle(m).outlineStyle)).toBe("dashed");
   await expect(page.locator(`.ao-hl[data-annotation="${same}"]`)).not.toHaveClass(/ao-hl--changed/);
@@ -318,7 +340,129 @@ test("a highlight on a scanned page with no text is drawn, and nothing is said o
   // No verdict: drawn plain, and no notice (the page's text, none, has been handed on by now).
   await page.waitForTimeout(300);
   await expect(mark).not.toHaveClass(/ao-hl--changed/);
-  await expect(page.getByRole("region", { name: "Highlights to check" })).toHaveCount(0);
+  await expect(annotationList(page).locator(`[data-entry="${made.body.id}"]`)).toContainText("Orange");
   await expect(page.getByText(CHANGED)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("an imported highlight is recoloured, noted and kept after a reload, by keyboard", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  // Okafor's article: the highlight "informal markets" (note "key claim") on page 1, and a note
+  // "check the numbers" on page 3, which this one-page file does not have.
+  const { projectId, sid, listed } = await importOkafor(app, page, "Annotated by keyboard");
+  const highlight = listed.annotations.find((a) => a.kind === "highlight")!;
+  const note = listed.annotations.find((a) => a.kind === "note")!;
+  expect(note).toBeTruthy();
+  await readFromLibrary(page, app, projectId, sid);
+  const list = annotationList(page);
+  await expect(list.getByRole("heading", { level: 2 })).toHaveText("Annotations (2)");
+  const hlEntry = list.locator(`[data-entry="${highlight.id}"]`);
+  const noteEntry = list.locator(`[data-entry="${note.id}"]`);
+  await expect(hlEntry).toContainText("Imported from Zotero");
+  await expect(hlEntry).toContainText("Yellow");
+  await expect(noteEntry).toContainText("This note is on page 3, which this file does not have.");
+  const live = list.getByRole("status");
+
+  await test.step("recoloured to Green from the colour menu", async () => {
+    await tabTo(page, hlEntry);
+    await tabTo(page, hlEntry.getByRole("button", { name: /^Colour of yellow highlight on page 1/ }));
+    await page.keyboard.press("Enter");
+    const menu = page.getByRole("menu", { name: /^Colour of yellow highlight/ });
+    await expect(menu.getByRole("menuitemradio", { name: "Yellow" })).toBeFocused();
+    await expect(menu.getByRole("menuitemradio", { name: "Yellow" })).toHaveAttribute("aria-checked", "true");
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("ArrowDown");
+    await expect(menu.getByRole("menuitemradio", { name: "Green" })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(live).toHaveText("Highlight recoloured: Green.");
+    await expect(menu).toHaveCount(0);
+    await expect(hlEntry.getByRole("button", { name: /^Colour of green highlight on page 1/ })).toBeFocused();
+    await expect(hlEntry).toContainText("Green");
+    await expect(hlEntry).toContainText("Imported from Zotero");
+    await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${highlight.id}"]`)).toHaveClass(/ao-hl--green/);
+  });
+
+  await test.step("its note edited and saved with Ctrl+Enter", async () => {
+    await page.keyboard.press("Shift+Tab");
+    await expect(hlEntry.getByRole("button", { name: /^Edit note of green highlight/ })).toBeFocused();
+    await page.keyboard.press("Enter");
+    const area = hlEntry.getByRole("textbox", { name: "Note" });
+    await expect(area).toBeFocused();
+    await expect(area).toHaveValue("key claim");
+    await page.keyboard.press("End");
+    await page.keyboard.type(", checked twice");
+    await page.keyboard.press("Control+Enter");
+    await expect(live).toHaveText("Note saved.");
+    await expect(area).toHaveCount(0);
+    await expect(hlEntry).toContainText("key claim, checked twice");
+    await expect(hlEntry.getByRole("button", { name: /^Edit note of green highlight/ })).toBeFocused();
+  });
+
+  await test.step("the other one deleted, after its question", async () => {
+    await page.keyboard.press("ArrowDown");
+    await expect(noteEntry).toBeFocused();
+    await tabTo(page, noteEntry.getByRole("button", { name: /^Delete / }));
+    await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", { name: "Delete this note?" });
+    await expect(dialog.getByRole("button", { name: "Keep it" })).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(dialog.getByRole("button", { name: "Delete" })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(live).toHaveText("Note deleted.");
+    await expect(noteEntry).toHaveCount(0);
+    // It was the last: the focus goes to the one before it.
+    await expect(hlEntry).toBeFocused();
+    await expect(list.getByRole("heading", { level: 2 })).toHaveText("Annotations (1)");
+  });
+
+  await test.step("after a reload, everything is as it was left", async () => {
+    await page.reload();
+    await expect(list.getByRole("heading", { level: 2 })).toHaveText("Annotations (1)");
+    await expect(hlEntry).toContainText("Green");
+    await expect(hlEntry).toContainText("key claim, checked twice");
+    await expect(hlEntry).toContainText("Imported from Zotero");
+    await expect(noteEntry).toHaveCount(0);
+    await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${highlight.id}"]`)).toHaveClass(/ao-hl--green/);
+    const after = await app.api<{ annotations: Array<{ id: string; colorName: string; body?: string; imported: boolean }> }>("GET", `/projects/${projectId}/sources/${sid}/annotations`);
+    expect(after.body.annotations.map((a) => [a.id, a.colorName, a.body, a.imported])).toEqual([[highlight.id, "green", "key claim, checked twice", true]]);
+  });
+  expect(errors).toEqual([]);
+});
+
+test("Go to from the list lands on the page with the highlight outlined", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Going to" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  // Page 3 says "This is the text of page 3, …" in 11-point Helvetica from x 50 on baseline 760.
+  const made = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, {
+    kind: "highlight",
+    assetId: aid,
+    anchors: [{ page: 3, rects: [{ x: 50, y: 760 - 0.207 * 11, w: 70.917, h: 0.925 * 11 }] }],
+    quote: "This is the text",
+    colorName: "purple",
+  });
+  expect(made.status, JSON.stringify(made.body)).toBe(201);
+  await readFromLibrary(page, app, projectId, sid);
+  const entry = annotationList(page).locator(`[data-entry="${made.body.id}"]`);
+  await expect(entry).toContainText("Page 3");
+  await tabTo(page, entry);
+  await page.keyboard.press("Enter");
+  const page3 = page.locator('[data-page-number="3"]');
+  await expect(page3).toBeFocused();
+  await expect(page3).toHaveAttribute("aria-label", "Page 3 of 3");
+  await expect(toolbar(page).getByRole("spinbutton", { name: "Page" })).toHaveValue("3");
+  const mark = page3.locator(`.ao-hl[data-annotation="${made.body.id}"]`);
+  await expect(mark).toHaveClass(/ao-hl--selected/);
+  await expect(mark).toBeInViewport();
+  await expect(entry).toHaveAttribute("aria-current", "true");
+  // Its ring is drawn: the chosen one is seen on the page.
+  expect(await mark.evaluate((m) => getComputedStyle(m).boxShadow)).not.toBe("none");
+  // By the entry's button too.
+  await tabTo(page, entry.getByRole("button", { name: /^Go to purple highlight on page 3/ }));
+  await page.keyboard.press("Enter");
+  await expect(page3).toBeFocused();
   expect(errors).toEqual([]);
 });

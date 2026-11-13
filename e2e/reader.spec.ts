@@ -954,7 +954,8 @@ test("a project locked while its PDF is shown, every page already fetched: the r
   for (const n of [1, 2]) await expect(region(page, n, 3).locator(".ao-reader-text-layer")).toContainText(`This is the text of page ${n}`);
   await expect.poll(() => inked(page, 1)).toBe(true);
   await expect(region(page, 1, 3).locator(".ao-hl")).toHaveCount(2);
-  await expect(page.getByRole("region", { name: "Highlights to check" })).toContainText("Words no page of it holds");
+  await expect(page.getByRole("region", { name: /^Annotations \(/ })).toContainText("Words no page of it holds");
+  await expect(page.getByRole("region", { name: /^Annotations \(/ })).toContainText("The text here has changed since this highlight was made.");
   const documentCalls = () => seen.requests.filter((u) => u.includes(`/assets/${aid}/document`)).length;
   const before = documentCalls();
   const workerClosed = new Promise<void>((r) => seen.workers[0]!.once("close", () => r()));
@@ -968,8 +969,8 @@ test("a project locked while its PDF is shown, every page already fetched: the r
   await expect(page.locator("canvas")).toHaveCount(0);
   await expect(page.locator(".ao-reader-text-layer, [data-page-number], .ao-reader-scroll")).toHaveCount(0);
   expect(await page.evaluate(() => document.body.textContent?.includes("This is the text of page") ?? false)).toBe(false);
-  // Nor anything of its annotations (R8): no highlight, no notice, no quote.
-  await expect(page.locator(".ao-hl, .ao-hl-layer, .ao-reader-hl-notices")).toHaveCount(0);
+  // Nor anything of its annotations (R8, R9): no highlight, no list, no quote.
+  await expect(page.locator(".ao-hl, .ao-hl-layer, .ao-ann, .ao-reader-hl-notices")).toHaveCount(0);
   expect(await page.evaluate(() => document.body.textContent?.includes("Words no page of it holds") ?? false)).toBe(false);
   // pdf.js's worker (and its copy of the file) ended with the document; nothing was read to learn of the lock.
   await workerClosed;
