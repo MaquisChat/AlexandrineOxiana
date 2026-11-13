@@ -2296,7 +2296,7 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await until(() => ["a.pdf", "b.pdf"].every((f) => events.some((e) => e.kind === "imported" && e.file === f)));
     expect(w.status()).toMatchObject({
       state: "watching",
-      reason: "Downloading has stopped at the size you agreed to. 1 files (300 bytes) are waiting for your word.",
+      reason: "Downloading has stopped at the size you agreed to. 1 file (300 bytes) are waiting for your word.",
       downloadHeld: { files: 1, bytes: 300 },
       counts: { cameIn: 2, notDownloaded: 1, notDownloadedBytes: 300 },
     });
@@ -2356,7 +2356,7 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await until(() => w.status().downloadHeld !== undefined);
     await sleep(400);
     expect(dl.calls).toEqual([]);
-    expect(w.status()).toMatchObject({ reason: "Downloading has stopped at the size you agreed to. 1 files (3.2 GB) are waiting for your word.", downloadHeld: { files: 1, bytes: WATCH_DOWNLOAD_CONFIRM_BYTES * 3 } });
+    expect(w.status()).toMatchObject({ reason: "Downloading has stopped at the size you agreed to. 1 file (3.2 GB) are waiting for your word.", downloadHeld: { files: 1, bytes: WATCH_DOWNLOAD_CONFIRM_BYTES * 3 } });
   });
 
   it("a later arrival is held at 1 GiB beyond the confirmed size", async () => {
@@ -2521,11 +2521,14 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
 
     // Read-only: the library turns read-only just as the researcher says "download".
     const q = await project();
-    const qid = await watched(q);
+    const inbox2 = join(tmp, "Inbox2");
+    await mkdir(inbox2);
+    await sparse(join(inbox2, "a.pdf"), 100);
+    const qid = await watched(q, inbox2);
     let ro = false;
     const flip = Object.create(lib, { mode: { get: () => (ro ? "read-only" : "read-write") } }) as Library;
     const dl2 = downloader();
-    const w2 = watchFolder({ repo, http, lib: flip, fetchContent: dl2.fn, ...FASTW }, q.id, inbox, {}, qid);
+    const w2 = watchFolder({ repo, http, lib: flip, fetchContent: dl2.fn, ...FASTW }, q.id, inbox2, {}, qid);
     watches.push(w2);
     await w2.ready;
     await until(() => w2.status().counts.notDownloaded === 1);
@@ -2619,8 +2622,8 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
 
     // stop() in the middle of a download that does not answer returns at once and issues nothing further; a new watch
     // of the same folder makes no call until that download settles.
-    const q = await project();
-    const qid = await watched(q);
+    const q = p; // one folder feeds one project (I6): the same watch, started again
+    const qid = wid;
     await sparse(join(inbox, "zzz.pdf"), 100);
     await choose(q, qid, { notDownloaded: "download", confirmedBytes: 10_000 });
     const dl2 = downloader();
@@ -2713,8 +2716,8 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     const y = join(real, "y.pdf");
     const hookedY = lstatHook(y);
     await w.stop();
-    const q2 = await project();
-    const qid = await watched(q2);
+    const q2 = p; // one folder feeds one project (I6): the same watch, started again, with a new confirmation
+    const qid = wid;
     opened.length = 0;
     const { w: w2 } = start(q2, { ...FASTW, watchId: qid, fetchContent: undefined, watchEvents: false, rescanMs: 600_000, fs: { lstat: hookedY.lstat, open } });
     await w2.ready;
@@ -2763,7 +2766,8 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     expect(twinEvents).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "error", reason: WATCH_REASONS.alreadyWatched })]));
     // Another id on the same real folder: refused too (once the folder's real path is known).
     const q = await project();
-    const qid = await watched(q);
+    await mkdir(join(tmp, "Elsewhere"));
+    const qid = await watched(q, join(tmp, "Elsewhere"));
     const { w: other } = start(q, { ...FASTW, watchId: qid, dir: inbox + "/.", fetchContent: dl.fn });
     await other.ready;
     await until(() => other.stopped);
@@ -2862,7 +2866,8 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await sleep(600);
     expect(dl.calls).toEqual([]);
     expect(w.status().downloadHeld).toEqual({ files: 2, bytes: 100 });
-    expect(w.status().reason).toBe("Downloading has stopped at the size you agreed to. 2 files (100 bytes) are waiting for your word.");
+    expect(w.status().reason).toBe("Nothing is downloaded until you agree to a size. 2 files (100 bytes) are waiting for your word.");
+    expect(WATCH_REASONS.nothingAgreed).toBe("Nothing is downloaded until you agree to a size. {files} files ({size}) are waiting for your word.");
   });
 
   it("I5: a restart does not grant the allowance again", async () => {
@@ -2970,5 +2975,104 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await until(() => w.stopped);
     await sleep(200);
     expect(dl.calls).toEqual([]);
+  });
+
+  it("I6: a folder already watched for a project of this library is refused when added, by real path and through an alias", async () => {
+    const a = await project();
+    const b = await project();
+    await watched(a);
+    const sentence = "This folder is already watched. A folder can be watched for one project at a time.";
+    await expect(addWatchedFolder({ repo, lib }, b.id, inbox)).rejects.toThrow(sentence);
+    await symlink(inbox, join(tmp, "Alias"));
+    await expect(addWatchedFolder({ repo, lib }, b.id, join(tmp, "Alias"))).rejects.toThrow(sentence);
+    await expect(addWatchedFolder({ repo, lib }, a.id, inbox)).rejects.toThrow(sentence); // the same project twice too
+    // Choosing it on this computer for an existing watch of another project is refused the same way.
+    await mkdir(join(tmp, "Other"));
+    const bw = await watched(b, join(tmp, "Other"));
+    await expect(setWatchFolder({ repo, lib }, b.id, bw, join(tmp, "Alias"))).rejects.toThrow(sentence);
+    const err = await addWatchedFolder({ repo, lib }, b.id, inbox).catch((e: unknown) => e as Error);
+    expect(err.message).not.toContain(a.name); // no project is named
+    expect(err.message).not.toContain(tmp);
+    expect((await listWatchedFolders({ repo, lib }, b.id)).map((x) => x.id)).toEqual([bw]); // nothing was added for b
+  });
+
+  it("I6: two older records of one folder: the watch added first keeps it, whatever the order of starting", async () => {
+    const a = await project();
+    const b = await project();
+    const aw = await watched(a);
+    await mkdir(join(tmp, "Other"));
+    const bw = await watched(b, join(tmp, "Other"));
+    // A record made before the rule: b's folder on this computer is the same folder as a's.
+    const file = join(tmp, "config", "watched-folders.json");
+    const store = JSON.parse(await readFile(file, "utf8")) as Record<string, Record<string, Record<string, string>>>;
+    store[lib.id]![b.id]![bw] = await realpath(inbox);
+    await writeFile(file, JSON.stringify(store));
+    const loser = "This folder is already watched for another project. A folder can be watched for one project at a time.";
+    expect(WATCH_REASONS.folderOfAnotherProject).toBe(loser);
+    for (const order of ["b first", "a first", "together"] as const) {
+      let wa: FolderWatch;
+      let wb: FolderWatch;
+      if (order === "b first") {
+        wb = start(b, { ...FASTW, watchId: bw }).w;
+        await wb.ready;
+        wa = start(a, { ...FASTW, watchId: aw }).w;
+      } else if (order === "a first") {
+        wa = start(a, { ...FASTW, watchId: aw }).w;
+        await wa.ready;
+        wb = start(b, { ...FASTW, watchId: bw }).w;
+      } else {
+        wb = start(b, { ...FASTW, watchId: bw }).w;
+        wa = start(a, { ...FASTW, watchId: aw }).w;
+      }
+      await Promise.all([wa.ready, wb.ready]);
+      await until(() => wb.stopped);
+      expect(wb.status(), order).toMatchObject({ state: "stopped", reason: loser });
+      expect(wa.stopped, order).toBe(false);
+      expect(wa.status().state, order).toBe("watching");
+      await Promise.all([wa.stop(), wb.stop()]);
+    }
+  }, 30_000);
+
+  it("a file not downloaded whose size reads 0 is never fetched: its true size is not known", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    await writeFile(join(inbox, "empty.pdf"), "");
+    await sparse(join(inbox, "some.pdf"), 100);
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) {
+        const st = m.get(q);
+        if (q.endsWith("empty.pdf") && st && st.presence === "local") m.set(q, { ...st, presence: "not-downloaded" });
+      }
+      return m;
+    };
+    const dl = downloader({ local: false });
+    const { w } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 2);
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 1_000_000 });
+    await w.refreshChoices();
+    await until(() => dl.calls.length === 1);
+    await until(() => w.problems(page(10)).items.some((i) => i.file === "empty.pdf" && i.reason === WATCH_REASONS.sizeUnknown));
+    await sleep(500);
+    expect(dl.calls.map((q) => q.split("/").at(-1))).toEqual(["some.pdf"]);
+    expect(WATCH_REASONS.sizeUnknown).toBe("The size of this file is not known until it is downloaded, so it is left for you to download yourself.");
+  });
+
+  it("a confirmation of 0 bytes is no confirmation: nothing is fetched under it, later arrivals included", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    const dl = downloader();
+    const { w } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn });
+    await w.ready;
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 0 }); // nothing was waiting when they agreed
+    await w.refreshChoices();
+    await sparse(join(inbox, "later.pdf"), 10);
+    await until(() => w.status().downloadHeld !== undefined);
+    await sleep(500);
+    expect(dl.calls).toEqual([]);
+    expect(w.status().reason).toBe("Nothing is downloaded until you agree to a size. 1 file (10 bytes) are waiting for your word.");
   });
 });

@@ -140,9 +140,13 @@ describe("this computer's choices for a watched folder (Task W4)", () => {
     expect(await getWatchDownloadCount(d, projectId, watchId)).toEqual({ confirmation: 0, fetchedBytes: 0 });
     expect(await reserveWatchDownload(d, projectId, watchId, 0, 0, false)).toEqual({ reserved: false, reason: "held" });
     expect(await reserveWatchDownload(d, projectId, watchId, 0, 0, true)).toEqual({ reserved: false, reason: "held" });
-    // Once a size is agreed, a file of 0 bytes is reserved under that confirmation.
+    // A confirmation of 0 bytes is no confirmation: nothing, later arrivals included (fix round 2).
     await setWatchChoices(d, projectId, watchId, { confirmedBytes: 0 });
-    expect(await reserveWatchDownload(d, projectId, watchId, 1, 0, false)).toEqual({ reserved: true, fetchedBytes: 0 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 1, 0, false)).toEqual({ reserved: false, reason: "held" });
+    expect(await reserveWatchDownload(d, projectId, watchId, 1, 10, true)).toEqual({ reserved: false, reason: "held" });
+    // A size agreed: a file of 0 bytes is reserved under it like any other.
+    await setWatchChoices(d, projectId, watchId, { confirmedBytes: 5 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 2, 0, false)).toEqual({ reserved: true, fetchedBytes: 0 });
   });
 
   it("an unknown watch, an unknown project and a malformed choice are refused, writing nothing", async () => {
