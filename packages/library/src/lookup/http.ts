@@ -24,6 +24,7 @@
  *    (recorded.ts, R47/R130).
  */
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { libraryVersion } from "../resources.js";
 import { join } from "node:path";
@@ -157,6 +158,14 @@ interface MemoryEntry extends CacheEntry {
 export class HttpClient {
   readonly userAgent: string;
   private readonly cacheDir: string;
+  /**
+   * R247 (c): whether the library's root folder existed when the client was made. If it did, a cache write never
+   * creates it again (a library closed, moved or deleted meanwhile gets nothing written into a folder of that name).
+   * A client made for a folder that does not exist yet creates it as before.
+   */
+  private readonly rootExisted: boolean;
+  /** R247 (c): false once the service has said the library is closing or moving: nothing more is written to disk. */
+  private diskCache = true;
   private readonly dispatcher?: Dispatcher;
   private readonly clock: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -179,6 +188,7 @@ export class HttpClient {
     const email = opts.contactEmail?.trim();
     this.userAgent = email && EMAIL_RE.test(email) ? `AlexandrineOxiana/${VERSION} (+${PROJECT_URL}; mailto:${email})` : USER_AGENT;
     this.cacheDir = join(opts.libraryRoot, ".cache", "lookups");
+    this.rootExisted = existsSync(opts.libraryRoot);
     this.dispatcher = opts.dispatcher;
     this.clock = opts.clock ?? Date.now;
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -256,6 +266,14 @@ export class HttpClient {
     for (const [k, e] of this.memory) if (e.sensitive) this.memory.delete(k);
   }
 
+  /**
+   * R247 (c): `false` when the library is being closed, switched or moved: from then on no answer, however late, is
+   * written to the disk cache (reads go on, and the memory cache still serves). `true` again when it is in use.
+   */
+  setDiskCache(on: boolean): void {
+    this.diskCache = on;
+  }
+
   private remember(name: string, e: CacheEntry, sensitive: boolean): void {
     const prior = this.memory.get(name);
     this.memory.delete(name);
@@ -287,9 +305,15 @@ export class HttpClient {
   }
 
   private async writeCache(name: string, e: CacheEntry): Promise<void> {
+    if (!this.diskCache) return;
     try {
       const parent = join(this.cacheDir, "..");
-      await fsp.mkdir(parent, { recursive: true, mode: 0o700 });
+      if (this.rootExisted) {
+        // Never above `.cache`: a library folder that is gone is not made again (R247 c).
+        await fsp.mkdir(parent, { mode: 0o700 }).catch((err: NodeJS.ErrnoException) => {
+          if (err.code !== "EEXIST") throw err;
+        });
+      } else await fsp.mkdir(parent, { recursive: true, mode: 0o700 });
       if (!(await this.realDir(parent))) return;
       await fsp.mkdir(this.cacheDir, { mode: 0o700 }).catch((err: NodeJS.ErrnoException) => {
         if (err.code !== "EEXIST") throw err;
@@ -297,6 +321,7 @@ export class HttpClient {
       // Never chmod or write through a symlink planted in place of the cache directory.
       if (!(await this.realDir(this.cacheDir))) return;
       if (process.platform !== "win32") await fsp.chmod(this.cacheDir, 0o700);
+      if (!this.diskCache) return;
       await writeFileAtomic(join(this.cacheDir, `${name}.json`), JSON.stringify(e), { mode: 0o600 });
     } catch {
       // The cache is an optimisation: a read-only or full disk only costs a repeat lookup.
