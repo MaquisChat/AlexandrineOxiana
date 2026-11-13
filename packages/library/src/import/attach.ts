@@ -46,7 +46,8 @@ import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
-import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, type Repo } from "../repo/repo.js";
+import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectCollectionsAndTags, type Repo } from "../repo/repo.js";
+import type { CreateInTx } from "../repo/sources.js";
 import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
 import { pendingFor, proxyQueueFor, proxyTypeFor, type ProxyPlan, type ProxyQueue } from "./proxies.js";
 import { serialStore, storeTurn } from "./project-queue.js";
@@ -67,7 +68,25 @@ export interface AttachOutcome {
   reason?: string;
   /** Stored, but something is still to come: e.g. LOCATION_REASON (its location-safe viewing copy waits for the media worker, R83). */
   note?: string;
+  /** A watched folder's collection (`AttachOpts.collectionId`) no longer exists: the new source came in without one (Task W3). */
+  noCollection?: true;
 }
+
+/**
+ * Per call (Task W3). `toSourceId`: the files become further originals of that source. `collectionId`: new sources
+ * get this collection in the same change that creates them, when it exists at that moment (otherwise none, and
+ * the outcome says `noCollection`). `origin`: the file comes from a watched folder; the new source's provenance
+ * says so (`tool: { name: "watched-folder" }`, `externalKeys["watched-folder"] = watchId`), set at creation and never
+ * changed afterwards. Without these, attach behaves exactly as before (drag-and-drop, Bulk Import).
+ */
+export interface AttachOpts {
+  toSourceId?: string;
+  collectionId?: string;
+  origin?: { watchId: string };
+}
+
+/** The tool name a watched folder's sources carry in their provenance, and the external key that names the watch. */
+export const WATCHED_FOLDER_TOOL = "watched-folder";
 
 export interface AttachDeps {
   repo: Repo;
@@ -79,14 +98,24 @@ export interface AttachDeps {
   debug?: (note: string) => void;
   /** Viewing proxies of located photos and videos (R83); default: the library's queue (proxyQueueFor, R85). */
   proxies?: ProxyQueue;
+  /**
+   * A watched folder (Task W2): asked for each file (the item, then each sidecar beside it) before a byte of
+   * it is read; false means its content is not on this computer, and reading it would download it. The item
+   * then fails with NOT_DOWNLOADED_REASON before its type is sniffed, and a sidecar is left out. Absent (drag
+   * and drop, Bulk Import): every file is read as before.
+   */
+  readable?: (path: string) => Promise<boolean>;
 }
 
 export interface Attach {
-  attachFiles(projectId: string, paths: string[], opts?: { toSourceId?: string }): Promise<AttachOutcome[]>;
+  attachFiles(projectId: string, paths: string[], opts?: AttachOpts): Promise<AttachOutcome[]>;
 }
 
 export const FOLDER_REASON = "Use Bulk Import for folders";
-const REASONS = {
+/** A file `readable` refused: its content is not on this computer (a cloud drive's online-only file). */
+export const NOT_DOWNLOADED_REASON = "Not downloaded to this Mac. It comes in once it is downloaded.";
+/** The plain reasons attach gives (callers tell them apart, e.g. the watched folder's file kinds). */
+export const ATTACH_REASONS = {
   missing: "The file could not be found or read.",
   notAFile: "Only files can be attached.",
   unsupported: "This kind of file cannot be attached. Attach PDFs, EPUB or Kindle books, Word documents, images, audio or video.",
@@ -96,6 +125,7 @@ const REASONS = {
   failed: "The file could not be attached.",
   ...ITEM_REASONS,
 };
+const REASONS = ATTACH_REASONS;
 
 /**
  * The sniffed (`file-type`) extensions attach accepts: documents and books, images (incl. camera
@@ -122,6 +152,9 @@ export function acceptedType(type: { ext: string; mime: string }): { ext: string
 }
 
 const failed = (path: string, reason: string): AttachOutcome => ({ path, outcome: "failed", reason });
+
+/** Thrown inside the creating change when the collection was deleted meanwhile: that change is taken back. */
+class CollectionGone extends Error {}
 
 /** A short label for an added original's file name: its kind and when it was added (no user file name). */
 function addedLabel(kind: string, at: Date): string {
@@ -205,6 +238,9 @@ export function createAttach(deps: AttachDeps): Attach {
   }
   type Session = ReturnType<typeof session>;
 
+  /** True when `readable` is given and refuses `path` now (each open of the file asks it again). */
+  const notReadable = async (path: string) => !!deps.readable && !(await deps.readable(path).catch(() => false));
+
   const storeInputs = (projectId: string) => sharedStoreInputs(repo, projectId, undefined, deps.debug);
 
   type Stored = { ext: string; mime: string; kind: string };
@@ -216,10 +252,15 @@ export function createAttach(deps: AttachDeps): Attach {
     if (current.assets.some((a) => a.sha256 === sha256)) return { path, outcome: "duplicate", sourceId };
     // Media with GPS: location governance applies to the store (R54a).
     // Unreadable metadata counts as located (fail closed, R57); a thrown error is not swallowed.
-    const hasLocation = LOCATED_MEDIA.test(mime) && mayHaveLocation(mime, await extractMetadata(path, mime));
+    let hasLocation = false;
+    if (LOCATED_MEDIA.test(mime)) {
+      if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the metadata read
+      hasLocation = mayHaveLocation(mime, await extractMetadata(path, mime));
+    }
     const plan = locatedPlan(hasLocation, mime);
     const rule = locationRule();
     const { ext, kind } = stored;
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the copy
     await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, mime: stored.mime, label: addedLabel(kind, new Date()) }, "manual_upload", {
       hasLocation,
       refuse: rule.hook,
@@ -245,12 +286,17 @@ export function createAttach(deps: AttachDeps): Attach {
     return { note: LOCATION_REASON };
   }
 
-  async function ontoLibrary(projectId: string, path: string, mime: string, stored: Stored, sha256: string, s: Session): Promise<AttachOutcome> {
+  async function ontoLibrary(projectId: string, path: string, mime: string, stored: Stored, sha256: string, s: Session, opts: AttachOpts): Promise<AttachOutcome> {
     const keys = await s.keys();
     const same = keys.find((k) => k.sha256s.includes(sha256));
     if (same) return { path, outcome: "duplicate", sourceId: same.sourceId };
 
-    const r = await resolveItem({ path, mime, sidecarPaths: await findSidecars(path) }, { projectId, patterns, lookup: await s.lookup() });
+    const sidecarPaths = await findSidecars(path, deps.readable);
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the metadata read (resolveItem's first step)
+    const r = await resolveItem(
+      { path, mime, sidecarPaths, ...(deps.readable ? { sidecarReadable: deps.readable } : {}) },
+      { projectId, patterns, lookup: await s.lookup() },
+    );
     const dup = findDuplicate(candidateKey(r, [sha256]), keys);
     if (dup?.certainty === "certain") return { path, outcome: "duplicate", sourceId: dup.sourceId };
     const reviewItem = reviewFor(r, dup);
@@ -259,34 +305,77 @@ export function createAttach(deps: AttachDeps): Attach {
     const { identifiable, legalBasis } = await storeInputs(projectId);
     const provenance = itemProvenance(r, {
       captureMethod: "manual_upload",
-      tool: { name: "drag-and-drop", version: VERSION },
+      tool: { name: opts.origin ? WATCHED_FOLDER_TOOL : "drag-and-drop", version: VERSION },
       identifiable,
       ...(legalBasis ? { legalBasis } : {}),
+      ...(opts.origin ? { externalKeys: { [WATCHED_FOLDER_TOOL]: opts.origin.watchId } } : {}),
     });
     // createSource evaluates capture and store again, right before writing (R42). Under a location
     // condition (coarsen/strip) the viewing proxy is queued in the same change (R83).
     const plan = locatedPlan(r.hasLocation, mime);
     const rule = locationRule();
-    const sf = await createSourceRefusing(repo, projectId, r.draft, [{ path, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind }], {
-      provenance,
-      fieldEvidence: r.fieldEvidence,
-      verification: r.verification.fields,
-      ...(r.hasLocation ? { hasLocation: true } : {}),
-      ...(reviewItem ? { reviewItem } : {}),
-      pendingProxies: (assets) => pendingFor(plan, assets, rule.mode()),
-    }, rule.hook);
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the copy, perhaps long after the lookups
+    const create = (collectionIds: string[], inTx?: CreateInTx) =>
+      createSourceRefusing(
+        repo,
+        projectId,
+        { ...r.draft, collectionIds },
+        [{ path, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind }],
+        {
+          provenance,
+          fieldEvidence: r.fieldEvidence,
+          verification: r.verification.fields,
+          ...(r.hasLocation ? { hasLocation: true } : {}),
+          ...(reviewItem ? { reviewItem } : {}),
+          pendingProxies: (assets) => pendingFor(plan, assets, rule.mode()),
+        },
+        rule.hook,
+        inTx,
+      );
+    // The collection is given in the change that creates the source, and checked inside it (no other change runs
+    // meanwhile): one deleted since is not written; that change is taken back and the source made without it.
+    let noCollection = false;
+    let sf: SourceFile;
+    if (!opts.collectionId) sf = await create(r.draft.collectionIds);
+    else if (!(await collectionExists(projectId, opts.collectionId))) {
+      noCollection = true;
+      sf = await create(r.draft.collectionIds);
+    } else {
+      const wanted = opts.collectionId;
+      try {
+        sf = await create([...new Set([...r.draft.collectionIds, wanted])], async () => {
+          if (!(await collectionExists(projectId, wanted))) throw new CollectionGone();
+        });
+      } catch (err) {
+        if (!(err instanceof CollectionGone)) throw err;
+        noCollection = true;
+        if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the copy again
+        sf = await create(r.draft.collectionIds);
+      }
+    }
     keys.push(dupKey(sf));
-    const note = proxyNote(projectId, sf.source.id, plan, rule.mode());
+    const note = { ...proxyNote(projectId, sf.source.id, plan, rule.mode()), ...(noCollection ? { noCollection: true as const } : {}) };
     if (!needsReview) return { path, outcome: "created", sourceId: sf.source.id, ...note };
     return { path, outcome: "needs-review", sourceId: sf.source.id, reason: dup ? REASONS.likelyDuplicate : REASONS.review, ...note };
   }
 
-  async function attachOne(projectId: string, path: string, toSourceId: string | undefined, s: Session, freshKeys = false): Promise<AttachOutcome> {
+  async function collectionExists(projectId: string, id: string): Promise<boolean> {
+    return (await projectCollectionsAndTags(repo, projectId)).collections.some((c) => c.id === id);
+  }
+
+  async function attachOne(projectId: string, path: string, opts: AttachOpts, s: Session, freshKeys = false): Promise<AttachOutcome> {
+    const toSourceId = opts.toSourceId;
     if (freshKeys) s.refreshKeys();
     const st = await fsp.stat(path).catch(() => null);
     if (!st) return failed(path, REASONS.missing);
     if (st.isDirectory()) return failed(path, FOLDER_REASON);
     if (!st.isFile()) return failed(path, REASONS.notAFile);
+    // Before the first byte is read (the type sniff below), and again before EACH later open (the hash, the
+    // metadata, the copy): a file that is not on this computer, or no longer as it was checked, is not read (A6).
+    // These opens (by file-type, the hash stream, the metadata worker, the copy, readSidecar) follow a symbolic link:
+    // they rely on the comparison made immediately before each (a link swapped in fails it); only the watched
+    // folder's own hash refuses a link outright (O_NOFOLLOW).
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON);
     let type: { ext: string; mime: string } | undefined;
     try {
       type = await fileTypeFromFile(path);
@@ -299,12 +388,13 @@ export function createAttach(deps: AttachDeps): Attach {
     if (toSourceId && !target) return failed(path, REASONS.noSource);
     const denied = await s.policy();
     if (denied) return failed(path, denied);
+    if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the hash
     const sha256 = await sha256File(path);
     if (target) return ontoSource(projectId, path, target, type.mime, stored, sha256);
-    return ontoLibrary(projectId, path, type.mime, stored, sha256, s);
+    return ontoLibrary(projectId, path, type.mime, stored, sha256, s, opts);
   }
 
-  async function attachFiles(projectId: string, paths: string[], opts: { toSourceId?: string } = {}): Promise<AttachOutcome[]> {
+  async function attachFiles(projectId: string, paths: string[], opts: AttachOpts = {}): Promise<AttachOutcome[]> {
     repo.getProject(projectId); // NotFoundError for an unknown project
     const s = session(projectId, opts.toSourceId);
     const out: AttachOutcome[] = [];
@@ -312,7 +402,7 @@ export function createAttach(deps: AttachDeps): Attach {
       try {
         // One file at a time per project, across attach, watched folders and Bulk Import (R81 I4);
         // the duplicate keys are read afresh inside the turn.
-        out.push(await serialStore(repo, projectId, () => attachOne(projectId, path, opts.toSourceId, s, true)));
+        out.push(await serialStore(repo, projectId, () => attachOne(projectId, path, opts, s, true)));
       } catch (err) {
         if (err instanceof PolicyDeniedError) out.push(failed(path, err.reason));
         else if (err instanceof ProjectLockedError) out.push(failed(path, REASONS.locked));

@@ -1,9 +1,16 @@
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MockAgent } from "undici";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Project } from "@ao/core";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { newId, type Project } from "@ao/core";
+import { IndexHandle } from "../index/db.js";
+import { createBulkImport, folderAdapter } from "./bulk/index.js";
 import { ExifTool } from "exiftool-vendored";
 import { buildCameraTiff, buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { WorkerClient } from "../worker-client.js";
@@ -16,19 +23,101 @@ import { shutdownExtractors } from "../extract/index.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient } from "../lookup/index.js";
 import type { Repo } from "../repo/repo.js";
+import { WatchRegisterUnwritableError } from "../repo/watch-register.js";
 import { openTestRepo } from "../repo/testing.js";
+import { createAttach, type Attach } from "./attach.js";
+import { POINTER_REASON, contentState, ignoredName as ignoredNameLocal } from "./watch-local.js";
 import {
+  WATCH_FS_TIMEOUT_MS,
+  WATCH_MASS_GONE_MIN,
+  WATCH_PROBLEMS_MAX,
+  WATCH_RECHECK_MS,
   WATCH_REASONS,
+  WATCH_RESCAN_MS,
   WATCH_STABILITY_MS,
+  WATCH_STATUS_INTERVAL_MS,
+  WatchFileNotLocalError,
   addWatchedFolder,
+  bringInNewVersion,
   ignoredName,
+  settleWatchedFile,
   listWatchedFolders,
   removeWatchedFolder,
   setWatchFolder,
   watchFolder,
+  withProvider,
   type FolderWatch,
+  type WatchDeps,
   type WatchEvent,
+  type WatchStatus,
 } from "./watch.js";
+
+// Every change the test itself makes in a watched folder goes through these, which note the time of the
+// last one: after each test, nothing in any watched folder may have changed after it (W2 Accept 8: the
+// engine never writes, renames, deletes or touches anything there — any such change moves a ctime).
+let lastWrite = 0;
+const tracked =
+  <A extends unknown[], R>(fn: (...a: A) => Promise<R>) =>
+  async (...a: A): Promise<R> => {
+    try {
+      return await fn(...a);
+    } finally {
+      lastWrite = Date.now();
+    }
+  };
+const writeFile = tracked(fsp.writeFile);
+const appendFile = tracked(fsp.appendFile);
+const mkdir = tracked(fsp.mkdir);
+const rename = tracked(fsp.rename);
+const rm = tracked(fsp.rm);
+const symlink = tracked(fsp.symlink);
+const truncate = tracked(fsp.truncate);
+const chmod = tracked(fsp.chmod);
+const utimes = tracked(fsp.utimes);
+/** The real `fsp.open`, captured before any spy. */
+const realFspOpen = fsp.open;
+const watchedDirs = new Set<string>();
+
+// Review M8: besides the ctimes, every call that can change a file is spied on for the whole test. The test's own
+// changes go through the functions above, captured before any spy, so every spied call comes from the code under
+// test; none may name a path in a watched folder.
+const MUTATING_P = ["writeFile", "appendFile", "rename", "rm", "rmdir", "unlink", "mkdir", "symlink", "link", "truncate", "chmod", "chown", "lchown", "utimes", "lutimes", "copyFile", "cp", "open"] as const;
+const MUTATING_S = ["writeFile", "writeFileSync", "appendFile", "appendFileSync", "rename", "renameSync", "rm", "rmSync", "unlink", "unlinkSync", "mkdir", "mkdirSync", "symlink", "symlinkSync", "truncate", "truncateSync", "chmod", "chmodSync", "utimes", "utimesSync", "copyFile", "copyFileSync", "open", "openSync", "createWriteStream"] as const;
+let mutating: Array<{ mock: { calls: unknown[][] }; name: string }> = [];
+function spyMutations() {
+  mutating = [
+    ...MUTATING_P.map((n) => ({ mock: vi.spyOn(fsp, n as "open").mock as { calls: unknown[][] }, name: n })),
+    ...MUTATING_S.map((n) => ({ mock: vi.spyOn(fs, n as "open").mock as { calls: unknown[][] }, name: n })),
+  ];
+  syncBuiltinESMExports();
+}
+/** Calls of the code under test that could change something in a watched folder. */
+function mutationsIn(dirs: string[]): string[] {
+  const inside = (v: unknown) => typeof v === "string" && dirs.some((d) => v === d || v.startsWith(`${d}/`));
+  const writes = (flags: unknown) =>
+    typeof flags === "string" ? /[wa+]/u.test(flags) : typeof flags === "number" && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_APPEND)) !== 0;
+  const out: string[] = [];
+  for (const s of mutating)
+    for (const a of s.mock.calls) {
+      if ((s.name === "open" || s.name === "openSync") && !writes(a[1])) continue;
+      if (inside(a[0]) || ((s.name.startsWith("rename") || s.name.startsWith("copyFile") || s.name.startsWith("symlink") || s.name === "link" || s.name === "cp") && inside(a[1]))) out.push(`${s.name} ${String(a[0])}`);
+    }
+  return out;
+}
+
+/** Every entry under `dir` (dot entries included) with its change time; null when `dir` is gone. */
+async function ctimes(dir: string): Promise<Array<[string, number]> | null> {
+  const st = await fsp.lstat(dir).catch(() => null);
+  if (!st) return null;
+  const out: Array<[string, number]> = [[dir, st.ctimeMs]];
+  if (!st.isDirectory()) return out;
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...((await ctimes(p)) ?? []));
+    else out.push([p, (await fsp.lstat(p)).ctimeMs]);
+  }
+  return out;
+}
 
 const FAST = 2 ** 10;
 const GOV = `identifiability:
@@ -71,10 +160,21 @@ beforeEach(async () => {
   http = new HttpClient({ libraryRoot: lib.root, dispatcher: agent, sleep: async () => {}, maxRetries: 0 });
   inbox = join(tmp, "Inbox");
   await mkdir(inbox);
+  spyMutations();
 });
 
 afterEach(async () => {
   await Promise.all(watches.splice(0).map((w) => w.stop()));
+  const dirs = await Promise.all([...watchedDirs].map((d) => realpath(d).catch(() => d)));
+  expect(mutationsIn([...dirs, ...watchedDirs])).toEqual([]);
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  // Nothing in a watched folder changed after the test's own last change (W2 Accept 8).
+  for (const d of watchedDirs) {
+    const changed = ((await ctimes(d)) ?? []).filter(([, c]) => c > lastWrite + 1).map(([p]) => p);
+    expect(changed).toEqual([]);
+  }
+  watchedDirs.clear();
   await agent.close();
   await lib.close();
   ring.clear();
@@ -94,13 +194,61 @@ const project = async (encrypted = false): Promise<Project> =>
     })
   ).project;
 
-function start(p: Project, opts: { stabilityMs?: number; pollMs?: number; dir?: string; recursive?: boolean } = {}): { w: FolderWatch; events: WatchEvent[] } {
+type Seams = Partial<Omit<WatchDeps, "repo" | "http" | "lib" | "onEvent" | "onStatus">>;
+function start(
+  p: Project,
+  opts: Seams & { dir?: string; recursive?: boolean; watchId?: string; collectionId?: string } = {},
+): { w: FolderWatch; events: WatchEvent[]; statuses: Array<WatchStatus & { at: number }> } {
   const events: WatchEvent[] = [];
-  const { dir, recursive, ...seams } = opts;
-  const w = watchFolder({ repo, http, lib, onEvent: (e) => events.push(e), ...seams }, p.id, dir ?? inbox, recursive ? { recursive: true } : {});
+  const statuses: Array<WatchStatus & { at: number }> = [];
+  const { dir, recursive, watchId, collectionId, ...seams } = opts;
+  // (A folder holding the library, or inside it, is refused; the library itself changes, so it is not checked.)
+  const d = dir ?? inbox;
+  if (!lib.root.startsWith(d) && !d.startsWith(lib.root)) watchedDirs.add(d);
+  const w = watchFolder(
+    { repo, http, lib, onEvent: (e) => events.push(e), onStatus: (s) => statuses.push({ ...structuredClone(s), at: Date.now() }), ...seams },
+    p.id,
+    dir ?? inbox,
+    { ...(recursive ? { recursive: true } : {}), ...(collectionId ? { collectionId } : {}) },
+    watchId ?? newId(),
+  );
   watches.push(w);
-  return { w, events };
+  return { w, events, statuses };
 }
+
+/** Spies on every call that opens or reads a file's bytes (through each module's own binding); returns the calls for one path. */
+function readSpies(): (path: string) => unknown[][] {
+  const spies = [
+    vi.spyOn(fsp, "open"),
+    vi.spyOn(fsp, "readFile"),
+    vi.spyOn(fsp, "copyFile"),
+    vi.spyOn(fsp, "cp"),
+    vi.spyOn(fs, "createReadStream"),
+    vi.spyOn(fs, "open"),
+    vi.spyOn(fs, "readFile"),
+    vi.spyOn(fs, "openSync"),
+    vi.spyOn(fs, "readFileSync"),
+    vi.spyOn(fs, "copyFile"),
+    vi.spyOn(fs, "copyFileSync"),
+  ];
+  syncBuiltinESMExports();
+  return (path) => spies.flatMap((s) => s.mock.calls as unknown[][]).filter((args) => String(args[0]) === path);
+}
+
+/** A file whose size is `size` bytes and which has no blocks: Linux's stand-in for a file that is not downloaded (W1). */
+async function sparse(path: string, size: number): Promise<void> {
+  await writeFile(path, "");
+  await truncate(path, size);
+}
+
+/** An attach that stores nothing and reads nothing: every file "comes in" at once (tests of the engine alone). */
+const quickAttach = (): Attach & { paths: string[] } => {
+  const paths: string[] = [];
+  return {
+    paths,
+    attachFiles: async (_p, ps) => ps.map((path) => (paths.push(path), { path, outcome: "created" as const, sourceId: `s${paths.length}` })),
+  };
+};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function until(cond: () => boolean, ms = 15_000): Promise<void> {
@@ -208,8 +356,11 @@ describe("watchFolder (review round 1, R81)", () => {
     await w.ready;
     await rm(inbox, { recursive: true });
     await until(() => events.some((e) => e.kind === "stopped"));
-    expect(events.find((e) => e.kind === "stopped")).toMatchObject({ reason: WATCH_REASONS.removed });
-    expect(WATCH_REASONS.removed).toMatch(/the watched folder was removed/iu);
+    // W2 Accept 5: "Cannot be reached" with the `missing` sentence, replacing "the watched folder was removed".
+    const missing = withProvider(WATCH_REASONS.missing, null);
+    expect(missing).toBe("The folder cannot be found. If the system is signed out or still starting, watching resumes when the folder is back.");
+    expect(events.find((e) => e.kind === "stopped")).toMatchObject({ reason: missing });
+    expect(w.status()).toMatchObject({ state: "unreachable", reason: missing });
     expect(w.stopped).toBe(false); // waiting for it, not finished
     await mkdir(inbox);
     await until(() => events.some((e) => e.kind === "resumed"));
@@ -305,7 +456,7 @@ describe("watchFolder (review round 1, R81)", () => {
     expect(repo.listSourceIds(p.id)).toHaveLength(1);
   });
 
-  it("a changed file is imported again when its content changed (same content: nothing)", async () => {
+  it("R81's re-import is replaced (R207 3): a changed file is not imported again, even by a watch without a register in the library", async () => {
     const p = await project();
     const { w, events } = start(p, { stabilityMs: 200 });
     await w.ready;
@@ -317,8 +468,9 @@ describe("watchFolder (review round 1, R81)", () => {
     await sleep(1000);
     expect(events.filter((e) => e.file === "draft.pdf")).toHaveLength(1);
     await writeFile(f, await buildPdf({ title: "Draft two", extra: "v2" }));
-    await until(() => events.filter((e) => e.kind === "imported").length === 2);
-    expect(repo.listSourceIds(p.id)).toHaveLength(2);
+    await until(() => w.status().counts.changed === 1);
+    expect(events.filter((e) => e.file === "draft.pdf")).toHaveLength(1);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
   });
 
   it("a link to a folder in a recursive watch gets its own plain reason", async () => {
@@ -377,6 +529,706 @@ describe("watched-folder settings (R69)", () => {
   });
 });
 
+describe("cloud-drive folders: the engine reads nothing it may not (Task W2)", () => {
+  const eperm = () => Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+  const page = (n: number) => ({ offset: 0, limit: n });
+
+  it("ignoredName is the same function from both modules", () => {
+    expect(ignoredName).toBe(ignoredNameLocal);
+  });
+
+  it("a not-downloaded file is counted, listed and never opened", async () => {
+    expect([WATCH_PROBLEMS_MAX, WATCH_STATUS_INTERVAL_MS]).toEqual([5000, 1000]);
+    const p = await project();
+    const real = await realpath(inbox);
+    await sparse(join(inbox, "online.pdf"), 100_000);
+    const opened = readSpies();
+    const { w, statuses } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(w.status()).toMatchObject({ state: "watching", provider: null, counts: { notDownloaded: 1, notDownloadedBytes: 100_000, cameIn: 0, didNotComeIn: 0 } });
+    expect(w.problems(page(10))).toEqual({ total: 1, items: [{ file: "online.pdf", kind: "not-downloaded", reason: WATCH_REASONS.notDownloaded, bytes: 100_000 }] });
+    expect(w.problems({ kind: "not-supported", offset: 0, limit: 10 })).toEqual({ total: 0, items: [] });
+    await sleep(800); // several polls, each re-checking it
+    expect(opened(join(real, "online.pdf"))).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    expect(statuses.at(-1)!.counts.notDownloaded).toBe(1);
+    // A file that goes away leaves the list and the counts.
+    await rm(join(inbox, "online.pdf"));
+    await until(() => w.problems(page(10)).total === 0);
+    expect(w.status().counts).toMatchObject({ notDownloaded: 0, notDownloadedBytes: 0 });
+  });
+
+  it("a not-downloaded sidecar is not read", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "paper.pdf"), await buildPdf({ lines: ["Some page text without a title that we could use."], extra: "sidecar" }));
+    await sparse(join(inbox, "paper.bib"), 4096);
+    const opened = readSpies();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await until(() => events.some((e) => e.file === "paper.pdf" && e.kind === "imported"));
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(opened(join(real, "paper.pdf")).length).toBeGreaterThan(0); // the spies see the engine's reads
+    expect(opened(join(real, "paper.bib"))).toEqual([]);
+    expect(w.problems(page(10)).items).toEqual([expect.objectContaining({ file: "paper.bib", kind: "not-downloaded" })]);
+  });
+
+  it("a scanned file still being written waits for 2 seconds of no change", async () => {
+    const p = await project();
+    const pdf = await buildPdf({ title: "Slow copy", extra: "slow" });
+    const half = Math.ceil(pdf.length / 2);
+    await writeFile(join(inbox, "slow.pdf"), pdf.subarray(0, half));
+    const { w, events } = start(p, { watchEvents: false }); // found by the scan alone, never by an event
+    await w.ready;
+    await sleep(700);
+    await appendFile(join(inbox, "slow.pdf"), pdf.subarray(half));
+    const last = Date.now();
+    await until(() => events.some((e) => e.file === "slow.pdf"));
+    expect(Date.now() - last).toBeGreaterThanOrEqual(1900);
+    expect(events.filter((e) => e.file === "slow.pdf")).toEqual([expect.objectContaining({ kind: "imported" })]);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  }, 30_000);
+
+  it("a file that becomes downloaded comes in without an event", async () => {
+    const p = await project();
+    let online = true;
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) {
+        const s = m.get(q);
+        if (online && q.endsWith("later.pdf") && s?.presence === "local") m.set(q, { ...s, presence: "not-downloaded" });
+      }
+      return m;
+    };
+    await writeFile(join(inbox, "later.pdf"), await buildPdf({ title: "Later", extra: "later" }));
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 100, recheckMs: 100, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(events.filter((e) => e.file === "later.pdf")).toEqual([]);
+    const before = lastWrite;
+    online = false; // downloaded: nothing in the folder changes, so no file-system event comes
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "later.pdf"));
+    expect(lastWrite).toBe(before);
+    expect(w.status().counts).toMatchObject({ notDownloaded: 0, notDownloadedBytes: 0, cameIn: 1 });
+    expect(w.problems(page(10)).total).toBe(0); // removed when the file came in
+  });
+
+  it("a missed event is caught by the rescan", async () => {
+    expect(WATCH_RESCAN_MS).toBe(300_000);
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 100, rescanMs: 600, watchEvents: false });
+    await w.ready;
+    await sleep(300);
+    await writeFile(join(inbox, "missed.pdf"), await buildPdf({ title: "Missed", extra: "missed" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "missed.pdf"));
+  });
+
+  it('an EPERM on the folder says the privacy sentence, not "cannot be found"', async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let denied = true;
+    const readdirS = async (d: string) => {
+      if (denied && d === real) throw eperm();
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, fs: { readdir: readdirS } });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    const sentence = withProvider(WATCH_REASONS.notPermitted, null);
+    expect(sentence).toBe("macOS did not allow the app to read files managed by the system, so this folder is not watched. Press “Try again” and choose Allow if macOS asks.");
+    expect(w.status().reason).toBe(sentence);
+    expect(w.status().reason).not.toMatch(/cannot be found/u);
+    await writeFile(join(inbox, "allowed.pdf"), await buildPdf({ title: "Allowed", extra: "allowed" }));
+    denied = false; // allowed now: watching resumes by itself
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "allowed.pdf"));
+    expect(w.status().state).toBe("watching");
+  });
+
+  it('EPERM on the root gives state "unreachable" with the privacy reason naming the provider', async () => {
+    const p = await project();
+    const home = join(tmp, "home");
+    const drive = join(home, "Library", "CloudStorage", "GoogleDrive-a@b.c", "My Drive");
+    await mkdir(drive, { recursive: true });
+    const real = await realpath(drive);
+    const { w } = start(p, {
+      dir: drive,
+      pollMs: 50,
+      locationEnv: { homeDir: await realpath(home), platform: "darwin", mounts: [] },
+      fs: { readdir: async (d: string) => (d === real ? Promise.reject(eperm()) : fsp.readdir(d, { withFileTypes: true })) },
+    });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    expect(w.status()).toMatchObject({
+      provider: "google-drive",
+      reason: "macOS did not allow the app to read files managed by Google Drive, so this folder is not watched. Press “Try again” and choose Allow if macOS asks.",
+    });
+  });
+
+  it('a folder operation that never answers marks the folder "Cannot be reached" after 30 s and other requests still answer', async () => {
+    expect(WATCH_FS_TIMEOUT_MS).toBe(30_000);
+    const p = await project();
+    const real = await realpath(inbox);
+    const other = join(tmp, "Inbox2");
+    await mkdir(other);
+    const inStuck = (q: string) => q === real || q.startsWith(`${real}/`);
+    let outstanding = 0;
+    let most = 0;
+    let calls = 0;
+    const never = new Promise<never>(() => {});
+    const count =
+      <A extends [string, ...unknown[]], R>(fn: (...a: A) => Promise<R>) =>
+      async (...a: A): Promise<R> => {
+        if (!inStuck(a[0])) return fn(...a);
+        calls++;
+        most = Math.max(most, ++outstanding);
+        try {
+          return await fn(...a);
+        } finally {
+          outstanding--;
+        }
+      };
+    const stuckFs = {
+      readdir: count(async (d: string) => (inStuck(d) ? never : fsp.readdir(d, { withFileTypes: true }))),
+      lstat: count(async (q: string) => (inStuck(q) ? never : fsp.lstat(q, { bigint: true }))),
+    };
+    const a = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: stuckFs });
+    const b = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: stuckFs, dir: other });
+    await Promise.all([a.w.ready, b.w.ready]);
+    await until(() => a.w.status().state === "unreachable");
+    const sentence = withProvider(WATCH_REASONS.notResponding, null);
+    expect(sentence).toBe("The folder did not answer for 30 seconds (the system may be starting, signed out or offline). Watching goes on when it answers.");
+    expect(a.w.status().reason).toBe(sentence);
+    // The other folder is still watched, and an ordinary file call elsewhere still answers.
+    await writeFile(join(other, "elsewhere.pdf"), await buildPdf({ title: "Elsewhere", extra: "elsewhere" }));
+    await until(() => b.events.some((e) => e.kind === "imported" && e.file === "elsewhere.pdf"));
+    expect((await stat(tmp)).isDirectory()).toBe(true);
+    // Nothing further is asked of the stuck folder, even when files arrive in it.
+    const n = calls;
+    await writeFile(join(inbox, "meanwhile.pdf"), "x");
+    await sleep(1000);
+    expect(calls).toBe(n);
+    expect(most).toBe(1);
+  });
+
+  it("after a call that never answers, no further call is issued on that folder until it settles", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "stuck.pdf"), await buildPdf({ title: "Stuck", extra: "stuck" }));
+    await writeFile(join(inbox, "fine.pdf"), await buildPdf({ title: "Fine", extra: "fine" }));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let hold = true;
+    let calls = 0;
+    let outstanding = 0;
+    let most = 0;
+    const lstatS = async (q: string) => {
+      if (q.startsWith(real)) {
+        calls++;
+        most = Math.max(most, ++outstanding);
+      }
+      try {
+        if (hold && q === join(real, "stuck.pdf")) await held;
+        return await fsp.lstat(q, { bigint: true });
+      } finally {
+        if (q.startsWith(real)) outstanding--;
+      }
+    };
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: { lstat: lstatS } });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    const n = calls;
+    await sleep(1000);
+    expect(calls).toBe(n);
+    hold = false;
+    release(); // the stuck call answers at last: watching goes on, and both files come in
+    await until(() => ["stuck.pdf", "fine.pdf"].every((f) => events.some((e) => e.kind === "imported" && e.file === f)));
+    expect(w.status().state).toBe("watching");
+    expect(most).toBe(1);
+  });
+
+  it("status is coalesced to one per second during a burst of 2,000 files", async () => {
+    const p = await project();
+    const { w, statuses } = start(p, { stabilityMs: 200, pollMs: 100, attach: quickAttach() });
+    await w.ready;
+    await Promise.all(Array.from({ length: 2000 }, (_, i) => writeFile(join(inbox, `f${String(i).padStart(4, "0")}.txt`), `file ${i}`)));
+    await until(() => w.status().counts.cameIn === 2000, 60_000);
+    await sleep(WATCH_STATUS_INTERVAL_MS + 300);
+    expect(statuses.at(-1)!.counts.cameIn).toBe(2000); // the last change is pushed too
+    for (let i = 1; i < statuses.length; i++) {
+      if (statuses[i]!.state === statuses[i - 1]!.state) expect(statuses[i]!.at - statuses[i - 1]!.at).toBeGreaterThanOrEqual(WATCH_STATUS_INTERVAL_MS - 5);
+    }
+  }, 90_000);
+
+  it("the watched folder is unchanged after a run", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "paper.pdf"), await buildPdf({ title: "Unchanged", extra: "unchanged" }));
+    await writeFile(join(inbox, "notes.txt"), "plain text");
+    await writeFile(join(inbox, "Notes.gdoc"), '{"url": "https://docs.google.com/document/d/x"}');
+    await writeFile(join(inbox, ".hidden"), "dot");
+    await sparse(join(inbox, "online.pdf"), 50_000);
+    await mkdir(join(inbox, "Sub"));
+    await writeFile(join(inbox, "Sub", "inner.pdf"), await buildPdf({ title: "Inner", extra: "inner" }));
+    await symlink(join(inbox, "paper.pdf"), join(inbox, "link.pdf"));
+    const snapshot = async (d: string, base = d): Promise<Record<string, string>> => {
+      const out: Record<string, string> = {};
+      for (const e of await readdir(d, { withFileTypes: true })) {
+        const q = join(d, e.name);
+        const s = await fsp.lstat(q, { bigint: true });
+        out[q.slice(base.length)] = [s.mode, s.size, s.blocks, s.ino, s.nlink, s.mtimeNs, s.ctimeNs].join(" ");
+        if (e.isDirectory()) Object.assign(out, await snapshot(q, base));
+      }
+      return out;
+    };
+    const before = await snapshot(inbox);
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, rescanMs: 400, recursive: true });
+    await w.ready;
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "Sub/inner.pdf") && repo.listSourceIds(p.id).length === 2);
+    await sleep(1000);
+    await w.stop();
+    expect(await snapshot(inbox)).toEqual(before);
+  });
+
+  it("a folder put into a recursive watch is watched, and a file put in it later comes in", async () => {
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, recursive: true });
+    await w.ready;
+    await mkdir(join(inbox, "New folder"));
+    await sleep(500);
+    await writeFile(join(inbox, "New folder", "later.pdf"), await buildPdf({ title: "In a new folder", extra: "newdir" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "New folder/later.pdf"));
+  });
+
+  it("a Google pointer file is listed with its sentence", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "Notes.gdoc"), '{"url": "https://docs.google.com/document/d/x"}');
+    await writeFile(join(inbox, "Budget.GSHEET"), '{"url": "https://docs.google.com/spreadsheets/d/y"}');
+    const opened = readSpies();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await until(() => w.status().counts.didNotComeIn === 2);
+    expect(w.problems({ kind: "online-only-document", offset: 0, limit: 10 }).items.map((i) => [i.file, i.reason]).sort()).toEqual([
+      ["Budget.GSHEET", POINTER_REASON],
+      ["Notes.gdoc", POINTER_REASON],
+    ]);
+    expect(opened(join(real, "Notes.gdoc"))).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("the state judged by the check is compared with the stability reading before the hash; a file that changed in between is not read", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let judged = 0;
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) {
+        const s = m.get(q);
+        if (q.endsWith("moved.pdf") && s?.presence === "local") {
+          judged++;
+          m.set(q, { ...s, mtimeNs: s.mtimeNs + 1n }); // changed between the stability reading and the check
+        }
+      }
+      return m;
+    };
+    await writeFile(join(inbox, "moved.pdf"), await buildPdf({ title: "Moved", extra: "moved" }));
+    await writeFile(join(inbox, "ok.pdf"), await buildPdf({ title: "Ok", extra: "ok" }));
+    const opened = readSpies();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, presence });
+    await w.ready;
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "ok.pdf"));
+    await sleep(1500);
+    expect(judged).toBeGreaterThan(0);
+    expect(opened(join(real, "moved.pdf"))).toEqual([]);
+    expect(events.filter((e) => e.file === "moved.pdf")).toEqual([]);
+    expect(w.status().counts.waiting).toBe(1);
+  });
+
+  it("an unknown file is listed with its own sentence and never opened", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) if (q.endsWith("mystery.pdf")) m.set(q, { presence: "unknown" });
+      return m;
+    };
+    await writeFile(join(inbox, "mystery.pdf"), "%PDF-1.7 twelve");
+    const opened = readSpies();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(WATCH_REASONS.unknownPresence).toBe("The app could not tell whether this file is on this Mac, so it has left it alone.");
+    expect(w.status().counts.notDownloadedBytes).toBe(15);
+    expect(w.problems(page(10)).items).toEqual([{ file: "mystery.pdf", kind: "not-downloaded", reason: WATCH_REASONS.unknownPresence, bytes: 15 }]);
+    await sleep(500);
+    expect(opened(join(real, "mystery.pdf"))).toEqual([]);
+  });
+});
+
+describe("cloud-drive folders: fix round 1 (A6, R213)", () => {
+  const noTitle = (extra: string) => buildPdf({ lines: ["Some page text without a title that we could use."], extra });
+  const RIS = "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nER  - \n";
+  const page = (n: number) => ({ offset: 0, limit: n });
+  /** A stand-in for `fs.watch` that records its calls and hands back emitters the test can feed. */
+  function fakeWatch() {
+    const calls: Array<[string, unknown]> = [];
+    const emitters: EventEmitter[] = [];
+    const fn = ((d: string, o: unknown) => {
+      calls.push([d, o]);
+      const e = Object.assign(new EventEmitter(), { close: () => {}, ref: () => e, unref: () => e });
+      emitters.push(e);
+      return e;
+    }) as unknown as typeof fs.watch;
+    return { calls, emitters, fn };
+  }
+  /** The real `fs.watch`, counting the handles left open. */
+  function countedWatch() {
+    const handles = { open: 0, closed: 0 };
+    const fn = ((d: string, o: { persistent?: boolean; recursive?: boolean }) => {
+      const w = fs.watch(d, o);
+      handles.open++;
+      const close = w.close.bind(w);
+      let done = false;
+      w.close = () => {
+        if (!done) handles.closed++;
+        done = true;
+        close();
+      };
+      return w;
+    }) as unknown as typeof fs.watch;
+    return { handles, fn };
+  }
+
+  it("a sidecar still changing beside a stable file is never read (C1)", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "paper.pdf"), await noTitle("c1"));
+    await writeFile(join(inbox, "paper.ris"), RIS);
+    const opened = readSpies();
+    const timer = setInterval(() => void appendFile(join(inbox, "paper.ris"), "N1  - more\n").catch(() => {}), 50);
+    try {
+      const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+      await w.ready;
+      await until(() => events.some((e) => e.file === "paper.pdf" && e.kind === "imported"));
+      expect(opened(join(real, "paper.ris"))).toEqual([]);
+    } finally {
+      clearInterval(timer);
+      await sleep(100);
+    }
+    const sf = await repo.getSource(p.id, repo.listSourceIds(p.id)[0]!);
+    expect(sf.source.title.variants[0]?.value ?? "").not.toBe("Weaving and Kinship in Highland Markets");
+  });
+
+  it("a stable sidecar that is on this computer is used", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "paper.pdf"), await noTitle("c1b"));
+    await writeFile(join(inbox, "paper.ris"), RIS);
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await until(() => events.some((e) => e.file === "paper.pdf" && e.kind === "imported"));
+    const sf = await repo.getSource(p.id, events.find((e) => e.file === "paper.pdf")!.sourceId!);
+    expect(sf.source.title.variants[0]!.value).toBe("Weaving and Kinship in Highland Markets");
+  });
+
+  it("a file evicted between the type sniff and the copy is never opened again and nothing stays in the library (M1)", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    const f = join(real, "evicted.pdf");
+    await writeFile(join(inbox, "evicted.pdf"), await buildPdf({ title: "Evicted", extra: "evicted" }));
+    let evicted = false;
+    let opens = 0;
+    const opened = readSpies();
+    vi.spyOn(fsp, "open").mockImplementation((async (...a: Parameters<typeof fsp.open>) => {
+      const r = await realFspOpen(...a);
+      if (String(a[0]) === f && ++opens === 2) evicted = true; // 1: the engine's hash, 2: attach's type sniff
+      return r;
+    }) as typeof fsp.open);
+    syncBuiltinESMExports();
+    const lstatS = async (q: string) => {
+      const s = await fsp.lstat(q, { bigint: true });
+      return evicted && q === f ? (Object.assign(Object.create(Object.getPrototypeOf(s) as object), s, { blocks: 0n }) as typeof s) : s;
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fs: { lstat: lstatS } });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    expect(opens).toBe(2); // the hash and the sniff, through the open stand-in
+    expect(opened(f)).toEqual([]); // and no other read of any kind (attach's hash stream, the copy)
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("a symbolic link swapped in for the file is not followed (M1)", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    const f = join(real, "linked.pdf");
+    const away = join(tmp, "away.pdf");
+    await writeFile(join(inbox, "linked.pdf"), await buildPdf({ title: "Linked", extra: "linked" }));
+    let swapped = false;
+    let followed = false;
+    const openS = async (q: string, flags?: number) => {
+      if (!swapped && q === f) {
+        swapped = true;
+        await rename(f, away);
+        await symlink(away, f);
+      }
+      const fh = await fsp.open(q, flags);
+      if (swapped && q === f) followed = true; // opened through the link
+      return fh;
+    };
+    const opened = readSpies();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fs: { open: openS } });
+    await w.ready;
+    await until(() => w.problems(page(10)).items.some((i) => i.file === "linked.pdf" && i.reason === WATCH_REASONS.outside));
+    expect(swapped).toBe(true);
+    expect(followed).toBe(false);
+    expect(opened(away)).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("linux form: a folder deleted and made again under the same name is watched and listed at once; no handle is left (I1)", async () => {
+    const p = await project();
+    await mkdir(join(inbox, "Sub"));
+    await writeFile(join(inbox, "Sub", "one.pdf"), await buildPdf({ title: "One", extra: "one" }));
+    const { handles, fn } = countedWatch();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, recursive: true, watcherForm: "per-folder", fsWatch: fn });
+    await w.ready;
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "Sub/one.pdf"));
+    expect(handles.open - handles.closed).toBe(2);
+    await rm(join(inbox, "Sub"), { recursive: true });
+    await until(() => handles.open - handles.closed === 1);
+    await mkdir(join(inbox, "Sub"));
+    await sleep(300);
+    await writeFile(join(inbox, "Sub", "two.pdf"), await buildPdf({ title: "Two", extra: "two" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "Sub/two.pdf"), 10_000);
+    expect(handles.open - handles.closed).toBe(2);
+    await w.stop();
+    expect(handles.open - handles.closed).toBe(0);
+  });
+
+  it("darwin form: ONE recursive watcher for the whole tree, fed with relative paths as FSEvents gives them", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await mkdir(join(inbox, "Sub", "Deeper"), { recursive: true });
+    const fake = fakeWatch();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, recursive: true, watcherForm: "tree", fsWatch: fake.fn });
+    await w.ready;
+    await sleep(300);
+    await writeFile(join(inbox, "Sub", "Deeper", "fed.pdf"), await buildPdf({ title: "Fed", extra: "fed" }));
+    fake.emitters[0]!.emit("change", "rename", "Sub/Deeper/fed.pdf");
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "Sub/Deeper/fed.pdf"));
+    expect(fake.calls).toEqual([[real, { recursive: true, persistent: true }]]);
+  });
+
+  for (const form of ["tree", "per-folder"] as const) {
+    it(`${form} form: a watcher that fails is set up again at once and a scan follows; the status never says "watching" without one (N1)`, async () => {
+      const p = await project();
+      const fake = fakeWatch();
+      const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, rescanMs: 600_000, watcherForm: form, fsWatch: fake.fn });
+      await w.ready;
+      await sleep(200);
+      expect(fake.calls).toHaveLength(1);
+      // Written while the watcher is lost: no event will ever name it; only the scan after the new watcher finds it.
+      await writeFile(join(inbox, "between.pdf"), await buildPdf({ title: "Between", extra: "between" }));
+      fake.emitters[0]!.emit("error", new Error("watcher lost"));
+      expect(w.status().state).not.toBe("watching");
+      await until(() => fake.calls.length === 2 && w.status().state === "watching", 3000);
+      await until(() => events.some((e) => e.kind === "imported" && e.file === "between.pdf"), 5000);
+    });
+  }
+
+  it("a watcher is set up only after the folder has answered, never while a call on it is stuck", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let hold = true;
+    const readdirS = async (d: string) => {
+      if (hold && d === real) await held;
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const fake = fakeWatch();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, watcherForm: "tree", fsWatch: fake.fn, fs: { readdir: readdirS } });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    await sleep(300);
+    expect(fake.calls).toEqual([]);
+    hold = false;
+    release();
+    await until(() => w.status().state === "watching");
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  /** File-system stand-ins that count every call outstanding on the folder; the first `read` of a file is held. */
+  function heldReadFs() {
+    const s = { outstanding: 0, most: 0, closes: 0, release: () => {} };
+    const held = new Promise<void>((r) => (s.release = r));
+    let holdRead = true;
+    const count = async <T>(fn: () => Promise<T>): Promise<T> => {
+      s.most = Math.max(s.most, ++s.outstanding);
+      try {
+        return await fn();
+      } finally {
+        s.outstanding--;
+      }
+    };
+    const fsS = {
+      lstat: (q: string) => count(() => fsp.lstat(q, { bigint: true })),
+      readdir: (q: string) => count(() => fsp.readdir(q, { withFileTypes: true })),
+      stat: (q: string) => count(() => fsp.stat(q)),
+      realpath: (q: string) => count(() => fsp.realpath(q)),
+      open: async (q: string, flags?: number) => {
+        const fh = await count(() => fsp.open(q, flags));
+        return {
+          read: (...a: Parameters<typeof fh.read>) =>
+            count(async () => {
+              if (holdRead) {
+                holdRead = false;
+                await held;
+              }
+              return fh.read(...(a as unknown as [Buffer, number, number, null]));
+            }),
+          close: () => count(() => (s.closes++, fh.close())),
+        } as unknown as fsp.FileHandle;
+      },
+    };
+    return { s, fsS };
+  }
+
+  it("stop() issues nothing on a folder whose call is stuck; the stuck read's handle is closed once it settles (I2)", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "big.pdf"), await buildPdf({ title: "Big", extra: "big" }));
+    const { s, fsS } = heldReadFs();
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: fsS });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    await w.stop();
+    expect(s.closes).toBe(0);
+    expect(s.outstanding).toBe(1);
+    s.release();
+    await until(() => s.closes === 1);
+    expect(s.most).toBe(1);
+  });
+
+  it("when a stuck read answers at last, its close takes its turn beside the folder's other calls (I2)", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "big.pdf"), await buildPdf({ title: "Big again", extra: "big2" }));
+    const { s, fsS } = heldReadFs();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: fsS });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    s.release();
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "big.pdf"));
+    expect(s.closes).toBeGreaterThanOrEqual(1);
+    expect(s.most).toBe(1);
+  });
+
+  it("a folder with a call outstanding stays \"Cannot be reached\" for a new watch, which issues nothing until it settles", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "after.pdf"), await buildPdf({ title: "After", extra: "after" }));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let hold = true;
+    let calls = 0;
+    const readdirS = async (d: string) => {
+      calls++;
+      if (hold && d === real) await held;
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const lstatS = async (q: string) => (calls++, fsp.lstat(q, { bigint: true }));
+    const a = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: { readdir: readdirS, lstat: lstatS } });
+    await a.w.ready;
+    await until(() => a.w.status().state === "unreachable");
+    await a.w.stop();
+    const n = calls;
+    const b = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 300, fs: { readdir: readdirS, lstat: lstatS } });
+    await b.w.ready;
+    expect(b.w.status()).toMatchObject({ state: "unreachable", reason: withProvider(WATCH_REASONS.notResponding, null) });
+    await sleep(500);
+    expect(calls).toBe(n);
+    hold = false;
+    release();
+    await until(() => b.events.some((e) => e.kind === "imported" && e.file === "after.pdf"));
+  });
+
+  it("an event naming a not-downloaded file re-checks it at once (M7)", async () => {
+    const p = await project();
+    let online = true;
+    const presence: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const q of paths) {
+        const s = m.get(q);
+        if (online && q.endsWith("later.pdf") && s?.presence === "local") m.set(q, { ...s, presence: "not-downloaded" });
+      }
+      return m;
+    };
+    await writeFile(join(inbox, "later.pdf"), await buildPdf({ title: "Later by event", extra: "event" }));
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    online = false;
+    await sleep(600);
+    expect(events.some((e) => e.file === "later.pdf")).toBe(false); // no round in 60 s
+    await chmod(join(inbox, "later.pdf"), 0o600); // an event that changes no size, time or block
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "later.pdf"), 5000);
+  });
+
+  it("otherwise files not downloaded are re-checked once per WATCH_RECHECK_MS (M7, fake time)", async () => {
+    expect(WATCH_RECHECK_MS).toBe(60_000);
+    const p = await project();
+    await sparse(join(inbox, "online.pdf"), 10_000);
+    let asked = 0;
+    const presence: typeof contentState = async (paths, o) => {
+      if (paths.some((q) => q.endsWith("online.pdf"))) asked++;
+      return contentState(paths, o);
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, presence });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    const k = asked;
+    await sleep(600);
+    expect(asked).toBe(k);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 60_001);
+      await sleep(600);
+      expect(asked).toBe(k + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a file the system refuses to open, and a folder it refuses to list, are \"not-permitted\" and counted (M4, M5)", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "locked.pdf"), await buildPdf({ title: "Locked", extra: "locked" }));
+    await mkdir(join(inbox, "Private"));
+    const eacces = () => Object.assign(new Error("permission denied"), { code: "EACCES" });
+    const openS = async (q: string, flags?: number) => (q === join(real, "locked.pdf") ? Promise.reject(eacces()) : fsp.open(q, flags));
+    const readdirS = async (d: string) => (d === join(real, "Private") ? Promise.reject(eacces()) : fsp.readdir(d, { withFileTypes: true }));
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, recursive: true, fs: { open: openS, readdir: readdirS } });
+    await w.ready;
+    await until(() => w.status().counts.didNotComeIn === 2);
+    expect(w.problems({ kind: "not-permitted", offset: 0, limit: 10 }).items.map((i) => [i.file, i.reason]).sort()).toEqual([
+      ["Private", WATCH_REASONS.fileNotPermitted],
+      ["locked.pdf", WATCH_REASONS.fileNotPermitted],
+    ]);
+    expect(WATCH_REASONS.fileNotPermitted).toBe("The app was not allowed to read this file.");
+  });
+
+  it("a renamed file that already came in is not counted or announced as a duplicate (M3)", async () => {
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await writeFile(join(inbox, "first.pdf"), await buildPdf({ title: "Renamed", extra: "renamed" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "first.pdf"));
+    await rename(join(inbox, "first.pdf"), join(inbox, "second.pdf"));
+    await sleep(1500);
+    expect(events.filter((e) => e.file === "second.pdf")).toEqual([]);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, alreadyInLibrary: 0, waiting: 0 });
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  });
+});
+
 describe("watched folders and viewing proxies (R85)", () => {
   it("a located photo in a watched folder goes through the library's proxy queue (proxyQueueFor)", async () => {
     const et = new ExifTool({ maxProcs: 1 });
@@ -407,3 +1259,868 @@ describe("watched folders and viewing proxies (R85)", () => {
     }
   });
 });
+
+describe("the register: where a source came from, and what happened to its file (Task W3)", () => {
+  const W3 = { stabilityMs: 200, pollMs: 50, registerFlushMs: 100 } as const;
+  const regOf = (p: Project, wid: string) => repo.watchRegister(p.id, wid);
+  const sha256 = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
+  async function untilAsync(cond: () => Promise<boolean>, ms = 15_000): Promise<void> {
+    const end = Date.now() + ms;
+    while (!(await cond())) {
+      if (Date.now() > end) throw new Error("timed out");
+      await sleep(50);
+    }
+  }
+  const stateOf = async (p: Project, wid: string, key: string) => (await regOf(p, wid)).get(key)?.state;
+  async function auditText(p: Project): Promise<string> {
+    const dir = join(lib.root, p.folder, "audit");
+    let out = "";
+    for (const f of (await readdir(dir)).sort()) out += await readFile(join(dir, f), "utf8");
+    return out;
+  }
+  const auditOps = async (p: Project) =>
+    (await auditText(p))
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => (JSON.parse(l) as { details?: { op?: string } }).details?.op);
+  const registerWrites = async (p: Project) => (await auditOps(p)).filter((o) => o === "project.watched-folder.register").length;
+  /** Every file under `dir` with the SHA-256 of its bytes. */
+  async function bytesUnder(dir: string): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) for (const [k, v] of Object.entries(await bytesUnder(p))) out[`${e.name}/${k}`] = v;
+      else out[e.name] = sha256(await readFile(p));
+    }
+    return out;
+  }
+  /** One file comes in through the watch; its source id. */
+  async function cameIn(p: Project, wid: string, events: WatchEvent[], name: string, data: Buffer): Promise<string> {
+    const before = events.filter((e) => e.kind === "imported").length;
+    await writeFile(join(inbox, name), data);
+    await until(() => events.filter((e) => e.kind === "imported").length > before);
+    await untilAsync(async () => (await stateOf(p, wid, name)) === "in-library");
+    return (await regOf(p, wid)).get(name)!.sourceId;
+  }
+  /** Register lines written straight into the file (seeding many entries for the arithmetic of mass disappearance). */
+  async function seed(p: Project, wid: string, entries: Array<Record<string, unknown>>): Promise<void> {
+    const dir = join(lib.root, p.folder, "watched");
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(join(dir, `${wid}.jsonl`), entries.map((e) => JSON.stringify(e)).join("\n") + "\n", { mode: 0o600 });
+  }
+  const seeded = (key: string, extra: Record<string, unknown> = {}) => ({
+    key,
+    file: key,
+    sourceId: newId(),
+    sha256: sha256(key),
+    size: 10,
+    mtimeNs: "1700000000000000000",
+    state: "in-library",
+    at: new Date().toISOString(),
+    ...extra,
+  });
+
+  it('a changed file is never imported or replaced; the source shows "changed"', async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const name = "Interview Ana Pérez.pdf";
+    const v1 = await buildPdf({ title: "Interview one", extra: "w3-a1" });
+    const sid = await cameIn(p, wid, events, name, v1);
+    const sf = await repo.getSource(p.id, sid);
+    expect(sf.source.provenance.tool.name).toBe("watched-folder");
+    expect(sf.source.provenance.externalKeys).toEqual({ "watched-folder": wid });
+    const v2 = await buildPdf({ title: "Interview two", extra: "w3-a2" });
+    await writeFile(join(inbox, name), v2);
+    await untilAsync(async () => (await stateOf(p, wid, name)) === "changed");
+    const e = (await regOf(p, wid)).get(name)!;
+    expect(e).toMatchObject({ key: name, file: name, sourceId: sid, sha256: sha256(v1), newSha256: sha256(v2), newSize: v2.length, size: v2.length });
+    await sleep(800);
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+    expect(events.filter((x) => x.kind === "imported")).toHaveLength(1);
+    expect((await repo.getSource(p.id, sid)).assets.map((a) => a.sha256)).toEqual([sha256(v1)]);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, alreadyInLibrary: 0, changed: 1, gone: 0 });
+    expect(await repo.watchOrigins(p.id, sid)).toEqual([{ watchId: wid, entry: (await regOf(p, wid)).get(name) }]);
+    // The same content written again (a new time): nothing is written (A8); still no import.
+    const writes = await registerWrites(p);
+    await writeFile(join(inbox, name), v2);
+    await sleep(1200);
+    expect(await registerWrites(p)).toBe(writes);
+    expect((await regOf(p, wid)).get(name)).toMatchObject({ state: "changed", sha256: sha256(v1), newSha256: sha256(v2) });
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+    // No audit line holds the file's name (R177, R69).
+    for (const n of [name, "Interview", "Pérez"]) expect(await auditText(p)).not.toContain(n);
+  }, 40_000);
+
+  it("the source's files and annotations.json are byte-identical after the folder's file changed", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid, rescanMs: 300 });
+    await w.ready;
+    const sid = await cameIn(p, wid, events, "highlighted.pdf", await buildPdf({ title: "Highlighted", extra: "w3-h1" }));
+    const sf = await repo.getSource(p.id, sid);
+    await repo.createAnnotation(p.id, sid, { kind: "highlight", assetId: sf.assets[0]!.id, anchors: [{ page: 1, rects: [{ x: 72, y: 600, w: 200, h: 12 }] }], quote: "a passage", colorName: "yellow" });
+    const folder = join(lib.root, sf.source.folder);
+    const before = await bytesUnder(folder);
+    const notes = await repo.listAnnotations(p.id, sid);
+    expect(notes).toHaveLength(1);
+    const opsBefore = (await auditOps(p)).length;
+    // A colleague replaces it, then removes it.
+    await writeFile(join(inbox, "highlighted.pdf"), await buildPdf({ title: "Replaced by a colleague", extra: "w3-h2" }));
+    await untilAsync(async () => (await stateOf(p, wid, "highlighted.pdf")) === "changed");
+    await rm(join(inbox, "highlighted.pdf"));
+    await untilAsync(async () => (await stateOf(p, wid, "highlighted.pdf")) === "gone");
+    expect(w.status().counts).toMatchObject({ gone: 1, changed: 0 });
+    expect(await bytesUnder(folder)).toEqual(before);
+    expect(await repo.listAnnotations(p.id, sid)).toEqual(notes);
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+    // The notes are register lines and nothing else.
+    expect((await auditOps(p)).slice(opsBefore).every((o) => o === "project.watched-folder.register")).toBe(true);
+  }, 40_000);
+
+  it('a not-downloaded change is "may-have-changed" and is not read', async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const f = join(inbox, "report.pdf");
+    const v1 = await buildPdf({ title: "Report", extra: "w3-n1" });
+    await cameIn(p, wid, events, "report.pdf", v1);
+    const opened = readSpies();
+    // Replaced by a version that is not on this computer (a sparse file is Linux's stand-in), moved in whole.
+    await sparse(join(tmp, "aside.pdf"), 250_000);
+    await rename(join(tmp, "aside.pdf"), f);
+    await untilAsync(async () => (await stateOf(p, wid, "report.pdf")) === "may-have-changed");
+    const e = (await regOf(p, wid)).get("report.pdf")!;
+    expect(e).toMatchObject({ sha256: sha256(v1), newSize: 250_000 });
+    expect(e.newSha256).toBeUndefined();
+    await sleep(600);
+    expect(opened(f)).toEqual([]); // a registered file that is not local is never hashed
+    expect(w.status().counts).toMatchObject({ cameIn: 1, notDownloaded: 0, changed: 1 });
+    expect(w.problems({ offset: 0, limit: 10 }).total).toBe(0);
+    // Once it is on this computer it is read (through the whole order) and noted "changed".
+    const v2 = await buildPdf({ title: "Report, second edition", extra: "w3-n2" });
+    await writeFile(join(tmp, "aside2.pdf"), v2);
+    await rename(join(tmp, "aside2.pdf"), f);
+    await untilAsync(async () => (await stateOf(p, wid, "report.pdf")) === "changed");
+    expect((await regOf(p, wid)).get("report.pdf")).toMatchObject({ newSha256: sha256(v2), newSize: v2.length });
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  }, 40_000);
+
+  it("half the register vanishing at once marks nothing gone", async () => {
+    const p = await project();
+    const wid = newId();
+    // 40 entries "in-library": 20 files are here (as registered), 20 are missing.
+    const entries = [];
+    for (let i = 0; i < 40; i++) {
+      const key = `paper-${String(i).padStart(2, "0")}.pdf`;
+      if (i < 20) {
+        await writeFile(join(inbox, key), `content ${i}`);
+        const st = await fsp.lstat(join(inbox, key), { bigint: true });
+        entries.push(seeded(key, { size: Number(st.size), mtimeNs: st.mtimeNs.toString() }));
+      } else entries.push(seeded(key));
+    }
+    await seed(p, wid, entries);
+    const opened = readSpies();
+    const { w } = start(p, { ...W3, watchId: wid, watchEvents: false });
+    await w.ready;
+    // (The seeded entries name sources this test never made: the files count as removed here, A8.)
+    await until(() => !w.status().scanning && w.status().counts.waiting === 0 && w.status().counts.didNotComeIn === 20);
+    await until(() => w.status().reason !== undefined);
+    expect(w.status()).toMatchObject({ state: "watching", reason: withProvider(WATCH_REASONS.massGone, null), counts: { gone: 0 } });
+    expect(WATCH_REASONS.massGone).toBe("Most files in this folder disappeared at once. This usually means {provider} is signed out or still starting. Nothing in the library has changed.");
+    await sleep(400);
+    expect([...(await regOf(p, wid)).values()].every((e) => e.state === "in-library")).toBe(true);
+    expect(await registerWrites(p)).toBe(0);
+    // The 20 registered files here were not read: their size and exact time are as registered.
+    for (let i = 0; i < 20; i++) expect(opened(join(inbox, `paper-${String(i).padStart(2, "0")}.pdf`))).toEqual([]);
+  }, 30_000);
+
+  it("mass disappearance at 1, 19, 20 and 40,000 entries (and at the half)", async () => {
+    // [missing "in-library" entries, missing "changed" entries, present ones, marked gone?]
+    const cases: Array<[number, number, number, boolean]> = [
+      [1, 0, 0, true],
+      [19, 0, 0, true],
+      [20, 0, 0, false],
+      [40_000, 0, 0, false],
+      [20, 0, 20, false], // exactly half
+      [20, 0, 21, true], // less than half
+      [5, 25, 0, false], // review M3: changed entries count too
+      [5, 14, 0, true],
+    ];
+    expect(WATCH_MASS_GONE_MIN).toBe(20);
+    for (const [missingIn, missingChanged, present, marked] of cases) {
+      const missing = missingIn + missingChanged;
+      const p = await project();
+      const wid = newId();
+      const dir = join(tmp, `Inbox-${missingIn}-${missingChanged}-${present}`);
+      await mkdir(dir);
+      const entries = [];
+      for (let i = 0; i < present; i++) {
+        const key = `here-${i}.txt`;
+        await writeFile(join(dir, key), `here ${i}`);
+        const st = await fsp.lstat(join(dir, key), { bigint: true });
+        entries.push(seeded(key, { size: Number(st.size), mtimeNs: st.mtimeNs.toString() }));
+      }
+      for (let i = 0; i < missingIn; i++) entries.push(seeded(`gone-${i}.pdf`));
+      for (let i = 0; i < missingChanged; i++) entries.push(seeded(`changed-${i}.pdf`, { state: "changed", newSha256: sha256(`new ${i}`), newSize: 3 }));
+      await seed(p, wid, entries);
+      const { w } = start(p, { ...W3, dir, watchId: wid, watchEvents: false });
+      await w.ready;
+      await until(() => !w.status().scanning && w.status().counts.waiting === 0 && w.status().counts.didNotComeIn === present, 30_000);
+      if (marked) await until(() => w.status().counts.gone === missing);
+      else await sleep(500);
+      const reg = await (async () => {
+        if (marked) await untilAsync(async () => [...(await regOf(p, wid)).values()].filter((e) => e.state === "gone").length === missing);
+        return regOf(p, wid);
+      })();
+      const gone = [...reg.values()].filter((e) => e.state === "gone").length;
+      expect({ missing, present, gone, reason: w.status().reason }).toEqual({
+        missing,
+        present,
+        gone: marked ? missing : 0,
+        reason: marked ? undefined : withProvider(WATCH_REASONS.massGone, null),
+      });
+      await w.stop();
+    }
+  }, 120_000);
+
+  it("an unreachable folder marks nothing gone", async () => {
+    const p = await project();
+    const wid = newId();
+    await seed(p, wid, [seeded("a.pdf"), seeded("b.pdf"), seeded("c.pdf")]);
+    const dir = join(tmp, "NotYet");
+    const { w } = start(p, { ...W3, dir, watchId: wid });
+    await w.ready;
+    await until(() => w.status().state === "unreachable");
+    await sleep(800);
+    expect([...(await regOf(p, wid)).values()].map((e) => e.state)).toEqual(["in-library", "in-library", "in-library"]);
+    expect(w.status().counts.gone).toBe(0);
+    expect(await registerWrites(p)).toBe(0);
+    // The folder answers again (empty): a complete listing, and three entries are fewer than the mass rule's minimum.
+    await mkdir(dir);
+    await until(() => w.status().state === "watching");
+    await untilAsync(async () => [...(await regOf(p, wid)).values()].every((e) => e.state === "gone"));
+  }, 30_000);
+
+  it("a renamed file keeps its source and makes none", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid, recursive: true });
+    await w.ready;
+    const sid = await cameIn(p, wid, events, "first.pdf", await buildPdf({ title: "Renamed", extra: "w3-r1" }));
+    await rename(join(inbox, "first.pdf"), join(inbox, "second.pdf"));
+    await untilAsync(async () => (await stateOf(p, wid, "second.pdf")) === "in-library");
+    let reg = await regOf(p, wid);
+    expect([...reg.keys()]).toEqual(["second.pdf"]);
+    expect(reg.get("second.pdf")).toMatchObject({ sourceId: sid, file: "second.pdf", renamedFrom: "first.pdf" });
+    // Moved into a folder: the same.
+    await mkdir(join(inbox, "Sub"));
+    await rename(join(inbox, "second.pdf"), join(inbox, "Sub", "third.pdf"));
+    await untilAsync(async () => (await stateOf(p, wid, "Sub/third.pdf")) === "in-library");
+    reg = await regOf(p, wid);
+    expect([...reg.keys()]).toEqual(["Sub/third.pdf"]);
+    expect(reg.get("Sub/third.pdf")!.sourceId).toBe(sid);
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+    expect(events.filter((e) => e.kind === "imported")).toHaveLength(1);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, alreadyInLibrary: 0, gone: 0 });
+  }, 40_000);
+
+  it("a name differing only by case with the same content is a rename", async () => {
+    const p = await project();
+    const wid = newId();
+    // A file system that ignores case (macOS): the old name still answers, with the same inode.
+    const caseless = async (q: string) => {
+      try {
+        return await fsp.lstat(q, { bigint: true });
+      } catch (err) {
+        const d = join(q, "..");
+        const twin = (await fsp.readdir(d).catch(() => [] as string[])).find((n) => n.toLowerCase() === q.slice(d.length + 1).toLowerCase());
+        if (twin) return fsp.lstat(join(d, twin), { bigint: true });
+        throw err;
+      }
+    };
+    for (const [fs, label] of [[undefined, "case-sensitive"], [{ lstat: caseless }, "case-insensitive"]] as const) {
+      const dir = join(tmp, `Case-${label}`);
+      await mkdir(dir);
+      const { w, events } = start(p, { ...W3, dir, watchId: wid, ...(fs ? { fs } : {}) });
+      await w.ready;
+      await writeFile(join(dir, "report.pdf"), await buildPdf({ title: `Case ${label}`, extra: `w3-case-${label}` }));
+      await until(() => events.some((e) => e.kind === "imported"));
+      await untilAsync(async () => (await stateOf(p, wid, "report.pdf")) === "in-library");
+      const sid = (await regOf(p, wid)).get("report.pdf")!.sourceId;
+      await rename(join(dir, "report.pdf"), join(dir, "Report.pdf"));
+      await untilAsync(async () => (await stateOf(p, wid, "Report.pdf")) === "in-library");
+      const reg = await regOf(p, wid);
+      expect([...reg.keys()]).toEqual(["Report.pdf"]);
+      expect(reg.get("Report.pdf")).toMatchObject({ sourceId: sid, renamedFrom: "report.pdf" });
+      expect(repo.listSourceIds(p.id).filter((id) => id === sid)).toHaveLength(1);
+      await w.stop();
+      await seed(p, wid, []); // the next round starts with an empty register
+    }
+    expect(repo.listSourceIds(p.id)).toHaveLength(2);
+  }, 60_000);
+
+  it("a source removed here is not imported again from the same file", async () => {
+    const p = await project();
+    const wid = newId();
+    const first = start(p, { ...W3, watchId: wid });
+    await first.w.ready;
+    const v1 = await buildPdf({ title: "Deleted here", extra: "w3-d1" });
+    const sid = await cameIn(p, wid, first.events, "deleted.pdf", v1);
+    await first.w.stop();
+    await repo.deleteSource(p.id, sid);
+    // The next start, and a copy of the same file under another name: nothing comes back.
+    await writeFile(join(inbox, "deleted (copy).pdf"), v1);
+    const second = start(p, { ...W3, watchId: wid });
+    await second.w.ready;
+    await until(() => !second.w.status().scanning && second.w.status().counts.waiting === 0 && second.w.status().counts.didNotComeIn === 2);
+    await sleep(500);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    expect(second.events.filter((e) => e.kind === "imported")).toEqual([]);
+    // Both are listed as removed here (A8).
+    expect(second.w.status().counts).toMatchObject({ cameIn: 0, alreadyInLibrary: 0, didNotComeIn: 2 });
+    expect(
+      second.w
+        .problems({ offset: 0, limit: 10 })
+        .items.map((i) => [i.file, i.kind, i.reason])
+        .sort(),
+    ).toEqual([
+      ["deleted (copy).pdf", "removed-here", WATCH_REASONS.removedHere],
+      ["deleted.pdf", "removed-here", WATCH_REASONS.removedHere],
+    ]);
+    expect(WATCH_REASONS.removedHere).toBe("This file was removed from the library here, so it is not brought in again. To bring it in, add it by hand.");
+    expect((await regOf(p, wid)).get("deleted.pdf")).toMatchObject({ sourceId: sid, state: "in-library" });
+  }, 40_000);
+
+  it("a conflict copy with the same content makes no source and is listed as already in the library", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const v1 = await buildPdf({ title: "Report", extra: "w3-c1" });
+    await cameIn(p, wid, events, "Report.pdf", v1);
+    await writeFile(join(inbox, "Report (Ana's conflicted copy 2026-11-13).pdf"), v1);
+    await writeFile(join(inbox, "Report (1).pdf"), v1);
+    await until(() => w.status().counts.alreadyInLibrary === 2);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, alreadyInLibrary: 2 });
+    await sleep(300);
+    expect([...(await regOf(p, wid)).keys()]).toEqual(["Report.pdf"]);
+  }, 40_000);
+
+  it("a conflict copy with different content becomes its own source under its own name", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const a = await cameIn(p, wid, events, "Report.pdf", await buildPdf({ title: "Report", extra: "w3-c2" }));
+    const name = "Report (Ana's conflicted copy 2026-11-13).pdf";
+    const b = await cameIn(p, wid, events, name, await buildPdf({ title: "Report, Ana's edits", extra: "w3-c3" }));
+    expect(b).not.toBe(a);
+    expect(repo.listSourceIds(p.id).sort()).toEqual([a, b].sort());
+    expect((await regOf(p, wid)).get(name)).toMatchObject({ file: name, state: "in-library" });
+    expect(w.status().counts).toMatchObject({ cameIn: 2, alreadyInLibrary: 0 });
+  }, 40_000);
+
+  it("new files land in the chosen collection; a deleted collection is said", async () => {
+    const p = await project();
+    const wid = newId();
+    const c = await repo.createCollection(p.id, "From the shared drive");
+    const { w, events } = start(p, { ...W3, watchId: wid, collectionId: c.id });
+    await w.ready;
+    const a = await cameIn(p, wid, events, "a.pdf", await buildPdf({ title: "Into the collection", extra: "w3-k1" }));
+    expect((await repo.getSource(p.id, a)).source.collectionIds).toEqual([c.id]);
+    expect(w.status().reason).toBeUndefined();
+    await repo.deleteCollection(p.id, c.id);
+    const b = await cameIn(p, wid, events, "b.pdf", await buildPdf({ title: "No collection now", extra: "w3-k2" }));
+    expect((await repo.getSource(p.id, b)).source.collectionIds).toEqual([]);
+    expect(w.status().reason).toBe(WATCH_REASONS.noCollection);
+    expect(WATCH_REASONS.noCollection).toBe("The collection chosen for this folder no longer exists, so new files go into the project without a collection.");
+    // A watch started with a collection that no longer exists says so at once; nothing fails.
+    const empty = join(tmp, "Empty");
+    await mkdir(empty);
+    const second = start(p, { ...W3, dir: empty, watchId: newId(), collectionId: c.id });
+    await second.w.ready;
+    await until(() => second.w.status().reason === WATCH_REASONS.noCollection);
+    expect(second.w.status().state).toBe("watching");
+  }, 40_000);
+
+  it("bring in the new version adds an original and keeps the first", async () => {
+    const p = await project();
+    const wf = await addWatchedFolder({ repo, lib }, p.id, inbox);
+    const wid = wf.id;
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const v1 = await buildPdf({ title: "Version one", extra: "w3-b1" });
+    const sid = await cameIn(p, wid, events, "paper.pdf", v1);
+    const sf1 = await repo.getSource(p.id, sid);
+    const firstBytes = await bytesUnder(join(lib.root, sf1.source.folder, "original"));
+    const actDeps = { repo, http, lib, stabilityMs: 200 };
+    // Nothing to bring in yet.
+    await expect(bringInNewVersion(actDeps, p.id, wid, "paper.pdf")).rejects.toThrow(/not changed/u);
+    const v2 = await buildPdf({ title: "Version two", extra: "w3-b2" });
+    await writeFile(join(inbox, "paper.pdf"), v2);
+    await untilAsync(async () => (await stateOf(p, wid, "paper.pdf")) === "changed");
+    const o = await bringInNewVersion(actDeps, p.id, wid, "paper.pdf");
+    expect(o).toMatchObject({ outcome: "attached", sourceId: sid });
+    const sf2 = await repo.getSource(p.id, sid);
+    expect(sf2.assets.filter((a) => a.role === "original").map((a) => a.sha256)).toEqual([sha256(v1), sha256(v2)]);
+    expect(sf2.source.provenance).toEqual(sf1.source.provenance);
+    const now = await bytesUnder(join(lib.root, sf1.source.folder, "original"));
+    for (const [k, v] of Object.entries(firstBytes)) expect(now[k]).toBe(v); // the first original is kept, unchanged
+    expect((await regOf(p, wid)).get("paper.pdf")).toMatchObject({ state: "in-library", sha256: sha256(v2), size: v2.length });
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+    await until(() => w.status().counts.changed === 0);
+
+    // Not on this computer: refused, and nothing is read.
+    await sparse(join(tmp, "aside.pdf"), 300_000);
+    await rename(join(tmp, "aside.pdf"), join(inbox, "paper.pdf"));
+    await untilAsync(async () => (await stateOf(p, wid, "paper.pdf")) === "may-have-changed");
+    const opened = readSpies();
+    await expect(bringInNewVersion(actDeps, p.id, wid, "paper.pdf")).rejects.toBeInstanceOf(WatchFileNotLocalError);
+    expect(opened(join(inbox, "paper.pdf"))).toEqual([]);
+    expect((await repo.getSource(p.id, sid)).assets.filter((a) => a.role === "original")).toHaveLength(2);
+
+    // "Keep the library's copy as it is": settled; nothing is read or changed.
+    const folderBytes = await bytesUnder(join(lib.root, sf1.source.folder));
+    await settleWatchedFile(actDeps, p.id, wid, "paper.pdf");
+    expect(await stateOf(p, wid, "paper.pdf")).toBe("settled");
+    expect(await bytesUnder(join(lib.root, sf1.source.folder))).toEqual(folderBytes);
+    expect(opened(join(inbox, "paper.pdf"))).toEqual([]);
+    await expect(settleWatchedFile(actDeps, p.id, wid, "paper.pdf")).rejects.toThrow(/nothing to settle/u);
+
+    // With no watch running here, the act reads the folder chosen on this computer, through the same order.
+    await w.stop();
+    const v3 = await buildPdf({ title: "Version three", extra: "w3-b3" });
+    await writeFile(join(tmp, "aside3.pdf"), v3);
+    await rename(join(tmp, "aside3.pdf"), join(inbox, "paper.pdf"));
+    const e = (await regOf(p, wid)).get("paper.pdf")!;
+    await repo.recordWatchedFiles(p.id, wid, [{ ...e, state: "changed", newSha256: sha256(v3), newSize: v3.length, at: new Date().toISOString() }]);
+    expect(await bringInNewVersion(actDeps, p.id, wid, "paper.pdf")).toMatchObject({ outcome: "attached", sourceId: sid });
+    expect((await repo.getSource(p.id, sid)).assets.filter((a) => a.role === "original")).toHaveLength(3);
+    expect((await regOf(p, wid)).get("paper.pdf")).toMatchObject({ state: "in-library", sha256: sha256(v3) });
+  }, 60_000);
+
+  it("the researcher's acts refuse a read-only library and a locked project in plain words", async () => {
+    const p = await project(true);
+    const wid = newId();
+    await repo.recordWatchedFiles(p.id, wid, [{ ...seeded("a.pdf"), state: "changed", newSha256: sha256("x"), newSize: 1 } as never]);
+    const ro = { repo, http, lib: { ...lib, mode: "read-only", readOnlyReason: "locked-by-other-device" } as Library };
+    await expect(bringInNewVersion(ro, p.id, wid, "a.pdf")).rejects.toThrow(/read-only/u);
+    await expect(settleWatchedFile(ro, p.id, wid, "a.pdf")).rejects.toThrow(/read-only/u);
+    repo.lockProject(p.id);
+    await expect(bringInNewVersion({ repo, http, lib }, p.id, wid, "a.pdf")).rejects.toThrow(/locked/u);
+    await expect(settleWatchedFile({ repo, http, lib }, p.id, wid, "a.pdf")).rejects.toThrow(/locked/u);
+  });
+
+  it("a rescan that finds nothing new writes nothing", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid, rescanMs: 200 });
+    await w.ready;
+    await cameIn(p, wid, events, "a.pdf", await buildPdf({ title: "Steady", extra: "w3-s1" }));
+    await sleep(300);
+    const writes = await registerWrites(p);
+    expect(writes).toBe(1);
+    const opened = readSpies();
+    await sleep(2000); // about ten rescans
+    expect(await registerWrites(p)).toBe(writes);
+    expect(opened(join(inbox, "a.pdf"))).toEqual([]);
+    // A restart reads nothing either: the file is as registered.
+    await w.stop();
+    const again = start(p, { ...W3, watchId: wid });
+    await again.w.ready;
+    await until(() => again.w.status().counts.cameIn === 1);
+    await sleep(300);
+    expect(opened(join(inbox, "a.pdf"))).toEqual([]);
+    expect(await registerWrites(p)).toBe(writes);
+  }, 40_000);
+
+  it("entries are written in batches of at most 50, and at stop()", async () => {
+    const p = await project();
+    const wid = newId();
+    const registerEvents = async () =>
+      (await auditText(p))
+        .split("\n")
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l) as { details?: { op?: string; entries?: number } })
+        .filter((e) => e.details?.op === "project.watched-folder.register")
+        .map((e) => e.details!.entries!);
+    // One file: its line waits for the timer (here a minute), and is written at stop().
+    const first = start(p, { stabilityMs: 200, pollMs: 50, registerFlushMs: 60_000, watchId: wid, attach: realishAttach() });
+    await first.w.ready;
+    await writeFile(join(inbox, "one.pdf"), "one");
+    await until(() => first.w.status().counts.cameIn === 1);
+    await sleep(500);
+    expect(await registerEvents()).toEqual([]);
+    await first.w.stop();
+    expect(await registerEvents()).toEqual([1]);
+    // 120 files: written as soon as 50 wait, in changes of at most 50 lines each.
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, registerFlushMs: 60_000, watchId: wid, attach: realishAttach() });
+    await w.ready;
+    for (let i = 0; i < 120; i++) await writeFile(join(inbox, `f-${String(i).padStart(3, "0")}.pdf`), `file ${i}`);
+    // (one.pdf is registered for a source this stand-in never stored: it counts as removed here.)
+    await until(() => w.status().counts.cameIn === 120 && w.status().counts.didNotComeIn === 1, 30_000);
+    await untilAsync(async () => (await registerEvents()).length >= 3);
+    await w.stop();
+    const sizes = await registerEvents();
+    expect(sizes.every((n) => n <= 50)).toBe(true);
+    expect(sizes.reduce((a, b) => a + b, 0)).toBe(121);
+    expect((await regOf(p, wid)).size).toBe(121);
+  }, 60_000);
+
+  it("a locked project's register is not read and the watch is paused", async () => {
+    const p = await project(true);
+    const wid = newId();
+    await repo.recordWatchedFiles(p.id, wid, [seeded("a.pdf") as never]);
+    repo.lockProject(p.id);
+    const read = vi.spyOn(repo, "watchRegister");
+    const { w } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    await until(() => w.status().state === "locked");
+    await sleep(500);
+    expect(read).not.toHaveBeenCalled();
+    await repo.unlockProject(p.id, "pw");
+    await until(() => w.status().state === "watching");
+    await until(() => read.mock.calls.length > 0);
+    await until(() => w.status().counts.gone === 1); // the empty folder's complete listing: one entry is fewer than the minimum
+  }, 30_000);
+
+  // ---- fix round 1 (A8, R217) ------------------------------------------------------------------------------------
+  /** A source made the way drag-and-drop makes one, from a copy of `data` outside the watched folder. */
+  async function droppedSource(p: Project, name: string, data: Buffer): Promise<string> {
+    const outside = join(tmp, `Desk-${Math.random().toString(36).slice(2, 8)}`, name);
+    await fsp.mkdir(join(outside, ".."), { recursive: true });
+    await fsp.writeFile(outside, data);
+    const [o] = await createAttach({ repo, http }).attachFiles(p.id, [outside]);
+    return o!.sourceId!;
+  }
+  const removedItems = (w: FolderWatch) => w.problems({ kind: "removed-here", offset: 0, limit: 100 }).items.map((i) => i.file).sort();
+
+  it("C1: a drag-and-drop source's file in the folder is registered; deleted, it does not come back", async () => {
+    const p = await project();
+    const wid = newId();
+    const v = await buildPdf({ title: "Dragged in first", extra: "a8-c1" });
+    const sid = await droppedSource(p, "shared.pdf", v);
+    await writeFile(join(inbox, "shared.pdf"), v);
+    const { w, events } = start(p, { ...W3, watchId: wid, rescanMs: 300 });
+    await w.ready;
+    await untilAsync(async () => (await stateOf(p, wid, "shared.pdf")) === "in-library");
+    expect((await regOf(p, wid)).get("shared.pdf")).toMatchObject({ sourceId: sid, sha256: sha256(v) });
+    expect(w.status().counts).toMatchObject({ cameIn: 0, alreadyInLibrary: 1 });
+    await repo.deleteSource(p.id, sid);
+    await until(() => removedItems(w).length === 1);
+    await sleep(1500); // several rescans
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    expect(events.filter((e) => e.kind === "imported")).toEqual([]);
+    expect(w.problems({ offset: 0, limit: 10 }).items).toEqual([{ file: "shared.pdf", kind: "removed-here", reason: WATCH_REASONS.removedHere }]);
+    expect(w.status().counts).toMatchObject({ cameIn: 0, alreadyInLibrary: 0, didNotComeIn: 1 });
+    // After a restart too.
+    await w.stop();
+    const again = start(p, { ...W3, watchId: wid });
+    await again.w.ready;
+    await until(() => again.w.status().counts.didNotComeIn === 1);
+    await sleep(500);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  }, 40_000);
+
+  it("I1: such a file edited by a colleague is a \"changed\" note on that source, not a second source", async () => {
+    const p = await project();
+    const wid = newId();
+    const v1 = await buildPdf({ title: "Dragged in, then edited", extra: "a8-i1a" });
+    const sid = await droppedSource(p, "draft.pdf", v1);
+    await writeFile(join(inbox, "draft.pdf"), v1);
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    await untilAsync(async () => (await stateOf(p, wid, "draft.pdf")) === "in-library");
+    const v2 = await buildPdf({ title: "Edited by a colleague", extra: "a8-i1b" });
+    await writeFile(join(inbox, "draft.pdf"), v2);
+    await untilAsync(async () => (await stateOf(p, wid, "draft.pdf")) === "changed");
+    await sleep(800);
+    expect((await regOf(p, wid)).get("draft.pdf")).toMatchObject({ sourceId: sid, sha256: sha256(v1), newSha256: sha256(v2) });
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+    expect(events.filter((e) => e.kind === "imported")).toEqual([]);
+  }, 40_000);
+
+  it("every other way in is registered the first time it is seen: Bulk Import, another tool's source, a watch before the register", async () => {
+    const p = await project();
+    const wid = newId();
+    const handle = new IndexHandle(lib.root);
+    try {
+      const a = await buildPdf({ title: "By Bulk Import", extra: "a8-w1" });
+      const b = await buildPdf({ title: "By another tool", extra: "a8-w2" });
+      const c = await buildPdf({ title: "By a watch before the register", extra: "a8-w3" });
+      const src = join(tmp, "BulkDesk");
+      await mkdir(src);
+      await fsp.writeFile(join(src, "a.pdf"), a);
+      const h = await createBulkImport({ repo, http, index: handle }).startBatch(p.id, folderAdapter(src));
+      await h.done;
+      const bulkSid = repo.listSourceIds(p.id)[0]!;
+      // Another tool (as the Zotero import does): a source with its own provenance and the file among its assets.
+      const bFile = join(tmp, "zotero-b.pdf");
+      await fsp.writeFile(bFile, b);
+      const other = await repo.createSource(
+        p.id,
+        { projectIds: [], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: "By another tool" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+        [{ path: bFile, role: "original", handling: "copy" }],
+        { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "zotero-web", version: "1" }, fileHashes: {}, legal: { status: "unknown" }, identifiable: false } },
+      );
+      // A watch before the register: attach without an origin (drag-and-drop provenance).
+      const cSid = await droppedSource(p, "c.pdf", c);
+      for (const [n, d] of [["a.pdf", a], ["b.pdf", b], ["c.pdf", c]] as const) await writeFile(join(inbox, n), d);
+      const { w, events } = start(p, { ...W3, watchId: wid });
+      await w.ready;
+      await untilAsync(async () => (await regOf(p, wid)).size === 3);
+      const reg = await regOf(p, wid);
+      expect(Object.fromEntries([...reg.values()].map((e) => [e.key, e.sourceId]))).toEqual({ "a.pdf": bulkSid, "b.pdf": other.source.id, "c.pdf": cSid });
+      expect(repo.listSourceIds(p.id)).toHaveLength(3);
+      expect(events.filter((e) => e.kind === "imported")).toEqual([]);
+      expect(w.status().counts).toMatchObject({ cameIn: 0, alreadyInLibrary: 3 });
+    } finally {
+      handle.close();
+    }
+  }, 60_000);
+
+  it("deleted stays deleted, an undo included: a Bulk Import batch whose file also lies in the folder", async () => {
+    const p = await project();
+    const wid = newId();
+    const handle = new IndexHandle(lib.root);
+    try {
+      const bulk = createBulkImport({ repo, http, index: handle });
+      const src = join(tmp, "Desk");
+      await mkdir(src);
+      const v1 = await buildPdf({ title: "Bulk then watched", extra: "w3-u1" });
+      await fsp.writeFile(join(src, "x.pdf"), v1);
+      const h = await bulk.startBatch(p.id, folderAdapter(src));
+      await h.done;
+      const bulkSource = repo.listSourceIds(p.id)[0]!;
+      await writeFile(join(inbox, "x.pdf"), v1);
+      const { w, events } = start(p, { ...W3, watchId: wid, rescanMs: 300 });
+      await w.ready;
+      // Seen once: registered for the batch's source.
+      await untilAsync(async () => (await stateOf(p, wid, "x.pdf")) === "in-library");
+      expect((await regOf(p, wid)).get("x.pdf")!.sourceId).toBe(bulkSource);
+      // The batch is undone: the file is not brought back, and it is listed as removed here.
+      await bulk.undoBatch(p.id, h.batchId);
+      expect(repo.listSourceIds(p.id)).toEqual([]);
+      await until(() => removedItems(w).length === 1);
+      await sleep(1500);
+      expect(repo.listSourceIds(p.id)).toEqual([]);
+      expect(events.filter((e) => e.kind === "imported")).toEqual([]);
+      expect(removedItems(w)).toEqual(["x.pdf"]);
+      // The register and what the library holds agree: the entry names the removed source; nothing else was written.
+      expect((await regOf(p, wid)).get("x.pdf")).toMatchObject({ sourceId: bulkSource, state: "in-library" });
+    } finally {
+      handle.close();
+    }
+  }, 60_000);
+
+  it("deleted stays deleted: a source this watch brought in, deleted while the watch runs", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid, rescanMs: 300 });
+    await w.ready;
+    const sid = await cameIn(p, wid, events, "mine.pdf", await buildPdf({ title: "Watched, then deleted", extra: "a8-d2" }));
+    await repo.deleteSource(p.id, sid);
+    await until(() => removedItems(w).length === 1);
+    await sleep(1200);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    expect(events.filter((e) => e.kind === "imported")).toHaveLength(1);
+  }, 40_000);
+
+  /** A watcher stand-in whose events the test emits (as FSEvents would name paths below the folder). */
+  function fakeTreeWatch() {
+    const emitters: EventEmitter[] = [];
+    const fn = (() => {
+      const e = Object.assign(new EventEmitter(), { close: () => {}, ref: () => e, unref: () => e });
+      emitters.push(e);
+      return e;
+    }) as unknown as typeof fs.watch;
+    return { emitters, fn };
+  }
+
+  it("I2: links are never followed — a subfolder replaced by a link reads nothing, in the engine and in bring-in", async () => {
+    const p = await project();
+    const wf = await addWatchedFolder({ repo, lib }, p.id, inbox, { recursive: true });
+    const wid = wf.id;
+    const away = join(tmp, "Away");
+    await fsp.mkdir(away);
+    const fake = fakeTreeWatch();
+    const { w, events } = start(p, { ...W3, watchId: wid, recursive: true, watcherForm: "tree", fsWatch: fake.fn, rescanMs: 60_000 });
+    await w.ready;
+    await mkdir(join(inbox, "Sub"));
+    await writeFile(join(inbox, "Sub", "x.pdf"), await buildPdf({ title: "In the subfolder", extra: "a8-l1" }));
+    fake.emitters[0]!.emit("change", "rename", "Sub/x.pdf");
+    await until(() => events.some((e) => e.kind === "imported"));
+    await untilAsync(async () => (await stateOf(p, wid, "Sub/x.pdf")) === "in-library");
+    const sid = (await regOf(p, wid)).get("Sub/x.pdf")!.sourceId;
+    // The subfolder is replaced by a link to a folder elsewhere holding another x.pdf.
+    const outsideFile = join(away, "x.pdf");
+    await fsp.writeFile(outsideFile, await buildPdf({ title: "Outside the folder", extra: "a8-l2" }));
+    const opened = readSpies();
+    await rm(join(inbox, "Sub"), { recursive: true });
+    await symlink(away, join(inbox, "Sub"));
+    fake.emitters[0]!.emit("change", "change", "Sub/x.pdf");
+    await sleep(1500);
+    expect(opened(outsideFile)).toEqual([]);
+    expect(opened(join(inbox, "Sub", "x.pdf"))).toEqual([]);
+    expect((await regOf(p, wid)).get("Sub/x.pdf")).toMatchObject({ state: "in-library", sourceId: sid });
+    // Bring-in, as after a restart before the next listing: refused, nothing read, nothing added.
+    await w.stop();
+    const e = (await regOf(p, wid)).get("Sub/x.pdf")!;
+    await repo.recordWatchedFiles(p.id, wid, [{ ...e, state: "changed", newSha256: sha256("x"), newSize: 1, at: new Date().toISOString() }]);
+    await expect(bringInNewVersion({ repo, http, lib, stabilityMs: 200 }, p.id, wid, "Sub/x.pdf")).rejects.toThrow(WATCH_REASONS.outside);
+    expect(opened(outsideFile)).toEqual([]);
+    expect((await repo.getSource(p.id, sid)).assets.filter((a) => a.role === "original")).toHaveLength(1);
+  }, 40_000);
+
+  it("I2: a file replaced by a link to a file elsewhere, or inside, is never read through the link", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid, rescanMs: 300 });
+    await w.ready;
+    await cameIn(p, wid, events, "paper.pdf", await buildPdf({ title: "Then a link", extra: "a8-l3" }));
+    const outsideFile = join(tmp, "elsewhere.pdf");
+    await fsp.writeFile(outsideFile, await buildPdf({ title: "Elsewhere", extra: "a8-l4" }));
+    const opened = readSpies();
+    await rm(join(inbox, "paper.pdf"));
+    await symlink(outsideFile, join(inbox, "paper.pdf"));
+    await until(() => w.problems({ offset: 0, limit: 10 }).items.some((i) => i.file === "paper.pdf" && i.reason === WATCH_REASONS.outside));
+    await sleep(600);
+    expect(opened(outsideFile)).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  }, 40_000);
+
+  it("a change of time alone writes nothing, and the file is hashed once, not at every rescan", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { ...W3, watchId: wid, rescanMs: 200 });
+    await w.ready;
+    await cameIn(p, wid, events, "touched.pdf", await buildPdf({ title: "Touched", extra: "a8-t1" }));
+    await sleep(300);
+    const writes = await registerWrites(p);
+    const opened = readSpies();
+    const f = join(inbox, "touched.pdf");
+    const later = new Date(Date.now() + 60_000);
+    await utimes(f, later, later);
+    await until(() => opened(f).length > 0);
+    await sleep(2000); // about ten rescans
+    expect(opened(f)).toHaveLength(1); // hashed once
+    expect(await registerWrites(p)).toBe(writes); // no line
+    expect((await regOf(p, wid)).get("touched.pdf")!.state).toBe("in-library");
+    // A second touch: one more hash, still no line.
+    const later2 = new Date(Date.now() + 120_000);
+    await utimes(f, later2, later2);
+    await until(() => opened(f).length > 1);
+    await sleep(1000);
+    expect(opened(f)).toHaveLength(2);
+    expect(await registerWrites(p)).toBe(writes);
+  }, 40_000);
+
+  it("no watch without its register: a watch id that is not an id is refused at once", async () => {
+    const p = await project();
+    const { w, events } = start(p, { ...W3, watchId: "not-an-id" });
+    await w.ready;
+    expect(w.stopped).toBe(true);
+    expect(events[0]).toEqual({ kind: "error", reason: WATCH_REASONS.noWatchId });
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("N4: while the register cannot be saved nothing new comes in; once it can, imports resume and the waiting lines are written once", async () => {
+    const p = await project();
+    const wid = newId();
+    const real = repo.recordWatchedFiles.bind(repo);
+    let fail = true;
+    vi.spyOn(repo, "recordWatchedFiles").mockImplementation(async (...a: Parameters<Repo["recordWatchedFiles"]>) => {
+      if (fail) throw new WatchRegisterUnwritableError();
+      return real(...a);
+    });
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const imported = () => events.filter((e) => e.kind === "imported");
+    await writeFile(join(inbox, "first.pdf"), await buildPdf({ title: "Before the trouble", extra: "n4-1" }));
+    await until(() => imported().length === 1);
+    expect(WATCH_REASONS.registerUnwritable).toBe(
+      "The record of which files in this folder are in the library could not be saved, so nothing new is brought in from this folder until it can be. Nothing in the library has been lost.",
+    );
+    await until(() => w.status().reason === WATCH_REASONS.registerUnwritable);
+    await writeFile(join(inbox, "second.pdf"), await buildPdf({ title: "During the trouble", extra: "n4-2" }));
+    await sleep(1500);
+    expect(imported()).toHaveLength(1);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+    expect(w.status().state).toBe("watching");
+    fail = false;
+    await until(() => imported().length === 2);
+    await untilAsync(async () => (await regOf(p, wid)).size === 2);
+    await until(() => w.status().reason === undefined);
+    const raw = await readFile(join(lib.root, p.folder, "watched", `${wid}.jsonl`), "utf8");
+    expect(raw.split("\n").filter((l) => l.includes('"first.pdf"'))).toHaveLength(1);
+    expect(raw.split("\n").filter((l) => l.includes('"second.pdf"'))).toHaveLength(1);
+  }, 40_000);
+
+  it("N5: two acts at once on a folder no watch runs on take turns: never two calls in flight", async () => {
+    const p = await project();
+    const wf = await addWatchedFolder({ repo, lib }, p.id, inbox);
+    const wid = wf.id;
+    const { w, events } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    const v1 = await buildPdf({ title: "Twice at once", extra: "n5-1" });
+    const sid = await cameIn(p, wid, events, "paper.pdf", v1);
+    await w.stop();
+    const v2 = await buildPdf({ title: "Twice at once, edited", extra: "n5-2" });
+    await writeFile(join(inbox, "paper.pdf"), v2);
+    const e = (await regOf(p, wid)).get("paper.pdf")!;
+    await repo.recordWatchedFiles(p.id, wid, [{ ...e, state: "changed", newSha256: sha256(v2), newSize: v2.length, at: new Date().toISOString() }]);
+    let inFlight = 0;
+    let most = 0;
+    const counted =
+      <A extends unknown[], R>(fn: (...a: A) => Promise<R>) =>
+      async (...a: A): Promise<R> => {
+        most = Math.max(most, ++inFlight);
+        try {
+          return await fn(...a);
+        } finally {
+          inFlight--;
+        }
+      };
+    const actDeps = {
+      repo,
+      http,
+      lib,
+      stabilityMs: 200,
+      fs: { lstat: counted((q: string) => fsp.lstat(q, { bigint: true })), realpath: counted((q: string) => fsp.realpath(q)) },
+    };
+    const results = await Promise.allSettled([bringInNewVersion(actDeps, p.id, wid, "paper.pdf"), bringInNewVersion(actDeps, p.id, wid, "paper.pdf")]);
+    expect(most).toBe(1);
+    expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]); // the second finds it no longer changed
+    expect((await repo.getSource(p.id, sid)).assets.filter((a) => a.role === "original")).toHaveLength(2);
+  }, 40_000);
+
+  it("a register that cannot be read stops imports from that folder and says so", async () => {
+    const p = await project();
+    const wid = newId();
+    await fsp.mkdir(join(lib.root, p.folder, "watched", `${wid}.jsonl`), { recursive: true }); // unreadable as a file
+    await writeFile(join(inbox, "new.pdf"), await buildPdf({ title: "Waits", extra: "a8-u1" }));
+    const opened = readSpies();
+    const { w } = start(p, { ...W3, watchId: wid });
+    await w.ready;
+    expect(WATCH_REASONS.registerUnreadable).toBe(
+      "The record of which files in this folder are already in the library could not be read, so nothing new is brought in from this folder. Nothing in the library has changed.",
+    );
+    await until(() => w.status().reason === WATCH_REASONS.registerUnreadable);
+    await sleep(1000);
+    expect(w.status().state).toBe("watching");
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    expect(opened(join(inbox, "new.pdf"))).toEqual([]);
+    expect(JSON.stringify(w.status())).not.toContain(tmp);
+  }, 30_000);
+});
+
+/** An attach that stores nothing and reads nothing, and answers with well-formed source ids (so the register's lines are written). */
+function realishAttach(): Attach {
+  return {
+    attachFiles: async (_p, ps) => ps.map((path) => ({ path, outcome: "created" as const, sourceId: newId() })),
+  };
+}

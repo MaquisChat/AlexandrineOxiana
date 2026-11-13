@@ -198,7 +198,8 @@ export const ZOTERO_WEB_NOTES = {
   notConfirmed: "This sync could not confirm which items were deleted in Zotero, so the next sync will read the whole library again.",
 } as const;
 
-class ZoteroWebError extends Error {
+/** Package-internal (zotero-web-account.ts). */
+export class ZoteroWebError extends Error {
   constructor(readonly reason: string) {
     super(reason);
   }
@@ -273,7 +274,8 @@ const header = (h: Headers, n: string): string | undefined => {
 };
 
 /** The Web API, with the key, Backoff and retries. Errors are ZoteroWebError with a fixed reason (never the key or the server's text). */
-class ZoteroApi {
+/** Package-internal (zotero-web-account.ts reuses the key handling, Backoff and retries); not exported from the package index. */
+export class ZoteroApi {
   private nextAt = 0;
   /**
    * The library version the scan is reading (from the first page). Later item and collection
@@ -345,7 +347,7 @@ class ZoteroApi {
   }
 
   /** One GET with retries on 429/5xx/network errors. `accept(status)` decides which answers are final. */
-  private async get(url: URL, withKey: boolean, accept: (s: number) => boolean, extra: Record<string, string> = {}): Promise<Dispatcher.ResponseData> {
+  async get(url: URL, withKey: boolean, accept: (s: number) => boolean, extra: Record<string, string> = {}): Promise<Dispatcher.ResponseData> {
     for (let attempt = 0; ; attempt++) {
       if (withKey) await this.waitTurn();
       let res: Dispatcher.ResponseData | undefined;

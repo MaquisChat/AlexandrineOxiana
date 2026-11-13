@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "Alexandrine Oxiana: the desktop shell (starts the library service, shows the interface)"
 edition = "2021"
 publish = false
-license = "UNLICENSED"
+license = "AGPL-3.0-or-later"
 
 [lib]
 name = "ao_desktop"

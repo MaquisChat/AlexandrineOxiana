@@ -36,15 +36,22 @@ export interface SidecarMetadata extends Biblio {
   isbn?: string[];
 }
 
-/** Existing sidecar files for `path` (same folder, same base name), in SIDECAR_EXTS order. */
-export async function findSidecars(path: string): Promise<string[]> {
+/**
+ * Existing sidecar files for `path` (same folder, same base name), in SIDECAR_EXTS order.
+ * `readable` (a watched folder, Task W2): a sidecar is kept only when it answers true — the watch answers
+ * true only for a file whose content is on this computer, so a sidecar that is not downloaded is never
+ * read. Without it, every existing file is kept, as before (drag-and-drop, Bulk Import).
+ */
+export async function findSidecars(path: string, readable?: (p: string) => Promise<boolean>): Promise<string[]> {
   const stem = basename(path, extname(path));
   const out: string[] = [];
   for (const ext of SIDECAR_EXTS) {
     const p = join(dirname(path), stem + ext);
     if (p === path) continue;
     const st = await fsp.stat(p).catch(() => null);
-    if (st?.isFile()) out.push(p);
+    if (!st?.isFile()) continue;
+    if (readable && !(await readable(p).catch(() => false))) continue;
+    out.push(p);
   }
   return out;
 }
