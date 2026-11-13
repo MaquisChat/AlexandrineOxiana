@@ -1,0 +1,282 @@
+# PDF Reader and Highlights Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task.
+
+**Goal:** A researcher opens a source's PDF inside the app, reads it, and makes, recolours, annotates, edits and deletes highlights and page notes, with Zotero's imported highlights shown in place exactly like new ones, in every locked, encrypted and read-only situation.
+**Architecture:** The service gains a ranged, token-authenticated byte route for a stored PDF (decrypting as it streams) and governed, audited, crash-safe annotation routes over the existing per-source `annotations.json(.enc)` (R74). The interface renders with pdf.js's core API (no pdf.js viewer, no PDF link or form layer) fed through a `PDFDataRangeTransport` backed by authenticated `fetch` range requests, and draws highlights as its own overlay from one anchor shape: page, rectangles in PDF user space, quote, sort index. Imported and new annotations go through the same model, the same colour mapping and the same overlay code.
+**Tech Stack:** pdfjs-dist 6.4.299 (Apache-2.0, legacy build, already pinned at `packages/library/package.json:25`), React 19.3.1, Vite 7.3.8, Fastify (existing), zod (existing), Vitest, Playwright (Chromium + WebKit, `e2e/playwright.config.ts:26-29`), pdf-lib (existing fixture builder, `tests/fixtures/generate.mjs:203`).
+**Spec:** docs/handoff/SPEC.md §3.4 Anchor and §3.5 Annotation (lines 125-131); §5 Zotero import of reader annotations (lines 255, 331); §7.1 Phase 3 coding of any anchor (lines 515-521); §8.1 locators carried from annotations (line 535); §8A.1 tokens (lines 564-567), §8A.2 reading-view typeface (line 573), §8A.4 accessibility (lines 581-583); §9 "Originals never modified" (line 589); §11 Phase 3 (line 620).
+
+## Global Constraints
+- R26: every annotation change is one `runMutation` (`packages/library/src/repo/mutate.ts:443`): txn marker, change log, audit event carrying `details.txn`; a crash in between rolls back the whole change.
+- R74 I4 / R77: annotations live in `<source>/annotations.json` (`annotations.json.enc` sealed when encrypted) written only through `writeSourceFile` (`packages/library/src/repo/sources.ts:255`); caps 10,000 per source and 16 MB of quote+body text (`packages/library/src/import/bulk/update.ts:149-150`); a write over a cap is refused whole, never truncated.
+- R96: new routes are UI-token only (`req.caller === "ui"`), loopback, no token or secret in any URL, JSON bodies ≤ 1 MB, errors `{error:{code,message,reason?}}` with no absolute path, mutations through governed library APIs only.
+- R113 / R145: colours from theme tokens only (`lint:css`, `lint:colours`); every quote, note, page label and author through `UserText`; never `innerHTML`; every control keyboard-reachable with a visible focus; any dialog or popover test asserts `document.activeElement` on open, Tab, Shift+Tab and close.
+- R135 / R140: media tickets are NOT used for PDFs (pdf.js can fetch ranges itself, so the token stays in the `Authorization` header); the ticket rules and `media-src` are untouched.
+- R161: no index migration. Annotation text is already indexed per source in chunks (`packages/library/src/index/db.ts:323-345`); each annotation change calls `tx.index((sink) => sink.indexSource(sf))`, which rewrites only changed chunks and keeps the 2 MB per-source index cap.
+- R177: an annotation audit entry holds kinds, counts, field names and ids only; never a quote, a note, a colour value typed by anyone, or a page's text.
+- Originals are never modified: nothing writes into a PDF; the PDF route is read-only and changes nothing.
+- Pinned exactly: `pdfjs-dist` 6.4.299 in both `packages/library` and `packages/ui` (a test keeps them equal); no other new runtime dependency.
+- pdf.js options everywhere in the UI: `isEvalSupported: false`, `enableXfa: false`, `useWasm: false`, `useWorkerFetch: false`, `disableAutoFetch: true`, `disableStream: true`, `rangeChunkSize: 1048576`, `cMapUrl: "/pdfjs/cmaps/"`, `cMapPacked: true`, `standardFontDataUrl: "/pdfjs/standard_fonts/"`, `wasmUrl: "/pdfjs/wasm/"`, `iccUrl: "/pdfjs/iccs/"`; the pdf.js annotation layer (links, forms) is never rendered and the scripting sandbox bundle is never loaded.
+- Addresses carry ids only: `/reader?project=<id>&source=<id>[&asset=<id>][&annotation=<id>]`; search words never go in an address.
+- Wording: plain British English on screen ("colour", "grey"); every string in quotes below is exact; the API field stays `colorName` to match the existing model's `color`.
+- Commits end with the session's own trailers; no model identifiers anywhere else.
+
+## Review Focus
+1. **Re-import from Zotero after the researcher changed an imported highlight** (soon automatic with "Sync with Zotero now", ledger 2026-11-12 23:55): a recolour or a note must survive a re-import, and a deleted one must not come back. Pinned in R2: `planAnnotations keeps a recoloured imported highlight`, `planAnnotations does not re-add a deleted imported highlight`, `annotationHash of an imported annotation is unchanged by the new optional fields`.
+2. **A two-column article**: a mouse selection from the foot of column one to the head of column two must give rectangles on those lines only and the quote in reading order. Pinned in R10: `selectionToPdfRects merges per line and drops the gutter` and e2e `a selection across two columns highlights only the selected lines` (both browsers).
+3. **Overlapping highlights and a highlight across a page break**: both overlapping highlights must stay reachable and editable; a selection from page 4 into page 5 is one annotation with two anchors. Pinned in R10: e2e `two overlapping highlights are both offered where they overlap` and `a selection across a page break makes one highlight on two pages`.
+4. **A 900-page scanned PDF** (no text, hundreds of MB): memory stays bounded, every page says plainly it has no text, and jumping to page 900 works. Pinned in R7: `PdfPages keeps at most 6 pages rendered`, e2e `a 900-page scan opens, jumps to page 900 and says it has no text`.
+5. **The PDF changed on disk after highlights were made** (a linked file edited elsewhere, or a different page count): highlights must not silently mark the wrong words. Pinned in R8: `quoteStillMatches tolerates hyphenation and spacing but not different words`, e2e `a highlight whose text no longer matches says "The text here has changed since this highlight was made."`.
+
+## File Structure
+- `packages/core/src/model/anchor.ts` — modify: pdf anchor gains optional `sortIndex`; documents the coordinate convention (PDF user space, origin bottom-left, unrotated, points).
+- `packages/core/src/model/annotation.ts` — modify: optional `colorName`, `modifiedAt`, `modifiedBy`.
+- `packages/core/src/model/source.ts` — modify: `SourceFile.deletedAnnotationKeys` (optional, ≤ 10,000).
+- `packages/core/src/annotations/highlightColours.ts` — create: the named colour set, nearest-colour mapping of imported values, `highlightColourOf`.
+- `packages/core/src/annotations/sortIndex.ts` — create: Zotero-compatible sort index build, derive and compare.
+- `packages/core/src/annotations/match.ts` — create: word matching of annotations for a search hit.
+- `packages/core/src/index.ts` — modify: export the three modules.
+- `packages/library/src/import/zotero-common.ts`, `zotero-local.ts`, `zotero-web.ts`, `bulk/scan.ts`, `bulk/update.ts`, `bulk/merge.ts` — modify: carry Zotero's sort index; stable hash; honour deleted keys.
+- `packages/library/src/repo/annotations.ts` — create: governed list/create/update/delete of one source's annotations.
+- `packages/library/src/repo/repo.ts`, `packages/library/src/index.ts` — modify: expose them.
+- `packages/library/src/asset-content.ts` — modify: `isPdfMime`.
+- `packages/shared/src/api/annotations.ts`, `packages/shared/src/api/documents.ts` — create: request/response types and limits; `index.ts` exports them.
+- `apps/library-service/src/routes/annotations.ts` — create: the four annotation routes.
+- `apps/library-service/src/routes/documents.ts` — create: the ranged PDF route.
+- `apps/library-service/src/media.ts` — modify: export `sendContent` (already exports `parseRange`, line 264).
+- `apps/library-service/src/errors.ts` — modify: map `AnnotationLimitError`.
+- `apps/library-service/src/server.ts` — modify: register both route modules.
+- `packages/ui/package.json` — modify: add `"pdfjs-dist": "6.4.299"`.
+- `packages/ui/vite.config.ts` — modify: `copyPdfJsAssets()` plugin copying cmaps, standard_fonts, wasm, iccs into `dist/pdfjs/`.
+- `packages/ui/index.html`, `apps/desktop/src-tauri/tauri.conf.json` — modify: `connect-src` gains `'self'` (only change).
+- `packages/ui/src/contentSecurityPolicy.test.ts` — modify: new expected `connect-src`; new test that the two policies are identical.
+- `packages/ui/src/api/client.ts` — modify: `byteRange()`.
+- `packages/ui/src/api/reader.ts` — create: typed calls for the document and annotation routes.
+- `packages/ui/src/reader/pdfjs.ts` — create: the one place pdf.js is loaded and configured.
+- `packages/ui/src/reader/rangeTransport.ts` — create: `PDFDataRangeTransport` over `byteRange()`.
+- `packages/ui/src/reader/geometry.ts` — create: selection rectangles ↔ PDF rectangles, per-line merging.
+- `packages/ui/src/reader/textCheck.ts` — create: does a highlight's quote still match the text under it.
+- `packages/ui/src/reader/keyboardSelection.ts` — create: keyboard text selection over a page's text items.
+- `packages/ui/src/reader/readerHandoff.ts` — create: in-memory hand-over of search words to the reader.
+- `packages/ui/src/reader/PdfPages.tsx`, `HighlightLayer.tsx`, `HighlightToolbar.tsx`, `AnnotationList.tsx`, `Reader.css` — create: pages, overlay, colour toolbar, side list, styles.
+- `packages/ui/src/screens/Reader.tsx` — create: the reader screen and its states.
+- `packages/ui/src/routes/reader.tsx` — create: route, `readerHref`.
+- `packages/ui/src/navigation.tsx`, `App.tsx` — modify: `PATHS.reader`, one route line.
+- `packages/ui/src/components/ReaderLink.tsx` — create; `screens/SourceDetail.tsx` — modify: one line beside `TranscriptLink` (line 422).
+- `packages/ui/src/components/SourceTable.tsx` — modify: "Found in an annotation" becomes a "Show in the reader" button (line 109).
+- `packages/ui/src/theme/tokens.css` — modify: `--hl-*` tokens in light and dark; regenerated high-contrast blocks.
+- `e2e/fixtures.ts` — modify: content types for `.bcmap`, `.pfb`, `.icc`.
+- `tests/fixtures/generate.mjs` — modify: `buildTwoColumnPdf`, `buildScanPdf(pages)`, `buildRotatedCropPdf`, `buildMultiPagePdf(pages)`, `buildDamagedPdf`.
+- `tests/fixtures/pdf/password-protected.pdf` (+ line in `tests/fixtures/ATTRIBUTION.md`) — create: a one-page PDF with user password `ao-fixture` (made once with Ghostscript, committed).
+- `e2e/reader.spec.ts`, `e2e/reader-highlights.spec.ts`, `e2e/reader-search.spec.ts` — create.
+
+### Task R1: Anchor, annotation and colour model
+**Depends:** none **Can run beside:** R5
+**Files:** Modify: `packages/core/src/model/anchor.ts`, `annotation.ts`, `source.ts`, `packages/core/src/index.ts` / Create: `packages/core/src/annotations/highlightColours.ts`, `sortIndex.ts`, `match.ts` / Test: `packages/core/src/annotations/annotations.test.ts`, `packages/core/src/model/model.test.ts`
+**Interfaces:** Consumes: `Anchor` (`anchor.ts:21`), `Annotation` (`annotation.ts:5`). · Produces: pdf anchor field `sortIndex?: string` matching `/^\d{5}\|\d{6}\|\d{5}$/`; `Annotation.colorName?: HighlightColourName`, `Annotation.modifiedAt?: Timestamp`, `Annotation.modifiedBy?: string`; `SourceFile.deletedAnnotationKeys?: string[]` (each ≤ 256, ≤ 10,000); `HIGHLIGHT_COLOURS: readonly ["yellow","red","green","blue","purple","magenta","orange","grey"]`; `type HighlightColourName`; `HIGHLIGHT_COLOUR_LABELS: Record<HighlightColourName,string>` ("Yellow" … "Grey"); `ZOTERO_REFERENCE_COLOURS: Record<HighlightColourName,string>` (#ffd400, #ff6666, #5fb236, #2ea8e5, #a28ae5, #e56eee, #f19837, #aaaaaa); `nearestHighlightColour(hex: string): HighlightColourName`; `highlightColourOf(a: Pick<Annotation,"colorName"|"color">): HighlightColourName`; `pdfSortIndex(pageIndex: number, charOffset: number, top: number): string`; `derivedSortIndex(anchor: PdfAnchor): string`; `annotationSortKey(a: Annotation): string`; `matchAnnotations(list: readonly Pick<Annotation,"id"|"quote"|"body">[], words: string): string[]`.
+**Accept:**
+1. An existing stored annotation and anchor (fixtures from `model.test.ts:203`) still parse unchanged; the new fields are optional.
+2. `nearestHighlightColour` returns the exact name for each Zotero reference value, the nearest by CIEDE2000 for any other valid `#rgb`/`#rrggbb`/`#rrggbbaa`, and "yellow" for anything invalid.
+3. `highlightColourOf` prefers `colorName`, then maps `color`, then "yellow"; it never changes the record.
+4. `derivedSortIndex` of an anchor without `sortIndex` is `pdfSortIndex(page-1, 0, floor(top of its highest rect measured from the page top))`; when the page height is unknown it uses `100000 - floor(maxY)` clamped to 5 digits so higher rects sort first; `annotationSortKey` uses the first anchor's stored or derived index, then `createdAt`, then `id`.
+5. `matchAnnotations` folds case, NFKC and diacritics, requires every word of the search in quote+body, treats a word with CJK characters as a substring, and returns ids in sort order.
+**Tests first:** `model.test.ts › "a pdf anchor takes a Zotero sort index and refuses a malformed one"`; `annotations.test.ts › "every Zotero reference colour maps to its own name"`, `"#ffd500 maps to yellow and #000000 to grey"`, `"an invalid colour maps to yellow"`, `"colorName wins over the imported color"`, `"derived sort index orders a higher rect first"`, `"stored sort index wins over the derived one"`, `"matchAnnotations needs every word, folds accents, finds CJK by substring"`. All fail first (modules absent).
+**Verify:** `pnpm --filter @ao/core test && pnpm -r typecheck`
+**Model:** Sonnet · **Review:** that no existing annotation fails to parse; nearest-colour ties are deterministic; the sort index never overflows its digits for page 100,000 or negative coordinates.
+
+### Task R2: Zotero import keeps the sort index; re-import respects the researcher's changes
+**Depends:** R1 **Can run beside:** R3, R5
+**Files:** Modify: `packages/library/src/import/zotero-common.ts` (`ZoteroAnnotationRow` line 142, `anchorOf` line 111, `zoteroAnnotation` line 155), `zotero-local.ts` (SQL lines 370-372), `zotero-web.ts` (`annotationOf` line 603), `bulk/scan.ts` (line 72), `bulk/update.ts` (`toAnnotation` line 124, `planAnnotations` line 188), `bulk/merge.ts` (`annotationHash` line 15) / Test: `zotero-local.test.ts`, `zotero-web.test.ts`, `packages/library/src/import/bulk/annotations-plan.test.ts` (create)
+**Interfaces:** Consumes: R1 `sortIndex`, `colorName`, `deletedAnnotationKeys`. · Produces: `ZoteroAnnotationRow.sortIndex?: string | null`; `ScanAnnotation.anchor` pdf variant `{ kind:"pdf"; page; rects; sortIndex?: string }`; `annotationHash` ignores anchor `id` and `sortIndex`, and appends `colorName` only when present; `planAnnotations` skips keys in `sf.deletedAnnotationKeys`.
+**Accept:**
+1. Today's imported anchors already render: `page = position.pageIndex + 1` and rects `{x,y,w,h}` in PDF user space with `y` the lower edge (`zotero-common.ts:85-87,133`); nothing is migrated or rewritten.
+2. A fresh import stores Zotero's `sortIndex` on the pdf anchor when it matches the format; a malformed one is dropped silently.
+3. The hash of every annotation imported before this task is unchanged (so a re-import does not count it as "edited here" or update it).
+4. A re-import leaves an imported highlight that was recoloured here (`colorName` set) or given a note here as it is, and reports it as kept (existing R75 path).
+5. A re-import does not re-add an imported annotation whose key is in `deletedAnnotationKeys`; the batch report gains a line beside the sources' one (`bulk/report.ts:87`): "- Annotations deleted here — not re-imported: N".
+**Tests first:** `zotero-local.test.ts › "the fixture's highlight keeps sort index 00000|000100|00200"`; `zotero-web.test.ts › "annotationSortIndex is carried"`; `annotations-plan.test.ts › "annotationHash of an imported annotation is unchanged by the new optional fields"`, `"planAnnotations keeps a recoloured imported highlight"`, `"planAnnotations does not re-add a deleted imported highlight"`, `"an annotation hashed before this change is still unedited"` (a frozen hash from today's code). All but the last fail first.
+**Verify:** `pnpm --filter @ao/library test -- zotero annotations-plan merge && pnpm -r typecheck`
+**Model:** Sonnet · **Review:** compute today's hash for a stored fixture and prove it unchanged; probe a re-import where Zotero changed the text AND the researcher recoloured.
+
+### Task R3: Governed annotation operations in the library
+**Depends:** R1 **Can run beside:** R2, R5
+**Files:** Create: `packages/library/src/repo/annotations.ts` / Modify: `repo/repo.ts`, `packages/library/src/index.ts`, `asset-content.ts` / Test: `packages/library/src/repo/annotations.test.ts`
+**Interfaces:** Consumes: `runMutation`, `storeRequest` (`sources.ts:107`), `readSourceFile` (`sources.ts:146`), `writeSourceFile` (`sources.ts:255`), `capAnnotations` limits, R1 types. · Produces: `AnnotationDraft = { kind: "highlight" | "note"; assetId: string; anchors: Array<{ page: number; rects: Array<{x:number;y:number;w:number;h:number}>; sortIndex?: string }>; quote?: string; body?: string; colorName: HighlightColourName; pageLabel?: string }`; `AnnotationPatch = { body?: string | null; colorName?: HighlightColourName }`; `listAnnotations(core, projectId, sourceId): Promise<Annotation[]>`; `createAnnotation(core, projectId, sourceId, draft: AnnotationDraft): Promise<Annotation>`; `updateAnnotation(core, projectId, sourceId, annotationId: string, patch: AnnotationPatch): Promise<Annotation>`; `deleteAnnotation(core, projectId, sourceId, annotationId: string): Promise<{ id: string; external: boolean }>`; same four as `Repo` methods; `class AnnotationLimitError { kind: "count" | "text" }`; ops `ANNOTATION_CREATE_OP = "annotation.create"`, `ANNOTATION_UPDATE_OP = "annotation.update"`, `ANNOTATION_DELETE_OP = "annotation.delete"`; policy: create/update `storeRequest(source.provenance)`, delete `{ action: "delete" }`; `isPdfMime(mime: string): boolean` (`application/pdf` only).
+**Accept:**
+1. Each operation is one governed change (R26): read again inside the change, `writeSourceFile`, `tx.record("annotation", id, before, after)`, `tx.index(sink.indexSource(sf))`; the source record itself is not edited.
+2. Create checks: the asset is a live (not destroyed) asset of this source with a PDF type; 1 to 50 anchors on distinct pages 1-100,000, 1 to 1,000 rects each, finite, `w,h ≥ 0`, `|v| ≤ 1e6`; quote and note ≤ 65,536 characters; a note needs a non-blank body ("Write the note first."); ids, `author` (the actor) and `createdAt` are set by the library; anchors are stored in page order.
+3. At 10,000 annotations a create throws `AnnotationLimitError("count")`; past 16 MB of text a create or a longer note throws `AnnotationLimitError("text")`; nothing is written either way.
+4. Update sets `modifiedAt`/`modifiedBy`; `body: null` removes the note; any kind may be updated, including imported ones.
+5. Delete removes the annotation; if it has an `externalKey`, the key is appended to `deletedAnnotationKeys` (oldest dropped past 10,000) in the same change.
+6. Audit details are exactly `{ annotation, kind, anchorCount, hasNote }` (create), `{ annotation, kind, changed: ("body"|"colorName")[] }` (update), `{ annotation, kind, external }` (delete), entity `{ type: "source", id: sourceId }`: no text, in encrypted projects too.
+7. Read-only library → `ReadOnlyLibraryError`; locked project → `ProjectLockedError` before anything is read; a policy refusal is audited and nothing changes; unknown annotation → `NotFoundError`.
+**Tests first:** `annotations.test.ts › "create writes annotations.json once and audits ids and counts only"`, `"a crash after the annotations file and before the audit rolls the whole change back"` (using `pauseBetweenSourceFilesForTests`, `sources.ts:244`), `"the 10,001st annotation is refused and nothing is written"`, `"a note that would pass 16 MB of text is refused"`, `"an encrypted project's audit line holds no quote or note"`, `"deleting an imported highlight records its key"`, `"a locked project is refused before reading"`, `"a read-only library is refused"`, `"an asset that is not a PDF is refused"`, `"two updates at once both land, the second on the first"`, `"the search index finds a new note's word"`. All fail first.
+**Verify:** `pnpm --filter @ao/library test -- annotations && pnpm -r typecheck`
+**Model:** Opus · **Review:** crash at every `maybeCrash` point; audit text leakage (grep the audit file for the quote); cap arithmetic on update; tombstone growth; that reading through `readSourceFile` is used, never `getSourceRecord` (R186).
+
+### Task R4: Annotation routes in the service
+**Depends:** R3 **Can run beside:** R6
+**Files:** Create: `apps/library-service/src/routes/annotations.ts`, `packages/shared/src/api/annotations.ts` / Modify: `server.ts`, `errors.ts`, `packages/shared/src/api/index.ts`, `boundary.test.ts` / Test: `apps/library-service/src/annotations-routes.test.ts`, `packages/library/src/repo/annotations-shared.test.ts`
+**Interfaces:** Consumes: R3 repo methods. · Produces: shared `HIGHLIGHT_COLOUR_NAMES` (equal to core's `HIGHLIGHT_COLOURS`, tested in the library package, which sees both), `ANNOTATION_NOTE_MAX_CHARS = 65536`, `ANNOTATION_QUOTE_MAX_CHARS = 65536`, `ANNOTATION_ANCHORS_MAX = 50`, `ANNOTATION_RECTS_MAX = 1000`, `SOURCE_ANNOTATIONS_MAX = 10000`, `SOURCE_ANNOTATION_TEXT_MAX = 16777216`; `PdfRectDto {x,y,w,h}`; `PdfAnchorRecord { id; assetId; page; rects: PdfRectDto[]; sortIndex: string; sortIndexDerived: boolean }`; `AnnotationRecord { id; sourceId; kind; pdfAnchors: PdfAnchorRecord[]; otherAnchorKinds: string[]; quote?; body?; colorName: HighlightColourName; importedColour?: string; imported: boolean; pageLabel?; author; createdAt; modifiedAt? }`; `AnnotationListResponse { annotations: AnnotationRecord[]; count: number; textChars: number }`; `AnnotationCreateRequest { kind: "highlight"|"note"; assetId; anchors: Array<{page; rects: PdfRectDto[]; sortIndex?}>; quote?; body?; colorName; pageLabel? }`; `AnnotationUpdateRequest { body?: string | null; colorName?: HighlightColourName }`; `AnnotationDeleteResponse { deleted: true; id: string }`. Routes: `GET /projects/:id/sources/:sid/annotations` → `AnnotationListResponse` (sorted by `annotationSortKey`); `POST …/annotations` → 201 `AnnotationRecord`; `PATCH …/annotations/:anid` → `AnnotationRecord`; `DELETE …/annotations/:anid` → `AnnotationDeleteResponse`.
+**Accept:**
+1. Only the UI token; the extension token gets 403 "Only the desktop app can do this." Mutations call `state.requireWritable()` first.
+2. Errors: read-only 409 READ_ONLY "This library is open read-only, so nothing can be changed."; locked 423 PROJECT_LOCKED; policy 403 POLICY_DENIED with its reason; count cap 409 CONFLICT "This source already has 10,000 annotations, the most one source can hold. Delete some to add more."; text cap 413 PAYLOAD_TOO_LARGE "This source's annotations would pass 16 MB of text, the most one source can hold."; bad shapes 400 VALIDATION naming the field; unknown 404.
+3. `importedColour` is the stored `color` only when the annotation is imported and it differs from the named colour's reference value; `colorName` is always `highlightColourOf`.
+4. The request logger never logs a body (existing redaction holds; tested with a note containing "secret-note-text").
+**Tests first:** `annotations-routes.test.ts › "list, create, recolour, add a note, delete: each audited once"`, `"the extension token is refused"`, `"read-only library answers READ_ONLY in plain words"`, `"locked project answers 423"`, `"the count cap answers 409 with the sentence"`, `"a body over 1 MB is refused"`, `"an imported Zotero highlight lists with colorName and importedColour"`, `"no log line contains the note"`; `annotations-shared.test.ts › "shared colour names equal the model's"`. All fail first.
+**Verify:** `pnpm --filter @ao/library-service test -- annotations && pnpm --filter @ao/shared test && pnpm -r typecheck`
+**Model:** Sonnet · **Review:** route ordering vs `/sources/:sid` routes; error mapping completeness; that the list never returns another source's annotations.
+
+### Task R5: Ranged PDF route and the client's range reader
+**Depends:** none **Can run beside:** R1, R2, R3
+**Files:** Create: `apps/library-service/src/routes/documents.ts`, `packages/shared/src/api/documents.ts` / Modify: `apps/library-service/src/media.ts` (export `sendContent`, line 434), `server.ts`, `packages/library/src/asset-content.ts` (`isPdfMime`, if R3 has not landed it first: the later task rebases), `packages/ui/src/api/client.ts` / Test: `apps/library-service/src/documents-route.test.ts`, `packages/ui/src/api/client.test.ts`
+**Interfaces:** Consumes: `openAssetContent` (`asset-content.ts:56`), `parseRange` (`media.ts:264`). · Produces: `DOCUMENT_RANGE_MAX_BYTES = 4194304`; `READER_PDF_MAX_BYTES = 536870912`; route `GET /projects/:id/sources/:sid/assets/:aid/document` with a required `Range: bytes=a-b` → 206, `Content-Range: bytes a-b/total`, `Content-Type: application/pdf`, plus the headers of `contentHeaders` (`media.ts:284`); client `byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>`.
+**Accept:**
+1. Decision 2: an authenticated `fetch` per range with the bearer token in the header, not a media ticket: pdf.js can be given a range transport, so no element needs a credential-free URL, no ticket can leak, and `media-src` stays as R135 set it. Encrypted projects are decrypted by the service chunk by chunk as it streams (`asset-content.ts:81-88`); the page never holds the whole file in JavaScript memory beyond what pdf.js's worker keeps.
+2. No Range header, several ranges or a malformed one → 400 VALIDATION "Ask for a byte range."; a range longer than 4 MiB is shortened to 4 MiB (the `Content-Range` says so); unsatisfiable → 416.
+3. Only assets whose recorded type is `application/pdf`; anything else 400 "This file cannot be shown here."; a destroyed or missing file (linked file gone) 404 "The file of this source is not where it was recorded."; locked 423; a file over 512 MiB answers 413 PAYLOAD_TOO_LARGE "This PDF is larger than 512 MB, too large to open in the app." (decided from the recorded size before reading).
+4. Reading audits nothing and changes nothing (as for pictures, `asset-content.ts:8-9`); works in a read-only library.
+5. `byteRange` refuses a response whose `Content-Range` does not match what was asked, or whose body length differs.
+**Tests first:** `documents-route.test.ts › "serves the first MiB of a stored PDF with its total"`, `"decrypts a range of an encrypted project's PDF"`, `"a request without Range is refused"`, `"a 10 MiB range is cut to 4 MiB"`, `"a picture asset is refused"`, `"a missing linked file answers 404 in plain words"`, `"the extension token is refused"`, `"a read-only library can read"`, `"a locked project answers 423"`; `client.test.ts › "byteRange sends the token in the header and returns the bytes and total"`, `"byteRange refuses a mismatched Content-Range"`. All fail first.
+**Verify:** `pnpm --filter @ao/library-service test -- documents && pnpm --filter @ao/ui test -- client && pnpm -r typecheck`
+**Model:** Sonnet · **Review:** a range at the very end of an encrypted file (chunk boundary); a symlink swapped in (existing `O_NOFOLLOW`); that `If-Range` cannot unlock a full-file stream.
+
+### Task R6: pdf.js in the interface, bundled, under the policy
+**Depends:** R5 **Can run beside:** R4, R2
+**Files:** Modify: `packages/ui/package.json`, `vite.config.ts`, `index.html`, `apps/desktop/src-tauri/tauri.conf.json` (line 14), `contentSecurityPolicy.test.ts`, `serviceConnection.test.ts` (line 36), `e2e/fixtures.ts` (content types, line ~120), `tests/fixtures/generate.mjs` / Create: `packages/ui/src/reader/pdfjs.ts`, `reader/rangeTransport.ts`, `packages/ui/src/api/reader.ts`, `tests/fixtures/pdf/password-protected.pdf` / Test: `packages/ui/src/reader/pdfjs.test.ts`, `reader/rangeTransport.test.ts`, `packages/ui/src/pdfjsBundle.test.ts`, `e2e/reader.spec.ts` (first scenario)
+**Interfaces:** Consumes: `byteRange` (R5). · Produces: `readerApi(client: ApiClient): ReaderApi` with `documentRange(projectId, sourceId, assetId, start, end, signal?)`, `listAnnotations(projectId, sourceId)`, `createAnnotation(projectId, sourceId, req: AnnotationCreateRequest)`, `updateAnnotation(projectId, sourceId, id, req: AnnotationUpdateRequest)`, `deleteAnnotation(projectId, sourceId, id)`; `createRangeTransport(first: { bytes: Uint8Array; total: number }, fetchRange: (start: number, end: number) => Promise<Uint8Array>): PDFDataRangeTransport`; `openPdf(opts: { transport: PDFDataRangeTransport; password?: string; signal: AbortSignal }): Promise<PdfHandle>`; `PdfHandle { doc: PDFDocumentProxy; pageCount: number; pageLabels: string[] | null; destroy(): Promise<void> }`; `PdfOpenError { kind: "password-needed" | "password-wrong" | "damaged" | "too-large" | "missing" | "locked" | "other" }`; fixtures `buildTwoColumnPdf()`, `buildScanPdf(pages)`, `buildRotatedCropPdf()`, `buildMultiPagePdf(pages)`, `buildDamagedPdf()`.
+**Accept:**
+1. `pdfjs-dist` 6.4.299 exactly in `packages/ui`; the legacy build (`pdfjs-dist/legacy/build/pdf.mjs` and its `pdf.worker.min.mjs`, loaded with Vite's `?url`) so the macOS 15 WebKit (`tauri.macos.conf.json:7`) is covered.
+2. `copyPdfJsAssets()` copies `cmaps/`, `standard_fonts/`, `wasm/` (only the `*_nowasm_fallback.js` files and licences), `iccs/` from the pinned package into `dist/pdfjs/`; the built app requests nothing outside its own origin and the service.
+3. The one policy change, made identically in both places: `connect-src 'self' http://127.0.0.1:* http://localhost:*` — because pdf.js (with `useWorkerFetch: false`) reads its bundled character maps, standard fonts, ICC profile and image-decoder fallbacks with `fetch` from the app's own origin, which `connect-src` refuses today. Not needed and not added: `worker-src` (falls back to `script-src 'self'`, which allows the bundled worker), `'wasm-unsafe-eval'` (`useWasm: false` uses the JavaScript fallbacks, loaded by `import()` under `script-src 'self'`), `'unsafe-eval'` (`isEvalSupported: false`), `font-src` changes (pdf.js builds fonts with the `FontFace` API from bytes). A new test asserts the two policies are character-for-character identical (none exists today).
+4. `openPdf` maps pdf.js `PasswordException` to `password-needed`/`password-wrong`, `InvalidPDFException` to `damaged`, and the service's 413/404/423 to `too-large`/`missing`/`locked`; `destroy()` frees the worker's copy of the bytes.
+5. E2E (Chromium and WebKit): the built app opens the fixture PDF through the service with no `securitypolicyviolation` event and no request to any other host.
+6. The About screen's third-party notices list pdf.js (Apache-2.0) and the licences of its bundled character maps, standard fonts and colour profiles, each text verbatim, through the mechanism the notices already use (ledger R165); a test fails if `dist/pdfjs/` holds a licensed asset whose notice is missing.
+**Tests first:** `contentSecurityPolicy.test.ts › "connect-src: exactly 'self' http://127.0.0.1:* http://localhost:*"`, `"index.html and tauri.conf.json carry the same policy"`; `pdfjsBundle.test.ts › "ui and library pin the same pdfjs-dist"`, `"the build has cmaps, standard fonts and the fallbacks under dist/pdfjs"`; `rangeTransport.test.ts › "requestDataRange answers with the bytes fetched for that range"`, `"an aborted signal stops further ranges"`; `pdfjs.test.ts › "every option is set as the plan lists"`; `e2e/reader.spec.ts › "a PDF loads under the app's policy with nothing fetched from elsewhere"`. All fail first.
+**Verify:** `pnpm --filter @ao/ui test && pnpm --filter @ao/ui run build && pnpm e2e -- e2e/reader.spec.ts --trace off`
+**Model:** Opus · **Review:** read pdf.js 6.4.299's source for any `fetch`, `new Function`, `eval`, `innerHTML` or external URL reachable with these options; that `connect-src 'self'` adds no reach beyond the app's own files.
+
+### Task R7: The reader screen: open, page, zoom, rotate, and every state
+**Depends:** R6 **Can run beside:** R4
+**Files:** Create: `packages/ui/src/screens/Reader.tsx`, `reader/PdfPages.tsx`, `reader/Reader.css`, `routes/reader.tsx`, `components/ReaderLink.tsx` / Modify: `navigation.tsx` (`PATHS.reader = "/reader"`), `App.tsx` (one route line), `screens/SourceDetail.tsx` (one line at 422) / Test: `screens/Reader.test.tsx`, `reader/PdfPages.test.tsx`, `routes/reader.test.tsx`, `e2e/reader.spec.ts`
+**Interfaces:** Consumes: R6 `readerApi`, `openPdf`. · Produces: `isReaderPath(path: string): boolean`; `readerHref(projectId: string, sourceId: string, opts?: { assetId?: string; annotationId?: string }): string`; `ReaderRoute({ client, loc })`; `ReaderScreen(props: { api: ReaderApi; projectId: string; sourceId: string; assetId?: string; annotationId?: string; readOnly: boolean })`; `PdfPages(props: { handle: PdfHandle; scale: number; rotation: 0|90|180|270; currentPage: number; onPageChange(n: number): void; renderOverlay(pageIndex: number, viewport: PageViewport): ReactNode })`; `ReaderLink({ projectId, sourceId, assets })`; `isReadablePdf(a: LinkAsset): boolean`.
+**Accept:**
+1. SourceDetail shows "Read the PDF" for a source with a live original PDF asset; with several PDFs the reader opens the first and offers a "File" choice listing them by file name.
+2. Toolbar: "Previous page", "Next page", a "Page" number field with "of N" (and the printed label in brackets when it differs, e.g. "Page 7 of 120 (vii)"), "Zoom out", "Zoom in", "Fit width", a zoom value "100%", "Rotate view"; keys on the page area: PageDown/PageUp, Home/End, "+" and "-"; zoom 50%-400%; rotation is a view setting only.
+3. Pages are drawn lazily: placeholders sized from page 1 until a page's own size is known; at most 6 pages hold a canvas; canvases are drawn at `devicePixelRatio`; each page is a region labelled "Page 3 of 120".
+4. Each page has pdf.js's `TextLayer` for selection; a page with no text shows "This page has no text to select. It is probably a scanned image; you can still add a note to it." (no broken selection).
+5. States, each a heading and a sentence, the screen otherwise empty: locked "This project is locked. Unlock it in the library to read its files."; missing "The file of this source is not where it was recorded, so it cannot be shown." with the source's availability; damaged "This PDF is damaged and cannot be shown. The file itself has not been changed."; too large "This PDF is larger than 512 MB, too large to open in the app."; password "This PDF is protected by a password. Enter it to read it here." with a "Password" field and "Open" (the password is used in memory only, never sent to the service or stored); wrong password "That password did not open this PDF."
+6. Read-only library: a notice "This library is open read-only: you can read and see annotations, but not change them." and no making or changing control is enabled.
+7. Any 423 while open destroys the document and shows the locked state; leaving the screen destroys it too.
+8. E2E in Chromium and WebKit for each of 2-7, including an unlocked encrypted project and a linked PDF outside the library.
+**Tests first:** `PdfPages.test.tsx › "PdfPages keeps at most 6 pages rendered"`; `Reader.test.tsx › "each open error shows its sentence"`, `"the password is never sent to the service"` (msw records every request), `"a 423 during reading destroys the document"`, `"read-only shows the notice and no making control"`; `routes/reader.test.tsx › "readerHref carries ids only"`; `e2e/reader.spec.ts › "an encrypted project's PDF opens, pages and zooms"`, `"a 900-page scan opens, jumps to page 900 and says it has no text"`, `"a damaged PDF says so"`, `"a password-protected PDF opens with its password"`, `"a missing linked file says so"`, `"a read-only library shows the PDF and the notice"`, `"Page Down moves to the next page"`. All fail first.
+**Verify:** `pnpm --filter @ao/ui test && pnpm --filter @ao/ui run lint:css && pnpm --filter @ao/ui run lint:colours && pnpm --filter @ao/ui run build && pnpm e2e -- e2e/reader.spec.ts --trace off`
+**Model:** Opus · **Review:** memory with a 900-page file (count canvases, check `page.cleanup()`); focus after page jumps; that pdf.js's text layer writes only `textContent`; that no state leaks the password into React state that outlives the screen.
+
+### Task R8: Highlights drawn in place, imported and new alike
+**Depends:** R7, R4 **Can run beside:** none
+**Files:** Create: `packages/ui/src/reader/HighlightLayer.tsx`, `reader/geometry.ts`, `reader/textCheck.ts` / Modify: `theme/tokens.css` (then `pnpm --filter @ao/ui gen:tokens`), `Reader.css`, `screens/Reader.tsx` / Test: `reader/geometry.test.ts`, `reader/textCheck.test.ts`, `reader/HighlightLayer.test.tsx`, `theme/highlightTokens.test.ts`, `e2e/reader-highlights.spec.ts`
+**Interfaces:** Consumes: `AnnotationRecord` (R4), `highlightColourOf` and labels (R1), `PdfPages.renderOverlay` (R7). · Produces: tokens `--hl-yellow`, `--hl-red`, `--hl-green`, `--hl-blue`, `--hl-purple`, `--hl-magenta`, `--hl-orange`, `--hl-grey`; `pdfRectToBox(rect: PdfRectDto, viewport: PageViewport): Box`; `HighlightLayer(props: { pageIndex: number; viewport: PageViewport; annotations: AnnotationRecord[]; selectedId?: string; onSelect(id: string): void; changed: ReadonlySet<string> })`; `quoteStillMatches(quote: string, textUnderRects: string): boolean`; `textUnderRects(textContent: TextContent, rects: PdfRectDto[]): string`.
+**Accept:**
+1. Every pdf anchor on this asset is drawn from its PDF rects through `viewport.convertToViewportRectangle`, so the same code serves imported and new ones at any zoom, view rotation, `/Rotate` and crop box offset.
+2. Highlight fill is `var(--hl-<name>)` with `mix-blend-mode: multiply`; underline kind is a bottom border; note kind is a note mark; imported image and ink are an outlined box; the class carries the colour, never a style colour.
+3. The page overlay is `aria-hidden`; the list (R9) is the accessible route. Clicking a highlight selects it in the list.
+4. Each `--hl-*` token, blended at its alpha over white, keeps the page's black text at 4.5:1 or more; the tokens are the same in all four themes (the page is paper whatever the theme).
+5. When a highlight's quote no longer matches the text under its rects (normalised: whitespace, hyphenation at line ends, ligatures, case), its list entry says "The text here has changed since this highlight was made." and the highlight is drawn dashed; an anchor on a page the file does not have says "This highlight is on page 412, which this file does not have."
+6. E2E (both browsers): a Zotero-imported highlight (import fixture, `packages/library/tests/fixtures/zotero/build-fixture.mjs:166`) is drawn over its words at 100% and 200%, and on the rotated, offset-crop fixture.
+**Tests first:** `geometry.test.ts › "an imported rect on a rotated page with an offset crop box lands on its text"`, `"pdfRectToBox is stable across zoom"`; `textCheck.test.ts › "quoteStillMatches tolerates hyphenation and spacing but not different words"`; `highlightTokens.test.ts › "every highlight colour keeps black text at 4.5:1 on white"`, `"highlight tokens exist in all four themes"`; `HighlightLayer.test.tsx › "a highlight carries its colour class and no inline colour"`; `e2e/reader-highlights.spec.ts › "an imported Zotero highlight sits on its words at two zooms"`, `"a highlight whose text no longer matches says so"`. All fail first.
+**Verify:** `pnpm --filter @ao/ui test && pnpm --filter @ao/ui run lint:css && pnpm --filter @ao/ui run lint:colours && pnpm --filter @ao/ui run build && pnpm e2e -- e2e/reader-highlights.spec.ts --trace off`
+**Model:** Opus · **Review:** the y-axis flip and crop-box origin with real Zotero data; a page with 1,000 rects; contrast of grey and purple; that `lint:colours` passes with no exemption added.
+
+### Task R9: The annotation list: jump, note, recolour, delete
+**Depends:** R8 **Can run beside:** R10 (different files; R10 takes Reader.tsx after R9 merges)
+**Files:** Create: `packages/ui/src/reader/AnnotationList.tsx` / Modify: `screens/Reader.tsx`, `Reader.css` / Test: `reader/AnnotationList.test.tsx`, `e2e/reader-highlights.spec.ts`
+**Interfaces:** Consumes: R6 `readerApi`, R8 `changed` set. · Produces: `AnnotationList(props: { annotations: AnnotationRecord[]; assetId: string; selectedId?: string; readOnly: boolean; filterWords?: string; onJump(id: string): void; onSaveNote(id: string, body: string | null): Promise<void>; onRecolour(id: string, colour: HighlightColourName): Promise<void>; onDelete(id: string): Promise<void> })`.
+**Accept:**
+1. A side panel "Annotations (N)" lists this file's annotations in `annotationSortKey` order; each entry: kind ("Highlight", "Underline", "Note", "Area", "Drawing"), colour name ("Yellow"), "Page 7" (or label), the quote and note through `UserText`, "Imported from Zotero" when imported, author when not the researcher. Further groups: "On another file of this source (N)" and "Not placed on a page (N)" (notes without anchors, read only).
+2. Each entry is a list item with buttons "Go to", "Edit note" (or "Add note"), "Colour", "Delete"; Up/Down move between entries; Enter on an entry does "Go to" (scrolls the page, focuses the page region, outlines the highlight).
+3. "Edit note" opens a text area labelled "Note" with "Save note" and "Cancel" (Ctrl/Cmd+Enter saves; no autosave); "Colour" opens a menu of the eight colour names, each with its swatch, current one checked; "Delete" asks "Delete this highlight?" (or "Delete this note?") with "Delete" and "Keep it", focus returning to the next entry.
+4. Each change answers through a polite live region: "Highlight recoloured: Green.", "Note saved.", "Highlight deleted."; refusals show the service's sentence in an alert.
+5. Read-only: only "Go to" is enabled.
+6. E2E (both browsers): recolour an imported Zotero highlight to Green, add a note, delete another — all by keyboard only — and reload: the state persists.
+**Tests first:** `AnnotationList.test.tsx › "entries are in sort order and say colour by name"`, `"the colour menu manages focus"` (R145), `"the delete dialog manages focus and returns it to the next entry"` (R145), `"read-only offers Go to only"`, `"a refusal is shown as an alert"`; `e2e › "an imported highlight is recoloured, noted and kept after a reload, by keyboard"`. All fail first.
+**Verify:** `pnpm --filter @ao/ui test && pnpm --filter @ao/ui run lint:css && pnpm --filter @ao/ui run lint:colours && pnpm --filter @ao/ui run build && pnpm e2e -- e2e/reader-highlights.spec.ts --trace off`
+**Model:** Sonnet · **Review:** VoiceOver-style naming of each button (include the page and colour in its accessible name); a list of 10,000 entries (render windowed past 500); RTL quotes.
+
+### Task R10: Making highlights with the mouse
+**Depends:** R9 **Can run beside:** R12
+**Files:** Create: `packages/ui/src/reader/HighlightToolbar.tsx` / Modify: `reader/geometry.ts`, `screens/Reader.tsx`, `HighlightLayer.tsx` / Test: `reader/geometry.test.ts`, `reader/HighlightToolbar.test.tsx`, `e2e/reader-highlights.spec.ts`
+**Interfaces:** Consumes: R8 geometry, R1 `pdfSortIndex`, R6 `createAnnotation`. · Produces: `selectionToAnchors(range: Range, pages: PageGeometry[]): Array<{ page: number; rects: PdfRectDto[]; sortIndex: string; quote: string }>`; `selectionToPdfRects(clientRects: DOMRectLike[], pageBox: DOMRectLike, viewport: PageViewport): PdfRectDto[]`; `HighlightToolbar(props: { anchorBox: Box; lastColour: HighlightColourName; onHighlight(c: HighlightColourName): void; onCancel(): void })`.
+**Accept:**
+1. A text selection shows a toolbar "Highlight" (last colour used, default Yellow) and the eight colour buttons named "Highlight in Yellow" … "Highlight in Grey", plus "Cancel"; Escape cancels.
+2. Rects are merged per text line, widened by nothing, and limited to the selection; the quote is the selection's text normalised (line-end hyphens joined, whitespace collapsed).
+3. A selection across a page break makes one highlight with one anchor per page; the list shows "Pages 4–5".
+4. Where highlights overlap, a click offers a small menu "2 highlights here" listing each by colour and opening words; both remain editable.
+5. The new highlight appears at once (the service's answer replaces the draft); on a refusal the draft is removed and the sentence shown.
+6. The sort index is `pdfSortIndex(pageIndex, character offset of the selection start in the page's text, distance of the first rect's top from the page top)`; the page label is stored when it differs from the page number.
+**Tests first:** `geometry.test.ts › "selectionToPdfRects merges per line and drops the gutter"`, `"a selection's sort index orders it after an earlier one on the page"`; `HighlightToolbar.test.tsx › "the toolbar is reachable by Tab and closes on Escape"`; `e2e › "a selection across two columns highlights only the selected lines"`, `"a selection across a page break makes one highlight on two pages"`, `"two overlapping highlights are both offered where they overlap"`, `"a new highlight survives a reload at another zoom"`. All fail first.
+**Verify:** `pnpm --filter @ao/ui test && pnpm --filter @ao/ui run build && pnpm e2e -- e2e/reader-highlights.spec.ts --trace off`
+**Model:** Opus · **Review:** WebKit's `getClientRects` on transformed text-layer spans; selection that starts in the gap between pages; a 200-page selection hitting the 50-anchor limit (message "A highlight can cover at most 50 pages.").
+
+### Task R11: Highlights and page notes without a mouse
+**Depends:** R10 **Can run beside:** R12
+**Files:** Create: `packages/ui/src/reader/keyboardSelection.ts` / Modify: `screens/Reader.tsx`, `reader/PdfPages.tsx`, `Reader.css` / Test: `reader/keyboardSelection.test.ts`, `screens/Reader.test.tsx`, `e2e/reader-highlights.spec.ts`
+**Interfaces:** Consumes: R10 `selectionToAnchors`, `HighlightToolbar`. · Produces: `createKeyboardSelection(items: TextItemRef[]): KeyboardSelection` with `start(at: "first-visible-word")`, `extend(by: "word" | "line", dir: 1 | -1)`, `range(): Range | null`, `text(): string`, `cancel()`.
+**Accept:**
+1. With the page area focused, "Select text" (button, or key S) starts a selection at the first word visible on the current page; Shift+Arrow Right/Left extend by a word, Shift+Arrow Down/Up by a line, across into the next page; the live region reads "Selected: <first 200 characters>"; Enter opens the colour toolbar; Escape ends.
+2. "Add a note to this page" (button, or key N) opens the "Note" text area with "Save note"; the note is placed at the top left of the page's visible part (keyboard) or where the researcher then clicks (mouse, after choosing "Place by clicking"); it lists as a "Note" on that page.
+3. On a page without text, "Select text" is disabled with its reason "This page has no text to select."
+4. Stated limit, shown in the reader's "Keyboard help": "Text is selected in the order the PDF stores it, which for some two-column or unusual layouts is not the reading order."
+5. E2E (both browsers): a highlight and a page note made with the keyboard alone.
+**Tests first:** `keyboardSelection.test.ts › "extends by word and by line, across a page"`, `"never selects past the document's end"`; `Reader.test.tsx › "Select text is disabled on a page with no text, with its reason"`; `e2e › "a highlight and a page note made by keyboard alone"`. All fail first.
+**Verify:** `pnpm --filter @ao/ui test && pnpm --filter @ao/ui run build && pnpm e2e -- e2e/reader-highlights.spec.ts --trace off`
+**Model:** Opus · **Review:** single-letter keys never fire inside the note field or the page-number field; screen-reader announcement frequency (debounced to one per 500 ms).
+
+### Task R12: From a search hit to the annotation
+**Depends:** R9 **Can run beside:** R10, R11
+**Files:** Create: `packages/ui/src/reader/readerHandoff.ts` / Modify: `components/SourceTable.tsx` (line 109), `screens/Library.tsx`, `screens/Reader.tsx`, `reader/AnnotationList.tsx` / Test: `reader/readerHandoff.test.ts`, `components/SourceTable` test in `screens/Library.test.tsx`, `e2e/reader-search.spec.ts`
+**Interfaces:** Consumes: R1 `matchAnnotations`, R7 `readerHref`, R9 `filterWords`. · Produces: `setPendingFind(projectId: string, sourceId: string, words: string): void`; `takePendingFind(projectId: string, sourceId: string): string | undefined` (once, then cleared; expires after 60 s).
+**Accept:**
+1. Decision: no index migration (R161 untouched). A hit "Found in an annotation" gets a button "Show in the reader"; it hands the search words over in memory (never in the address) and opens `readerHref(projectId, sourceId)`.
+2. The reader filters its list with `matchAnnotations`, opens the asset of the first match, jumps to it and focuses its entry; the list header reads "Annotations matching your search (N)" with "Show all".
+3. When nothing matches exactly: "None of this source's annotations contains all of these words exactly; the search may have matched another form of a word." and the full list.
+4. `readerHref(..., { annotationId })` opens at that annotation directly (for later citation and coding links).
+**Tests first:** `readerHandoff.test.ts › "words are taken once and never put in the address"`; `Library.test.tsx › "an annotation hit offers Show in the reader"`; `e2e/reader-search.spec.ts › "a search for a word of an imported note opens the reader at that note"` (both browsers). All fail first.
+**Verify:** `pnpm --filter @ao/ui test && pnpm --filter @ao/ui run build && pnpm e2e -- e2e/reader-search.spec.ts --trace off`
+**Model:** Sonnet · **Review:** encrypted projects (words held only in memory; cleared on lock); CJK queries.
+
+### Task R13 (optional): Area highlights
+**Depends:** R11 **Can run beside:** none
+**Files:** Modify: `packages/library/src/repo/annotations.ts` (accept `kind: "image"`), `packages/shared/src/api/annotations.ts`, `screens/Reader.tsx`, `HighlightLayer.tsx` / Test: `annotations.test.ts`, `e2e/reader-highlights.spec.ts`
+**Interfaces:** Consumes: everything above; the model already has `kind: "image"` with a pdf anchor (`annotation.ts:12`, imported Zotero image annotations). · Produces: `AnnotationCreateRequest.kind` gains `"image"` (one anchor, one rect, no quote).
+**Accept:** "Mark an area" then drag (mouse), or arrow keys to move and Shift+arrows to resize a box with Enter to finish (keyboard); listed as "Area"; recolour, note and delete as for highlights; the picture of the area is not extracted (later plan).
+**Tests first:** `annotations.test.ts › "an area takes exactly one rect and no quote"`; `e2e › "an area marked by keyboard alone"`. Both fail first.
+**Verify:** as R11, plus `pnpm --filter @ao/library test -- annotations`
+**Model:** Sonnet · **Review:** a zero-size area; an area on a rotated view.
+
+## Rulings the coordinator must make before work starts
+**Settled by the coordinator on 2026-11-13 (ledger, Ruling R192):** 1 — reuse `store` and `delete`, with their own audit operation names. 2 — add `'self'` to `connect-src`, nothing else. 3 — yes to both. 4 — 512 MiB (not 1 GiB), revisited after the owner's check on the Mac. 5 — explicit "Save note". 6 — matching, no index migration. Task R13 stays optional and is decided after R11. The questions are kept below for their reasoning.
+
+1. **Policy action for annotation changes: reuse `store` (with the source's provenance, as `updateSource` does, `sources.ts:667-669`) and `delete`, or add a new `annotate` action?** Recommended: reuse. Annotations are new data stored with that source and should meet exactly its store rules; a new action would be "allow" everywhere today and adds an engine case for nothing. Cost if wrong: a later profile that wants to forbid annotating while allowing storing needs a new action and a migration of no data (one engine case).
+2. **The content-security policy: add `'self'` to `connect-src`, or keep it unchanged by feeding pdf.js its character maps and fonts through a custom `BinaryDataFactory` built into lazily imported script chunks?** Recommended: add `'self'`; it reaches only the app's own bundled files. Cost if wrong: if a reviewer finds the own-origin fetch reach unacceptable, R6 grows by the factory (about a day) and the bundle by 4 MB of encoded data.
+3. **Re-import against the researcher's changes: a recolour (`colorName`) counts as an edit, and a deleted imported highlight is remembered (`deletedAnnotationKeys`) so a re-import never brings it back.** Recommended: yes to both, since "Sync with Zotero now" will re-import on a schedule. Cost if wrong: a researcher who wants a deleted Zotero highlight back must re-create it here (no undo of a deletion in this plan).
+4. **Largest PDF the reader opens: 1 GiB (pdf.js allocates the file's full length in its worker).** Recommended: 1 GiB, revisited after the owner's Mac check. Cost if wrong: an over-large scan makes the web view's content process run out of memory on a small Mac; a smaller limit refuses some scanned books.
+5. **Notes are saved by "Save note", not as one types.** Recommended: explicit save, because every save rewrites the source's whole annotations file (up to 16 MB, sealed when encrypted). Cost if wrong: a note typed and abandoned without saving is lost (the screen asks "Discard this note?" on leaving).
+6. **Search to annotation by matching words in the reader, not by indexing annotation ids.** Recommended: matching (no R161 migration). Cost if wrong: a hit found by stemming or bigrams opens the reader on the whole list with the stated sentence.
+
+## What only the owner can check on a real Mac
+- The pdf.js module worker starts from `tauri://localhost` (otherwise pdf.js silently falls back to the main thread: large files scroll slowly).
+- The bundled `.bcmap`, `.pfb`, `.icc` and `.mjs` files are served by the shell with working types (a Japanese or Chinese PDF shows its text; a PDF using only standard fonts renders without missing glyphs).
+- Text selection with the trackpad, including a two-column article and a selection across a page break; Retina sharpness at 100% and 200%.
+- VoiceOver: reading a page's text, moving through the annotation list, the colour menu and the delete dialog; the "Selected: …" announcements.
+- A 300-500 MB scanned PDF in an encrypted project: opening time, scrolling, memory (Activity Monitor), and that locking the project in the library ends the reader.
+- Highlights imported from the owner's own Zotero library sit on their words, including rotated pages and books scanned with crop boxes.
+- No PDF opens a link, a form or a script, and nothing reaches the network (Little Snitch or the firewall log if available).
+
+## Order of work
+- Start at once, no open ruling needed: **R1** (model) and **R5** (ranged PDF route and `byteRange`) in parallel.
+- After R1: **R2** and **R3** in parallel (R3 needs rulings 1 and 3 settled before its review; R2 needs ruling 3). After R5: **R6** (needs ruling 2 and 4 before dispatch).
+- After R3: **R4**. After R6: **R7**. R4 and R7 can run side by side.
+- After R4 and R7: **R8**, then **R9**; then **R10** and **R12** in parallel; then **R11**; **R13** last and only if the coordinator keeps it.
+- Every UI task's end-to-end check runs in both the `chromium` and `webkit` projects; a WebKit-only failure is a failure.
