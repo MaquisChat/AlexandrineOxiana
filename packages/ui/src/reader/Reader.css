@@ -562,3 +562,85 @@
   color: var(--deny);
   border-color: var(--deny);
 }
+
+/*
+ * Highlights and page notes without a mouse (Task R11, useKeyboardMaking.tsx): the reasons a button
+ * cannot act, the "Keyboard help", the note field placed over the pages, and the wait for a click
+ * ("Place by clicking"), shown on the page area as well as in words.
+ */
+.ao-reader-why {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  color: var(--muted);
+}
+
+.ao-reader-why p {
+  margin: 0;
+}
+
+.ao-reader-help {
+  max-width: 44rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+}
+
+.ao-reader-help h2 {
+  font-size: 1rem;
+  margin: 0 0 var(--space-1);
+}
+
+.ao-reader-help dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.ao-reader-help dt {
+  font-weight: 600;
+}
+
+.ao-reader-help dd {
+  margin: 0;
+}
+
+.ao-reader-note {
+  position: absolute;
+  z-index: 5;
+  top: var(--space-2);
+  left: var(--space-2);
+  width: min(26rem, calc(100% - 2 * var(--space-2)));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+
+.ao-reader-note p {
+  margin: 0;
+}
+
+.ao-reader-note__placing {
+  font-weight: 600;
+}
+
+.ao-reader-note button[aria-pressed="true"] {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ao-reader-area--placing .ao-reader-page {
+  cursor: crosshair;
+}
+
+.ao-reader-area--placing .ao-reader-scroll {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}

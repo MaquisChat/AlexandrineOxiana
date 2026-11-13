@@ -1229,3 +1229,83 @@ test("a highlight made while the list is filtered to a search's words shows in i
   await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
   expect(errors).toEqual([]);
 });
+
+// ---- Task R11: highlights and page notes without a mouse ----
+
+test("a highlight and a page note made by keyboard alone", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "by-keyboard.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "By keyboard" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  await expect(page.locator('[data-page-number="1"] .ao-reader-text-layer > .ao-reader-end-of-content')).toBeAttached();
+  const pages = page.locator(".ao-reader-scroll");
+  // The reader puts the focus on its pages when it opens.
+  await expect(pages).toBeFocused();
+  const selection = () => page.evaluate(() => document.getSelection()?.toString() ?? "");
+
+  // S: the first word visible on page 1; Shift+Right twice; said in the live region.
+  await page.keyboard.press("s");
+  await expect.poll(selection).toBe("Page");
+  await page.keyboard.press("Shift+ArrowRight");
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect.poll(selection).toBe("Page 1 of");
+  await expect(said(page)).toHaveText("Selected: ⁨Page 1 of⁩");
+  // The tint is the browser's own selection, inside page 1's text layer.
+  expect(await page.evaluate(() => !!document.getSelection()?.getRangeAt(0).startContainer.parentElement?.closest('[data-page-number="1"] .ao-reader-text-layer'))).toBe(true);
+  // Enter: R10's toolbar, the focus on "Highlight"; the arrows to Green; Enter.
+  await page.keyboard.press("Enter");
+  await expect(colourBar(page)).toBeVisible();
+  await expect(colourBar(page).getByRole("button", { name: "Highlight", exact: true })).toBeFocused();
+  for (let i = 0; i < 3; i++) await page.keyboard.press("ArrowRight");
+  await expect(colourBar(page).getByRole("button", { name: "Highlight in Green" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(said(page)).toHaveText("Highlight added: Green, page 1.");
+  await expect(colourBar(page)).toHaveCount(0);
+  await expect(pages).toBeFocused();
+  expect(await selection()).toBe("");
+
+  // N: the note field for page 1, placed at the top left of what is shown; Ctrl/Cmd+Enter saves it.
+  await page.keyboard.press("n");
+  const field = page.getByRole("region", { name: "Note on page 1" });
+  await expect(field).toContainText("On page 1, at the top left of what is shown.");
+  await expect(field.getByRole("textbox", { name: "Note" })).toBeFocused();
+  await page.keyboard.type("Typed without a mouse");
+  await page.keyboard.press("ControlOrMeta+Enter");
+  await expect(said(page)).toHaveText("Note added, page 1.");
+  await expect(field).toHaveCount(0);
+  await expect(pages).toBeFocused();
+
+  const all = (await listed(app, projectId, sid)) as Array<Made & { kind: string; body?: string }>;
+  expect(all).toHaveLength(2);
+  const hl = all.find((a) => a.kind === "highlight")!;
+  const note = all.find((a) => a.kind === "note")!;
+  expect(hl.quote).toBe("Page 1 of");
+  expect(hl.colorName).toBe("green");
+  expect(hl.pdfAnchors.map((a) => a.page)).toEqual([1]);
+  expect(hl.pdfAnchors[0]!.sortIndex.startsWith("00000|000000|")).toBe(true);
+  expect(note.body).toBe("Typed without a mouse");
+  expect(note.pdfAnchors.map((a) => a.page)).toEqual([1]);
+  // The view was at the page's top: the note's 22-point square lies at the page's top left, 8 px (6 points) in.
+  const r = note.pdfAnchors[0]!.rects[0]!;
+  const detail = JSON.stringify(r);
+  expect(Math.abs(r.w - 22), detail).toBeLessThan(0.01);
+  expect(Math.abs(r.h - 22), detail).toBeLessThan(0.01);
+  expect(r.x, detail).toBeLessThan(40);
+  expect(r.y + r.h, detail).toBeGreaterThan(842 - 40);
+  expect(note.pdfAnchors[0]!.sortIndex.startsWith("00000|000000|")).toBe(true);
+  // Both are listed and drawn at once.
+  await expect(annotationList(page).locator(`[data-entry="${hl.id}"]`)).toContainText("Page 1 of");
+  await expect(annotationList(page).locator(`[data-entry="${note.id}"]`)).toContainText("Typed without a mouse");
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${note.id}"]`)).toHaveCount(1);
+
+  // Read again: both are still there, drawn on page 1 and listed, the highlight not "changed".
+  await page.reload();
+  await expect(annotationList(page).locator(`[data-entry="${hl.id}"]`)).toContainText("Page 1 of");
+  await expect(annotationList(page).locator(`[data-entry="${note.id}"]`)).toContainText("Typed without a mouse");
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${hl.id}"]`)).toHaveCount(1);
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${note.id}"]`)).toHaveCount(1);
+  await expect(page.getByText(CHANGED)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
