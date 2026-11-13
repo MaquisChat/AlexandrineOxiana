@@ -138,3 +138,4 @@ R213 (2026-11-13): cloud folders W2 after review — fs.watch accepted, chokidar
 R214 (2026-11-13): Zotero Z2 — the key list whole by its own evidence, at any version; a full run without it is not finished and records no version.
 R215 (2026-11-13): Zotero sync — the key list is taken before the downloads; a full run not finished for lack of it says so (carried by Z4).
 R216 (2026-11-13): reader R9 after review — "Discard this note?" stands (R192 e); nothing pressed dropped; annotation groups; the list sorts itself; measured heights; no author for now. D22 opened (importer writes the OS user name as author).
+R217 (2026-11-13): cloud folders W3 after review — the register covers every file the library holds; deleted stays deleted (undo included); watchId required; links never followed; torn line survived; time-only changes write nothing.
