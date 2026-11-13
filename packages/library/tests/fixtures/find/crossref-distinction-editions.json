@@ -1,0 +1,29 @@
+{
+  "status": "ok",
+  "message-type": "work-list",
+  "message": {
+    "total-results": 2,
+    "items": [
+      {
+        "DOI": "10.5555/ao.find.distinction.1984",
+        "type": "book",
+        "title": ["Distinction"],
+        "subtitle": ["A Social Critique of the Judgement of Taste"],
+        "author": [{ "given": "Pierre", "family": "Bourdieu" }],
+        "issued": { "date-parts": [[1984]] },
+        "publisher": "Fixture University Press",
+        "ISBN": ["9780000000002"]
+      },
+      {
+        "DOI": "10.5555/ao.find.distinction.2010",
+        "type": "book",
+        "title": ["Distinction"],
+        "subtitle": ["A Social Critique of the Judgement of Taste"],
+        "author": [{ "given": "Pierre", "family": "Bourdieu" }],
+        "issued": { "date-parts": [[2010]] },
+        "publisher": "Fixture Classics",
+        "ISBN": ["9780000000019"]
+      }
+    ]
+  }
+}

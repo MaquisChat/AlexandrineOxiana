@@ -1,0 +1,25 @@
+{
+  "status": "ok",
+  "message-type": "work-list",
+  "message": {
+    "total-results": 2,
+    "items": [
+      {
+        "DOI": "10.5555/ao.find.distinction.1984",
+        "type": "book",
+        "title": ["Distinction"],
+        "author": [{ "given": "Pierre", "family": "Bourdieu" }],
+        "issued": { "date-parts": [[1984]] },
+        "ISBN": ["9780000000002"]
+      },
+      {
+        "DOI": "10.5555/ao.find.lindqvist.2015",
+        "type": "journal-article",
+        "title": ["Distinction"],
+        "author": [{ "given": "Henrik", "family": "Lindqvist" }],
+        "issued": { "date-parts": [[2015, 2]] },
+        "container-title": ["Journal of Upland Studies"]
+      }
+    ]
+  }
+}

@@ -1,0 +1,998 @@
+import { readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { DEFAULT_GOVERNANCE, type GovernanceConfig } from "@ao/core";
+import { Agent, MockAgent } from "undici";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DEFAULT_CONCURRENCY, HttpClient, LookupHttpError, USER_AGENT } from "../lookup/http.js";
+import type { LookupContext } from "../lookup/context.js";
+import type { WorkCandidate } from "./candidates.js";
+import { parseReference, type Reference } from "./reference.js";
+import {
+  FIND_MAX_CANDIDATES,
+  decideMatch,
+  openAlexSearchPausedUntil,
+  scoreCandidate,
+  searchWorks,
+  type SearchNote,
+} from "./search.js";
+
+const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/find");
+const fixture = (n: string) => readFileSync(join(FIX, n), "utf8");
+const JSON_HEADERS = { headers: { "content-type": "application/json" } };
+const SELECT = "DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN";
+
+const crPath = (text: string) => `/works?query.bibliographic=${encodeURIComponent(text)}&rows=5&select=${SELECT}`;
+const oaPath = (text: string) => `/works?search=${encodeURIComponent(text)}&per-page=5`;
+
+let tmp: string;
+let agent: MockAgent;
+let now: number;
+let sleeps: number[];
+let notes: string[];
+let seen: Array<{ origin: string; path: string; headers: Record<string, string> }>;
+
+const sleep = async (ms: number) => {
+  sleeps.push(ms);
+  now += ms;
+};
+
+function client(extra: Partial<ConstructorParameters<typeof HttpClient>[0]> = {}): HttpClient {
+  return new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: agent, clock: () => now, sleep, env: {}, ...extra });
+}
+
+function policy(providers: string[]): GovernanceConfig {
+  return { ...DEFAULT_GOVERNANCE, processing: { ...DEFAULT_GOVERNANCE.processing, metadata_lookup: providers } };
+}
+
+function ctx(http: HttpClient, providers: string[] | null = ["crossref", "openalex"]): LookupContext {
+  return {
+    http,
+    policy: providers ? policy(providers) : null,
+    projectId: "P1",
+    actor: "tester",
+    clock: () => new Date(now),
+    debug: (n) => notes.push(n),
+    sensitive: false,
+  };
+}
+
+function headersOf(h: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (h instanceof Headers) h.forEach((v, k) => (out[k.toLowerCase()] = v));
+  else if (Array.isArray(h)) for (let i = 0; i + 1 < h.length; i += 2) out[String(h[i]).toLowerCase()] = String(h[i + 1]);
+  else if (h && typeof h === "object") for (const [k, v] of Object.entries(h)) out[k.toLowerCase()] = String(v);
+  return out;
+}
+
+/** Answers `path` on `origin` with `body` and records what was sent. */
+function answer(origin: string, path: string, body: string, status = 200, headers: Record<string, string> = {}) {
+  agent
+    .get(origin)
+    .intercept({ path, method: "GET" })
+    .reply((opts) => {
+      seen.push({ origin, path: opts.path, headers: headersOf(opts.headers) });
+      return { statusCode: status, data: body, responseOptions: { headers: { "content-type": "application/json", ...headers } } };
+    });
+}
+const crossref = (text: string, file: string) => answer("https://api.crossref.org", crPath(text), fixture(file));
+const openalex = (text: string, file: string) => answer("https://api.openalex.org", oaPath(text), fixture(file));
+
+function ref(line: string): Reference {
+  const r = parseReference(line);
+  if (!r) throw new Error(`not a reference: ${line}`);
+  return r;
+}
+
+async function search(line: string, c: LookupContext, sources: ("crossref" | "openalex")[] = ["crossref", "openalex"]) {
+  return searchWorks(ref(line), c, { sources });
+}
+
+function cand(over: Partial<WorkCandidate> & { title: string }): WorkCandidate {
+  return {
+    id: over.id ?? `w-${over.title}`,
+    creators: [{ given: "Pierre", family: "Bourdieu", role: "author" }],
+    issued: "1984",
+    type: "book",
+    identifiers: {},
+    providers: ["crossref"],
+    ...over,
+  };
+}
+
+beforeEach(async () => {
+  tmp = await mkdtemp(join(tmpdir(), "ao-find-search-"));
+  agent = new MockAgent();
+  agent.disableNetConnect();
+  now = Date.parse("2026-11-13T10:00:00Z");
+  sleeps = [];
+  notes = [];
+  seen = [];
+});
+
+afterEach(async () => {
+  await agent.close();
+  await rm(tmp, { recursive: true, force: true });
+});
+
+describe("searchWorks and decideMatch (the confidence rule)", () => {
+  it("Bourdieu, Distinction asks, with the one book first (one main-title word and no year)", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction.json");
+    openalex("Bourdieu, Distinction", "openalex-distinction.json");
+    const r = ref("Bourdieu, Distinction");
+    const { candidates, notes: n } = await searchWorks(r, ctx(client()), { sources: ["crossref", "openalex"] });
+    expect(n).toEqual([]);
+    agent.assertNoPendingInterceptors();
+    // The book came from both services (one in upper case): one candidate, both providers, first.
+    const book = candidates[0]!;
+    expect(book.title).toBe("Distinction: A Social Critique of the Judgement of Taste");
+    expect(book.identifiers).toEqual({ doi: "10.5555/ao.find.distinction.1984", isbn: ["9780000000002"] });
+    expect(book.providers).toEqual(["crossref", "openalex"]);
+    expect(book.type).toBe("book");
+    expect(book.issued).toBe("1984");
+    expect(book.creators).toEqual([{ given: "Pierre", family: "Bourdieu", role: "author" }]);
+    expect(candidates.filter((c) => c.identifiers.doi === "10.5555/ao.find.distinction.1984")).toHaveLength(1);
+    expect(candidates).toHaveLength(4);
+    const d = decideMatch(r, candidates);
+    expect(d.kind).toBe("choose");
+    expect(d.kind === "choose" && d.ids[0]).toBe(book.id);
+    expect(scoreCandidate(r, book)).toEqual({ score: 1, titleCover: 1, creator: true, year: true });
+  });
+
+  it("Bourdieu, Distinction 1984 is sure when one book matches", async () => {
+    crossref("Bourdieu, Distinction 1984", "crossref-distinction.json");
+    openalex("Bourdieu, Distinction 1984", "openalex-distinction.json");
+    const r = ref("Bourdieu, Distinction 1984");
+    const { candidates } = await searchWorks(r, ctx(client()), { sources: ["crossref", "openalex"] });
+    const book = candidates[0]!;
+    expect(book.identifiers.doi).toBe("10.5555/ao.find.distinction.1984");
+    expect(decideMatch(r, candidates)).toEqual({ kind: "sure", id: book.id });
+  });
+
+  describe("the main-title guard (R228 a)", () => {
+    const marx = [{ given: "Karl", family: "Marx", role: "author" as const }];
+    it("Marx, Capital Volume 1 against only Capital: Volume 2 asks", () => {
+      const v2 = cand({ id: "v2", title: "Capital: Volume 2", creators: marx, issued: "1885", identifiers: { doi: "10.5555/v2" } });
+      expect(decideMatch(ref("Marx, Capital Volume 1"), [v2])).toEqual({ kind: "choose", ids: ["v2"] });
+    });
+    it("Granovetter, The Strength of Weak Ties against the 1983 Revisited paper asks", () => {
+      const g = [{ given: "Mark", family: "Granovetter", role: "author" as const }];
+      const rev = cand({ id: "rev", title: "The Strength of Weak Ties: A Network Theory Revisited", type: "article-journal", creators: g, issued: "1983", identifiers: { doi: "10.5555/rev" } });
+      const job = cand({ id: "job", title: "Getting a Job", creators: g, issued: "1974", identifiers: { isbn: ["9780000000040"] } });
+      expect(decideMatch(ref("Granovetter, The Strength of Weak Ties"), [rev, job])).toEqual({ kind: "choose", ids: ["rev", "job"] });
+    });
+    it("Smith, Introduction against the chapter asks", () => {
+      const s = [{ given: "Ann", family: "Smith", role: "author" as const }];
+      const ch = cand({ id: "ch", title: "Introduction: Rethinking Kinship", type: "chapter", creators: s, identifiers: { doi: "10.5555/ch" } });
+      const book = cand({ id: "intro", title: "Introduction to Sociology", creators: s, identifiers: { isbn: ["9780000000057"] } });
+      const d = decideMatch(ref("Smith, Introduction"), [ch, book]);
+      expect(d).toEqual({ kind: "choose", ids: ["ch", "intro"] });
+    });
+    it("Weber, Science against a book whose main title is that one word asks; with its year it is sure", () => {
+      const w = cand({ id: "sci", title: "Science - as a Vocation and other things", creators: [{ given: "Max", family: "Weber", role: "author" }], issued: "1919", identifiers: { isbn: ["9780000000064"] } });
+      expect(decideMatch(ref("Weber, Science"), [w])).toEqual({ kind: "choose", ids: ["sci"] });
+      expect(decideMatch(ref("Weber, Science 1919"), [w])).toEqual({ kind: "sure", id: "sci" });
+      expect(decideMatch(ref("Weber, Science 1920"), [w])).toEqual({ kind: "sure", id: "sci" }); // rule 4's ±1
+      expect(decideMatch(ref("Weber, Science 1921"), [w]).kind).toBe("choose");
+    });
+    it("Putnam, Bowling Alone is sure when the book is the only close title", () => {
+      const p = [{ given: "Robert", family: "Putnam", role: "author" as const }];
+      const book = cand({ id: "ba", title: "Bowling Alone: The Collapse and Revival of American Community", creators: p, issued: "2000", identifiers: { isbn: ["9780000000071"] } });
+      const other = cand({ id: "mw", title: "Making Democracy Work", creators: p, issued: "1993", identifiers: { isbn: ["9780000000088"] } });
+      expect(decideMatch(ref("Putnam, Bowling Alone"), [book, other])).toEqual({ kind: "sure", id: "ba" });
+      // By the main title alone, no word may be left unexplained, and a typed number must be in the title or be the year.
+      expect(decideMatch(ref("Putnam, Bowling Alone, Simon"), [book, other]).kind).toBe("choose");
+      expect(decideMatch(ref("Putnam, Bowling Alone 2"), [book, other]).kind).toBe("choose");
+      expect(decideMatch(ref("Putnam, Bowling Alone 1990"), [book, other]).kind).toBe("choose");
+      // An article is never sure by its main title alone.
+      expect(decideMatch(ref("Putnam, Bowling Alone"), [{ ...book, type: "article-journal" }, other]).kind).toBe("choose");
+      // The full title typed: the guard does not apply (one unexplained word allowed again).
+      expect(decideMatch(ref("Putnam, Bowling Alone: The Collapse and Revival of American Community, Simon"), [{ ...book, type: "article-journal" }, other]).kind).toBe("sure");
+    });
+  });
+
+  describe("names in scripts written without spaces (R228 b)", () => {
+    it("李白詩選 is not 詩選 by 李", () => {
+      const w = cand({ id: "sx", title: "詩選", creators: [{ given: "四", family: "李", role: "author" }], issued: "1990", identifiers: { isbn: ["9780000000095"] } });
+      expect(scoreCandidate(ref("李白詩選"), w).creator).toBe(false);
+      expect(decideMatch(ref("李白詩選"), [w]).kind).toBe("choose");
+      // The family name as a run of its own counts; so does the family name followed by the given name.
+      expect(scoreCandidate(ref("李 詩選"), w).creator).toBe(true);
+      expect(decideMatch(ref("李 詩選"), [w])).toEqual({ kind: "sure", id: "sx" });
+      expect(scoreCandidate(ref("李四詩選"), w).creator).toBe(true);
+    });
+    it("王国の思想 is not 思想 by 王", () => {
+      const w = cand({ id: "sx", title: "思想", creators: [{ given: "某", family: "王", role: "author" }], issued: "1990", identifiers: { isbn: ["9780000000101"] } });
+      expect(scoreCandidate(ref("王国の思想"), w).creator).toBe(false);
+      expect(decideMatch(ref("王国の思想"), [w]).kind).toBe("choose");
+    });
+  });
+
+  describe("a contradiction is never the one allowed unexplained word (R228 c)", () => {
+    const capital = cand({ id: "cap", title: "Capital", creators: [{ given: "Ann", family: "Smith", role: "author" }], issued: "1990", identifiers: { isbn: ["9780000000118"] } });
+    it.each([["Smith, Not Capital"], ["Smith, No Capital"], ["Smith, Capital without"], ["Smith, anti Capital"], ["Smith, non Capital"], ["Smith, against Capital"], ["Smith, Capital 3"], ["Smith, Capital vol II"], ["Smith, Capital, Volume iv"], ["Smith, Capital part III"], ["Smith, Capital ed 2"]])("%s asks", (line) => {
+      expect(decideMatch(ref(line), [capital]).kind).toBe("choose");
+    });
+    it("an ordinary unexplained word, or a roman-looking word not after a volume word, is still allowed", () => {
+      expect(decideMatch(ref("Smith, Capital Routledge"), [capital]).kind).toBe("sure");
+      expect(decideMatch(ref("Smith, Capital mix"), [capital]).kind).toBe("sure");
+      expect(decideMatch(ref("Smith, Capital unbound"), [capital]).kind).toBe("sure"); // un- is not a negation here
+    });
+  });
+
+  describe("what counts as a number among the typed words (R231 c)", () => {
+    const marx = [{ given: "Karl", family: "Marx", role: "author" as const }];
+    const capital = cand({ id: "cap", title: "Capital", creators: marx, issued: "1867", identifiers: { isbn: ["9780000000125"] } });
+    const sociology = cand({ id: "soc", title: "Sociology", creators: [{ given: "Anthony", family: "Giddens", role: "author" }], issued: "1989", identifiers: { isbn: ["9780000000132"] } });
+    it("a digit ordinal or a bare roman numeral of two or more letters that the title does not hold asks", () => {
+      expect(decideMatch(ref("Giddens, Sociology 2nd"), [sociology]).kind).toBe("choose");
+      expect(decideMatch(ref("Giddens, Sociology 3rd"), [sociology]).kind).toBe("choose");
+      expect(decideMatch(ref("Marx, Capital II"), [capital]).kind).toBe("choose");
+      expect(decideMatch(ref("Marx, Capital xiv"), [capital]).kind).toBe("choose");
+    });
+    it("the same number in the title explains it", () => {
+      const v2 = cand({ id: "v2", title: "Capital Volume II", creators: marx, issued: "1885", identifiers: { isbn: ["9780000000149"] } });
+      expect(decideMatch(ref("Marx, Capital Volume II"), [v2])).toEqual({ kind: "sure", id: "v2" });
+      const ed2 = cand({ id: "e2", title: "Sociology 2nd edition", creators: sociology.creators, issued: "1993", identifiers: { isbn: ["9780000000156"] } });
+      expect(decideMatch(ref("Giddens, Sociology 2nd edition"), [ed2])).toEqual({ kind: "sure", id: "e2" });
+    });
+    it("single letters i, v and x are initials, not numbers; ordinal words are not numbers", () => {
+      for (const line of ["Marx, Capital x", "Marx, Capital v", "Marx, Capital i", "Giddens, Sociology second"]) {
+        const c = line.startsWith("Marx") ? capital : sociology;
+        expect([line, decideMatch(ref(line), [c]).kind]).toEqual([line, "sure"]);
+      }
+    });
+    it("a second 4-digit number that is not in the title and is not the year asks (M-b)", () => {
+      const cw = cand({ id: "cw", title: "Collected Works", creators: [{ given: "Ann", family: "Smith", role: "author" }], issued: "1950", identifiers: { isbn: ["9780000000163"] } });
+      expect(decideMatch(ref("Smith, Collected Works 1950"), [cw])).toEqual({ kind: "sure", id: "cw" });
+      expect(decideMatch(ref("Smith, Collected Works 1950 1960"), [cw]).kind).toBe("choose");
+    });
+  });
+
+  describe("a number in the subtitle that was not typed, on the main-title path (R231 a)", () => {
+    const s = [{ given: "Ann", family: "Smith", role: "author" as const }];
+    const v3 = cand({ id: "v3", title: "Collected Works: Volume 3", creators: s, issued: "1960", identifiers: { isbn: ["9780000000170"] } });
+    it("Smith, Collected Works against only Collected Works: Volume 3 asks; with the volume typed it is sure", () => {
+      expect(decideMatch(ref("Smith, Collected Works"), [v3])).toEqual({ kind: "choose", ids: ["v3"] });
+      expect(decideMatch(ref("Smith, Collected Works 3"), [v3])).toEqual({ kind: "sure", id: "v3" });
+      expect(decideMatch(ref("Smith, Collected Works volume 3"), [v3])).toEqual({ kind: "sure", id: "v3" });
+      expect(decideMatch(ref("Smith, Collected Works 4"), [v3]).kind).toBe("choose");
+    });
+    it("roman numerals after a volume word and digit ordinals in the subtitle count too", () => {
+      for (const sub of ["Band IV", "Tome II", "Tomo III", "Part ii", "Book XII", "Edition V", "2nd edition", "Volume 12"]) {
+        const c = { ...v3, title: `Collected Works: ${sub}` };
+        expect([sub, decideMatch(ref("Smith, Collected Works"), [c]).kind]).toEqual([sub, "choose"]);
+      }
+    });
+    it("Putnam, Bowling Alone is still sure: its subtitle holds no number", () => {
+      const p = [{ given: "Robert", family: "Putnam", role: "author" as const }];
+      const book = cand({ id: "ba", title: "Bowling Alone: The Collapse and Revival of American Community", creators: p, issued: "2000", identifiers: { isbn: ["9780000000071"] } });
+      expect(decideMatch(ref("Putnam, Bowling Alone"), [book])).toEqual({ kind: "sure", id: "ba" });
+    });
+  });
+
+  describe("a word beside the matched family name that is not that creator's name (R231 d)", () => {
+    const adam = cand({ id: "won", title: "The Wealth of Nations", creators: [{ given: "Adam", family: "Smith", role: "author" }], issued: "1776", identifiers: { isbn: ["9780000000187"] } });
+    const withJones = { ...adam, creators: [...adam.creators, { given: "Mary", family: "Jones", role: "author" as const }] };
+    it.each([
+      ["John Smith, The Wealth of Nations", adam, "choose"],
+      ["J. Smith, The Wealth of Nations", adam, "choose"],
+      ["Smith and Brown, The Wealth of Nations", adam, "choose"],
+      ["Adam Smith, The Wealth of Nations", adam, "sure"],
+      ["A. Smith, The Wealth of Nations", adam, "sure"],
+      ["Smith, A., The Wealth of Nations", adam, "sure"],
+      ["Smith and Jones, The Wealth of Nations", withJones, "sure"],
+      ["Smith & Jones, The Wealth of Nations", withJones, "sure"],
+      // An unexplained word away from the name is the ordinary one allowed word.
+      ["Smith, The Wealth of Nations, Glasgow", adam, "sure"],
+    ] as const)("%s", (line, c, kind) => {
+      expect(decideMatch(ref(line), [c]).kind).toBe(kind);
+    });
+
+    const simone = cand({ id: "ss", title: "The Second Sex", creators: [{ given: "Simone", family: "de Beauvoir", role: "author" }], issued: "1949", identifiers: { isbn: ["9780000000194"] } });
+    const theo = cand({ id: "lt", title: "Letters", creators: [{ given: "Theo", family: "van Gogh", role: "author" }], issued: "1914", identifiers: { isbn: ["9780000000200"] } });
+    it.each([
+      ["Hélène de Beauvoir, The Second Sex", simone, "choose"],
+      ["Simone de Beauvoir, The Second Sex", simone, "sure"],
+      ["S. de Beauvoir, The Second Sex", simone, "sure"],
+      ["de Beauvoir, Simone, The Second Sex", simone, "sure"],
+      ["Beauvoir, The Second Sex", simone, "sure"],
+      ["Vincent van Gogh Letters", theo, "choose"],
+      ["Theo van Gogh Letters", theo, "sure"],
+    ] as const)("a particle does not hide another given name (I5): %s", (line, c, kind) => {
+      expect(decideMatch(ref(line), [c]).kind).toBe(kind);
+    });
+
+    it.each([
+      ["ed. Smith, The Wealth of Nations", "sure"],
+      ["Prof Smith, The Wealth of Nations", "sure"],
+      ["Dr. Smith, The Wealth of Nations", "sure"],
+      ["Smith (eds.), The Wealth of Nations", "sure"],
+      ["Smith, trans., The Wealth of Nations, Glasgow", "sure"], // the role word does not use up the one allowed word
+      ["Smith hrsg, The Wealth of Nations", "sure"],
+      ["Dr. John Smith, The Wealth of Nations", "choose"],
+    ] as const)("a role word beside the name is not another person (M2): %s", (line, kind) => {
+      expect(decideMatch(ref(line), [adam]).kind).toBe(kind);
+    });
+  });
+
+  it("a year or a range of years in a subtitle does not make a main-title citation ask (M1)", () => {
+    const j = [{ given: "Ann", family: "Jones", role: "author" as const }];
+    const ht = cand({ id: "ht", title: "Hard Times: Essays 1970–1980", creators: j, issued: "1981", identifiers: { isbn: ["9780000000217"] } });
+    expect(decideMatch(ref("Jones, Hard Times"), [ht])).toEqual({ kind: "sure", id: "ht" });
+    // A volume number in the subtitle still asks (R231 a).
+    expect(decideMatch(ref("Jones, Hard Times"), [{ ...ht, title: "Hard Times: Essays, Volume 2" }]).kind).toBe("choose");
+  });
+
+  describe("rules 5 and 6 each decide on their own (M8)", () => {
+    it("rule 5 alone: an identical title by another author, 0.3 lower, still asks", () => {
+      const a = cand({ id: "a", title: "Distinction", identifiers: { doi: "10.5555/a" } });
+      const b = cand({ id: "b", title: "Distinction", creators: [{ given: "Henrik", family: "Lindqvist", role: "author" }], identifiers: { doi: "10.5555/b" } });
+      expect(scoreCandidate(ref("Bourdieu, Distinction"), b).score).toBe(0.7);
+      expect(decideMatch(ref("Bourdieu, Distinction"), [a, b])).toEqual({ kind: "choose", ids: ["a", "b"] });
+    });
+    it("rule 5 alone: two editions where the typed year leaves the other 0.2 or more lower", () => {
+      const e84 = cand({ id: "e84", title: "Distinction", issued: "1984", identifiers: { doi: "10.5555/e84", isbn: ["9780000000002"] } });
+      // An edition whose record names only its translator as creator, 26 years after the typed year: 0.6.
+      const other = cand({ id: "e10", title: "Distinction", issued: "2010", creators: [{ given: "Henrik", family: "Lindqvist", role: "translator" }], identifiers: { doi: "10.5555/e10", isbn: ["9780000000019"] } });
+      expect(scoreCandidate(ref("Bourdieu, Distinction 1984"), other).score).toBe(0.6);
+      expect(decideMatch(ref("Bourdieu, Distinction 1984"), [e84, other]).kind).toBe("choose");
+    });
+    it("rule 6 alone: another title (similarity below 0.8) as good leaves nothing unexplained and still asks", () => {
+      const a = cand({ id: "a", title: "Distinction", identifiers: { doi: "10.5555/a" } });
+      const b = cand({ id: "b", title: "Habitus Distinction", identifiers: { doi: "10.5555/b" } });
+      const r = ref("Bourdieu, Distinction, Habitus");
+      expect(scoreCandidate(r, a).score).toBe(1);
+      expect(scoreCandidate(r, b).score).toBe(1);
+      expect(decideMatch(r, [a, b]).kind).toBe("choose");
+      // With b 0.2 lower it is sure on a (rule 6 is what asked).
+      const c = cand({ id: "c", title: "Habitus Distinction Field", identifiers: { doi: "10.5555/c" } });
+      expect(scoreCandidate(r, c).score).toBe(0.8);
+      expect(decideMatch(r, [a, c])).toEqual({ kind: "sure", id: "a" });
+    });
+  });
+
+  it("two editions of Distinction with different ISBNs are never sure: the entry is Choose", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction-editions.json");
+    openalex("Bourdieu, Distinction", "openalex-empty.json");
+    const r = ref("Bourdieu, Distinction");
+    const { candidates } = await search("Bourdieu, Distinction", ctx(client()));
+    expect(candidates).toHaveLength(2);
+    const d = decideMatch(r, candidates);
+    expect(d.kind).toBe("choose");
+    expect(d.kind === "choose" && [...d.ids].sort()).toEqual(candidates.map((c) => c.id).sort());
+    // With a year typed that fits only one edition, the other is still offered: never sure.
+    expect(decideMatch(ref("Bourdieu, Distinction 1984"), candidates).kind).toBe("choose");
+  });
+
+  it("a book and its translation (same title, different ISBNs, no DOI) are never sure", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction-translation.json");
+    openalex("Bourdieu, Distinction", "openalex-empty.json");
+    const { candidates } = await search("Bourdieu, Distinction", ctx(client()));
+    expect(candidates).toHaveLength(2);
+    expect(decideMatch(ref("Bourdieu, Distinction"), candidates).kind).toBe("choose");
+    // The original and the translation under different titles: the typed words decide only when
+    // they name one title; typing the French title with "la" leaves both close, so it asks.
+    const fr = cand({ id: "fr", title: "La Distinction: critique sociale du jugement", identifiers: { isbn: ["9780000000033"] }, issued: "1979" });
+    const en = cand({ id: "en", title: "Distinction: A Social Critique of the Judgement of Taste", identifiers: { isbn: ["9780000000002"] } });
+    expect(decideMatch(ref("Bourdieu, La Distinction"), [fr, en])).toEqual({ kind: "choose", ids: ["fr", "en"] });
+  });
+
+  it("a preprint and its article with different DOIs are offered both", async () => {
+    crossref("Okafor, Rivers and Memory in Upland Villages", "crossref-preprint-article.json");
+    openalex("Okafor, Rivers and Memory in Upland Villages", "openalex-empty.json");
+    const r = ref("Okafor, Rivers and Memory in Upland Villages");
+    const { candidates } = await search("Okafor, Rivers and Memory in Upland Villages", ctx(client()));
+    expect(candidates.map((c) => c.identifiers.doi)).toEqual(["10.5555/ao.find.rivers.2021", "10.5555/ao.find.rivers.preprint.2020"]);
+    const d = decideMatch(r, candidates);
+    expect(d).toEqual({ kind: "choose", ids: candidates.map((c) => c.id) });
+    // Even with the article's year typed, the preprint (one year off) keeps it a choice.
+    expect(decideMatch(ref("Okafor 2021 Rivers and Memory in Upland Villages"), candidates).kind).toBe("choose");
+  });
+
+  it("a same-titled work by a different author keeps it a choice", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction-other-author.json");
+    openalex("Bourdieu, Distinction", "openalex-empty.json");
+    const r = ref("Bourdieu, Distinction");
+    const { candidates } = await search("Bourdieu, Distinction", ctx(client()));
+    expect(candidates).toHaveLength(2);
+    const d = decideMatch(r, candidates);
+    expect(d.kind).toBe("choose");
+    // Bourdieu's first, the other author's after.
+    expect(d.kind === "choose" && d.ids[0]).toBe(candidates.find((c) => c.creators[0]?.family === "Bourdieu")!.id);
+    expect(scoreCandidate(r, candidates.find((c) => c.creators[0]?.family === "Lindqvist")!)).toEqual({ score: 0.7, titleCover: 1, creator: false, year: true });
+  });
+
+  it("a one-word title with no author typed is never sure", async () => {
+    crossref("Distinction", "crossref-distinction.json");
+    openalex("Distinction", "openalex-empty.json");
+    const { candidates } = await search("Distinction", ctx(client()));
+    expect(decideMatch(ref("Distinction"), candidates).kind).toBe("choose");
+  });
+
+  it("two unexplained words make it Choose", () => {
+    const book = cand({ id: "b", title: "Distinction", identifiers: { doi: "10.5555/x" } });
+    expect(decideMatch(ref("Bourdieu, Distinction, Minuit"), [book])).toEqual({ kind: "sure", id: "b" }); // one is allowed
+    expect(decideMatch(ref("Bourdieu, Distinction, Paris Minuit"), [book])).toEqual({ kind: "choose", ids: ["b"] });
+    // The listed small words, a year and the creators' given names are explained.
+    expect(decideMatch(ref("Pierre Bourdieu, and the Distinction by et al 1984"), [book]).kind).toBe("sure");
+  });
+
+  it("a typed year two years off is not sure; one year off is", () => {
+    const book = cand({ id: "b", title: "Distinction", issued: "1984" });
+    expect(decideMatch(ref("Bourdieu, Distinction 1986"), [book])).toEqual({ kind: "choose", ids: ["b"] });
+    expect(decideMatch(ref("Bourdieu, Distinction 1982"), [book]).kind).toBe("choose");
+    expect(decideMatch(ref("Bourdieu, Distinction 1985"), [book]).kind).toBe("sure");
+    expect(decideMatch(ref("Bourdieu, Distinction 1983"), [book]).kind).toBe("sure");
+    // A typed year and a candidate without a year: not matched.
+    expect(decideMatch(ref("Bourdieu, Distinction 1984"), [cand({ id: "n", title: "Distinction", issued: undefined })]).kind).toBe("choose");
+    expect(scoreCandidate(ref("Bourdieu, Distinction 1986"), book)).toEqual({ score: 0.9, titleCover: 1, creator: true, year: false });
+  });
+
+  it("the next best candidate must score at least 0.2 lower", () => {
+    const a = cand({ id: "a", title: "Distinction", identifiers: { doi: "10.5555/a" } });
+    // Shares no title word with a, so rule 5 does not apply; its score decides.
+    const b = cand({ id: "b", title: "Distinction Taste Field Habitus Capital", identifiers: { doi: "10.5555/b" } });
+    // b covers 1/5 of its title: 0.12 + 0.3 + 0.1 = 0.52; a scores 1.
+    expect(decideMatch(ref("Bourdieu, Distinction"), [b, a])).toEqual({ kind: "sure", id: "a" });
+    const c = cand({ id: "c", title: "Taste Distinction", identifiers: { doi: "10.5555/c" } });
+    // c covers 1/2: 0.3 + 0.3 + 0.1 = 0.7 (0.3 lower): still sure; d covers 4/5 → 0.88: not.
+    expect(decideMatch(ref("Bourdieu, Distinction"), [c, a]).kind).toBe("sure");
+    const d = cand({ id: "d", title: "Distinction and Social Theory Today", identifiers: { doi: "10.5555/d" } });
+    expect(decideMatch(ref("Bourdieu, Distinction social theory today"), [a, d]).kind).toBe("choose");
+  });
+
+  it("not found when no candidate scores 0.4", () => {
+    const other = cand({ id: "o", title: "Rivers of Memory", creators: [{ given: "Joan", family: "Rivers", role: "author" }], issued: "1999" });
+    expect(decideMatch(ref("Bourdieu, Distinction 1984"), [other])).toEqual({ kind: "none" });
+    expect(decideMatch(ref("Bourdieu, Distinction"), [])).toEqual({ kind: "none" });
+  });
+
+  it("a family name that is also a title word is not counted twice", () => {
+    // A work titled with the typed name, by someone of that name: the one word cannot be both.
+    const w = cand({ id: "g", title: "Granovetter", creators: [{ given: "Ann", family: "Granovetter", role: "author" }], issued: "2001" });
+    expect(scoreCandidate(ref("Granovetter"), w).creator).toBe(false);
+    expect(decideMatch(ref("Granovetter"), [w]).kind).toBe("choose");
+    // Typed twice (title and author) it can be both.
+    expect(decideMatch(ref("Granovetter, Granovetter"), [w]).kind).toBe("sure");
+    // A study about Bourdieu by someone else is not Bourdieu's.
+    const about = cand({ id: "a", title: "Bourdieu", creators: [{ given: "Ann", family: "Fixture", role: "author" }] });
+    expect(decideMatch(ref("Bourdieu"), [about]).kind).toBe("choose");
+  });
+
+  it("an empty or whitespace title never covers anything", () => {
+    const blank = cand({ id: "e", title: "   " });
+    const punct = cand({ id: "p", title: "?!—" });
+    expect(scoreCandidate(ref("Bourdieu"), blank).titleCover).toBe(0);
+    expect(scoreCandidate(ref("Bourdieu"), punct).titleCover).toBe(0);
+    expect(decideMatch(ref("Bourdieu"), [blank, punct]).kind).not.toBe("sure");
+  });
+
+  it("a book and a chapter sharing its ISBN but with their own DOIs are not one work", () => {
+    const book = cand({ id: "book", title: "Distinction", identifiers: { doi: "10.5555/book", isbn: ["9780000000002"] } });
+    const chapter = cand({ id: "ch", title: "Distinction", type: "chapter", identifiers: { doi: "10.5555/book.ch1", isbn: ["9780000000002"] } });
+    expect(decideMatch(ref("Bourdieu, Distinction"), [book, chapter]).kind).toBe("choose");
+    // A chapter by another author scores 0.3 lower (rule 6 alone would allow it): rule 5 still blocks.
+    const other = { ...chapter, creators: [{ given: "Henrik", family: "Lindqvist", role: "author" as const }] };
+    expect(scoreCandidate(ref("Bourdieu, Distinction"), other).score).toBe(0.7);
+    expect(decideMatch(ref("Bourdieu, Distinction"), [book, other]).kind).toBe("choose");
+  });
+
+  it("an Elicit candidate alone is never sure; with another provider it can be", () => {
+    const e = cand({ id: "e", title: "Distinction", providers: ["elicit"], identifiers: { doi: "10.5555/e" } });
+    expect(decideMatch(ref("Bourdieu, Distinction"), [e])).toEqual({ kind: "choose", ids: ["e"] });
+    expect(decideMatch(ref("Bourdieu, Distinction"), [{ ...e, providers: ["elicit", "crossref"] }])).toEqual({ kind: "sure", id: "e" });
+  });
+
+  it("diacritics and ligatures: Muller finds Müller, and field finds ﬁeld", async () => {
+    crossref("Muller, Feldforschung im Gebirge", "crossref-diacritics.json");
+    crossref("Okafor, Notes from the field", "crossref-diacritics.json");
+    const c = ctx(client());
+    const a = await search("Muller, Feldforschung im Gebirge", c, ["crossref"]);
+    expect(decideMatch(ref("Muller, Feldforschung im Gebirge"), a.candidates)).toEqual({ kind: "sure", id: a.candidates.find((x) => x.creators[0]?.family === "Müller")!.id });
+    const b = await search("Okafor, Notes from the field", c, ["crossref"]);
+    const fieldNotes = b.candidates.find((x) => x.identifiers.doi === "10.5555/ao.find.fieldnotes.2004")!;
+    expect(fieldNotes.title).toBe("Notes from the ﬁeld"); // kept as given: only the comparison folds it
+    expect(decideMatch(ref("Okafor, Notes from the field"), b.candidates)).toEqual({ kind: "sure", id: fieldNotes.id });
+  });
+
+  it("a Japanese reference with or without spaces between the words", async () => {
+    crossref("丸山眞男 日本の思想", "crossref-japanese.json");
+    crossref("日本の思想丸山眞男", "crossref-japanese.json");
+    const c = ctx(client());
+    for (const line of ["丸山眞男 日本の思想", "日本の思想丸山眞男"]) {
+      const { candidates } = await search(line, c, ["crossref"]);
+      const nihon = candidates.find((x) => x.identifiers.doi === "10.5555/ao.find.nihon.1961")!;
+      expect(decideMatch(ref(line), candidates)).toEqual({ kind: "sure", id: nihon.id });
+    }
+    // The author alone, or another title's words, are not enough.
+    const { candidates } = await search("丸山眞男 日本の思想", c, ["crossref"]);
+    expect(decideMatch(ref("丸山眞男"), candidates).kind).not.toBe("sure");
+    expect(decideMatch(ref("丸山眞男 日本の政治思想史研究"), candidates).kind).not.toBe("sure");
+  });
+});
+
+describe("what is sent, and to whom", () => {
+  it("each service receives exactly the typed words, percent-encoded, and nothing else", async () => {
+    const line = `"weak ties" Granovetter & co / 1973?#`;
+    crossref(line, "crossref-weak-ties.json");
+    openalex(line, "openalex-empty.json");
+    await search(line, ctx(client()));
+    expect(seen.map((s) => `${s.origin}${s.path}`)).toEqual([
+      `https://api.crossref.org/works?query.bibliographic=%22weak%20ties%22%20Granovetter%20%26%20co%20%2F%201973%3F%23&rows=5&select=${SELECT}`,
+      "https://api.openalex.org/works?search=%22weak%20ties%22%20Granovetter%20%26%20co%20%2F%201973%3F%23&per-page=5",
+    ]);
+    for (const s of seen) {
+      expect(s.headers["user-agent"]).toBe(USER_AGENT);
+      expect(s.headers["user-agent"]).not.toMatch(/mailto/u);
+      expect(Object.keys(s.headers).sort()).toEqual(["accept", "user-agent"]);
+    }
+  });
+
+  it("characters the URL parser would otherwise leave or change are percent-encoded too", async () => {
+    const line = "Bourdieu's (Distinction)! *";
+    answer("https://api.crossref.org", crPath(line), fixture("crossref-empty.json"));
+    await search(line, ctx(client()), ["crossref"]);
+    expect(seen[0]!.path).toBe(`/works?query.bibliographic=Bourdieu%27s%20%28Distinction%29%21%20%2A&rows=5&select=${SELECT}`);
+  });
+
+  it("a denied provider is not asked", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction.json");
+    const r = await search("Bourdieu, Distinction", ctx(client(), ["crossref"]));
+    expect(seen.map((s) => s.origin)).toEqual(["https://api.crossref.org"]);
+    expect(r.notes).toEqual([]);
+    expect(r.candidates.every((c) => c.providers.join() === "crossref")).toBe(true);
+    expect(notes.some((n) => n.includes("openalex skipped"))).toBe(true);
+
+    // Every provider denied, or a policy that cannot be read: nothing is asked, no error.
+    const none = await search("Bourdieu, Distinction", ctx(client(), []));
+    const unreadable = await search("Bourdieu, Distinction", ctx(client(), null));
+    expect(none).toEqual({ candidates: [], notes: [] });
+    expect(unreadable).toEqual({ candidates: [], notes: [] });
+    expect(seen).toHaveLength(1);
+  });
+
+  it("only the sources asked for are asked, each once", async () => {
+    openalex("Bourdieu, Distinction", "openalex-distinction.json");
+    const r = await searchWorks(ref("Bourdieu, Distinction"), ctx(client()), { sources: ["openalex", "openalex"] });
+    expect(seen.map((s) => s.origin)).toEqual(["https://api.openalex.org"]);
+    expect(r.candidates[0]!.providers).toEqual(["openalex"]);
+  });
+
+  it("a line with no words to search sends nothing", async () => {
+    const r = await search("?!", ctx(client()));
+    expect(r).toEqual({ candidates: [], notes: [] });
+    expect(seen).toEqual([]);
+  });
+});
+
+describe("OpenAlex's daily allowance", () => {
+  const budget429 = (headers: Record<string, string> = {}) =>
+    answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), fixture("openalex-budget-429.json"), 429, headers);
+
+  it("OpenAlex's daily budget 429 leaves Crossref only and notes it", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction.json");
+    budget429({ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "3600" });
+    const http = client();
+    const r = await search("Bourdieu, Distinction", ctx(http));
+    expect(r.notes).toEqual(["openalex-budget"]);
+    expect(r.candidates[0]!.providers).toEqual(["crossref"]);
+    // Not retried: one OpenAlex request, no back-off.
+    expect(seen.filter((s) => s.origin === "https://api.openalex.org")).toHaveLength(1);
+    expect(sleeps.filter((ms) => ms >= 500)).toEqual([]);
+    expect(openAlexSearchPausedUntil(http)).toBe(now + 3_600_000);
+
+    // The pause holds across calls for the life of the client: OpenAlex is not asked again.
+    // (Crossref's answer now comes from the client's cache.)
+    now += 1_800_000;
+    const again = await search("Bourdieu, Distinction", ctx(http));
+    expect(again.notes).toEqual(["openalex-budget"]);
+    expect(seen.filter((s) => s.origin === "https://api.openalex.org")).toHaveLength(1);
+
+    // After the reset it is asked again.
+    now += 1_800_001;
+    openalex("Bourdieu, Distinction", "openalex-distinction.json");
+    const later = await search("Bourdieu, Distinction", ctx(http));
+    expect(later.notes).toEqual([]);
+    expect(openAlexSearchPausedUntil(http)).toBeUndefined();
+    agent.assertNoPendingInterceptors();
+  });
+
+  it("a budget 429 that names no reset pauses until 00:00 UTC; another client is not paused", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction.json");
+    budget429();
+    const http = client();
+    const r = await search("Bourdieu, Distinction", ctx(http));
+    expect(r.notes).toEqual(["openalex-budget"]);
+    expect(openAlexSearchPausedUntil(http)).toBe(Date.parse("2026-11-14T00:00:00Z"));
+    expect(openAlexSearchPausedUntil(client())).toBeUndefined();
+  });
+
+  it("the pause never runs past the next 00:00 UTC: the earlier of the reset and midnight (R231 b)", async () => {
+    // The clock is 10:00 UTC; midnight is 14 hours on.
+    expect(new Date(now).toISOString()).toBe("2026-11-13T10:00:00.000Z");
+    const midnight = Date.parse("2026-11-14T00:00:00Z");
+    const until = async (reset: string) => {
+      crossref("Bourdieu, Distinction", "crossref-distinction.json");
+      answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), "{}", 429, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset });
+      const http = client();
+      await search("Bourdieu, Distinction", ctx(http));
+      await rm(join(tmp, "Lib"), { recursive: true, force: true });
+      return openAlexSearchPausedUntil(http);
+    };
+    // A reset after midnight (90,000 s = 25 h, 20 h, an epoch next year): midnight.
+    for (const reset of ["90000", String(20 * 3600), "1830000000", String(Date.parse("2026-11-14T06:00:00Z"))]) expect(await until(reset)).toBe(midnight);
+    // In the past, not a number, or missing: midnight.
+    for (const reset of ["1000000000", "not a time", "-5", "0", "1e3", "", "2026-11-14T06:00:00Z"]) expect(await until(reset)).toBe(midnight);
+    // A reset before midnight is kept.
+    expect(await until("3600")).toBe(now + 3_600_000);
+    expect(await until(String(Math.floor(Date.parse("2026-11-13T20:00:00Z") / 1000)))).toBe(Date.parse("2026-11-13T20:00:00Z"));
+  });
+
+  it("only a 429 that positively shows the daily allowance spent pauses (M1)", async () => {
+    const cases: Array<[body: string, headers: Record<string, string>, pauses: boolean]> = [
+      // A per-second limit that merely mentions a daily limit: ordinary.
+      [`{"message":"Limits: 10 requests per second, 100000 per day"}`, { "retry-after": "1" }, false],
+      [`{"message":"Rate limit exceeded"}`, {}, false],
+      [`{"message":"daily"}`, {}, false],
+      // Remaining 0 with a short Retry-After is the per-second window: ordinary.
+      [`{}`, { "x-ratelimit-remaining": "0", "retry-after": "1" }, false],
+      [`{}`, { "x-ratelimit-remaining": "00x" }, false],
+      // Spent: the body names the daily budget and that it is used up; or Remaining is 0 with no short Retry-After.
+      [`{"message":"You have exceeded your daily budget."}`, {}, true],
+      [`{"message":"Daily allowance exhausted; resets at midnight UTC"}`, { "retry-after": "1" }, true],
+      [`{}`, { "x-ratelimit-remaining": "0" }, true],
+      [`{}`, { "x-ratelimit-remaining": "0", "retry-after": "3600" }, true],
+    ];
+    for (const [body, headers, pauses] of cases) {
+      crossref("Bourdieu, Distinction", "crossref-distinction.json");
+      answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), body, 429, headers);
+      if (!pauses) openalex("Bourdieu, Distinction", "openalex-distinction.json");
+      const http = client();
+      const r = await search("Bourdieu, Distinction", ctx(http));
+      expect([body, headers, r.notes]).toEqual([body, headers, pauses ? ["openalex-budget"] : []]);
+      expect(openAlexSearchPausedUntil(http) !== undefined).toBe(pauses);
+      await rm(join(tmp, "Lib"), { recursive: true, force: true }); // no cached answer between cases
+    }
+  });
+
+  it("nothing of a 429's body is kept on the error, its message or its serialised form (M3)", async () => {
+    const secret = "daily budget exceeded for key-abc123 on account x";
+    agent.get("https://api.openalex.org").intercept({ path: "/works?search=x&per-page=5", method: "GET" }).reply(429, secret, { headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "120" } });
+    const http = client();
+    let seenBody = "";
+    const err = await http
+      .getJson("https://api.openalex.org/works?search=x&per-page=5", { cacheKey: "t:x", final429: (a) => ((seenBody = a.body), true) })
+      .catch((e: unknown) => e);
+    expect(seenBody).toBe(secret); // given to the decision, once
+    expect(err).toBeInstanceOf(LookupHttpError);
+    const e = err as LookupHttpError;
+    expect(e.status).toBe(429);
+    expect(e.rateLimit).toEqual({ remaining: 0, reset: 120, final: true });
+    for (const text of [e.message, String(e), JSON.stringify(e), JSON.stringify(e.rateLimit), JSON.stringify({ ...e }), e.stack ?? ""]) {
+      expect(text).not.toContain("key-abc123");
+      expect(text).not.toContain("account");
+    }
+  });
+
+  it("an ordinary 429 is retried as before and pauses nothing", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction.json");
+    answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), `{"error":"slow down"}`, 429, { "retry-after": "1", "x-ratelimit-remaining": "3" });
+    openalex("Bourdieu, Distinction", "openalex-distinction.json");
+    const http = client();
+    const r = await search("Bourdieu, Distinction", ctx(http));
+    expect(r.notes).toEqual([]);
+    expect(r.candidates[0]!.providers).toEqual(["crossref", "openalex"]);
+    expect(sleeps).toContain(1000);
+    expect(openAlexSearchPausedUntil(http)).toBeUndefined();
+  });
+
+  it("ordinary 429s that never stop give openalex-failed, not a pause", async () => {
+    crossref("Bourdieu, Distinction", "crossref-distinction.json");
+    for (let i = 0; i < 4; i++) answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), "{}", 429);
+    const http = client();
+    const r = await search("Bourdieu, Distinction", ctx(http));
+    expect(r.notes).toEqual(["openalex-failed"]);
+    expect(openAlexSearchPausedUntil(http)).toBeUndefined();
+  });
+});
+
+describe("hostile and broken answers", () => {
+  it("a response that is not JSON gives no candidates from it and a note, never an error", async () => {
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), "<html>maintenance</html>");
+    openalex("Bourdieu, Distinction", "openalex-distinction.json");
+    const r = await search("Bourdieu, Distinction", ctx(client()));
+    expect(r.notes).toEqual(["crossref-failed"]);
+    expect(r.candidates.every((c) => c.providers.join() === "openalex")).toBe(true);
+    expect(notes.some((n) => n.startsWith("work search via crossref"))).toBe(true);
+  });
+
+  it("an answer of the wrong shape is not kept in the cache: the next search asks again (M6)", async () => {
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), `{"message":"x"}`);
+    answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), `{"results":"x"}`);
+    const c = ctx(client());
+    expect((await search("Bourdieu, Distinction", c)).notes).toEqual(["crossref-failed", "openalex-failed"]);
+    crossref("Bourdieu, Distinction", "crossref-distinction.json");
+    openalex("Bourdieu, Distinction", "openalex-distinction.json");
+    const again = await search("Bourdieu, Distinction", c);
+    expect(again.notes).toEqual([]);
+    expect(again.candidates.length).toBeGreaterThan(0);
+    agent.assertNoPendingInterceptors();
+    // A good answer is still cached: a third search asks nothing.
+    await search("Bourdieu, Distinction", c);
+    expect(seen).toHaveLength(4);
+  });
+
+  it("a Reference built elsewhere is bounded too: an over-long or wordless text sends nothing (M5)", async () => {
+    const huge: Reference = { text: "Bourdieu ".repeat(20_000), tokens: ["bourdieu"] };
+    expect(await searchWorks(huge, ctx(client()), { sources: ["crossref", "openalex"] })).toEqual({ candidates: [], notes: [] });
+    const fake: Reference = { text: "?!", tokens: ["bourdieu"] };
+    expect(await searchWorks(fake, ctx(client()), { sources: ["crossref", "openalex"] })).toEqual({ candidates: [], notes: [] });
+    expect(seen).toEqual([]);
+    // The text is tidied again before it is sent.
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), fixture("crossref-empty.json"));
+    await searchWorks({ text: "  Bourdieu,‮\u0000 Distinction ", tokens: [] }, ctx(client()), { sources: ["crossref"] });
+    expect(seen.map((s) => s.path)).toEqual([crPath("Bourdieu, Distinction")]);
+  });
+
+  it("JSON of another shape gives no candidates and a note", async () => {
+    for (const body of [`{"message":"x"}`, `[1,2,3]`, `null`, `{"message":{"items":{"0":{}}}}`, `{"message":{"items":[1,"x",null,[],{"title":7}]}}`]) {
+      answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), body);
+      answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), body);
+      const r = await search("Bourdieu, Distinction", ctx(client()));
+      expect(r.candidates).toEqual([]);
+    }
+  });
+
+  it("a body over 5 MB is refused, and the other service still answers", async () => {
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), `{"message":{"items":[],"pad":"${"x".repeat(5 * 1024 * 1024)}"}}`);
+    openalex("Bourdieu, Distinction", "openalex-distinction.json");
+    const r = await search("Bourdieu, Distinction", ctx(client()));
+    expect(r.notes).toEqual(["crossref-failed"]);
+    expect(r.candidates.length).toBeGreaterThan(0);
+  });
+
+  it("10,000 results: at most 5 read per service and 10 kept, quickly", async () => {
+    const items = Array.from({ length: 10_000 }, (_, i) => ({ DOI: `10.5555/ao.find.many.${i}`, type: "book", title: [`Distinction volume ${i}`], author: [{ family: "Bourdieu" }], issued: { "date-parts": [[1984]] } }));
+    const results = Array.from({ length: 10_000 }, (_, i) => ({ doi: `https://doi.org/10.5555/ao.find.oa.${i}`, title: `Distinction part ${i}`, publication_year: 1984, type: "book", authorships: [{ author: { display_name: "Pierre Bourdieu" } }] }));
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), JSON.stringify({ message: { items } }));
+    answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), JSON.stringify({ results }));
+    const t0 = performance.now();
+    const r = await search("Bourdieu, Distinction", ctx(client()));
+    expect(r.candidates).toHaveLength(FIND_MAX_CANDIDATES);
+    expect(FIND_MAX_CANDIDATES).toBe(10);
+    expect(r.candidates.filter((c) => c.providers.includes("crossref"))).toHaveLength(5);
+    expect(performance.now() - t0).toBeLessThan(3000);
+  });
+
+  it("a title of 5,000 characters is cut to 1,000", async () => {
+    const long = "Distinction ".repeat(417).slice(0, 5000);
+    const item = { DOI: "10.5555/ao.find.long", type: "book", title: [long], author: [{ given: "Pierre", family: "Bourdieu" }] };
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), JSON.stringify({ message: { items: [item] } }));
+    const r = await search("Bourdieu, Distinction", ctx(client()), ["crossref"]);
+    expect(r.candidates[0]!.title.length).toBeLessThanOrEqual(1000);
+    expect(r.candidates[0]!.title.length).toBeGreaterThan(900);
+  });
+
+  it("strings of 100,000 characters are bounded: title, names, container and publisher", async () => {
+    const huge = "Ä".repeat(100_000);
+    const item = {
+      DOI: `10.5555/${"x".repeat(100_000)}`,
+      type: huge,
+      title: [huge],
+      subtitle: [huge],
+      author: [{ given: huge, family: huge }, { name: huge }],
+      "container-title": [huge],
+      publisher: huge,
+      ISBN: [huge, ...Array.from({ length: 1000 }, () => "9780000000002")],
+    };
+    const oa = { results: [{ doi: huge, title: huge, publication_date: huge, type: huge, authorships: [{ author: { display_name: huge }, raw_author_name: huge }], primary_location: { source: { display_name: huge, host_organization_name: huge } } }] };
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), JSON.stringify({ message: { items: [item] } }));
+    answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), JSON.stringify(oa));
+    const t0 = performance.now();
+    const r = await search("Bourdieu, Distinction", ctx(client()));
+    expect(performance.now() - t0).toBeLessThan(3000);
+    expect(r.candidates.length).toBeGreaterThan(0);
+    for (const c of r.candidates) {
+      expect(c.title.length).toBeLessThanOrEqual(1000);
+      expect(c.creators.length).toBeLessThanOrEqual(100);
+      for (const p of c.creators) for (const v of [p.given, p.family, p.literal]) expect((v ?? "").length).toBeLessThanOrEqual(200);
+      expect((c.container ?? "").length).toBeLessThanOrEqual(1000);
+      expect((c.publisher ?? "").length).toBeLessThanOrEqual(200);
+      expect(c.identifiers.doi).toBeUndefined(); // neither is a DOI
+      expect((c.identifiers.isbn ?? []).length).toBeLessThanOrEqual(20);
+      expect(c.type).toBe("other");
+    }
+  });
+
+  it("control characters and bidi marks in a title are removed; the match still works", async () => {
+    const item = { DOI: "10.5555/ao.find.bidi", type: "book", title: ["Dis‮tinc\u0007tion⁦⁩​\u0085"], author: [{ given: "Pierre", family: "Bour‭dieu" }], issued: { "date-parts": [[1984]] } };
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), JSON.stringify({ message: { items: [item] } }));
+    const r = await search("Bourdieu, Distinction", ctx(client()), ["crossref"]);
+    const c = r.candidates[0]!;
+    expect(c.title).toBe("Distinc tion");
+    expect(c.creators[0]!.family).toBe("Bourdieu");
+    expect(JSON.stringify(r.candidates)).not.toMatch(/[\u0000-\u001f\u007f-\u009f​‪-‮⁦-⁩]/u);
+  });
+
+  it("a DOI that is not a DOI is dropped; the candidate stays", async () => {
+    const items = [
+      { DOI: "not-a-doi", type: "book", title: ["Distinction"], author: [{ family: "Bourdieu" }] },
+      { DOI: "10.5555/has space", type: "book", title: ["The Forms of Capital"], author: [{ family: "Bourdieu" }] },
+      { DOI: 42, type: "book", title: ["Homo Academicus"], author: [{ family: "Bourdieu" }] },
+    ];
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), JSON.stringify({ message: { items } }));
+    const r = await search("Bourdieu, Distinction", ctx(client()), ["crossref"]);
+    expect(r.candidates).toHaveLength(3);
+    for (const c of r.candidates) expect(c.identifiers.doi).toBeUndefined();
+  });
+
+  it("the same DOI in two cases, from both services or twice from one, is one candidate", async () => {
+    const items = [
+      { DOI: "10.5555/AO.Find.Same", type: "book", title: ["Distinction"], author: [{ family: "Bourdieu" }] },
+      { DOI: "10.5555/ao.find.same", type: "book", title: ["Distinction (reprint)"], author: [{ family: "Bourdieu" }] },
+    ];
+    const oa = { results: [{ doi: "https://doi.org/10.5555/ao.FIND.same", title: "Distinction", publication_year: 1984, type: "book", authorships: [{ author: { display_name: "Pierre Bourdieu" } }] }] };
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), JSON.stringify({ message: { items } }));
+    answer("https://api.openalex.org", oaPath("Bourdieu, Distinction"), JSON.stringify(oa));
+    const r = await search("Bourdieu, Distinction", ctx(client()));
+    expect(r.candidates).toHaveLength(1);
+    expect(r.candidates[0]!.identifiers.doi).toBe("10.5555/ao.find.same");
+    expect(r.candidates[0]!.providers).toEqual(["crossref", "openalex"]);
+    expect(r.candidates[0]!.issued).toBe("1984"); // filled from OpenAlex
+  });
+
+  it("records without an author are not merged by their title alone", async () => {
+    const items = [
+      { DOI: "10.5555/ao.find.annual.a", type: "report", title: ["Annual Report"] },
+      { type: "report", title: ["Annual Report"] },
+    ];
+    answer("https://api.crossref.org", crPath("Annual Report"), JSON.stringify({ message: { items } }));
+    const r = await search("Annual Report", ctx(client()), ["crossref"]);
+    expect(r.candidates).toHaveLength(2);
+    expect(new Set(r.candidates.map((c) => c.id)).size).toBe(2);
+  });
+
+  it("an empty or whitespace title in a candidate drops that candidate", async () => {
+    const items = [
+      { DOI: "10.5555/ao.find.blank", type: "book", title: ["   "], author: [{ family: "Bourdieu" }] },
+      { DOI: "10.5555/ao.find.ctrl", type: "book", title: ["\u0000‮​"], author: [{ family: "Bourdieu" }] },
+      { DOI: "10.5555/ao.find.none", type: "book", author: [{ family: "Bourdieu" }] },
+    ];
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), JSON.stringify({ message: { items } }));
+    const r = await search("Bourdieu, Distinction", ctx(client()), ["crossref"]);
+    expect(r).toEqual({ candidates: [], notes: [] });
+  });
+
+  it("a candidate with 500 creators keeps 100", async () => {
+    const author = Array.from({ length: 500 }, (_, i) => ({ given: "Ann", family: `Fixture${i}` }));
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), JSON.stringify({ message: { items: [{ DOI: "10.5555/ao.find.crowd", type: "journal-article", title: ["Distinction"], author }] } }));
+    const r = await search("Bourdieu, Distinction", ctx(client()), ["crossref"]);
+    expect(r.candidates[0]!.creators).toHaveLength(100);
+    // The 101st author and later are not considered.
+    expect(scoreCandidate(ref("Fixture300 Distinction"), r.candidates[0]!).creator).toBe(false);
+    expect(scoreCandidate(ref("Fixture99 Distinction"), r.candidates[0]!).creator).toBe(true);
+  });
+
+  it("a network failure of one service is a note; of both, two notes", async () => {
+    answer("https://api.crossref.org", crPath("Bourdieu, Distinction"), "", 400);
+    openalex("Bourdieu, Distinction", "openalex-distinction.json");
+    const r = await search("Bourdieu, Distinction", ctx(client()));
+    expect(r.notes).toEqual(["crossref-failed"]);
+    // Nothing intercepted: the mock refuses to connect.
+    const both = await search("Somebody, Something else", ctx(client()));
+    expect(both).toEqual({ candidates: [], notes: ["crossref-failed", "openalex-failed"] });
+  });
+});
+
+describe("the lookup client's per-host concurrency", () => {
+  it("Crossref is asked one request at a time by default", () => {
+    expect(DEFAULT_CONCURRENCY).toEqual({ "api.crossref.org": 1 });
+  });
+
+  it("a host limited to 1 never has two requests open; an unlimited host may", async () => {
+    let open = 0;
+    let most = 0;
+    const server = createServer((_req, res) => {
+      open++;
+      most = Math.max(most, open);
+      setTimeout(() => {
+        open--;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+      }, 40);
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+    const real = new Agent();
+    try {
+      const run = async (concurrency: Record<string, number>) => {
+        most = 0;
+        const http = new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: real, env: {}, rateLimits: { "127.0.0.1": 1000 }, concurrency, maxRetries: 0 });
+        await Promise.all([1, 2, 3, 4].map((k) => http.getJson(`http://127.0.0.1:${port}/c${k}?${Math.random()}`, { cacheKey: `c:${k}:${Math.random()}` })));
+        return most;
+      };
+      expect(await run({ "127.0.0.1": 1 })).toBe(1);
+      expect(await run({})).toBeGreaterThan(1);
+    } finally {
+      await real.close();
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("places are handed out first in, first out: a newcomer cannot overtake a waiter (M2)", async () => {
+    const http = client({ concurrency: { "h.example": 1 } });
+    const h = http as unknown as { hold(host: string): Promise<() => void> };
+    const order: string[] = [];
+    const first = await h.hold("h.example");
+    const w = h.hold("h.example").then((give) => {
+      order.push("W");
+      give();
+    });
+    first(); // the place goes to W, which was waiting …
+    const newcomers = [0, 1, 2, 3, 4].map((i) =>
+      h.hold("h.example").then((give) => {
+        order.push(`N${i}`);
+        give();
+      }),
+    ); // … even though these ask in the same tick
+    await Promise.all([w, ...newcomers]);
+    expect(order).toEqual(["W", "N0", "N1", "N2", "N3", "N4"]);
+  });
+
+  it("a failed request gives its turn back", async () => {
+    agent.get("https://api.crossref.org").intercept({ path: "/a", method: "GET" }).replyWithError(new Error("reset"));
+    agent.get("https://api.crossref.org").intercept({ path: "/b", method: "GET" }).reply(200, "{}", JSON_HEADERS);
+    const http = client({ maxRetries: 0 });
+    await expect(http.getJson("https://api.crossref.org/a", { cacheKey: "t:a" })).rejects.toThrow();
+    await expect(http.getJson("https://api.crossref.org/b", { cacheKey: "t:b" })).resolves.toEqual({});
+  });
+});
+
+describe("twelve typed lines (the report's table)", () => {
+  const cases: Array<[line: string, crossrefFile: string, openalexFile: string, kind: "sure" | "choose" | "none"]> = [
+    ["Bourdieu, Distinction", "crossref-distinction.json", "openalex-distinction.json", "choose"],
+    ["Bourdieu, Distinction 1984", "crossref-distinction.json", "openalex-distinction.json", "sure"],
+    ["Bourdieu, Distinction", "crossref-distinction-editions.json", "openalex-empty.json", "choose"],
+    ["Bourdieu, Distinction", "crossref-distinction-translation.json", "openalex-empty.json", "choose"],
+    ["Bourdieu, Distinction", "crossref-distinction-other-author.json", "openalex-empty.json", "choose"],
+    ["Distinction", "crossref-distinction.json", "openalex-empty.json", "choose"],
+    ["Bourdieu, Distinction 1986", "crossref-distinction.json", "openalex-distinction.json", "choose"],
+    ["Bourdieu, Distinction 1985", "crossref-distinction.json", "openalex-distinction.json", "sure"],
+    ["Bourdieu, Distinction 1984, Paris Minuit", "crossref-distinction.json", "openalex-distinction.json", "choose"],
+    ["Bourdieu, Distinction 1984, Minuit", "crossref-distinction.json", "openalex-distinction.json", "choose"],
+    ["Bourdieu, Distinction 1984 vol II", "crossref-distinction.json", "openalex-distinction.json", "choose"],
+    [`"weak ties" Granovetter 1973`, "crossref-weak-ties.json", "openalex-empty.json", "choose"],
+    ["Granovetter, The Strength of Weak Ties, 1973", "crossref-weak-ties.json", "openalex-empty.json", "sure"],
+    ["Okafor, Rivers and Memory in Upland Villages", "crossref-preprint-article.json", "openalex-empty.json", "choose"],
+    ["Muller, Feldforschung im Gebirge", "crossref-diacritics.json", "openalex-empty.json", "sure"],
+    ["日本の思想丸山眞男", "crossref-japanese.json", "openalex-empty.json", "sure"],
+    ["Weber, Economy and Society", "crossref-empty.json", "openalex-empty.json", "none"],
+  ];
+  it.each(cases)("%s with %s and %s → %s", async (line, cr, oa, kind) => {
+    crossref(line, cr);
+    openalex(line, oa);
+    const { candidates, notes: n } = await search(line, ctx(client()));
+    expect(n).toEqual([]);
+    expect(decideMatch(ref(line), candidates).kind).toBe(kind);
+  });
+});
+
+describe("decideMatch is pure and bounded", () => {
+  it("returns ids only of the candidates given, likeliest first", () => {
+    const list = [cand({ id: "x", title: "Taste" }), cand({ id: "y", title: "Distinction" }), cand({ id: "z", title: "Distinction", identifiers: { isbn: ["9780000000019"] } })];
+    const d = decideMatch(ref("Bourdieu Distinction"), list);
+    expect(d.kind).toBe("choose");
+    expect(d.kind === "choose" && d.ids).toEqual(["y", "z", "x"]);
+  });
+
+  it("notes are of the declared kinds only", () => {
+    const kinds: SearchNote[] = ["openalex-budget", "crossref-failed", "openalex-failed"];
+    expect(kinds).toHaveLength(3);
+  });
+});
