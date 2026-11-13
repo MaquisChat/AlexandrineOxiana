@@ -39,6 +39,13 @@ const WORKER = JSON.stringify({
 });
 
 describe("About", () => {
+  it("says the app itself is free software under the GNU Affero General Public License, version 3 or later", () => {
+    render(<About />);
+    expect(screen.getByRole("heading", { level: 1, name: "About and third-party notices" })).toBeTruthy();
+    const own = screen.getByText(/Alexandrine Oxiana itself is free software/);
+    expect(own.textContent).toContain("GNU Affero General Public License, version 3 or (at your option) any later version");
+  });
+
   it("shows the citeproc-js notice with what CPAL-1.0 section 3.6 calls for, from the CSL NOTICE", () => {
     render(<About />);
     expect(screen.getByRole("heading", { level: 1, name: "About and third-party notices" })).toBeTruthy();

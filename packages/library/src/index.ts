@@ -193,6 +193,16 @@ export {
   zoteroWebSince,
 } from "./import/zotero-web.js";
 export type { ZoteroWebAdapter, ZoteroWebOptions, ZoteroWebScanResult } from "./import/zotero-web.js";
+export {
+  ZOTERO_ACCOUNT_MAX_WAIT_MS,
+  ZOTERO_ACCOUNT_MESSAGES,
+  ZOTERO_KEY_CHECK_TIMEOUT_MS,
+  ZOTERO_UNCHANGED_TIMEOUT_MS,
+  ZoteroAccountError,
+  checkZoteroKey,
+  zoteroLibraryUnchanged,
+} from "./import/zotero-web-account.js";
+export type { ZoteroAccountReason, ZoteroKeyAccess } from "./import/zotero-web-account.js";
 export { SECRET_NAMES, SECRET_SERVICE, SECRET_STORE_UNAVAILABLE, SecretStoreUnavailableError, deleteSecret, getSecret, setSecret } from "./secrets.js";
 export type { SecretName } from "./secrets.js";
 export { DEIDENTIFIED_NOTE, REFMAN_FORMATS, exportRefman, writeRefmanExport } from "./export/refman-export.js";

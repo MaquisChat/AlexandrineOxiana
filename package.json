@@ -1,6 +1,7 @@
 {
   "name": "alexandrine-oxiana",
   "private": true,
+  "license": "AGPL-3.0-or-later",
   "type": "module",
   "packageManager": "pnpm@10.28.0",
   "engines": { "node": ">=22" },
@@ -9,7 +10,7 @@
     "typecheck": "pnpm -r typecheck",
     "test": "vitest run --passWithNoTests --reporter=default --reporter=json --outputFile.json=reports/vitest.json",
     "test:scale": "vitest run --config packages/library/vitest.scale.config.ts",
-    "test:scripts": "node --test scripts/test-report.test.mjs scripts/e2e-args.test.mjs scripts/build-sidecars.test.mjs scripts/notices/licence-texts.test.mjs apps/browser-extension/scripts/package.test.mjs",
+    "test:scripts": "node --test scripts/test-report.test.mjs scripts/e2e-args.test.mjs scripts/build-sidecars.test.mjs scripts/notices/licence-texts.test.mjs scripts/licence.test.mjs apps/browser-extension/scripts/package.test.mjs",
     "test:py": "node scripts/run-pytest.mjs",
     "e2e": "node scripts/run-e2e.mjs",
     "report": "node scripts/test-report.mjs",

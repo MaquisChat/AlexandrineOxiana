@@ -49,3 +49,14 @@ Node 22+, pnpm 10 (pnpm 9 or later works), Python 3.12+.
 | `pnpm report` | Write a plain-language summary to `reports/test-report.md` |
 
 When you add a test file, add a line for it to the table at the top of `scripts/test-report.mjs` so the report uses a friendly area name.
+
+## Licence
+
+Alexandrine Oxiana
+Copyright (C) 2026 the Alexandrine Oxiana authors
+
+This program is free software, under the GNU Affero General Public License, version 3 or (at your option) any later version, as published by the Free Software Foundation: you can redistribute it and modify it under the terms of that licence.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+The full text of the GNU Affero General Public License, version 3, is in the file `LICENSE`. The licences of the software and fonts the app is built with are listed in its About screen.

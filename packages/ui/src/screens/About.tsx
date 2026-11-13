@@ -317,6 +317,7 @@ export function About({ notices = BUILT_NOTICES, licenceTexts = BUILT_LICENCE_TE
   return (
     <main className="ao-page" aria-labelledby="ao-about-title">
       <h1 id="ao-about-title">About and third-party notices</h1>
+      <p>Alexandrine Oxiana itself is free software, under the GNU Affero General Public License, version 3 or (at your option) any later version.</p>
       <p>Alexandrine Oxiana is built with the work of others. Their notices and licences follow.</p>
 
       <section aria-labelledby="ao-about-csl" className="ao-card">
