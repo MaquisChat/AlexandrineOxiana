@@ -415,7 +415,8 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
       // the journal cannot be read (the project locked under it): the run's own counts stand
     }
     run.counts = detail.counts;
-    const hosts = sr.refusedHosts.slice(0, ZOTERO_SYNC_MAX_HOSTS);
+    // Host names only, in the form the history file accepts (one odd name must not make the record unsaveable).
+    const hosts = sr.refusedHosts.filter((h) => /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/u.test(h)).slice(0, ZOTERO_SYNC_MAX_HOSTS);
     if (hosts.length) run.refusedHosts = hosts;
     const asked = askedBackoff(sr.backoffUntil, now());
     const closed = isClosed(repoLibrary(deps.repo));

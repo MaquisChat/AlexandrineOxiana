@@ -284,7 +284,7 @@ describe("the plan's tests", () => {
 
   it("an unfinished sync batch is resumed, not started again", async () => {
     const p = await project();
-    await articles(6, U, true);
+    await articles(24, U, true);
     const ctl = new AbortController();
     const onBatch = (_p: string, h: BatchHandle) => {
       void (async () => {
@@ -301,9 +301,9 @@ describe("the plan's tests", () => {
     expect(resumed.outcome).toBe("finished");
     expect(resumed.batchId).toBe(stopped.batchId);
     expect((await batchDirs(repo, p.id)).length).toBe(dirs);
-    expect(sourceCount(p)).toBe(6);
+    expect(sourceCount(p)).toBe(24);
     // No file twice: the resumed part asked only for the files of the items the first part did not finish.
-    expect(filesRequested() - files).toBeLessThanOrEqual(6 - 2);
+    expect(filesRequested() - files).toBeLessThanOrEqual(24 - 2);
     expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
     expect((await stored()).fullDone).toBe(true);
   });
@@ -535,7 +535,8 @@ describe("every way a run ends leaves one honest record", () => {
 
   it("the library closing under it (the batch suspended, as on close) is stopped / app-closed", async () => {
     const p = await project();
-    await articles(4);
+    // Enough items that the suspend lands before the batch can finish (with a few, "finished" would be the truth).
+    await articles(60);
     const onBatch = (_p: string, h: BatchHandle) => void h.suspend();
     const r = await sync(await linked(linkOf(p)), {}, { onBatch });
     expect(r).toMatchObject({ outcome: "stopped", reason: "app-closed", batchId: expect.any(String) });
