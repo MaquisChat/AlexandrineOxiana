@@ -28,10 +28,19 @@
  * quote still matches the text under it is worked out from each drawn page's text as PdfPages read
  * it (`onPageText`, the one guarded read, A7), never by reading a page again: `changed` grows as
  * pages are drawn; a highlight on a page not drawn yet is not checked and nothing is said of it.
- * HighlightNotices says which have changed and which lie on a page the file does not have (until
- * the list of Task R9 says it beside each entry). Everything of the annotations — the list, the
- * page texts kept to check them, the verdicts, the choice — goes with the document: when it fails
- * (A7), when the screen ends (A9) or leaves; a list answer arriving after that is dropped.
+ * Everything of the annotations — the list, the page texts kept to check them, the verdicts, the
+ * choice — goes with the document: when it fails (A7), when the screen ends (A9) or leaves; a list
+ * answer arriving after that is dropped.
+ *
+ * The annotation list (Task R9, AnnotationList) stands beside the pages: it says which highlights
+ * have changed and which lie on a page the file does not have (A11: R8's temporary region is gone),
+ * and it is where a list that could not be had is said, with "Try again". "Go to" moves to the
+ * highlight's page, gives that page's box the focus (whatever its role, A10), chooses the highlight
+ * on it and brings it into view; a highlight clicked on the page is chosen in the list. Each change
+ * (a note, a colour, a delete) goes to the service, and what is shown afterwards is the service's
+ * answer. A 423 answered to any of them ends the reader as locked at once, by the same path as a
+ * refused range (A9, A11); an answer arriving after the document ended or the file changed is
+ * dropped (AnswerDropped), so nothing of it is ever shown.
  *
  * A11 (Ruling R209): no verdict when the quote is under four letters, a rectangle touches vertical
  * text, the page has no text, or the annotation also lies on another file. A 423 answered to the list
@@ -44,11 +53,12 @@ import { READER_PDF_MAX_BYTES } from "@ao/shared";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { ApiClientError } from "../api/client";
 import type { SourceAvailability } from "../api/library";
-import type { AnnotationRecord, ReaderApi } from "../api/reader";
+import type { AnnotationRecord, HighlightColourName, ReaderApi } from "../api/reader";
 import { AvailabilityMark } from "../components/AvailabilityMark";
 import { UserText } from "../components/UserText";
 import { inAppLink, libraryHref } from "../navigation";
-import { HighlightLayer, HighlightNotices } from "../reader/HighlightLayer";
+import { AnnotationList, AnswerDropped, ListBroughtUpToDate } from "../reader/AnnotationList";
+import { HighlightLayer } from "../reader/HighlightLayer";
 import { MAX_RENDERED_PAGES, PdfPages, type TextContent, type ViewRotation } from "../reader/PdfPages";
 import { openPdf, toPdfOpenError, type PdfHandle, type PdfOpenError } from "../reader/pdfjs";
 import { createRangeTransport } from "../reader/rangeTransport";
@@ -163,8 +173,8 @@ function stateOf(err: unknown, lastRangeError: unknown): { state: ReaderStateKin
 }
 
 const NO_IDS: ReadonlySet<string> = new Set();
-/** Said when the list of annotations could not be had (the service's own sentence follows). */
-export const ANNOTATIONS_NOT_SHOWN = "The highlights of this file could not be shown";
+/** Said when the list of annotations could not be had (the list says it now, A11). */
+export { ANNOTATIONS_NOT_SHOWN } from "../reader/AnnotationList";
 const hasText = (t: TextContent) => t.items.some((i) => "str" in i && i.str.trim() !== "");
 
 const typing = (t: EventTarget | null) => t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement || (t instanceof HTMLElement && t.isContentEditable);
@@ -225,6 +235,17 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     setPhase({ kind: "failed", ...s, attempt: attempts.current });
   }, []);
 
+  /** A 423 while open (A11): locked, by the same path as a refused range (A7, A9): destroyed at once, never reused. */
+  const endLocked = useCallback(
+    (h: PdfHandle) => {
+      if (current.current !== h) return;
+      current.current = undefined;
+      void h.destroy().catch(() => {});
+      fail({ state: "locked", sentence: READER_STATES.locked.sentence });
+    },
+    [fail],
+  );
+
   /** Ends the open document, if any: destroyed, dropped, never used again. */
   const close = useCallback(() => {
     const h = current.current;
@@ -279,14 +300,20 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     [assetId, projectId, sourceId, close, fail],
   );
 
-  useEffect(() => {
-    void open();
-    return () => {
+  // Letting go of the document (the screen goes, the file changes) happens in a LAYOUT effect's
+  // clean-up: in the same commit that takes the pages away, before whatever is shown in their place
+  // is laid out (A9: the reader ends at once). Opening stays a passive effect.
+  useLayoutEffect(
+    () => () => {
       gen.current++;
       abort.current?.abort();
       close();
-    };
-  }, [open, close]);
+    },
+    [open, close],
+  );
+  useEffect(() => {
+    void open();
+  }, [open]);
 
   useLayoutEffect(() => {
     const b = focusedPair.current;
@@ -339,9 +366,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
         if (!alive() || ac.signal.aborted || isAbort(e)) return;
         if (e instanceof ApiClientError && e.status === 423) {
           // A11: locked — the same path as a refused range (A7, A9): destroyed at once, never reused.
-          current.current = undefined;
-          void handle.destroy().catch(() => {});
-          fail({ state: "locked", sentence: READER_STATES.locked.sentence });
+          endLocked(handle);
           return;
         }
         if (e instanceof ApiClientError && e.status === 404) inDoubt.current?.();
@@ -351,7 +376,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
       on = false;
       ac.abort();
     };
-  }, [handle, projectId, sourceId, listAttempt, fail]);
+  }, [handle, projectId, sourceId, listAttempt, endLocked]);
 
   // Everything of the annotations goes with the document.
   useEffect(() => {
@@ -455,13 +480,95 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     focusTo.current = undefined;
     area.current?.querySelector<HTMLElement>(`[data-page-number="${n}"]`)?.focus({ preventScroll: true });
   };
+  /** The highlight "Go to" chose and its page, to bring into view once that page is drawn. */
+  const jumpTo = useRef<{ id: string; page: number } | undefined>(undefined);
   const goTo = (n: number, toPage: boolean) => {
     if (!count) return;
     const to = Math.min(Math.max(1, Math.round(n)), count);
+    // Moving to another page than "Go to" chose ends that wait (M9).
+    if (jumpTo.current && jumpTo.current.page !== to) jumpTo.current = undefined;
     if (toPage) focusPage(to, to !== page);
     setPage(to);
     setDraft(String(to));
   };
+  // Once the chosen highlight is drawn on its page (a state, waited for however long it takes: A13,
+  // M9) it is brought into view; the page's box keeps the focus. The wait ends when the page is drawn,
+  // when another page is gone to, or with the document.
+  useEffect(() => {
+    const want = jumpTo.current;
+    const root = area.current;
+    if (want === undefined || phase.kind !== "open" || !root) return;
+    const find = () => [...root.querySelectorAll<HTMLElement>(".ao-hl")].find((m) => m.dataset.annotation === want.id);
+    const bring = (mark: HTMLElement) => {
+      jumpTo.current = undefined;
+      mark.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    };
+    const now = find();
+    if (now) return bring(now);
+    const watch = new MutationObserver(() => {
+      if (jumpTo.current !== want) return watch.disconnect();
+      const mark = find();
+      if (mark) {
+        watch.disconnect();
+        bring(mark);
+      }
+    });
+    watch.observe(root, { childList: true, subtree: true });
+    return () => watch.disconnect();
+  });
+  /** "Go to" (R9): the highlight's first page in this file, that page's box focused, the highlight chosen. */
+  const onJump = (id: string) => {
+    const pages = fileAnnotations?.find((a) => a.id === id)?.pdfAnchors.map((x) => x.page).filter((p) => p >= 1 && p <= count) ?? [];
+    if (pages.length === 0) return;
+    setSelectedId(id);
+    jumpTo.current = { id, page: Math.min(...pages) };
+    goTo(Math.min(...pages), true);
+  };
+
+  /**
+   * One change asked of the service (R9). What is shown afterwards is the service's answer. An answer
+   * that arrives after the document ended or another was opened is dropped (AnswerDropped: the list
+   * shows nothing for it); a 423 ends the reader as locked at once (A9, A11); any other refusal is
+   * handed to the list, which shows the service's sentence. A 404 (the annotation deleted elsewhere,
+   * or the project gone): the list is asked for again and the route asked whether the project is still
+   * there (A10, A13); the list says so (ListBroughtUpToDate).
+   */
+  const change = async <T,>(ask: (api: ReaderApi) => Promise<T>, apply: (answer: T) => void): Promise<void> => {
+    const h = current.current;
+    if (!h || h.dead) throw new AnswerDropped();
+    const alive = () => current.current === h && !h.dead;
+    let answer: T;
+    try {
+      answer = await ask(apiRef.current);
+    } catch (e) {
+      if (!alive()) throw new AnswerDropped();
+      if (e instanceof ApiClientError && e.status === 423) {
+        endLocked(h);
+        throw new AnswerDropped();
+      }
+      if (e instanceof ApiClientError && e.status === 404) {
+        setListAttempt((n) => n + 1);
+        inDoubt.current?.();
+        throw new ListBroughtUpToDate();
+      }
+      throw e;
+    }
+    if (!alive()) throw new AnswerDropped();
+    apply(answer);
+  };
+  const replace = (r: AnnotationRecord) => setAnnotations((list) => list?.map((a) => (a.id === r.id ? r : a)));
+  const onSaveNote = (id: string, body: string | null) => change((api) => api.updateAnnotation(projectId, sourceId, id, { body }), replace);
+  const onRecolour = (id: string, colorName: HighlightColourName) => change((api) => api.updateAnnotation(projectId, sourceId, id, { colorName }), replace);
+  const onDelete = (id: string) =>
+    change(
+      (api) => api.deleteAnnotation(projectId, sourceId, id),
+      (r) => {
+        setAnnotations((list) => list?.filter((a) => a.id !== r.id));
+        setChanged((c) => (c.has(r.id) ? new Set([...c].filter((x) => x !== r.id)) : c));
+        setSelectedId((s) => (s === r.id ? undefined : s));
+      },
+    );
+
   const zoomBy = (dir: 1 | -1) => setScale((s) => (dir > 0 ? (ZOOM_STEPS.find((z) => z > s + 1e-9) ?? ZOOM_MAX) : ([...ZOOM_STEPS].reverse().find((z) => z < s - 1e-9) ?? ZOOM_MIN)));
 
   const fitWidth = async () => {
@@ -664,26 +771,30 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
           </button>
         </span>
       </div>
-      {annotationsError !== undefined && (
-        <div className="ao-reader-notice">
-          <p role="alert">
-            {ANNOTATIONS_NOT_SHOWN}: <UserText>{annotationsError}</UserText>
-          </p>
-          <button
-            type="button"
-            onClick={() => {
+      <div className="ao-reader-body">
+        <div className="ao-reader-area" ref={area} onKeyDown={onAreaKey}>
+          <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} />
+        </div>
+        {(annotations !== undefined || annotationsError !== undefined) && (
+          <AnnotationList
+            annotations={annotations ?? []}
+            assetId={assetId}
+            {...(selectedId !== undefined ? { selectedId } : {})}
+            readOnly={readOnly}
+            pageCount={count}
+            changed={changed}
+            {...(annotationsError !== undefined ? { loadError: annotationsError } : {})}
+            onRetry={() => {
               // One request a press: the button goes with the error until the answer.
               setAnnotationsError(undefined);
               setListAttempt((n) => n + 1);
             }}
-          >
-            Try again
-          </button>
-        </div>
-      )}
-      {fileAnnotations && <HighlightNotices annotations={fileAnnotations} pageCount={count} changed={changed} />}
-      <div className="ao-reader-area" ref={area} onKeyDown={onAreaKey}>
-        <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} />
+            onJump={onJump}
+            onSaveNote={onSaveNote}
+            onRecolour={onRecolour}
+            onDelete={onDelete}
+          />
+        )}
       </div>
     </div>
   );
