@@ -1904,9 +1904,17 @@ processing:
       const { p: key, att } = await withHighlightedFile("Imported before Z4");
       await run(p);
       const before = await sourceOf(p, key);
-      // The journal as the code before this task wrote it: `ext` with the id and the token, no parts.
-      await rewriteJournal(p, 1, (e) => (e.ext ? { ...e, ext: { id: e.ext.id, version: e.ext.version } } : e));
-      expect((await journal(p, 1)).every((e) => !e.ext?.parts)).toBe(true);
+      // The journal line as the code BEFORE this task wrote it for this very item (I3): `ext` with the id and the
+      // token that code computed, and no parts. The token below was produced by the pre-Z4 adapter (7ca50c9's
+      // zotero-web.ts, scanning the same stand-in library: the stand-in's keys and versions are deterministic),
+      // and is written here literally, so that any change to the token's computation makes this item "updated".
+      const OLD_EXT = { id: "user:42/22222DD5", version: "w1-0fb11037c4fab05f" };
+      expect(`${U}/${key}`).toBe(OLD_EXT.id);
+      // The new code computes the same token for the same item (an "unchanged" count alone would not show it:
+      // a changed token on an unchanged item also ends "unchanged", through the update path).
+      expect((await journal(p, 1)).find((e) => e.ext)!.ext.version).toBe(OLD_EXT.version);
+      await rewriteJournal(p, 1, (e) => (e.ext ? { ...e, ext: OLD_EXT } : e));
+      expect((await journal(p, 1)).filter((e) => e.ext).map((e) => e.ext)).toEqual([OLD_EXT]);
       z.requests.length = 0;
       const second = await run(p, { full: true });
       // The same token: unchanged. The file is fetched once more (nothing says it is stored) and dropped by its hash.
@@ -1915,8 +1923,11 @@ processing:
       const after = await sourceOf(p, key);
       expect(after.assets.map((a) => a.id)).toEqual(before.assets.map((a) => a.id));
       expect(after).toEqual(before);
-      // That run wrote the part: never again.
-      expect((await journal(p, 2)).find((e) => e.ext?.id === `${U}/${key}`)!.ext.parts).toEqual({ [att]: { v: expect.any(Number), sha256: before.assets[0]!.sha256 } });
+      // That run matched the old line's token (no update) and wrote the part: never again.
+      const line2 = (await journal(p, 2)).find((e) => e.ext?.id === `${U}/${key}`)!;
+      expect(line2.ext.version).toBe(OLD_EXT.version);
+      expect(line2.snapshot).toBeUndefined(); // nothing was written to the source
+      expect(line2.ext.parts).toEqual({ [att]: { v: expect.any(Number), sha256: before.assets[0]!.sha256 } });
       z.requests.length = 0;
       const third = await run(p, { full: true });
       expect(third.r.counts).toMatchObject({ unchanged: 1, failed: 0 });
