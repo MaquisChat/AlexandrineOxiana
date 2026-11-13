@@ -15,6 +15,8 @@ import {
   newId,
   primary,
   timeZoneName,
+  Project,
+  WatchedFolderOptions,
 } from "../index.js";
 
 describe("project time zone (Task 58, R93)", () => {
@@ -295,5 +297,28 @@ describe("ImportOptions / ImportBatch", () => {
       counts: { created: 0, merged: 0, skipped: 0, failed: 0, needsReview: 0 },
     };
     expect(ImportBatch.parse(b).options.ocr).toBe(true);
+  });
+});
+
+describe("watched folder options (cloud-drive folders, Task W3)", () => {
+  it("watched folder options take a collection id", () => {
+    const id = newId();
+    expect(WatchedFolderOptions.parse({ collectionId: id })).toEqual({ recursive: false, collectionId: id });
+    expect(() => WatchedFolderOptions.parse({ collectionId: "not an id" })).toThrow();
+  });
+
+  it("an old project.json without collectionId parses", () => {
+    const old = {
+      id: newId(),
+      name: "Old",
+      folder: "Projects/Old",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      targetLanguages: [],
+      encryption: { enabled: false },
+      watchedFolders: [{ id: newId(), options: { label: "Inbox", recursive: true }, createdAt: "2026-01-01T00:00:00.000Z" }],
+    };
+    const p = Project.parse(old);
+    expect(p.watchedFolders![0]!.options).toEqual({ label: "Inbox", recursive: true });
+    expect(p.watchedFolders![0]!.options.collectionId).toBeUndefined();
   });
 });
