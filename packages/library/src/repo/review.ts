@@ -109,30 +109,65 @@ export async function resolveSettledCaptureEntries(core: RepoCore, tx: Tx, sf: R
 
 type Rechecked = { source: { id: string }; verification: Record<string, { status: string; reason?: string }> };
 
+/** What one change queued in one entry: the audit's `reviewQueued` items. */
+export type QueuedConflicts = { entry: string; fields: string[] };
+
+/** The pending capture-conflict entries of a source (only these hold a conflicting field open, R193 a). */
+const pendingCaptureEntries = (entries: ReviewEntry[], sourceId: string) =>
+  entries.filter((e) => e.status === "pending" && e.sourceId === sourceId && reviewCauseOf(e)?.kind === "capture-conflict");
+
+/** The fields of `sf` in conflict that no pending capture-conflict entry lists as in conflict. */
+function unlistedConflicts(entries: ReviewEntry[], sf: Rechecked): string[] {
+  const listed = new Set(
+    pendingCaptureEntries(entries, sf.source.id).flatMap((e) =>
+      Object.entries(e.fields ?? {})
+        .filter(([, st]) => st === "conflict")
+        .map(([f]) => f),
+    ),
+  );
+  return Object.keys(sf.verification).filter((f) => sf.verification[f]!.status === "conflict" && !listed.has(f));
+}
+
+/** Without writing: whether a recheck must queue a conflict (R193 b), so a recheck that changes no verification still runs. */
+export async function hasUnlistedConflicts(core: RepoCore, st: ProjectState, sf: Rechecked): Promise<boolean> {
+  return unlistedConflicts(await readReviewEntries(core, st), sf).length > 0;
+}
+
 /**
- * Inside a running mutation that has just written `after` with a recomputed report (R190 a): every
- * field the change left newly in conflict (not in conflict in `before`'s report) that no pending
- * entry of the source already lists is queued in this same change: the source's pending
- * capture-conflict entry is extended with it (one entry per source), or, when there is none, a new
- * one is written, its cause recorded as a later check. A field the researcher confirmed is never in
- * conflict (the recheck keeps it user-confirmed), so it raises nothing. Returns what was queued.
+ * The invariant of R193 (b), inside a running mutation that has just written `after` with its
+ * verification report: every field of the source in conflict is listed, as in conflict, in a pending
+ * capture-conflict entry of the source. (A field the researcher confirmed is user-confirmed, never in
+ * conflict, so it raises nothing.) Only capture-conflict entries count (R193 a): an import entry that
+ * lists the field is settled by its decision, which says nothing about the conflict. A field a
+ * capture entry lists with another status ("unverified") is relisted as in conflict in that entry
+ * (review M1); any other goes into the source's pending capture-conflict entry (one per source), or,
+ * when there is none, into a new entry whose cause is recorded as a later check. This holds whether
+ * the conflict is new or was already there with no entry (a source D19 left behind). Returns what was
+ * written, per entry; empty when everything was already listed.
  */
-export async function queueNewConflicts(core: RepoCore, tx: Tx, before: Pick<Rechecked, "verification">, after: Rechecked): Promise<{ entry: string; fields: string[] } | undefined> {
-  const newly = Object.keys(after.verification).filter((f) => after.verification[f]!.status === "conflict" && before.verification[f]?.status !== "conflict");
-  if (newly.length === 0) return undefined;
-  const pending = (await readReviewEntries(core, tx.state)).filter((e) => e.status === "pending" && e.sourceId === after.source.id);
-  const listed = new Set(pending.flatMap((e) => Object.keys(e.fields ?? {})));
-  const fields = newly.filter((f) => !listed.has(f));
-  if (fields.length === 0) return undefined;
-  const reasons = fields.map((f) => after.verification[f]!.reason?.trim() || `A later check found conflicting values for ${f}.`);
-  const added = Object.fromEntries(fields.map((f) => [f, "conflict"]));
-  const open = pending.find((e) => reviewCauseOf(e)?.kind === "capture-conflict");
-  if (open) {
-    await writeReviewLine(core, tx, { ...open, fields: { ...open.fields, ...added }, reasons: [...open.reasons, ...reasons] });
-    return { entry: open.id, fields };
+export async function queueUnlistedConflicts(core: RepoCore, tx: Tx, after: Rechecked): Promise<QueuedConflicts[]> {
+  const entries = await readReviewEntries(core, tx.state);
+  const fields = unlistedConflicts(entries, after);
+  if (fields.length === 0) return [];
+  const reasonOf = (f: string) => after.verification[f]!.reason?.trim() || `A later check found conflicting values for ${f}.`;
+  const captures = pendingCaptureEntries(entries, after.source.id);
+  const byEntry = new Map<ReviewEntry, string[]>();
+  const fresh: string[] = [];
+  for (const f of fields) {
+    const home = captures.find((e) => f in (e.fields ?? {})) ?? captures[0];
+    if (home) byEntry.set(home, [...(byEntry.get(home) ?? []), f]);
+    else fresh.push(f);
   }
-  const entry = await appendReviewEntry(core, tx, { sourceId: after.source.id, fields: added, reasons, cause: { kind: "capture-conflict", foundBy: "later-check" } });
-  return { entry: entry.id, fields };
+  const out: QueuedConflicts[] = [];
+  for (const [e, fs] of byEntry) {
+    await writeReviewLine(core, tx, { ...e, fields: { ...e.fields, ...Object.fromEntries(fs.map((f) => [f, "conflict"])) }, reasons: [...e.reasons, ...fs.map(reasonOf)] });
+    out.push({ entry: e.id, fields: fs });
+  }
+  if (fresh.length) {
+    const e = await appendReviewEntry(core, tx, { sourceId: after.source.id, fields: Object.fromEntries(fresh.map((f) => [f, "conflict"])), reasons: fresh.map(reasonOf), cause: { kind: "capture-conflict", foundBy: "later-check" } });
+    out.push({ entry: e.id, fields: fresh });
+  }
+  return out;
 }
 
 /** The value a JSON pointer names ("/identifiers/doi"). */

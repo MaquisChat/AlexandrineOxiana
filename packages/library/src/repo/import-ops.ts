@@ -10,7 +10,7 @@ import { NotFoundError } from "./errors.js";
 import { decryptBytes, foldName, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
-import { appendReviewEntry, appendReviewUpdate, queueNewConflicts, readReviewEntries, resolveSettledCaptureEntries, type ReviewEntry, type ReviewInput } from "./review.js";
+import { appendReviewEntry, appendReviewUpdate, queueUnlistedConflicts, readReviewEntries, resolveSettledCaptureEntries, type ReviewEntry, type ReviewInput } from "./review.js";
 import { deleteSourceInTx, fileMode, readSourceFile, writeSourceFile } from "./sources.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
 import { addDeletions, clearDeletions, releaseDeletions, resetDeletions } from "./tombstones.js";
@@ -86,12 +86,11 @@ export function runImportChange<T>(
           // An existing source given a new report (a review decision's fields, a merge, an incremental
           // update): its capture entries are re-examined in this change. A new source has none yet.
           if (before && !isDeepStrictEqual(before.verification, parsed.verification)) {
-            // A field newly in conflict is queued first (R190 a), so an entry it extends is not resolved
-            // under it. Only a review decision rewrites an existing source's report here (a run's merges
+            // Every field in conflict is listed in a pending capture entry first (R193 b), so an entry it
+            // extends is not resolved under it. Only a review decision rewrites an existing source's report here (a run's merges
             // and updates, and the undo's reverts, leave it as it is); a batch's undo removes that source
             // and resolves the entry with it ("undone", R176 4).
-            const q = await queueNewConflicts(core, tx, before, parsed);
-            if (q) queued.push(q);
+            queued.push(...(await queueUnlistedConflicts(core, tx, parsed)));
             resolved.push(...(await resolveSettledCaptureEntries(core, tx, parsed, "recheck")));
           }
           tx.index((sink) => sink.indexSource(parsed));

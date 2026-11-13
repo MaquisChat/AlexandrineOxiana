@@ -32,7 +32,7 @@ import { readFullData, writeProjectData } from "./projects.js";
 import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
-import { appendReviewEntry, queueNewConflicts, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type ReexaminedBy, type ReviewInput } from "./review.js";
+import { appendReviewEntry, queueUnlistedConflicts, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type QueuedConflicts, type ReexaminedBy, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 
@@ -661,7 +661,7 @@ export async function updateSource(
   let resolved: string[] = [];
   let confirmed: FieldConfirmation[] = [];
   let by: ReexaminedBy | undefined;
-  let queued: { entry: string; fields: string[] } | undefined;
+  let queued: QueuedConflicts[] = [];
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
@@ -712,9 +712,10 @@ export async function updateSource(
       confirmed = (extra.confirmed ?? []).map((field) => ({ field, choice: deepEqual(atPointer(cur.source, field), atPointer(source, field)) ? "kept" : "changed" }));
       // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
       if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
-      // A field the recomputed report newly puts in conflict is queued for review in this change (R190 a),
-      // before the entries are re-examined, so an entry it extends is not resolved under it.
-      if (extra.verification) queued = await queueNewConflicts(core, tx, cur, sf);
+      // Every field the recomputed report has in conflict is listed in a pending capture-conflict entry,
+      // in this change (R193 b: new or left without one by D19), before the entries are re-examined, so
+      // an entry it extends is not resolved under it.
+      if (extra.verification) queued = await queueUnlistedConflicts(core, tx, sf);
       // The source's capture entries are re-examined in this change (R176 1): against the new report
       // when one was computed; after an ordinary edit, against the stored report and the source as edited.
       by = extra.resolveReview ?? (extra.verification ? "recheck" : "edit");
@@ -732,7 +733,7 @@ export async function updateSource(
         ...(confirmed.length ? { confirmed } : {}),
         ...(resolved.length ? { reviewResolved: { entries: resolved, by } } : {}),
         // One shape in every audit event that carries it: an array of { entry, fields } (here one element).
-        ...(queued ? { reviewQueued: [queued] } : {}),
+        ...(queued.length ? { reviewQueued: queued } : {}),
       }),
     },
   );
