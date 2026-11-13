@@ -49,6 +49,7 @@
  * failure leaves the PDF reading, with an alert and "Try again". The request is aborted when the
  * document ends.
  */
+import { matchAnnotations } from "@ao/core/annotations/match";
 import { READER_PDF_MAX_BYTES } from "@ao/shared";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { ApiClientError } from "../api/client";
@@ -57,7 +58,7 @@ import type { AnnotationRecord, HighlightColourName, ReaderApi } from "../api/re
 import { AvailabilityMark } from "../components/AvailabilityMark";
 import { UserText } from "../components/UserText";
 import { inAppLink, libraryHref } from "../navigation";
-import { AnnotationList, AnswerDropped, ListBroughtUpToDate } from "../reader/AnnotationList";
+import { AnnotationList, annotationsInReadingOrder, AnswerDropped, ListBroughtUpToDate } from "../reader/AnnotationList";
 import { HighlightLayer } from "../reader/HighlightLayer";
 import { MAX_RENDERED_PAGES, PdfPages, type TextContent, type ViewRotation } from "../reader/PdfPages";
 import { openPdf, toPdfOpenError, type PdfHandle, type PdfOpenError } from "../reader/pdfjs";
@@ -142,8 +143,16 @@ export interface ReaderScreenProps {
   sourceId: string;
   /** The PDF to open; none: the source has no PDF that can be shown. */
   assetId?: string;
-  /** An annotation to open at (Task R12). */
+  /** An annotation to open at (Task R12): its page is gone to, it is chosen and its entry focused; "That highlight or note is no longer there." if it is gone. */
   annotationId?: string;
+  /**
+   * The words of a library search, taken from the hand-over (Task R12). Held in this screen's state only
+   * until the list is in and they have been matched (R1's `matchAnnotations`), then dropped; never
+   * shown, stored or put in an address.
+   */
+  findWords?: string;
+  /** Called once when the words are no longer needed (matched, or the document ended), so that whoever held them lets go. */
+  onFindDone?(): void;
   readOnly: boolean;
   /** The source's availability, said with a missing file. */
   availability?: SourceAvailability;
@@ -179,7 +188,12 @@ const hasText = (t: TextContent) => t.items.some((i) => "str" in i && i.str.trim
 
 const typing = (t: EventTarget | null) => t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement || (t instanceof HTMLElement && t.isContentEditable);
 
-export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, availability, onProjectInDoubt }: ReaderScreenProps) {
+/** Said when a search's words are in none of this file's annotations exactly (Task R12). */
+export const FIND_NO_EXACT_MATCH = "None of this source's annotations contains all of these words exactly; the search may have matched another form of a word.";
+/** Said when the annotation the address names is not in the source (Task R12). */
+export const ANNOTATION_GONE = "That highlight or note is no longer there.";
+
+export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, findWords, onFindDone, readOnly, availability, onProjectInDoubt }: ReaderScreenProps) {
   const [phase, setPhase] = useState<Phase>({ kind: "opening" });
   const [page, setPage] = useState(1);
   const [scale, setScale] = useState(1);
@@ -229,6 +243,26 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
   const [listAttempt, setListAttempt] = useState(0);
   const inDoubt = useRef(onProjectInDoubt);
   inDoubt.current = onProjectInDoubt;
+
+  // Task R12: a search's words and an annotation to open at, held only until the list is in (the words
+  // are dropped as soon as they have been matched, and with the document), and what they led to.
+  const [finding, setFinding] = useState<string | undefined>(findWords);
+  const [wantId, setWantId] = useState<string | undefined>(annotationId);
+  const [filterIds, setFilterIds] = useState<ReadonlySet<string> | undefined>(undefined);
+  const [searchNote, setSearchNote] = useState<string | undefined>(undefined);
+  const [focusRequest, setFocusRequest] = useState<{ id: string; seq: number } | undefined>(undefined);
+  const focusSeq = useRef(0);
+  const findDone = useRef(onFindDone);
+  findDone.current = onFindDone;
+  const findHandedBack = useRef(false);
+  /** The words are no longer held here: whoever handed them over is told, once. */
+  const releaseFind = useCallback(() => {
+    setFinding(undefined);
+    if (!findHandedBack.current) {
+      findHandedBack.current = true;
+      findDone.current?.();
+    }
+  }, []);
 
   const fail = useCallback((s: { state: ReaderStateKind; sentence: string }) => {
     attempts.current++;
@@ -392,8 +426,14 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
       setAnnotationsError(undefined);
       setChanged(NO_IDS);
       setSelectedId(undefined);
+      // Task R12: nothing of a search or of the place asked for outlives the document.
+      setWantId(undefined);
+      setFilterIds(undefined);
+      setSearchNote(undefined);
+      setFocusRequest(undefined);
+      releaseFind();
     };
-  }, [handle, projectId, sourceId]);
+  }, [handle, projectId, sourceId, releaseFind]);
 
   /** This file's annotations, each with only its places in this file (A4); `partial`: those that also lie on another file (no verdict, A11). */
   const { fileAnnotations, partial } = useMemo(() => {
@@ -556,6 +596,48 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
     if (!alive()) throw new AnswerDropped();
     apply(answer);
   };
+  /** Task R12: opens at annotation `id` of this file: chosen, its page gone to, its entry focused (not the page: the list is where the researcher lands). */
+  const openAt = (id: string, ordered: AnnotationRecord[]) => {
+    const pages = ordered.find((a) => a.id === id)?.pdfAnchors.map((x) => x.page).filter((p) => p >= 1 && p <= count) ?? [];
+    setSelectedId(id);
+    // The page area's own first focus (on opening) must not take the focus from the entry.
+    focusTo.current = undefined;
+    setFocusRequest({ id, seq: ++focusSeq.current });
+    if (pages.length === 0) return;
+    jumpTo.current = { id, page: Math.min(...pages) };
+    goTo(Math.min(...pages), false);
+  };
+  const openAtNow = useRef(openAt);
+  openAtNow.current = openAt;
+
+  // Task R12: once the list is in (after the reader has opened and drawn: a macrotask later, never on the
+  // path that opens the document, A4) the words are matched among this file's annotations, in the list's
+  // reading order, with R1's `matchAnnotations`; the list is filtered to them and the first is opened. The
+  // words go at once (`releaseFind`). Else the annotation the address names is opened, or said to be gone.
+  useEffect(() => {
+    if (!handle || !fileAnnotations || !annotations || !assetId) return;
+    if (finding === undefined && wantId === undefined) return;
+    const timer = setTimeout(() => {
+      if (current.current !== handle || handle.dead) return;
+      const ordered = annotationsInReadingOrder(fileAnnotations, assetId);
+      if (finding !== undefined) {
+        const ids = matchAnnotations(ordered, finding);
+        releaseFind();
+        setWantId(undefined);
+        if (ids.length === 0) setSearchNote(FIND_NO_EXACT_MATCH);
+        else {
+          setFilterIds(new Set(ids));
+          openAtNow.current(ids[0]!, ordered);
+        }
+        return;
+      }
+      setWantId(undefined);
+      if (ordered.some((a) => a.id === wantId)) openAtNow.current(wantId!, ordered);
+      else if (!annotations.some((a) => a.id === wantId)) setSearchNote(ANNOTATION_GONE);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [handle, fileAnnotations, annotations, assetId, finding, wantId, releaseFind]);
+
   const replace = (r: AnnotationRecord) => setAnnotations((list) => list?.map((a) => (a.id === r.id ? r : a)));
   const onSaveNote = (id: string, body: string | null) => change((api) => api.updateAnnotation(projectId, sourceId, id, { body }), replace);
   const onRecolour = (id: string, colorName: HighlightColourName) => change((api) => api.updateAnnotation(projectId, sourceId, id, { colorName }), replace);
@@ -793,6 +875,11 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
             onSaveNote={onSaveNote}
             onRecolour={onRecolour}
             onDelete={onDelete}
+            {...(finding !== undefined ? { filterWords: finding } : {})}
+            {...(filterIds ? { filterIds } : {})}
+            {...(searchNote !== undefined ? { searchNote } : {})}
+            {...(focusRequest ? { focusRequest } : {})}
+            onShowAll={() => setFilterIds(undefined)}
           />
         )}
       </div>
