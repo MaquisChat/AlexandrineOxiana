@@ -77,6 +77,8 @@ describe("highlight tokens", () => {
     const rule = (sel: string) => new RegExp(`${sel.replace(/[.]/g, "\\.")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] ?? "";
     expect(rule(".ao-hl--underline.ao-hl--edge-bottom")).toMatch(/border-bottom: 3px solid var\(--hl-line\)/);
     expect(rule(".ao-hl--underline")).toMatch(/var\(--hl-edge\)/);
+    // Laid with multiply (A12): black letters under it stay black; over white the colour is unchanged.
+    expect(rule(".ao-hl--underline")).toMatch(/mix-blend-mode: multiply/);
     for (const name of HIGHLIGHT_COLOURS) expect(rule(`.ao-hl--${name}`)).toContain(`--hl-line: var(--hl-${name}-line)`);
   });
 

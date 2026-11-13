@@ -255,6 +255,9 @@
   --foot: 0 0 0 0 var(--hl-edge);
 
   box-shadow: var(--foot);
+
+  /* Black letters under the line stay black; over white paper the colour is unchanged. */
+  mix-blend-mode: multiply;
 }
 
 .ao-hl--underline.ao-hl--edge-bottom { border-bottom: 3px solid var(--hl-line); --foot: 0 1px 0 0 var(--hl-edge); }
