@@ -37,7 +37,7 @@ test("every npm manifest states exactly AGPL-3.0-or-later", () => {
 
 test("the desktop shell's Cargo.toml and the media worker's pyproject.toml state it too", () => {
   assert.match(read("apps/desktop/src-tauri/Cargo.toml"), new RegExp(`^license = "${ID}"$`, "m"));
-  assert.match(read("services/media-worker/pyproject.toml"), new RegExp(`^license = "${ID}"$`, "m"));
+  assert.match(read("services/media-worker/pyproject.toml"), new RegExp(`^license = \\{ text = "${ID}" \\}$`, "m"));
 });
 
 test("README.md carries the project's notice", () => {
