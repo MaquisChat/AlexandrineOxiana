@@ -13,6 +13,7 @@ import { appConfigDir, deviceDeps, deviceNoticesIdle, type Deps, type openLibrar
 import { Pairing, SHELL_ORIGINS, bearerOf, hostAllowed, isExtensionOrigin, queryCarriesToken, sameSecret, type PairingOptions } from "./auth.js";
 import { ApiError, errorBody, toApiError } from "./errors.js";
 import { ServiceState, defaultWorkerProvider, type WorkerProvider } from "./state.js";
+import { registerAnnotations } from "./routes/annotations.js";
 import { registerAppearance } from "./routes/appearance.js";
 import { registerAudit } from "./routes/audit.js";
 import { registerLibraryAudit } from "./routes/library-audit.js";
@@ -288,6 +289,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
+  registerAnnotations(app, ctx);
   registerCapture(app, ctx);
   registerImport(app, ctx);
   registerReview(app, ctx);
