@@ -61,22 +61,23 @@ struct Shell {
     relaunch: AtomicBool,
     /// Start-up failed: the program exits non-zero however its error window is closed.
     failed: AtomicBool,
-    /// The watched-folder chooser is open: a second request meanwhile answers null (one chooser at a time).
-    picking: AtomicBool,
+    /// The watched-folder chooser: one at a time.
+    picker: grant::Picker,
 }
 
-/// Marks the watched-folder chooser open while it lives.
-struct Picking<'a>(&'a AtomicBool);
-
-impl<'a> Picking<'a> {
-    fn begin(flag: &'a AtomicBool) -> Option<Self> {
-        (!flag.swap(true, Ordering::SeqCst)).then_some(Picking(flag))
+impl grant::GrantTarget for Shell {
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst)
     }
-}
 
-impl Drop for Picking<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+    /// The running service's standard input; None once a stop has taken the service or it has exited.
+    fn service_input(&self) -> Option<service::ServiceInput> {
+        let mut guard = self.service.lock().unwrap_or_else(|p| p.into_inner());
+        let svc = guard.as_mut()?;
+        if svc.has_exited() {
+            return None;
+        }
+        Some(svc.input())
     }
 }
 
@@ -229,40 +230,22 @@ fn focus_main(app: &AppHandle, shell: &Shell) {
 /// here (the page passes only a title). The chosen path goes to the service as a grant line on its
 /// standard input (grant.rs), written under the lock the shutdown closes that pipe under; the page
 /// receives only `{grantId, name}`, or null when the choice was cancelled, the window is not the main
-/// window, the chooser is already open, the app is closing, the service has exited, the path cannot
-/// be put in a grant line, or the write failed. Granted to the main window only (capabilities/main-window.json); the browser
+/// window, the chooser is already open, the app is closing, the service has exited, the folder is a
+/// root or cannot be put in a grant line, or the write failed (see `grant::pick_with`). Granted to the main window only (capabilities/main-window.json); the browser
 /// extension's token is the service's affair and reaches no shell command (it is not a window of
 /// this app and has no IPC).
 #[tauri::command]
 async fn pick_watch_folder(app: AppHandle, window: tauri::WebviewWindow, title: String) -> Option<serde_json::Value> {
-    if window.label() != "main" {
-        return None;
-    }
     let shell = app.try_state::<Arc<Shell>>()?.inner().clone();
-    if shell.stopping.load(Ordering::SeqCst) || shell.closing.load(Ordering::SeqCst) {
-        return None;
-    }
-    let _open = Picking::begin(&shell.picking)?;
+    let label = window.label().to_string();
     let dialog = app.dialog().file().set_title(grant::chooser_title(&title)).set_parent(&window);
-    let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_folder()).await.ok()??;
-    let path = picked.into_path().ok()?;
-    let id = grant::new_grant_id()?;
-    let line = grant::grant_line(&id, &path)?;
-    let name = grant::folder_name(&path)?;
-    drop(path);
-    // Taken after the chooser closed: a stop that began meanwhile has removed the service.
-    let input = {
-        let mut guard = shell.service.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(svc) = guard.as_mut() else { return None };
-        if svc.has_exited() {
-            return None;
-        }
-        svc.input()
-    };
-    if !input.send_line(&line) {
-        return None;
-    }
-    Some(grant::PickedFolder { grant_id: id, name }.to_json())
+    // The checks, the chooser and the hand-over (grant::pick_with, tested there), off the main thread.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        grant::pick_with(&shell.picker, &label, &*shell, || dialog.blocking_pick_folder().and_then(|p| p.into_path().ok()))
+    })
+    .await
+    .ok()??;
+    Some(picked.to_json())
 }
 
 /// SIGTERM, SIGINT and SIGHUP end the app the same way closing the window does.

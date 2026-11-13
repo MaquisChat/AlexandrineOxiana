@@ -11,7 +11,10 @@
 //! of its string or start a second line. The service accepts exactly the text this module writes:
 //! keys in this order, no spaces, serde_json's escapes (which are JavaScript's `JSON.stringify`'s).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::service::ServiceInput;
 
 /// The longest grant line, in bytes, its line end included (the service reads at most 8 KiB without it).
 pub const GRANT_LINE_MAX_BYTES: usize = 8192;
@@ -65,13 +68,65 @@ pub fn grant_line(id: &str, path: &Path) -> Option<String> {
     (line.len() <= GRANT_LINE_MAX_BYTES).then_some(line)
 }
 
-/// The folder's last name component, as the page may show it (through `UserText`); the root has none,
-/// and is named as it is.
+/// The folder's last name component, as the page may show it (through `UserText`). None for a path
+/// with no last component (a root: `/`, `C:\`, `\\server\share\`), which cannot be a watched folder;
+/// never the whole path.
 pub fn folder_name(path: &Path) -> Option<String> {
-    match path.file_name() {
-        Some(n) => n.to_str().map(str::to_owned),
-        None => path.to_str().map(str::to_owned),
+    path.file_name()?.to_str().map(str::to_owned)
+}
+
+/// What a folder choice needs from the shell: whether it is stopping, and the service's standard
+/// input (None when there is no running service).
+pub trait GrantTarget {
+    fn stopping(&self) -> bool;
+    fn service_input(&self) -> Option<ServiceInput>;
+}
+
+/// One watched-folder chooser at a time.
+#[derive(Default)]
+pub struct Picker {
+    open: AtomicBool,
+}
+
+/// Marks the chooser open while it lives.
+struct Open<'a>(&'a AtomicBool);
+
+impl Drop for Open<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// Everything `pick_watch_folder` (lib.rs) does, around the chooser `choose` (the system dialog in
+/// the app; a stand-in in tests). Answers None, writing nothing, when:
+/// - the asking window is not the main window (no chooser opens);
+/// - a chooser is already open (no second one opens);
+/// - the shell is stopping, before the chooser or once it has closed;
+/// - the choice was cancelled, or the folder is a root or cannot be put in a grant line;
+/// - there is no running service once the chooser has closed (looked up only then), or the write fails.
+///
+/// Otherwise exactly one grant line is written and the page's answer returned.
+pub fn pick_with(picker: &Picker, window_label: &str, target: &dyn GrantTarget, choose: impl FnOnce() -> Option<PathBuf>) -> Option<PickedFolder> {
+    if window_label != "main" || target.stopping() {
+        return None;
+    }
+    if picker.open.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    let _open = Open(&picker.open);
+    let path = choose()?;
+    let name = folder_name(&path)?;
+    let id = new_grant_id()?;
+    let line = grant_line(&id, &path)?;
+    drop(path);
+    if target.stopping() {
+        return None;
+    }
+    let input = target.service_input()?;
+    if !input.send_line(&line) {
+        return None;
+    }
+    Some(PickedFolder { grant_id: id, name })
 }
 
 /// The chooser's title from the page: plain text, control characters removed, at most
@@ -168,7 +223,161 @@ mod tests {
         let v = picked.to_json();
         assert_eq!(v, serde_json::json!({ "grantId": ID, "name": "Fieldwork <b>" }));
         assert!(!v.to_string().contains("CloudStorage"));
-        assert_eq!(folder_name(Path::new("/")), Some("/".into()));
+    }
+
+    #[test]
+    fn a_root_has_no_name_and_the_whole_path_is_never_the_name() {
+        for root in ["/", "/a/..", "/."] {
+            assert_eq!(folder_name(Path::new(root)), None, "{root}");
+        }
+        assert_eq!(folder_name(Path::new("/Users/r/Fieldwork/")), Some("Fieldwork".into()));
+        assert_eq!(folder_name(Path::new("/Users/r/a b")), Some("a b".into()));
+    }
+
+    // The Windows shapes are parsed as roots only on Windows (on Linux `\` is an ordinary character).
+    #[cfg(windows)]
+    #[test]
+    fn windows_roots_have_no_name() {
+        for root in ["C:\\", "C:/", "\\\\server\\share\\", "\\\\server\\share", "\\\\?\\C:\\"] {
+            assert_eq!(folder_name(Path::new(root)), None, "{root}");
+        }
+        assert_eq!(folder_name(Path::new("C:\\Users\\r\\Fieldwork")), Some("Fieldwork".into()));
+    }
+
+    #[test]
+    fn the_title_is_cut_by_characters_never_inside_one() {
+        let t = chooser_title(&"📁".repeat(250));
+        assert_eq!(t, "📁".repeat(TITLE_MAX_CHARS));
+    }
+
+    // ----- what the command does around the chooser (M4) -----
+
+    use crate::service::ServiceInput;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Written(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Written {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Written {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    struct FakeShell {
+        stopping: AtomicBool,
+        input: Option<ServiceInput>,
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+    impl FakeShell {
+        fn new(w: &Written) -> Self {
+            FakeShell { stopping: AtomicBool::new(false), input: Some(ServiceInput::for_test(w.clone())), lookups: Default::default() }
+        }
+    }
+    impl GrantTarget for FakeShell {
+        fn stopping(&self) -> bool {
+            self.stopping.load(Ordering::SeqCst)
+        }
+        fn service_input(&self) -> Option<ServiceInput> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            self.input.clone()
+        }
+    }
+
+    const FOLDER: &str = "/Users/r/Library/CloudStorage/Dropbox/Fieldwork";
+
+    #[test]
+    fn a_good_pick_writes_exactly_one_line_and_answers_the_id_and_the_name() {
+        let w = Written::default();
+        let shell = FakeShell::new(&w);
+        let picker = Picker::default();
+        let picked = pick_with(&picker, "main", &shell, || Some(PathBuf::from(FOLDER))).unwrap();
+        assert!(valid_id(&picked.grant_id));
+        assert_eq!(picked.name, "Fieldwork");
+        assert_eq!(w.text(), grant_line(&picked.grant_id, Path::new(FOLDER)).unwrap());
+        assert_eq!(w.text().matches('\n').count(), 1);
+        assert!(!picked.to_json().to_string().contains("CloudStorage"));
+        // The chooser is free again afterwards.
+        assert!(pick_with(&picker, "main", &shell, || Some(PathBuf::from(FOLDER))).is_some());
+        assert_eq!(w.text().matches('\n').count(), 2);
+    }
+
+    #[test]
+    fn another_window_gets_nothing_and_no_chooser_opens() {
+        let w = Written::default();
+        let shell = FakeShell::new(&w);
+        let picker = Picker::default();
+        for label in ["second", "", "Main", "main "] {
+            let opened = AtomicBool::new(false);
+            assert_eq!(pick_with(&picker, label, &shell, || { opened.store(true, Ordering::SeqCst); Some(PathBuf::from(FOLDER)) }), None, "{label}");
+            assert!(!opened.load(Ordering::SeqCst));
+        }
+        assert_eq!(w.text(), "");
+    }
+
+    #[test]
+    fn a_second_pick_while_one_is_open_gets_nothing() {
+        let w = Written::default();
+        let shell = FakeShell::new(&w);
+        let picker = Picker::default();
+        let first = pick_with(&picker, "main", &shell, || {
+            // Asked again while the chooser is open: no second chooser, nothing written.
+            let opened = AtomicBool::new(false);
+            assert_eq!(pick_with(&picker, "main", &shell, || { opened.store(true, Ordering::SeqCst); Some(PathBuf::from("/other")) }), None);
+            assert!(!opened.load(Ordering::SeqCst));
+            Some(PathBuf::from(FOLDER))
+        });
+        assert!(first.is_some());
+        assert_eq!(w.text().matches('\n').count(), 1);
+        assert!(!w.text().contains("/other"));
+    }
+
+    #[test]
+    fn a_stopping_or_gone_service_gets_nothing() {
+        let picker = Picker::default();
+        // Stopping before: no chooser.
+        let w = Written::default();
+        let shell = FakeShell::new(&w);
+        shell.stopping.store(true, Ordering::SeqCst);
+        let opened = AtomicBool::new(false);
+        assert_eq!(pick_with(&picker, "main", &shell, || { opened.store(true, Ordering::SeqCst); Some(PathBuf::from(FOLDER)) }), None);
+        assert!(!opened.load(Ordering::SeqCst));
+        // Stopping begins while the chooser is open: nothing written.
+        let shell = FakeShell::new(&w);
+        assert_eq!(pick_with(&picker, "main", &shell, || { shell.stopping.store(true, Ordering::SeqCst); Some(PathBuf::from(FOLDER)) }), None);
+        assert_eq!(w.text(), "");
+        // The service is gone (no input), or its input is closed.
+        let gone = FakeShell { stopping: AtomicBool::new(false), input: None, lookups: Default::default() };
+        assert_eq!(pick_with(&picker, "main", &gone, || Some(PathBuf::from(FOLDER))), None);
+        let closed = FakeShell::new(&w);
+        closed.input.as_ref().unwrap().close_for_test();
+        assert_eq!(pick_with(&picker, "main", &closed, || Some(PathBuf::from(FOLDER))), None);
+        assert_eq!(w.text(), "");
+        // The service is looked up only after the chooser closed.
+        let late = FakeShell::new(&w);
+        pick_with(&picker, "main", &late, || { assert_eq!(late.lookups.load(Ordering::SeqCst), 0); None });
+        assert_eq!(late.lookups.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_cancelled_pick_a_root_or_a_path_that_fits_no_line_gets_nothing() {
+        let w = Written::default();
+        let shell = FakeShell::new(&w);
+        let picker = Picker::default();
+        assert_eq!(pick_with(&picker, "main", &shell, || None), None);
+        assert_eq!(pick_with(&picker, "main", &shell, || Some(PathBuf::from("/"))), None);
+        assert_eq!(pick_with(&picker, "main", &shell, || Some(PathBuf::from("relative"))), None);
+        assert_eq!(pick_with(&picker, "main", &shell, || Some(PathBuf::from(format!("/{}", "a".repeat(5000))))), None);
+        assert_eq!(w.text(), "");
     }
 
     #[test]
