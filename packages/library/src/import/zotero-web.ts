@@ -21,14 +21,22 @@
  *     revoked key still ends the run), an oversize or damaged file leaves the item with a file note
  *     instead (R66). A dry run, or `files: false`, downloads nothing.
  *
- * Unattended runs (Task Z2): every item request asks with `includeTrashed=1`, so an item in Zotero's
- * bin is seen and never yielded as content; a top-level one known here is yielded as `{ gone: "bin" }`. An incremental
- * run yields each key of `/deleted?since=` that is known here (ScanContext.knownIds, this library
- * only) as `{ gone: "deleted" }`; child keys are counted only. A full run yields each known item it
- * did not see as `{ gone: "deleted" }` ONLY when its picture is whole: every page read, no restart
- * and no back-off in the run, nothing dropped from a page. Gone items are yielded last, after a check
- * that the key may still read the library; any failure first yields none. ScanContext.skip lets the
- * engine pass an item by before anything is fetched for it.
+ * Unattended runs (Task Z2; A4, A5): every item request asks with `includeTrashed=1`, so an item in
+ * Zotero's bin is seen and never yielded as content; a top-level one known here is yielded as
+ * `{ gone: "bin" }`. An incremental run yields each key of `/deleted?since=` that is known here
+ * (ScanContext.knownIds, this library only) as `{ gone: "deleted" }`; child keys are counted only. A
+ * full run yields a known item as `{ gone: "deleted" }` by absence only when the scan was complete
+ * AND the key is missing from the library's complete key list, read in one listing at the version
+ * the scan read at. Gone items are yielded last, after a check that the key may still read the
+ * library; any failure first yields none. ScanContext.skip lets the engine pass an item by before
+ * anything under it is fetched.
+ *
+ * A complete scan: every paged listing carried Total-Results and added up to it, no page failed or
+ * was cut for good (a page cut in mid-body is asked for again), the tag colours came in or are not
+ * set, and the read ended in one whole read at one library version (a restart after the library
+ * changed, R80, that then read everything is complete; the restart limit is not). A Backoff or
+ * Retry-After that was waited out changes nothing; the longest wait asked for (at most a day) is
+ * reported in `backoffUntil` for the scheduler.
  *
  * Items: the same mapping as the local import (zotero-common.ts): item types, creators, collections
  * (folderPath), tags (+ colours from /settings/tagColors), child notes (note-html.ts → Markdown),
@@ -47,12 +55,13 @@
  * records the version under the same rule (finishZoteroWebRun). Sources deleted here stay deleted
  * (R73 tombstones, as for the local import).
  *
- * What holds `since` back (the next run asks for the same changes again): a failed item (including
- * the scan's own failure: unreachable, refused key, library gone, a page cut), a download that failed
- * in a way a later run may fix (network error, 5xx, a connection cut, no disk space; also when it
- * happened before a resume), and any Backoff or Retry-After in the run. What does not: a refused
- * redirect host, a file not in Zotero's storage (404, or a checksum that never matches), a key that
- * may not read files, a file over 2 GB.
+ * What holds `since` back (the next run asks for the same changes again; A4): a failed item (the scan's
+ * own failure included: unreachable, a 429 or 5xx outlasting its retries, a page cut for good, refused
+ * key, library gone, the restart limit), a scan that was not complete (above), a download that failed
+ * in a way a later run may fix (5xx, a connection cut, no disk space; also in a part before a resume).
+ * What does not: a Backoff or Retry-After waited out, a refused redirect host, a file Zotero says it
+ * does not have (404), a checksum that never matched in 3 tries, a key that may not read files, a file
+ * over 2 GB. A resumed batch records the LOWEST version any of its parts read at (A5).
  */
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
@@ -126,6 +135,8 @@ const SPACE_MARGIN = 64 * 1024 * 1024;
 export const ZOTERO_FILE_TRIES = 3;
 /** Refused redirect hosts kept in the scan result. */
 const MAX_REFUSED_HOSTS = 5;
+/** The longest wait reported in `backoffUntil` (a day). */
+const MAX_BACKOFF_REPORT_MS = 24 * 3_600_000;
 
 export const ZOTERO_WEB_REASONS = {
   noKey: "No Zotero API key is saved on this computer, so nothing was imported from Zotero online. Save your key first.",
@@ -143,8 +154,9 @@ export const ZOTERO_WEB_FILE_NOTES = {
   redirectRefused: "attached file download was redirected elsewhere and was not followed",
   tooLarge: "attached file is larger than 2 GB and was not downloaded",
   failed: "attached file could not be downloaded",
-  /** Kept for older batch reports; a checksum that never matches is now noted as `notInStorage` (Z2). */
-  checksum: "attached file did not match Zotero's checksum and was not imported",
+  /** After ZOTERO_FILE_TRIES tries (A5). */
+  checksum:
+    "attached file did not match Zotero's checksum after 3 tries and was not brought in (the copy in Zotero's storage may be damaged or out of date, or the file may be kept elsewhere, for example on a WebDAV server)",
   noSpace: "attached file was not downloaded: not enough free disk space",
   noFileAccess: "attached file was not fetched: the Zotero key may not read files",
 } as const;
@@ -167,7 +179,8 @@ export const ZOTERO_WEB_NOTES = {
   pendingDownloads: (n: number) => `${plural(n, "file is", "files are")} downloaded from Zotero when the import runs (not in this preview).`,
   groupLinked: (n: number) =>
     `Not imported from Zotero: ${plural(n, "linked file in a group library", "linked files in a group library")} (linked files live on the computer of the member who added them).`,
-  deleted: (n: number) => `${plural(n, "item was", "items were")} deleted in Zotero since the last sync; ${n === 1 ? "it was" : "they were"} kept here and marked.`,
+  /** Counts top-level items known here only (A5); Z5 adds what it marked. */
+  deleted: (n: number) => `${plural(n, "item you have here was", "items you have here were")} deleted in Zotero since the last sync; nothing was deleted here.`,
   filesOff: (n: number) => `${plural(n, "attached file was", "attached files were")} not fetched: the Zotero key may not read files.`,
 } as const;
 
@@ -179,6 +192,9 @@ class ZoteroWebError extends Error {
 
 /** The library changed while the scan read it (412, or a different Last-Modified-Version). */
 class LibraryChanged extends Error {}
+
+/** A JSON answer that broke off in its body, or is not JSON: asked for again (bounded). */
+class CutAnswer extends Error {}
 
 export interface ZoteroWebOptions {
   libraryType: "user" | "group";
@@ -251,7 +267,11 @@ class ZoteroApi {
    * library changed under the scan (LibraryChanged).
    */
   scanVersion: number | undefined;
-  /** A page held entries that were not items, or ended before Total-Results: the picture is not whole. */
+  /**
+   * The scan is not complete (A5): a page held entries that were not items, a listing had no
+   * Total-Results or did not add up to it, or something that should have come in failed for a
+   * passing reason (tag colours). Since is held back and nothing is yielded gone by absence.
+   */
   lossy = false;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly maxRetries: number;
@@ -278,7 +298,8 @@ class ZoteroApi {
   /** The server asked for a pause of `ms`: the run reports the longest one asked for (uncapped). */
   private askedToWait(ms: number | undefined): void {
     if (ms === undefined) return;
-    const until = Date.now() + ms;
+    // A day at most: a wild header must not park the scheduler for years (M6).
+    const until = Date.now() + Math.min(ms, MAX_BACKOFF_REPORT_MS);
     this.result.backoffUntil = Math.max(this.result.backoffUntil ?? 0, until);
   }
 
@@ -343,6 +364,20 @@ class ZoteroApi {
   async json(path: string, query: Record<string, string | number> = {}, versioned = false): Promise<{ body: unknown; headers: Headers }> {
     const url = new URL(path, ZOTERO_API_ORIGIN);
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, String(v));
+    // An answer cut in the middle of its body (or unreadable as JSON) is asked for again, like a dropped one (M7).
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.jsonOnce(url, versioned);
+      } catch (err) {
+        if (!(err instanceof CutAnswer)) throw err;
+        if (this.signal.aborted) throw this.signal.reason ?? err;
+        if (attempt >= this.maxRetries) throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
+        await this.sleep(this.retryWait(attempt, undefined));
+      }
+    }
+  }
+
+  private async jsonOnce(url: URL, versioned: boolean): Promise<{ body: unknown; headers: Headers }> {
     const pinned: Record<string, string> = versioned && this.scanVersion !== undefined ? { "if-unmodified-since-version": String(this.scanVersion) } : {};
     const res = await this.get(url, true, (s) => s === 200, pinned);
     if (versioned) {
@@ -363,18 +398,23 @@ class ZoteroApi {
     }
     const chunks: Buffer[] = [];
     let size = 0;
-    for await (const c of res.body as AsyncIterable<Buffer>) {
-      size += c.length;
-      if (size > max) {
-        res.body.destroy();
-        throw new ZoteroWebError(ZOTERO_WEB_REASONS.tooLarge);
+    try {
+      for await (const c of res.body as AsyncIterable<Buffer>) {
+        size += c.length;
+        if (size > max) {
+          res.body.destroy();
+          throw new ZoteroWebError(ZOTERO_WEB_REASONS.tooLarge);
+        }
+        chunks.push(c);
       }
-      chunks.push(c);
+    } catch (err) {
+      if (err instanceof ZoteroWebError || this.signal.aborted) throw err;
+      throw new CutAnswer();
     }
     try {
       return { body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown, headers: res.headers };
     } catch {
-      throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
+      throw new CutAnswer();
     }
   }
 
@@ -390,14 +430,14 @@ class ZoteroApi {
   /**
    * Downloads an attachment's file into `dest` (streamed, capped, MD5-checked). Returns the
    * file's path, or what the item says instead. A file whose checksum does not match is fetched
-   * again, ZOTERO_FILE_TRIES times in all, then noted as not in Zotero's storage (a WebDAV library's
-   * older copy never matches). Never throws for a file-level problem; aborts and refused keys do.
+   * again, ZOTERO_FILE_TRIES times in all, then noted (`checksum`: damaged, out of date, or kept on
+   * WebDAV). Never throws for a file-level problem; aborts and refused keys do.
    */
   async file(prefix: string, attKey: string, dest: string, md5: string | undefined): Promise<{ path: string } | FileMiss> {
     for (let attempt = 1; ; attempt++) {
       const got = await this.fileOnce(prefix, attKey, dest, md5);
       if (!("mismatch" in got)) return got;
-      if (attempt >= ZOTERO_FILE_TRIES) return miss(ZOTERO_WEB_FILE_NOTES.notInStorage, true);
+      if (attempt >= ZOTERO_FILE_TRIES) return miss(ZOTERO_WEB_FILE_NOTES.checksum, true);
     }
   }
 
@@ -554,14 +594,21 @@ async function* pages(api: ZoteroApi, path: string, query: Record<string, string
     yield { items, headers };
     start += body.length;
     const total = Number(header(headers, "total-results"));
-    if (Number.isFinite(total)) {
-      if (start >= total) return;
+    if (Number.isFinite(total) && header(headers, "total-results") !== undefined) {
+      if (start >= total) {
+        if (start !== total) api.lossy = true; // more than announced: the listing moved under us
+        return;
+      }
       if (!body.length) {
         // The listing ended before the total it announced.
         api.lossy = true;
         return;
       }
-    } else if (body.length < PAGE) return;
+    } else {
+      // No Total-Results: nothing says the listing is whole (A5, I3). Read on to a short page, but not complete.
+      api.lossy = true;
+      if (body.length < PAGE) return;
+    }
     if (start >= MAX_ITEMS) throw new ZoteroWebError(ZOTERO_WEB_REASONS.tooLarge);
   }
 }
@@ -726,7 +773,8 @@ async function tagColorsOf(api: ZoteroApi, prefix: string): Promise<Map<string, 
     }
   } catch (err) {
     if (err instanceof ZoteroWebError && err.reason === ZOTERO_WEB_REASONS.keyRefused) throw err;
-    // no colours (none set, or the setting cannot be read)
+    // 404: no colours set. Anything else is a passing failure: the colours did not come in (M4).
+    if (!(err instanceof ZoteroWebError && err.reason === ZOTERO_WEB_REASONS.notFound)) api.lossy = true;
   }
   return out;
 }
@@ -773,7 +821,14 @@ const relatedOf = (d: Record<string, unknown>): string[] => {
   return keys;
 };
 
-async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanResult, signal: AbortSignal, ctx: ScanContext | undefined): AsyncGenerator<ScanItem> {
+async function* scanWeb(
+  o: ZoteroWebOptions,
+  ref: string,
+  result: ZoteroWebScanResult,
+  signal: AbortSignal,
+  ctx: ScanContext | undefined,
+  readVersions: { zoteroReadVersions?: number[] },
+): AsyncGenerator<ScanItem> {
   const fail = (reason: string): ScanItem => ({ key: "zotero-web:", files: [], unreadable: reason });
   result.completed = false;
   result.deletedInZotero = 0;
@@ -807,7 +862,6 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   let tops: Set<string> | undefined;
   let pathsOf!: (keys: unknown) => string[][];
   let colors: Map<string, string>;
-  let restarted = false;
   /** Keys `/deleted?since=` lists (items; children among them). */
   let deletedKeys: string[] = [];
   try {
@@ -823,11 +877,14 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
         break;
       } catch (err) {
         if (!(err instanceof LibraryChanged)) throw err;
-        restarted = true;
         if (attempt >= MAX_RESTARTS) throw new ZoteroWebError(ZOTERO_WEB_REASONS.changing);
       }
     }
     result.libraryVersion = api.scanVersion ?? result.libraryVersion;
+    // The version this part of the batch read at: kept in the batch record (C1, A5). Unknown: none is recorded.
+    const read = api.scanVersion;
+    if (read === undefined) delete readVersions.zoteroReadVersions;
+    else if (readVersions.zoteroReadVersions && !readVersions.zoteroReadVersions.includes(read)) readVersions.zoteroReadVersions.push(read);
     colors = await tagColorsOf(api, prefix);
     if (since !== undefined) {
       const { body } = await api.json(`${prefix}/deleted`, { since });
@@ -999,20 +1056,38 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   }
 
   // Gone from Zotero: only items known here (an item never imported is neither content nor gone), and
-  // only from a picture that is whole: every page read (a failure has returned above).
+  // only after every page was read (a failure has returned above).
   const knownHere = knownOf(ctx, ref);
   const gone = new Map<string, { gone: "deleted" | "bin"; version: string }>();
   for (const t of tree.trashed.values()) if (!tree.parentOf(t) && knownHere.has(t.key)) gone.set(t.key, { gone: "bin", version: `bin:${t.version}` });
-  // A run that restarted, was asked to back off, or dropped something from a page has no whole picture of what is missing.
-  const whole = !restarted && result.backoffUntil === undefined && !api.lossy;
-  let heldBack = false;
+  /** Top-level items known here that Zotero says it deleted (the note counts these, A5). */
+  let deletedHere = 0;
   if (since !== undefined) {
     // Incremental: only what Zotero said. Keys of items known here (child keys never are: they are counted only).
-    for (const k of deletedKeys) if (knownHere.has(k) && !tree.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
-  } else {
+    for (const k of deletedKeys) {
+      if (!knownHere.has(k) || tree.has(k)) continue;
+      deletedHere++;
+      gone.set(k, { gone: "deleted", version: "deleted" });
+    }
+  } else if (!api.lossy) {
+    // Full: absence alone never makes an item gone (A5). A known item not seen is gone only when its key is
+    // also missing from the library's complete key list, read in one listing at the version the scan read at.
     const unseen = [...knownHere].filter((k) => !tree.has(k));
-    if (whole) for (const k of unseen) gone.set(k, { gone: "deleted", version: "deleted" });
-    else heldBack = unseen.length > 0; // not complete: since stays, and a later full run looks again
+    if (unseen.length) {
+      let keys: Set<string> | undefined;
+      try {
+        keys = await completeKeyList(api, prefix);
+      } catch (err) {
+        if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
+        // The key may no longer read the library: the run says so. Any other failure: none gone by absence this run.
+        if (err instanceof ZoteroWebError && (err.reason === ZOTERO_WEB_REASONS.keyRefused || err.reason === ZOTERO_WEB_REASONS.notFound)) {
+          yield fail(err.reason);
+          return;
+        }
+        keys = undefined;
+      }
+      if (keys) for (const k of unseen) if (!keys.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
+    }
   }
   for (const k of [...gone.keys()]) if (skip(`zotero:${k}`)) gone.delete(k);
   if (gone.size) {
@@ -1037,8 +1112,25 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   if (groupLinked) ctx.note?.(ZOTERO_WEB_NOTES.groupLinked(groupLinked));
   if (pendingDownloads) ctx.note?.(ZOTERO_WEB_NOTES.pendingDownloads(pendingDownloads));
   if (filesOff) ctx.note?.(ZOTERO_WEB_NOTES.filesOff(filesOff));
-  if (result.deletedInZotero) ctx.note?.(ZOTERO_WEB_NOTES.deleted(result.deletedInZotero));
-  result.completed = !heldBack;
+  if (deletedHere) ctx.note?.(ZOTERO_WEB_NOTES.deleted(deletedHere));
+  result.completed = !api.lossy;
+}
+
+/**
+ * The library's complete key list, bin included, in ONE listing (`format=versions`, no limit), read at
+ * the version the scan read at (A5). Throws when it cannot be had whole: an error, another version, a
+ * body that is not the object it should be, or a count that does not match Total-Results.
+ */
+async function completeKeyList(api: ZoteroApi, prefix: string): Promise<Set<string> | undefined> {
+  const { body, headers } = await api.json(`${prefix}/items`, { format: "versions", ...WITH_BIN });
+  const v = libraryVersionOf(headers);
+  if (api.scanVersion === undefined || v !== api.scanVersion) return undefined;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const keys = Object.keys(body as Record<string, unknown>);
+  const total = header(headers, "total-results");
+  if (total !== undefined && Number(total) !== keys.length) return undefined;
+  if (keys.some((k) => !KEY.test(k))) return undefined;
+  return new Set(keys);
 }
 
 /** The item keys of this library (`<ref>/<key>`) among the ids the engine knows; ids of any other library are left out. */
@@ -1068,6 +1160,13 @@ export function zoteroWebAdapter(opts: ZoteroWebOptions): ZoteroWebAdapter {
   const ref = `${opts.libraryType}:${opts.libraryId}`;
   const since = opts.full ? undefined : opts.since;
   const result: ZoteroWebScanResult = { deletedInZotero: 0, completed: false, downloadsFailed: 0, refusedHosts: [], goneKeys: { deleted: 0, bin: 0 } };
+  // Kept with the batch record (the engine copies it at each checkpoint), so a resumed batch asks for the same
+  // changes with the same files mode, and knows the version every part read at (C1, A5).
+  const resumeOptions: NonNullable<ImportSourceAdapter["resumeOptions"]> = {
+    ...(since !== undefined ? { zoteroSince: since } : {}),
+    zoteroFiles: opts.files !== false,
+    zoteroReadVersions: [],
+  };
   return {
     kind: "zotero-web",
     location: ref,
@@ -1076,9 +1175,8 @@ export function zoteroWebAdapter(opts: ZoteroWebOptions): ZoteroWebAdapter {
     incremental: true,
     uniqueCitationKeys: true,
     tool: TOOL,
-    // Kept with the batch record, so a resumed batch asks for the same changes with the same files mode (Z2).
-    resumeOptions: { ...(since !== undefined ? { zoteroSince: since } : {}), zoteroFiles: opts.files !== false },
-    scan: (signal, ctx) => scanWeb(opts, ref, result, signal, ctx),
+    resumeOptions,
+    scan: (signal, ctx) => scanWeb(opts, ref, result, signal, ctx, resumeOptions),
     scanResult: () => ({ ...result, refusedHosts: [...result.refusedHosts], goneKeys: { ...result.goneKeys } }),
   };
 }
@@ -1092,12 +1190,18 @@ export function zoteroWebAdapterFor(location: string, adapterOptions?: BatchReco
   const m = /^(user|group):(\d{1,12})$/u.exec(location);
   if (!m) return undefined;
   const since = adapterOptions?.zoteroSince;
-  return zoteroWebAdapter({
+  const a = zoteroWebAdapter({
     libraryType: m[1] as "user" | "group",
     libraryId: m[2]!,
     ...(Number.isInteger(since) && since! >= 0 ? { since } : {}),
     ...(adapterOptions?.zoteroFiles === false ? { files: false } : {}),
   });
+  // The versions the earlier parts read at. A record without them (written before A5), or with anything
+  // that is not a version, leaves the batch's read version unknown: then no version is ever recorded for it.
+  const read = adapterOptions?.zoteroReadVersions;
+  if (Array.isArray(read) && read.length && read.every((v) => Number.isInteger(v) && v >= 0)) a.resumeOptions!.zoteroReadVersions = [...read];
+  else delete a.resumeOptions!.zoteroReadVersions;
+  return a;
 }
 
 /** The library version the last finished Web API import of `ref` saw in this project, if any. */
@@ -1157,22 +1261,30 @@ export async function resumeZoteroWebImport(deps: BulkImportDeps, projectId: str
 }
 
 /**
- * When a Web batch (started or resumed) is done, records the library version Zotero reported, so the
- * next run asks only for later changes. Only a run where nothing held it back moves it on (R80 I1):
- * the batch finished with no failed item, the scan completed with no back-off and no download that
- * a later run may fix, in this run or, for a resumed batch, in any earlier part of it (its journal).
+ * When a Web batch (started or resumed) is done, records a library version, so the next run asks only
+ * for later changes: the LOWEST version any part of the batch read at (`adapterOptions.zoteroReadVersions`;
+ * none known for a part: nothing recorded). Only a run where nothing held it back moves it on (R80 I1,
+ * A4): the batch finished with no failed item, the scan was complete, and no download failed in a way a
+ * later run may fix, in this run or, for a resumed batch, in any earlier part of it (its journal). A
+ * Backoff or Retry-After that was waited out holds nothing back.
  * The batch record keeps the version it recorded (`recordedLibraryVersion`), written first, so that
  * undo can put `since` back (Z5). `done` settles after that.
  */
 export function finishZoteroWebRun(deps: BulkImportDeps, projectId: string, adapter: ZoteroWebAdapter, h: BatchHandle, since: number | undefined): BatchHandle {
   const done = h.done.then(async (r) => {
     const s = adapter.scanResult();
-    const v = s.libraryVersion;
-    if (r.state !== "finished" || r.counts.failed !== 0 || !s.completed || s.downloadsFailed !== 0 || s.backoffUntil !== undefined || v === undefined || v === since) return r;
+    // A Backoff or Retry-After that was waited out holds nothing back (A4); a failure that outlasted its retries is a failed item.
+    if (r.state !== "finished" || r.counts.failed !== 0 || !s.completed || s.downloadsFailed !== 0) return r;
     try {
       const { BOOKKEEPING, findBatch, latestByKey, readJournal, writeBatchRecord } = await import("./bulk/batch.js");
       const rec = await findBatch(deps.repo, projectId, r.batchId);
       if (!rec || rec.state !== "finished") return r;
+      // The LOWEST version any part of the batch read at (C1, A5): the items an earlier part brought in were
+      // passed by later, so whatever changed in Zotero after that part's read must be asked for again.
+      const read = rec.adapterOptions?.zoteroReadVersions;
+      if (!Array.isArray(read) || !read.length || !read.every((x) => Number.isInteger(x) && x >= 0)) return r;
+      const v = Math.min(...read);
+      if (v === since) return r;
       // A download that failed before a resume is in the journal, not in this run's scan result.
       for (const e of latestByKey(await readJournal(deps.repo, projectId, rec.dir)).values()) if (e.notes?.some((n) => HOLDS_SINCE.has(n))) return r;
       const projectRel = deps.repo.getProject(projectId).folder;

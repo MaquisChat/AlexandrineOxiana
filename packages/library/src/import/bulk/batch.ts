@@ -117,7 +117,7 @@ export interface BatchRecord extends ImportBatch {
   /** Device import (R83): the session and participants every new source is linked to. */
   fieldwork?: { sessionId?: string; participantIds?: string[] };
   /** The adapter's resume options (ImportSourceAdapter.resumeOptions), e.g. device import's researcher name, a Zotero Web batch's `since` and files mode. */
-  adapterOptions?: { researcherName?: string; zoteroSince?: number; zoteroFiles?: boolean };
+  adapterOptions?: { researcherName?: string; zoteroSince?: number; zoteroFiles?: boolean; zoteroReadVersions?: number[] };
   /** Zotero Web (Z2): the library version this batch recorded in the project when it finished (undo resets it, Z5). */
   recordedLibraryVersion?: number;
 }

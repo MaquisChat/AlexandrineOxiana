@@ -158,6 +158,11 @@ function serveCollections(collections: Array<{ key: string; name: string; parent
     .persist();
 }
 
+/** The library answers a small keyed check (`/items/top`), so nothing but the scan itself can stop gone items. */
+function serveKeyCheck(prefix = "/users/42") {
+  agent.get(API).intercept({ path: (p) => p.startsWith(`${prefix}/items/top?`), method: "GET" }).reply(200, "{}", { headers: { ...JSON_HEADERS, "last-modified-version": "40" } }).persist();
+}
+
 function serveTagColors(prefix = "/users/42") {
   agent.get(API).intercept({ path: `${prefix}/settings/tagColors`, method: "GET" }).reply(404, "Not found").persist();
 }
@@ -485,7 +490,8 @@ describe("zoteroWebAdapter", () => {
     expect(out[0]!.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.notInStorage]);
     expect(out[0]!.annotations).toEqual([expect.objectContaining({ key: "zotero:ANNO0006", kind: "underline", quote: "new" })]);
     expect(a.scanResult()).toEqual({ libraryVersion: 21, deletedInZotero: 3, completed: true, downloadsFailed: 0, refusedHosts: [], goneKeys: { deleted: 0, bin: 0 } });
-    expect(notes).toContain("3 items were deleted in Zotero since the last sync; they were kept here and marked.");
+    // None of the three is known here, so the note (which counts items you have here, A5) is not given.
+    expect(notes.filter((t) => /deleted in Zotero/u.test(t))).toEqual([]);
     expect(seen.filter((p) => p.startsWith("/users/42/items?") && page(p).has("since"))).toHaveLength(1);
   });
 
@@ -594,7 +600,7 @@ describe("zoteroWebAdapter", () => {
     expect(createHash("md5").update(await readFile(ok.files[0]!.path)).digest("hex")).toBe(md5);
     const no = items.find((i) => i.key === `zotero:${bad}`)!;
     expect(no.files).toEqual([]);
-    expect(no.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.notInStorage]);
+    expect(no.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.checksum]);
     expect(z.requests.filter((r) => r.path.endsWith(`/items/${badAtt}/file`))).toHaveLength(3);
   });
 
@@ -736,7 +742,20 @@ describe("unattended scans against the stand-in (Z2)", () => {
     expect(items.map((i) => i.key)).not.toContain(`zotero:${note}`);
     expect(result.deletedInZotero).toBe(2);
     expect(result.goneKeys).toEqual({ deleted: 1, bin: 0 });
-    expect(notes).toContain("2 items were deleted in Zotero since the last sync; they were kept here and marked.");
+    // The note counts only top-level items known here (a, not its note), and says nothing it did not do (A5).
+    expect(notes.filter((t) => /deleted in Zotero/u.test(t))).toEqual(["1 item you have here was deleted in Zotero since the last sync; nothing was deleted here."]);
+  });
+
+  it("the deletion note counts only items you have here, in the plural too", async () => {
+    const keys = [z.addItem(U, art("One")), z.addItem(U, art("Two")), z.addItem(U, art("Never here"))];
+    const since = z.libraryVersion(U);
+    for (const k of keys) z.remove(U, k);
+    const { notes, result } = await scanFake({ since }, { knownIds: known(keys[0]!, keys[1]!) });
+    expect(result.deletedInZotero).toBe(3);
+    expect(notes.filter((t) => /deleted in Zotero/u.test(t))).toEqual(["2 items you have here were deleted in Zotero since the last sync; nothing was deleted here."]);
+    // None known here: no note at all.
+    const none = await scanFake({ since }, { knownIds: known() });
+    expect(none.notes.filter((t) => /deleted in Zotero/u.test(t))).toEqual([]);
   });
 
   it("a full completed run yields known but unseen items as gone", async () => {
@@ -752,6 +771,45 @@ describe("unattended scans against the stand-in (Z2)", () => {
     expect(result).toMatchObject({ completed: true, goneKeys: { deleted: 1, bin: 1 } });
     // A full run reads the bin too.
     expect(itemRequests().every((p) => page(p).get("includeTrashed") === "1")).toBe(true);
+    // Absence was checked against the library's complete key list, bin included, in one listing (A5).
+    const keyLists = z.requests.filter((r) => r.path.startsWith("/users/42/items?") && page(r.path).get("format") === "versions");
+    expect(keyLists).toHaveLength(1);
+    expect(page(keyLists[0]!.path).get("includeTrashed")).toBe("1");
+    expect(page(keyLists[0]!.path).has("limit")).toBe(false);
+  });
+
+  it("a key list read at another version yields no item gone by absence; the scan is still complete", async () => {
+    const a = z.addItem(U, art("Here"));
+    let edited = false;
+    // Called in the content loop, after the scan read the library and before the key list is asked for.
+    const skip = () => {
+      if (!edited) {
+        edited = true;
+        z.editItem(U, a, { title: "Changed after the read" });
+      }
+      return false;
+    };
+    const { items, result } = await scanFake({}, { knownIds: known(a, "GONEGONE"), skip });
+    expect(edited).toBe(true);
+    expect(goneOf(items)).toEqual([]);
+    expect(result.completed).toBe(true);
+  });
+
+  it("a key list that fails yields no item gone by absence; the scan is still complete", async () => {
+    const a = z.addItem(U, art("Here"));
+    let armed = false;
+    const skip = () => {
+      if (!armed) {
+        armed = true;
+        z.failNext(5, 500);
+      }
+      return false;
+    };
+    const { items, result } = await scanFake({ maxRetries: 1 }, { knownIds: known(a, "GONEGONE"), skip });
+    expect(armed).toBe(true);
+    expect(goneOf(items)).toEqual([]);
+    expect(items.some((i) => i.unreadable)).toBe(false);
+    expect(result.completed).toBe(true);
   });
 
   it("knownIds of another library are never yielded", async () => {
@@ -790,7 +848,7 @@ describe("unattended scans against the stand-in (Z2)", () => {
   it("a scan cut on a later page yields no gone item", async () => {
     for (let i = 0; i < 650; i++) z.addItem(U, art(`Item ${i}`));
     z.dropConnectionOnPage(7, { mode: "midBody" });
-    const cut = await scanFake({}, { knownIds: known("GONEGONE") });
+    const cut = await scanFake({ maxRetries: 0 }, { knownIds: known("GONEGONE") });
     expect(goneOf(cut.items)).toEqual([]);
     expect(cut.items.at(-1)).toEqual({ key: "zotero-web:", files: [], unreadable: ZOTERO_WEB_REASONS.unavailable });
     expect(cut.result.completed).toBe(false);
@@ -803,6 +861,17 @@ describe("unattended scans against the stand-in (Z2)", () => {
     z.dropConnectionOnPage(7);
     const retried = await scanFake({}, { knownIds: known("GONEGONE") });
     expect(goneOf(retried.items)).toEqual([["zotero:GONEGONE", "deleted"]]);
+  });
+
+  it("a page cut in the middle of its body is read again (M7)", async () => {
+    for (let i = 0; i < 250; i++) z.addItem(U, art(`Item ${i}`));
+    z.dropConnectionOnPage(2, { mode: "midBody" });
+    const { items, result } = await scanFake({}, { knownIds: known("GONEGONE") });
+    expect(items.some((i) => i.unreadable)).toBe(false);
+    expect(contentOf(items)).toHaveLength(250);
+    expect(goneOf(items)).toEqual([["zotero:GONEGONE", "deleted"]]);
+    expect(result.completed).toBe(true);
+    expect(z.requests.filter((r) => r.path.startsWith("/users/42/items?") && page(r.path).get("start") === "100" && page(r.path).get("format") === "json")).toHaveLength(2);
   });
 
   it("a key revoked half-way yields no gone item and ends as key-refused", async () => {
@@ -829,7 +898,7 @@ describe("unattended scans against the stand-in (Z2)", () => {
     expect(late.items.at(-1)).toEqual({ key: "zotero-web:", files: [], unreadable: ZOTERO_WEB_REASONS.keyRefused });
   });
 
-  it("a library that changes during the scan (restarted) yields no unseen item as gone, and does not count as complete", async () => {
+  it("a library that changes during the scan restarts it; the whole read after the restart is complete (A5)", async () => {
     for (let i = 0; i < 150; i++) z.addItem(U, art(`Item ${i}`));
     const first = z.addItem(U, art("Edited mid-scan"));
     z.backoffOnce(1); // after page 1 the client waits (sleep): the library changes there
@@ -844,8 +913,73 @@ describe("unattended scans against the stand-in (Z2)", () => {
     expect(edited).toBe(true);
     expect(z.requests.filter((q) => q.path.startsWith("/users/42/items?") && q.path.includes("start=0")).length).toBeGreaterThanOrEqual(2); // it restarted
     expect(contentOf(items)).toHaveLength(151);
-    expect(goneOf(items)).toEqual([]);
-    expect(result.completed).toBe(false);
+    expect(JSON.stringify(items.find((i) => i.key === `zotero:${first}`)!.referenceMetadata)).toContain("Revised");
+    // The back-off was waited out (A4) and the restart read everything at one version: whole.
+    expect(goneOf(items)).toEqual([["zotero:GONEGONE", "deleted"]]);
+    expect(result.completed).toBe(true);
+    expect(result.backoffUntil).toBeDefined();
+  });
+
+  it("with no Total-Results, a short page makes the scan incomplete and no item gone (P2b)", async () => {
+    // The stand-in always sends Total-Results, so this listing comes from the plain mock agent.
+    const all = Array.from({ length: 250 }, (_, i) => article(`NOTOT${String(i).padStart(3, "0")}`, `Item ${i}`));
+    agent
+      .get(API)
+      .intercept({ path: (q) => q.startsWith("/users/42/items?"), method: "GET" })
+      .reply((req) => {
+        const start = Number(page(req.path).get("start") ?? 0);
+        // Page 2 comes back short (50 of 100), and no answer says how many there are.
+        const body = start === 100 ? all.slice(100, 150) : all.slice(start, start + 100);
+        return { statusCode: 200, data: JSON.stringify(body), responseOptions: { headers: { ...JSON_HEADERS, "last-modified-version": "40" } } };
+      })
+      .persist();
+    serveCollections([]);
+    serveTagColors();
+    serveKeyCheck();
+    const work = join(tmp, "work2");
+    await mkdir(work, { recursive: true });
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: agent, sleep: async () => {} });
+    const items: ScanItem[] = [];
+    // Every one of the 250 is known here: the 100 never read must not be taken as deleted.
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work, knownIds: () => new Set(all.map((x) => `user:42/${x.key}`)) })) items.push(i);
+    expect(items.filter((i) => i.gone)).toEqual([]);
+    expect(a.scanResult().completed).toBe(false);
+  });
+
+  it("items that do not add up to Total-Results make the scan incomplete and no item gone", async () => {
+    const all = Array.from({ length: 120 }, (_, i) => article(`SHORT${String(i).padStart(3, "0")}`, `Item ${i}`));
+    agent
+      .get(API)
+      .intercept({ path: (q) => q.startsWith("/users/42/items?"), method: "GET" })
+      .reply((req) => {
+        const start = Number(page(req.path).get("start") ?? 0);
+        return { statusCode: 200, data: JSON.stringify(all.slice(start, start + 100)), responseOptions: { headers: { ...JSON_HEADERS, "total-results": "300", "last-modified-version": "40" } } };
+      })
+      .persist();
+    serveCollections([]);
+    serveTagColors();
+    serveKeyCheck();
+    const work = join(tmp, "work3");
+    await mkdir(work, { recursive: true });
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: agent, sleep: async () => {} });
+    const out: ScanItem[] = [];
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work, knownIds: () => new Set(["user:42/GONEGONE"]) })) out.push(i);
+    expect(out.filter((i) => i.gone)).toEqual([]);
+    expect(out.filter((i) => !i.gone && !i.unreadable)).toHaveLength(120);
+    expect(a.scanResult().completed).toBe(false);
+  });
+
+  it("tag colours that fail for a passing reason make the scan incomplete (M4)", async () => {
+    serveItems([article("COLOUR01", "Coloured")], 7);
+    serveCollections([]);
+    agent.get(API).intercept({ path: "/users/42/settings/tagColors", method: "GET" }).reply(503, "busy").persist();
+    const work = join(tmp, "work4");
+    await mkdir(work, { recursive: true });
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: agent, sleep: async () => {}, maxRetries: 0 });
+    const out: ScanItem[] = [];
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work })) out.push(i);
+    expect(out.map((i) => i.key)).toEqual(["zotero:COLOUR01"]);
+    expect(a.scanResult().completed).toBe(false);
   });
 
   it("an item the context skips is never downloaded", async () => {
@@ -905,6 +1039,9 @@ describe("unattended scans against the stand-in (Z2)", () => {
   });
 
   it("a WebDAV library's items come in with their highlights, unanchored, and say the file is not in Zotero's online storage", async () => {
+    expect(ZOTERO_WEB_FILE_NOTES.checksum).toBe(
+      "attached file did not match Zotero's checksum after 3 tries and was not brought in (the copy in Zotero's storage may be damaged or out of date, or the file may be kept elsewhere, for example on a WebDAV server)",
+    );
     expect(ZOTERO_WEB_FILE_NOTES.notInStorage).toBe("attached file is not in Zotero's online storage (it may be kept on a WebDAV server)");
     const p = z.addItem(U, art("On WebDAV"));
     const att = await pdfAttachment(p, { storage: "webdav" });
@@ -913,13 +1050,13 @@ describe("unattended scans against the stand-in (Z2)", () => {
     const qatt = await pdfAttachment(q, { storage: "webdav", stale: true });
     highlight(qatt, "stale highlight");
     const { items, result } = await scanFake();
-    for (const [key, quote] of [
-      [p, "webdav highlight"],
-      [q, "stale highlight"],
+    for (const [key, quote, note] of [
+      [p, "webdav highlight", ZOTERO_WEB_FILE_NOTES.notInStorage],
+      [q, "stale highlight", ZOTERO_WEB_FILE_NOTES.checksum], // Zotero has a copy; it never matches
     ] as const) {
       const it0 = items.find((i) => i.key === `zotero:${key}`)!;
       expect(it0.files).toEqual([]);
-      expect(it0.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.notInStorage]);
+      expect(it0.fileNotes).toEqual([note]);
       expect(it0.annotations).toEqual([expect.objectContaining({ kind: "highlight", quote })]);
       // Unanchored: no file to anchor in (the engine stores it without an anchor; its page stays as a label).
       expect(it0.annotations![0]).not.toHaveProperty("file");
@@ -985,6 +1122,11 @@ describe("unattended scans against the stand-in (Z2)", () => {
     expect(r2.backoffUntil).toBeGreaterThanOrEqual(before + 3_600_000);
     const { result: r3 } = await scanFake();
     expect(r3.backoffUntil).toBeUndefined();
+    // A wait beyond a day is reported as a day (M6).
+    z.backoffOnce(999_999_999);
+    const { result: r4 } = await scanFake();
+    expect(r4.backoffUntil).toBeLessThanOrEqual(Date.now() + 24 * 3_600_000);
+    expect(r4.backoffUntil).toBeGreaterThan(Date.now() + 23 * 3_600_000);
   });
 
   it("the scan result holds no key, path or title", async () => {
@@ -1316,7 +1458,7 @@ processing:
       expect(z.requests.filter((q) => q.path.endsWith(`/items/${att}/file`))).toHaveLength(3);
       expect(since).toBe(z.libraryVersion(U));
       const report = await createBulkImport(bulkDeps()).batchReport(p.id, batchId);
-      expect(JSON.stringify(report)).toContain(ZOTERO_WEB_FILE_NOTES.notInStorage);
+      expect(JSON.stringify(report)).toContain(ZOTERO_WEB_FILE_NOTES.checksum);
     });
 
     it("a key that may not read files does not hold since back", async () => {
@@ -1346,18 +1488,27 @@ processing:
       expect(since).toBeUndefined();
     });
 
-    it("a back-off holds since back (and the run still finishes)", async () => {
+    it("a back-off that was waited out does not hold since back (A4)", async () => {
       const p = await project();
       z.addItem(U, { itemType: "book", title: "Slowly" });
       z.backoffOnce(30);
       const { r, since } = await runOnce(p);
       expect(r.state).toBe("finished");
       expect(r.counts.created + r.counts.needsReview).toBe(1);
+      expect(since).toBe(z.libraryVersion(U));
+      // A 429 with Retry-After that then succeeded: the same.
+      const p2 = await project();
+      z.failNext(1, 429, 5);
+      expect((await runOnce(p2)).since).toBe(z.libraryVersion(U));
+    });
+
+    it("a 429 that outlasts its retries holds since back", async () => {
+      const p = await project();
+      z.addItem(U, { itemType: "book", title: "Too busy" });
+      z.failNext(10, 429, 5);
+      const { r, since } = await runOnce(p, { maxRetries: 1 });
+      expect(r.counts.failed).toBe(1);
       expect(since).toBeUndefined();
-      // The next run, with no back-off, moves it on.
-      const again = await runOnce(p);
-      expect(again.r.counts.unchanged).toBe(1);
-      expect(again.since).toBe(z.libraryVersion(U));
     });
 
     it("imports, records the library version, then asks only since it; Zotero deletions are yielded as gone and change nothing here", async () => {
@@ -1384,17 +1535,26 @@ processing:
       const second = (await sources(p)).find((sf) => sf.source.provenance.externalKeys?.zoteroKey === a2)!;
       expect(second).toEqual(before.find((sf) => sf.source.provenance.externalKeys?.zoteroKey === a2));
       const report = await createBulkImport(bulkDeps()).batchReport(p.id, h2.batchId);
-      expect(report.notes.join(" ")).toMatch(/1 item was deleted in Zotero since the last sync/u);
+      expect(report.notes).toContain("1 item you have here was deleted in Zotero since the last sync; nothing was deleted here.");
       expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
       const rec = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "batch.json"), "utf8"));
-      expect(rec.adapterOptions).toEqual({ zoteroSince: v1, zoteroFiles: true });
+      expect(rec.adapterOptions).toEqual({ zoteroSince: v1, zoteroFiles: true, zoteroReadVersions: [z.libraryVersion(U)] });
       expect(rec.recordedLibraryVersion).toBe(z.libraryVersion(U));
     });
   });
 
-  it("every request in this suite is a GET", () => {
-    // The after-each hook checks every request of every test; this proves it has been checking.
-    expect(checked.tests).toBeGreaterThan(20);
-    expect(checked.requests).toBeGreaterThan(100);
+  it("every request in this suite is a GET", async () => {
+    // The after-each hook checks every request of every test (stand-ins and the plain mock agent). This
+    // test makes requests of its own, so it proves the hook's input is there even when run alone (M9).
+    const z = newFake();
+    await setSecret("zotero-api-key", z.key);
+    z.addItem("user:42", { itemType: "book", title: "Checked" });
+    const work = join(tmp, "w-get");
+    await mkdir(work, { recursive: true });
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} });
+    for await (const _ of a.scan(new AbortController().signal, { workDir: async () => work })) void _;
+    expect(z.requests.length).toBeGreaterThan(0);
+    expect(z.requests.every((r) => r.method === "GET")).toBe(true);
+    expect(checked.requests >= checked.tests).toBe(true);
   });
 });

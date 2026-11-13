@@ -134,7 +134,9 @@ export interface ScanContext {
   /**
    * True when the engine will pass this item by anyway (e.g. it is already in a resumed batch's
    * journal): an adapter that downloads may then fetch nothing for it and yield nothing. Optional:
-   * an adapter that ignores it is still correct (the engine keeps its own journal check).
+   * an adapter that ignores it is still correct (the engine keeps its own journal check). The adapter
+   * may need a little to learn an item's key first (the Zotero Web incremental scan fetches a changed
+   * child's parent records by key to find the item), but nothing under a skipped item.
    */
   skip?(itemKey: string): boolean;
   /**
@@ -179,6 +181,8 @@ export interface ImportSourceAdapter {
     zoteroSince?: number;
     /** Zotero Web (Z2): whether files are downloaded (absent: true). */
     zoteroFiles?: boolean;
+    /** Zotero Web (A5): the library version each part of the batch read at, as soon as that part knows it. */
+    zoteroReadVersions?: number[];
   };
 }
 
