@@ -81,6 +81,17 @@ export interface BatchCounts {
   unchanged: number;
   deletedHere: number;
   failed: number;
+  /**
+   * Zotero (Task Z5, R224; absent from older reports): sources this import marked gone from Zotero (of them in its
+   * bin), sources already marked so earlier, sources back in Zotero (of them also updated, which are in `updated`
+   * too), and gone items with no source of their own here.
+   */
+  goneInZotero?: number;
+  goneInZoteroBin?: number;
+  goneAlready?: number;
+  backInZotero?: number;
+  backInZoteroUpdated?: number;
+  goneNotMarked?: number;
 }
 
 export interface GovernanceNote {

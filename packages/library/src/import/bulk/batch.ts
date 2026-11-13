@@ -100,6 +100,11 @@ export interface JournalEntry {
   files?: { copied: number; linked: number };
   /** Task Z5: what Zotero said of the item (`zotero-gone`, `zotero-gone-unmarked`): deleted, or in its bin. */
   gone?: "deleted" | "bin";
+  /**
+   * Task Z5 (R224 a): a `zotero-back` line whose change also updated the item's content from Zotero (fields, files,
+   * tags or annotations), not only its availability: it is counted as back AND as updated.
+   */
+  contentUpdated?: true;
 }
 
 /** A journal line's `files`, from whether each stored file is a link; undefined when none was stored. */
@@ -292,19 +297,27 @@ export function countOutcomes(latest: Iterable<JournalEntry>): {
   deletedHere: number;
   failed: number;
   items: number;
-  /** Task Z5: sources marked gone from Zotero (or already marked the same way), of them in Zotero's bin, and back. */
+  /**
+   * Task Z5 (R224): sources this batch marked gone from Zotero (a change it made: the line records it), of them in
+   * Zotero's bin; sources already marked the same way (counted only); sources whose mark it took away, of them those
+   * whose content it also updated (also counted in `updated`).
+   */
   goneInZotero: number;
   goneInZoteroBin: number;
+  goneAlready: number;
   backInZotero: number;
+  backInZoteroUpdated: number;
   /** Items Zotero said are gone that have no source of their own here to mark (deleted here, merged only). */
   goneNotMarked: number;
 } {
-  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, deletedHere: 0, failed: 0, items: 0, goneInZotero: 0, goneInZoteroBin: 0, backInZotero: 0, goneNotMarked: 0 };
+  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, deletedHere: 0, failed: 0, items: 0, goneInZotero: 0, goneInZoteroBin: 0, goneAlready: 0, backInZotero: 0, backInZoteroUpdated: 0, goneNotMarked: 0 };
   for (const e of latest) {
     // Items gone from Zotero brought nothing in: counted apart, not as items.
     if (e.outcome === "zotero-gone") {
-      c.goneInZotero++;
-      if (e.gone === "bin") c.goneInZoteroBin++;
+      if (e.merge?.availability) {
+        c.goneInZotero++;
+        if (e.gone === "bin") c.goneInZoteroBin++;
+      } else c.goneAlready++;
       continue;
     }
     if (e.outcome === "zotero-gone-unmarked") {
@@ -312,8 +325,13 @@ export function countOutcomes(latest: Iterable<JournalEntry>): {
       continue;
     }
     c.items++;
-    if (e.outcome === "zotero-back") c.backInZotero++;
-    else if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
+    if (e.outcome === "zotero-back") {
+      c.backInZotero++;
+      if (e.contentUpdated) {
+        c.backInZoteroUpdated++;
+        c.updated++;
+      }
+    } else if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
     else if (e.outcome === "needs-review") c.needsReview++;
     else if (e.outcome === "duplicate" || e.outcome === "skipped") c.duplicates++;
     else if (e.outcome === "merged") c.merged++;

@@ -28,7 +28,7 @@ import { decryptBytes, readMaybe } from "../../repo/io.js";
 import { projectDataKey } from "../../repo/repo.js";
 import { join } from "node:path";
 import { zoteroKeysOf } from "../../repo/tombstones.js";
-import { BOOKKEEPING, PRIVATE_MODE, activeBatches, findBatch, readJournal, writeBatchRecord } from "./batch.js";
+import { BOOKKEEPING, PRIVATE_MODE, activeBatches, batchDirs, findBatch, readBatchAt, readJournal, writeBatchRecord } from "./batch.js";
 import { revertMerge } from "./merge.js";
 import { BatchRefusedError } from "./run.js";
 
@@ -61,6 +61,20 @@ export interface UndoResult {
   libraryVersionReset?: true;
 }
 
+/** The ids of the project's batches whose record says undone (an unreadable record is taken as standing). */
+async function undoneBatchIds(repo: Repo, projectId: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const d of await batchDirs(repo, projectId)) {
+    try {
+      const r = await readBatchAt(repo, projectId, d.name);
+      if (r?.state === "undone") out.add(r.id);
+    } catch {
+      // unreadable: not known to be undone
+    }
+  }
+  return out;
+}
+
 export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
   // The batch's slot is taken before anything is awaited (R63): no resume, start or second undo meanwhile.
   if (activeBatches.has(batchId)) throw new BatchRefusedError("This import is running or being undone; try again when it has stopped.", false, "running");
@@ -80,7 +94,9 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
   const journal = await readJournal(repo, projectId, rec.dir);
   const kept: UndoKept[] = [];
 
-  // 1. Merges, newest first, exactly what each one added.
+  // 1. Merges, newest first, exactly what each one added. Z5 (R224 b): a "gone from Zotero" mark whose own batch is
+  //    undone is never put back; which batches are undone is read from their records (never their journals).
+  const undone = journal.some((e) => e.merge?.availability?.marks?.length) ? await undoneBatchIds(repo, projectId) : new Set<string>();
   let revertedMerges = 0;
   for (const e of [...journal].reverse()) {
     if (!e.mergedInto || !e.merge || !hasSource(repo, projectId, e.mergedInto)) continue;
@@ -92,12 +108,12 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
       { action: "store", store: { identifiable: p.identifiable, hasLocation: false, ...(p.legal.basis ? { legalBasis: p.legal.basis } : {}) } },
       async (ops) => {
         const now = await ops.readSource(e.mergedInto!);
-        const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor);
+        const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor, (id) => undone.has(id));
         for (const a of r.removed) await ops.trashAssetFile(a);
         for (const path of r.kept) kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: "changed after the import; kept" });
         for (const id of r.keptAnnotations) kept.push({ kind: "annotation", id, sourceId: e.mergedInto!, reason: "edited after the import; kept" });
         // Z5: an availability changed since this batch wrote it (a later batch, or the researcher) is left as it is.
-        if (r.keptAvailability) kept.push({ kind: "availability", id: "/availability", sourceId: e.mergedInto!, reason: "its availability changed after the import; kept" });
+        if (r.keptAvailability) kept.push({ kind: "availability", id: "/availability", sourceId: e.mergedInto!, reason: "its availability was changed after this import, so it was left as it is" });
         if (r.changed) await ops.writeSource(now, r.next);
         return r.changed;
       },

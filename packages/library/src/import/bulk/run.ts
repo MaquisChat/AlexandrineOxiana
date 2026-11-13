@@ -133,7 +133,7 @@ import {
   type ShownState,
 } from "./batch.js";
 import { BatchDedupe } from "./dedupe.js";
-import { applyMerge, missingFields, type MergeRecord } from "./merge.js";
+import { applyMerge, missingFields, type MarkRecord, type MergeRecord } from "./merge.js";
 import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./outside.js";
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
@@ -242,13 +242,17 @@ export interface BatchCounts {
   deletedHere: number;
   failed: number;
   /**
-   * Task Z5: items deleted in Zotero or in its bin whose source was marked (or already was, the same way), and of
-   * them those in the bin; items seen again whose mark was taken away; and items Zotero said are gone that have no
-   * source of their own here (deleted here, merged only), counted apart. None of these is in `items`, except back.
+   * Task Z5 (R224): sources this batch marked gone from Zotero (deleted there, or in its bin), and of them those in
+   * the bin; sources already marked the same way by an earlier batch (counted only, `goneAlready`); sources seen
+   * again whose mark was taken away (`backInZotero`), and of them those whose content was also updated
+   * (`backInZoteroUpdated`, which are counted in `updated` too); and items Zotero said are gone that have no source
+   * of their own here (deleted here, merged only), counted apart. None of these is in `items`, except back.
    */
   goneInZotero: number;
   goneInZoteroBin: number;
+  goneAlready: number;
   backInZotero: number;
+  backInZoteroUpdated: number;
   goneNotMarked: number;
 }
 
@@ -639,17 +643,26 @@ class Run {
   private syncRecord(state: BatchState): void {
     const c = this.counts();
     this.rec.state = state;
-    // An item back in Zotero was updated here (its mark taken away); items gone from Zotero brought nothing in.
+    // The record's counts agree with the report's (R224 a): `merged` is the report's merged + updated (a back that
+    // also updated the item is in `updated`); marks, bare backs and gone items are counted only in countsDetail.
     this.rec.counts = {
       created: c.created,
-      merged: c.merged + c.updated + c.backInZotero,
-      skipped: c.duplicates + c.unchanged + c.deletedHere + c.goneInZotero + c.goneNotMarked,
+      merged: c.merged + c.updated,
+      skipped: c.duplicates + c.unchanged + c.deletedHere,
       failed: c.failed,
       needsReview: c.needsReview,
     };
     // Z5: the Zotero detail, counted apart in the record (absent when there is none, as in every other kind of batch).
-    if (c.goneInZotero || c.backInZotero || c.goneNotMarked) {
-      this.rec.countsDetail = { ...(this.rec.countsDetail ?? {}), goneInZotero: c.goneInZotero, goneInZoteroBin: c.goneInZoteroBin, backInZotero: c.backInZotero, goneNotMarked: c.goneNotMarked };
+    if (c.goneInZotero || c.goneAlready || c.backInZotero || c.goneNotMarked) {
+      this.rec.countsDetail = {
+        ...(this.rec.countsDetail ?? {}),
+        goneInZotero: c.goneInZotero,
+        goneInZoteroBin: c.goneInZoteroBin,
+        goneAlready: c.goneAlready,
+        backInZotero: c.backInZotero,
+        backInZoteroUpdated: c.backInZoteroUpdated,
+        goneNotMarked: c.goneNotMarked,
+      };
     }
     this.rec.createdSourceIds = [...this.createdIds];
     this.rec.governance = [
@@ -906,7 +919,11 @@ class Run {
           const record: MergeRecord = { addedAssetIds: [], filled: [], addedEvidence: [] };
           if (same(before)) return { next: null, record, outcome: "zotero-gone" };
           const after: Availability = { status: "unavailable-on-platform", zotero: g, firstNoticedAt: ops.tx.at };
-          return { next: { ...cur, source: { ...cur.source, availability: after } }, record: { ...record, availability: { before, after } }, outcome: "zotero-gone" };
+          // R224 b: the record carries the marks under `before` and the availability before all of them, so its undo
+          // (and a later back) never depends on another batch's journal, nor puts back a mark whose batch is undone.
+          const under = before.zotero !== undefined ? this.markChain(cur.source.id, before) : { marks: [], preMark: before };
+          const availability: MarkRecord = { before, after, ...(under.preMark ? { preMark: under.preMark } : {}), marks: under.marks };
+          return { next: { ...cur, source: { ...cur.source, availability: after } }, record: { ...record, availability }, outcome: "zotero-gone" };
         },
         () => ({ gone: g }),
         undefined,
@@ -914,26 +931,42 @@ class Run {
       ),
     );
     const a = out.entry.merge?.availability;
-    if (a) this.marks.set(k.sourceId, [...(this.marks.get(k.sourceId) ?? []), a]);
+    if (a) this.marks.set(k.sourceId, [...(this.marks.get(k.sourceId) ?? []), { ...a, batchId: this.rec.id }]);
     return out.entry;
   }
 
   /**
-   * Task Z5: the availability a marked source had before its "gone from Zotero" marks: each mark recorded what it
-   * found (MergeRecord.availability.before), so the chain is followed back from the availability it has now (a bin
-   * mark, then a deletion mark, back to the one before both). Whatever it was (available, incomplete, …) it is
-   * given back exactly. A chain that cannot be followed (a batch whose journal cannot be read) gives "available",
-   * as profile capture restores a post that returns.
+   * Task Z5 (R224 b): the "gone from Zotero" marks under a marked availability, oldest first, each with the batch that
+   * made it, and the availability before all of them (`preMark`). The marks known are those of batches not undone and
+   * of this run. `preMark` comes from the newest mark that matches (each mark records it), so a mark whose earlier
+   * mark's batch was undone still knows it; for a mark recorded before R224 (no `preMark`), the chain is followed back
+   * through each mark's `before`. Undefined only when neither works (see restoreFor).
    */
-  private restoreFor(sourceId: string, now: Availability): Availability {
+  private markChain(sourceId: string, now: Availability): { marks: Array<{ batchId: string; after: Availability }>; preMark?: Availability } {
     const list = this.marks.get(sourceId) ?? [];
+    const marks: Array<{ batchId: string; after: Availability }> = [];
+    let preMark: Availability | undefined;
     let a = now;
     for (let i = 0; i <= list.length && a.zotero !== undefined; i++) {
       const m = [...list].reverse().find((x) => isDeepStrictEqual(x.after, a));
       if (!m) break;
+      marks.unshift({ batchId: m.batchId, after: m.after });
+      preMark ??= m.preMark;
       a = m.before;
     }
-    return a.zotero === undefined ? a : { status: "available" };
+    if (a.zotero === undefined) preMark ??= a;
+    return { marks, ...(preMark ? { preMark } : {}) };
+  }
+
+  /**
+   * Task Z5: the availability a marked source had before its "gone from Zotero" marks (markChain), given back
+   * exactly, whatever it was. The fallback "available" (as profile capture restores a post that returns) is reached
+   * only when no mark that is known matches the availability it has now and none records it: a mark batch whose
+   * journal cannot be read, or an availability carrying `zotero` that no mark of this kind wrote (set by hand).
+   */
+  private restoreFor(sourceId: string, now: Availability): { to: Availability; marks: Array<{ batchId: string; after: Availability }> } {
+    const c = this.markChain(sourceId, now);
+    return { to: c.preMark ?? { status: "available" }, marks: c.marks };
   }
 
   private queue(e: JournalEntry, assets?: Asset[]): JournalEntry {
@@ -1733,6 +1766,8 @@ class Run {
     const rule = locationRule();
     let dropped = 0;
     let deletedHere = 0;
+    /** R224 a: a back whose change also updated the item's content (counted as back and as updated). */
+    let contentUpdated = false;
     const out = await this.changeSource(
       item,
       sourceId,
@@ -1740,7 +1775,8 @@ class Run {
       markOnly ? [storeRequest(target.source.provenance, located)] : [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance, located)],
       markOnly ? "import.zotero-mark" : "import.update",
       async (ops, cur) => {
-        const backTo = cur.source.availability.zotero !== undefined ? this.restoreFor(cur.source.id, cur.source.availability) : undefined;
+        const back = cur.source.availability.zotero !== undefined ? this.restoreFor(cur.source.id, cur.source.availability) : undefined;
+        const backTo = back?.to;
         const plan = planUpdate(cur, ref, evSource, ops.tx.at);
         const added = await this.addFiles(ops, cur, inputs);
         const merged = applyMerge(cur, added, plan.filled, plan.evidence, ops.tx.at, ops.tx.actor, tagIds);
@@ -1755,7 +1791,9 @@ class Run {
           ...(ann.added.length ? { addedAnnotationIds: ann.added.map((a) => a.id) } : {}),
           ...(ann.updated.length || ann.backfilled.length ? { updatedAnnotations: [...ann.updated, ...ann.backfilled] } : {}),
           ...(keptAll.length ? { kept: keptAll } : {}),
-          ...(backTo ? { availability: { before: cur.source.availability, after: backTo } } : {}),
+          // R224 b: the marks this back takes away, with their batches, and the availability before them all (its own
+          // after), so that its undo never puts back a mark whose batch is undone.
+          ...(back ? { availability: { before: cur.source.availability, after: back.to, preMark: back.to, marks: back.marks } } : {}),
         };
         const changed = plan.filled.length > 0 || added.length > 0 || ann.added.length > 0 || ann.updated.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0;
         // Only a back-filled sort index (R195): written and recorded for undo, but reported as unchanged.
@@ -1774,9 +1812,10 @@ class Run {
         );
         // Z5: the availability before the mark, and nothing more of its own (not a modification of the source).
         const next: SourceFile = backTo ? { ...updated, source: { ...updated.source, availability: backTo } } : updated;
+        contentUpdated = !!backTo && changed;
         return { next, record, outcome: backTo ? "zotero-back" : changed ? "updated" : "unchanged" };
       },
-      () => ({ ...(dropped ? { annotationsDropped: dropped } : {}), ...(deletedHere ? { annotationsDeletedHere: deletedHere } : {}) }),
+      () => ({ ...(dropped ? { annotationsDropped: dropped } : {}), ...(deletedHere ? { annotationsDeletedHere: deletedHere } : {}), ...(contentUpdated ? { contentUpdated: true as const } : {}) }),
       rule.hook,
       marked ? { marked: "back" } : undefined,
     );
@@ -1898,7 +1937,7 @@ export const zoteroDeletedNote = (n: number) =>
     : `${n} items you have here were deleted in Zotero since the last sync; they were kept here and marked.`;
 
 /** Task Z5: per source, the availability changes its "gone from Zotero" marks made, oldest first. */
-type Marks = Map<string, Array<{ before: Availability; after: Availability }>>;
+type Marks = Map<string, Array<MarkRecord & { batchId: string }>>;
 const deletedNote = (n: number) =>
   `${n} ${n === 1 ? "item you deleted here was" : "items you deleted here were"} not re-imported (choose "include deleted items" to import ${n === 1 ? "it" : "them"} again).`;
 
@@ -1926,7 +1965,7 @@ async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["s
     for (const e of await readJournal(repo, projectId, rec.dir)) {
       if (marks && e.outcome === "zotero-gone" && e.sourceId && e.merge?.availability) {
         const list = marks.get(e.sourceId) ?? [];
-        list.push(e.merge.availability);
+        list.push({ ...e.merge.availability, batchId: rec.id });
         marks.set(e.sourceId, list);
       }
       if (!e.ext || !e.sourceId) continue;
