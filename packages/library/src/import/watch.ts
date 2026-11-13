@@ -16,17 +16,26 @@
  *   3. `contentState` says "local" (anything else is counted and listed, never read: not hashed, not sniffed,
  *      not copied, not used as a sidecar, not given to metadata extraction);
  *   4. immediately before the first byte is read, `contentState` is asked again for that one file and the
- *      state it judged must equal the stability reading exactly; then the hash, then attach, which asks
- *      `readable` (the same check) again before its type sniff and for each sidecar beside the file.
+ *      state it judged must equal the stability reading exactly; then the hash (opened with O_NOFOLLOW), then
+ *      attach, which asks `readable` again immediately before EACH of its opens — the type sniff, its hash, the
+ *      metadata, the copy — and before each sidecar read: a fresh `lstat` must still equal the judged state (A6).
+ *   Sidecars (`.bib`, `.ris`, `.json`, `.opf`) are files like any other: one is read only after it passed steps
+ *   1–4 by itself (`sidecarOk`); one that has not is not used this time (A6, C1).
  *
- * Calls that never answer (R208 d): a time limit around a promise does not free the thread a stuck call
+ * Calls that never answer (R208 d, A6): a time limit around a promise does not free the thread a stuck call
  * holds. So every file-system call this module makes for a folder goes through that folder's one gate
  * (`FolderGate`): at most ONE call in flight per watched folder (the `lstat`s `contentState` makes included —
  * it is given the gate's `lstat`; on macOS its `/usr/bin/stat` process runs only after its `lstat`s have
- * answered, while this folder's one worker waits for it, so it is never beside another call of this folder).
- * A call unanswered after `fsTimeoutMs` marks the folder "unreachable" (notResponding), closes the watcher,
- * and NO further call is made on that folder until the stuck one settles; then the folder is checked again
- * and scanned.
+ * answered, while this folder's one worker waits for it, so it is never beside another call of this folder;
+ * the close of a handle whose read did not answer takes its turn after that read has settled). A call
+ * unanswered after `fsTimeoutMs` marks the folder "unreachable" (notResponding), closes the watchers, and NO
+ * further call is made on that folder until the stuck one settles — not by this watch, not by `stop()`, and
+ * not by a new watch of the same folder (`outstandingFolders`); then the folder is checked again and scanned.
+ *
+ * Left as they are (review M2, M6): attach's own reads of a file judged local are not time-limited (they run
+ * while this folder's worker waits, so they are still its one call, but a stuck one is not reported as "not
+ * responding" and it holds the project's store queue); and what is kept per file (`Rec`, about 255 bytes at
+ * 40,000 files) grows with the folder, not with time.
  *
  * Other behaviour kept from Task 26:
  *   - a file whose content changes after it came in is imported again (its new content is a new source;
