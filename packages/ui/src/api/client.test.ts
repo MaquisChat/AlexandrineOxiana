@@ -495,6 +495,8 @@ describe("byteRange() — a range of a stored file with the token in the header 
       );
       expect(err, what).toBeInstanceOf(ApiClientError);
       expect((err as ApiClientError).code, what).toBe("INTERNAL");
+      // Not a success status: the answer was wrong, as a bad gateway's would be (review M5).
+      expect((err as ApiClientError).status, what).toBe(502);
       expect((err as ApiClientError).message, what).not.toContain(TOKEN);
     }
   });
@@ -504,7 +506,10 @@ describe("byteRange() — a range of a stored file with the token in the header 
     const api = createClient(BASE, TOKEN, { fetch: f.fetch });
     await expect(api.byteRange(PATH, 0, 9)).rejects.toMatchObject({ status: 423, code: "PROJECT_LOCKED" });
     const unsatisfiable = createClient(BASE, TOKEN, { fetch: fakeFetch(() => new Response(null, { status: 416, headers: { "content-range": "bytes */100" } })).fetch });
-    await expect(unsatisfiable.byteRange(PATH, 200, 300)).rejects.toMatchObject({ status: 416 });
+    // A 416 has no error body: it is said in plain words, with the file's length when the service gave it (review M5).
+    await expect(unsatisfiable.byteRange(PATH, 200, 300)).rejects.toMatchObject({ status: 416, code: "VALIDATION", message: "The part of the file asked for is past its end.", reason: "100" });
+    const empty = createClient(BASE, TOKEN, { fetch: fakeFetch(() => new Response(null, { status: 416, headers: { "content-range": "bytes */0" } })).fetch });
+    await expect(empty.byteRange(PATH, 0, 9)).rejects.toMatchObject({ status: 416, reason: "0" });
     const before = f.calls.length;
     for (const [a, b] of [
       [-1, 9],
@@ -531,5 +536,18 @@ describe("byteRange() — a range of a stored file with the token in the header 
     ctl.abort();
     const g = fakeFetch((_url, init) => (init.signal?.aborted ? Promise.reject(new DOMException("aborted", "AbortError")) : partial(bytesOf(2), "bytes 0-1/2")));
     await expect(createClient(BASE, TOKEN, { fetch: g.fetch }).byteRange(PATH, 0, 1, { signal: ctl.signal })).rejects.toMatchObject({ name: "AbortError" });
+    // Aborted once the body is read but before the bytes are handed back: no stale answer (review M5).
+    const late = new AbortController();
+    const h = fakeFetch(() => {
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) {
+          c.enqueue(bytesOf(2));
+          c.close();
+          late.abort();
+        },
+      });
+      return new Response(body, { status: 206, headers: { "content-range": "bytes 0-1/2" } });
+    });
+    await expect(createClient(BASE, TOKEN, { fetch: h.fetch }).byteRange(PATH, 0, 1, { signal: late.signal })).rejects.toMatchObject({ name: "AbortError" });
   });
 });

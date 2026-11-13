@@ -93,8 +93,10 @@ export interface ApiClient {
    * ticket, never anything in the URL). The answer must be 206 with `Content-Range` starting at
    * `start` and ending at `end`, or earlier only where the service may cut it (the file's last byte,
    * or DOCUMENT_RANGE_MAX_BYTES), and a body of exactly that length; anything else is refused
-   * (INTERNAL) and never handed on. The service's own refusals (404, 413, 416, 423…) are thrown as
-   * they are. Same path rules as request(); bad arguments throw before anything is sent.
+   * (status 502, INTERNAL) and never handed on. The service's own refusals (404, 413, 423…) are
+   * thrown as they are; a 416 (no body) as VALIDATION with the file's length as `reason`. An answer
+   * whose signal was aborted meanwhile is never returned (AbortError). Same path rules as
+   * request(); bad arguments throw before anything is sent.
    */
   byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
 }
@@ -477,7 +479,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       throw new Error("A byte range needs whole numbers with 0 ≤ start ≤ end.");
     }
     const url = urlFor(path); // throws on a bad path or a credential in the URL
-    const mismatch = () => new ApiClientError(206, { code: "INTERNAL", message: "The library service answered with another part of the file than was asked for." });
+    const mismatch = () => new ApiClientError(502, { code: "INTERNAL", message: "The library service answered with another part of the file than was asked for." });
     const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "*/*", Range: `bytes=${start}-${end}` }, cache: "no-store" };
     if (o.signal) init.signal = o.signal;
     let res: Response;
@@ -486,6 +488,12 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     } catch (err) {
       if (o.signal?.aborted) throw err;
       throw unreachable();
+    }
+    if (res.status === 416) {
+      // No error body: said in plain words, with the file's length (`bytes */<total>`) as the reason.
+      res.body?.cancel().catch(() => {});
+      const total = /^bytes \*\/(\d{1,16})$/.exec(res.headers.get("content-range") ?? "")?.[1];
+      throw new ApiClientError(416, { code: "VALIDATION", message: "The part of the file asked for is past its end.", ...(total !== undefined ? { reason: total } : {}) });
     }
     if (!res.ok) throw await errorFrom(res);
     const refuse = (): never => {
@@ -524,6 +532,8 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       }
     }
     if (got !== length) throw mismatch();
+    // Aborted while the body was being read: the answer is stale, never handed back.
+    if (o.signal?.aborted) throw o.signal.reason instanceof Error ? o.signal.reason : new DOMException("The range was no longer wanted.", "AbortError");
     return { bytes, start: a, end: b, total };
   }
 
