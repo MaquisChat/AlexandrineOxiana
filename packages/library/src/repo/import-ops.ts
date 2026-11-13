@@ -43,6 +43,11 @@ export interface ImportOps {
   deleteTags(tagIds: string[], sourceIds: Iterable<string>): Promise<string[]>;
   /** Reads a project file written by this repo (decrypted when the project is encrypted). */
   readText(rel: string): Promise<string | null>;
+  /**
+   * For a decision that leaves a source in place without writing it (a plain accept): every field of
+   * its stored report in conflict is listed in a pending capture entry, in this change (R194).
+   */
+  keepConflictsListed(sourceId: string): Promise<void>;
 }
 
 export function runImportChange<T>(
@@ -83,14 +88,12 @@ export function runImportChange<T>(
           const nowAnn = new Set(parsed.annotations.map((a) => a.id));
           for (const a of before?.annotations ?? []) if (!nowAnn.has(a.id)) tx.record("annotation", a.id, a, null);
           if (!st.sources.has(parsed.source.id)) tx.onCommit(() => st.sources.set(parsed.source.id, parsed.source.folder));
-          // An existing source given a new report (a review decision's fields, a merge, an incremental
-          // update): its capture entries are re-examined in this change. A new source has none yet.
+          // An existing source written with its report: every field in conflict is listed in a pending
+          // capture entry, whether or not the report changed (R193 b, R194), and first, so an entry it
+          // extends is not resolved under it. A new source has none yet (its creation queued its own).
+          if (before) queued.push(...(await queueUnlistedConflicts(core, tx, parsed)));
+          // Given a new report (a review decision's fields): its capture entries are re-examined (R176 1).
           if (before && !isDeepStrictEqual(before.verification, parsed.verification)) {
-            // Every field in conflict is listed in a pending capture entry first (R193 b), so an entry it
-            // extends is not resolved under it. Only a review decision rewrites an existing source's report here (a run's merges
-            // and updates, and the undo's reverts, leave it as it is); a batch's undo removes that source
-            // and resolves the entry with it ("undone", R176 4).
-            queued.push(...(await queueUnlistedConflicts(core, tx, parsed)));
             resolved.push(...(await resolveSettledCaptureEntries(core, tx, parsed, "recheck")));
           }
           tx.index((sink) => sink.indexSource(parsed));
@@ -161,6 +164,9 @@ export function runImportChange<T>(
           if (!tx.encrypted) return raw.toString("utf8");
           const { key, keyId } = tx.key();
           return (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
+        },
+        async keepConflictsListed(sourceId) {
+          queued.push(...(await queueUnlistedConflicts(core, tx, await readSourceFile(core, st, sourceId))));
         },
       };
       if (opts.entity) tx.entity(opts.entity.type, opts.entity.id);
