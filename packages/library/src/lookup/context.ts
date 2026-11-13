@@ -36,7 +36,7 @@ export interface LookupContext {
   debug?: (note: string) => void;
 }
 
-export type Provider = "crossref" | "openalex" | "openlibrary" | "loc";
+export type Provider = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
 
 /** True unless the context explicitly says `sensitive: false` (R52, fail-closed). */
 export const isSensitive = (ctx: LookupContext): boolean => ctx.sensitive !== false;

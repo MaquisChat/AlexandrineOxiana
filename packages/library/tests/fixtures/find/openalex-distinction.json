@@ -1,0 +1,25 @@
+{
+  "meta": { "count": 2, "page": 1, "per_page": 5 },
+  "results": [
+    {
+      "id": "https://openalex.org/W2000000001",
+      "doi": "https://doi.org/10.5555/AO.FIND.DISTINCTION.1984",
+      "title": "Distinction: A Social Critique of the Judgement of Taste",
+      "publication_year": 1984,
+      "publication_date": "1984-01-01",
+      "type": "book",
+      "authorships": [{ "author": { "display_name": "Pierre Bourdieu" } }],
+      "primary_location": { "source": { "display_name": null, "host_organization_name": "Fixture University Press" } }
+    },
+    {
+      "id": "https://openalex.org/W2000000002",
+      "doi": "https://doi.org/10.5555/ao.find.reading.2001",
+      "title": "Reading Bourdieu in the Uplands",
+      "publication_year": 2001,
+      "publication_date": "2001-06-01",
+      "type": "article",
+      "authorships": [{ "author": { "display_name": "Henrik Lindqvist" } }],
+      "primary_location": { "source": { "display_name": "Journal of Upland Studies" } }
+    }
+  ]
+}
