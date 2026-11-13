@@ -8,6 +8,11 @@
 //!   closes.
 //! - Ready when it prints `AO_SERVICE_READY port=<n>`, within a time limit; otherwise it is stopped
 //!   and the reason is a plain sentence.
+//! - After the token, the shell writes on the same pipe only folder grant lines (grant.rs, R207),
+//!   through `ServiceInput::send_line`. Writing and closing take the same lock, so a grant is either
+//!   written whole before the close or refused after it; once closing has begun every send is
+//!   refused at once, and a close that cannot take the lock in time (a write stuck on a service that
+//!   no longer reads) gives way to the forced stop, whose kill ends the stuck write.
 //! - On POSIX systems it runs in its own process group, which the worker inherits: stopping waits
 //!   until no process of that group is left, then forces (SIGKILL to the group) after a time limit.
 //!   On Linux the shell is a "child subreaper", so the worker, orphaned when the service exits
@@ -17,9 +22,66 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
+
+/// The service's standard input after the token line, shared by the shell's stop and the folder
+/// chooser's grant (see the module comment). Cloning shares the same pipe and lock.
+#[derive(Clone)]
+pub struct ServiceInput {
+    pipe: Arc<Mutex<Option<ChildStdin>>>,
+    closing: Arc<AtomicBool>,
+}
+
+impl ServiceInput {
+    fn new(stdin: Option<ChildStdin>) -> Self {
+        ServiceInput { pipe: Arc::new(Mutex::new(stdin)), closing: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// Writes `line` whole under the pipe's lock. False when the pipe is closed or closing, or the
+    /// write failed (the service has exited); a failed write does not close the pipe.
+    pub fn send_line(&self, line: &str) -> bool {
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut guard = match self.pipe.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some(stdin) = guard.as_mut() else { return false };
+        stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).is_ok()
+    }
+
+    /// Closes the pipe (the service then shuts down cleanly). Sends are refused from the first
+    /// moment; the close itself waits for a write in progress, until `deadline`. False if the lock
+    /// could not be taken by then (the pipe is then still open).
+    fn close_by(&self, deadline: Instant) -> bool {
+        self.closing.store(true, Ordering::SeqCst);
+        loop {
+            match self.pipe.try_lock() {
+                Ok(mut g) => {
+                    drop(g.take());
+                    return true;
+                }
+                Err(TryLockError::Poisoned(p)) => {
+                    drop(p.into_inner().take());
+                    return true;
+                }
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+}
 
 /// What to run.
 #[derive(Debug, Clone)]
@@ -68,7 +130,7 @@ pub enum Stopped {
 
 pub struct Service {
     child: Child,
-    stdin: Option<ChildStdin>,
+    input: ServiceInput,
     pub port: u16,
 }
 
@@ -182,7 +244,7 @@ pub fn start(launch: &Launch, token: &str, ready_timeout: Duration, log: LogFn) 
         });
     }
 
-    let mut service = Service { child, stdin, port: 0 };
+    let mut service = Service { child, input: ServiceInput::new(stdin), port: 0 };
     match rx.recv_timeout(ready_timeout) {
         Ok(port) => {
             service.port = port;
@@ -213,24 +275,32 @@ impl Service {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
+    /// The service's standard input, for a grant line (grant.rs); it shares the lock `stop` closes under.
+    pub fn input(&self) -> ServiceInput {
+        self.input.clone()
+    }
+
     /// Closes the service's standard input (it then shuts down cleanly, and stops the worker), waits
     /// up to `grace` for every process of its group to be gone, and otherwise kills them.
     pub fn stop(&mut self, grace: Duration) -> Stopped {
-        drop(self.stdin.take());
-        if self.wait_gone(grace) {
+        let deadline = Instant::now() + grace;
+        if self.input.close_by(deadline) && self.wait_gone(deadline.saturating_duration_since(Instant::now())) {
             return Stopped::Clean;
         }
         self.kill_all();
         Stopped::Forced
     }
 
+    /// Kills the service's process group, then closes its standard input: killing first ends any
+    /// write blocked on a service that no longer reads, so the close never waits on it.
     fn kill_all(&mut self) {
-        drop(self.stdin.take());
+        self.input.closing.store(true, Ordering::SeqCst);
         #[cfg(unix)]
         unsafe {
             libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
         }
         let _ = self.child.kill();
+        let _ = self.input.close_by(Instant::now() + Duration::from_secs(5));
         let _ = self.wait_gone(Duration::from_secs(5));
     }
 
@@ -297,10 +367,15 @@ mod tests {
     /// (unless told otherwise) stops when its standard input ends.
     const STUB: &str = r#"
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 const [dir, mode] = [process.env.STUB_DIR, process.env.STUB_MODE];
 const lines = createInterface({ input: process.stdin });
+let first = true;
+lines.on("line", (line) => {
+  if (first) { first = false; return; }
+  appendFileSync(dir + "/lines", line + "\n");
+});
 lines.once("line", (token) => {
   writeFileSync(dir + "/token", token);
   writeFileSync(dir + "/env.json", JSON.stringify(process.env));
@@ -424,6 +499,70 @@ setInterval(() => {}, 1000);
         );
         assert_eq!(plain_reason("The library service will not start: NODE_PATH is set.").unwrap(), "The library service will not start: NODE_PATH is set.");
         assert_eq!(plain_reason("anything else"), None);
+    }
+
+    #[test]
+    fn a_line_sent_after_the_token_reaches_the_service_on_the_same_pipe() {
+        become_subreaper();
+        let dir = tmp("line");
+        let mut s = start(&launch(&dir, "ok"), TOKEN, Duration::from_secs(30), quiet()).unwrap();
+        let input = s.input();
+        assert!(input.send_line("{\"type\":\"folder-grant\"}\n"));
+        assert!(input.send_line("second\n"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read_to_string(dir.join("lines")).map(|l| l.lines().count()).unwrap_or(0) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(fs::read_to_string(dir.join("lines")).unwrap(), "{\"type\":\"folder-grant\"}\nsecond\n");
+        assert_eq!(fs::read_to_string(dir.join("token")).unwrap(), TOKEN);
+        assert_eq!(s.stop(Duration::from_secs(20)), Stopped::Clean);
+        // Closed by the stop: nothing more is written.
+        assert!(!input.send_line("late\n"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_send_racing_the_shutdown_neither_deadlocks_nor_writes_after_the_close() {
+        become_subreaper();
+        let dir = tmp("race");
+        let mut s = start(&launch(&dir, "ok"), TOKEN, Duration::from_secs(30), quiet()).unwrap();
+        let input = s.input();
+        let sender = std::thread::spawn(move || {
+            let mut sent = 0u32;
+            while input.send_line("x\n") {
+                sent += 1;
+            }
+            // Once refused, refused for good.
+            assert!(!input.send_line("x\n"));
+            sent
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let t0 = Instant::now();
+        assert_eq!(s.stop(Duration::from_secs(20)), Stopped::Clean);
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        let sent = sender.join().unwrap();
+        assert!(sent > 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_send_to_a_service_that_has_exited_is_refused() {
+        become_subreaper();
+        let dir = tmp("exited");
+        let mut s = start(&launch(&dir, "ok"), TOKEN, Duration::from_secs(30), quiet()).unwrap();
+        let input = s.input();
+        unsafe {
+            libc::kill(-(s.pid() as libc::pid_t), libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !s.has_exited() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(s.has_exited());
+        // The pipe's reader is gone: the write fails (EPIPE; SIGPIPE is ignored by Rust programs).
+        assert!(!input.send_line("{\"type\":\"folder-grant\"}\n"));
+        drop(s);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

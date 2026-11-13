@@ -16,6 +16,7 @@
 //! worker (R155 rule 3).
 
 pub mod connection;
+pub mod grant;
 pub mod helper_env;
 pub mod paths;
 #[cfg(debug_assertions)]
@@ -207,6 +208,45 @@ fn focus_main(app: &AppHandle, shell: &Shell) {
     }
 }
 
+/// The watched-folder chooser (Task W6, R207): the system's own folder chooser, ONE folder, started
+/// here (the page passes only a title). The chosen path goes to the service as a grant line on its
+/// standard input (grant.rs), written under the lock the shutdown closes that pipe under; the page
+/// receives only `{grantId, name}`, or null when the choice was cancelled, the window is not the main
+/// window, the app is closing, the service has exited, the path cannot be put in a grant line, or
+/// the write failed. Granted to the main window only (capabilities/main-window.json); the browser
+/// extension's token is the service's affair and reaches no shell command (it is not a window of
+/// this app and has no IPC).
+#[tauri::command]
+async fn pick_watch_folder(app: AppHandle, window: tauri::WebviewWindow, title: String) -> Option<serde_json::Value> {
+    if window.label() != "main" {
+        return None;
+    }
+    let shell = app.try_state::<Arc<Shell>>()?.inner().clone();
+    if shell.stopping.load(Ordering::SeqCst) || shell.closing.load(Ordering::SeqCst) {
+        return None;
+    }
+    let dialog = app.dialog().file().set_title(grant::chooser_title(&title)).set_parent(&window);
+    let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_folder()).await.ok()??;
+    let path = picked.into_path().ok()?;
+    let id = grant::new_grant_id()?;
+    let line = grant::grant_line(&id, &path)?;
+    let name = grant::folder_name(&path)?;
+    drop(path);
+    // Taken after the chooser closed: a stop that began meanwhile has removed the service.
+    let input = {
+        let mut guard = shell.service.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(svc) = guard.as_mut() else { return None };
+        if svc.has_exited() {
+            return None;
+        }
+        svc.input()
+    };
+    if !input.send_line(&line) {
+        return None;
+    }
+    Some(grant::PickedFolder { grant_id: id, name }.to_json())
+}
+
 /// SIGTERM, SIGINT and SIGHUP end the app the same way closing the window does.
 #[cfg(unix)]
 fn on_termination_signals(app: AppHandle) {
@@ -268,7 +308,9 @@ pub fn run() {
         // First, so that a second launch hands over to the first before it starts anything.
         .plugin(tauri_plugin_single_instance::init(move |app, _argv, _cwd| focus_main(app, &instance_shell)))
         .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![pick_watch_folder])
         .setup(move |app| {
+            app.manage(setup_shell.clone());
             let handle = app.handle().clone();
             #[cfg(unix)]
             on_termination_signals(handle.clone());
