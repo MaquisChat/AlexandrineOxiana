@@ -188,7 +188,7 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
               <ul>
                 {report.keptFields.map((f, i) => (
                   <li key={`${i}:${f.item}`}>
-                    <UserText>{f.item}</UserText>: {f.fields.join(", ")}
+                    <UserText>{f.item}</UserText>: <UserText>{f.fields.join(", ")}</UserText>
                   </li>
                 ))}
               </ul>

@@ -1413,6 +1413,9 @@ class Run {
    * batch's undo restores the earlier anchors.
    */
   private async backfillOnly(item: ScanItem, sourceId: string): Promise<JournalEntry | null> {
+    // Cost (R197, accepted for now): every Zotero highlight has a sort index, so this guard cannot tell a source that
+    // still needs the back-fill from one that has had it; each unchanged, highlighted item costs one source read per
+    // re-import. To be revisited when the automatic Zotero sync is planned.
     if (!item.annotations?.some((a) => a.anchor?.kind === "pdf" && a.anchor.sortIndex)) return null;
     try {
       const target = await this.repo.getSource(this.projectId, sourceId);
@@ -1604,7 +1607,8 @@ function keptLabels(sf: SourceFile, keys: string[]): string[] {
     const a = sf.annotations.find((x) => x.externalKey === k);
     if (!a) return "an annotation (changed here, kept)";
     const page = a.pageLabel ?? a.anchors.find((x) => x.kind === "pdf")?.page;
-    return `${a.kind}${page !== undefined ? ` on page ${page}` : ""} (changed here, kept)`;
+    const word = a.kind === "ink" ? "drawing" : a.kind === "image" ? "marked area" : a.kind;
+    return `${word}${page !== undefined ? ` on page ${page}` : ""} (changed here, kept)`;
   });
 }
 

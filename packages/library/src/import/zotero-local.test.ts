@@ -23,6 +23,7 @@ import { importChange, projectCollectionsAndTags, projectWarnings } from "../rep
 import { encryptBytes } from "../repo/io.js";
 import { ImmutableProvenanceError } from "../repo/errors.js";
 import { applyMerge } from "./bulk/merge.js";
+import { readJournal } from "./bulk/batch.js";
 import { openTestRepo, seams } from "../repo/testing.js";
 import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
 import type { ScanAnnotation } from "./bulk/scan.js";
@@ -898,28 +899,48 @@ processing:
     expect(a2.annotations).toEqual(before.annotations);
   });
 
-  it("R196 (a): a crash half-way through the back-fill leaves the annotations whole, and the next run back-fills", async () => {
-    const p = await project();
-    const bulk = bulkImport();
-    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
-    const a0 = byZoteroKey(await sources(p), "AAAA1111");
-    await stripSortIndexes(p, a0.source.id);
-    seams.crashAt = "before-audit";
-    try {
+  // The crash is armed from inside the back-fill's own governed change (when it makes its snapshot folder), so
+  // it only passes if the annotations, the journal line and the audit event are all written by that one change.
+  for (const point of ["before-changes", "before-audit", "before-marker-delete"] as const) {
+    it(`R196 (a): a crash inside the back-fill's change (${point}) leaves file, audit and journal in agreement; the next run completes it`, async () => {
+      const p = await project();
+      const bulk = bulkImport();
       await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
-    } catch {
-      // the process "died" at the crash point
-    } finally {
-      seams.crashAt = undefined;
-    }
-    repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
-    const whole = byZoteroKey(await sources(p), "AAAA1111");
-    expect(whole.annotations).toHaveLength(3);
-    expect(withIndex(whole)).toBe(0);
-    const r = await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
-    expect(r.counts.failed).toBe(0);
-    expect(withIndex(byZoteroKey(await sources(p), "AAAA1111"))).toBe(2);
-  });
+      const a0 = byZoteroKey(await sources(p), "AAAA1111");
+      await stripSortIndexes(p, a0.source.id);
+      const sourceEvents = async () => (await auditEvents(p)).filter((e) => e.entity?.id === a0.source.id).length;
+      const eventsBefore = await sourceEvents();
+      let fired = false;
+      seams.beforeMkdir = async (abs) => {
+        if (fired || !abs.includes("snapshots")) return;
+        fired = true;
+        seams.crashAt = point;
+        seams.failAuditAppendFor = p.id; // the run cannot carry on in-process after the "crash"
+      };
+      try {
+        await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+      } catch {
+        // the process "died" at the crash point
+      } finally {
+        seams.beforeMkdir = undefined;
+        seams.crashAt = undefined;
+        seams.failAuditAppendFor = undefined;
+      }
+      expect(fired).toBe(true);
+      repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+      const after = byZoteroKey(await sources(p), "AAAA1111");
+      expect(after.annotations).toHaveLength(3); // whole
+      const filled = withIndex(after);
+      expect([0, 2]).toContain(filled); // all of it or none of it
+      const journal = (await readJournal(repo, p.id, "imports/batch-0002")).filter((e) => e.mergedInto === a0.source.id && e.merge?.updatedAnnotations?.length);
+      expect(journal).toHaveLength(filled ? 1 : 0);
+      expect(await sourceEvents()).toBe(eventsBefore + (filled ? 1 : 0));
+      if (point !== "before-marker-delete") expect(filled).toBe(0); // before the commit point: rolled back
+      const r = await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+      expect(r.counts.failed).toBe(0);
+      expect(withIndex(byZoteroKey(await sources(p), "AAAA1111"))).toBe(2);
+    });
+  }
 
   it("a re-import keeps what the researcher changed (even when Zotero changed it too) and does not bring back what was deleted", async () => {
     const p = await project();
