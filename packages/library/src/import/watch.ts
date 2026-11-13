@@ -747,7 +747,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
    * file); `seen` the files not downloaded when this watch saw the confirmation (null: not known — every file is
    * then held to `confirmedBytes`, the tighter limit); `held` once a file would pass the allowance.
    */
-  let dl: { identity: string; confirmation: number; confirmedBytes: number; fetched: number; seen: Set<string> | null; held: boolean } | null = null;
+  let dl: { identity: string; confirmation: number; confirmedBytes: number; seen: Set<string> | null; held: boolean } | null = null;
   /** Files that could not be downloaded: not tried again before this time. */
   const dlRetry = new Map<string, number>();
   let dlNextAt = 0;
@@ -1900,7 +1900,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         // complete listing; otherwise every file is held to the confirmed size, the tighter limit.
         const live = before !== null && listedOnce && !pausedNow();
         // No confirmation on record: nothing at all is downloaded, 0 bytes included (I4); held for the researcher's word.
-        dl = { identity, confirmation: count.confirmation, confirmedBytes: c.confirmedBytes, fetched: count.fetchedBytes, seen: live ? new Set(ndOrder) : null, held: count.confirmation === 0 };
+        dl = { identity, confirmation: count.confirmation, confirmedBytes: c.confirmedBytes, seen: live ? new Set(ndOrder) : null, held: count.confirmation === 0 };
         dlNextAt = 0;
       }
     }
@@ -2008,15 +2008,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       return;
     }
     // The allowance, exactly: files the researcher saw up to `confirmedBytes`; later arrivals up to
-    // WATCH_DOWNLOAD_CONFIRM_BYTES beyond it. At the limit is allowed; one byte past it holds downloading. This watch's
-    // own count is only a first look: the RESERVATION in the device record decides (I1), in one turn of that file.
+    // WATCH_DOWNLOAD_CONFIRM_BYTES beyond it. At the limit is allowed; one byte past it holds downloading. The device
+    // record alone decides (I1), in one turn of that file: this watch keeps no count of its own.
     const later = d.seen !== null && !d.seen.has(rel);
-    const limit = later ? d.confirmedBytes + WATCH_DOWNLOAD_CONFIRM_BYTES : d.confirmedBytes;
-    if (d.fetched + a.size > limit) {
-      d.held = true;
-      touch();
-      return;
-    }
     // Reserved BEFORE the download starts: a download cut short still counts, a restart does not grant the allowance
     // again, and no other watch of the id can download what this one reserved.
     let r: Awaited<ReturnType<typeof reserveWatchDownload>>;
@@ -2034,7 +2028,6 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       } else await refreshChoices(); // a new confirmation came meanwhile: decided afresh
       return;
     }
-    d.fetched = Math.max(d.fetched, r.fetchedBytes);
     touch();
     // The file in hand must still be the one counted (its size read again just before): any change, and it is decided
     // again by the ordinary steps (its bytes stay counted: the conservative side).
