@@ -96,6 +96,12 @@ export interface ScanItem {
   tags?: string[];
   /** Further collection paths the item is in (a Zotero item can be in several collections). */
   moreFolderPaths?: string[][];
+  /**
+   * Zotero Web (Task Z6, R236 f): the source's own collection keys along each path, in the order of
+   * `[folderPath, ...moreFolderPaths]` (each list as long as its path). Journaled, so that a collection renamed at the
+   * source (the same key under another name) is told from a new one. Optional: other adapters give none.
+   */
+  folderKeys?: string[][];
   /** Colours of the item's tags, by tag name (used when the tag is created). */
   tagColors?: Record<string, string>;
   /** Annotations and notes (Zotero, R72). */

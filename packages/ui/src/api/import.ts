@@ -92,6 +92,14 @@ export interface BatchCounts {
   backInZotero?: number;
   backInZoteroUpdated?: number;
   goneNotMarked?: number;
+  /**
+   * Zotero account sync (Task Z6, R236; absent from older reports): sources with a field changed in Zotero and here,
+   * Zotero's value waiting for the researcher's decision (an updated one is in `updated` too); sources with a field
+   * Zotero cleared that keeps its value here; collections renamed in Zotero.
+   */
+  conflicts?: number;
+  clearedInZoteroKept?: number;
+  collectionsRenamed?: number;
 }
 
 export interface GovernanceNote {
@@ -145,7 +153,7 @@ export interface UndoResult {
   removedSources: number;
   revertedMerges: number;
   /** Of revertedMerges, by what the import had done (Z5; absent from an older service). */
-  reverted?: { merged: number; updated: number; unmarked: number; remarked: number };
+  reverted?: { merged: number; updated: number; unmarked: number; remarked: number; /** Z6: sources whose waiting Zotero values were taken off (absent when none). */ conflicts?: number };
   kept: Array<{ kind: string; id: string; sourceId?: string; reason: string }>;
 }
 

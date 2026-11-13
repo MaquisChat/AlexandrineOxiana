@@ -79,6 +79,36 @@ function validEvidence(evidence: unknown): FieldEvidence[] {
   );
 }
 
+/** Structural equality of JSON values (key order ignored). Core stays free of Node built-ins. */
+function isDeepStrictEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) return a.length === (b as unknown[]).length && a.every((x, i) => isDeepStrictEqual(x, (b as unknown[])[i]));
+  const ka = Object.keys(a).filter((k) => (a as Record<string, unknown>)[k] !== undefined);
+  const kb = Object.keys(b).filter((k) => (b as Record<string, unknown>)[k] !== undefined);
+  return ka.length === kb.length && ka.every((k) => isDeepStrictEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
+
+const emptyValue = (v: unknown) => v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
+
+/**
+ * The evidence that counts as a claim (Z6, R236 c). For evidence of kind `zotero`, only the NEWEST value of each field
+ * from each Zotero source (`provider` and `ref`) is a claim: every Zotero import or sync records the value it brought,
+ * so the earlier ones are history (what Zotero once said, kept so that a re-import knows what it brought last), not
+ * claims. A newest value that is empty (Zotero cleared the field) means Zotero claims nothing for it. "Newest" is the
+ * last in the list, the order in which imports append evidence. Every other kind is left exactly as it was: a page
+ * captured twice or a lookup repeated keeps each value as a claim (R190–R194 rely on a later check's value standing
+ * beside the earlier one).
+ */
+export function currentClaims(evidence: FieldEvidence[]): FieldEvidence[] {
+  const newest = new Map<string, FieldEvidence>();
+  for (const e of evidence) if (e.source.kind === "zotero") newest.set(`${e.field}\u0000${e.source.provider ?? ""}\u0000${e.source.ref ?? ""}`, e);
+  if (!newest.size) return evidence;
+  const keep = new Set([...newest.values()].filter((e) => !emptyValue(e.value)));
+  return evidence.filter((e) => e.source.kind !== "zotero" || keep.has(e));
+}
+
 /**
  * Check every field's evidence against the document text, platform snapshot and lookups.
  * Never throws: anything it cannot make sense of becomes `unverified` with a reason.
@@ -96,7 +126,7 @@ export function verifyDraft(draft: SourceDraft, evidence: FieldEvidence[], ctx: 
   } catch {
     docNorm = "";
   }
-  const stored = validEvidence(evidence);
+  const stored = currentClaims(validEvidence(evidence));
   const c: CheckCtx = {
     type,
     draft: d,
@@ -144,10 +174,30 @@ export function recheckSourceFile(sf: SourceFile, ctx: VerifyContext): SourceFil
   const snapshot = ctx.platformSnapshot ?? (isRecord(sf.source.provenance?.platformSnapshot) ? sf.source.provenance.platformSnapshot : undefined);
   const report = verifyDraft(sf.source as unknown as SourceDraft, sf.fieldEvidence, { ...ctx, platformSnapshot: snapshot });
   const verification: Record<string, FieldVerification> = { ...report.fields };
+  const claims = currentClaims(validEvidence(sf.fieldEvidence));
   for (const [k, v] of Object.entries(sf.verification)) {
+    if (v.status === "conflict" && v.checks.includes(ZOTERO_CONFLICT_CHECK)) {
+      // Z6 (R236 c): a field changed in Zotero and here stays as the update recorded it (its reason, the value Zotero
+      // gave) while both of its values are still what it recorded: the value here, and Zotero's newest. Settled by the
+      // researcher's own evidence, or by either value moving on: then the fresh check speaks.
+      // I5 (fix round 2): the researcher's evidence settles it only when it is NEWER than Zotero's newest evidence for
+      // the field — later in `fieldEvidence`, the order in which every change appends (a confirm takes its own earlier
+      // evidence out and appends the new one). Position, never time: two entries recorded in the same second are still
+      // ordered. An older "keep mine" does not answer the question Zotero raised after it.
+      const zotero = [...claims].reverse().find((e) => e.field === k && e.source.kind === "zotero");
+      const still = zotero && isDeepStrictEqual(zotero.value, v.values?.[0]?.value) && isDeepStrictEqual(getByPointer(sf.source as unknown as Record<string, unknown>, k), v.current);
+      const all = validEvidence(sf.fieldEvidence);
+      const lastAt = (kind: (e: FieldEvidence) => boolean) => all.reduce((at, e, i) => (e.field === k && kind(e) ? i : at), -1);
+      const userNewer = lastAt((e) => e.source.kind === "user") > lastAt((e) => e.source.kind === "zotero");
+      if (still && !(userNewer && report.fields[k]?.status === "user-confirmed")) verification[k] = structuredClone(v);
+      continue;
+    }
     if (v.status !== "user-confirmed") continue;
     // The fresh report is the only authority: it must have reached user-confirmed on its own.
     if (report.fields[k]?.status === "user-confirmed") verification[k] = structuredClone(v);
   }
   return { ...sf, verification };
 }
+
+/** Z6: the check name of a field changed in Zotero and here (the conflict the account sync records). */
+export const ZOTERO_CONFLICT_CHECK = "zotero-update";
