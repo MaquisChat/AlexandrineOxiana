@@ -58,3 +58,4 @@ export const Anchor = AnchorShape.superRefine((a, ctx) => {
   }
 });
 export type Anchor = z.infer<typeof Anchor>;
+export type PdfAnchor = Extract<Anchor, { kind: "pdf" }>;

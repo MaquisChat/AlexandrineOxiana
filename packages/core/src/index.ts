@@ -13,7 +13,8 @@ export {
   nearestHighlightColour,
 } from "./annotations/highlightColours.js";
 export type { HighlightColourName } from "./annotations/highlightColours.js";
-export { annotationSortKey, derivedSortIndex, pdfSortIndex } from "./annotations/sortIndex.js";
+export { SORT_INDEX_PATTERN, pdfSortIndex, sortAnnotations } from "./annotations/sortIndex.js";
+export { cjkBigrams, cjkRuns, hasCjk, latinWords } from "./annotations/words.js";
 export { matchAnnotations } from "./annotations/match.js";
 
 export {

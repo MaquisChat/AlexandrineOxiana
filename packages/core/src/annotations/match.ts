@@ -1,24 +1,40 @@
 import type { Annotation } from "../model/annotation.js";
+import { cjkRuns, latinWords } from "./words.js";
 
-const CJK = /[⺀-鿿가-힯豈-﫿\u{20000}-\u{2fa1f}぀-ヿ]/u;
+/** Compatibility (NFKC) normalisation, invisible format characters (soft hyphen, zero-width, direction marks) removed. */
+const normalise = (s: string) => s.normalize("NFKC").replace(/\p{Cf}/gu, "");
 
-/** Case, compatibility (NFKC) and diacritic folding. */
-const fold = (s: string) => s.normalize("NFKC").toLowerCase().normalize("NFD").replace(/\p{M}+/gu, "");
+/** Full case folding of the common cases, then diacritics removed; applied to words outside CJK runs only, so kana and Hangul are never altered. */
+const foldWord = (w: string) => w.toLowerCase().replace(/ß/g, "ss").normalize("NFD").replace(/\p{M}+/gu, "");
+
+interface Terms {
+  words: string[];
+  runs: string[];
+}
+function terms(text: string): Terms {
+  return { words: latinWords(text).map(foldWord).filter(Boolean), runs: cjkRuns(text) };
+}
 
 /**
- * The ids of the annotations whose quote and body together contain every word of `words` (a search
- * hit's words), keeping the order of `list`, which the caller has already sorted. A word with CJK
- * characters matches as a substring; any other word must equal a whole word of the text, after
- * folding case, compatibility forms and diacritics. No words match nothing.
+ * The ids of the annotations whose quote and body together contain every term of `words` (a search
+ * hit's words), keeping the order of `list` (the caller sorts first, with `sortAnnotations`). Words
+ * are split as the search index splits them (`words.ts`): punctuation separates words; a query word
+ * matches the beginning of a word of the text (prefix, as the index does); a run of Chinese,
+ * Japanese or Korean characters matches inside a run of the text. Case, compatibility forms and
+ * diacritics are folded for words; a hyphen at a line end is joined. No terms match nothing.
  */
 export function matchAnnotations(list: readonly Pick<Annotation, "id" | "quote" | "body">[], words: string): string[] {
-  const wanted = fold(words).split(/\s+/).filter(Boolean);
-  if (wanted.length === 0) return [];
+  const q = terms(normalise(words));
+  if (q.words.length === 0 && q.runs.length === 0) return [];
   const ids: string[] = [];
   for (const a of list) {
-    const text = fold(`${a.quote ?? ""} ${a.body ?? ""}`);
-    const tokens = new Set(text.split(/[^\p{L}\p{N}]+/u).filter(Boolean));
-    if (wanted.every((w) => (CJK.test(w) ? text.includes(w) : tokens.has(w)))) ids.push(a.id);
+    const text = normalise(`${a.quote ?? ""}\n${a.body ?? ""}`).replace(/(\p{L})[-‐]\s*\n\s*(\p{L})/gu, "$1$2");
+    const t = terms(text);
+    if (
+      q.runs.every((r) => t.runs.some((tr) => tr.includes(r))) &&
+      q.words.every((w) => t.words.some((tw) => tw.startsWith(w)))
+    )
+      ids.push(a.id);
   }
   return ids;
 }

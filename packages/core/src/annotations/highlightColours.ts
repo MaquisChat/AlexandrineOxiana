@@ -30,13 +30,13 @@ export const ZOTERO_REFERENCE_COLOURS: Record<HighlightColourName, string> = {
   grey: "#aaaaaa",
 };
 
-type Lab = [number, number, number];
+export type Lab = [number, number, number];
 
 function parseHex(hex: string): [number, number, number] | undefined {
-  const m = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(hex.trim());
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(hex.trim());
   if (!m) return undefined;
   let h = m[1]!;
-  if (h.length === 3) h = [...h].map((c) => c + c).join("");
+  if (h.length === 3 || h.length === 4) h = [...h.slice(0, 3)].map((c) => c + c).join("");
   return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)) as [number, number, number];
 }
 
@@ -59,7 +59,8 @@ const rad = (d: number) => (d * Math.PI) / 180;
 const deg = (r: number) => (r * 180) / Math.PI;
 
 /** CIEDE2000 colour difference (Sharma, Wu and Dalal's reference formulation). */
-function deltaE2000([L1, a1, b1]: Lab, [L2, a2, b2]: Lab): number {
+/** CIEDE2000 colour difference between two Lab colours (exported for its test). */
+export function ciede2000([L1, a1, b1]: Lab, [L2, a2, b2]: Lab): number {
   const C1 = Math.hypot(a1, b1), C2 = Math.hypot(a2, b2);
   const Cbar7 = ((C1 + C2) / 2) ** 7;
   const G = 0.5 * (1 - Math.sqrt(Cbar7 / (Cbar7 + 25 ** 7)));
@@ -115,7 +116,7 @@ export function nearestHighlightColour(hex: string): HighlightColourName {
   let best: HighlightColourName = "yellow";
   let bestD = Infinity;
   for (const [name, ref] of REFERENCE_LABS) {
-    const d = deltaE2000(lab, ref);
+    const d = ciede2000(lab, ref);
     if (d < bestD) {
       bestD = d;
       best = name;
@@ -126,7 +127,7 @@ export function nearestHighlightColour(hex: string): HighlightColourName {
 
 /** The colour to show: the researcher's `colorName`, else the imported `color` mapped, else yellow. Never changes the record. */
 export function highlightColourOf(a: { colorName?: HighlightColourName | undefined; color?: string | undefined }): HighlightColourName {
-  if (a.colorName) return a.colorName;
+  if (a.colorName && (HIGHLIGHT_COLOURS as readonly string[]).includes(a.colorName)) return a.colorName;
   if (a.color) return nearestHighlightColour(a.color);
   return "yellow";
 }
