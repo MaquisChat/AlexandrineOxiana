@@ -50,6 +50,12 @@ export const Availability = z.object({
   status: z.enum(["available", "incomplete", "unavailable-on-platform"]),
   reason: z.string().optional(),
   firstNoticedAt: Timestamp.optional(),
+  /**
+   * Task Z5 (R206 2): with `unavailable-on-platform`, why: the item was deleted in the researcher's Zotero
+   * library, or moved to its bin. Optional: a source written before it parses, and an older reader that does
+   * not know it still reads the status ("No longer available at its source").
+   */
+  zotero: z.enum(["deleted", "bin"]).optional(),
 });
 export type Availability = z.infer<typeof Availability>;
 
