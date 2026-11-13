@@ -23,26 +23,13 @@
  * `annotations` are the open file's only (the caller filters by file, A4); an annotation with no
  * place (A5) or a place on another page is not drawn here.
  *
- * `HighlightNotices` says, until the list of Task R9 says it beside each entry, which highlights'
- * text has changed and which lie on a page the file does not have: at most NOTICES_MAX entries, then
- * "and N more"; quotes cut by characters (never inside one).
+ * What the shapes show (the text changed, a page the file does not have) is said in the annotation
+ * list (Task R9, AnnotationList.tsx), which replaced R8's temporary region (A11).
  */
 import { memo, useEffect, useMemo, useRef } from "react";
 import type { PageViewport } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { AnnotationKind, AnnotationRecord } from "../api/reader";
-import { UserText } from "../components/UserText";
 import { footEdge, pdfRectToBox, type Box } from "./geometry";
-
-/** Said of a highlight whose quote no longer matches the text under its rectangles. */
-export const HIGHLIGHT_CHANGED_SENTENCE = "The text here has changed since this highlight was made.";
-/** Said of a highlight on a page the open file does not have. */
-export const missingPageSentence = (page: number) => `This highlight is on page ${page}, which this file does not have.`;
-/** Said of a note on a page the open file does not have. */
-export const missingNoteSentence = (page: number) => `This note is on page ${page}, which this file does not have.`;
-/** The most entries HighlightNotices lists; the rest are counted. */
-export const NOTICES_MAX = 50;
-/** The most characters of a quote HighlightNotices shows. */
-const QUOTE_SHOWN = 120;
 
 export interface HighlightLayerProps {
   /** 0-based, as PdfPages gives it (anchors store 1-based pages). */
@@ -129,48 +116,3 @@ function HighlightLayerImpl({ pageIndex, viewport, annotations, selectedId, onSe
 }
 
 export const HighlightLayer = memo(HighlightLayerImpl);
-
-/** The pages of the open file an annotation lies on that the file does not have. */
-const missingPages = (a: AnnotationRecord, pageCount: number) => [...new Set(a.pdfAnchors.map((x) => x.page).filter((p) => p > pageCount))];
-
-/** Short enough to say beside a sentence: cut by characters (code points), never inside one. */
-function opening(quote: string): string {
-  const chars = [...quote];
-  return chars.length > QUOTE_SHOWN ? `${chars.slice(0, QUOTE_SHOWN).join("")}…` : quote;
-}
-
-/**
- * Which of the open file's highlights cannot be trusted where they are drawn: those whose text has
- * changed (`changed`) and those on a page the file does not have. Nothing when there are none.
- */
-export function HighlightNotices({ annotations, pageCount, changed }: { annotations: AnnotationRecord[]; pageCount: number; changed: ReadonlySet<string> }) {
-  const items: Array<{ key: string; page: number; quote?: string; sentence: string }> = [];
-  for (const a of annotations) {
-    const first = a.pdfAnchors[0]?.page;
-    for (const p of missingPages(a, pageCount)) items.push({ key: `${a.id}:${p}`, page: p, ...(a.quote ? { quote: a.quote } : {}), sentence: a.kind === "note" ? missingNoteSentence(p) : missingPageSentence(p) });
-    if (changed.has(a.id) && first !== undefined) items.push({ key: `${a.id}:changed`, page: first, ...(a.quote ? { quote: a.quote } : {}), sentence: HIGHLIGHT_CHANGED_SENTENCE });
-  }
-  if (items.length === 0) return null;
-  const more = items.length - NOTICES_MAX;
-  return (
-    <section className="ao-reader-hl-notices" aria-label="Highlights to check">
-      <ul>
-        {items.slice(0, NOTICES_MAX).map((i) => (
-          <li key={i.key}>
-            Page {i.page}
-            {i.quote !== undefined && (
-              <>
-                {", “"}
-                <UserText>{opening(i.quote)}</UserText>
-                {"”"}
-              </>
-            )}
-            {": "}
-            {i.sentence}
-          </li>
-        ))}
-      </ul>
-      {more > 0 && <p>and {more} more</p>}
-    </section>
-  );
-}

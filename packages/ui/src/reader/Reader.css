@@ -305,13 +305,260 @@
   box-shadow: inset -5px 5px 0 0 var(--hl-edge), 0 0 0 2px var(--hl-edge);
 }
 
-.ao-reader-hl-notices {
+/*
+ * The pages and, beside them, the annotation list (Task R9, AnnotationList.tsx); on a narrow window
+ * the list goes under the pages.
+ */
+.ao-reader-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(15rem, 24rem);
+  gap: var(--space-3);
+  align-items: start;
+}
+
+@media (width <= 60rem) {
+  .ao-reader-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.ao-ann {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.ao-ann h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.ao-ann h3 {
+  margin: var(--space-2) 0 var(--space-1);
+  font-size: 1rem;
+}
+
+.ao-ann-readonly,
+.ao-ann-load-error {
+  margin: 0;
   border-left: 4px solid var(--line-strong);
   padding: var(--space-1) var(--space-2);
   background: var(--surface);
 }
 
-.ao-reader-hl-notices ul {
+.ao-ann-load-error p {
+  margin: 0 0 var(--space-1);
+}
+
+/* The one polite live region: kept a line high so that the list does not jump when it speaks. */
+.ao-ann-live {
+  min-height: 1.4em;
   margin: 0;
-  padding-left: var(--space-3);
+  font-size: 0.9rem;
+}
+
+.ao-ann-scroll {
+  position: relative;
+  max-height: 75vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.ao-ann-empty {
+  margin: 0;
+  padding: var(--space-2);
+}
+
+.ao-ann-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/*
+ * Windowed (past 500 entries): each entry placed at its measured offset, at its own full height
+ * (A13: nothing is cut off); its top is set by the list.
+ */
+.ao-ann-list--windowed {
+  position: relative;
+}
+
+.ao-ann-entry {
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--line);
+  border-left: 4px solid transparent;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  background: var(--surface);
+}
+
+.ao-ann-entry--slot {
+  position: absolute;
+  left: 0;
+  right: 0;
+  box-sizing: border-box;
+}
+
+.ao-ann-entry--open {
+  z-index: 2;
+}
+
+.ao-ann-saving {
+  margin: var(--space-1) 0;
+  font-size: 0.9rem;
+  font-style: italic;
+}
+
+/* Disabled while a change of the entry is on its way: aria-disabled, so that the focus stays. */
+.ao-ann-entry button[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+.ao-ann-entry:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+
+/* The one chosen on the page: a thick edge (and aria-current), not a colour alone. */
+.ao-ann-entry--selected {
+  border-left-color: var(--accent);
+}
+
+.ao-ann-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 var(--space-1);
+  margin: 0;
+  font-weight: 600;
+}
+
+/* A swatch beside the colour's name: the colour at full strength, with a dark edge. */
+.ao-ann-swatch {
+  display: inline-block;
+  flex: none;
+  width: 0.9em;
+  height: 0.9em;
+  border: 1px solid var(--hl-edge);
+  border-radius: 2px;
+  background: var(--swatch);
+}
+
+.ao-ann-swatch--yellow { --swatch: var(--hl-yellow-line); }
+.ao-ann-swatch--red { --swatch: var(--hl-red-line); }
+.ao-ann-swatch--green { --swatch: var(--hl-green-line); }
+.ao-ann-swatch--blue { --swatch: var(--hl-blue-line); }
+.ao-ann-swatch--purple { --swatch: var(--hl-purple-line); }
+.ao-ann-swatch--magenta { --swatch: var(--hl-magenta-line); }
+.ao-ann-swatch--orange { --swatch: var(--hl-orange-line); }
+.ao-ann-swatch--grey { --swatch: var(--hl-grey-line); }
+
+.ao-ann-quote {
+  margin: var(--space-1) 0;
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--line-strong);
+  white-space: pre-wrap;
+}
+
+.ao-ann-note {
+  margin: var(--space-1) 0;
+  white-space: pre-wrap;
+}
+
+.ao-ann-meta,
+.ao-ann-sentence {
+  margin: var(--space-1) 0;
+  font-size: 0.9rem;
+  color: var(--ink-2);
+}
+
+.ao-ann-error {
+  margin: var(--space-1) 0;
+  color: var(--deny);
+}
+
+.ao-ann-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+.ao-ann-menu-anchor {
+  position: relative;
+}
+
+.ao-ann-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 9rem;
+  padding: var(--space-1);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+
+.ao-ann-menu [role="menuitemradio"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  text-align: start;
+}
+
+/* The current colour: a tick as well as the checked state. */
+.ao-ann-menu [aria-checked="true"]::after {
+  content: "✓";
+  margin-inline-start: auto;
+}
+
+.ao-ann-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+.ao-ann-editor textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+/* The delete question: the shared dialog shell's classes, repeated here so the reader does not depend on another screen's styles. */
+.ao-dialog-backdrop:has(> .ao-ann-dialog) {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--backdrop);
+}
+
+.ao-dialog.ao-ann-dialog {
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: var(--space-3) var(--space-4);
+  max-width: 34rem;
+  width: calc(100% - 2rem);
+}
+
+.ao-dialog.ao-ann-dialog h2 {
+  margin-top: 0;
+  font-size: 1.2rem;
+}
+
+.ao-ann-dialog .ao-danger {
+  color: var(--deny);
+  border-color: var(--deny);
 }
