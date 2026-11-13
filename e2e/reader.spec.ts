@@ -901,11 +901,12 @@ test("Page Down moves to the next page", async ({ page, app }) => {
   await expect(button("Zoom in")).toBeFocused();
   expect(await active()).toBe("Zoom in");
   // The controls are reached by Tab, with a visible focus.
+  // At 50% "Zoom out" is disabled, so Tab from the page field reaches "Zoom in".
   await pageField(page).focus();
   await page.keyboard.press("Tab");
-  const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
-  await expect(zoomOut).toBeFocused();
-  expect(await zoomOut.evaluate((b) => getComputedStyle(b).outlineStyle)).not.toBe("none");
+  const zoomInButton = toolbar(page).getByRole("button", { name: "Zoom in" });
+  await expect(zoomInButton).toBeFocused();
+  expect(await zoomInButton.evaluate((b) => getComputedStyle(b).outlineStyle)).not.toBe("none");
   expect(seen.pageErrors).toEqual([]);
   expectOnlyOwnOrigins(seen, app);
 });
@@ -917,7 +918,8 @@ test("a project locked while its PDF is shown, every page already fetched: the r
   const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Sealed while reading", passphrase: PASSPHRASE });
   const { sid, aid } = await attachPdf(app, projectId, file);
   await readFromLibrary(page, app, projectId, sid);
-  for (const n of [1, 2, 3]) await expect(region(page, n, 3).locator(".ao-reader-text-layer")).toContainText(`This is the text of page ${n}`);
+  // The file is whole in the first range: every page is fetched; the pages in view are drawn.
+  for (const n of [1, 2]) await expect(region(page, n, 3).locator(".ao-reader-text-layer")).toContainText(`This is the text of page ${n}`);
   await expect.poll(() => inked(page, 1)).toBe(true);
   const documentCalls = () => seen.requests.filter((u) => u.includes(`/assets/${aid}/document`)).length;
   const before = documentCalls();
