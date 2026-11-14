@@ -380,6 +380,21 @@ describe("the plan's tests", () => {
     expect((await sync(await stored(), { backoffUntil: until })).outcome).toBe("finished");
   });
 
+  it("R252: a run whose library is taken by its caller is refused with its record, and no request is made", async () => {
+    const p = await project();
+    await articles(1);
+    let asked = 0;
+    const r = await sync(await linked(linkOf(p)), {}, { taken: () => (asked++, true) });
+    expect(r).toMatchObject({ outcome: "failed", reason: "import-running" });
+    expect(r.finishedAt).toBeDefined();
+    expect(asked).toBe(1);
+    expect(z.requests).toEqual([]);
+    expect((await history())[0]).toMatchObject({ id: r.id, outcome: "failed", reason: "import-running" });
+    expect(sourceCount(p)).toBe(0);
+    // Not taken: the run goes ahead.
+    expect((await sync(await stored(), {}, { taken: () => false })).outcome).toBe("finished");
+  });
+
   it("a locked project refuses before any request", async () => {
     const p = await project({ encrypted: true });
     await articles(1);

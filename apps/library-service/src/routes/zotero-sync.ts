@@ -190,14 +190,9 @@ export class ZoteroSyncHolder {
         publish({ ref: link.ref, projectId: link.projectId, state: "checking" });
         const at = new Date(now()).toISOString();
         const failed = (reason: ZoteroSyncReason): ZoteroSyncRun => ({ id: randomUUID(), ref: link.ref, projectId: link.projectId, trigger: "manual", startedAt: at, finishedAt: at, outcome: "failed", reason });
-        // R250 a: this Zotero library, claimed before anything is awaited; taken by an import, the link is refused.
+        // R250 a: this Zotero library, claimed before anything is awaited. Taken by an import, the runner itself refuses
+        // the link with its own `import-running` record, before any request (R252: `taken`).
         const release = this.claim(link.ref, s);
-        if (!release) {
-          const refused = failed("import-running");
-          cur.last = refused;
-          publish({ ref: link.ref, projectId: link.projectId, state: "finished", run: refused });
-          continue;
-        }
         const follow = (projectId: string, h: BatchHandle) => {
           // In the service's batch registry too: GET /jobs lists it, and a close suspends it if all else failed.
           s.batches.set(h.batchId, { projectId, handle: h });
@@ -237,6 +232,7 @@ export class ZoteroSyncHolder {
             appConfigDir: state.deps.appConfigDir,
             libraryId: s.lib.id,
             onBatch: follow,
+            taken: () => !release,
             now,
             // A bounded note at most (the runner's notes name no key, no title and no server text).
             debug: (note) => state.opts.log.info({ note: scrubPaths(String(note), state.roots).slice(0, 300) }, "zotero sync"),
@@ -247,7 +243,7 @@ export class ZoteroSyncHolder {
         } catch (err) {
           state.opts.log.info({ note: err instanceof Error ? err.name : "error" }, "zotero sync: the run stopped on an unexpected error");
         } finally {
-          release();
+          release?.();
         }
         let shown: ZoteroSyncRun;
         if (run) {

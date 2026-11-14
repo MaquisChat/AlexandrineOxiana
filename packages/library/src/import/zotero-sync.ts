@@ -89,6 +89,11 @@ export interface ZoteroSyncDeps extends BulkImportDeps {
   libraryId: string;
   /** The batch, as soon as there is one (started or resumed): for progress, and for suspending it on close. */
   onBatch?(projectId: string, h: BatchHandle): void;
+  /**
+   * R252: the caller's own synchronous check that this Zotero library is taken by another import or sync (its claim).
+   * True: refused with `import-running` exactly where the runner's own lock refuses (before any request).
+   */
+  taken?: () => boolean;
   /** Told when a device file's damaged content was set aside (the device notice belongs there). */
   onSetAside?: ZoteroSyncFileOptions["onSetAside"];
   /** Test seams: the dispatcher for every Zotero request, the waits, the clock (ms) for back-off and record times. */
@@ -362,7 +367,7 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     // M1: the stored link's pause, or its absence, is what counts; the caller's copy only when nothing is stored.
     const paused = current.paused;
     if (paused) throw new Ending("failed", paused === "undone" ? "sync-undone" : paused);
-    if (busy || (await zoteroImportRunning(deps.repo, link.projectId, link.ref))) throw new Ending("failed", "import-running");
+    if (busy || deps.taken?.() || (await zoteroImportRunning(deps.repo, link.projectId, link.ref))) throw new Ending("failed", "import-running");
     checkStop();
     const waitUntil = zoteroSyncBackoff(o.backoffUntil, now());
     if (waitUntil !== undefined) throw new Ending("failed", "backing-off", waitUntil);

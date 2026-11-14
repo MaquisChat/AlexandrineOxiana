@@ -1007,11 +1007,16 @@ export class ServiceState {
       if (!s.repo.listProjects().some((p) => p.id === b.projectId)) continue;
       this.startWork("resume-import", async () => {
         // A Zotero Web batch finishes as every Web resume does: it records the library version (Z2, A5).
-        const kind = (await bulk.listBatches(b.projectId)).find((x) => x.batchId === b.batchId)?.kind;
-        const h =
-          kind === "zotero-web"
-            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index, proxies: proxyQueueFor(s.repo) }, b.projectId, b.batchId)
-            : await bulk.resumeBatch(b.projectId, b.batchId);
+        const listed = (await bulk.listBatches(b.projectId)).find((x) => x.batchId === b.batchId);
+        const kind = listed?.kind;
+        // R252: its Zotero library claimed in this same step; taken (or the batch is a sync's own), it stays paused.
+        const release = listed?.ref ? (listed.origin === "zotero-sync" ? undefined : this.zoteroSync.claim(listed.ref, s)) : () => {};
+        if (!release) return;
+        const h = await (kind === "zotero-web"
+          ? resumeZoteroWebImport({ repo: s.repo, http: s.http, index, proxies: proxyQueueFor(s.repo) }, b.projectId, b.batchId)
+          : bulk.resumeBatch(b.projectId, b.batchId)
+        ).catch((err: unknown) => (release(), Promise.reject(err)));
+        void h.done.then(release, release);
         this.followBatch(s, b.projectId, h);
       });
     }

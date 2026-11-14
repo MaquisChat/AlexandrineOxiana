@@ -741,6 +741,11 @@ describe("a manual import and a sync of one Zotero library never run together (A
     const [run] = await runAndWait();
     expect(run).toMatchObject({ outcome: "failed", reason: "import-running" });
     expect((await call({ url: `/projects/${p}/imports` })).json.batches).toEqual([]);
+    // R252: the runner's own record of the refusal: the link's last run and the history hold it.
+    const st = await state();
+    expect(st.links[0].lastRun).toMatchObject({ id: run.id, outcome: "failed", reason: "import-running" });
+    expect(st.links[0].status).toMatch(/^Could not sync with Zotero at \d\d:\d\d today: Another import from this Zotero library is running\. Nothing here was changed\.$/u);
+    expect((await call({ url: "/zotero/sync/history" })).json.runs[0]).toMatchObject({ id: run.id, reason: "import-running" });
     expect((await call({ method: "POST", url: `/imports/${started.json.batchId}/cancel` })).status).toBe(200);
     await svc.state.idle();
   });
@@ -805,6 +810,103 @@ describe("a manual import and a sync of one Zotero library never run together (A
     await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
     await svc.state.idle();
   });
+});
+
+describe("the service's own resume of a suspended Zotero Web import takes the claim too (R252)", () => {
+  const ADAPTER = { kind: "zotero-web", libraryType: "user", libraryId: "42" };
+  /** A manual import of user:42 into a new project, left paused by a close (as a move's quiesce leaves it). */
+  async function suspendedImport(libPath: string): Promise<{ x: string; batchId: string }> {
+    const x = await newProject(false, "X");
+    const h = holdImport();
+    const r = await call({ method: "POST", url: `/projects/${x}/import`, body: { adapter: ADAPTER } });
+    await h;
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).status).toBe(200);
+    return { x, batchId: r.json.batchId as string };
+  }
+  const batchState = async (pid: string, batchId: string) => ((await call({ url: `/projects/${pid}/imports` })).json.batches as Array<{ batchId: string; state: string }>).find((b) => b.batchId === batchId)?.state;
+  /** Waits for the service's resume work to end (without waiting for a held sync). */
+  async function resumeWorkDone(): Promise<void> {
+    for (let i = 0; i < 500 && svc.state.workKinds().includes("resume-import"); i++) await new Promise((r) => setTimeout(r, 20));
+  }
+
+  it("the resume after a move is refused while a sync holds the library: the batch stays paused, nothing is lost", async () => {
+    const libPath = await openLibrary();
+    addItems(U, 10);
+    const { x, batchId } = await suspendedImport(libPath);
+    expect(await batchState(x, batchId)).toBe("paused");
+    const p = await newProject(false, "P");
+    await saveSettings([linkOf(U, p)]);
+    const held = holdSync();
+    await call({ method: "POST", url: "/zotero/sync/run", body: {} });
+    await held;
+    // The path a move (and a failed move, and the open after it) takes to put its paused batches back to work.
+    svc.state.resumeBatches([{ projectId: x, batchId }]);
+    await resumeWorkDone();
+    expect(await batchState(x, batchId)).toBe("paused");
+    expect(svc.state.session!.batches.has(batchId)).toBe(false);
+    await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
+    // Resumed by hand afterwards, it finishes, and each item is there once.
+    expect((await call({ method: "POST", url: `/imports/${batchId}/resume` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(x, batchId)).toBe("finished");
+    expect((await call({ url: `/projects/${x}/sources?limit=100` })).json.total).toBe(10);
+  });
+
+  it("a sync sent while the service's resume of the same library runs is refused with its record", async () => {
+    const libPath = await openLibrary();
+    addItems(U, 10);
+    const { x, batchId } = await suspendedImport(libPath);
+    const p = await newProject(false, "P");
+    await saveSettings([linkOf(U, p)]);
+    const heldResume = holdImport();
+    svc.state.resumeBatches([{ projectId: x, batchId }]);
+    await heldResume;
+    const [run] = await runAndWait();
+    expect(run).toMatchObject({ outcome: "failed", reason: "import-running" });
+    expect((await call({ url: `/projects/${p}/imports` })).json.batches).toEqual([]);
+    svc.state.session!.batches.get(batchId)!.handle.resume();
+    await svc.state.idle();
+    expect(await batchState(x, batchId)).toBe("finished");
+    expect((await call({ url: `/projects/${x}/sources?limit=100` })).json.total).toBe(10);
+    expect((await call({ url: `/projects/${p}/sources?limit=100` })).json.total).toBe(0);
+  });
+
+  it("no claim is left after a close, a switch or a move: a later start works", async () => {
+    const libPath = await openLibrary();
+    addItems(U, 6);
+    const x = await newProject(false, "X");
+    const startHeld = async () => {
+      const h = holdImport();
+      const r = await call({ method: "POST", url: `/projects/${x}/import`, body: { adapter: ADAPTER } });
+      expect(r.status, r.body).toBe(200);
+      await h;
+      return r.json.batchId as string;
+    };
+    const startOk = async () => {
+      const r = await call({ method: "POST", url: `/projects/${x}/import`, body: { adapter: ADAPTER } });
+      expect(r.status, r.body).toBe(200);
+      await svc.state.idle();
+    };
+    // Close.
+    await startHeld();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).status).toBe(200);
+    await startOk();
+    // Switch: another library opened in its place, then this one again.
+    await startHeld();
+    expect((await call({ method: "POST", url: "/libraries", body: { path: join(tmp, "Other"), name: "Other" } })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).status).toBe(200);
+    await startOk();
+    // Move: the held import is paused for it and resumed (with its claim) in the moved library; once it ends, a start works.
+    const moving = await startHeld();
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.status).toBe(200);
+    expect(JSON.parse(moved.body.trim().split("\n").at(-1)!).done, moved.body).toBe(true);
+    await svc.state.idle();
+    expect(await batchState(x, moving)).toBe("finished");
+    await startOk();
+  }, 180_000);
 });
 
 describe("undo of a sync batch (R206, R242)", () => {
