@@ -319,7 +319,9 @@ test("add, choose, complete, already, survives a restart", async ({ page, app })
   });
 
   await test.step("nothing was looked up again: the queue file is unchanged and the library holds the same two records", async () => {
-    // Read the queue through the service once more (a read that the restarted runner would have answered after any work).
+    // Read the queue through the service once more. A read of the queue does not wait for the runner, so this step shows only that, some time after the
+    // restart and the page's load, the queue file's bytes and the entries' stamps are unchanged; the later step in which a candidate is chosen after
+    // the restart shows that the runner has acted since.
     expect((await queueOf(app, projectId)).entries.map((e) => e.state).sort()).toEqual(["already", "record-complete", "record-complete"]);
     expect(queueFile(libraryPath, projectFolder)).toBe(fileBefore);
     expect(await doisOf(app, projectId)).toEqual([WORK_A.doi, B_CHOSEN.doi].sort());
@@ -366,6 +368,8 @@ test("Check everything I have finds the other project", async ({ page, app }) =>
     const sw = page.getByRole("switch", { name: "Check everything I have" });
     await sw.click();
     await expect(sw).toBeChecked();
+    // The screen shows the switch checked at once; the service's runner judges duplicates with the stored value, so wait until the change is confirmed.
+    await expect(sw).not.toHaveAttribute("aria-busy", "true");
     await addLines(page, [SURE_C]);
     await expect(stateOf(page, 1)).toHaveText(WORDS.elsewhere(SECOND), { timeout: STATE_TIMEOUT });
     await expect(page.getByRole("button", { name: act("Add it to this project as well", SURE_C) })).toBeVisible();
@@ -468,6 +472,8 @@ test("by keyboard only: add, choose, use this one", async ({ page, app }) => {
 
 // ---------- what was typed stays in request bodies ----------
 
+// The scan covers every request's address, headers and body, and the service's log at its real level (info). It does NOT cover the service's
+// debug-level lines (it logs at info, so they are never written) or the media worker's own output.
 test("what was typed is in no address, header or log line", async ({ page, app }) => {
   const seen: Array<{ url: string; method: string; headers: Record<string, string>; body: string | null }> = [];
   const pending: Array<Promise<void>> = [];
