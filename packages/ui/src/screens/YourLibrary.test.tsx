@@ -259,8 +259,9 @@ describe("Your library: the pasted link is never kept", () => {
     for (const st of [localStorage, sessionStorage]) for (let i = 0; i < st.length; i++) expect(`${st.key(i)}=${st.getItem(st.key(i)!)}`).not.toContain(SESSION);
     expect(window.location.href).not.toContain(SESSION);
     expect(JSON.stringify(consoleCalls)).not.toContain(SESSION);
-    // The shell gets the ticket and the test's address only.
+    // The shell gets the ticket, the test's address and the kind of start (R347 a: the library's) only.
     expect(fake.shell!.openLibraryWindow.mock.calls[0]![1]).toBe(TEST_URL);
+    expect(fake.shell!.openLibraryWindow.mock.calls[0]![2]).toBe("library");
   });
 
   it("a refusal of the derive route (400) shows the service's sentence and never the link; the field is emptied", async () => {
@@ -862,9 +863,10 @@ describe("Your library: Test (R334 b, R336 d)", () => {
     await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2));
     const calls = fake.shell!.openLibraryWindow.mock.calls;
     for (const c of calls) {
-      expect(c).toHaveLength(2);
+      expect(c).toHaveLength(3);
       expect(c[0]).toMatch(/^[0-9a-f]{32}$/);
       expect(c[1]).toBe(TEST_URL);
+      expect(c[2]).toBe("library");
     }
     expect(calls[0]![0]).toBe("00112233445566778899aabbccddeeff");
     expect(calls[0]![0]).not.toBe(calls[1]![0]);
@@ -973,9 +975,9 @@ describe("Your library: Test (R334 b, R336 d)", () => {
     const gate = held<void>();
     const win = realWindow(fake.shell!);
     const real = fake.shell!.openLibraryWindow.getMockImplementation()!;
-    fake.shell!.openLibraryWindow.mockImplementationOnce(async (ticket, address) => {
+    fake.shell!.openLibraryWindow.mockImplementationOnce(async (ticket, address, from) => {
       await gate.p;
-      return real(ticket, address);
+      return real(ticket, address, from);
     });
     await act(async () => btn("Test").click());
     await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));

@@ -211,18 +211,22 @@ describe("the library sign-in window (Task F16): six commands and one event, thr
   const TICKET = "0123456789abcdef0123456789abcdef";
   const URL_ = "https://ezproxy.lib.example/login?url=https://doi.org/10.1038/171737a0";
 
-  it("openLibraryWindow passes ticket and url only", async () => {
+  it("openLibraryWindow passes ticket, url and the kind of start (R347 a) only", async () => {
     g.isTauri = true;
     const m = await load();
-    invoke.mockResolvedValueOnce(true);
-    expect(await m.openLibraryWindow(TICKET, URL_)).toBe(true);
-    expect(invoke).toHaveBeenCalledTimes(1);
-    expect(invoke).toHaveBeenLastCalledWith("open_library_window", { ticket: TICKET, url: URL_ });
-    expect(Object.keys(invoke.mock.calls[0]![1] as object)).toEqual(["ticket", "url"]);
-    // The same through the shell object.
-    invoke.mockResolvedValueOnce(true);
-    expect(await m.desktopShell()!.openLibraryWindow(TICKET, URL_)).toBe(true);
-    expect(invoke).toHaveBeenLastCalledWith("open_library_window", { ticket: TICKET, url: URL_ });
+    for (const from of ["library", "link"] as const) {
+      invoke.mockClear();
+      invoke.mockResolvedValueOnce(true);
+      expect(await m.openLibraryWindow(TICKET, URL_, from)).toBe(true);
+      expect(invoke).toHaveBeenCalledTimes(1);
+      expect(invoke).toHaveBeenLastCalledWith("open_library_window", { ticket: TICKET, url: URL_, from });
+      expect(Object.keys(invoke.mock.calls[0]![1] as object)).toEqual(["ticket", "url", "from"]);
+      // The same through the shell object.
+      invoke.mockResolvedValueOnce(true);
+      expect(await m.desktopShell()!.openLibraryWindow(TICKET, URL_, from)).toBe(true);
+      expect(invoke).toHaveBeenLastCalledWith("open_library_window", { ticket: TICKET, url: URL_, from });
+      expect(Object.keys(invoke.mock.calls[1]![1] as object)).toEqual(["ticket", "url", "from"]);
+    }
   });
 
   it("each command is invoked by its own name with only its own arguments, and only `true` counts as done", async () => {
@@ -252,12 +256,12 @@ describe("the library sign-in window (Task F16): six commands and one event, thr
     invoke.mockRejectedValueOnce(new Error("x"));
     await expect(m.closeLibraryWindow()).resolves.toBeUndefined();
     invoke.mockResolvedValueOnce(false);
-    expect(await m.openLibraryWindow(TICKET, URL_)).toBe(false);
+    expect(await m.openLibraryWindow(TICKET, URL_, "library")).toBe(false);
   });
 
   it("outside the desktop shell nothing is available: false, nothing invoked, no Tauri module loaded", async () => {
     const m = await load();
-    expect(await m.openLibraryWindow(TICKET, URL_)).toBe(false);
+    expect(await m.openLibraryWindow(TICKET, URL_, "library")).toBe(false);
     expect(await m.libraryWindowTakePdf()).toBe(false);
     expect(await m.closeLibraryWindow()).toBeUndefined();
     expect(await m.signOutOfLibrary()).toBe(false);

@@ -3125,7 +3125,7 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
     await user.dblClick(btn("through", "Get through my library"));
     await waitFor(() => expect(row("through").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
     expect(posts("/library/start")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/library/start`, body: undefined }]);
-    expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([[TICKET, LIB_URL]]);
+    expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([[TICKET, LIB_URL, "library"]]);
     expect(posts("/library/cancel")).toHaveLength(0);
     await waitFor(() => expect(h.said).toContain("“through”: Waiting for you in the sign-in window."));
     expect(within(row("through")).getByRole("button", { name: `Add the PDF showing in the sign-in window: ${T("through")}` })).toBeTruthy();
@@ -3332,8 +3332,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       // The calls to the shell that carry them — the open, and R342 b's second open — and no other (the take and the
       // closes, the leftover's and Cancel's, carry nothing).
       expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([
-        [TICKET, LIB_URL],
-        [TICKET, LIB_URL],
+        [TICKET, LIB_URL, "library"],
+        [TICKET, LIB_URL, "library"],
       ]);
       expect(fake.shell!.libraryWindowTakePdf.mock.calls).toEqual([[]]);
       expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[], []]);
@@ -3781,8 +3781,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       await waitFor(() => expect(stateOf("leftover")).toBe("Waiting for you in the sign-in window"));
       expect(posts("/library/start")).toHaveLength(1);
       expect(shell.openLibraryWindow.mock.calls).toEqual([
-        [TICKET, LIB_URL],
-        [TICKET, LIB_URL],
+        [TICKET, LIB_URL, "library"],
+        [TICKET, LIB_URL, "library"],
       ]);
       expect(shell.closeLibraryWindow).toHaveBeenCalledTimes(1);
       const [first, second] = shell.openLibraryWindow.mock.invocationCallOrder;
@@ -3807,8 +3807,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       expect(posts("/library/cancel")).toHaveLength(1);
       expect(posts("/library/start")).toHaveLength(1);
       expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([
-        [TICKET, LIB_URL],
-        [TICKET, LIB_URL],
+        [TICKET, LIB_URL, "library"],
+        [TICKET, LIB_URL, "library"],
       ]);
       expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
     });
@@ -4158,7 +4158,7 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
         await waitFor(() => expect(row("pressed here").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
         expect(linkPosts()).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/link/start`, body: { url: REPO } }]);
         expect(posts("/library/start")).toHaveLength(0);
-        expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([[TICKET, REPO]]);
+        expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([[TICKET, REPO, "link"]]);
         expect(document.activeElement).toBe(row("pressed here").querySelector("[data-entry-state]"));
         // The waiting row is the library's: the shell's take, Cancel.
         expect(btn("pressed here", "Add the PDF showing in the sign-in window")).toBeTruthy();
@@ -4190,8 +4190,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       await waitFor(() => expect(row("leftover").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
       expect(linkPosts().map((c) => c.body)).toEqual([{ url: PUB }]);
       expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([
-        [TICKET, REPO],
-        [TICKET, REPO],
+        [TICKET, REPO, "link"],
+        [TICKET, REPO, "link"],
       ]);
       expect(posts("/library/cancel")).toHaveLength(0);
     });

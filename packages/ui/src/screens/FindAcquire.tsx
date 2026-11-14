@@ -57,7 +57,7 @@
  * Through the researcher's library (Task F18b; R340, R301; F15's start and cancel, F16's shell, F17's outcome):
  *   - Every library step is the researcher's press on that row: nothing is started on focus, on hover, on a timer, on
  *     an event or when the screen opens. "Get through my library" is ONE `POST …/library/start` (no body); with its
- *     answer the shell opens the sign-in window (`openLibraryWindow(ticket, url)`). If the shell does not take it
+ *     answer the shell opens the sign-in window (`openLibraryWindow(ticket, url, from)`; R347 a). If the shell does not take it
  *     (anything but `true`, or no answer in LIBRARY_SHELL_TIMEOUT_MS), the start is cancelled at the service and the
  *     row says so. A refusal is the service's sentence on the row (said once, as every act's refusal is).
  *   - **The ticket and the address go to the shell and nowhere else**: they live in the press's own variables; the
@@ -104,7 +104,7 @@ import { ChooseWorkDialog } from "../components/ChooseWorkDialog";
 import { ChooseWorksDialog } from "../components/ChooseWorksDialog";
 import { authorOfferOf, entryLabel, FIND_TEXT, FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
 import { UserText } from "../components/UserText";
-import { desktopShell, type LibraryWindowEvent } from "../desktopShell";
+import { desktopShell, type LibraryWindowEvent, type LibraryWindowFrom } from "../desktopShell";
 import "../components/library.css";
 import { inAppLink, navigate, projectInQuery, type AppLocation } from "../navigation";
 import { searchSourcesHref } from "./SearchSources";
@@ -1562,10 +1562,10 @@ function ProjectQueue(props: {
    * page gave up on (no answer in time) may still be carried out by the shell: its ticket is ended here, and if the
    * shell then answers that it opened the window, the window is closed.
    */
-  const openWindow = async (ticket: string, address: string, live: () => boolean): Promise<boolean> => {
+  const openWindow = async (ticket: string, address: string, from: LibraryWindowFrom, live: () => boolean): Promise<boolean> => {
     if (!shell) return false;
     const ask = async (): Promise<boolean | "refused"> => {
-      const p = shell.openLibraryWindow(ticket, address);
+      const p = shell.openLibraryWindow(ticket, address, from);
       const r = await shellWithin(p);
       if (r === "gave-up") {
         endedTickets.current.add(ticket);
@@ -1627,7 +1627,7 @@ function ProjectQueue(props: {
       // The screen was left (or the library changed) meanwhile: no window is opened, and the start is cancelled below.
       if (live() && ticket && address) {
         libTicket.current = { entryId: e.id, ticket };
-        opened = await openWindow(ticket, address, live);
+        opened = await openWindow(ticket, address, how.kind, live);
       }
       if (opened) {
         // R342 c: the focus goes to the row's own words — never onto a control that acts (the start's control goes).
