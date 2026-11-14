@@ -92,6 +92,9 @@ export const FIND_REASON_CODES = [
   "record-removed",
   "copy-store-not-allowed",
   "copy-no-legal-basis",
+  // Task F15 (R324 b): an entry found "waiting-sign-in" at start-up with nothing kept to return to (a line written by
+  // an older build, or damaged): "no-open-copy" with this reason, never a claim that no free copy exists.
+  "library-unfinished",
 ] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
@@ -129,6 +132,7 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "record-removed": "The record was removed from the library.",
   "copy-store-not-allowed": "This project's rules do not allow storing the file found for this record.",
   "copy-no-legal-basis": "This project's rules need a legal basis to store the file found for this record, and the record has none.",
+  "library-unfinished": "A fetch through your library was not finished, and what this entry said before could not be read back. Nothing was added.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */
@@ -170,6 +174,12 @@ export const FIND_REFUSAL_REASONS = [
   "work-ids",
   // Task F8b (R279): "Show this author's works" on an entry that carries no author offer (any more).
   "no-author",
+  // Task F15 (R324): a start "through my library" refused — the sentences are FIND_LIBRARY_TEXT and libraryReadyIn.
+  "library-not-offered",
+  "no-library",
+  "library-busy",
+  "library-pause",
+  "library-held-full",
 ] as const;
 export type FindRefusalReason = (typeof FIND_REFUSAL_REASONS)[number];
 
@@ -336,6 +346,14 @@ export interface FindEntryView {
    * was built by the app (title, family name), not typed: F9 says where it came from (R271 M7).
    */
   work?: string;
+  /**
+   * Task F15 (R324 a): whether "Get through my library" may start for this entry — worked out by the service, never
+   * by the screen. Present only on an entry that would be offered it if a library were set: `{ canStart: true }`, or
+   * `{ canStart: false, reason: "no-library" }` (the researcher's to mend: FIND_LIBRARY_TEXT.noLibrary). Absent on every
+   * other entry. A start can still be refused at the press (another ticket open, the pause, the limit of waiting
+   * files): the route says why.
+   */
+  library?: FindLibraryChance;
 }
 
 /** Task F8b (R279 c): an author of the typed name offered beside the works ("Show this author's works"). Counts only. */
@@ -437,3 +455,122 @@ export interface FindProgressEvent {
   entryId: string;
   state: FindState;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F15 (R324): "Your library" — the address, "Where to get it", and starting a fetch through the library.
+//
+//   GET  /settings/your-library                   → YourLibraryResponse
+//   PUT  /settings/your-library                   YourLibrary → YourLibraryResponse (400 naming the field; 409 newer)
+//   POST /settings/your-library/derive            YourLibraryDeriveRequest → YourLibraryDeriveResponse (200, also
+//                                                 when no address can be worked out: `access` null and the sentence)
+//   POST /projects/:id/find/:eid/library/start    no body → FindLibraryStartResponse (409 with a `reason` of
+//                                                 FIND_REFUSAL_REASONS "library-…"/"no-library"; 423; 404; 503)
+//   POST /projects/:id/find/:eid/library/cancel   no body → FindEntryView (409 "entry-state" unless it is waiting)
+//
+// Every route is for the desktop app's token only. The pasted link is never stored, logged or repeated in an answer:
+// only the address worked out from it (`LibraryAccess.base`) is kept, and that holds nothing of the link's query but
+// the name of its target parameter. The service never fetches anything from the library: a start answers the
+// library's address for the work and a one-time ticket, which the sign-in window (Task F16) opens. Neither is in any
+// log line, audit entry, event, error or file. Every entry resting as R324 a names carries "Where to get it" in
+// `offers` (the copy services' links first, then the publisher's page, the catalogue, Open Library and WorldCat).
+
+/** How the researcher's library builds its links (the library's `LibraryAccess`). Only https addresses. */
+export type LibraryAccess = { kind: "ezproxy-login"; base: string } | { kind: "openathens"; base: string } | { kind: "openurl"; base: string };
+export const LIBRARY_ACCESS_KINDS = ["ezproxy-login", "openathens", "openurl"] as const;
+export type LibraryAccessKind = (typeof LIBRARY_ACCESS_KINDS)[number];
+/** The kind in words, for the screen and the derive sentence. */
+export const LIBRARY_ACCESS_KIND_TEXT: Record<LibraryAccessKind, string> = { "ezproxy-login": "EZproxy", openathens: "OpenAthens", openurl: "link resolver" };
+
+/** The settings (this computer's `your-library.json`). Not set: `access` null. */
+export interface YourLibrary {
+  /** "Your institution's name": at most 200 characters, no control characters ("" when not given). */
+  name: string;
+  access: LibraryAccess | null;
+  /** The catalogue's search address: https, `{query}` exactly once after the host, no user name or password. */
+  catalogueSearch?: string;
+  /** Off unless the researcher turns it on (the shell honours it on a Mac only, F16). */
+  staySignedIn: boolean;
+}
+export interface YourLibraryResponse extends YourLibrary {
+  /** The file could not be used: shown as not set ("unreadable", replaced by the next save) or read-only ("newer"). */
+  problem?: { code: "unreadable" | "newer"; text: string };
+}
+export interface YourLibraryDeriveRequest {
+  link: string;
+}
+export interface YourLibraryDeriveResponse {
+  access: LibraryAccess | null;
+  /** On success "Your library's address: <host> (<kind>)" (a resolver: "<host><path>"); otherwise why the link cannot be used. Never the link. */
+  sentence: string;
+}
+/** `POST …/library/start`: the library's address for the work, and the one-time ticket (32 hex). */
+export interface FindLibraryStartResponse {
+  url: string;
+  ticket: string;
+}
+/** R324 a: on the entry's view (`FindEntryView.library`). */
+export type FindLibraryChance = { canStart: true } | { canStart: false; reason: "no-library" };
+
+/** The longest link "derive" reads (a longer one is refused in words). */
+export const YOUR_LIBRARY_LINK_MAX = 4096;
+/** The longest institution's name kept. */
+export const YOUR_LIBRARY_NAME_MAX = 200;
+/** The longest catalogue search address kept. */
+export const YOUR_LIBRARY_CATALOGUE_MAX = 2048;
+/** The largest body these routes take. */
+export const YOUR_LIBRARY_BODY_MAX_BYTES = 16_384;
+/** At least this long between one hand-over and the next start (the plan's Running constraint). */
+export const LIBRARY_PAUSE_MS = 20_000;
+/** A ticket is good for this long, once. */
+export const LIBRARY_TICKET_MS = 30 * 60_000;
+/** "Where to get it" holds at most this many links, each address at most this long. */
+export const WHERE_TO_GET_IT_MAX = 12;
+export const WHERE_TO_GET_IT_URL_MAX = 2048;
+
+/** Why a pasted link gives no address (the library's `DeriveRefusal`), each with its sentence. */
+export const YOUR_LIBRARY_DERIVE_REFUSALS = ["not-https", "userinfo", "too-long", "unreadable", "bad-host", "not-library", "session-key"] as const;
+export type YourLibraryDeriveRefusal = (typeof YOUR_LIBRARY_DERIVE_REFUSALS)[number];
+export const YOUR_LIBRARY_DERIVE_TEXT: Record<YourLibraryDeriveRefusal, string> = {
+  "not-https": "Only a link that starts with https:// can be used. Paste one you reached by signing in through your library.",
+  userinfo: "That link holds a user name or a password, so it was not used. Paste a link without one.",
+  "too-long": "That link is too long to be used (at most 4,096 characters).",
+  unreadable: "That is not a link the app can read. Copy the whole address from your browser and paste it again.",
+  "bad-host": "That link's address cannot be used: it needs a full host name, not a number or a single word.",
+  "not-library": "That link does not go through a library. Paste one you reached by signing in through your library.",
+  /** R328 b: a link resolver's path holding what looks like a session's key. */
+  "session-key": "That link holds what looks like a session's key in its address. Paste the link of your library's own search page instead.",
+};
+/**
+ * The derive sentence for an address worked out (the plan's F18 words): the host and the kind, never the link; for a
+ * link resolver, whose address keeps its path, `host` is the host AND the path (R328 b).
+ */
+export const yourLibraryAddressSentence = (host: string, kind: LibraryAccessKind): string => `Your library's address: ${host} (${LIBRARY_ACCESS_KIND_TEXT[kind]})`;
+
+/** The pause's refusal: "Ready in N seconds." in whole seconds, rounded up by the caller ("Ready in 1 second."). */
+export const libraryReadyIn = (seconds: number): string => (seconds === 1 ? "Ready in 1 second." : `Ready in ${seconds} seconds.`);
+
+/** The settings routes' sentences. A refusal names the field, never what was sent. */
+export const YOUR_LIBRARY_TEXT = {
+  uiOnly: "Your library is set from the desktop app.",
+  fields: "Only name, access, catalogueSearch and staySignedIn can be saved.",
+  name: "The institution's name must be at most 200 characters, with no control characters.",
+  access: "The library's address is not one the app worked out. Use “Work out the address” again.",
+  catalogueSearch: "The catalogue search address must start with https://, hold {query} exactly once after its host, and hold no user name or password.",
+  staySignedIn: "“Stay signed in” must be on or off.",
+  link: "Send the link to work out, and nothing else.",
+  newer: "These Your library settings were written by a newer version of the app. Update the app to change them.",
+  unreadable: "Your library settings could not be read, so no library is set. Saving them again replaces the file (the old one is kept beside it).",
+  noBody: "This request takes no body. Nothing was changed.",
+} as const;
+
+/** A start through the library refused (its `reason` → its sentence; the pause's sentence is `libraryReadyIn`). */
+export const FIND_LIBRARY_TEXT = {
+  /** "library-not-offered": the entry is not one a start is offered for (R324 a). */
+  notOffered: "This entry cannot be fetched through your library now. Nothing was changed.",
+  /** "no-library": no library is set — the researcher's to mend. */
+  noLibrary: "Your library is not set. Set it in Your library, then try again.",
+  /** "library-busy": another ticket is open (one sign-in window, one entry at a time). */
+  busy: "Another work is waiting in the sign-in window. Finish or cancel it first.",
+  /** "library-held-full" (R324 a): FIND_HELD_MAX files already wait for the researcher's check. */
+  heldFull: `${FIND_HELD_MAX} files are already waiting for your check. Decide on some of them, then try again.`,
+} as const;

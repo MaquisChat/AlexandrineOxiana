@@ -1156,3 +1156,31 @@ describe("Task F8 (R267): an author's entry, and works added from it with the en
     }
   }
 });
+
+describe("Task F15: what a waiting entry returns to, and the start's own change", () => {
+  it("returnTo is kept on a waiting-sign-in entry only; one not of its shape is not kept, and the entry stays readable", async () => {
+    const p = await project(true);
+    const keep = entry(p, { state: "waiting-sign-in", returnTo: { state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } } });
+    const elsewhere = entry(p, { state: "no-open-copy", returnTo: { state: "record-complete" } });
+    const odd = entry(p, { state: "waiting-sign-in", returnTo: { state: "in-library" } as unknown as FindEntry["returnTo"] });
+    await appendFindEntries(coreOf(), p.id, [keep, elsewhere, odd], "add");
+    const q = await readFindQueue(coreOf(), p.id);
+    expect(q.get(keep.id)!.returnTo).toEqual({ state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } });
+    expect(q.get(elsewhere.id)!.returnTo).toBeUndefined();
+    expect(q.get(odd.id)!.state).toBe("waiting-sign-in");
+    expect(q.get(odd.id)!.returnTo).toBeUndefined();
+  });
+
+  it("library-start: one waiting entry, governed with the capture of library_access, audited with the method and ids only", async () => {
+    const p = await project();
+    const e = entry(p, { state: "no-open-copy" });
+    await appendFindEntries(coreOf(), p.id, [e], "add");
+    await appendFindEntries(coreOf(), p.id, [{ ...e, state: "waiting-sign-in", returnTo: { state: "no-open-copy" } }], "library-start");
+    const ev = await findEvents(p, FIND_QUEUE_OPS["library-start"]);
+    expect(ev.map((x) => x.action)).toEqual(["capture", "store"]);
+    for (const x of ev) expect(x.details).toMatchObject({ op: "project.find.library-start", entries: [e.id], count: 1, method: "library_access" });
+    // Anything but one entry written "waiting-sign-in" is not this change.
+    await expect(appendFindEntries(coreOf(), p.id, [{ ...e, state: "no-open-copy" }], "library-start")).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(appendFindEntries(coreOf(), p.id, [], "library-start")).rejects.toBeInstanceOf(InvalidInputError);
+  });
+});

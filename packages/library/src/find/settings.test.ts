@@ -8,7 +8,7 @@
  */
 import { link, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DEFAULT_GOVERNANCE, type GovernanceConfig } from "@ao/core";
 import { MockAgent, type Dispatcher } from "undici";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -27,7 +27,13 @@ import {
   searchKeyWanted,
   testSearchSource,
   writeSearchSettings,
+  YOUR_LIBRARY_FILE,
+  YourLibraryNewerError,
+  readYourLibrary,
+  writeYourLibrary,
+  type YourLibrary,
 } from "./settings.js";
+import { InvalidInputError } from "../repo/errors.js";
 import { _resetElicitForTests } from "./elicit.js";
 import { DEFAULT_SEARCH_SETTINGS, type SearchSettings } from "./types.js";
 
@@ -302,5 +308,81 @@ describe("Test (R290 g)", () => {
     const t0 = Date.now();
     expect(await testSearchSource("record", "crossref", { http: client(), timeoutMs: 100 })).toBe("unreachable");
     expect(Date.now() - t0).toBeLessThan(1_500);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F15 (R324 f): "Your library" — `your-library.json`, beside `search-sources.json`, by the same code path.
+
+describe("Your library: the settings file", () => {
+  const ylFile = () => join(dir, YOUR_LIBRARY_FILE);
+  const EZ = { kind: "ezproxy-login" as const, base: "https://ezproxy.lib.example.edu/login?url=" };
+  const SET: YourLibrary = { name: "University of Invented Studies", access: EZ, catalogueSearch: "https://catalogue.example.edu/search?q={query}", staySignedIn: false };
+  const NOT_SET: YourLibrary = { name: "", access: null, staySignedIn: false };
+
+  it("missing: not set (no address, Stay signed in off), nothing said, nothing written", async () => {
+    expect(await readYourLibrary(dir)).toEqual({ settings: NOT_SET });
+    await expect(stat(ylFile())).rejects.toThrow();
+  });
+
+  it("is written 0600 and atomically, beside search-sources.json, and read back", async () => {
+    await writeYourLibrary(dir, SET, new Date());
+    const before = await readFile(ylFile(), "utf8");
+    await link(ylFile(), join(tmp, "yl-old-link"));
+    const next = { ...SET, staySignedIn: true, name: "Another Name" };
+    expect(await writeYourLibrary(dir, next, new Date())).toEqual(next);
+    expect(await readFile(join(tmp, "yl-old-link"), "utf8")).toBe(before);
+    if (process.platform !== "win32") expect((await stat(ylFile())).mode & 0o777).toBe(0o600);
+    expect(await readYourLibrary(dir)).toEqual({ settings: next });
+    expect(JSON.parse(await readFile(ylFile(), "utf8"))).toEqual({ v: 1, ...next });
+    expect(dirname(ylFile())).toBe(dirname(join(dir, SEARCH_SOURCES_FILE)));
+  });
+
+  it("an unreadable or misshapen file means not set AND says so; the read never rewrites it; the next save sets it aside", async () => {
+    await mkdir(dir, { recursive: true });
+    const bad = [
+      "not json {",
+      "[]",
+      JSON.stringify({ v: 1, name: "x", access: null }), // staySignedIn missing
+      JSON.stringify({ ...SET, v: 1, extra: 1 }),
+      JSON.stringify({ ...SET, v: 1, access: { kind: "ezproxy-login", base: "http://ezproxy.lib.example.edu/login?url=" } }),
+      JSON.stringify({ ...SET, v: 1, access: { kind: "ezproxy-login", base: "https://u:p@ezproxy.lib.example.edu/login?url=" } }),
+      JSON.stringify({ ...SET, v: 1, catalogueSearch: "https://{query}.example.edu/" }),
+      JSON.stringify({ ...SET, v: 1, name: "a\u0007b" }),
+      JSON.stringify({ ...SET, v: 1, name: "x".repeat(201) }),
+      JSON.stringify({ ...SET, v: 1 }).padEnd(64 * 1024 + 1, " "),
+    ];
+    for (const b of bad) {
+      await writeFile(ylFile(), b);
+      const r = await readYourLibrary(dir);
+      expect(r, b.slice(0, 200)).toEqual({ settings: NOT_SET, problem: "unreadable" });
+      expect(await readFile(ylFile(), "utf8")).toBe(b);
+    }
+    await writeYourLibrary(dir, SET, new Date("2026-11-14T10:00:00Z"));
+    expect((await readdir(dir)).some((n) => n.startsWith(`${YOUR_LIBRARY_FILE}.unreadable-`))).toBe(true);
+    expect(await readYourLibrary(dir)).toEqual({ settings: SET });
+  });
+
+  it("a file written by a newer version is not overwritten, and the read says so", async () => {
+    await mkdir(dir, { recursive: true });
+    const newer = JSON.stringify({ v: 2, name: "x", access: null, staySignedIn: true, somethingNew: 1 });
+    await writeFile(ylFile(), newer);
+    expect(await readYourLibrary(dir)).toEqual({ settings: NOT_SET, problem: "newer" });
+    const err = await writeYourLibrary(dir, SET, new Date()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(YourLibraryNewerError);
+    expect((err as Error).message).toMatch(/^[A-Z].*\.$/u);
+    expect(await readFile(ylFile(), "utf8")).toBe(newer);
+  });
+
+  it("a save keeps only the fields of the type, each checked again (an address it could not have worked out is refused)", async () => {
+    const saved = await writeYourLibrary(dir, { ...SET, link: "https://ezproxy.lib.example.edu/login?ticket=SESSION-SECRET&url=x" } as unknown as YourLibrary, new Date());
+    expect(saved).toEqual(SET);
+    expect(await readFile(ylFile(), "utf8")).not.toContain("SESSION-SECRET");
+    await expect(writeYourLibrary(dir, { ...SET, access: { kind: "openurl", base: "https://r.example.edu/o?sid=x" } }, new Date())).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(writeYourLibrary(dir, { ...SET, catalogueSearch: "http://c.example.edu/?q={query}" }, new Date())).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(writeYourLibrary(dir, { ...SET, name: "a\nb" }, new Date())).rejects.toBeInstanceOf(InvalidInputError);
+    expect(await readYourLibrary(dir)).toEqual({ settings: SET });
+    // Without a catalogue address, and Stay signed in off unless given.
+    expect(await writeYourLibrary(dir, { name: "", access: EZ } as YourLibrary, new Date())).toEqual({ name: "", access: EZ, staySignedIn: false });
   });
 });

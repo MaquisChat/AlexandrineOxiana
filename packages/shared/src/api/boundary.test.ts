@@ -1,7 +1,7 @@
 // Task 47: the constants both the service and the interface used to keep their own copy of, now
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
-import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin, SEARCH_RECORD_SOURCES, SEARCH_COPY_SOURCES, SEARCH_SOURCE_GROUPS, SEARCH_SOURCE_INFO, SEARCH_KEY_SECRETS, SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI, SEARCH_TEST_TEXT, SEARCH_SETTINGS_TEXT, searchEmailRefusal, isSearchApiKeyShape, type SearchSourcesResponse, type SearchRecordRow } from "../index.js";
+import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, FIND_LIBRARY_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, WHERE_TO_GET_IT_MAX, WHERE_TO_GET_IT_URL_MAX, YOUR_LIBRARY_DERIVE_REFUSALS, YOUR_LIBRARY_DERIVE_TEXT, YOUR_LIBRARY_LINK_MAX, YOUR_LIBRARY_NAME_MAX, YOUR_LIBRARY_TEXT, libraryReadyIn, yourLibraryAddressSentence, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin, SEARCH_RECORD_SOURCES, SEARCH_COPY_SOURCES, SEARCH_SOURCE_GROUPS, SEARCH_SOURCE_INFO, SEARCH_KEY_SECRETS, SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI, SEARCH_TEST_TEXT, SEARCH_SETTINGS_TEXT, searchEmailRefusal, isSearchApiKeyShape, type SearchSourcesResponse, type SearchRecordRow } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
   it("the service's error codes, each once", () => {
@@ -94,6 +94,8 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "record-removed",
       "copy-store-not-allowed",
       "copy-no-legal-basis",
+      // F15 (R324 b): found waiting in the sign-in window at start-up with nothing kept to return to.
+      "library-unfinished",
     ]);
     expect(FIND_REASON_TEXT["copy-some-unreachable"]).toBe("Some services could not be reached, so a free copy may still exist. “Try again” looks again.");
     expect(FIND_REASON_TEXT["record-removed"]).toBe("The record was removed from the library.");
@@ -187,5 +189,24 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     // @ts-expect-error Open Library is not a source the screen shows
     const wrongRow: SearchRecordRow = { id: "openlibrary", on: true };
     expect(wrongRow.on).toBe(true);
+  });
+
+  it("Your library (F15, R324): the sentences, the bounds, and the refusals' reasons", () => {
+    expect(yourLibraryAddressSentence("ezproxy.lib.example.edu", "ezproxy-login")).toBe("Your library's address: ezproxy.lib.example.edu (EZproxy)");
+    expect(yourLibraryAddressSentence("go.openathens.net", "openathens")).toBe("Your library's address: go.openathens.net (OpenAthens)");
+    expect(yourLibraryAddressSentence("r.example.edu", "openurl")).toBe("Your library's address: r.example.edu (link resolver)");
+    expect(libraryReadyIn(12)).toBe("Ready in 12 seconds.");
+    expect(libraryReadyIn(1)).toBe("Ready in 1 second.");
+    expect(FIND_LIBRARY_TEXT.heldFull).toBe("50 files are already waiting for your check. Decide on some of them, then try again.");
+    // R328 b: the resolver's sentence names host and path; a session's key in a link's path is refused in words.
+    expect(yourLibraryAddressSentence("r.example.edu/openurl", "openurl")).toBe("Your library's address: r.example.edu/openurl (link resolver)");
+    expect(YOUR_LIBRARY_DERIVE_TEXT["session-key"]).toBe("That link holds what looks like a session's key in its address. Paste the link of your library's own search page instead.");
+    expect(YOUR_LIBRARY_DERIVE_TEXT["not-library"]).toBe("That link does not go through a library. Paste one you reached by signing in through your library.");
+    expect(Object.keys(YOUR_LIBRARY_DERIVE_TEXT).sort()).toEqual([...YOUR_LIBRARY_DERIVE_REFUSALS].sort());
+    for (const t of [...Object.values(YOUR_LIBRARY_DERIVE_TEXT), ...Object.values(YOUR_LIBRARY_TEXT), ...Object.values(FIND_LIBRARY_TEXT)]) expect(t).toMatch(/^[A-Z0-9“].*\.$/u);
+    for (const r of ["library-not-offered", "no-library", "library-busy", "library-pause", "library-held-full"]) expect(FIND_REFUSAL_REASONS).toContain(r);
+    expect([LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, YOUR_LIBRARY_LINK_MAX, YOUR_LIBRARY_NAME_MAX, WHERE_TO_GET_IT_MAX, WHERE_TO_GET_IT_URL_MAX]).toEqual([20_000, 1_800_000, 4096, 200, 12, 2048]);
+    const chance: FindEntryView["library"] = { canStart: false, reason: "no-library" };
+    expect(chance.canStart).toBe(false);
   });
 });
