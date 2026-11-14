@@ -9,8 +9,9 @@
  *
  * Linux's stand-in for a file that is not downloaded to this Mac is a sparse file (a size with no blocks; W1): made
  * as the engine's tests make it (an empty file truncated up to its size), checked with `stat` to have no blocks, and
- * "downloaded" by writing its real bytes into it. That nothing opened it is read from its access time: the test sets
- * it far in the past (the file system is mounted relatime, so any read moves it to now).
+ * "downloaded" by writing its real bytes into it. That nothing READ it is seen from its access time: the test sets it
+ * far in the past (the file system is mounted relatime, so any read moves it to now). An open without a read leaves
+ * the access time as it was, so "never opened" is not proved here: that stays on the owner's Mac list.
  *
  * Never a fixed sleep: every wait is for something the screen shows — a state word, a count line, a row of the
  * library, a sentence on the source — with a generous limit. What makes the engine look again is always an act the
@@ -23,23 +24,26 @@
  * Every sentence asserted is copied from the screen's code (WatchedFolders.tsx, WatchOrigin.tsx) or from the engine
  * and the service, whose sentences the screen shows as they are.
  */
-import { closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Request } from "@playwright/test";
+import ts from "typescript";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
 import { APP_ORIGIN, DEFECT_TIMEOUT, expect, expectDefect, libraryWithProject, test as base, type AppHarness, type Defect, type Page } from "./fixtures.js";
+import type { Locator } from "@playwright/test";
 
 /**
- * Found by this spec (Task W10), not fixed here (nothing outside e2e/): a registered file whose content changed and
+ * D25 (ledger R251; found by this spec, Task W10; fixed by Task W11), not fixed here (nothing outside e2e/): a registered file whose content changed and
  * which then left this Mac (its blocks gone, its size and exact time kept, as a cloud drive evicts a file) is still
  * reported `local: true` in the source's origin, so the source never says R235's sentence. The engine does not
  * judge a registered file whose size and time are as last known (watch.ts `settleStep` → `registeredUnchanged`,
  * which records it as in the library), and the service's `local` (routes/watched-folders.ts, watch-origin) looks
  * only at the engine's list of files not downloaded, which never holds a registered file.
  */
-const D_NOT_LOCAL: Defect = { id: "W10-D1", title: "A changed file that has left this Mac is reported as on this Mac: the source never says R235's sentence" };
+const D_NOT_LOCAL: Defect = { id: "D25", title: "A changed file that has left this Mac is reported as on this Mac: the source never says R235's sentence" };
 
 // ---------- what every request of the page is checked for (Accept 6) ----------
 
@@ -64,30 +68,76 @@ function keysIn(v: unknown, out: string[] = []): string[] {
   return out;
 }
 
-/** What is wrong with the page's requests: any that holds a watched folder's path (in any spelling) or a path-like key. */
-function pathProblems(seen: Seen[], folders: string[]): string[] {
-  const spellings = new Set<string>();
-  for (const f of folders) {
-    for (const p of [f, realpathOr(f)]) {
-      spellings.add(p);
-      spellings.add(encodeURIComponent(p));
-      spellings.add(encodeURI(p));
-      spellings.add(JSON.stringify(p).slice(1, -1));
+/** Every string value inside a parsed JSON value, at any depth. */
+function stringsIn(v: unknown, out: string[] = []): string[] {
+  if (typeof v === "string") out.push(v);
+  else if (Array.isArray(v)) for (const x of v) stringsIn(x, out);
+  else if (v && typeof v === "object") for (const x of Object.values(v)) stringsIn(x, out);
+  return out;
+}
+
+/** `decodeURIComponent`, or the text itself when it is not valid percent-encoding. */
+function decoded(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * The texts and keys a request carries, decoded every way the page could have encoded them: the URL raw and decoded,
+ * its path decoded, every query key and value as URLSearchParams reads them (a space written as `+` included);
+ * every header name and value, raw and decoded; the body raw and decoded, its JSON keys and string values at any depth
+ * (so a JSON escape is undone), and, for a body that is not JSON, its form keys and values.
+ */
+function partsOf(r: Seen): { texts: string[]; keys: string[] } {
+  const texts = [r.url, decoded(r.url)];
+  const keys: string[] = [];
+  let url: URL | undefined;
+  try {
+    url = new URL(r.url);
+  } catch {
+    url = undefined;
+  }
+  if (url) {
+    texts.push(url.pathname, decoded(url.pathname), ...url.pathname.split("/").map(decoded));
+    for (const [k, v] of url.searchParams) {
+      keys.push(k);
+      texts.push(k, v, decoded(k), decoded(v));
     }
   }
+  for (const [k, v] of Object.entries(r.headers)) texts.push(`${k}: ${v}`, decoded(v));
+  if (r.body) {
+    texts.push(r.body, decoded(r.body));
+    let parsed: unknown;
+    let json = true;
+    try {
+      parsed = JSON.parse(r.body);
+    } catch {
+      json = false;
+    }
+    if (json) {
+      keys.push(...keysIn(parsed));
+      texts.push(...stringsIn(parsed), ...keysIn(parsed));
+    } else {
+      for (const [k, v] of new URLSearchParams(r.body)) {
+        keys.push(k);
+        texts.push(k, v);
+      }
+    }
+  }
+  return { texts, keys };
+}
+
+/** What is wrong with the page's requests: any that holds a watched folder's path (however encoded) or a key naming a folder. */
+function pathProblems(seen: Seen[], folders: string[]): string[] {
+  const paths = [...new Set(folders.flatMap((f) => [f, realpathOr(f)]))];
   const problems: string[] = [];
   for (const r of seen) {
-    const text = [r.url, ...Object.entries(r.headers).map(([k, v]) => `${k}: ${v}`), r.body ?? ""].join("\n");
-    for (const s of spellings) if (text.includes(s)) problems.push(`${r.method} ${r.url} holds the folder's path`);
-    if (r.body) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(r.body);
-      } catch {
-        parsed = undefined;
-      }
-      for (const k of keysIn(parsed)) if (PATH_KEYS.has(k.toLowerCase())) problems.push(`${r.method} ${r.url} sends the key "${k}"`);
-    }
+    const { texts, keys } = partsOf(r);
+    for (const p of paths) if (texts.some((t) => t.includes(p))) problems.push(`${r.method} ${r.url} holds the folder's path`);
+    for (const k of keys) if (PATH_KEYS.has(k.toLowerCase())) problems.push(`${r.method} ${r.url} sends the key "${k}"`);
   }
   return problems;
 }
@@ -129,20 +179,29 @@ const LIBRARY = "Shared drive library";
 const PROJECT = "Coastal fieldwork";
 const COLLECTION = "From the drive";
 
-/** One entry of a folder's tree as the test reads it: name, kind, size and exact modification time. */
-type TreeEntry = [name: string, kind: "file" | "dir", size: string, mtimeNs: string];
+/** One entry of a folder's tree as the test reads it: name, kind, size, exact modification time and exact change time. */
+type TreeEntry = [name: string, kind: "file" | "dir", size: string, mtimeNs: string, ctimeNs: string];
 
-/** The folder's tree (names, sizes, modification times), sorted: compared before and after the app's work. */
+/**
+ * The folder's tree, sorted, the watched folder's own entry (".") first: names, sizes, modification times and change
+ * times (ctime moves on any write, a name created or removed in a folder, chmod, chown or an extended attribute).
+ * Compared with a listing taken right after the test's own last act.
+ */
 function tree(dir: string): TreeEntry[] {
   const out: TreeEntry[] = [];
+  const entry = (p: string): TreeEntry => {
+    const st = lstatSync(p, { bigint: true });
+    return [relative(dir, p) || ".", st.isDirectory() ? "dir" : "file", st.size.toString(), st.mtimeNs.toString(), st.ctimeNs.toString()];
+  };
   const walk = (d: string) => {
     for (const name of readdirSync(d).sort()) {
       const p = join(d, name);
-      const st = lstatSync(p, { bigint: true });
-      out.push([relative(dir, p), st.isDirectory() ? "dir" : "file", st.size.toString(), st.mtimeNs.toString()]);
-      if (st.isDirectory()) walk(p);
+      const e = entry(p);
+      out.push(e);
+      if (e[1] === "dir") walk(p);
     }
   };
+  out.push(entry(dir));
   walk(dir);
   return out;
 }
@@ -267,9 +326,10 @@ async function openSource(page: Page, title: string) {
 /**
  * Opens a source and returns its "Watched folder" region. The origin is read once when the source is shown, from the
  * register as written, and the engine writes register lines in batches (at most WATCH_REGISTER_FLUSH_MS = 5 s after
- * the first): so the source is closed and opened again until the region is on the screen.
+ * the first): so the source is closed and opened again until the region is on the screen — and, with `needs`, until
+ * that control is shown too (a button is waited for, never assumed: R251 c, R255).
  */
-async function originOf(page: Page, title: string) {
+async function originOf(page: Page, title: string, needs?: (origin: Locator) => Locator) {
   const details = page.getByRole("region", { name: "Source details" });
   const origin = details.getByRole("region", { name: "Watched folder" });
   await expect(async () => {
@@ -277,9 +337,13 @@ async function originOf(page: Page, title: string) {
     if (await close.isVisible()) await close.click();
     await openSource(page, title);
     await expect(origin).toBeVisible({ timeout: 3_000 });
+    if (needs) await expect(needs(origin)).toBeVisible({ timeout: 3_000 });
   }).toPass({ timeout: 45_000 });
   return { details, origin };
 }
+
+/** The origin's "Bring in the new version…" button for `file` (its accessible name carries the file's name). */
+const bringButton = (file: string) => (origin: Locator) => origin.getByRole("button", { name: `${BRING}: “${file}”` });
 
 // The words of the screens and the service (copied, never adapted).
 const NEEDS_APP = "Adding a folder needs the desktop app.";
@@ -294,17 +358,52 @@ const notLocalR235 = (bytes: number) => `The new version is not downloaded to th
 /** The count line for one file not downloaded, with its size as the screen writes it. */
 const notDownloadedLine = (bytes: number) => `1 file here is not downloaded to this Mac (${sizeText(bytes)})`;
 
-// ---------- in a plain browser ----------
+// ---------- the spec's own checks can fail ----------
 
-test("without the option the screen says the desktop app is needed", async ({ page, app }) => {
-  const { projectId } = await libraryWithProject(app, page, { library: LIBRARY, project: PROJECT });
-  await openWatched(page, projectId);
-  await expect(page.getByText(NEEDS_APP, { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Add a folder…" })).toHaveCount(0);
-  await expect(page.getByText("No folder is watched in this project yet.", { exact: true })).toBeVisible();
-  // A plain browser: nothing of the shell's stand-in reached this page.
-  expect(await page.evaluate(() => ["isTauri", "__TAURI_INTERNALS__", "__aoShellStubPick"].filter((k) => k in window))).toEqual([]);
-  expect(app.chooser).toBeUndefined();
+test.describe("the spec's own checks", () => {
+  const FOLDER = "/tmp/ao-e2e-selftest/drive/Private · Ana/Interviews";
+  const SERVICE = "http://127.0.0.1:41000";
+  const req = (o: Partial<Seen>): Seen => ({ url: `${SERVICE}/projects/p1/watched-folders`, method: "GET", headers: {}, body: null, ...o });
+  const asQuery = new URLSearchParams({ q: FOLDER }).toString();
+  const jsonEscaped = `{"note":"${FOLDER.replace(/\//g, "\\/").replace("·", "\\u00b7")}"}`;
+
+  test("the request check finds every form of a leaked path or a key naming a folder, and nothing in a clean request", () => {
+    const leaks: Record<string, Seen> = {
+      "raw, in a body": req({ method: "POST", body: `{"note":${JSON.stringify(FOLDER)}}` }),
+      "raw, in a header": req({ headers: { "x-where": FOLDER } }),
+      "percent-encoded, in the path": req({ url: `${SERVICE}/projects/p1/files/${encodeURIComponent(FOLDER)}` }),
+      "a space written as +, in a query": req({ url: `${SERVICE}/projects/p1/sources?${asQuery}` }),
+      "JSON-escaped, in a body": req({ method: "POST", body: jsonEscaped }),
+      "a form body": req({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ where: FOLDER }).toString() }),
+      "a plain-text body, percent-encoded": req({ method: "POST", headers: { "content-type": "text/plain" }, body: encodeURIComponent(FOLDER) }),
+      "the key dir in a query": req({ url: `${SERVICE}/projects/p1/watched-folders?dir=Interviews` }),
+      "the key path in a form": req({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "grantId=ab&path=Interviews" }),
+      "the key folder nested in JSON": req({ method: "POST", body: JSON.stringify({ grantId: "ab", options: [{ folder: "Interviews" }] }) }),
+    };
+    const missed = Object.entries(leaks).filter(([, r]) => pathProblems([r], [FOLDER]).length === 0).map(([form]) => form);
+    expect(missed, "every leak is found").toEqual([]);
+    const clean = req({ method: "POST", headers: { "content-type": "application/json", authorization: "Bearer x" }, body: JSON.stringify({ grantId: "0123456789abcdef0123456789abcdef", recursive: false, label: "Interviews" }) });
+    expect(pathProblems([clean], [FOLDER])).toEqual([]);
+  });
+
+  test("the folder listing sees a file created and removed, and a change of permissions", ({}, testInfo) => {
+    const base = testInfo.outputPath("listing");
+    const fresh = (name: string) => {
+      const d = join(base, name);
+      mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, "a.pdf"), "x");
+      return d;
+    };
+    const created = fresh("created");
+    const made1 = tree(created);
+    writeFileSync(join(created, ".ao-tmp"), "lock");
+    rmSync(join(created, ".ao-tmp"));
+    expect(tree(created), "a file created and removed in the folder is seen").not.toEqual(made1);
+    const chmodded = fresh("chmodded");
+    const made2 = tree(chmodded);
+    chmodSync(join(chmodded, "a.pdf"), 0o600);
+    expect(tree(chmodded), "a change of a file's permissions is seen").not.toEqual(made2);
+  });
 });
 
 // ---------- inside the desktop app (its folder chooser is the stand-in) ----------
@@ -380,9 +479,9 @@ test.describe("in the desktop app", () => {
       const list = page.getByRole("list", { name: "Files of “Harbour drive”" });
       await expect(list.getByRole("listitem")).toHaveCount(1);
       await expect(list.getByRole("listitem")).toHaveText(`Harbour rents.pdf: ${NOT_DOWNLOADED} (${sizeText(pdf.length)})`);
-      // Never in the library, and never opened.
+      // Never in the library, and never read.
       expect((await sources(app, s.projectId)).total).toBe(0);
-      expect(statSync(file).atime.getTime(), "nothing opened the file that is not downloaded").toBe(LONG_AGO.getTime());
+      expect(statSync(file).atime.getTime(), "nothing read the file that is not downloaded").toBe(LONG_AGO.getTime());
       expect(statSync(file).blocks, "nothing downloaded it").toBe(0);
       expect(tree(s.dir)).toEqual(made);
     });
@@ -397,16 +496,16 @@ test.describe("in the desktop app", () => {
     });
   });
 
-  test("a file not downloaded is never opened", async ({ page, app, folders }) => {
+  test("a file not downloaded is never read", async ({ page, app, folders }) => {
     test.setTimeout(240_000);
     const s = await setUp(app, page, folders);
     await openWatched(page, s.projectId);
     await addFolder(page, app, s.dir, "Archive drive");
     const file = join(s.dir, "Minutes 1952.pdf");
     sparse(file, 180_000);
-    const made = tree(s.dir);
+    let made = tree(s.dir);
     const untouched = () => {
-      expect(statSync(file).atime.getTime(), "nothing opened the file").toBe(LONG_AGO.getTime());
+      expect(statSync(file).atime.getTime(), "nothing read the file").toBe(LONG_AGO.getTime());
       expect(statSync(file).blocks, "nothing downloaded it").toBe(0);
     };
 
@@ -415,23 +514,29 @@ test.describe("in the desktop app", () => {
       untouched();
     });
 
-    await test.step("Pause and Resume (a full listing of the folder) leave it unopened", async () => {
+    await test.step("Pause and Resume (a full listing of the folder) leave it unread", async () => {
       const region = folderRegion(page, "Archive drive");
       await region.getByRole("button", { name: "Pause watching “Archive drive”" }).click();
       await expect(region.locator(".ao-watch__state")).toHaveText("Paused");
+      // A file put in while paused is found only by the listing the resume makes: once it has come in, that listing
+      // has looked at the folder, the file not downloaded included.
+      writeFileSync(join(s.dir, "Minutes 1953.pdf"), await buildPdf({ title: "Minutes of the Harbour Board, 1953", extra: "w10-paused" }));
+      made = tree(s.dir);
       await region.getByRole("button", { name: "Resume watching “Archive drive”" }).click();
       await watching(page, "Archive drive");
+      await expect(countLine(page, "Archive drive", "1 file came in")).toHaveText("1 file came in", { timeout: 30_000 });
       await expect(countLine(page, "Archive drive", notDownloadedLine(180_000))).toHaveText(notDownloadedLine(180_000));
       untouched();
+      expect(tree(s.dir), "the app wrote nothing into the folder").toEqual(made);
     });
 
-    await test.step("a relaunch of the app (the start-up scan) leaves it unopened", async () => {
+    await test.step("a relaunch of the app (the start-up scan) leaves it unread", async () => {
       await app.restart();
       await openWatched(page, s.projectId);
       await watching(page, "Archive drive");
       await expect(countLine(page, "Archive drive", notDownloadedLine(180_000))).toHaveText(notDownloadedLine(180_000), { timeout: 30_000 });
       untouched();
-      expect((await sources(app, s.projectId)).total, "it never reached the library").toBe(0);
+      expect((await sources(app, s.projectId)).items.map((i) => i.title), "it never reached the library").toEqual(["Minutes of the Harbour Board, 1953"]);
       expect(tree(s.dir), "the app wrote nothing into the folder").toEqual(made);
     });
   });
@@ -491,7 +596,7 @@ test.describe("in the desktop app", () => {
 
     await test.step("the source says so, and “Bring in the new version…” adds a second original, keeping the first", async () => {
       await libraryShows(page, s.projectId, ["Salt Marsh Tenancies"]);
-      const { details, origin } = await originOf(page, "Salt Marsh Tenancies");
+      const { details, origin } = await originOf(page, "Salt Marsh Tenancies", bringButton("Tenancies.pdf"));
       await expect(origin.getByText("Came from the watched folder “Marsh drive” as “Tenancies.pdf”.", { exact: true })).toBeVisible();
       await expect(origin.getByText(CHANGED, { exact: true })).toBeVisible();
       await expect(origin.getByText(/^The new version is not downloaded/)).toHaveCount(0);
@@ -499,7 +604,7 @@ test.describe("in the desktop app", () => {
       const before = await app.api<SourceAnswer>("GET", `/projects/${s.projectId}/sources/${sid}`);
       const originals = (a: SourceAnswer) => a.assets.filter((x) => x.role === "original");
       expect(originals(before.body)).toHaveLength(1);
-      await origin.getByRole("button", { name: `${BRING}: “Tenancies.pdf”` }).click();
+      await bringButton("Tenancies.pdf")(origin).click();
       await expect(origin.getByRole("status")).toHaveText(ADDED, { timeout: 30_000 });
       await expect(origin.getByText(CHANGED, { exact: true })).toHaveCount(0);
       const after = await app.api<SourceAnswer>("GET", `/projects/${s.projectId}/sources/${sid}`);
@@ -543,16 +648,16 @@ test.describe("in the desktop app", () => {
 
     await test.step("“Bring in the new version…” adds nothing and says why, in the service's words", async () => {
       await libraryShows(page, s.projectId, ["Dredging Petitions"]);
-      const { origin } = await originOf(page, "Dredging Petitions");
+      const { origin } = await originOf(page, "Dredging Petitions", bringButton("Petitions.pdf"));
       await expect(origin.getByText(CHANGED, { exact: true })).toBeVisible();
       const sid = (await sources(app, s.projectId)).items[0]!.id;
       const before = await app.api<SourceAnswer>("GET", `/projects/${s.projectId}/sources/${sid}`);
-      await origin.getByRole("button", { name: `${BRING}: “Petitions.pdf”` }).click();
+      await bringButton("Petitions.pdf")(origin).click();
       await expect(origin.getByRole("alert")).toHaveText(NOT_LOCAL_409, { timeout: 30_000 });
       const after = await app.api<SourceAnswer>("GET", `/projects/${s.projectId}/sources/${sid}`);
       expect(after.body.assets).toEqual(before.body.assets);
       expect((await sources(app, s.projectId)).total).toBe(1);
-      expect(statSync(file).atime.getTime(), "the file that is not on this Mac was not opened").toBe(LONG_AGO.getTime());
+      expect(statSync(file).atime.getTime(), "the file that is not on this Mac was not read").toBe(LONG_AGO.getTime());
       expect(tree(s.dir), "the app wrote nothing into the folder").toEqual(made);
     });
 
@@ -560,7 +665,7 @@ test.describe("in the desktop app", () => {
       await page.reload();
       const { origin } = await originOf(page, "Dredging Petitions");
       await expect(origin.getByText(CHANGED, { exact: true })).toBeVisible();
-      // What the service answers for the origin, kept with the result (the evidence for W10-D1).
+      // What the service answers for the origin, kept with the result (the evidence for D25).
       const sid = (await sources(app, s.projectId)).items[0]!.id;
       const answer = await app.api<{ origins: Array<{ state: string; local: boolean }> }>("GET", `/projects/${s.projectId}/sources/${sid}/watch-origin`);
       test.info().annotations.push({ type: "origin answer", description: JSON.stringify(answer.body.origins.map((o) => ({ state: o.state, local: o.local }))) });
@@ -577,6 +682,16 @@ test.describe("in the desktop app", () => {
     writeFileSync(join(s.dir, "Ferry tolls.pdf"), pdf);
     await expect(countLine(page, "Ferry drive", "1 file came in")).toHaveText("1 file came in", { timeout: 30_000 });
     const made = tree(s.dir);
+    // What came from the folder, before it is removed: the source's files (its record) and the stored bytes' hashes.
+    const sid = (await sources(app, s.projectId)).items[0]!.id;
+    const stored = join(s.libraryPath, s.projectFolder, "Sources");
+    const files = async () => ({
+      assets: (await app.api<SourceAnswer>("GET", `/projects/${s.projectId}/sources/${sid}`)).body.assets,
+      hashes: filesUnder(stored).map((f) => [f, sha256(readFileSync(join(stored, f)))]),
+    });
+    const before = await files();
+    expect(before.assets.filter((a) => a.role === "original")).toHaveLength(1);
+    expect(before.hashes.map(([, h]) => h)).toContain(sha256(pdf));
 
     await test.step("“Remove…” says nothing is removed from the library, and stops watching", async () => {
       await page.getByRole("button", { name: "Remove “Ferry drive”…" }).click();
@@ -593,8 +708,32 @@ test.describe("in the desktop app", () => {
       const { origin } = await originOf(page, "Ferry Tolls and Parish Rates");
       await expect(origin.getByText("Came from a folder that is no longer watched, as “Ferry tolls.pdf”.", { exact: true })).toBeVisible();
       expect((await sources(app, s.projectId)).total).toBe(1);
+      expect(await files(), "the source's files are as they were before the folder was removed").toEqual(before);
       expect(tree(s.dir), "the app wrote nothing into the folder").toEqual(made);
     });
+  });
+
+  test("the chooser's stand-in answers only the app's own page", async ({ page, app, folders }) => {
+    const s = await setUp(app, page, folders);
+    await openWatched(page, s.projectId);
+    app.chooser!.willPick(s.dir);
+    // A frame inside the app's page (here a srcdoc frame) reaches the binding, as every frame does, and is refused.
+    const fromFrame = await page.evaluate(async () => {
+      const f = document.createElement("iframe");
+      f.srcdoc = "<p>inner</p>";
+      document.body.append(f);
+      await new Promise((r) => f.addEventListener("load", r, { once: true }));
+      const pick = (f.contentWindow as unknown as { __aoShellStubPick?: (t: string) => Promise<unknown> }).__aoShellStubPick;
+      if (!pick) return "absent";
+      return pick("from a frame").then(() => "answered", () => "refused");
+    });
+    expect(["absent", "refused"]).toContain(fromFrame);
+    expect(app.chooser!.titles, "no chooser was opened for the frame").toEqual([]);
+    expect(app.chooser!.grants, "and no grant was written").toEqual([]);
+    // The page itself still gets its chooser.
+    await page.getByRole("button", { name: "Add a folder…" }).click();
+    await expect(page.getByRole("dialog", { name: "Add a watched folder" }).getByText(`Folder: ${basename(s.dir)}`, { exact: true })).toBeVisible();
+    expect(app.chooser!.grants).toHaveLength(1);
   });
 
   test("no request carries a folder path", async ({ page, app, folders, seen }) => {
@@ -659,8 +798,21 @@ test.describe("in the desktop app", () => {
 
     expect(tree(s.dir), "names, sizes and modification times are as the test made them").toEqual(made);
     expect(contents(), "and so are the contents").toEqual(madeContents);
-    expect(statSync(join(s.dir, "Online only.pdf")).atime.getTime(), "the file not downloaded was not opened").toBe(LONG_AGO.getTime());
+    expect(statSync(join(s.dir, "Online only.pdf")).atime.getTime(), "the file not downloaded was not read").toBe(LONG_AGO.getTime());
   });
+});
+
+// ---------- in a plain browser, after the stubbed tests in the same worker (so a leak of the stand-in would show) ----------
+
+test("without the option the screen says the desktop app is needed", async ({ page, app }) => {
+  const { projectId } = await libraryWithProject(app, page, { library: LIBRARY, project: PROJECT });
+  await openWatched(page, projectId);
+  await expect(page.getByText(NEEDS_APP, { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Add a folder…" })).toHaveCount(0);
+  await expect(page.getByText("No folder is watched in this project yet.", { exact: true })).toBeVisible();
+  // A plain browser: nothing of the shell's stand-in reached this page.
+  expect(await page.evaluate(() => ["isTauri", "__TAURI_INTERNALS__", "__aoShellStubPick"].filter((k) => k in window))).toEqual([]);
+  expect(app.chooser).toBeUndefined();
 });
 
 // ---------- helpers ----------
@@ -674,14 +826,22 @@ async function tabTo(page: Page, target: ReturnType<Page["getByRole"]>): Promise
   throw new Error("Tab never reached the control.");
 }
 
-/** A size as the screen writes it (packages/ui/src/api/tools.ts `formatSize`, copied). */
-function sizeText(bytes: number): string {
-  const b = Math.max(0, bytes);
-  if (b >= 1e9) return `${(b / 1e9).toFixed(1).replace(/\.0$/, "")} GB`;
-  if (b >= 1e6) return `${Math.round(b / 1e6)} MB`;
-  if (b >= 1e3) return `${Math.round(b / 1e3)} kB`;
-  return b === 0 ? "nothing" : `${b} bytes`;
-}
+/**
+ * A size as the screen writes it: the interface's own `formatSize`, taken from its source
+ * (packages/ui/src/api/tools.ts), never copied here. The module itself cannot be imported into a Node test (it reaches
+ * the interface's stylesheets through its imports, and this package's type check would check the interface's sources
+ * under rules they are not written for), so the one function declaration is read from the file with the TypeScript
+ * compiler, transpiled and evaluated. It uses nothing else of its module; if it ever does, this fails loudly.
+ */
+const formatSize = ((): ((bytes: number) => string) => {
+  const file = fileURLToPath(new URL("../packages/ui/src/api/tools.ts", import.meta.url));
+  const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.ES2022, true);
+  const decl = source.statements.find((s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === "formatSize");
+  if (!decl) throw new Error("formatSize was not found in packages/ui/src/api/tools.ts");
+  const js = ts.transpileModule(decl.getText(source).replace(/^export\s+/, ""), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  return new Function(`${js}\nreturn formatSize;`)() as (bytes: number) => string;
+})();
+const sizeText = (bytes: number): string => formatSize(bytes);
 
 function filesUnder(dir: string): string[] {
   const out: string[] = [];

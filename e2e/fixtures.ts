@@ -792,12 +792,24 @@ function shellChooserFor(app: AppHarness): ShellChooser & { pick(title: string):
 /**
  * Makes this test's page believe it runs in the desktop shell, before any app code: `isTauri`, and a
  * `__TAURI_INTERNALS__.invoke` that answers ONLY `pick_watch_folder` (through `app.chooser`) and refuses every other
- * command as the shell refuses one it does not know. In the app's own top-level document only. A test without
- * `shellStub` never reaches here, so its page is a plain browser.
+ * command as the shell refuses one it does not know. The stand-in is set up in the app's own top-level document
+ * only. The page's channel to the harness (`__aoShellStubPick`, a Playwright binding) is visible in every frame, as
+ * bindings are, but it ANSWERS only a call from the page's main frame at the app's origin: from any other frame it
+ * refuses, opens no chooser and writes no grant. A test without `shellStub` never reaches here, so its page is a
+ * plain browser.
  */
 async function installShellStub(page: Page, chooser: ShellChooser): Promise<void> {
   const context = page.context();
-  await context.exposeBinding("__aoShellStubPick", (_source, title: unknown) => (chooser as ReturnType<typeof shellChooserFor>).pick(String(title ?? "")));
+  await context.exposeBinding("__aoShellStubPick", (source, title: unknown) => {
+    let origin = "";
+    try {
+      origin = new URL(source.frame.url()).origin;
+    } catch {
+      origin = "";
+    }
+    if (source.frame !== source.page.mainFrame() || origin !== APP_ORIGIN) throw new Error("Command pick_watch_folder not found");
+    return (chooser as ReturnType<typeof shellChooserFor>).pick(String(title ?? ""));
+  });
   await context.addInitScript(
     ({ origin }) => {
       if (window !== window.top || window.location.origin !== origin) return;
