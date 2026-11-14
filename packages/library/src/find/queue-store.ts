@@ -52,7 +52,7 @@ import * as fsp from "node:fs/promises";
 import { Creator, SourceType, isId } from "@ao/core";
 import { InvalidInputError } from "../repo/errors.js";
 import { openLine, readMaybe, sealLine } from "../repo/io.js";
-import { CHANGE_LOG_MODE, runMutation } from "../repo/mutate.js";
+import { CHANGE_LOG_MODE, runMutation, type Tx } from "../repo/mutate.js";
 import { PURPOSE_FIND_QUEUE } from "../repo/sealed-purposes.js";
 import type { ProjectState, RepoCore } from "../repo/state.js";
 import type { WorkCandidate } from "./candidates.js";
@@ -582,68 +582,101 @@ function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[], al
     projectId,
     REQ,
     async (tx) => {
-      const st = tx.state;
-      const folded = await loadFolded(core, st);
-      // What is to be written, decided against the queue as it is now (this runs one change at a time).
-      const byId = new Map<string, FindEntry>();
-      for (const c of given) {
-        const cur = folded.map.get(c.id);
-        if (op === "add") {
-          if (cur && cur.removed !== true) throw new InvalidInputError("A queue entry with this id is already there.");
-          const { removed: _r, ...rest } = c;
-          byId.set(c.id, rest);
-        } else if (cur && cur.removed !== true) {
-          if (op === "update") {
-            const { removed: _r, ...rest } = c;
-            byId.set(c.id, rest);
-          } else byId.set(c.id, removalOf(cur, c.updatedAt));
-        }
-      }
-      const added = [...byId.values()];
-      if (added.length === 0) throw new NothingToWrite();
-      if (op === "add" && liveOf(folded).length + added.length > FIND_QUEUE_MAX) throw new FindQueueFullError();
-      // The lines of live entries that go with this add (F8): an entry no longer in the queue refuses the whole add.
-      const along = alongside.map((c) => {
-        const cur = folded.map.get(c.id);
-        if (!cur || cur.removed === true) throw new InvalidInputError("That entry is no longer in the queue. Nothing was added.");
-        const { removed: _r, ...rest } = c;
-        return rest;
-      });
-      const todo = [...added, ...along];
-      written = todo;
-
-      const rel = queueRel(st.rel);
-      const abs = core.abs(rel);
-      // A last line torn by an unclean stop (not by this app's own writes, which the marker takes back) is
-      // removed in this change, so that the file can be appended to again.
-      if (await endsTorn(abs)) {
-        const raw = await readMaybe(abs);
-        if (raw && raw.length > 0 && raw[raw.length - 1] !== 0x0a) await tx.writeFile(rel, raw.subarray(0, raw.lastIndexOf(0x0a) + 1), { mode: CHANGE_LOG_MODE });
-      }
-      tx.onCommit(() => {
-        const kept = cacheOf(core).get(abs);
-        if (!kept || kept.folded !== folded) return;
-        try {
-          const first = folded.lines;
-          todo.forEach((e, i) => apply(folded, structuredClone(e), first + i));
-          folded.lines += todo.length;
-          const after = statSync(abs, { bigint: true });
-          folded.size = Number(after.size);
-          kept.sig = sigOf(after);
-        } catch {
-          cacheOf(core).delete(abs);
-        }
-      });
-      if (tx.encrypted) {
-        const { key, keyId } = tx.key();
-        for (const e of todo) await tx.appendLine(rel, sealLine(key, keyId, st.project.id, JSON.stringify(e), PURPOSE));
-      } else {
-        for (const e of todo) await tx.appendLine(rel, JSON.stringify(e), { mode: CHANGE_LOG_MODE });
-      }
+      written = await linesInTx(core, tx, op, given, alongside);
     },
     { op: FIND_QUEUE_OPS[op], entity: { type: "project", id: projectId }, auditDetails: () => ({ entries: written.map((e) => e.id), count: written.length, states: countStates(written) }) },
   );
 }
+
+/** Inside a running change: decides what is to be written against the queue as it is now, and appends it. */
+async function linesInTx(core: RepoCore, tx: Tx, op: Op, given: FindEntry[], alongside: FindEntry[] = []): Promise<FindEntry[]> {
+  const st = tx.state;
+  const folded = await loadFolded(core, st);
+  // What is to be written, decided against the queue as it is now (this runs one change at a time).
+  const byId = new Map<string, FindEntry>();
+  for (const c of given) {
+    const cur = folded.map.get(c.id);
+    if (op === "add") {
+      if (cur && cur.removed !== true) throw new InvalidInputError("A queue entry with this id is already there.");
+      const { removed: _r, ...rest } = c;
+      byId.set(c.id, rest);
+    } else if (cur && cur.removed !== true) {
+      if (op === "update") {
+        const { removed: _r, ...rest } = c;
+        byId.set(c.id, rest);
+      } else byId.set(c.id, removalOf(cur, c.updatedAt));
+    }
+  }
+  const added = [...byId.values()];
+  if (added.length === 0) throw new NothingToWrite();
+  if (op === "add" && liveOf(folded).length + added.length > FIND_QUEUE_MAX) throw new FindQueueFullError();
+  // The lines of live entries that go with this add (F8): an entry no longer in the queue refuses the whole add.
+  const along = alongside.map((c) => {
+    const cur = folded.map.get(c.id);
+    if (!cur || cur.removed === true) throw new InvalidInputError("That entry is no longer in the queue. Nothing was added.");
+    const { removed: _r, ...rest } = c;
+    return rest;
+  });
+  const todo = [...added, ...along];
+
+  const rel = queueRel(st.rel);
+  const abs = core.abs(rel);
+  // A last line torn by an unclean stop (not by this app's own writes, which the marker takes back) is
+  // removed in this change, so that the file can be appended to again.
+  if (await endsTorn(abs)) {
+    const raw = await readMaybe(abs);
+    if (raw && raw.length > 0 && raw[raw.length - 1] !== 0x0a) await tx.writeFile(rel, raw.subarray(0, raw.lastIndexOf(0x0a) + 1), { mode: CHANGE_LOG_MODE });
+  }
+  tx.onCommit(() => {
+    const kept = cacheOf(core).get(abs);
+    if (!kept || kept.folded !== folded) return;
+    try {
+      const first = folded.lines;
+      todo.forEach((e, i) => apply(folded, structuredClone(e), first + i));
+      folded.lines += todo.length;
+      const after = statSync(abs, { bigint: true });
+      folded.size = Number(after.size);
+      kept.sig = sigOf(after);
+    } catch {
+      cacheOf(core).delete(abs);
+    }
+  });
+  if (tx.encrypted) {
+    const { key, keyId } = tx.key();
+    for (const e of todo) await tx.appendLine(rel, sealLine(key, keyId, st.project.id, JSON.stringify(e), PURPOSE));
+  } else {
+    for (const e of todo) await tx.appendLine(rel, JSON.stringify(e), { mode: CHANGE_LOG_MODE });
+  }
+  return todo;
+}
+
+/**
+ * Task F11: new lines of entries written INSIDE a change another part of the library runs (the held file, its review
+ * entry and the entry's line in one change; a decision in the review queue; a removal that discards a held file):
+ * checked as `appendFindEntries` checks them. `update` and `remove` only. Returns what was written: an entry that is
+ * no longer live in the queue is passed by (an empty list when nothing is left), so the caller decides whether that
+ * undoes its whole change. The caller audits it (ids and counts only, R177).
+ */
+export async function appendFindLinesInTx(core: RepoCore, tx: Tx, op: "update" | "remove", entries: FindEntry[]): Promise<FindEntry[]> {
+  if (op !== "update" && op !== "remove") throw new InvalidInputError("This is not a change the queue knows.");
+  const cleaned = entries.map((e) => {
+    const c = sanitizeEntry(e);
+    if (!c) throw new InvalidInputError(NOT_WELL_FORMED);
+    if (c.projectId !== tx.projectId) throw new InvalidInputError("A queue entry belongs to another project.");
+    if (Buffer.byteLength(JSON.stringify(c), "utf8") > FIND_LINE_MAX_BYTES) throw new FindEntryTooLargeError();
+    return c;
+  });
+  if (!cleaned.length) return [];
+  try {
+    return await linesInTx(core, tx, op, cleaned);
+  } catch (err) {
+    if (err instanceof NothingToWrite) return [];
+    throw err;
+  }
+}
+
+/** Counts by state of entries (for an audit entry: counts only). */
+export const findStateCounts = (entries: readonly FindEntry[]): Record<FindState, number> => countStates(entries);
 
 /**
  * Compaction's check of what it built: scans `text` with the routine the reader uses and compares with what the

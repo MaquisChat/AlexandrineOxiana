@@ -2,6 +2,7 @@
 import {
   Asset,
   DEFAULT_GOVERNANCE,
+  type AcquiredFrom,
   derivedFileName,
   effectivePolicy,
   encName,
@@ -16,7 +17,7 @@ import {
 } from "@ao/core";
 import { DestroyedParentError, MissingParentError, ProxyRecordRefusedError } from "./errors.js";
 import { foldName, mimeFor, namesIn, readMaybe } from "./io.js";
-import { runMutation, type RefuseHook, type MutateRequest } from "./mutate.js";
+import { runMutation, type RefuseHook, type MutateRequest, type Tx } from "./mutate.js";
 import { fileMode, readSourceFile, storeRequest, writeSourceFile } from "./sources.js";
 import type { RepoCore } from "./state.js";
 
@@ -45,6 +46,8 @@ export interface OriginalAssetInput {
   label: string;
   fromEncrypted?: boolean;
   metadata?: Asset["metadata"];
+  /** Find and acquire (F11): how the file was got, kept on the asset (set once, here). */
+  acquired?: AcquiredFrom;
 }
 
 export async function addDerivedAsset(
@@ -302,46 +305,55 @@ export async function addOriginalAsset(
     core,
     projectId,
     reqs,
-    async (tx) => {
-      const cur = await readSourceFile(core, st, sourceId);
-      const folder = cur.source.folder;
-      const folderName = folder.slice(folder.lastIndexOf("/") + 1);
-      const sourceName = folderName.replace(/\s*\[[^\]]*\](?: \(\d+\))?\s*$/, "");
-      const ext = input.ext.replace(/^\.+/, "").toLowerCase();
-      let name = originalFileName(`${sourceName} - ${input.label}`, ext);
-      if (tx.encrypted) name = encName(name);
-      const dir = `${folder}/original`;
-      await tx.mkdir(dir);
-      const taken = await namesIn(core.abs(dir));
-      name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
-      const rel = `${dir}/${name}`;
-      if (input.fromEncrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
-      const { sha256, bytes } = await tx.copyFile(input.fromPath, rel, {
-        encrypt: tx.encrypted,
-        mode: fileMode(core, st, cur.source.provenance.identifiable),
-        ...(input.fromEncrypted ? { sourceEncrypted: true } : {}),
-      });
-      const asset = Asset.parse({
-        id: newId(),
-        sourceId,
-        role: "original",
-        kind: input.kind,
-        path: rel,
-        encrypted: tx.encrypted,
-        sha256,
-        bytes,
-        mime: input.mime ?? mimeFor(ext),
-        ...(input.metadata ? { metadata: input.metadata } : {}),
-      });
-      tx.entity("asset", asset.id);
-      const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, asset] };
-      const more = internal.pendingProxies?.(asset) ?? [];
-      if (more.length) withPending(sf, [...(cur.pendingProxies ?? []), ...more]);
-      await writeSourceFile(core, tx, sf);
-      tx.record("asset", asset.id, null, asset);
-      tx.index((sink) => sink.indexSource(sf));
-      return asset;
-    },
+    (tx) => addOriginalInTx(core, tx, sourceId, input, internal.pendingProxies),
     { op: "asset.add-original", entity: { type: "source", id: sourceId }, ...(internal.refuse ? { refuse: internal.refuse } : {}) },
   );
+}
+
+/**
+ * Inside a running change (Task F11: a held file the researcher accepted, attached in the change that resolves its
+ * review entry): adds `input` as an original of the source, as `addOriginalAsset` does. The caller has evaluated the
+ * capture method and `store` for the change.
+ */
+export async function addOriginalInTx(core: RepoCore, tx: Tx, sourceId: string, input: OriginalAssetInput, pendingProxies?: (asset: Asset) => PendingProxy[]): Promise<Asset> {
+  const st = tx.state;
+  const cur = await readSourceFile(core, st, sourceId);
+  const folder = cur.source.folder;
+  const folderName = folder.slice(folder.lastIndexOf("/") + 1);
+  const sourceName = folderName.replace(/\s*\[[^\]]*\](?: \(\d+\))?\s*$/, "");
+  const ext = input.ext.replace(/^\.+/, "").toLowerCase();
+  let name = originalFileName(`${sourceName} - ${input.label}`, ext);
+  if (tx.encrypted) name = encName(name);
+  const dir = `${folder}/original`;
+  await tx.mkdir(dir);
+  const taken = await namesIn(core.abs(dir));
+  name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
+  const rel = `${dir}/${name}`;
+  if (input.fromEncrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
+  const { sha256, bytes } = await tx.copyFile(input.fromPath, rel, {
+    encrypt: tx.encrypted,
+    mode: fileMode(core, st, cur.source.provenance.identifiable),
+    ...(input.fromEncrypted ? { sourceEncrypted: true } : {}),
+  });
+  const asset = Asset.parse({
+    id: newId(),
+    sourceId,
+    role: "original",
+    kind: input.kind,
+    path: rel,
+    encrypted: tx.encrypted,
+    sha256,
+    bytes,
+    mime: input.mime ?? mimeFor(ext),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+    ...(input.acquired ? { acquired: input.acquired } : {}),
+  });
+  tx.entity("asset", asset.id);
+  const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, asset] };
+  const more = pendingProxies?.(asset) ?? [];
+  if (more.length) withPending(sf, [...(cur.pendingProxies ?? []), ...more]);
+  await writeSourceFile(core, tx, sf);
+  tx.record("asset", asset.id, null, asset);
+  tx.index((sink) => sink.indexSource(sf));
+  return asset;
 }
