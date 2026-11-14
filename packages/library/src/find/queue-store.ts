@@ -525,9 +525,12 @@ async function endsTorn(abs: string): Promise<boolean> {
 /**
  * Task F15: "library-start" is an update (one entry, written "waiting-sign-in") governed with the capture of
  * `library_access` too — the rules are asked again inside the change, fail closed — and audited with that method.
+ * Task F18c (R345): a start at one of the entry's own links is the same change with the method `free_copy`.
  */
 type Op = "add" | "update" | "remove" | "library-start";
-const LIBRARY_START_REQ = { action: "capture" as const, capture: { method: "library_access" as const } };
+/** The method a start through the sign-in window is governed and audited with. */
+export type FindStartMethod = "library_access" | "free_copy";
+const startReq = (method: FindStartMethod) => ({ action: "capture" as const, capture: { method } });
 
 /**
  * Appends changes of entries to the queue: ONE governed change (R26: policy, transaction marker, audit
@@ -553,10 +556,11 @@ const LIBRARY_START_REQ = { action: "capture" as const, capture: { method: "libr
  * the top of this file), it is compacted by a change of its own, which never fails this call (a failure leaves
  * a note in `core.indexErrors`).
  */
-export async function appendFindEntries(core: RepoCore, projectId: string, entries: FindEntry[], op: Op, alongside: FindEntry[] = []): Promise<void> {
+export async function appendFindEntries(core: RepoCore, projectId: string, entries: FindEntry[], op: Op, alongside: FindEntry[] = [], method: FindStartMethod = "library_access"): Promise<void> {
   core.assertWritable();
   if (op !== "add" && op !== "update" && op !== "remove" && op !== "library-start") throw new InvalidInputError("This is not a change the queue knows.");
   if (op === "library-start" && (!Array.isArray(entries) || entries.length !== 1 || entries[0]?.state !== "waiting-sign-in")) throw new InvalidInputError("This is not a change the queue knows.");
+  if (method !== "library_access" && method !== "free_copy") throw new InvalidInputError("This is not a change the queue knows.");
   const st0 = core.state(projectId);
   core.assertUnlocked(st0);
   if (!Array.isArray(entries)) throw new InvalidInputError("The queue entries are not a list.");
@@ -581,7 +585,7 @@ export async function appendFindEntries(core: RepoCore, projectId: string, entri
   const updates = alongside.map(clean);
   if (cleaned.length === 0) return;
   try {
-    await write(core, projectId, op, cleaned, updates);
+    await write(core, projectId, op, cleaned, updates, method);
   } catch (err) {
     if (err instanceof NothingToWrite) return;
     // A file-system error's message names the file: never passed on (R96).
@@ -597,20 +601,20 @@ export async function appendFindEntries(core: RepoCore, projectId: string, entri
   }
 }
 
-function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[], alongside: FindEntry[] = []): Promise<void> {
+function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[], alongside: FindEntry[] = [], method: FindStartMethod = "library_access"): Promise<void> {
   let written: FindEntry[] = [];
   const library = op === "library-start";
   return runMutation(
     core,
     projectId,
-    library ? [LIBRARY_START_REQ, REQ] : REQ,
+    library ? [startReq(method), REQ] : REQ,
     async (tx) => {
       written = await linesInTx(core, tx, op, given, alongside);
     },
     {
       op: FIND_QUEUE_OPS[op],
       entity: { type: "project", id: projectId },
-      auditDetails: () => ({ entries: written.map((e) => e.id), count: written.length, states: countStates(written), ...(library ? { method: "library_access" } : {}) }),
+      auditDetails: () => ({ entries: written.map((e) => e.id), count: written.length, states: countStates(written), ...(library ? { method } : {}) }),
     },
   );
 }

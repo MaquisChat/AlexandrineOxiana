@@ -17,7 +17,7 @@ import { findSourceBy } from "../index/db.js";
 import { HttpClient } from "../lookup/http.js";
 import { LOOKUP_FIXTURES_ENV, recordedLookupsFromEnv } from "../lookup/recorded.js";
 import { serialStore } from "../import/project-queue.js";
-import { InvalidInputError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { InvalidInputError, NotFoundError, ReadOnlyLibraryError } from "../repo/errors.js";
 import { addCapturedOriginal, recoveryPendingProjects, repoLibrary, type Repo } from "../repo/repo.js";
 import type { RepoCore } from "../repo/state.js";
 import { SimulatedCrash, openTestRepo, seams } from "../repo/testing.js";
@@ -54,7 +54,7 @@ import {
 } from "./runner.js";
 import { DEFAULT_SEARCH_SETTINGS, FIND_QUEUE_MAX, type FindEntry, type FindState, type SearchSettings } from "./types.js";
 import { SEARCH_SOURCES_FILE, readSearchSettings, writeSearchSettings } from "./settings.js";
-import { FIND_LIBRARY_TEXT, FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, LIBRARY_FILE_MAX_BYTES, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
+import { FIND_LIBRARY_TEXT, FIND_LINK_TEXT, FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, LIBRARY_FILE_MAX_BYTES, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
 import type { LibraryAccess } from "./where.js";
 import { checkFileAgainstRecord } from "./file-check.js";
 
@@ -5504,6 +5504,284 @@ describe("F15: a fetch through the researcher's library", () => {
         expect(first.log.took).toBe(1);
         expect(await reviewsOf(p)).toHaveLength(1);
         expect((await entryOf(p, e.id))!.state).toBe("needs-check");
+      });
+    });
+
+    // ----------------------------------------------------------------------------------------------------------
+    // Task F18c (R345): "Open it here and fetch the PDF" — one of the entry's own links opened in the sign-in window:
+    // a second entry point into the same start, ticket, waiting state and hand-over.
+
+    describe("F18c (R345): a link of the entry opened in the sign-in window", () => {
+      /** A free copy's link on a repository the app does not fetch from by itself (with a query and a fragment). */
+      const REPO_LINK = "https://repository.zorblatt-f18c.example.edu/bitstream/1/zorblatt.pdf?sequence=1&isAllowed=y#page=2";
+      /** What the record of how the file was got keeps of it: no query, no fragment. */
+      const REPO_KEPT = "https://repository.zorblatt-f18c.example.edu/bitstream/1/zorblatt.pdf";
+      const PUBLISHER = `https://doi.org/${DOI}`;
+      const CATALOGUE = { catalogueSearch: "https://catalogue.zorblatt-f18c.example.edu/search?q={query}" };
+      const FREE_ONLY = GOV("acquireMethods: [reference_lookup, free_copy]");
+      const withLink = (rest: Rest = RESTING[0]!): Rest & { offers: NonNullable<FindEntry["offers"]> } => ({ ...rest, offers: [{ label: "A free copy may be at", url: REPO_LINK, host: "repository.zorblatt-f18c.example.edu" }] });
+      async function restingWithLink(p: Project, rest: Rest = RESTING[0]!, sid?: string): Promise<FindEntry> {
+        const at = new Date(NOW).toISOString();
+        const e: FindEntry = { id: newId(), projectId: p.id, typed: "Zorblatt Grammar F18c", ...withLink(rest), createdAt: at, updatedAt: at, attempts: 0, sourceId: sid ?? (await record(p)) };
+        await appendFindEntries(coreOf(), p.id, [e], "add");
+        return e;
+      }
+      /** A resting entry started at its repository link and handed over: the runner, the entry and the start's answer. */
+      async function linkHandedOver(o: { gov?: string } = {}) {
+        const p = await project({ gov: o.gov ?? GOV() });
+        const e = await restingWithLink(p);
+        const r = runner();
+        const got = await r.linkStart(p.id, e.id, REPO_LINK, null);
+        expect(r.libraryHandedOver(got.ticket)).toEqual({ projectId: p.id, entryId: e.id });
+        return { p, e, r, got };
+      }
+
+      it("R345 b: the view says where a link start may be made — the resting states of a library start, with or without a library, and no other", async () => {
+        const p = await project();
+        const rows: Array<{ rest: Rest; link: boolean }> = [
+          ...RESTING.map((rest) => ({ rest, link: true })),
+          { rest: { state: "no-open-copy", reason: { code: "library-unfinished" } }, link: true },
+          { rest: { state: "no-open-copy", reason: { code: "record-removed" } }, link: false },
+          { rest: { state: "record-complete" }, link: false },
+          { rest: { state: "record-complete", reason: { code: "held-full" } }, link: false },
+          { rest: { state: "record-complete", reason: { code: "copy-store-not-allowed", by: "rules" } }, link: false },
+          { rest: { state: "failed", reason: { code: "unreachable" } }, link: false },
+          { rest: { state: "looking-for-copy" }, link: false },
+          { rest: { state: "fetching" }, link: false },
+          { rest: { state: "in-library" }, link: false },
+          { rest: { state: "needs-check", reason: { code: "file-looks-right" } }, link: false },
+          { rest: { state: "waiting-sign-in" }, link: false },
+        ];
+        const made = [];
+        for (const row of rows) made.push({ ...row, e: await restingWithLink(p, row.rest, await record(p, { doi: `10.5555/ao.f18c.${made.length}` })) });
+        const r = runner();
+        for (const access of [null, EZ]) {
+          const v = await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access, atWork: (id) => r.atWork(p.id, id) });
+          for (const m of made) expect(v.get(m.e.id)?.link === true, `link start for ${JSON.stringify(m.rest)} (library ${access ? "set" : "not set"})`).toBe(m.link);
+        }
+        // No DOI or ISBN (no library address could be made): a link start is still offered for its links.
+        const bare = await restingWithLink(p, RESTING[0]!, await record(p, { doi: null }));
+        const bv = (await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: EZ })).get(bare.id)!;
+        expect(bv.chance).toBeUndefined();
+        expect(bv.link).toBe(true);
+      });
+
+      it("R345 b: not offered for an entry with a file, with one waiting, at work, or whose rules forbid free copies or keeping the file; the library's own method is not needed", async () => {
+        const p = await project();
+        const r = runner();
+        const view = async (q: Project = p) => libraryChancesOf(repo, q.id, (await queue(q)).values(), { access: null, atWork: (id) => r.atWork(q.id, id) });
+        const withFile = await restingWithLink(p);
+        const mine = join(tmp, "f18c-mine.pdf");
+        await writeFile(mine, await buildPdf({ title: "Mine", lines: ["Mine"] }));
+        await addCapturedOriginal(repo, p.id, withFile.sourceId!, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+        const sid = await record(p);
+        const waitingFor = await restingWithLink(p, RESTING[1]!, sid);
+        await resting(p, { state: "needs-check", reason: { code: "file-title-absent" } }, sid);
+        const atWork = await restingWithLink(p, RESTING[3]!);
+        const plain = await restingWithLink(p);
+        settingsFn = () => new Promise(() => {}); // the copy part waits on the settings: the entry stays at work
+        r.resume(p.id);
+        await until(() => r.atWork(p.id, atWork.id), "the entry to be at work");
+        const v = await view();
+        for (const e of [withFile, waitingFor, atWork]) expect(v.get(e.id)!.link, e.typed).toBeUndefined();
+        expect(v.get(plain.id)!.link).toBe(true);
+        // The rules forbid free copies: none (and the start is refused in its own words).
+        const q = await project({ gov: NO_FREE });
+        const nf = await restingWithLink(q);
+        expect((await view(q)).get(nf.id)!.link).toBeUndefined();
+        expect((await refusal(r.linkStart(q.id, nf.id, REPO_LINK, null))).code).toBe("link-not-offered");
+        expect((await refusal(r.linkStart(q.id, nf.id, REPO_LINK, null))).message).toBe(FIND_LINK_TEXT.notOffered);
+        expect((await entryOf(q, nf.id))!.state).toBe("no-open-copy");
+        // Free copies allowed and the library's method forbidden: offered (the method asked is free_copy).
+        const fo = await project({ gov: FREE_ONLY });
+        const fe = await restingWithLink(fo);
+        const fv = (await view(fo)).get(fe.id)!;
+        expect([fv.chance, fv.link]).toEqual([undefined, true]);
+        // The rules would not keep the file (a legal basis needed and none): none.
+        const ident = (basis: boolean) => `identifiability:\n  containsIdentifiable: true\n  pseudonymizeFileNames: false\nencryption:\n  atRest: optional\nconsent:\n  requireLegalBasis: ${basis}\nprocessing:\n  metadata_lookup: [crossref, openalex]\n`;
+        const lb = await project({ gov: ident(false) });
+        const le = await restingWithLink(lb, RESTING[0]!, await record(lb, { identifiable: true }));
+        expect((await view(lb)).get(le.id)!.link).toBe(true);
+        const { sha256 } = await repo.getGovernance(lb.id);
+        await repo.setGovernance(lb.id, ident(true), { baseSha256: sha256 });
+        expect((await view(lb)).get(le.id)!.link).toBeUndefined();
+        expect((await refusal(r.linkStart(lb.id, le.id, REPO_LINK, null))).code).toBe("link-not-offered");
+      });
+
+      it("the start: only one of THAT entry's own links as the service gives them now, compared as parsed addresses; the link returned as the service holds it, with a ticket", async () => {
+        const p = await project();
+        const e = await restingWithLink(p, RESTING[3]!);
+        const other = await restingWithLink(p, RESTING[0]!, await record(p, { doi: "10.5555/ao.f18c.other" }));
+        const r = runner();
+        const n = changes.length;
+        // Not one of its places: another entry's link, a made-up address, the same with another path, not https, a user
+        // name, over the links' bound, not text; the catalogue's link while the settings give none. Nothing changes.
+        for (const bad of [
+          "https://doi.org/10.5555/ao.f18c.other",
+          "https://repository.zorblatt-f18c.example.edu/bitstream/1/other.pdf",
+          "https://evil.example.org/zorblatt.pdf",
+          REPO_LINK.replace("https:", "http:"),
+          REPO_LINK.replace("https://", "https://user:pw@"),
+          `${REPO_KEPT}?${"a".repeat(2100)}`,
+          "not an address",
+          42,
+          `https://catalogue.zorblatt-f18c.example.edu/search?q=${encodeURIComponent(`${ZORBLATT.title} ${ZORBLATT.family}`)}`,
+        ]) {
+          const err = await refusal(r.linkStart(p.id, e.id, bad as string, null));
+          expect(err.code, String(bad)).toBe("not-a-place");
+          expect(err.message).toBe(FIND_LINK_TEXT.notAPlace);
+          expect(err.message).not.toContain("zorblatt");
+        }
+        expect((await entryOf(p, e.id))!.state).toBe("record-complete");
+        expect(changes.length).toBe(n);
+        // Its own link, written as another spelling of the same address: the service's own spelling comes back.
+        const offered = new URL(REPO_LINK).href;
+        const got = await r.linkStart(p.id, e.id, REPO_LINK.replace("repository.zorblatt-f18c", "REPOSITORY.Zorblatt-F18c"), null);
+        expect(got.url).toBe(offered);
+        expect(got.ticket).toMatch(/^[0-9a-f]{32}$/u);
+        const w = (await entryOf(p, e.id))!;
+        expect(w.state).toBe("waiting-sign-in");
+        expect(w.returnTo).toEqual({ state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } });
+        expect(w.offers).toEqual(e.offers);
+        expect(got.entry).toEqual(w);
+        expect(r.windowStartOf(p.id, e.id)).toBe("link");
+        expect(r.windowStartOf(p.id, other.id)).toBeNull();
+        expect(changes.slice(n)).toEqual([{ projectId: p.id, entryId: e.id, state: "waiting-sign-in" }]);
+        // Audited as a start, with the method free_copy and nothing of the address; the notes hold none of it. The queue
+        // holds the ticket nowhere (its line keeps the entry's stored links as before, and nothing of which was pressed).
+        const audit = await auditText(p);
+        expect(audit).toContain('"op":"project.find.library-start"');
+        expect(audit).toContain('"method":"free_copy"');
+        expect(audit).not.toContain('"method":"library_access"');
+        const qfile = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"), "utf8");
+        expect(qfile).not.toContain(got.ticket);
+        expect(qfile.split("\n").filter(Boolean).every((l) => !l.includes("waiting-sign-in") || Object.keys(JSON.parse(l) as object).every((k) => k !== "url" && k !== "ticket" && k !== "start"))).toBe(true);
+        for (const secret of [got.ticket, "repository.zorblatt-f18c", "isAllowed", "doi.org"]) {
+          expect(audit).not.toContain(secret);
+          expect(notes.join("\n")).not.toContain(secret);
+        }
+        // The publisher's page and the catalogue's link (with the settings that give it) are its places too.
+        await r.libraryCancel(p.id, e.id);
+        expect(r.windowStartOf(p.id, e.id)).toBeNull();
+        expect((await r.linkStart(p.id, e.id, PUBLISHER, null)).url).toBe(PUBLISHER);
+        await r.libraryCancel(p.id, e.id);
+        const cat = `https://catalogue.zorblatt-f18c.example.edu/search?q=${encodeURIComponent(`${ZORBLATT.title} ${ZORBLATT.family}`)}`;
+        expect((await r.linkStart(p.id, e.id, cat, CATALOGUE)).url).toBe(cat);
+        sameRest(await r.libraryCancel(p.id, e.id), RESTING[3]!);
+      });
+
+      it("refused like a library start: one ticket for both kinds, the pause, the limit of waiting files, an unknown entry, a read-only library", async () => {
+        const p = await project();
+        const a = await restingWithLink(p);
+        const b = await restingWithLink(p, RESTING[0]!, await record(p, { doi: "10.5555/ao.f18c.b" }));
+        const r = runner();
+        // Two presses at once, one of each kind: one ticket.
+        const both = await Promise.allSettled([r.libraryStart(p.id, b.id, EZ), r.linkStart(p.id, a.id, REPO_LINK, null)]);
+        expect(both.map((x) => x.status).sort()).toEqual(["fulfilled", "rejected"]);
+        expect(((both.find((x) => x.status === "rejected") as PromiseRejectedResult).reason as FindLibraryRefusedError).code).toBe("busy");
+        const libFirst = both[0]!.status === "fulfilled";
+        // While a link's ticket is open, a library start is busy too (and the other way round).
+        const busy = await refusal(libFirst ? r.linkStart(p.id, a.id, REPO_LINK, null) : r.libraryStart(p.id, b.id, EZ));
+        expect([busy.code, busy.message]).toEqual(["busy", FIND_LIBRARY_TEXT.busy]);
+        const open = (both.find((x) => x.status === "fulfilled") as PromiseFulfilledResult<{ ticket: string }>).value;
+        // The hand-over starts the pause for both kinds.
+        expect(r.libraryHandedOver(open.ticket)).not.toBeNull();
+        const c = await restingWithLink(p, RESTING[0]!, await record(p, { doi: "10.5555/ao.f18c.c" }));
+        const paused = await refusal(r.linkStart(p.id, c.id, REPO_LINK, null));
+        expect([paused.code, paused.message]).toEqual(["pause", libraryReadyIn(20)]);
+        timers.now += LIBRARY_PAUSE_MS;
+        // An unknown entry.
+        await expect(r.linkStart(p.id, newId(), REPO_LINK, null)).rejects.toBeInstanceOf(NotFoundError);
+        // The limit of waiting files.
+        const q = await project();
+        const f = await restingWithLink(q);
+        await fillHeld(q, FIND_HELD_MAX);
+        const full = await refusal(r.linkStart(q.id, f.id, REPO_LINK, null));
+        expect([full.code, full.message]).toEqual(["held-full", FIND_LIBRARY_TEXT.heldFull]);
+        expect((await entryOf(q, f.id))!.state).toBe("no-open-copy");
+      });
+
+      it("the ways back: cancel, the ticket's end, a lock and a resume — as a library start's", async () => {
+        const p = await project();
+        const e = await restingWithLink(p, RESTING[2]!);
+        const r = runner();
+        await r.linkStart(p.id, e.id, REPO_LINK, null);
+        sameRest(await r.libraryCancel(p.id, e.id), RESTING[2]!);
+        const { ticket } = await r.linkStart(p.id, e.id, REPO_LINK, null);
+        timers.advance(LIBRARY_TICKET_MS);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
+        sameRest(await entryOf(p, e.id), RESTING[2]!);
+        expect(r.libraryHandedOver(ticket)).toBeNull();
+        expect(r.windowStartOf(p.id, e.id)).toBeNull();
+        const second = await r.linkStart(p.id, e.id, REPO_LINK, null);
+        r.stop(p.id);
+        expect(r.libraryHandedOver(second.ticket)).toBeNull();
+        r.resume(p.id);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back at the resume");
+        sameRest(await entryOf(p, e.id), RESTING[2]!);
+      });
+
+      it("R345 c: the hand-over — the file waits; its record says free_copy, via the sign-in window, the link without query or fragment, a signed-in session, no service; \"Use this file\" keeps that; the rules are asked for free_copy", async () => {
+        // The library's own method forbidden: only free_copy can let the hold and the attach pass.
+        const { p, e, r } = await linkHandedOver({ gov: FREE_ONLY });
+        expect(r.libraryAddressOf(p.id, e.id)).toBe(REPO_KEPT);
+        expect(r.windowStartOf(p.id, e.id)).toBe("link");
+        const { file, log } = handedFile(await goodPdf());
+        await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", REPO_KEPT, file);
+        expect(log.took).toBe(1);
+        expect((await entryOf(p, e.id))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+        expect(r.windowStartOf(p.id, e.id)).toBeNull();
+        const [rev] = await reviewsOf(p);
+        const acquired = rev!.heldFile!.acquired;
+        expect(acquired).toEqual({ method: "free_copy", via: "sign-in-window", address: REPO_KEPT, at: expect.any(String), tool: { name: FIND_TOOL, version: expect.any(String) }, access: "signed-in-session" });
+        expect(acquired).not.toHaveProperty("service");
+        expect((await repo.getSource(p.id, e.sourceId!)).assets).toEqual([]);
+        expect(await auditText(p)).toContain('"method":"free_copy"');
+        await r.resolveHeld(p.id, rev!.id, "attach");
+        const a = (await repo.getSource(p.id, e.sourceId!)).assets.find((x) => x.role === "original")!;
+        expect(a.acquired).toMatchObject({ method: "free_copy", via: "sign-in-window", address: REPO_KEPT, access: "signed-in-session", check: { result: "match", by: "title" } });
+        expect(a.acquired).not.toHaveProperty("service");
+        expect((await entryOf(p, e.id))!.state).toBe("in-library");
+        const audit = await auditText(p);
+        expect(audit).not.toContain("library_access");
+        expect(audit).not.toContain("repository.zorblatt-f18c");
+      });
+
+      it("R345 c: the rules changed between the start and the hand-over — not kept; the view says so for a link's file (and a library's file says nothing of a link)", async () => {
+        const { p, e, r } = await linkHandedOver();
+        const g = await repo.getGovernance(p.id);
+        await repo.setGovernance(p.id, NO_FREE, { baseSha256: g.sha256, reason: "test" });
+        await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", REPO_KEPT, handedFile(await goodPdf()).file);
+        expect(await reviewsOf(p)).toEqual([]);
+        expect((await entryOf(p, e.id))!.state).toBe("no-open-copy");
+        const v = (await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!;
+        expect([v.lastFile, v.lastFileFrom]).toEqual(["rules-method", "link"]);
+        // A file through the library carries no `lastFileFrom`.
+        const h = await handedOver();
+        await h.r.acceptLibraryFile(h.p.id, h.e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(Buffer.from("not a pdf")).file);
+        const lv = (await h.r.libraryChances(h.p.id, (await queue(h.p)).values(), EZ)).get(h.e.id)!;
+        expect(lv.lastFile).toBe("not-pdf");
+        expect(lv).not.toHaveProperty("lastFileFrom");
+        // A link's file that is not a PDF: said for the link; the entry back where it was.
+        timers.now += LIBRARY_PAUSE_MS;
+        const q = await project();
+        const f = await restingWithLink(q);
+        const got = await h.r.linkStart(q.id, f.id, REPO_LINK, null);
+        expect(h.r.libraryHandedOver(got.ticket)).not.toBeNull();
+        await h.r.acceptLibraryFile(q.id, f.id, INBOX_PATH, "sign-in-window", REPO_KEPT, handedFile(Buffer.from("<html>sign in</html>")).file);
+        sameRest(await entryOf(q, f.id), RESTING[0]!);
+        const fv = (await h.r.libraryChances(q.id, (await queue(q)).values(), null)).get(f.id)!;
+        expect([fv.lastFile, fv.lastFileFrom]).toEqual(["not-pdf", "link"]);
+      });
+
+      it("an address other than the link kept is refused at the hand-over; nothing of the link in the audit, notes or events", async () => {
+        const { p, e, r, got } = await linkHandedOver();
+        const b = handedFile(await goodPdf());
+        await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", REPO_LINK, b.file);
+        expect(b.log.took).toBe(0);
+        expect(await reviewsOf(p)).toEqual([]);
+        const seen = [await auditText(p), notes.join("\n"), JSON.stringify(changes)].join("\n");
+        for (const s of ["repository.zorblatt-f18c", "isAllowed", got.ticket]) expect(seen).not.toContain(s);
       });
     });
   });
