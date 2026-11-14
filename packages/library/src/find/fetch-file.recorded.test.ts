@@ -12,7 +12,7 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -104,12 +104,12 @@ describe("fetchFile with the fixtures switch on: a recorded file is downloaded t
   it("a redirect to another recorded address is followed under the host rule", async () => {
     await record(
       {
-        "https://europepmc.org/articles/PMC5555001?pdf=render": { status: 302, location: "https://www.ncbi.nlm.nih.gov/pmc/5555001.pdf" },
-        "https://www.ncbi.nlm.nih.gov/pmc/5555001.pdf": { status: 200, file: "made-up-handbuilt.pdf" },
+        "https://europepmc.org/articles/PMC955550001?pdf=render": { status: 302, location: "https://www.ncbi.nlm.nih.gov/pmc/955550001.pdf" },
+        "https://www.ncbi.nlm.nih.gov/pmc/955550001.pdf": { status: 200, file: "made-up-handbuilt.pdf" },
       },
       { "made-up-handbuilt.pdf": PDF },
     );
-    expect((await get("https://europepmc.org/articles/PMC5555001?pdf=render", on())).mime).toBe("application/pdf");
+    expect((await get("https://europepmc.org/articles/PMC955550001?pdf=render", on())).mime).toBe("application/pdf");
     expect(reached).toEqual([]);
   });
 
@@ -180,6 +180,17 @@ describe("fetchFile with the fixtures switch on: a recorded file is downloaded t
     const reason = new Error("stopped");
     ac.abort(reason);
     await expect(get("https://arxiv.org/pdf/5555.00006", on(), { signal: ac.signal })).rejects.toBe(reason);
+    await leftEmpty();
+    expect(reached).toEqual([]);
+  });
+  it("a recorded file that became a symbolic link after the load is not followed at reply time (R332 a): nothing from outside the folder is saved", async () => {
+    await record({ "https://arxiv.org/pdf/5555.00011": { status: 200, file: "made-up-handbuilt.pdf" } }, { "made-up-handbuilt.pdf": PDF });
+    const recorded = on();
+    const outside = Buffer.concat([PDF, Buffer.from("% outside the folder\n")]);
+    await writeFile(join(tmp, "outside-secret.pdf"), outside);
+    await unlink(join(fixtures, "made-up-handbuilt.pdf"));
+    await symlink(join(tmp, "outside-secret.pdf"), join(fixtures, "made-up-handbuilt.pdf"));
+    await refusal(get("https://arxiv.org/pdf/5555.00011", recorded));
     await leftEmpty();
     expect(reached).toEqual([]);
   });

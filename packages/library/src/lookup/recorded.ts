@@ -28,7 +28,7 @@
  * says as "The service did not send the file."; the dispatcher has no way to the network (an undici MockAgent with
  * net connect disabled, whose one catch-all interceptor answers every request from the map).
  */
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 import { MockAgent, type Dispatcher } from "undici";
 import { LookupHttpError } from "./http.js";
@@ -42,16 +42,39 @@ const REDIRECT_STATUSES: ReadonlySet<unknown> = new Set([301, 302, 303, 307, 308
 const HEADER_NAME = /^[a-z0-9-]{1,64}$/u;
 
 /**
- * The recorded FILE answers (R317), made only by `recordedLookupsFromEnv` (so only under NODE_ENV=test with the
- * switch set); `fetchFile` takes nothing else as recorded answers.
+ * R332 a: a recorded file read at reply time — opened without following a link (`O_NOFOLLOW`; a link there now is
+ * refused by the open), checked through the open handle to be a regular file, and read from that handle. The load
+ * (`plainFileIn`) has already refused a name that is empty, not a plain name, or not a regular file; this keeps a file
+ * replaced by a link or a folder after the load from being read through.
  */
-export class RecordedFiles {
-  /** Answers every request from the files map; a request it has no answer for is a 404. Never reaches the network. */
-  readonly dispatcher: Dispatcher;
-  /** @internal Made by `recordedLookupsFromEnv` only. */
-  constructor(dir: string, files: Readonly<Record<string, FileAnswer>>) {
-    const agent = new MockAgent();
-    agent.disableNetConnect();
+function readHeld(dir: string, file: string): Buffer {
+  const fd = openSync(join(dir, file), constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`${LOOKUP_FIXTURES_ENV}: ${file} is no longer a plain file of the folder`);
+    return readFileSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** R332 b: the two safeguards of the recorded file answers' dispatcher; both always on, except in its own tests. */
+export interface RecordedFileSafeguards {
+  /** The one catch-all interceptor: every request is answered from the map, or 404. */
+  catchAll: boolean;
+  /** `disableNetConnect()`: a request no interceptor answers is refused, never connected. */
+  refuseConnections: boolean;
+}
+
+/**
+ * @internal The dispatcher of the recorded file answers (R317): an undici MockAgent that answers every request from
+ * `files` (a request without an answer is a 404) and has no way to the network. Exported only so that its tests can
+ * take one safeguard away and see the other alone still stop a request (R332 b); `RecordedFiles` always makes it with
+ * both. A dispatcher made here is no `RecordedFiles`, so `fetchFile` does not take it as recorded answers.
+ */
+export function recordedFileAgent(dir: string, files: Readonly<Record<string, FileAnswer>>, safeguards: RecordedFileSafeguards = { catchAll: true, refuseConnections: true }): MockAgent {
+  const agent = new MockAgent();
+  if (safeguards.refuseConnections) agent.disableNetConnect();
+  if (safeguards.catchAll) {
     agent
       .get(() => true)
       .intercept({ path: () => true, method: () => true })
@@ -59,11 +82,29 @@ export class RecordedFiles {
         const url = `${new URL(String(opts.origin)).origin}${opts.path}`;
         const a = opts.method === "GET" && Object.hasOwn(files, url) ? files[url] : undefined;
         if (!a) return { statusCode: 404, data: "" };
-        if (a.status === 200) return { statusCode: 200, data: readFileSync(join(dir, a.file)), responseOptions: { headers: { ...a.headers } } };
+        if (a.status === 200) return { statusCode: 200, data: readHeld(dir, a.file), responseOptions: { headers: { ...a.headers } } };
         return { statusCode: a.status, data: "", responseOptions: { headers: { location: a.location } } };
       })
       .persist();
-    this.dispatcher = agent;
+  }
+  return agent;
+}
+
+/** R332 a (M3): known only to this module, so that only `recordedLookupsFromEnv` can make `RecordedFiles`. */
+const MADE_BY_LOADER: unique symbol = Symbol("RecordedFiles: made by recordedLookupsFromEnv");
+
+/**
+ * The recorded FILE answers (R317), made only by `recordedLookupsFromEnv` (so only under NODE_ENV=test with the
+ * switch set, from a map it has checked): the constructor takes a token private to this module and refuses to be
+ * called without it (R332 a). `fetchFile` takes nothing else as recorded answers.
+ */
+export class RecordedFiles {
+  /** Answers every request from the files map; a request it has no answer for is a 404. Never reaches the network. */
+  readonly dispatcher: Dispatcher;
+  /** @internal Made by `recordedLookupsFromEnv` only: any other call is a TypeError. */
+  constructor(token: typeof MADE_BY_LOADER, dir: string, files: Readonly<Record<string, FileAnswer>>) {
+    if (token !== MADE_BY_LOADER) throw new TypeError("RecordedFiles is made only by recordedLookupsFromEnv");
+    this.dispatcher = recordedFileAgent(dir, files);
   }
 }
 
@@ -74,11 +115,22 @@ export interface RecordedLookups {
   readonly files: RecordedFiles;
 }
 
-function plainFileIn(dir: string, file: unknown, url: string): void {
-  if (typeof file !== "string" || basename(file) !== file || file.startsWith(".")) {
-    throw new Error(`${LOOKUP_FIXTURES_ENV}: the file answer for ${url} needs a plain file name in the folder`);
+/**
+ * R332 a: an answer names a plain, non-empty, non-hidden name of a REGULAR file directly in the folder — not a folder,
+ * not a symbolic link (looked at with `lstat`, which does not follow one) — for the lookups' answers and the file
+ * answers alike; anything else fails the load.
+ */
+function plainFileIn(dir: string, file: unknown, what: string): void {
+  if (typeof file !== "string" || file === "" || basename(file) !== file || file.startsWith(".")) {
+    throw new Error(`${LOOKUP_FIXTURES_ENV}: ${what} needs a plain file name in the folder`);
   }
-  if (!existsSync(join(dir, file))) throw new Error(`${LOOKUP_FIXTURES_ENV}: the file answer for ${url} names ${file}, which is not in the folder`);
+  let st;
+  try {
+    st = lstatSync(join(dir, file));
+  } catch {
+    throw new Error(`${LOOKUP_FIXTURES_ENV}: ${what} names ${file}, which is not in the folder`);
+  }
+  if (!st.isFile()) throw new Error(`${LOOKUP_FIXTURES_ENV}: ${what} names ${file}, which is not a plain file of the folder (a folder or a link)`);
 }
 
 /** The optional "files" map, checked whole at start (fails closed like the lookups' map). */
@@ -95,7 +147,7 @@ function checkFiles(dir: string, raw: unknown): Record<string, FileAnswer> {
     }
     if (href !== url) throw new Error(`${LOOKUP_FIXTURES_ENV}: the file answer for ${url} is not under an address written as a download asks it (${href})`);
     if (a?.status === 200) {
-      plainFileIn(dir, a.file, url);
+      plainFileIn(dir, a.file, `the file answer for ${url}`);
       const h: unknown = a.headers;
       if (h !== undefined && (!h || typeof h !== "object" || Array.isArray(h) || Object.entries(h).some(([k, v]) => !HEADER_NAME.test(k) || typeof v !== "string"))) {
         throw new Error(`${LOOKUP_FIXTURES_ENV}: the file answer for ${url} has headers that are not lower-case names with text values`);
@@ -129,19 +181,17 @@ export function recordedLookupsFromEnv(env: NodeJS.ProcessEnv = process.env): Re
   }
   for (const [url, a] of Object.entries(answers)) {
     if (a?.status === 404) continue;
-    if (a?.status !== 200 || typeof a.file !== "string" || basename(a.file) !== a.file || a.file.startsWith(".")) {
-      throw new Error(`${LOOKUP_FIXTURES_ENV}: the answer for ${url} needs status 200 with a plain file name in the folder, or status 404`);
-    }
-    if (!existsSync(join(dir, a.file))) throw new Error(`${LOOKUP_FIXTURES_ENV}: the answer for ${url} names ${a.file}, which is not in the folder`);
+    if (a?.status !== 200) throw new Error(`${LOOKUP_FIXTURES_ENV}: the answer for ${url} needs status 200 with a plain file name in the folder, or status 404`);
+    plainFileIn(dir, a.file, `the answer for ${url}`);
   }
-  const files = new RecordedFiles(dir, checkFiles(dir, rawFiles));
+  const files = new RecordedFiles(MADE_BY_LOADER, dir, checkFiles(dir, rawFiles));
   return {
     files,
     answer(url) {
       const a = Object.hasOwn(answers, url) ? answers[url] : undefined;
       if (!a) throw new LookupHttpError("No recorded answer for this lookup (test mode: nothing is fetched)");
       if (a.status === 404) return { status: 404, body: null };
-      return { status: 200, body: readFileSync(join(dir, a.file), "utf8") };
+      return { status: 200, body: readHeld(dir, a.file).toString("utf8") };
     },
   };
 }
