@@ -257,8 +257,9 @@ const PAIRS: Row[] = [
   { id: "3.superscript", what: "below: superscript digits glued to names", record: ND, file: { kind: "epub", body: `<p>${T}</p><p>Amara Okafor¹, Ben Smith²</p>` }, want: "MATCH title", clause: "3: glued superscripts left out" },
   { id: "3.lowerCoauthor", what: "below: a co-author of the record written in lower case", record: { ...ND, creators: [...OK, { role: "author", given: "bell", family: "hooks" }] }, file: pdf([T, "Amara Okafor and bell hooks"]), want: "MATCH title", clause: "3: another name of a creator of the record" },
   { id: "3.lowerStranger", what: "below: someone not of the record written in lower case", record: ND, file: pdf([T, "Amara Okafor and bell hooks"]), want: "title-absent", clause: "3: a lower-case word that is no creator's name" },
-  { id: "3.thirty", what: "below: a line of names of 30 tokens", record: ND, file: pdf([T, ["Amara", "Okafor", ...Array.from({ length: 28 }, () => "Smith")].join(" ")]), want: "MATCH title", clause: "3" },
-  { id: "3.thirtyOne", what: "below: a line of names of 31 tokens", record: ND, file: pdf([T, ["Amara", "Okafor", ...Array.from({ length: 29 }, () => "Smith")].join(" ")]), want: "title-absent", clause: "3: more than 30 tokens" },
+  // The 30/31-token pair is an EPUB: a PDF line that long runs off the page and is cut by the extraction.
+  { id: "3.thirty", what: "below: a line of names of 30 tokens (EPUB)", record: ND, file: { kind: "epub", body: `<p>${T}</p><p>${["Amara", "Okafor", ...Array.from({ length: 28 }, () => "Smith")].join(" ")}</p>` }, want: "MATCH title", clause: "3" },
+  { id: "3.thirtyOne", what: "below: a line of names of 31 tokens (EPUB)", record: ND, file: { kind: "epub", body: `<p>${T}</p><p>${["Amara", "Okafor", ...Array.from({ length: 29 }, () => "Smith")].join(" ")}</p>` }, want: "title-absent", clause: "3: more than 30 tokens" },
   { id: "3.metaOnly", what: "the author only in the file's metadata, running text below the block", record: ND, file: pdf([T, F], { author: A }), want: "title-absent", clause: "3: the metadata is not the line below" },
   // Clause 4: nothing unexplained directly above.
   { id: "4.none", what: "above: nothing (the block opens the text)", record: ND, file: pdf([T, A]), want: "MATCH title", clause: "4" },

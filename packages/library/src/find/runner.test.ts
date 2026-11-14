@@ -2719,9 +2719,9 @@ describe("F11: the free copy of a record the queue completed", () => {
       role: "original",
       kind: "pdf",
       mime: "application/pdf",
-      acquired: { method: "free_copy", via: "service", service: "openalex", address: "https://europepmc.org/articles/PMC77", access: "public", tool: { name: FIND_TOOL }, check: { result: "match", by: "doi" } },
+      acquired: { method: "free_copy", via: "service", service: "openalex", address: "https://europepmc.org/articles/PMC77", access: "public", tool: { name: FIND_TOOL }, check: { result: "match", by: "title" } },
     });
-    // The third offer was never asked for; nothing is held; the folder is gone.
+    // R292: a match is always by "title" (a DOI is never evidence). The third offer was never asked for; nothing is held; the folder is gone.
     expect(fileRequests.filter((k) => k.includes("2101.00003"))).toEqual([]);
     expect(await pendingReviews(p)).toEqual([]);
     expect(await exists(heldDirOf(p))).toBe(false);
