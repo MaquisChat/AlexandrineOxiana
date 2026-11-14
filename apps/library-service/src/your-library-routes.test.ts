@@ -8,15 +8,16 @@
  * looked for — with every ticket and every pasted link — in every log line (at the most verbose level), error answer,
  * event, the audit and queue files, and every request.
  */
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
-import { Writable } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 // The service has no undici of its own: the library's (the one its lookup client uses) sets the global dispatcher.
 import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deviceDeps, type Deps, type FindEntry } from "@ao/library";
 import {
+  FIND_LIBRARY_FILE_TEXT,
   FIND_LIBRARY_TEXT,
   FIND_REASON_TEXT,
   FIND_ROUTE_TEXT,
@@ -32,6 +33,9 @@ import { appendFindEntriesIn, holdMismatchedFileIn } from "../../../packages/lib
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService } from "./server.js";
 import type { ServiceEvent } from "./events.js";
+import { inboxOf, inputLineHandler } from "./file-grants.js";
+import { libraryFileHandler } from "./routes/your-library.js";
+import { onInputLines, readStartupToken } from "./startup-token.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const PASS = "correct horse battery staple";
@@ -245,7 +249,8 @@ describe("the settings", () => {
     await start();
     expect((await call({ url: "/settings/your-library" })).json).toEqual({ name: "", access: null, staySignedIn: false });
     const saved = await setLibrary({ name: "  Zorblatt University  ", access: EZ, catalogueSearch: "https://catalogue.example.edu/search?q={query}" });
-    expect(saved).toEqual({ name: "Zorblatt University", access: EZ, catalogueSearch: "https://catalogue.example.edu/search?q={query}", staySignedIn: false });
+    // R336 i: the answer carries the service's own sentence for the stored address (the derive's words for it).
+    expect(saved).toEqual({ name: "Zorblatt University", access: EZ, catalogueSearch: "https://catalogue.example.edu/search?q={query}", staySignedIn: false, addressSentence: `Your library's address: ${LIB_HOST} (EZproxy)` });
     expect((await call({ url: "/settings/your-library" })).json).toEqual(saved);
     expect((await setLibrary({ name: "", access: null, staySignedIn: true })).staySignedIn).toBe(true);
     // The file is the app's, beside search-sources.json, 0600.
@@ -675,5 +680,296 @@ describe("the start (R324 a–c)", () => {
     expect(audit).toContain('"method":"library_access"');
     // (afterEach scans the log, the error answers, the events, the audit and the queue files for the host, the DOI,
     // the pasted link's session and both tickets, and checks that no request was made.)
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F17 (R329): the file handed over — through the service's input-line callback after the token, as main.ts
+// composes it, with a real file in a real temporary inbox and an open ticket made through the start route.
+
+describe("F17 (R329): the file the shell hands over waits in the review queue", () => {
+  const GRANT = "0123456789abcdef0123456789abcdef";
+  /** Recognisable: the grant id and the inbox's name, looked for in every log line, error, event, audit and queue file. */
+  const PATHS = [GRANT, "library-inbox", "Participant Ana Lopez"];
+  const GOOD_LINES = [
+    "Grammar of Invented Habits",
+    "Ottoline Mirabelle",
+    "Abstract. A grammar of invented habits, made up for these tests, with enough words to be read as text.",
+    "The study reads how people speak of their habits over many years, drawing on letters and",
+    "interviews kept in family hands, and argues that the words they choose shape what they",
+    "are able to remember of the places they have lived in and of the work they have done there.",
+  ];
+  const goodPdf = () => buildPdf({ title: "Grammar of Invented Habits", author: "Ottoline Mirabelle", lines: GOOD_LINES });
+  let inbox: string;
+
+  /** The inbox as the shell makes it (0700), in the service's own settings folder. */
+  async function inboxReady(): Promise<string> {
+    inbox = inboxOf(svc!.state.deps.appConfigDir);
+    await mkdir(inbox, { recursive: true, mode: 0o700 });
+    await chmod(inbox, 0o700);
+    return inbox;
+  }
+  /** The service's standard input after its token, with main.ts's callback attached. */
+  async function pipe(): Promise<PassThrough> {
+    const input = new PassThrough();
+    const p = readStartupToken({ input, env: { PATH: "/usr/bin" }, argv: ["/usr/bin/node", "/x/main.ts"], execArgv: [], timeoutMs: 2000 });
+    input.write(`${TOKEN}\n`);
+    await p;
+    onInputLines(input, inputLineHandler(svc!.folderGrants, libraryFileHandler(svc!.state)), () => {});
+    return input;
+  }
+  const fileLine = (ticket: string, path: string, id = GRANT) => `${JSON.stringify({ type: "file-grant", id, ticket, path })}\n`;
+  const there = (p: string) =>
+    lstat(p).then(
+      () => true,
+      () => false,
+    );
+  /** A project with a resting entry, a library set, and a fetch started: the ticket. */
+  async function started(gov?: string): Promise<{ pid: string; e: FindEntry; ticket: string }> {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject(gov ? { gov } : {});
+    await setLibrary();
+    const e = await resting(pid, { state: "no-open-copy" });
+    const r = await startFetch(pid, e.id);
+    expect(r.status, r.body).toBe(200);
+    await inboxReady();
+    return { pid, e, ticket: r.json.ticket as string };
+  }
+  /** Nothing of the line or the path in any log line, error answer, event, audit or queue file. */
+  async function nothingOfThePath(): Promise<void> {
+    const files = await everything(tmp);
+    const seen = [logs, ...errorBodies, ...events.map((x) => JSON.stringify(x)), files.audit, files.queue].join("\n");
+    for (const w of PATHS) expect(seen.includes(w), `"${w}" was logged, sent or written`).toBe(false);
+  }
+
+  it("accepted: the entry needs your check, the file waits in the review queue, the record has no file; the ticket ended and the pause started", async () => {
+    const { pid, e, ticket } = await started();
+    const f = join(inbox, `${GRANT}.pdf`);
+    await writeFile(f, await goodPdf(), { mode: 0o600 });
+    const input = await pipe();
+    input.write(fileLine(ticket, f));
+    const v = await until(async () => {
+      const x = await view(pid, e.id);
+      return x.state !== "waiting-sign-in" && x;
+    }, "the entry to leave the sign-in window");
+    expect(v.state).toBe("needs-check");
+    expect(v.reason?.code).toBe("file-looks-right");
+    // The inbox's file is gone; the file waits only under the project's waiting files.
+    expect(await readdir(inbox)).toEqual([]);
+    // The review queue holds it, as a found copy's (the same kind, cause and group).
+    const q = await call({ url: `/projects/${pid}/review` });
+    expect(q.status, q.body).toBe(200);
+    const item = (q.json.items as Array<Record<string, unknown>>).find((x) => (x.cause as { findEntryId?: string } | undefined)?.findEntryId === e.id)!;
+    expect(item).toMatchObject({ sourceId: e.sourceId, kind: "verification", group: "found-file", cause: { kind: "acquired-file-mismatch", findEntryId: e.id }, heldFile: { why: "looks-right", kind: "pdf" } });
+    // R301: nothing attached.
+    const rec = await call({ url: `/projects/${pid}/sources/${e.sourceId}` });
+    expect(rec.json.assets).toEqual([]);
+    // The ticket ended at the hand-over, and the pause started.
+    expect(svc!.state.session!.find!.libraryHandedOver(ticket)).toBeNull();
+    const other = await resting(pid, { state: "no-open-copy" });
+    expect((await startFetch(pid, other.id)).json.error.reason).toBe("library-pause");
+    // The audit says the method of the hold; "Use this file" then attaches it with how it was got.
+    expect((await everything(tmp)).audit).toContain('"method":"library_access"');
+    const used = await call({ method: "POST", url: `/review/${item.id as string}/held-file`, body: { projectId: pid, decision: "attach" } });
+    expect(used.status, used.body).toBe(200);
+    const after = await repo().getSource(pid, e.sourceId!);
+    expect(after.assets[0]!.acquired).toMatchObject({ method: "library_access", via: "sign-in-window", access: "signed-in-session", address: `https://${LIB_HOST}/login`, check: { result: "match", by: "title" } });
+    expect((await view(pid, e.id)).state).toBe("in-library");
+    await nothingOfThePath();
+  });
+
+  it("a grant without an open ticket deletes its file inside the inbox, touches nothing outside it, and changes nothing", async () => {
+    const { pid, e } = await started();
+    const f = join(inbox, `${GRANT}.pdf`);
+    await writeFile(f, await goodPdf(), { mode: 0o600 });
+    const outside = join(tmp, "Participant Ana Lopez.pdf");
+    await writeFile(outside, "%PDF-1.4 kept");
+    const input = await pipe();
+    const wrong = "ab".repeat(16);
+    input.write(fileLine(wrong, f));
+    input.write(fileLine(wrong, outside));
+    await until(async () => !(await there(f)), "the inbox file to go");
+    await new Promise((r) => setTimeout(r, 100));
+    expect(await readFile(outside, "utf8")).toBe("%PDF-1.4 kept");
+    expect((await view(pid, e.id)).state).toBe("waiting-sign-in");
+    await nothingOfThePath();
+  });
+
+  it("a file-grant outside the inbox is discarded: the ticket ends, the file outside is untouched, the entry comes back and says the file could not be read", async () => {
+    const { pid, e, ticket } = await started();
+    const outside = join(tmp, `${GRANT}.pdf`);
+    await writeFile(outside, await goodPdf());
+    const before = await readFile(outside);
+    const input = await pipe();
+    input.write(fileLine(ticket, outside));
+    const v = await until(async () => {
+      const x = await view(pid, e.id);
+      return x.state !== "waiting-sign-in" && x;
+    }, "the entry to come back");
+    expect(v.state).toBe("no-open-copy");
+    expect(v.library).toEqual({ canStart: true, lastFile: "unreadable" });
+    expect(await readFile(outside)).toEqual(before);
+    expect(svc!.state.session!.find!.libraryHandedOver(ticket)).toBeNull();
+    expect((await call({ url: `/projects/${pid}/review` })).json.items).toEqual([]);
+    await nothingOfThePath();
+  });
+
+  it("a symlink in the inbox is refused: the link removed, its target kept and unread; the entry comes back", async () => {
+    const { pid, e, ticket } = await started();
+    const target = join(tmp, "target.pdf");
+    await writeFile(target, await goodPdf());
+    const f = join(inbox, `${GRANT}.pdf`);
+    await symlink(target, f);
+    const input = await pipe();
+    input.write(fileLine(ticket, f));
+    await until(async () => (await view(pid, e.id)).state !== "waiting-sign-in", "the entry to come back");
+    expect(await there(f)).toBe(false);
+    expect(await there(target)).toBe(true);
+    expect((await view(pid, e.id)).library?.lastFile).toBe("unreadable");
+    await nothingOfThePath();
+  });
+
+  it("not a PDF or EPUB by its bytes: not kept; the entry is back exactly as it was and its view says why — until its next start", async () => {
+    const { pid, e, ticket } = await started();
+    const f = join(inbox, `${GRANT}.pdf`);
+    await writeFile(f, "<html><body>Your session has ended. Sign in again.</body></html>", { mode: 0o600 });
+    const input = await pipe();
+    input.write(fileLine(ticket, f));
+    const v = await until(async () => {
+      const x = await view(pid, e.id);
+      return x.state !== "waiting-sign-in" && x;
+    }, "the entry to come back");
+    expect(v.state).toBe("no-open-copy");
+    expect(v.reason).toBeUndefined();
+    expect(v.library).toEqual({ canStart: true, lastFile: "not-pdf" });
+    expect(FIND_LIBRARY_FILE_TEXT[v.library!.lastFile!]).toBe("The file from your library was not kept: it is not a PDF or EPUB.");
+    expect(await readdir(inbox)).toEqual([]);
+    expect((await call({ url: `/projects/${pid}/review` })).json.items).toEqual([]);
+    // The next start drops it.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + LIBRARY_PAUSE_MS });
+    expect((await startFetch(pid, e.id)).status).toBe(200);
+    const cancelled = await call({ method: "POST", url: `/projects/${pid}/find/${e.id}/library/cancel` });
+    expect(cancelled.json.library).toEqual({ canStart: true });
+    await nothingOfThePath();
+  });
+
+  it("the rules no longer allow fetching through the library: not kept, and the view says so in the rules' words (no start offered)", async () => {
+    const { pid, e, ticket } = await started();
+    const g = await repo().getGovernance(pid);
+    await repo().setGovernance(pid, GOV("acquireMethods: [reference_lookup]\n"), { baseSha256: g.sha256 });
+    const f = join(inbox, `${GRANT}.pdf`);
+    await writeFile(f, await goodPdf(), { mode: 0o600 });
+    const input = await pipe();
+    input.write(fileLine(ticket, f));
+    const v = await until(async () => {
+      const x = await view(pid, e.id);
+      return x.state !== "waiting-sign-in" && x;
+    }, "the entry to come back");
+    expect(v.state).toBe("no-open-copy");
+    expect(v.library).toEqual({ canStart: false, reason: "not-offered", lastFile: "rules-method" });
+    expect(await readdir(inbox)).toEqual([]);
+    await nothingOfThePath();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F18a (R334 b): "Test" on the Your library screen — the library's address for one fixed, well-known work.
+
+describe("the test's address (R334 b)", () => {
+  const TEST_TARGET = "https://doi.org/10.1038/171737a0";
+  const testAddress = () => call({ method: "POST", url: "/settings/your-library/test" });
+
+  it("POST /settings/your-library/test: the library's address for 10.1038/171737a0 by the stored access, no-store; no library need be open, no request is made", async () => {
+    await start();
+    await setLibrary({ name: "Zorblatt University", access: EZ });
+    const r = await testAddress();
+    expect(r.status, r.body).toBe(200);
+    expect(r.headers["cache-control"]).toBe("no-store");
+    expect(r.json).toEqual({ url: `https://${LIB_HOST}/login?url=${TEST_TARGET}` });
+    // Each kind of address, as libraryAddressFor builds it.
+    await setLibrary({ name: "", access: { kind: "openathens", base: "https://go.openathens.net/redirector/zorblatt-univ.example.edu?url=" } });
+    expect((await testAddress()).json).toEqual({ url: `https://go.openathens.net/redirector/zorblatt-univ.example.edu?url=${encodeURIComponent(TEST_TARGET)}` });
+    await setLibrary({ name: "", access: { kind: "openurl", base: `https://${LIB_HOST}/openurl` } });
+    expect((await testAddress()).json).toEqual({ url: `https://${LIB_HOST}/openurl?url_ver=Z39.88-2004&rft_id=info:doi/10.1038%2F171737a0` });
+    // The address is in no log line (the method, path and status only), and nothing of the fixed work either.
+    expect(logs).toContain("/settings/your-library/test");
+    expect(logs).not.toContain("171737a0");
+    expect(logs).not.toContain("doi.org");
+    // (afterEach: the library's host in no log line, error, event or file; no request at all.)
+  });
+
+  it("refused in words: no library set; a body; an unreadable file; a newer version's file; the extension's token", async () => {
+    await start();
+    const none = await testAddress();
+    expect(none.status).toBe(409);
+    expect(none.json.error).toMatchObject({ message: FIND_LIBRARY_TEXT.noLibrary, reason: "no-library" });
+    await setLibrary({ name: "", access: EZ });
+    for (const body of [{ url: `https://${LIB_HOST}/` }, { doi: "10.5555/x" }, [1]]) {
+      const r = await call({ method: "POST", url: "/settings/your-library/test", body });
+      expect(r.status, JSON.stringify(body)).toBe(400);
+      expect(r.json.error.message).toBe(YOUR_LIBRARY_TEXT.noBody);
+    }
+    const file = join(deps.appConfigDir, "your-library.json");
+    await writeFile(file, "not json {");
+    const unreadable = await testAddress();
+    expect(unreadable.status).toBe(409);
+    expect(unreadable.json.error.message).toBe(YOUR_LIBRARY_TEXT.unreadable);
+    await writeFile(file, JSON.stringify({ v: 2, name: "x", access: EZ, staySignedIn: false }));
+    const newer = await testAddress();
+    expect(newer.status).toBe(409);
+    expect(newer.json.error.message).toBe(YOUR_LIBRARY_TEXT.newer);
+    // R336 f: every answer of the route, its refusals included, is no-store.
+    for (const r of [none, unreadable, newer]) expect(r.headers["cache-control"]).toBe("no-store");
+    const withBody = await call({ method: "POST", url: "/settings/your-library/test", body: { doi: "10.5555/x" } });
+    expect(withBody.headers["cache-control"]).toBe("no-store");
+    // The extension's token: refused before the route runs, as on every Your library route.
+    await openNewLibrary();
+    const token = await pairExtension();
+    const ext = await svc!.app.inject({ method: "POST", url: "/settings/your-library/test", headers: { authorization: `Bearer ${token}`, origin: EXT } });
+    expect(ext.statusCode).toBe(403);
+    errorBodies.push(ext.body);
+  });
+
+  it("the address is in no log line, audit entry, event or error — over a test, a refused test and a start", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    await setLibrary({ name: "", access: EZ });
+    const ok = await testAddress();
+    expect(ok.status).toBe(200);
+    const body = await call({ method: "POST", url: "/settings/your-library/test", body: { link: LINK } });
+    expect(body.status).toBe(400);
+    expect(body.body).not.toContain(SESSION);
+    const e = await resting(pid, { state: "no-open-copy" });
+    expect((await startFetch(pid, e.id)).status).toBe(200);
+    // A test while a ticket is open is still answered (the shell, not the service, refuses a second window).
+    expect((await testAddress()).status).toBe(200);
+    const { audit } = await everything(tmp);
+    for (const w of [ok.json.url as string, "171737a0"]) {
+      expect(logs.includes(w), `${w} logged`).toBe(false);
+      expect(audit.includes(w), `${w} audited`).toBe(false);
+      expect(events.some((x) => JSON.stringify(x).includes(w)), `${w} in an event`).toBe(false);
+      expect(errorBodies.some((b) => b.includes(w)), `${w} in an error`).toBe(false);
+    }
+    // A test writes nothing: no audit entry names it.
+    expect(audit).not.toContain("your-library/test");
+  });
+});
+
+describe("R336 i: the answers name the stored address in the service's own words", () => {
+  it("GET and PUT carry `addressSentence` — the derive's sentence for that address (a resolver: host and path) — and none when no library is set", async () => {
+    await start();
+    expect((await call({ url: "/settings/your-library" })).json.addressSentence).toBeUndefined();
+    const derived = await call({ method: "POST", url: "/settings/your-library/derive", body: { link: LINK } });
+    const put = await setLibrary({ name: "", access: derived.json.access });
+    expect(put.addressSentence).toBe(derived.json.sentence);
+    expect((await call({ url: "/settings/your-library" })).json.addressSentence).toBe(derived.json.sentence);
+    const ou = await call({ method: "POST", url: "/settings/your-library/derive", body: { link: "https://resolver.example.edu/openurl?url_ver=Z39.88-2004&rft_id=x" } });
+    expect((await setLibrary({ name: "", access: ou.json.access })).addressSentence).toBe("Your library's address: resolver.example.edu/openurl (link resolver)");
+    expect((await setLibrary({ name: "", access: null })).addressSentence).toBeUndefined();
+    // A file that cannot be used names no address.
+    await writeFile(join(deps.appConfigDir, "your-library.json"), JSON.stringify({ v: 2, name: "x", access: EZ, staySignedIn: false }));
+    expect((await call({ url: "/settings/your-library" })).json.addressSentence).toBeUndefined();
   });
 });

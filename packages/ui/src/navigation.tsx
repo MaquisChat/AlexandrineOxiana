@@ -18,6 +18,7 @@ export const PATHS = {
   watchedFolders: "/settings/watched-folders",
   zotero: "/settings/zotero",
   searchSources: "/settings/search-sources",
+  yourLibrary: "/settings/your-library",
   importWizard: "/import",
   reviewQueue: "/import/review",
   governance: "/governance",

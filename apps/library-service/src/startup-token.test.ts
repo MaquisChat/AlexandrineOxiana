@@ -9,6 +9,7 @@ import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { deviceDeps } from "@ao/library";
 import { FolderGrants, grantLineHandler } from "./folder-grants.js";
+import { inputLineHandler, type FileGrant } from "./file-grants.js";
 import { createService } from "./server.js";
 import { INPUT_LINE_MAX_BYTES, InputLines, onInputLines, readStartupToken, startupErrorMessage, StartupTokenError, TOKEN_STDIN_TIMEOUT_MS } from "./startup-token.js";
 
@@ -263,6 +264,55 @@ describe("onInputLines (R155: end of standard input after the token line means s
     const input = source();
     const p = readStartupToken({ ...clean, input, timeoutMs: 1000 });
     input.write(`${JSON.stringify({ type: "folder-grant", id: GRANT_ID, path: "/Users/r/Secret folder" })}\n${TOKEN}\n`);
+    const err = await refusal(p);
+    expect(err.message).toMatch(/not a valid access token/);
+    expect(err.message).not.toContain("Secret");
+    expect(err.message).not.toContain("/Users");
+  });
+
+  it("after the token, exactly two line shapes are interpreted; anything else is discarded", async () => {
+    // As main.ts composes it (Task F17, R329 b): the folder grant (R207), then the file grant; nothing else.
+    const input = source();
+    const p = readStartupToken({ ...clean, input, timeoutMs: 1000 });
+    input.write(`${TOKEN}\n`);
+    await p;
+    const grants = new FolderGrants();
+    const files: FileGrant[] = [];
+    let ends = 0;
+    onInputLines(input, inputLineHandler(grants, (g) => void files.push(g)), () => ends++);
+    const TICKET = "fedcba9876543210fedcba9876543210";
+    const fileGrant = JSON.stringify({ type: "file-grant", id: GRANT_ID, ticket: TICKET, path: "/Users/r/Library/Application Support/ao/library-inbox/x.pdf" });
+    const folderGrant = JSON.stringify({ type: "folder-grant", id: GRANT_ID, path: "/Users/r/Field" });
+    for (const other of [
+      "not a command",
+      TOKEN,
+      JSON.stringify({ type: "file-grant", id: GRANT_ID, path: "/x" }),
+      JSON.stringify({ type: "file-grant", ticket: TICKET, id: GRANT_ID, path: "/x" }),
+      JSON.stringify({ type: "file-grant", id: GRANT_ID, ticket: TICKET, path: "/x", more: 1 }),
+      JSON.stringify({ type: "folder-grant", id: GRANT_ID, ticket: TICKET, path: "/x" }),
+      JSON.stringify({ type: "shell-command", id: GRANT_ID, path: "/x" }),
+      `\ufeff${fileGrant}`,
+    ])
+      input.write(`${other}\n`);
+    input.write(`${folderGrant}\n`);
+    // A file grant split across writes, ended by CRLF (the one tolerance, the line reader's).
+    input.write(fileGrant.slice(0, 30));
+    input.write(`${fileGrant.slice(30)}\r\n`);
+    await tick();
+    expect(grants.size).toBe(1);
+    expect(grants.take(GRANT_ID)).toBe("/Users/r/Field");
+    expect(files).toEqual([{ id: GRANT_ID, ticket: TICKET, path: "/Users/r/Library/Application Support/ao/library-inbox/x.pdf" }]);
+    // A last line without its line end is not a line.
+    input.end(fileGrant);
+    await tick();
+    expect(files).toHaveLength(1);
+    expect(ends).toBe(1);
+  });
+
+  it("a file-grant line before the token is not a grant: it is refused as a token, without its path in the message", async () => {
+    const input = source();
+    const p = readStartupToken({ ...clean, input, timeoutMs: 1000 });
+    input.write(`${JSON.stringify({ type: "file-grant", id: GRANT_ID, ticket: GRANT_ID, path: "/Users/r/Secret folder/x.pdf" })}\n${TOKEN}\n`);
     const err = await refusal(p);
     expect(err.message).toMatch(/not a valid access token/);
     expect(err.message).not.toContain("Secret");

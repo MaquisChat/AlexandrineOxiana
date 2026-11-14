@@ -492,6 +492,11 @@ export interface YourLibrary {
   staySignedIn: boolean;
 }
 export interface YourLibraryResponse extends YourLibrary {
+  /**
+   * R336 i: the service's own sentence for the stored address — the same words "derive" gives for it ("Your library's
+   * address: <host> (EZproxy)"; a resolver: "<host><path>") — absent when no library is set. The screen makes none.
+   */
+  addressSentence?: string;
   /** The file could not be used: shown as not set ("unreadable", replaced by the next save) or read-only ("newer"). */
   problem?: { code: "unreadable" | "newer"; text: string };
 }
@@ -508,8 +513,33 @@ export interface FindLibraryStartResponse {
   url: string;
   ticket: string;
 }
+/**
+ * Task F18a (R334 b): `POST /settings/your-library/test` (no body) — the library's address for the one fixed, well-known
+ * work `YOUR_LIBRARY_TEST_DOI`, by the stored access; nothing typed, nothing of a project. The page opens the sign-in
+ * window there with a ticket of its own (no ticket of the service), so whatever the window might fetch is discarded.
+ * Refused (409) with FIND_LIBRARY_TEXT.noLibrary (reason "no-library") when no library is set, and with
+ * YOUR_LIBRARY_TEXT.unreadable / .newer when the settings file cannot be used. The address is in no log, audit,
+ * event or error.
+ */
+export interface YourLibraryTestResponse {
+  url: string;
+}
+/** The fixed work of "Test" (the same well-known DOI the Search sources' tests ask about). */
+export const YOUR_LIBRARY_TEST_DOI = "10.1038/171737a0";
 /** R324 a: on the entry's view (`FindEntryView.library`). */
-export type FindLibraryChance = { canStart: true } | { canStart: false; reason: "no-library" };
+export type FindLibraryChance = (
+  | { canStart: true }
+  | { canStart: false; reason: "no-library" }
+  /** Task F17 (R329 g): no start is offered now; only with `lastFile` (otherwise the field is absent). */
+  | { canStart: false; reason: "not-offered" }
+) & {
+  /**
+   * Task F17 (R329 g): what became of the last file handed over for this entry when it could NOT be held — the entry
+   * returned to exactly what it was. Kept by the service in memory only: gone at the entry's next start and at a
+   * restart. Its sentence is FIND_LIBRARY_FILE_TEXT.
+   */
+  lastFile?: FindLibraryFileOutcome;
+};
 
 /** The longest link "derive" reads (a longer one is refused in words). */
 export const YOUR_LIBRARY_LINK_MAX = 4096;
@@ -561,6 +591,8 @@ export const YOUR_LIBRARY_TEXT = {
   newer: "These Your library settings were written by a newer version of the app. Update the app to change them.",
   unreadable: "Your library settings could not be read, so no library is set. Saving them again replaces the file (the old one is kept beside it).",
   noBody: "This request takes no body. Nothing was changed.",
+  /** F18a (R334 b): the stored address gives no address for the test's work (not expected: a stored access is checked). */
+  testNoAddress: "No address for the test could be made from your library's settings. Use “Work out the address” again, then save.",
 } as const;
 
 /** A start through the library refused (its `reason` → its sentence; the pause's sentence is `libraryReadyIn`). */
@@ -574,3 +606,24 @@ export const FIND_LIBRARY_TEXT = {
   /** "library-held-full" (R324 a): FIND_HELD_MAX files already wait for the researcher's check. */
   heldFull: `${FIND_HELD_MAX} files are already waiting for your check. Decide on some of them, then try again.`,
 } as const;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F17 (R329): the file handed over by the sign-in window (the shell writes it into its private inbox and names it
+// on the service's standard input). By the owner's rule (R301) it is never attached by the app: it waits in the review
+// queue for the researcher's check, as a found free copy does, and the entry says "Needs your check". When it cannot be
+// held, the entry returns to what it was and its view's `library.lastFile` says why.
+
+/** The largest file taken from the library (the plan's Limits). */
+export const LIBRARY_FILE_MAX_BYTES = 200 * 1024 * 1024;
+
+/** Why a file handed over through the library was not held. */
+export const FIND_LIBRARY_FILE_OUTCOMES = ["not-pdf", "too-large", "unreadable", "rules-method", "rules-store", "rules-legal-basis"] as const;
+export type FindLibraryFileOutcome = (typeof FIND_LIBRARY_FILE_OUTCOMES)[number];
+export const FIND_LIBRARY_FILE_TEXT: Record<FindLibraryFileOutcome, string> = {
+  "not-pdf": "The file from your library was not kept: it is not a PDF or EPUB.",
+  "too-large": "The file from your library was not kept: it is larger than 200 MB.",
+  unreadable: "The file from your library could not be read, so it was not kept. Try again through your library.",
+  "rules-method": "The file from your library was not kept: this project's rules do not allow fetching works through your library.",
+  "rules-store": "The file from your library was not kept: this project's rules do not allow storing the file for this record.",
+  "rules-legal-basis": "The file from your library was not kept: this project's rules need a legal basis to store the file for this record, and the record has none.",
+};
