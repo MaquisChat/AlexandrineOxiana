@@ -2938,6 +2938,157 @@ describe("F8: an author alone — the person, then their works", () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+// Task F12 (R290 b, c, f): the settings read when an entry's work starts; Elicit as one more source.
+
+describe("F12: Search sources and Elicit in the runner", () => {
+  const ELICIT_KEY = "elk-RECOGNISABLE-55e1b0";
+  const ELICIT_GOV = (list = "[crossref, openalex, elicit]") => GOV("vendors:\n  - id: elicit\n").replace("[crossref, openalex]", list);
+  /** Every body sent to Elicit, and what it answers (default: nothing found). */
+  let elicitBodies: string[];
+  let elicitAnswer: { status: number; body: string };
+  let keyReads: number;
+  const elicitOn = (others = true): SearchSettings => ({
+    record: DEFAULT_SEARCH_SETTINGS.record.map((s) => (s.id === "elicit" ? { ...s, on: true } : s.id === "crossref" || s.id === "openalex" ? { ...s, on: others } : s)),
+  });
+  const keyed = (key: string | null = ELICIT_KEY): Partial<FindRunnerDeps> => ({
+    elicitKey: async () => {
+      keyReads++;
+      return key ?? undefined;
+    },
+  });
+  const paper = (w: Work) => ({ title: w.title, authors: [`${w.given ?? "Mirabel"} ${w.family}`], year: w.year, ...(w.doi ? { doi: w.doi } : {}), venue: "Journal of Invented Studies" });
+
+  beforeEach(async () => {
+    const { _resetElicitForTests } = await import("./elicit.js");
+    _resetElicitForTests();
+    elicitBodies = [];
+    elicitAnswer = { status: 200, body: JSON.stringify({ papers: [] }) };
+    keyReads = 0;
+    agent
+      .get("https://elicit.com")
+      .intercept({ path: "/api/v2/search/papers", method: "POST" })
+      .reply((o) => {
+        elicitBodies.push(String(o.body));
+        return { statusCode: elicitAnswer.status, data: elicitAnswer.body, responseOptions: { headers: { "content-type": "application/json" } } };
+      })
+      .persist();
+  });
+
+  it("a save takes effect for the next entry; an entry already at work finishes under what it started with", async () => {
+    know(LINE, cr(ZORBLATT));
+    know(LINE_2, cr(ZORBLATT));
+    const p = await project();
+    const r = runner();
+    const release = gated.hold(parseReference(LINE)!.text, "crossref");
+    const first = (await r.add(p.id, [LINE])).added[0]!;
+    await until(() => gated.sent.filter((x) => x.text === parseReference(LINE)!.text).length === 2, "the first entry's two searches");
+    // Saved while the first entry is at work: OpenAlex off.
+    settings = { record: DEFAULT_SEARCH_SETTINGS.record.map((s) => (s.id === "openalex" ? { ...s, on: false } : s)) };
+    release();
+    await settled(p, first.id);
+    const second = (await r.add(p.id, [LINE_2])).added[0]!;
+    await settled(p, second.id);
+    expect(asked.filter((a) => a.text === parseReference(LINE)!.text).map((a) => a.service).sort()).toEqual(["crossref", "openalex"]);
+    expect(asked.filter((a) => a.text === parseReference(LINE_2)!.text).map((a) => a.service)).toEqual(["crossref"]);
+  });
+
+  it("a source the rules forbid is not asked whatever the setting, and the reason says rules", async () => {
+    // Elicit on with a key; the rules name only Crossref and OpenAlex, and the settings switch those two off.
+    settings = elicitOn(false);
+    const p = await project();
+    const r = runner(keyed());
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "failed", reason: { code: "not-allowed", by: "rules" } });
+    expect(elicitBodies).toEqual([]);
+    expect(asked).toEqual([]);
+    // And no key was read for it.
+    expect(keyReads).toBe(0);
+  });
+
+  it("every record source off: the entry says so (switched off, by settings), never Not found", async () => {
+    settings = { record: DEFAULT_SEARCH_SETTINGS.record.map((s) => ({ ...s, on: false })) };
+    const p = await project({ gov: ELICIT_GOV() });
+    const r = runner(keyed());
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "failed", reason: { code: "switched-off", by: "settings" } });
+    expect(keyReads).toBe(0);
+  });
+
+  it("no key is read for a source that is off: Elicit off (the default), its key never asked for", async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project({ gov: ELICIT_GOV() });
+    const r = runner(keyed());
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
+    expect(keyReads).toBe(0);
+    expect(elicitBodies).toEqual([]);
+  });
+
+  it("Elicit on, a key stored, the rules allow it: asked with the typed words only; a candidate only Elicit gave is offered, never sure", async () => {
+    settings = elicitOn();
+    elicitAnswer = { status: 200, body: JSON.stringify({ papers: [paper(ZORBLATT)] }) };
+    const p = await project({ gov: ELICIT_GOV() });
+    const r = runner(keyed());
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect(elicitBodies.map((b) => JSON.parse(b))).toEqual([{ query: parseReference(LINE)!.text, maxResults: 10 }]);
+    expect(elicitBodies.join()).not.toContain(p.id);
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e.state).toBe("choose");
+    expect(e.candidates!.map((c) => c.providers)).toEqual([["elicit"]]);
+    expect(await sourcesOf(p)).toEqual([]);
+    expect(keyReads).toBe(1);
+  });
+
+  it("Elicit failing never fails or delays an entry: a 401, a 400, a 429 or a 5xx, and the others' sure answer completes the record", async () => {
+    settings = elicitOn();
+    know(LINE, cr(ZORBLATT));
+    const r = runner(keyed());
+    for (const status of [401, 400, 503, 429, 200]) {
+      elicitAnswer = { status, body: status === 200 ? JSON.stringify({ papers: [paper(ZORBLATT)] }) : "no" };
+      const p = await project({ gov: ELICIT_GOV() });
+      const { added } = await r.add(p.id, [LINE]);
+      await settled(p, added[0]!.id);
+      const e = (await entryOf(p, added[0]!.id))!;
+      expect(e.state, String(status)).toBe("record-complete");
+      expect(e.reason).toBeUndefined();
+    }
+    // After the 429 Elicit is not asked again (five minutes, in this process): four bodies, not five.
+    expect(elicitBodies.length).toBe(4);
+  });
+
+  it("Elicit on and allowed without a key: not asked, and the others decide", async () => {
+    settings = elicitOn();
+    know(LINE, cr(ZORBLATT));
+    const p = await project({ gov: ELICIT_GOV() });
+    const r = runner(keyed(null));
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
+    expect(elicitBodies).toEqual([]);
+  });
+
+  it("only Elicit on: without a key the entry is switched off by the settings; with a key that fails, the ordinary retries", async () => {
+    settings = elicitOn(false);
+    const p = await project({ gov: ELICIT_GOV() });
+    const noKey = runner(keyed(null));
+    const a = (await noKey.add(p.id, [LINE])).added[0]!;
+    await settled(p, a.id);
+    expect((await entryOf(p, a.id))!).toMatchObject({ state: "failed", reason: { code: "switched-off", by: "settings" } });
+    await noKey.stopAll();
+    elicitAnswer = { status: 503, body: "down" };
+    const withKey = runner(keyed());
+    const b = (await withKey.add(p.id, [LINE_2])).added[0]!;
+    await until(async () => (await entryOf(p, b.id))?.attempts === 1, "the first failure");
+    expect((await entryOf(p, b.id))!.state).toBe("looking-up");
+    expect(asked).toEqual([]);
+  });
+});
+
 /** The largest lines measured by F8b's tests (for the report). */
 const measured: Array<{ kind: string; candidates: number; people: number; bytes: number }> = [];
 afterAll(() => {

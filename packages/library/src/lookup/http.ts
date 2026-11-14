@@ -69,7 +69,6 @@ const DEFAULT_RATE = 1;
 export const DEFAULT_CONCURRENCY: Readonly<Record<string, number>> = {
   "api.crossref.org": 1,
   "export.arxiv.org": 1,
-  "elicit.com": 1,
 };
 /**
  * The only hosts a key is ever sent to (R290 a): OpenAlex's key to `api.openalex.org`, Elicit's to `elicit.com`; https
