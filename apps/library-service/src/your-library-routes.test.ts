@@ -386,6 +386,24 @@ describe("the queue's view: Where to get it, and whether a start is offered (R32
   });
 });
 
+describe("R328 g: \"no library set\" only where a library could give an address", () => {
+  it("an ISBN alone carries no `library` field while no library is set; once a resolver is set it may start", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const doi = await resting(pid, { state: "no-open-copy" });
+    const isbn = await resting(pid, { state: "no-open-copy" }, await record(pid, { doi: null, isbn: ["9780674212770"], type: "book" }));
+    expect((await view(pid, doi.id)).library).toEqual({ canStart: false, reason: "no-library" });
+    const v = await view(pid, isbn.id);
+    expect(v.library).toBeUndefined();
+    expect(v.offers!.map((o) => o.label)).toEqual(["Open Library", "WorldCat"]);
+    await setLibrary({ name: "", access: { kind: "openurl", base: "https://resolver.example.edu/openurl" } });
+    expect((await view(pid, isbn.id)).library).toEqual({ canStart: true });
+    await setLibrary();
+    expect((await view(pid, isbn.id)).library).toBeUndefined();
+  });
+});
+
 describe("the start (R324 a–c)", () => {
   it("one ticket at a time, and the pause between hand-overs", async () => {
     await start();

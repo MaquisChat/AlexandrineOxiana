@@ -316,7 +316,8 @@ export type FindLibraryChanceOf = { work: WorkCandidate; chance?: "yes" | "no-li
  * may start: "yes" when its record has no file, no file of it waits for the researcher's check (no entry of the queue
  * for the same record is "needs-check"), it is not at work (`atWork`), it has a DOI or ISBN that gives an address
  * through `access`, and the rules allow `library_access` and would keep the file; "no-library" when all of that holds
- * but no library is set (`access` null; then a DOI or an ISBN is enough). One read of the rules, one read of each
+ * but no library is set (`access` null; then a DOI is needed, R328 g: an ISBN alone gives no address through EZproxy
+ * or OpenAthens, so it carries no such promise). One read of the rules, one read of each
  * resting entry's record. A locked project gives nothing.
  */
 export async function libraryChancesOf(
@@ -348,7 +349,9 @@ export async function libraryChancesOf(
     const work = workOfSourceFile(sf);
     const ids = idsOf(work);
     const free = !sourceHasFile(sf) && !waitingFor.has(e.sourceId!) && !(o.atWork?.(e.id) ?? false);
-    const target = o.access ? libraryAddressFor(o.access, work) !== null : !!(ids.doi || ids.isbn);
+    // R328 g: with no library set, a DOI is needed for the promise "set your library" (every kind of library gives an
+    // address for a DOI; an ISBN alone gives one only through a link resolver).
+    const target = o.access ? libraryAddressFor(o.access, work) !== null : !!ids.doi;
     const may = free && target && libraryAllowedBy(info, projectId, sf.source.provenance);
     out.set(e.id, { work, ...(may ? { chance: o.access ? ("yes" as const) : ("no-library" as const) } : {}) });
   }

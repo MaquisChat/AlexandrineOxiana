@@ -4532,6 +4532,23 @@ describe("F15: a fetch through the researcher's library", () => {
     await expect(r.libraryStart(q.id, forbidden.id, EZ)).rejects.toMatchObject({ code: "not-offered" });
   });
 
+  it("R328 g: with no library set, \"no-library\" is said only for an entry with a DOI; an ISBN alone carries no such promise", async () => {
+    const p = await project();
+    runner();
+    const withDoi = await resting(p, RESTING[0]!);
+    const isbnOnly = await resting(p, RESTING[0]!, await record(p, { doi: null, isbn: ["9780674212770"], type: "book" }));
+    const both = await resting(p, RESTING[0]!, await record(p, { isbn: ["9780674212770"], type: "book" }));
+    const unset = await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: null });
+    expect(unset.get(withDoi.id)!.chance).toBe("no-library");
+    expect(unset.get(both.id)!.chance).toBe("no-library");
+    expect(unset.get(isbnOnly.id)!.chance).toBeUndefined();
+    // Its links are given all the same.
+    expect(unset.get(isbnOnly.id)!.work.identifiers.isbn).toEqual(["9780674212770"]);
+    // Once a resolver is set, the ISBN alone may start (as before); through EZproxy it may not.
+    expect((await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: OU })).get(isbnOnly.id)!.chance).toBe("yes");
+    expect((await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: EZ })).get(isbnOnly.id)!.chance).toBeUndefined();
+  });
+
   it("R324 a: not offered when the rules would not let the file be kept (a missing legal basis)", async () => {
     const ident = (basis: boolean) => `identifiability:\n  containsIdentifiable: true\n  pseudonymizeFileNames: false\nencryption:\n  atRest: optional\nconsent:\n  requireLegalBasis: ${basis}\nprocessing:\n  metadata_lookup: [crossref, openalex]\n`;
     const p = await project({ gov: ident(false) });
