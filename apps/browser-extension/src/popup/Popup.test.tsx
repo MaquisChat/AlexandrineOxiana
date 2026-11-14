@@ -492,3 +492,254 @@ describe("the popup remembers the downloader choice (R189, D18)", () => {
     expect(storage.data.alsoDownload).toBe(false);
   });
 });
+
+// Find and acquire, the browser's fallback (R348 i): the popup asks the background for the works waiting for a PDF
+// from this browser; when one waits, its FIRST section offers "Send this tab's PDF". Nothing waiting (or the list not
+// readable): the popup is exactly as before.
+describe("Find and acquire: a work waiting for a PDF from this browser (R348 i)", () => {
+  const TICKET = "0123456789abcdef0123456789abcdef";
+  const T2 = "fedcba9876543210fedcba9876543210";
+  const LABEL = "Quillbrook Ledger of Habits";
+  const HELD_SENTENCE = "Sent. The file waits for your check in the app's review queue.";
+
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((a, b) => {
+      resolve = a;
+      reject = b;
+    });
+    return { promise, resolve, reject };
+  }
+
+  /** A stand-in for the background's answers to the popup's find-* messages. */
+  function fakeBackground(init: { waiting?: Array<{ ticket: string; label: string }>; read?: unknown; status?: string | null; result?: { sentence: string; at: number } | null } = {}) {
+    const bg = {
+      waiting: init.waiting ?? [],
+      read: init.read,
+      status: init.status ?? null,
+      result: init.result ?? null,
+      sent: [] as BackgroundRequest[],
+      replies: [] as Array<ReturnType<typeof deferred<unknown>>>,
+      waitingReads: 0,
+      resultTakes: 0,
+    };
+    const send = async <T,>(msg: BackgroundRequest): Promise<T> => {
+      bg.sent.push(msg);
+      switch (msg.type) {
+        case "find-waiting":
+          bg.waitingReads++;
+          if (bg.read instanceof Error) throw bg.read;
+          return (bg.read ?? { waiting: bg.waiting }) as T;
+        case "find-status":
+          return { sending: bg.status } as T;
+        case "find-result": {
+          bg.resultTakes++;
+          const r = bg.result;
+          bg.result = null;
+          return r as T;
+        }
+        case "find-send": {
+          const d = deferred<unknown>();
+          bg.replies.push(d);
+          return d.promise as Promise<T>;
+        }
+        default:
+          return { active: false, count: 0 } as T;
+      }
+    };
+    return { bg, send };
+  }
+
+  async function mountWith(send: PopupBridge["send"], o: { tab?: number | undefined } = {}) {
+    const net = fakeNet((port) => (port === OLD ? { status: 200, body: PROJECTS } : null));
+    const storage = memoryStorage();
+    storage.data.pairing = { port: OLD, token: TOKEN, pairedAt: "2026-11-01T10:00:00.000Z" };
+    const bridge: PopupBridge = {
+      api: createApi({ fetch: net.fn, storage }),
+      prefs: storage,
+      activeTabId: async () => ("tab" in o ? o.tab : 7),
+      send,
+      pendingLinks: async () => ({}),
+      copy: async () => {},
+    };
+    root = createRoot(host);
+    await act(async () => root!.render(<Popup bridge={bridge} />));
+    await settle();
+    return net;
+  }
+  async function remount(send: PopupBridge["send"]) {
+    act(() => root?.unmount());
+    root = undefined;
+    host.replaceChildren();
+    await mountWith(send);
+  }
+  /** The popup as it was before this task: a background that knows no find-* message. */
+  async function baseline(): Promise<string> {
+    await mountWith(async <T,>() => ({ active: false, count: 0 }) as T);
+    const html = host.innerHTML;
+    act(() => root?.unmount());
+    root = undefined;
+    host.replaceChildren();
+    return html;
+  }
+  const section = () => host.querySelector("main")?.firstElementChild as HTMLElement | null;
+  const live = () => section()?.querySelector('[aria-live="polite"]')?.textContent ?? "";
+  const findSends = (sent: BackgroundRequest[]) => sent.filter((m) => m.type === "find-send");
+
+  it("nothing waiting: the popup is exactly as before, and the list is asked of the background, not fetched by the popup", async () => {
+    const before = await baseline();
+    const { bg, send } = fakeBackground();
+    const net = await mountWith(send);
+    expect(host.innerHTML).toBe(before);
+    expect(host.textContent).not.toContain("Find and acquire");
+    expect(bg.waitingReads).toBe(1);
+    expect(net.calls.map((c) => c.url)).toEqual([`http://127.0.0.1:${OLD}/projects`]);
+  });
+
+  it.each([
+    ["the app not answering", { waiting: [], unreachable: unreachable(OLD) }],
+    ["the list not readable", { waiting: [], failed: true }],
+    ["an answer of another shape", { waiting: "yes" }],
+    ["the background failing", new Error("Could not establish connection. Receiving end does not exist.")],
+  ])("%s: the popup is exactly as before; the list's failure is not shown as an error of its own", async (_what, read) => {
+    const before = await baseline();
+    const { send } = fakeBackground({ read });
+    await mountWith(send);
+    expect(host.innerHTML).toBe(before);
+  });
+
+  it("a waiting work: the FIRST section is “Find and acquire”, with “Waiting for a PDF: <label>” and the button", async () => {
+    const { send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }] });
+    await mountWith(send);
+    const s = section()!;
+    expect(s.tagName).toBe("SECTION");
+    expect(s.querySelector("h2")?.textContent).toBe("Find and acquire");
+    expect(s.getAttribute("aria-labelledby")).toBe(s.querySelector("h2")?.id);
+    expect(s.textContent).toContain(`Waiting for a PDF: ${LABEL}`);
+    const b = button("Send this tab's PDF");
+    expect(b?.textContent).toBe("Send this tab's PDF");
+    expect(b?.disabled).toBe(false);
+    expect(s.contains(b!)).toBe(true);
+    // The rest of the popup is still there, after it.
+    expect(host.textContent).toContain("Estuary");
+  });
+
+  it("the label is TEXT: markup is not made into elements, a right-to-left override stays inside it, 200 characters are shown whole", async () => {
+    const label = `<img src=x onerror="alert(1)"><b>bold</b>‮evil.pdf ${"ॐ".repeat(160)}`.slice(0, 200);
+    const { send } = fakeBackground({ waiting: [{ ticket: TICKET, label }] });
+    await mountWith(send);
+    expect(host.querySelector("img")).toBeNull();
+    expect(host.querySelector("b")).toBeNull();
+    const bdi = section()!.querySelector("bdi");
+    expect(bdi?.textContent).toBe(label);
+    expect(bdi?.childNodes).toHaveLength(1);
+    expect(bdi?.firstChild?.nodeType).toBe(Node.TEXT_NODE);
+    // The override cannot reach past the label: the button's name is its own.
+    expect(button("Send this tab's PDF")).toBeDefined();
+  });
+
+  it("a press: the button busy, a second press ignored; “held”: the service's sentence once, in a polite live region, and no button", async () => {
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }] });
+    await mountWith(send);
+    const b = button("Send this tab's PDF")!;
+    await act(async () => {
+      b.click();
+      b.click();
+    });
+    await settle();
+    expect(findSends(bg.sent)).toEqual([{ type: "find-send", tabId: 7, ticket: TICKET }]);
+    const busy = section()!.querySelector("button")!;
+    expect(busy.textContent).toBe("Sending the PDF…");
+    expect(busy.getAttribute("aria-busy")).toBe("true");
+    expect(busy.disabled).toBe(true);
+    await click(busy);
+    expect(findSends(bg.sent)).toHaveLength(1);
+    // The service held it: the work no longer waits.
+    bg.waiting = [];
+    await act(async () => bg.replies[0]!.resolve({ sentence: HELD_SENTENCE }));
+    await settle();
+    expect(live()).toBe(HELD_SENTENCE);
+    expect(section()!.querySelector("h2")?.textContent).toBe("Find and acquire");
+    expect(section()!.querySelector("button")).toBeNull();
+    expect(host.textContent!.split(HELD_SENTENCE)).toHaveLength(2);
+    // The result kept for a next opening was taken: it will not be said again.
+    expect(bg.resultTakes).toBeGreaterThanOrEqual(2);
+    expect(host.textContent).not.toMatch(/\badded\b/i);
+  });
+
+  it("a refusal that leaves the work waiting: the service's sentence, and the button usable again", async () => {
+    const refusal = "The PDF did not arrive whole. The work is still waiting. Try again.";
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }] });
+    await mountWith(send);
+    await click(button("Send this tab's PDF"));
+    await act(async () => bg.replies[0]!.resolve({ sentence: refusal }));
+    await settle();
+    expect(live()).toBe(refusal);
+    const again = button("Send this tab's PDF");
+    expect(again?.disabled).toBe(false);
+    await click(again);
+    expect(findSends(bg.sent)).toHaveLength(2);
+  });
+
+  it("several waiting: one line and one button each, each button named with its label, each sending its own ticket", async () => {
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }, { ticket: T2, label: "Second work" }] });
+    await mountWith(send);
+    expect(section()!.textContent).toContain(`Waiting for a PDF: ${LABEL}`);
+    expect(section()!.textContent).toContain("Waiting for a PDF: Second work");
+    const first = button(`Send this tab's PDF for “${LABEL}”`);
+    const second = button("Send this tab's PDF for “Second work”");
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    await click(second);
+    expect(findSends(bg.sent)).toEqual([{ type: "find-send", tabId: 7, ticket: T2 }]);
+  });
+
+  it.each([
+    ["still waiting", [{ ticket: TICKET, label: LABEL }], undefined, "The PDF could not be sent. The work is still waiting — try again."],
+    ["no longer waiting", [], undefined, "The app's answer did not arrive, and the work is no longer waiting for a PDF from this browser. The app shows what became of it."],
+    ["the app not answering", [], { waiting: [], unreachable: unreachable(OLD) }, unreachable(OLD)],
+  ])("the background did not answer (stopped mid-way): the list is read again and the popup claims no result — %s", async (_what, after, read, sentence) => {
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }] });
+    await mountWith(send);
+    await click(button("Send this tab's PDF"));
+    bg.waiting = after;
+    if (read) bg.read = read;
+    await act(async () => bg.replies[0]!.reject(new Error("The message port closed before a response was received.")));
+    await settle();
+    expect(live()).toBe(sentence);
+  });
+
+  it("the popup closed meanwhile: the result is shown at the next opening, once", async () => {
+    const { bg, send } = fakeBackground({ result: { sentence: HELD_SENTENCE, at: Date.now() } });
+    await mountWith(send);
+    expect(section()!.querySelector("h2")?.textContent).toBe("Find and acquire");
+    expect(live()).toBe(HELD_SENTENCE);
+    expect(bg.result).toBeNull();
+    await remount(send);
+    expect(host.textContent).not.toContain(HELD_SENTENCE);
+    expect(host.textContent).not.toContain("Find and acquire");
+  });
+
+  it("opened while a sending runs: its button is busy until it ends, then its result is shown", async () => {
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }], status: TICKET });
+    await mountWith(send);
+    const busy = section()!.querySelector("button")!;
+    expect(busy.textContent).toBe("Sending the PDF…");
+    expect(busy.disabled).toBe(true);
+    expect(bg.resultTakes).toBe(0);
+    bg.status = null;
+    bg.waiting = [];
+    bg.result = { sentence: HELD_SENTENCE, at: Date.now() };
+    await act(async () => void (await new Promise((r) => setTimeout(r, 1300))));
+    await settle();
+    expect(live()).toBe(HELD_SENTENCE);
+    expect(section()!.querySelector("button")).toBeNull();
+  });
+
+  it("no active tab known: the button cannot be pressed", async () => {
+    const { send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }] });
+    await mountWith(send, { tab: undefined });
+    expect(button("Send this tab's PDF")?.disabled).toBe(true);
+  });
+});

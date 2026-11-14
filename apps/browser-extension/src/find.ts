@@ -46,7 +46,7 @@ export const FIND_TICKET = /^[0-9a-f]{32}$/;
  *  post — the POST, from its start to its answer: then it is stopped and the list read again;
  *  keepAlive — how often the background calls the browser while a sending runs, so the idle worker is not stopped.
  */
-export const FIND_WAITS = { list: 5_000, tab: 5_000, inject: 15_000, connect: 10_000, piece: 60_000, read: 15 * 60_000, post: 5 * 60_000, keepAlive: 20_000 };
+export const FIND_WAITS = { list: 5_000, tab: 5_000, inject: 15_000, connect: 10_000, piece: 60_000, read: 10 * 60_000, post: 5 * 60_000, keepAlive: 20_000 };
 
 /** The extension's own sentences (R348 i and the dispatch) — none says a file was "added" (R301). */
 export const FIND_TEXT = {

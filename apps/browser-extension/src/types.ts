@@ -46,6 +46,11 @@ export type BackgroundRequest =
   | { type: "profile-cancel"; tabId: number }
   | { type: "pending-retry"; projectId: string }
   | { type: "pending-discard"; projectId: string }
+  /** Find and acquire, the browser's fallback (R348 i; find.ts): the list, whether a sending runs, the last result (taken once), the sending. */
+  | { type: "find-waiting" }
+  | { type: "find-status" }
+  | { type: "find-result" }
+  | { type: "find-send"; tabId: number; ticket: string }
   /** From the in-page overlay (sender.tab is checked). */
   | { type: "overlay-finish"; urls: string[] }
   | { type: "overlay-cancel" };

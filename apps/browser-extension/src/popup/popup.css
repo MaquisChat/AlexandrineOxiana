@@ -136,6 +136,37 @@ button.link {
   gap: 6px;
 }
 
+/* Find and acquire (R348 i): the work waiting for a PDF from this browser, first in the popup. */
+.find {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+h2 {
+  font-size: 15px;
+  margin: 0;
+}
+
+.find-work {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+/* A long title, or one without spaces, wraps inside the popup's width. */
+.find-work p,
+.find-said {
+  overflow-wrap: anywhere;
+}
+
+.find-said:empty {
+  display: none;
+}
+
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;

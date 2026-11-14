@@ -4,8 +4,9 @@
  *  - injects the content script into that tab (activeTab; never on its own),
  *  - collects the page's fields and HTML, takes the stitched screenshot, and posts them to
  *    POST /capture/browser with the paired token;
- *  - runs "profile as I scroll" (start / status / finish / cancel) and sends the noted links.
- * It listens only to the extension's own popup and to its own content script.
+ *  - runs "profile as I scroll" (start / status / finish / cancel) and sends the noted links;
+ *  - sends the active tab's PDF for a work waiting in this browser (Find and acquire, R348 i; find.ts).
+ * It listens only to the extension's own popup, to its own content script, and to the port of its own tab script.
  */
 import browser, { type Runtime } from "webextension-polyfill";
 import { ApiError, createApi } from "./api.js";
@@ -13,10 +14,45 @@ import { fitCaptureBody } from "./body-size.js";
 import type { ContentApi } from "./content/index.js";
 import { bytesToBase64, captureFullPage, createCaptureLimiter } from "./content/screenshot.js";
 import { validateSelectors, type SelectorsConfig } from "./content/selectors-schema.js";
+import { FIND_RESULT_KEY, FIND_WAITS, createFinder, parseFindResult, parseFindSend, parseWaiting, type WaitingRead } from "./find.js";
+import type { PortLike } from "./find-protocol.js";
 import { afterSend, parsePending, removePending, sendInChunks } from "./pending.js";
 import type { BackgroundRequest, CaptureReply, ProfileStatus } from "./types.js";
 
 const api = createApi({ fetch: (input, init) => fetch(input, init), storage: browser.storage.local });
+
+// ---- Find and acquire: a tab's PDF for the work waiting in this browser (R348 i; find.ts) ----
+
+/** The list of works waiting for a PDF from this browser; a failure is said only as what it was (never shown at the opening). */
+async function readWaiting(): Promise<WaitingRead> {
+  try {
+    return { waiting: parseWaiting(await api.findWaiting({ signal: AbortSignal.timeout(FIND_WAITS.list) })) };
+  } catch (e) {
+    if (e instanceof ApiError && e.code === "UNREACHABLE") return { waiting: [], unreachable: e.message };
+    return { waiting: [], failed: true };
+  }
+}
+
+const finder = createFinder({
+  extensionId: browser.runtime.id,
+  // Under activeTab (the researcher's click on the toolbar button) the browser gives this tab's address.
+  tabUrl: async (tabId) => (await browser.tabs.get(tabId)).url,
+  // The top frame only, the default isolated world.
+  inject: async (tabId) => void (await browser.scripting.executeScript({ target: { tabId }, files: ["find-tab.js"] })),
+  post: (ticket, page, body, signal) => api.sendFindPdf(ticket, page, body, { signal }),
+  waiting: readWaiting,
+  // For the popup's next opening, if it was closed meanwhile: the sentence and its time, nothing else.
+  saveResult: (sentence) => browser.storage.session.set({ [FIND_RESULT_KEY]: { sentence, at: Date.now() } }),
+  // A call to the browser resets the idle worker's timer while a sending runs.
+  keepAlive: () => void browser.runtime.getPlatformInfo().catch(() => undefined),
+});
+
+/** The last sending's sentence, taken once. */
+async function takeFindResult(): Promise<{ sentence: string; at: number } | null> {
+  const v = parseFindResult((await browser.storage.session.get(FIND_RESULT_KEY))[FIND_RESULT_KEY]);
+  await browser.storage.session.remove(FIND_RESULT_KEY);
+  return v ?? null;
+}
 
 /** captureVisibleTab allows two calls a second for the whole extension: one limiter for all captures. */
 const captureSlot = createCaptureLimiter();
@@ -275,12 +311,26 @@ async function handle(msg: BackgroundRequest, sender: Runtime.MessageSender): Pr
       if (!validId(msg.projectId)) return undefined;
       await updatePending((p) => removePending(p, msg.projectId));
       return { ok: true, message: "Discarded." };
+    case "find-waiting":
+      return readWaiting();
+    case "find-status":
+      return { sending: finder.sending() ?? null };
+    case "find-result":
+      return takeFindResult();
+    case "find-send": {
+      const r = parseFindSend(msg);
+      return r ? finder.send(r.tabId, r.ticket) : undefined;
+    }
     default:
       return undefined;
   }
 }
 
 browser.runtime.onMessage.addListener((msg: unknown, sender: Runtime.MessageSender) => handle(msg as BackgroundRequest, sender));
+
+// The tab script's port: find.ts accepts it only for the sending under way, from this extension, the injected tab's
+// top frame, once; any other is disconnected unread.
+browser.runtime.onConnect.addListener((port: Runtime.Port) => finder.connect(port as unknown as PortLike));
 
 browser.tabs.onRemoved.addListener((tabId: number) => {
   void browser.storage.session.remove(profileKey(tabId));

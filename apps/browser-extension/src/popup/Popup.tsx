@@ -9,9 +9,16 @@
  * different port" beside "Unpair": the researcher types the port the app shows, the popup checks it
  * with one authorised request and saves it only if the app accepts the token there. It never looks
  * for a port itself (R110).
+ *
+ * Find and acquire, the browser's fallback (R348 i): at its opening the popup asks the background for the works
+ * waiting for a PDF from this browser. When one waits, the popup's FIRST section, "Find and acquire", says "Waiting for
+ * a PDF: <label>" (the label as text) with "Send this tab's PDF"; the background does the sending (find.ts), so a popup
+ * closed meanwhile does not stop it, and its sentence is shown at the next opening, once. Nothing waiting, or the list
+ * not readable: the popup is exactly as before.
  */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiError, type Api, type LocalStorageArea, type Pairing } from "../api.js";
+import { FIND_TEXT, FIND_TICKET, parseFindReply, parseFindResult, parseWaitingRead, sentenceAfterNoAnswer, type Waiting } from "../find.js";
 import type { PendingByProject } from "../pending.js";
 import type { BackgroundRequest, CaptureReply, ProfileStatus, ProjectChoice } from "../types.js";
 
@@ -79,6 +86,13 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   const pairedLine = useRef<HTMLSpanElement>(null);
   /** Where focus goes once the field closes: back to its button, or to the line naming the new port. */
   const [focusAfter, setFocusAfter] = useState<{ to: "button" | "paired" } | null>(null);
+  /** Find and acquire (R348 i): the works waiting for a PDF; the ticket being sent for; the last sentence said. */
+  const [findWaiting, setFindWaiting] = useState<Waiting[]>([]);
+  const [findSending, setFindSending] = useState<string | null>(null);
+  /** The sending under way is one this opening did not start (it is watched until it ends). */
+  const [findWatching, setFindWatching] = useState(false);
+  const [findSaid, setFindSaid] = useState("");
+  const findBusy = useRef(false);
 
   useEffect(() => {
     alive.current = true;
@@ -146,6 +160,98 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  /** A find-* question to the background; no answer is undefined (never an error of its own). */
+  const ask = useCallback(
+    async (type: "find-waiting" | "find-status" | "find-result"): Promise<unknown> => {
+      try {
+        return await bridge.send<unknown>({ type });
+      } catch {
+        return undefined;
+      }
+    },
+    [bridge],
+  );
+  const sendingOf = (v: unknown): string | null => {
+    const s = (v as { sending?: unknown } | null | undefined)?.sending;
+    return typeof s === "string" && FIND_TICKET.test(s) ? s : null;
+  };
+
+  // At the opening: a sending under way (watched until it ends), else the last result kept while the popup was closed
+  // (taken once), and the list.
+  useEffect(() => {
+    let current = true;
+    void (async () => {
+      const sending = sendingOf(await ask("find-status"));
+      const kept = sending ? undefined : parseFindResult(await ask("find-result"));
+      const read = parseWaitingRead(await ask("find-waiting"));
+      if (!current) return;
+      setFindWaiting(read.waiting);
+      if (kept) setFindSaid(kept.sentence);
+      if (sending && !findBusy.current) {
+        findBusy.current = true;
+        setFindSending(sending);
+        setFindWatching(true);
+      }
+    })();
+    return () => {
+      current = false;
+    };
+  }, [ask]);
+
+  // A sending this opening did not start: asked once a second until it ends (it has its own limits), then its result.
+  useEffect(() => {
+    if (!findWatching) return;
+    let current = true;
+    let asking = false;
+    const t = setInterval(() => {
+      if (asking) return;
+      asking = true;
+      void (async () => {
+        try {
+          if (sendingOf(await ask("find-status"))) return;
+          clearInterval(t);
+          const kept = parseFindResult(await ask("find-result"));
+          const read = parseWaitingRead(await ask("find-waiting"));
+          if (!current) return;
+          setFindWaiting(read.waiting);
+          setFindSaid(kept?.sentence ?? "");
+          setFindSending(null);
+          setFindWatching(false);
+          findBusy.current = false;
+        } finally {
+          asking = false;
+        }
+      })();
+    }, 1000);
+    return () => {
+      current = false;
+      clearInterval(t);
+    };
+  }, [findWatching, ask]);
+
+  /** "Send this tab's PDF": one sending at a time; the background does it; the service's sentence is shown as it is. */
+  async function sendPdf(ticket: string) {
+    if (findBusy.current || tabId === undefined) return;
+    findBusy.current = true;
+    setFindSending(ticket);
+    setFindSaid("");
+    let reply: ReturnType<typeof parseFindReply>;
+    try {
+      reply = parseFindReply(await bridge.send<unknown>({ type: "find-send", tabId, ticket }));
+    } catch {
+      reply = undefined;
+    }
+    // Said here: the copy kept for a next opening is taken, so it is not said twice.
+    if (reply) await ask("find-result");
+    // The list again: whether the work still waits decides the button; with no answer, it decides what is said.
+    const read = parseWaitingRead(await ask("find-waiting"));
+    if (!alive.current) return;
+    setFindWaiting(read.waiting);
+    setFindSaid(reply ? reply.sentence : sentenceAfterNoAnswer(ticket, read));
+    setFindSending(null);
+    findBusy.current = false;
+  }
 
   // While profile capture runs, keep the counter current.
   useEffect(() => {
@@ -275,8 +381,33 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   }
 
   const canCapture = !busy && !!project && tabId !== undefined;
+  const several = findWaiting.length > 1;
   return (
     <main className="popup">
+      {findWaiting.length > 0 || findSaid ? (
+        <section className="find" aria-labelledby={`${ids}-find`}>
+          <h2 id={`${ids}-find`}>{FIND_TEXT.heading}</h2>
+          {findWaiting.map((w) => (
+            <div className="find-work" key={w.ticket}>
+              <p>
+                Waiting for a PDF: <bdi>{w.label}</bdi>
+              </p>
+              <button
+                type="button"
+                disabled={findSending !== null || tabId === undefined}
+                aria-busy={findSending === w.ticket || undefined}
+                aria-label={several ? `${FIND_TEXT.button} for “${w.label}”` : undefined}
+                onClick={() => void sendPdf(w.ticket)}
+              >
+                {findSending === w.ticket ? FIND_TEXT.sending : FIND_TEXT.button}
+              </button>
+            </div>
+          ))}
+          <p className="find-said" aria-live="polite" aria-atomic="true">
+            {findSaid}
+          </p>
+        </section>
+      ) : null}
       <p className="paired">
         <span ref={pairedLine} tabIndex={-1}>
           Paired with the desktop app (port {load.pairing.port}).
