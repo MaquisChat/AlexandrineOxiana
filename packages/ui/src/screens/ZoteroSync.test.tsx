@@ -7,6 +7,7 @@
 import {
   ZOTERO_SYNC_REASON_TEXT,
   ZOTERO_SYNC_SENTENCES,
+  zoteroNextSyncLine,
   zoteroSyncReasonText,
   zoteroSyncStatusLine,
   type ZoteroKeyCheckResponse,
@@ -329,8 +330,23 @@ describe("ZoteroSync", () => {
     ]);
     expect(often.value).toBe("60");
     expect(screen.getByText("Only while this library is open and the project is unlocked.")).toBeTruthy();
-    // The state has no nextRunAt yet (the scheduler is Z10): no "next sync" line.
-    expect(screen.queryByText(/next sync/i)).toBeNull();
+    // The state has no nextRunAt (automatic sync is off): no "next sync" line.
+    expect(screen.queryByText(/next automatic sync/i)).toBeNull();
+  });
+
+  it("Z10 (R274 c): the screen shows the next-sync line only when the state gives a time, in the automatic section", async () => {
+    const at = new Date(Date.now() + 40 * 60_000).toISOString();
+    const svc = useSvc({ automatic: true, nextRunAt: at, links: [{ ref: "user:42", projectId: P1, lastRun: run() }] });
+    await show(svc);
+    const auto = screen.getByRole("region", { name: "Automatic sync" });
+    const line = await within(auto).findByText(zoteroNextSyncLine(at, new Date()));
+    expect(line.textContent).toMatch(/^Next automatic sync: not before /u);
+    // The state read again without it (automatic turned off, or nothing can become due): the line goes.
+    const done = run();
+    svc.state = stateOf({ automatic: false, links: [{ ref: "user:42", projectId: P1, lastRun: done }] });
+    svc.history = [done];
+    await push(svc, "zotero.sync", { ref: "user:42", projectId: P1, state: "finished", run: done });
+    await waitFor(() => expect(screen.queryByText(/next automatic sync/i)).toBeNull());
   });
 
   it("a failed run reads as a failure, never up to date; a failed, stopped or problem run shows nothing that reads as success", async () => {

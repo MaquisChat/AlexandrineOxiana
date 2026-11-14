@@ -1,7 +1,8 @@
 /**
  * Zotero account sync (Task Z8; types and sentences in @ao/shared api/zotero-sync.ts): the routes, and the holder of
- * the one run in progress. Manual runs only: nothing here runs by itself (no timer, no start at open or unlock); a run
- * starts only through `POST /zotero/sync/run`. The runner is the library's (`syncZoteroLibrary`, Task Z7), which always
+ * the one run in progress. A run starts through `POST /zotero/sync/run`, or — only while the researcher has turned
+ * automatic sync on — through the scheduler (Task Z10, zotero-sync-scheduler.ts), which the holder starts at a
+ * read-write library's activation and which comes through the same door (`start`, trigger "automatic"). The runner is the library's (`syncZoteroLibrary`, Task Z7), which always
  * leaves an honest record in this computer's history; these routes never write to the library themselves.
  *
  * Who may call (R96): the desktop app's token only, on every route, reads included (the extension's token is refused
@@ -11,13 +12,10 @@
  * whatever Zotero's servers said goes nowhere but a bounded debug note.
  */
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import type { FastifyInstance } from "fastify";
 import {
   SecretStoreUnavailableError,
   ZOTERO_SYNC_MAX_BACKOFF_MS,
-  ZOTERO_SYNC_FILE,
   ZOTERO_SYNC_MIN_BACKOFF_MS,
   ZOTERO_SYNC_NEWER_SENTENCE,
   ZoteroAccountError,
@@ -34,10 +32,12 @@ import {
   updateZoteroSyncSettings,
   zoteroSyncBackoff,
   zoteroSyncRunCounts,
+  zoteroSyncRunning,
   type BatchHandle,
   type IndexHandle,
   type ZoteroAccountReason,
   type ZoteroKeyAccess as LibraryKeyAccess,
+  type ZoteroSyncFileOptions,
   type ZoteroSyncLink,
   type ZoteroSyncReason as LibraryReason,
   type ZoteroSyncRun as LibraryRun,
@@ -63,6 +63,7 @@ import {
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
 import type { ServiceState, Session } from "../state.js";
+import { ZoteroSyncScheduler } from "../zotero-sync-scheduler.js";
 import { bodyOf, type Ctx, type Obj, type Same } from "./util.js";
 
 // The library's types and their declarations in @ao/shared are one and the same (a reason without a sentence, or a
@@ -131,15 +132,18 @@ export class ZoteroSyncHolder {
    * or undefined when it is taken. Synchronous: no wait comes between the check and the claim.
    */
   claim(given: string, session: Session): (() => void) | undefined {
-    // Canonical: `user:042` and `user:42` are one library (a stored ref may be older than the canonical form).
-    const ref = given.replace(/^(user|group):0*(\d+)$/u, (_m, type: string, id: string) => `${type}:${id}`);
-    const held = this.claims.get(ref);
-    if (held && held.session === session) return undefined;
+    const ref = canonical(given);
+    if (this.taken(ref, session)) return undefined;
     const token = {};
     this.claims.set(ref, { session, token });
     return () => {
       if (this.claims.get(ref)?.token === token) this.claims.delete(ref);
     };
+  }
+
+  /** Whether the Zotero library `ref` is claimed now by an import or a sync of the session's library (nothing is claimed). */
+  taken(ref: string, session: Session): boolean {
+    return this.claims.get(canonical(ref))?.session === session;
   }
 
   /** Whether the batch is one the sync runs now. */
@@ -173,8 +177,10 @@ export class ZoteroSyncHolder {
   /**
    * Runs `links` one after another, never two at once, in the background. The caller has checked that none runs now.
    * A run that stops, a refused key and a back-off now in force end the rest (they would only be refused).
+   * `trigger` is the record's: "automatic" for the scheduler's runs (Z10), which come through this same door.
+   * Settles, once every link has ended, with the record of the link that ended last.
    */
-  start(state: ServiceState, s: Session & { index: IndexHandle }, links: ZoteroSyncLink[], backoffUntil: number | undefined): void {
+  start(state: ServiceState, s: Session & { index: IndexHandle }, links: ZoteroSyncLink[], backoffUntil: number | undefined, trigger: "manual" | "automatic" = "manual"): Promise<ZoteroSyncRun | undefined> {
     const now = () => state.opts.now().getTime();
     if (backoffUntil !== undefined) this.backoffUntil = Math.max(this.backoffUntil ?? 0, backoffUntil);
     let resolveEnded!: () => void;
@@ -196,7 +202,7 @@ export class ZoteroSyncHolder {
         let lastProgress = -Infinity;
         publish({ ref: link.ref, projectId: link.projectId, state: "checking" });
         const at = new Date(now()).toISOString();
-        const failed = (reason: ZoteroSyncReason): ZoteroSyncRun => ({ id: randomUUID(), ref: link.ref, projectId: link.projectId, trigger: "manual", startedAt: at, finishedAt: at, outcome: "failed", reason });
+        const failed = (reason: ZoteroSyncReason): ZoteroSyncRun => ({ id: randomUUID(), ref: link.ref, projectId: link.projectId, trigger, startedAt: at, finishedAt: at, outcome: "failed", reason });
         // R250 a: this Zotero library, claimed before anything is awaited. Taken by an import, the runner itself refuses
         // the link with its own `import-running` record, before any request (R252: `taken`).
         const release = this.claim(link.ref, s);
@@ -245,7 +251,7 @@ export class ZoteroSyncHolder {
             debug: (note) => state.opts.log.info({ note: scrubPaths(String(note), state.roots).slice(0, 300) }, "zotero sync"),
           },
           link,
-          { trigger: "manual", signal: cur.ac.signal, ...(this.backoffUntil !== undefined ? { backoffUntil: this.backoffUntil } : {}) },
+          { trigger, signal: cur.ac.signal, ...(this.backoffUntil !== undefined ? { backoffUntil: this.backoffUntil } : {}) },
           );
         } catch (err) {
           state.opts.log.info({ note: err instanceof Error ? err.name : "error" }, "zotero sync: the run stopped on an unexpected error");
@@ -277,6 +283,76 @@ export class ZoteroSyncHolder {
       }),
       "zotero sync",
     );
+    return cur.ended.then(() => cur.last);
+  }
+
+  // ---- the scheduler of automatic runs (Task Z10, R274) ----------------------------------------------------------
+
+  /** The scheduler (one for the service; started at a read-write library's activation, stopped before every close). */
+  scheduler: ZoteroSyncScheduler | undefined;
+
+  /**
+   * Starts the scheduler for the open library `s` (at `activate`): its first run comes no sooner than 2 minutes from
+   * now. Never for a read-only library (nothing could become due). It reads the settings and the records afresh at each
+   * pass (through the library's own reader, which says itself when a file is newer, R269 c), never the key, and starts
+   * a run only through `start` with the trigger "automatic", in the same synchronous step as its check that nothing
+   * holds the link back (`obstacleTo`): so the claim of R250 is taken before anything is awaited, as for a manual run.
+   */
+  startScheduler(state: ServiceState, s: Session): void {
+    if (s.lib.mode !== "read-write" || !s.index) return;
+    const now = () => state.opts.now().getTime();
+    const open = () => (state.session === s ? s : undefined);
+    this.scheduler ??= new ZoteroSyncScheduler({
+      now: () => state.opts.now(),
+      ...(state.opts.zoteroTickMs !== undefined ? { tickMs: state.opts.zoteroTickMs } : {}),
+      settings: async () => {
+        const o = state.session;
+        if (!o) return undefined;
+        let newer = false;
+        const settings = await readZoteroSyncSettings(state.deps.appConfigDir, o.lib.id, { onNewer: () => (newer = true) });
+        return newer ? undefined : settings;
+      },
+      history: async () => {
+        const o = state.session;
+        if (!o) return undefined;
+        // R276 d: records written by a newer version (the module says so itself) stop scheduling, as newer settings do.
+        let newer = false;
+        const runs = await readZoteroSyncHistory(state.deps.appConfigDir, o.lib.id, { onNewer: () => (newer = true) });
+        return newer ? undefined : runs;
+      },
+      obstacle: (link) => this.obstacleTo(state, link),
+      backoffUntil: (history) => this.backoffInForce(now(), historyBackoff(history)),
+      run: (link) => {
+        const o = state.session;
+        if (!o?.index || o.lib.mode !== "read-write") return Promise.reject(new Error("no library is open"));
+        return this.start(state, o as Session & { index: IndexHandle }, [link], undefined, "automatic").then((r) => r ?? Promise.reject(new Error("no record")));
+      },
+      debug: (note) => state.opts.log.info({ note }, "zotero sync"),
+    });
+    if (open()) this.scheduler.start();
+  }
+
+  /** Stops the scheduler (close, switch, before a move, shutdown; awaited BEFORE `stop`): no timer left, nothing started after. */
+  async stopScheduler(): Promise<void> {
+    await this.scheduler?.stop();
+  }
+
+  /**
+   * Why the scheduler may not start `link` now (R274 a: then nothing is started and nothing recorded): "busy" while a
+   * run is going or its Zotero library is claimed by an import; "held" while the library is not open read-write (or is
+   * being moved or closed), the link's project is gone or locked. A paused link and a back-off the scheduler sees itself.
+   */
+  obstacleTo(state: ServiceState, link: ZoteroSyncLink): "busy" | "held" | undefined {
+    const s = state.session;
+    if (!s?.index || s.lib.mode !== "read-write" || state.moving || state.shuttingDown) return "held";
+    try {
+      s.repo.getProject(link.projectId);
+    } catch {
+      return "held";
+    }
+    if (lockedNow(s, link.projectId)) return "held";
+    if (this.current || zoteroSyncRunning(s.lib.id, link.ref) || this.taken(link.ref, s)) return "busy";
+    return undefined;
   }
 
   /**
@@ -293,6 +369,11 @@ export class ZoteroSyncHolder {
     if (reason !== "stopped-by-you") cur.live = false;
     return cur.last ? { last: cur.last } : {};
   }
+}
+
+/** Canonical: `user:042` and `user:42` are one library (a stored ref may be older than the canonical form). */
+function canonical(ref: string): string {
+  return ref.replace(/^(user|group):0*(\d+)$/u, (_m, type: string, id: string) => `${type}:${id}`);
 }
 
 function withTimeout(p: Promise<void>, ms: number): Promise<void> {
@@ -333,7 +414,7 @@ async function withCounts(s: Session, run: LibraryRun, read = true): Promise<Zot
 }
 
 /** The latest back-off any record of this library carries (ms), so a back-off outlives a restart of the service. */
-function historyBackoff(runs: LibraryRun[]): number | undefined {
+function historyBackoff(runs: readonly LibraryRun[]): number | undefined {
   let max: number | undefined;
   for (const r of runs) {
     const t = r.backoffUntil ? Date.parse(r.backoffUntil) : NaN;
@@ -349,9 +430,9 @@ function fileError(err: unknown): unknown {
   return err;
 }
 
-async function readSettings(dir: string, libraryId: string): Promise<ZoteroSyncSettings> {
+async function readSettings(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<ZoteroSyncSettings> {
   try {
-    return await readZoteroSyncSettings(dir, libraryId);
+    return await readZoteroSyncSettings(dir, libraryId, o);
   } catch (err) {
     throw fileError(err);
   }
@@ -361,25 +442,11 @@ function inProgressId(runs: LibraryRun[], ref: string | undefined): string | und
   if (ref === undefined) return undefined;
   return runs.filter((r) => r.finishedAt === undefined && r.ref === ref).sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0]?.id;
 }
-async function readHistory(dir: string, libraryId: string): Promise<LibraryRun[]> {
+async function readHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<LibraryRun[]> {
   try {
-    return await readZoteroSyncHistory(dir, libraryId);
+    return await readZoteroSyncHistory(dir, libraryId, o);
   } catch (err) {
     throw fileError(err);
-  }
-}
-
-/**
- * Whether this computer's sync settings file was written by a newer version of the app (R268 M4): the library module's
- * own rule for refusing it (an object whose `v` is a whole number above 1, R244 M7), read without changing anything.
- * Missing, unreadable or damaged is not "newer" (the module reads those as nothing, or sets the damaged one aside).
- */
-async function settingsNewer(dir: string): Promise<boolean> {
-  try {
-    const v = JSON.parse(await readFile(join(dir, ZOTERO_SYNC_FILE), "utf8")) as unknown;
-    return typeof v === "object" && v !== null && !Array.isArray(v) && Number.isSafeInteger((v as Obj).v) && ((v as Obj).v as number) > 1;
-  } catch {
-    return false;
   }
 }
 
@@ -436,7 +503,14 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
 
   /** The state, built from this computer's settings and history at request time (point 8). */
   async function stateOf(s: Session): Promise<ZoteroSyncStateResponse> {
-    const [settings, history, stored, newer] = await Promise.all([readSettings(dir(), s.lib.id), readHistory(dir(), s.lib.id), keyStored(), settingsNewer(dir())]);
+    // R268 M4, R269 c: whether the settings were written by a newer version is said by the library module itself.
+    let newer = false;
+    let historyNewer = false;
+    const [settings, history, stored] = await Promise.all([
+      readSettings(dir(), s.lib.id, { onNewer: () => (newer = true) }),
+      readHistory(dir(), s.lib.id, { onNewer: () => (historyNewer = true) }),
+      keyStored(),
+    ]);
     const running = holder.running;
     const current = inProgressId(history, running?.ref);
     const links: ZoteroSyncStateResponse["links"] = [];
@@ -458,6 +532,9 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
       });
     }
     const backoff = holder.backoffInForce(now().getTime(), historyBackoff(history));
+    // R274 c: when the scheduler would next start a run, from these same settings and records ("not before").
+    // Settings or records written by a newer version: nothing is scheduled (R269 c, R276 d).
+    const next = holder.scheduler?.nextRunAt({ settings: newer || historyNewer ? undefined : settings, history });
     return {
       readOnly: s.lib.mode === "read-only",
       settingsNewer: newer,
@@ -467,6 +544,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
       links,
       ...(running ? { running: { ref: running.ref, done: running.done, total: running.total } } : {}),
       ...(backoff !== undefined ? { backoffUntil: new Date(backoff).toISOString() } : {}),
+      ...(next ? { nextRunAt: next.toISOString() } : {}),
     };
   }
 
@@ -588,7 +666,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     }
     // Checked again right before it starts: another request may have started one while the files were read.
     if (holder.running) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.alreadyRunning);
-    holder.start(state, s, links, fromHistory);
+    void holder.start(state, s, links, fromHistory);
     void reply.status(202);
     return { started: true };
   });

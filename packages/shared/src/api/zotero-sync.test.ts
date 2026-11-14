@@ -5,6 +5,7 @@ import {
   ZOTERO_SYNC_REASON_TEXT,
   ZOTERO_SYNC_SENTENCES,
   zoteroKeySummary,
+  zoteroNextSyncLine,
   zoteroSyncReasonText,
   zoteroSyncStatusLine,
   type ZoteroSyncCounts,
@@ -199,5 +200,19 @@ describe("the key check's summary and the service's sentences", () => {
     expect(ZOTERO_SYNC_SENTENCES.notRunning).toBe("No sync is running.");
     expect(ZOTERO_SYNC_SENTENCES.undonePaused).toBe("Syncing this Zotero library is paused. Turn it on again on the Zotero screen.");
     expect(ZOTERO_SYNC_SENTENCES.importRunning).toBe(ZOTERO_SYNC_REASON_TEXT["import-running"]);
+  });
+});
+
+describe("Z10 (R274 c): the next automatic sync, in words", () => {
+  it("'not before', the time said as the status lines say it: today, another day, local time", () => {
+    // 15:10 in London on 12 March 2027 (GMT).
+    expect(zoteroNextSyncLine("2027-03-12T15:10:00.000Z", new Date("2027-03-12T14:32:00.000Z"))).toBe("Next automatic sync: not before 15:10 today.");
+    // Seconds are not said; the minute is the status lines' minute.
+    expect(zoteroNextSyncLine("2027-03-12T15:10:59.000Z", new Date("2027-03-12T14:32:00.000Z"))).toBe("Next automatic sync: not before 15:10 today.");
+    // After local midnight: another day reads as a date, as "on 12 March 2027 at 14:32" does in a status line.
+    expect(zoteroNextSyncLine("2027-03-13T00:10:00.000Z", new Date("2027-03-12T23:00:00.000Z"))).toBe("Next automatic sync: not before 13 March 2027 at 00:10.");
+    env.TZ = "America/New_York";
+    // 02:30 UTC on 13 March is 21:30 on 12 March in New York.
+    expect(zoteroNextSyncLine("2027-03-13T02:30:00.000Z", new Date("2027-03-13T01:00:00.000Z"))).toBe("Next automatic sync: not before 21:30 today.");
   });
 });

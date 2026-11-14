@@ -180,6 +180,8 @@ export interface StateOptions {
   rebuildIndexIfNeeded?: typeof rebuildIndexIfNeeded;
   /** Test seam (a fake clock): starts the timer of GET /libraries' wait at start; returns its cancel. */
   startupTimer?: (fire: () => void, ms: number) => () => void;
+  /** Test seam: the tick of the automatic Zotero sync's scheduler (Task Z10; default 60,000 ms). Not an environment variable. */
+  zoteroTickMs?: number;
 }
 
 /** How long GET /libraries waits, once, for the reopen at start (D5, I1). */
@@ -851,6 +853,9 @@ export class ServiceState {
     if (this.worker) this.attachWorker(s, this.worker);
     else if (this.opts.autoStartWorker && this.opts.worker) this.track(this.ensureWorker(), "starting the media helper");
     this.startBackupScheduler();
+    // Automatic Zotero syncs (Task Z10): the first no sooner than 2 minutes from now; read-write only. Stopped (awaited)
+    // before the sync's holder at close, switch, quiesce and shutdown, and started again here after a move or a reopen.
+    this.zoteroSync.startScheduler(this, s);
     this.publishState();
     // Opened at last after a move whose first open failed: what was paused for it resumes (R106).
     if (this.pendingResume && this.pendingResume.root === s.lib.root && s.lib.mode === "read-write") {
@@ -964,10 +969,12 @@ export class ServiceState {
     this.media.revokeAll();
     // An index rebuild stops between sources (the library at its new place checks its index again).
     await this.stopIndexRebuild(s);
+    await this.zoteroSync.stopScheduler();
     await this.zoteroSync.stop("library-closed");
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
     if (!(await this.drainWork(ms))) {
+      this.zoteroSync.startScheduler(this, s);
       this.restartStoppedWork();
       throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
     }
@@ -987,6 +994,7 @@ export class ServiceState {
         }
       }
       this.resumeBatches(paused);
+      this.zoteroSync.startScheduler(this, s);
       this.restartStoppedWork();
       throw new ApiError(409, "CONFLICT", "An import could not be paused in time, so the library was not moved; try again in a moment.");
     }
@@ -1080,6 +1088,8 @@ export class ServiceState {
     for (const w of stoppable) if (w.kind === "transcription") w.ctl.interrupt?.();
     await this.stopIndexRebuild(s);
     // A Zotero sync stops first, with its record, its batch suspended (Task Z8): nothing of it is written after the lock goes.
+    // Its scheduler before it (Task Z10): no automatic run can start once the holder has stopped.
+    await this.zoteroSync.stopScheduler();
     await this.zoteroSync.stop(this.shuttingDown ? "app-closed" : "library-closed");
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).

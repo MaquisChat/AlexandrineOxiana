@@ -69,6 +69,8 @@ export type FindReasonCode =
   | "queue-full"
   | "budget"
   | "unexpected"
+  // F8b (R283 a): on a "choose" entry: people of this name could not be looked up ("Try again" looks again).
+  | "people-unavailable"
   // Task F11: the free copy. The rules refuse the acquiring method `free_copy` (the entry stays "record-complete"
   // and is not tried again until the rules change); FIND_HELD_MAX files already wait ("failed", with "Try again");
   // the researcher said the held file was not this work ("no-open-copy"); and why a held file did not match

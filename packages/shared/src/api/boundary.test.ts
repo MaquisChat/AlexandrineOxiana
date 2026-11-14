@@ -1,7 +1,7 @@
 // Task 47: the constants both the service and the interface used to keep their own copy of, now
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
-import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin } from "../index.js";
+import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
   it("the service's error codes, each once", () => {
@@ -75,6 +75,7 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "queue-full",
       "budget",
       "unexpected",
+      "people-unavailable",
       // Task F11: the free copy.
       "copy-not-allowed",
       "held-full",
@@ -125,5 +126,21 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect(FIND_ROUTE_TEXT.tooManyWorks).toBe("At most 50 works can be added at once. Nothing was added.");
     expect(findAlreadyAddedRefusal(3)).toBe("Work 3 was already added from this entry. Nothing was added.");
     expect(findWorkIdRefusal(2)).toBe("Work 2 is not a work's id that OpenAlex gives. Nothing was added.");
+  });
+
+  it("find and acquire, a name that is also a title (F8b, R279): the author offer is counts only, and its refusal has its sentence", () => {
+    expect(FIND_REFUSAL_REASONS).toContain("no-author");
+    expect(FIND_ROUTE_TEXT.noAuthor).toBe("This entry has no author to show.");
+    // R285 b: the sentence for a request that carries a body is a shared route sentence.
+    expect(FIND_ROUTE_TEXT.noBody).toBe("This request takes no body. Nothing was changed.");
+    // R283 a: people of the name could not be looked up; "Try again" looks again.
+    expect(FIND_REASON_CODES).toContain("people-unavailable");
+    expect(FIND_REASON_TEXT["people-unavailable"]).toBe("People of this name could not be looked up just now. “Try again” looks again.");
+    const offer: FindAuthorOffer = { peopleCount: 2 };
+    const view: Pick<FindEntryView, "authorOffer"> = { authorOffer: { ...offer, morePeople: true } };
+    expect(view.authorOffer).toEqual({ peopleCount: 2, morePeople: true });
+    // @ts-expect-error the offer carries counts, never a list of people
+    const wrong: FindAuthorOffer = { peopleCount: 1, people: [] };
+    expect(wrong.peopleCount).toBe(1);
   });
 });
