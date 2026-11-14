@@ -2,12 +2,11 @@
  * Step 1: choose the source and the target project (spec 5.4). The project's governance applies
  * from here on; the wizard reads it to set safe defaults (R24 link refusal, R64 structure).
  */
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactElement } from "react";
-import { isZoteroApiKeyShape } from "@ao/shared";
-import { ApiClientError } from "../../api/client";
+import { useEffect, useId, useState, type ReactElement } from "react";
 import type { FieldSession, ImportAdapter, ImportApi, Participant, ProjectInfo, ZoteroDataFolder } from "../../api/import";
 import { PathField } from "../../components/PathField";
 import { UserText } from "../../components/UserText";
+import { ZoteroKeyField } from "../../components/ZoteroKeyField";
 import { ErrorNote, errorText, isAbsolutePath, PATH_HINT, Section } from "./shared";
 
 /** Makes a path field (label, value, setter, placeholder, what the picker chooses, the picker's title). */
@@ -180,7 +179,7 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
               <input type="checkbox" checked={choice.full} onChange={(e) => onChoice({ ...choice, full: e.target.checked })} />
               <span>Import everything again, not only what changed since the last import</span>
             </label>
-            <ZoteroKey api={api} />
+            <ZoteroKeyField api={api} />
           </>
         )}
         {choice.kind === "device" && <DeviceFields api={api} projectId={projectId} choice={choice} onChoice={onChoice} field={pathProps} />}
@@ -279,110 +278,6 @@ function DeviceFields({
       </p>
       <ErrorNote error={error} />
     </>
-  );
-}
-
-const KEY_RULE = "That does not look like a Zotero API key: it is 24 letters and digits. Create one at zotero.org, Settings, Security.";
-
-/** The service's words for a missing password store (503) stand alone; other errors as usual. */
-function keyError(err: unknown): string {
-  return err instanceof ApiClientError && err.status === 503 ? err.message : errorText(err);
-}
-
-/**
- * The Zotero Web API key (R78): stored through the service in this computer's password store. It is
- * write-only: the field is emptied once the key is stored, and the service never sends it back, so
- * all this shows is whether one is stored. One request at a time; answers after unmount are dropped.
- */
-function ZoteroKey({ api }: { api: ImportApi }) {
-  const id = useId();
-  const [stored, setStored] = useState<boolean | null>(null);
-  const [value, setValue] = useState("");
-  const [busy, setBusy] = useState(false);
-  const busyRef = useRef(false);
-  const live = useRef(true);
-  const [error, setError] = useState<string | null>(null);
-  const [status, setStatus] = useState("");
-
-  useEffect(() => {
-    live.current = true;
-    api.zoteroKeyStored().then(
-      (s) => live.current && setStored(s),
-      (e: unknown) => live.current && setError(keyError(e)),
-    );
-    return () => {
-      live.current = false;
-    };
-  }, [api]);
-
-  const run = async (what: () => Promise<unknown>, after: () => void) => {
-    if (busyRef.current) return;
-    busyRef.current = true;
-    setBusy(true);
-    setError(null);
-    setStatus("");
-    try {
-      await what();
-      if (live.current) after();
-    } catch (e) {
-      if (live.current) setError(keyError(e));
-    } finally {
-      busyRef.current = false;
-      if (live.current) setBusy(false);
-    }
-  };
-
-  const store = (e: FormEvent) => {
-    e.preventDefault();
-    const key = value.trim();
-    if (!isZoteroApiKeyShape(key)) {
-      setError(KEY_RULE);
-      return;
-    }
-    // Once sent, the key leaves the page whatever the answer: it is typed again to retry.
-    setValue("");
-    void run(
-      () => api.storeZoteroKey(key),
-      () => {
-        setStored(true);
-        setStatus("The key is stored in this computer's password store.");
-      },
-    );
-  };
-  const remove = () =>
-    void run(
-      () => api.removeZoteroKey(),
-      () => {
-        setStored(false);
-        setStatus("The key was removed from this computer's password store.");
-      },
-    );
-
-  return (
-    <div className="ao-import__key">
-      {stored !== null && <p className="ao-import__hint">{stored ? "A Zotero key is stored on this computer." : "No Zotero key is stored on this computer."}</p>}
-      <form className="ao-import__key-form" onSubmit={store}>
-        <label className="ao-import__field">
-          <span>Zotero API key</span>
-          <input type="password" autoComplete="off" spellCheck={false} value={value} aria-describedby={`${id}-key-hint`} onChange={(e) => setValue(e.target.value)} />
-        </label>
-        <button type="submit" disabled={busy}>
-          {stored ? "Replace key" : "Store key"}
-        </button>
-        {stored && (
-          <button type="button" disabled={busy} onClick={remove}>
-            Remove key
-          </button>
-        )}
-      </form>
-      <p id={`${id}-key-hint`} className="ao-import__hint">
-        Kept only in this computer's password store (the system keychain or credential manager), never in the library or a file, and never shown again. Public group libraries need no key.
-      </p>
-      <p role="status" className="ao-import__hint">
-        {status}
-      </p>
-      <ErrorNote error={error} />
-    </div>
   );
 }
 
