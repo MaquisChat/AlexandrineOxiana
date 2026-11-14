@@ -357,6 +357,24 @@ describe("derive: the address from one pasted link", () => {
   });
 });
 
+describe("R328 h: no link makes the route work longer than its size", () => {
+  it("a 16 KB body of one inner run of spaces is answered at once (the length is checked before any trim)", async () => {
+    await start();
+    const link = `a${" ".repeat(16_000)}a`;
+    await call({ method: "POST", url: "/settings/your-library/derive", body: { link: "x" } }); // warm
+    const times: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const t0 = performance.now();
+      const r = await call({ method: "POST", url: "/settings/your-library/derive", body: { link } });
+      times.push(performance.now() - t0);
+      expect(r.status).toBe(200);
+      expect(r.json).toEqual({ access: null, sentence: YOUR_LIBRARY_DERIVE_TEXT["too-long"] });
+    }
+    // A generous bound on this shared machine (the quadratic trim took about 100 ms for this body).
+    expect(Math.min(...times)).toBeLessThan(50);
+  });
+});
+
 describe("the queue's view: Where to get it, and whether a start is offered (R324 a, d)", () => {
   it("a resting entry carries the joined links, and `library` says it may start — or why not (no library set)", async () => {
     await start();
