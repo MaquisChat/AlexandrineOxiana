@@ -233,6 +233,7 @@ export {
   readZoteroSyncSettings,
   updateZoteroSyncSettings,
   writeZoteroSyncSettings,
+  zoteroHistoryBackoff,
 } from "./import/zotero-sync-settings.js";
 export type {
   ZoteroSyncCounts,

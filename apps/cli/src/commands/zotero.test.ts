@@ -15,6 +15,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { ZOTERO_SYNC_REASON_TEXT, ZOTERO_SYNC_SENTENCES, zoteroSyncStatusLine, type ZoteroSyncRun as SharedRun } from "@ao/shared";
 import {
   ZOTERO_SYNC_FILE,
+  ZOTERO_SYNC_HISTORY_FILE,
   deviceDeps,
   openLibrary,
   readZoteroSyncHistory,
@@ -336,16 +337,52 @@ describe("ao zotero sync", () => {
     expect(z.requests.filter((q) => q.path.startsWith("/groups/9/"))).toEqual([]);
   });
 
-  // The next run of the command line (a new process) must also respect a back-off an earlier run (or the app) recorded.
-  // The service reads it from the history in a function that is private to its route file
-  // (apps/library-service/src/routes/zotero-sync.ts, `historyBackoff`); the command line may not copy it and the library
-  // does not export it. Reported to the coordinator (Task Z12); this test is written when that function is the library's.
-  it.todo("a back-off recorded by an earlier run is respected by the next command: no request, the sentence with its time, the exit code");
+  it("a back-off recorded by an earlier run is respected by the next command: no request, the sentence with its time, the exit code", async () => {
+    articles(2);
+    await linked(link(U));
+    z.backoffOnce(7200);
+    const first = await ao(["zotero", "sync"]);
+    expect(first.code).toBe(1);
+    const [rec] = await history();
+    expect(rec!.backoffUntil).toBeDefined();
+    const n = z.requests.length;
+    // In the future: nothing is asked, nothing recorded, the sentence names the time.
+    const r = await ao(["zotero", "sync"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("Zotero asked this app to wait until");
+    expect(r.stdout).toBe("");
+    expect(z.requests.length).toBe(n);
+    expect(await history()).toHaveLength(1);
+    const j = await ao(["--json", "zotero", "sync"]);
+    expect(j.code).toBe(1);
+    expect(json(j).error).toContain("Zotero asked this app to wait until");
+    expect(z.requests.length).toBe(n);
+    // In the past: it runs.
+    const file = join(config, ZOTERO_SYNC_HISTORY_FILE);
+    const doc = JSON.parse(await readFile(file, "utf8"));
+    for (const x of doc.libraries[libraryId]) if (x.backoffUntil) x.backoffUntil = new Date(Date.now() - 60_000).toISOString();
+    await writeFile(file, JSON.stringify(doc));
+    const again = await ao(["zotero", "sync"]);
+    expect(again.code, again.stderr).toBe(0);
+    expect(z.requests.length).toBeGreaterThan(n);
+    expect((await history())[0]).toMatchObject({ outcome: "finished" });
+  });
 
-  // R78 d asks for exit 2 when the project's rules deny a run. The runner records a refusal by the rules as the generic
-  // reason "error" (zotero-sync.ts, the `BatchRefusedError` branch), so the command line cannot tell it from any other
-  // failure and exits 1. Reported to the coordinator (Task Z12); this test is written when the record can say it.
-  it.todo("a run the project's rules deny exits 2, and says the rules' own words");
+  it("a run the project's rules deny exits 2, and says the shared sentence, not the engine's", async () => {
+    // An encrypted project that is not declared free of identifiable data: the rules refuse an import of it.
+    const made = await ao(["--json", "project", "create", "Strict", "--encrypt", "--capture", "zotero_import"]);
+    expect(made.code, made.stderr).toBe(0);
+    articles(1);
+    await linked(link(U, { projectId: json(made).id }));
+    const r = await ao(["zotero", "sync"]);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toContain(ZOTERO_SYNC_REASON_TEXT["rules-denied"]);
+    expect(r.stdout).not.toContain("legal basis");
+    expect((await history())[0]).toMatchObject({ outcome: "failed", reason: "rules-denied" });
+    const j = await ao(["--json", "zotero", "sync"]);
+    expect(j.code).toBe(2);
+    expect(json(j).runs[0].run.reason).toBe("rules-denied");
+  });
 
   it("a library held by the app is read-only: nothing runs", async () => {
     articles(2);

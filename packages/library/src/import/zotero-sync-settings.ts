@@ -73,7 +73,9 @@ export type ZoteroSyncReason =
    */
   | "changes-incomplete"
   /** R244 (b): `failed` — this link's unfinished batch could never be resumed and was ended (what came in stays); `note` holds the engine's sentence. */
-  | "batch-ended";
+  | "batch-ended"
+  /** R295 (b): `failed` — the project's rules refused the sync (at a batch's start or its resumption); nothing was changed. */
+  | "rules-denied";
 
 export const ZOTERO_SYNC_REASONS: readonly ZoteroSyncReason[] = [
   "offline",
@@ -96,6 +98,7 @@ export const ZOTERO_SYNC_REASONS: readonly ZoteroSyncReason[] = [
   "deletions-unconfirmed",
   "changes-incomplete",
   "batch-ended",
+  "rules-denied",
 ];
 
 export type ZoteroSyncPause = "key-refused" | "library-gone" | "undone";
@@ -528,6 +531,20 @@ function settled(r: ZoteroSyncRun): ZoteroSyncRun {
 export async function readZoteroSyncHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<ZoteroSyncRun[]> {
   const f = await readFileStrict(dir, ZOTERO_SYNC_HISTORY_FILE, isHistoryFile, o);
   return (own(f?.libraries, libraryId) ?? []).map((r) => settled(structuredClone(r)));
+}
+
+/**
+ * R295 (a): the latest back-off any record of the history carries (ms since the epoch), so a back-off outlives a restart
+ * of the service and is seen by the command line. Undefined when no record carries one; an unreadable date is ignored.
+ * The caller gives it to `zoteroSyncBackoff` (the clock rule) or to the runner as `backoffUntil`.
+ */
+export function zoteroHistoryBackoff(runs: readonly Pick<ZoteroSyncRun, "backoffUntil">[]): number | undefined {
+  let max: number | undefined;
+  for (const r of runs) {
+    const t = r.backoffUntil ? Date.parse(r.backoffUntil) : NaN;
+    if (Number.isFinite(t)) max = Math.max(max ?? t, t);
+  }
+  return max;
 }
 
 /**

@@ -5,8 +5,10 @@ import {
   ZoteroAccountError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
+  readZoteroSyncHistory,
   readZoteroSyncSettings,
   syncZoteroLibrary,
+  zoteroHistoryBackoff,
   zoteroSyncBackoff,
   zoteroSyncRunCounts,
   type ZoteroSyncDeps,
@@ -66,6 +68,8 @@ function pauseSentence(paused: string): string {
 function exitForRun(r: ZoteroSyncRun): number {
   if (r.outcome === "up-to-date" || r.outcome === "finished") return EXIT.ok;
   if (r.outcome === "failed" && r.reason === "key-missing") return EXIT.needsAction;
+  // R295 b / R78 d: the project's rules refused it.
+  if (r.outcome === "failed" && r.reason === "rules-denied") return EXIT.denied;
   return EXIT.failure;
 }
 /** The worst of two exit codes, in the command line's order: denied 2, then needs-the-researcher 4, then failure 1. */
@@ -147,6 +151,17 @@ export function registerZotero(program: Command): void {
         if (aside) {
           throw new ExitError("This computer's Zotero sync settings were damaged, so they were set aside and no library is linked. Nothing was synced.", EXIT.failure, "The app shows a notice about it. Link your libraries again on its Zotero screen.");
         }
+        // R295 a: a back-off any earlier run recorded (the app's or this command's) is obeyed before Zotero is asked anything:
+        // nothing requested, nothing recorded, the sentence with its time (as the service refuses, before it looks at the links).
+        let earlier: ZoteroSyncRun[];
+        try {
+          earlier = await readZoteroSyncHistory(s.deps.appConfigDir, s.lib.id);
+        } catch (err) {
+          if (err instanceof ZoteroSyncFileUnreadableError) throw new ExitError(ZOTERO_SYNC_SENTENCES.settingsUnreadable, EXIT.failure);
+          throw err;
+        }
+        const inForce = zoteroSyncBackoff(zoteroHistoryBackoff(earlier), Date.now());
+        if (inForce !== undefined) throw new ExitError(zoteroSyncReasonText("backing-off", new Date(), new Date(inForce).toISOString()), EXIT.failure);
         let targets: ZoteroSyncLink[];
         if (o.ref !== undefined) {
           const one = settings.links.find((l) => l.ref === o.ref);

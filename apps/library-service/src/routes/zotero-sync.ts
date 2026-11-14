@@ -30,6 +30,7 @@ import {
   scrubPaths,
   syncZoteroLibrary,
   updateZoteroSyncSettings,
+  zoteroHistoryBackoff,
   zoteroSyncBackoff,
   zoteroSyncRunCounts,
   zoteroSyncRunning,
@@ -321,7 +322,7 @@ export class ZoteroSyncHolder {
         return newer ? undefined : runs;
       },
       obstacle: (link) => this.obstacleTo(state, link),
-      backoffUntil: (history) => this.backoffInForce(now(), historyBackoff(history)),
+      backoffUntil: (history) => this.backoffInForce(now(), zoteroHistoryBackoff(history)),
       run: (link) => {
         const o = state.session;
         if (!o?.index || o.lib.mode !== "read-write") return Promise.reject(new Error("no library is open"));
@@ -411,16 +412,6 @@ async function withCounts(s: Session, run: LibraryRun, read = true): Promise<Zot
   if (!read || !run.batchId || lockedNow(s, run.projectId)) return rest;
   const counts = await zoteroSyncRunCounts(s.repo, run.projectId, run.batchId);
   return counts ? { ...rest, counts } : rest;
-}
-
-/** The latest back-off any record of this library carries (ms), so a back-off outlives a restart of the service. */
-function historyBackoff(runs: readonly LibraryRun[]): number | undefined {
-  let max: number | undefined;
-  for (const r of runs) {
-    const t = r.backoffUntil ? Date.parse(r.backoffUntil) : NaN;
-    if (Number.isFinite(t)) max = Math.max(max ?? t, t);
-  }
-  return max;
 }
 
 /** This computer's sync files, refused in our words (never a path). */
@@ -531,7 +522,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
         ...(waitingFor ? { waitingFor } : {}),
       });
     }
-    const backoff = holder.backoffInForce(now().getTime(), historyBackoff(history));
+    const backoff = holder.backoffInForce(now().getTime(), zoteroHistoryBackoff(history));
     // R274 c: when the scheduler would next start a run, from these same settings and records ("not before").
     // Settings or records written by a newer version: nothing is scheduled (R269 c, R276 d).
     const next = holder.scheduler?.nextRunAt({ settings: newer || historyNewer ? undefined : settings, history });
@@ -580,7 +571,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     // A key is never taken here (R78): storing it is the secrets route's work. Neither echoed nor logged.
     if (Object.keys(b).length) throw badRequest(ZOTERO_SYNC_SENTENCES.keyNotChecked);
     const s = state.session;
-    const fromHistory = s ? historyBackoff(await readHistory(dir(), s.lib.id).catch(() => [])) : undefined;
+    const fromHistory = s ? zoteroHistoryBackoff(await readHistory(dir(), s.lib.id).catch(() => [])) : undefined;
     const wait = holder.backoffInForce(now().getTime(), fromHistory);
     // No request of any kind inside a back-off (Global Constraints).
     if (wait !== undefined) throw backingOff(wait);
@@ -650,7 +641,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     if (b.ref !== undefined && (typeof b.ref !== "string" || !REF.test(b.ref))) throw badRequest('"ref" must be user:<number> or group:<number>.');
     if (holder.running) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.alreadyRunning);
     const [settings, history] = await Promise.all([readSettings(dir(), s.lib.id), readHistory(dir(), s.lib.id)]);
-    const fromHistory = historyBackoff(history);
+    const fromHistory = zoteroHistoryBackoff(history);
     const wait = holder.backoffInForce(now().getTime(), fromHistory);
     if (wait !== undefined) throw backingOff(wait);
     let links: ZoteroSyncLink[];

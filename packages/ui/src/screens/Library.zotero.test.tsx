@@ -165,6 +165,15 @@ describe("Library: the Zotero lines", () => {
     expect(box.querySelector("[style], [class*=ok], [class*=success]")).toBeNull();
   });
 
+  it("R295 b: a run the project's rules refused shows the shared sentence, as a failure", async () => {
+    useService(() => stateOf([{ ref: "user:42", projectId: "p1", lastRun: run({ outcome: "failed", reason: "rules-denied", counts: undefined as never }) }]));
+    await open();
+    const box = await screen.findByTestId("zotero-lines");
+    expect(box.textContent).toContain("Could not sync with Zotero");
+    expect(box.textContent).toContain("This project's rules do not allow this sync. Change them in the project's Governance settings.");
+    expect(box.textContent).not.toMatch(/up to date|nothing has changed|Last synced/iu);
+  });
+
   it("a paused link and a locked project say what the service says", async () => {
     useService(() =>
       stateOf([
