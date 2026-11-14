@@ -30,6 +30,8 @@ import {
 } from "./review.js";
 import { SimulatedCrash, seams, type CrashPoint } from "./testing.js";
 import { addCapturedOriginal } from "./repo.js";
+import { runMutation } from "./mutate.js";
+import { REVIEW_FILE } from "./review.js";
 import { FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_REVIEW_TEXT } from "@ao/shared";
 import type { RepoCore } from "./state.js";
 
@@ -469,6 +471,44 @@ describe("Task F17 (R329 e, f): a file handed over through the researcher's libr
     await expect(resolveHeldFile(coreOf(), w.p.id, r.reviewId, "attach")).rejects.toMatchObject({ name: "PolicyDeniedError" });
     expect((await kit.repo.getSource(w.p.id, w.sourceId)).assets).toEqual([]);
     expect(await pending(w)).toHaveLength(1);
+    expect(await heldFiles(w)).toHaveLength(1);
+  });
+
+  it("R338 e: the method is looked at again inside the attach's change — an entry rewritten meanwhile under another method is refused; nothing is attached", async () => {
+    const w = await worldUnder(LIB_ONLY);
+    const r = await holdHanded(w, LOOKS_RIGHT);
+    const core = coreOf();
+    const [held] = (await pending(w)).filter((e) => e.id === r.reviewId);
+    // Another change holds the write turn. Meanwhile "Use this file" reads the entry (library_access, which the rules
+    // allow), asks the rules about that method, and waits behind it; the other change then rewrites the entry as a free
+    // copy (which the rules do not allow).
+    let open!: () => void;
+    const gate = new Promise<void>((res) => (open = res));
+    const serial = core.serial.bind(core);
+    let queued = 0;
+    core.serial = ((fn: () => Promise<unknown>) => {
+      queued++;
+      return serial(fn);
+    }) as typeof core.serial;
+    try {
+      const rewriting = runMutation(core, w.p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, async (tx) => {
+        await gate;
+        await tx.appendLine(`${tx.state.rel}/${REVIEW_FILE}`, JSON.stringify({ ...held!, heldFile: { ...held!.heldFile!, acquired: facts().acquired } }));
+      });
+      const attach = resolveHeldFile(core, w.p.id, r.reviewId, "attach");
+      attach.catch(() => undefined);
+      const end = Date.now() + 15_000;
+      while (queued < 2) {
+        if (Date.now() > end) throw new Error("timed out waiting for the attach to queue its change");
+        await new Promise((res) => setTimeout(res, 5));
+      }
+      open();
+      await rewriting;
+      await expect(attach).rejects.toThrow(/how this file was got/u);
+    } finally {
+      core.serial = serial;
+    }
+    expect((await kit.repo.getSource(w.p.id, w.sourceId)).assets).toEqual([]);
     expect(await heldFiles(w)).toHaveLength(1);
   });
 
