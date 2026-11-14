@@ -37,8 +37,14 @@
  * out nothing), WhereToGetIt gives each link that control in the desktop app; a press is the act "link" with that
  * link's address, which the screen starts as it starts the library's. A file of a link's start that was not kept is
  * said in FIND_LINK_FILE_TEXT (`library.lastFileFrom === "link"`), never in the library's words.
+ *
+ * Task F20c (R348 h, e): in the desktop app, where the view says `browserStart === true` (the row works out nothing),
+ * "Get through my library in my own browser" follows "Get through my library"; outside the desktop app it is absent. A
+ * row waiting in the researcher's own browser (`waitingIn === "browser"`) says "Waiting for you in your browser" and how
+ * to send the PDF, and offers "Cancel" — nothing of the sign-in window. A file sent from the browser that was not kept is
+ * said in FIND_BROWSER_FILE_TEXT (`library.lastFileFrom === "browser"`).
  */
-import { FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, FIND_LIBRARY_TEXT, FIND_LINK_FILE_TEXT, FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindLibraryFileOutcome, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
+import { FIND_BROWSER_FILE_TEXT, FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, FIND_LIBRARY_TEXT, FIND_LINK_FILE_TEXT, FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindLibraryFileOutcome, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
 import { Component, memo, useId, type ReactNode } from "react";
 import { creatorsText, isKnownState, kindWords, usableCandidates, yearOf } from "../api/find";
 import { inDesktopShell } from "../desktopShell";
@@ -62,7 +68,9 @@ export type FindActKind =
   | "library-take"
   | "library-cancel"
   // Task F18c (R345): "Open it here and fetch the PDF" on one of the row's links.
-  | "link";
+  | "link"
+  // Task F20c (R348 h): "Get through my library in my own browser".
+  | "browser";
 
 /** What the researcher pressed on a row. */
 export interface FindAction {
@@ -126,6 +134,14 @@ export const FIND_TEXT = {
   noWindowLink: "The sign-in window is not open for this work. Cancel, then use “Open it here and fetch the PDF” again.",
   handedOver: "The file was fetched and is being checked.",
   appSilent: "The app did not answer. Try again.",
+  // Task F20c (R348 h): the researcher's own browser. None of these says or implies that the app adds a file (R301).
+  /** The phrase of a row waiting in the browser (`waitingIn: "browser"`). */
+  waitingBrowser: "Waiting for you in your browser",
+  /** What the researcher does in the browser, on that row. */
+  browserHow:
+    "Sign in to your library in your browser and open the PDF. Then press the Alexandrine Oxiana button in the browser's toolbar and choose “Send this tab's PDF”. The file will wait for your check here.",
+  /** The shell could not open the browser: the wait was cancelled (the counterpart of `windowNotOpened`). */
+  browserNotOpened: "Your browser could not be opened, so nothing is waiting. Try again.",
 } as const;
 
 /** Reasons on "record-complete" that "Try again" takes (F11: the rules, the store part, the waiting files' limit; R326 adds "switched off" by the settings in `actionsOf`). */
@@ -160,8 +176,12 @@ const lastFileSentence = (e: FindEntryView): string | undefined => {
   const f = lastFileOf(e);
   if (!f) return undefined;
   const from = libraryOf(e)?.lastFileFrom;
-  return from === undefined ? FIND_LIBRARY_FILE_TEXT[f] : from === "link" ? FIND_LINK_FILE_TEXT[f] : undefined;
+  return from === undefined ? FIND_LIBRARY_FILE_TEXT[f] : from === "link" ? FIND_LINK_FILE_TEXT[f] : from === "browser" ? FIND_BROWSER_FILE_TEXT[f] : undefined;
 };
+/** F20c (R348 e, h): the service offers "Get through my library in my own browser" — exactly `browserStart: true`. */
+export const browserOffered = (e: FindEntryView): boolean => e.browserStart === true;
+/** F20c (R348 e): the entry waits for a PDF sent from the researcher's own browser, not in the sign-in window. */
+export const waitsInBrowser = (e: FindEntryView): boolean => e.state === "waiting-sign-in" && e.waitingIn === "browser";
 /** F18c (R345 b): the service offers "Open it here and fetch the PDF" for this entry's links. */
 export const linkOffered = (e: FindEntryView): boolean => e.linkStart === true;
 /** The acts that need the desktop shell: outside it they are shown unavailable and do nothing (R340 a). */
@@ -271,6 +291,9 @@ export function stateWords(e: FindEntryView, ctx: { stopped?: boolean; place?: F
       if (ctx.place?.status === "locked") return [e.state === "already" ? FIND_TEXT.elsewhereLocked : FIND_TEXT.maybeElsewhereLocked];
       return [e.state === "already" ? FIND_TEXT.elsewhereLoading : "Possibly already in another of your projects"];
     }
+    case "waiting-sign-in":
+      // R348 h: where the work waits is the view's word (`waitingIn`), never worked out here.
+      return [waitsInBrowser(e) ? FIND_TEXT.waitingBrowser : STATE_WORDS["waiting-sign-in"]];
     default:
       return [STATE_WORDS[e.state]];
   }
@@ -337,8 +360,10 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
       if (e.sourceId) out.push("open");
       break;
     case "waiting-sign-in":
-      // R340 b: the shell's take, the service's cancel; "Open" and removal as before.
-      out.push("library-take", "library-cancel");
+      // R340 b: the shell's take, the service's cancel; "Open" and removal as before. R348 h: waiting in the browser,
+      // only the cancel — the sign-in window's take has nothing to take there.
+      if (!waitsInBrowser(e)) out.push("library-take");
+      out.push("library-cancel");
       if (e.sourceId && !recordRemoved(e)) out.push("open");
       break;
     default:
@@ -349,6 +374,13 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
   if (libraryOffered(e) && e.state !== "waiting-sign-in") {
     const at = out.findIndex((k) => k === "open" || k === "open-there");
     out.splice(at === -1 ? out.length : at, 0, "library");
+  }
+  // R348 h: "Get through my library in my own browser" exactly where the service offers it, right after "Get through my
+  // library" (the row shows it only in the desktop app).
+  if (browserOffered(e) && e.state !== "waiting-sign-in") {
+    const lib = out.indexOf("library");
+    const at = lib !== -1 ? lib + 1 : out.findIndex((k) => k === "open" || k === "open-there");
+    out.splice(at === -1 ? out.length : at, 0, "browser");
   }
   out.push("remove");
   return out;
@@ -372,6 +404,7 @@ const ACT_TEXT: Record<FindActKind, string> = {
   "library-take": "Add the PDF showing in the sign-in window",
   "library-cancel": "Cancel",
   link: "Open it here and fetch the PDF",
+  browser: "Get through my library in my own browser",
 };
 const BUSY_TEXT: Partial<Record<FindActKind, string>> = {
   choose: "Choosing…",
@@ -385,6 +418,7 @@ const BUSY_TEXT: Partial<Record<FindActKind, string>> = {
   "library-take": "Asking the sign-in window…",
   "library-cancel": "Cancelling…",
   link: "Opening the sign-in window…",
+  browser: "Opening your browser…",
 };
 /** Acts that only read: allowed in a read-only library. */
 const READS: ReadonlySet<FindActKind> = new Set(["open", "open-there"]);
@@ -448,14 +482,17 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
   const mark = known ? MARKS[e.state] : undefined;
   const author = known && isAuthorEntry(e);
   const morePeople = known && e.state === "choose-person" && e.morePeople === true;
-  const actions = actionsOf(e, place);
+  // R348 h: "Get through my library in my own browser" only in the desktop app (outside it: absent, not unavailable).
+  const desktop = inDesktopShell();
+  const actions = actionsOf(e, place).filter((k) => k !== "browser" || desktop);
   // "Where to get it" (R340 d): wherever the view carries links — never on a record removed from the library (R282 g).
   const showOffers = known && !recordRemoved(e) && Array.isArray(e.offers);
   // R340 a, c: the service's sentences for the library part of the view (never one of the row's own).
   const lastFile = known ? lastFileSentence(e) : undefined;
   const noLibrary = known && noLibrarySet(e);
+  // R348 h: a row waiting in the browser says what to do there.
+  const inBrowser = known && waitsInBrowser(e);
   // Outside the desktop app the acts that need the shell are shown unavailable, with why (R340 a).
-  const desktop = inDesktopShell();
   const unavailable = !desktop && actions.some((k) => SHELL_ACTS.has(k));
   const button = (kind: FindActKind) => {
     const working = busy === kind;
@@ -528,6 +565,11 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
           <a href={PATHS.yourLibrary} onClick={inAppLink} data-act="your-library" aria-label={short ? `${FIND_TEXT.yourLibrary}: ${label}` : FIND_TEXT.yourLibrary}>
             {FIND_TEXT.yourLibrary}
           </a>
+        </p>
+      )}
+      {inBrowser && (
+        <p className="ao-find__library">
+          <span className="ao-find__library-how">{FIND_TEXT.browserHow}</span>
         </p>
       )}
       {note && <p className="ao-find__library-note">{note}</p>}

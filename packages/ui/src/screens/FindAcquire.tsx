@@ -54,6 +54,14 @@
  * the closing and the hand-over do not know which start it was — only the words that would name the library untruly
  * (the shell's "no ticket") are chosen by the view's `windowStart`.
  *
+ * "Get through my library in my own browser" (Task F20c; R348 h): the same press once more, `startWindow` with a third
+ * kind — ONE `POST …/browser/start` (no body), whose answer is the library's address and nothing else; the shell opens
+ * that address in the researcher's own browser (`openInBrowser`, as "Open in my browser" does), the paired extension
+ * sends the PDF back to the service. No window of the app opens and no ticket reaches the page, so the page holds none
+ * (`libTicket`, `heldATicket` untouched): the shell's window events are never such a row's, "Cancel" closes no window,
+ * and nothing closes or cancels by itself when the row stops waiting. A browser the shell could not open: the wait is
+ * cancelled (ONE cancel) and the row says so. Where the work waits is the view's word (`waitingIn`).
+ *
  * Through the researcher's library (Task F18b; R340, R301; F15's start and cancel, F16's shell, F17's outcome):
  *   - Every library step is the researcher's press on that row: nothing is started on focus, on hover, on a timer, on
  *     an event or when the screen opens. "Get through my library" is ONE `POST …/library/start` (no body); with its
@@ -86,6 +94,7 @@ import {
   FIND_ROUTE_TEXT,
   type FindAddResponse,
   type FindChosenPerson,
+  type FindBrowserStartResponse,
   type FindEntryView,
   type FindLibraryStartResponse,
   type FindLinkStartRequest,
@@ -102,7 +111,7 @@ import { isProjectLocked, libraryApi, type Collection, type LibraryApi, type Lib
 import { ChoosePersonDialog } from "../components/ChoosePersonDialog";
 import { ChooseWorkDialog } from "../components/ChooseWorkDialog";
 import { ChooseWorksDialog } from "../components/ChooseWorksDialog";
-import { authorOfferOf, entryLabel, FIND_TEXT, FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
+import { authorOfferOf, entryLabel, FIND_TEXT, FindEntryRow, stateWords, waitsInBrowser, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
 import { UserText } from "../components/UserText";
 import { desktopShell, type LibraryWindowEvent, type LibraryWindowFrom } from "../desktopShell";
 import "../components/library.css";
@@ -177,7 +186,15 @@ export function findLibraryApi(client: ApiClient) {
       if (!isValidId(pid) || !isValidId(eid)) throw new Error("That is not a valid id.");
       return client.request<FindLibraryStartResponse>("POST", `/projects/${encodeURIComponent(pid)}/find/${encodeURIComponent(eid)}/link/start`, { body: { url } satisfies FindLinkStartRequest });
     },
-    /** The entry back to what it was; 409 "entry-state" when it no longer waits. */
+    /**
+     * F20c (R348 d): "Get through my library in my own browser" — no body; the answer is the library's address for the
+     * work and nothing else (no ticket: the paired extension sends the file).
+     */
+    browserStart: (pid: string, eid: string) => {
+      if (!isValidId(pid) || !isValidId(eid)) throw new Error("That is not a valid id.");
+      return client.request<FindBrowserStartResponse>("POST", `/projects/${encodeURIComponent(pid)}/find/${encodeURIComponent(eid)}/browser/start`);
+    },
+    /** The entry back to what it was; 409 "entry-state" when it no longer waits (the one cancel serves every kind). */
     cancel: (pid: string, eid: string) => client.request<FindEntryView>("POST", path(pid, eid, "cancel")),
   };
 }
@@ -221,6 +238,12 @@ function windowSentence(e: LibraryWindowEvent, v: FindEntryView): string | undef
       return undefined;
   }
 }
+
+/**
+ * The three kinds of start of one press (`startWindow`): the library's and a link's in the app's sign-in window (with a
+ * ticket), and F20c's (R348 h) in the researcher's own browser (no ticket, no window of the app).
+ */
+type StartHow = { kind: "library" } | { kind: "link"; url: string } | { kind: "browser" };
 
 /** A sentence shown on a row about its fetch through the library: `whileWaiting` ones go when the row stops waiting. */
 interface LibraryNote {
@@ -1597,7 +1620,7 @@ function ProjectQueue(props: {
    * ticket also in `libTicket` while the row waits). A window that did not open leaves nothing waiting: the start is
    * cancelled (the one cancel route serves both kinds).
    */
-  const startWindow = async (e: FindEntryView, how: { kind: "library" } | { kind: "link"; url: string }) => {
+  const startWindow = async (e: FindEntryView, how: StartHow) => {
     // R342 i: outside the desktop app a press says why, once, and asks nothing.
     if (!shell) {
       sayAct([FIND_TEXT.onlyDesktop]);
@@ -1612,23 +1635,31 @@ function ProjectQueue(props: {
     const g = gen.current;
     const live = () => alive.current && g === gen.current;
     try {
-      let got: FindLibraryStartResponse;
+      let got: Partial<FindLibraryStartResponse> | FindBrowserStartResponse;
       try {
-        got = how.kind === "link" ? await libApi.linkStart(projectId, e.id, how.url) : await libApi.start(projectId, e.id);
+        got = how.kind === "link" ? await libApi.linkStart(projectId, e.id, how.url) : how.kind === "browser" ? await libApi.browserStart(projectId, e.id) : await libApi.start(projectId, e.id);
       } catch (err) {
         if (!live() || refused(err)) return;
         setErrorFor(e.id, sentenceOf(err, "That could not be done. Try again."));
         return;
       }
-      // R342 d: from the first start's answer on, this page has held a ticket.
-      heldATicket.current = true;
-      const ticket = typeof got?.ticket === "string" ? got.ticket : "";
       const address = typeof got?.url === "string" ? got.url : "";
+      let ticket = "";
       let opened = false;
-      // The screen was left (or the library changed) meanwhile: no window is opened, and the start is cancelled below.
-      if (live() && ticket && address) {
-        libTicket.current = { entryId: e.id, ticket };
-        opened = await openWindow(ticket, address, how.kind, live);
+      if (how.kind === "browser") {
+        // R348 c, h: the browser's start gives the page no ticket, so it holds none — `heldATicket` and `libTicket` are
+        // the window's, and stay as they were (no window event can then be taken for this row). The screen left (or the
+        // library changed) meanwhile: the browser is not opened, and the start is cancelled below.
+        if (live() && address) opened = (await shellWithin(shell.openInBrowser(address))) === true;
+      } else {
+        // R342 d: from the first start's answer on, this page has held a ticket.
+        heldATicket.current = true;
+        ticket = "ticket" in got && typeof got.ticket === "string" ? got.ticket : "";
+        // The screen was left (or the library changed) meanwhile: no window is opened, and the start is cancelled below.
+        if (live() && ticket && address) {
+          libTicket.current = { entryId: e.id, ticket };
+          opened = await openWindow(ticket, address, how.kind, live);
+        }
       }
       if (opened) {
         // R342 c: the focus goes to the row's own words — never onto a control that acts (the start's control goes).
@@ -1643,12 +1674,12 @@ function ProjectQueue(props: {
         return;
       }
       // Not opened (refused twice, failed, or no answer in time): the page forgets the ticket, and the entry goes back.
-      if (libTicket.current?.ticket === ticket) libTicket.current = null;
+      if (ticket && libTicket.current?.ticket === ticket) libTicket.current = null;
       try {
         const back = await libApi.cancel(projectId, e.id);
         if (!live()) return;
         const t = takeOne(back);
-        setNoteFor(e.id, { text: FIND_TEXT.windowNotOpened, whileWaiting: false });
+        setNoteFor(e.id, { text: how.kind === "browser" ? FIND_TEXT.browserNotOpened : FIND_TEXT.windowNotOpened, whileWaiting: false });
         if (t.changed) sayRows([e.id]);
         readSoon();
       } catch (err) {
@@ -1686,8 +1717,11 @@ function ProjectQueue(props: {
     setErrorFor(e.id, undefined);
     const g = gen.current;
     // The window this page opened for the row is ended as R342 a says (closed once); one it did not open (a page loaded
-    // afresh) is closed as before.
+    // afresh) is closed as before. R348 h: a row waiting in the researcher's own browser has no window — none is closed
+    // (a window open now is another's: a leftover, or the settings screen's Test).
+    const inBrowser = waitsInBrowser(e);
     const closeWindow = () => {
+      if (inBrowser) return;
       const t = libTicket.current;
       if (t?.entryId === e.id) endWindow(t.ticket);
       else if (shell) void shellWithin(shell.closeLibraryWindow());
@@ -1752,12 +1786,15 @@ function ProjectQueue(props: {
       else return;
     } else {
       if (heldATicket.current) return;
-      const waitingNow = [...held.current.values()].map((h) => h.view).filter((v) => v.state === "waiting-sign-in");
+      // R348 h: a row waiting in the researcher's own browser is never the window's row.
+      const waitingNow = [...held.current.values()].map((h) => h.view).filter((v) => v.state === "waiting-sign-in" && !waitsInBrowser(v));
       if (waitingNow.length !== 1) return;
       id = waitingNow[0]!.id;
     }
     const v = held.current.get(id)?.view;
-    if (!v || ev.state === "opened") return;
+    // R348 h: and no window event counts for a row the service says waits in the browser (the page's own ticket's row
+    // that now waits there could only be a later start's: its window has nothing to do with it).
+    if (!v || ev.state === "opened" || waitsInBrowser(v)) return;
     if (ev.state === "closed") {
       const handed = !!mine?.handedOver || handedOverRows.current.has(id);
       if (mine) endTicketOf(id);
@@ -1840,6 +1877,10 @@ function ProjectQueue(props: {
       case "link":
         // F18c (R345): the link pressed, as the row's "Where to get it" parsed it from the view.
         if (typeof a.url === "string" && a.url) void startWindow(e, { kind: "link", url: a.url });
+        return;
+      case "browser":
+        // F20c (R348 h): the same press, in the researcher's own browser.
+        void startWindow(e, { kind: "browser" });
         return;
       case "library-take":
         void takePdf(e);
