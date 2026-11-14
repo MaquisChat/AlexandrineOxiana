@@ -205,6 +205,30 @@ describe("LinkedRelativePath (R24)", () => {
   });
 });
 
+describe("Asset.acquired: how a file was got (Find and acquire F11, plan ruling 6)", () => {
+  const base = () => ({ ...fixture().assets[0]! });
+  const acquired = {
+    method: "free_copy",
+    via: "service",
+    service: "arxiv",
+    address: "https://arxiv.org/pdf/2101.00001",
+    at: "2026-11-14T10:00:00.000Z",
+    tool: { name: "find-and-acquire", version: "0.1.0" },
+    access: "public",
+    check: { result: "match", by: "doi" },
+  };
+  it("is kept on an asset, with the check that let it in", () => {
+    expect(Asset.parse({ ...base(), acquired }).acquired).toEqual(acquired);
+    const accepted = { result: "accepted-after-mismatch", why: "other-doi" };
+    expect(Asset.parse({ ...base(), acquired: { ...acquired, check: accepted } }).acquired?.check).toEqual(accepted);
+  });
+  it("refuses an unknown method, way, service or access, and an address over 2,000 characters", () => {
+    for (const bad of [{ method: "browser_capture" }, { via: "email" }, { service: "scihub" }, { access: "private" }, { address: `https://arxiv.org/${"x".repeat(2000)}` }, { check: { result: "match", by: "guess" } }]) {
+      expect(Asset.safeParse({ ...base(), acquired: { ...acquired, ...bad } }).success, JSON.stringify(bad)).toBe(false);
+    }
+  });
+});
+
 describe("LibraryRelativePath", () => {
   it("rejects unsafe paths", () => {
     for (const p of ["/etc/x", "a\\b", "a/../b", "..", "C:/x", "c:x", ""]) {

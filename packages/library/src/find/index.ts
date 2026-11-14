@@ -89,3 +89,9 @@ export type { SearchSettingsProblem, SearchSettingsRead, SearchSourceTestGroup, 
 export { ELICIT_MAX_RESULTS, ELICIT_PAUSE_MS, ELICIT_TIMEOUT_MS, ELICIT_URL, elicitLastRefusal, elicitPausedUntil, elicitSearch, forgetElicitRefusal } from "./elicit.js";
 export { FETCH_FILE_CONCURRENCY, FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FETCH_FILE_MAX_REDIRECTS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
 export type { FetchFileErrorCode } from "./fetch-file.js";
+// Task F11: the file check, the free copy into its source, and a mismatch held for the review queue.
+export { FIND_CHECK_TIMEOUT_MS, FIND_DOWNLOAD_TIMEOUT_MS, cleanAcquiredAddress } from "./runner.js";
+export { FILE_CHECK_EVIDENCE_CHARS, FILE_CHECK_TEXT_CHARS, checkFileAgainstRecord } from "./file-check.js";
+export type { FileCheckRecord, FileCheckResult, FileEvidence, FileMismatchWhy } from "./file-check.js";
+export { FIND_HELD_DIR, FIND_HELD_MAX, HELD_FILE_REASON, HeldFileLimitError, HeldFileSourceGoneError, HeldFileSourceHasFileError } from "../repo/review.js";
+export type { HeldFileCause, HeldFileFacts, HeldFileWhy } from "../repo/review.js";

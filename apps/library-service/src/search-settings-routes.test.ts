@@ -18,6 +18,8 @@ import { SEARCH_SETTINGS_TEXT, SEARCH_SOURCE_TEST_TIMEOUT_MS as FIND_SOURCE_TEST
 import { useMemorySecrets, useNoSecretStore } from "../../../packages/library/src/secrets-testing.js";
 import { _resetElicitForTests } from "../../../packages/library/src/find/elicit.js";
 import { _setSecretBackend } from "../../../packages/library/src/secrets.js";
+import { appendFindEntriesIn } from "../../../packages/library/src/repo/repo.js";
+import { newId } from "@ao/core";
 import { createService, type LibraryService } from "./server.js";
 import { SEARCH_KEY_WAIT_MS } from "./state.js";
 import type { ServiceEvent } from "./events.js";
@@ -56,6 +58,8 @@ const errorBodies: string[] = [];
 let crossrefDelay = 0;
 /** The status of Elicit's answers (200: nothing found). */
 let elicitStatus = 200;
+/** R297 c: OpenAlex answers that its daily allowance is spent to every request that carries no key. */
+let oaSpentWithoutKey = false;
 
 function headersOf(h: unknown): Record<string, string> {
   const out: Record<string, string> = {};
@@ -80,11 +84,20 @@ function mockServices(): void {
       return json({ status: "ok", message: { items: String(o.path).includes("Zorblatt") ? [ZORBLATT] : [] } });
     })
     .persist();
-  agent.get("https://api.openalex.org").intercept({ path: () => true, method: "GET" }).reply(() => json({ meta: { count: 0 }, results: [] })).persist();
+  // Task F11 (as in find-routes.test.ts): a record made goes on to look for a free copy; in this made-up world no
+  // service has one — a 404 for a work by its DOI and from the other free-copy services.
+  agent.get("https://api.openalex.org").intercept({ path: (p: string) => p.startsWith("/works/doi:"), method: "GET" }).reply(() => ({ statusCode: 404, data: "{}" })).persist();
+  agent
+    .get("https://api.openalex.org")
+    .intercept({ path: () => true, method: "GET" })
+    .reply((o) =>
+      // R297 c: OpenAlex's free daily allowance spent for requests without a key (a test sets it).
+      oaSpentWithoutKey && !headersOf(o.headers).authorization ? { statusCode: 429, data: JSON.stringify({ error: "Rate limit exceeded", message: "You have exceeded your daily budget." }) } : json({ meta: { count: 0 }, results: [] }),
+    )
+    .persist();
   agent.get("https://elicit.com").intercept({ path: "/api/v2/search/papers", method: "POST" }).reply(() => (elicitStatus === 200 ? json({ papers: [] }) : { statusCode: elicitStatus, data: "no" })).persist();
   agent.get("https://api.unpaywall.org").intercept({ path: () => true, method: "GET" }).reply(() => json({ is_oa: false })).persist();
-  agent.get("https://export.arxiv.org").intercept({ path: () => true, method: "GET" }).reply(() => ({ statusCode: 200, data: "<feed/>" })).persist();
-  for (const o of ["https://www.ebi.ac.uk", "https://api.semanticscholar.org", "https://directory.doabooks.org", "https://archive.org"]) agent.get(o).intercept({ path: () => true, method: "GET" }).reply(() => json({})).persist();
+  for (const o of ["https://export.arxiv.org", "https://www.ebi.ac.uk", "https://api.semanticscholar.org", "https://directory.doabooks.org", "https://archive.org"]) agent.get(o).intercept({ path: () => true, method: "GET" }).reply(() => ({ statusCode: 404, data: "{}" })).persist();
   previous = getGlobalDispatcher();
   setGlobalDispatcher(agent.compose(recorder));
 }
@@ -96,6 +109,7 @@ beforeEach(async () => {
   requests = [];
   crossrefDelay = 0;
   elicitStatus = 200;
+  oaSpentWithoutKey = false;
   secrets = useMemorySecrets();
   _resetElicitForTests();
   mockServices();
@@ -184,7 +198,13 @@ async function until<T>(fn: () => Promise<T | undefined | false>, what = "the co
     await new Promise((r) => setTimeout(r, 20));
   }
 }
-const FINAL = ["choose", "already", "maybe-duplicate", "record-complete", "not-found", "failed"];
+const FINAL = ["choose", "already", "maybe-duplicate", "record-complete", "not-found", "failed", "no-open-copy", "in-library", "needs-check"];
+/**
+ * F11 (as in find-routes.test.ts): a record the queue made goes on by itself to look for a free copy ("record-complete" →
+ * "looking-for-copy" → …); this file's made-up services offer none, so such an entry ends "no-open-copy". Each of these
+ * says the record is made; an entry is settled once its free copy's part has ended too (nothing of it left running).
+ */
+const MADE = ["record-complete", "looking-for-copy", "fetching", "no-open-copy"];
 async function addAndSettle(pid: string, line: string): Promise<{ state: string; reason?: unknown }> {
   const r = await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [line] } });
   expect(r.status, r.body).toBe(200);
@@ -192,7 +212,8 @@ async function addAndSettle(pid: string, line: string): Promise<{ state: string;
   return until(async () => {
     const q = await call({ url: `/projects/${pid}/find` });
     const e = q.json.entries.find((x: { id: string }) => x.id === id);
-    return e && FINAL.includes(e.state) ? e : undefined;
+    // F11: "record-complete" with no reason is the moment between the record and the free copy's part: not settled.
+    return e && FINAL.includes(e.state) && !(e.state === "record-complete" && !e.reason) ? e : undefined;
   }, "the entry to settle");
 }
 
@@ -368,7 +389,7 @@ describe("R297 b, R298 g: the OpenAlex key belongs to OpenAlex, is read lazily a
     const pid = await openLibraryWithProject();
     const t0 = Date.now();
     const e = await addAndSettle(pid, LINE);
-    expect(e.state).toBe("record-complete");
+    expect(MADE).toContain(e.state);
     expect(e.reason).toBeUndefined();
     const oa = requests.filter((r) => r.origin === "https://api.openalex.org");
     expect(oa.length).toBeGreaterThan(0);
@@ -769,7 +790,7 @@ describe("each e-mail only on its own service's requests, and Elicit in the serv
     const pid = await openLibraryWithProject(ELICIT_GOV);
     expect((await call({ url: `/settings/search-sources?project=${pid}` })).json.record.find((x: { id: string }) => x.id === "elicit").allowedByRules).toBe(true);
     const e = await addAndSettle(pid, LINE);
-    expect(e.state).toBe("record-complete");
+    expect(MADE).toContain(e.state);
     const toElicit = requests.filter((r) => r.origin === "https://elicit.com");
     expect(toElicit).toHaveLength(1);
     expect(JSON.parse(toElicit[0]!.body!)).toEqual({ query: LINE, maxResults: 10 });
@@ -782,5 +803,137 @@ describe("each e-mail only on its own service's requests, and Elicit in the serv
       else if (r.origin === "https://api.openalex.org") expect(r.headers.authorization).toBe(`Bearer ${OA_KEY}`);
       else expect(r.headers.authorization).toBeUndefined();
     }
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// R312 c (plan A9 "Still to join"): the copy part of the runner reads `copies` and `unpaywallEmail` from the settings
+// the researcher saves (PUT /settings/search-sources → search-sources.json), read when an entry's work starts.
+describe("R312 c: the copy part obeys the saved Search sources (through the service)", () => {
+  const COPY_ORIGINS = ["https://api.unpaywall.org", "https://export.arxiv.org", "https://www.ebi.ac.uk", "https://api.semanticscholar.org", "https://directory.doabooks.org", "https://archive.org"];
+  /** Requests to the free-copy services, by origin (OpenAlex's free-copy request is its single work by DOI). */
+  const copyAsked = () => {
+    const by = new Map<string, number>();
+    for (const r of requests) if (COPY_ORIGINS.includes(r.origin) || (r.origin === "https://api.openalex.org" && r.path.startsWith("/works/doi:"))) by.set(r.origin, (by.get(r.origin) ?? 0) + 1);
+    return by;
+  };
+  const copies = (on: string[]) => ALL_ON.copies.map((x) => ({ id: x.id, on: on.includes(x.id) }));
+  const put = async (body: unknown) => expect((await call({ method: "PUT", url: "/settings/search-sources", body })).status).toBe(200);
+  const newProject = async (name: string) => {
+    const p = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: GOV(), encryption: { enabled: false } } });
+    expect(p.status, p.body).toBe(200);
+    return p.json.project.id as string;
+  };
+
+  it("a copy service switched off is not asked, one switched on is (requests counted per host)", async () => {
+    await start();
+    await put({ ...ALL_ON, copies: copies(["europepmc"]) });
+    const pid = await openLibraryWithProject();
+    const e = await addAndSettle(pid, LINE);
+    expect(e.state).toBe("no-open-copy");
+    expect([...copyAsked().keys()]).toEqual(["https://www.ebi.ac.uk"]);
+  });
+
+  it("every copy service switched off: the entry rests with its record complete, 'switched off' by the settings; nothing asked", async () => {
+    await start();
+    await put({ ...ALL_ON, copies: copies([]) });
+    const pid = await openLibraryWithProject();
+    const e = await addAndSettle(pid, LINE);
+    expect(e).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+    expect(copyAsked().size).toBe(0);
+  });
+
+  it("Unpaywall on with its e-mail saved: asked, with the e-mail, which goes to no other host", async () => {
+    await start();
+    await put({ ...ALL_ON, copies: copies(["unpaywall", "openalex"]), unpaywallEmail: UNPAYWALL_EMAIL });
+    const pid = await openLibraryWithProject();
+    await addAndSettle(pid, LINE);
+    const toUnpaywall = requests.filter((r) => r.origin === "https://api.unpaywall.org");
+    expect(toUnpaywall).toHaveLength(1);
+    expect(decodeURIComponent(toUnpaywall[0]!.path)).toContain(`email=${UNPAYWALL_EMAIL}`);
+    for (const r of requests.filter((x) => x.origin !== "https://api.unpaywall.org")) {
+      expect(decodeURIComponent(JSON.stringify(r))).not.toContain(UNPAYWALL_EMAIL);
+    }
+    expect(copyAsked().get("https://api.openalex.org")).toBe(1);
+  });
+
+  it("Unpaywall off with its e-mail saved: not asked", async () => {
+    await start();
+    await put({ ...ALL_ON, copies: copies(["openalex"]), unpaywallEmail: UNPAYWALL_EMAIL });
+    const pid = await openLibraryWithProject();
+    await addAndSettle(pid, LINE);
+    expect(requests.filter((r) => r.origin === "https://api.unpaywall.org")).toEqual([]);
+    expect([...copyAsked().keys()]).toEqual(["https://api.openalex.org"]);
+    for (const r of requests) expect(decodeURIComponent(JSON.stringify(r))).not.toContain(UNPAYWALL_EMAIL);
+  });
+
+  it("a save takes effect for the next entry, without a restart", async () => {
+    await start();
+    await put({ ...ALL_ON, copies: copies([]) });
+    const pid = await openLibraryWithProject();
+    const first = await addAndSettle(pid, LINE);
+    expect(first).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+    expect(copyAsked().size).toBe(0);
+    await put({ ...ALL_ON, copies: copies(["openalex"]) });
+    const second = await addAndSettle(await newProject("Second"), LINE);
+    expect(second.state).toBe("no-open-copy");
+    expect([...copyAsked().entries()]).toEqual([["https://api.openalex.org", 1]]);
+  });
+
+  it("no settings saved: F12's defaults for copies — every free-copy service but Unpaywall may be asked; Unpaywall is not", async () => {
+    await start();
+    const pid = await openLibraryWithProject();
+    expect((await call({ url: "/settings/search-sources" })).json.copies.map((x: { id: string; on: boolean }) => [x.id, x.on])).toEqual(ALL_ON.copies.map((x) => [x.id, x.on]));
+    await addAndSettle(pid, LINE);
+    const asked = copyAsked();
+    expect(asked.has("https://api.unpaywall.org")).toBe(false);
+    for (const o of ["https://api.openalex.org", "https://www.ebi.ac.uk", "https://api.semanticscholar.org"]) expect(asked.get(o), o).toBe(1);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// R312 c with R297 c: a key added (PUT) wakes the entries waiting for OpenAlex's spent allowance, without a restart.
+describe("R297 c: an OpenAlex key saved wakes the entries waiting for the allowance (through the service)", () => {
+  /** Crossref knows nothing of these words (no "Zorblatt"), so the entry waits for OpenAlex. */
+  const WAITING_LINE = "Grammar of Habitus, Quillfeather";
+  const entryOf = async (pid: string, id: string) => (await call({ url: `/projects/${pid}/find` })).json.entries.find((x: { id: string }) => x.id === id);
+  const searches = () => requests.filter((r) => r.origin === "https://api.openalex.org" && r.path.startsWith("/works?search="));
+  async function waitingForAllowance(): Promise<{ pid: string; id: string }> {
+    oaSpentWithoutKey = true;
+    const pid = await openLibraryWithProject();
+    const r = await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [WAITING_LINE] } });
+    expect(r.status, r.body).toBe(200);
+    const id = r.json.added[0].id as string;
+    await until(async () => ((e) => e?.state === "looking-up" && e.reason?.code === "budget")(await entryOf(pid, id)), "the wait for the allowance");
+    expect(searches()).toHaveLength(1);
+    return { pid, id };
+  }
+
+  it("the PUT of the key: the waiting entry goes on at once, asked with the key; nothing restarted", async () => {
+    await start();
+    const { pid, id } = await waitingForAllowance();
+    // Another entry waits for another reason (an ordinary retry), stored as the runner stores it.
+    const at = new Date().toISOString();
+    const later = new Date(Date.now() + 3_600_000).toISOString();
+    const other = { id: newId(), projectId: pid, typed: "Another Typed Line, 2001", state: "looking-up" as const, attempts: 1, nextTryAt: later, reason: { code: "unreachable" as const }, createdAt: at, updatedAt: at };
+    await appendFindEntriesIn(svc!.state.requireSession().repo, pid, [other], "add");
+    const otherBefore = await entryOf(pid, other.id);
+    expect((await call({ method: "PUT", url: "/secrets/openalex-api-key", body: { apiKey: OA_KEY } })).status).toBe(200);
+    const done = await until(async () => ((e) => (e && e.state !== "looking-up" ? e : undefined))(await entryOf(pid, id)), "the entry to go on");
+    expect(done.state).toBe("not-found");
+    expect(done.reason).toBeUndefined();
+    expect(searches().map((r) => r.headers.authorization)).toEqual([undefined, `Bearer ${OA_KEY}`]);
+    expect(await entryOf(pid, other.id)).toEqual(otherBefore);
+    expect(JSON.stringify(requests)).not.toContain("Another Typed Line");
+  });
+
+  it("a DELETE of the key wakes nothing", async () => {
+    await start();
+    const { pid, id } = await waitingForAllowance();
+    const before = await entryOf(pid, id);
+    expect((await call({ method: "DELETE", url: "/secrets/openalex-api-key" })).status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(await entryOf(pid, id)).toEqual(before);
+    expect(searches()).toHaveLength(1);
   });
 });

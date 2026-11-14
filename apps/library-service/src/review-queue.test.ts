@@ -5,14 +5,16 @@
  * `PATCH /projects/:id/sources/:sid/fields`, R149). A locked project's queue is neither listed nor
  * decided, and nothing about it is said (R96).
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { SourceDraft } from "@ao/core";
+import { newId, type SourceDraft } from "@ao/core";
+import type { FindEntry } from "@ao/library";
+import { appendFindEntriesIn, holdMismatchedFileIn } from "../../../packages/library/src/repo/repo.js";
 import { deviceDeps, type Deps } from "@ao/library";
-import type { ProjectReviewEntry } from "@ao/shared";
+import { FIND_ROUTE_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT, type ProjectReviewEntry } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService } from "./server.js";
 
@@ -408,5 +410,126 @@ describe("a conflict found by a later check enters the queue (Task 72, D19, R190
     expect(await badge(pid, sid)).toBe(true);
     const q = await queue(pid);
     expect(q.items).toEqual([expect.objectContaining({ sourceId: sid, group: "capture", fields: { "/issued": "conflict" } })]);
+  });
+});
+
+describe("F11: a file found for a record that did not clearly match it (R277)", () => {
+  /** A record made by Find and acquire, and a file held for it with its review entry (as the runner holds one). */
+  async function heldFor(pid: string, title = "Rivers and Memory in Upland Villages", looksRight = false): Promise<{ sid: string; eid: string }> {
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(pid, draft(title, { type: "article-journal", creators: [{ role: "author", family: "Okafor", given: "Amara" }] }), [], { provenance: provenance() });
+    const at = new Date().toISOString();
+    const entry: FindEntry = { id: newId(), projectId: pid, typed: "Okafor, Rivers", state: "fetching", createdAt: at, updatedAt: at, attempts: 0, sourceId: sf.source.id };
+    await appendFindEntriesIn(repo, pid, [entry], "add");
+    await holdMismatchedFileIn(repo, pid, {
+      entry: { ...entry, state: "needs-check", reason: { code: looksRight ? "file-looks-right" : "file-other-doi" } },
+      sourceId: sf.source.id,
+      fromPath: await fixturePdf("held.pdf", "A Different Paper Entirely"),
+      facts: {
+        ...(looksRight ? { why: "looks-right" as const, by: "title" as const } : { why: "other-doi" as const }),
+        kind: "pdf",
+        bytes: 2048,
+        fileDoi: "10.5555/ao.f11.other",
+        embeddedTitle: "A Different Paper Entirely",
+        textStart: "A Different Paper Entirely. Abstract.",
+        acquired: { method: "free_copy", via: "service", service: "arxiv", address: "https://arxiv.org/pdf/2101.00001", at, tool: { name: "find-and-acquire", version: "0" }, access: "public" },
+      },
+    });
+    return { sid: sf.source.id, eid: entry.id };
+  }
+  const held = (pid: string, itemId: string, decision: unknown) => call({ method: "POST", url: `/review/${itemId}/held-file`, body: { projectId: pid, decision } });
+
+  it("is listed in its own group with what the check found, bounded, and never the file's address", async () => {
+    const pid = await newProject();
+    const { sid, eid } = await heldFor(pid);
+    const r = await call({ url: `/projects/${pid}/review` });
+    const [e] = (r.json as { items: ProjectReviewEntry[] }).items;
+    expect(e).toMatchObject({
+      sourceId: sid,
+      group: "found-file",
+      title: "Rivers and Memory in Upland Villages",
+      reasons: ["A file was found for this record, but it did not clearly match."],
+      cause: { kind: "acquired-file-mismatch", findEntryId: eid },
+      heldFile: { why: "other-doi", kind: "pdf", bytes: 2048, fileDoi: "10.5555/ao.f11.other", embeddedTitle: "A Different Paper Entirely", textStart: "A Different Paper Entirely. Abstract." },
+    });
+    expect(e!.heldFile).not.toHaveProperty("acquired");
+    expect(r.body).not.toContain("arxiv.org");
+    expect(r.body).not.toContain("find/held");
+  });
+
+  it("R296 b: a file the check found to look right is listed in the same group with the service's sentence and its advice; Use this file records the check's match", async () => {
+    const pid = await newProject();
+    const { sid, eid } = await heldFor(pid, undefined, true);
+    const [e] = (await queue(pid)).items;
+    expect(e).toMatchObject({ group: "found-file", reasons: [HELD_FILE_LOOKS_RIGHT_TEXT], cause: { kind: "acquired-file-mismatch", findEntryId: eid }, heldFile: { why: "looks-right", kind: "pdf" } });
+    expect(HELD_FILE_WHY_TEXT[e!.heldFile!.why]).toBe("This looks like the right file. Check it, then use it.");
+    const r = await held(pid, e!.id, "attach");
+    expect(r.status, r.body).toBe(200);
+    expect((await svc.state.session!.repo.getSource(pid, sid)).assets[0]!.acquired).toMatchObject({ method: "free_copy", check: { result: "match", by: "title" } });
+  });
+
+  it("Use this file attaches it: one decision, the entry leaves the queue, the source has its file; a second decision is a conflict in words", async () => {
+    const pid = await newProject();
+    const { sid } = await heldFor(pid);
+    const [e] = (await queue(pid)).items;
+    const r = await held(pid, e!.id, "attach");
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toEqual({ decided: true });
+    expect((await queue(pid)).total).toBe(0);
+    const src = await svc.state.session!.repo.getSource(pid, sid);
+    expect(src.assets).toHaveLength(1);
+    expect(src.assets[0]!.acquired).toMatchObject({ method: "free_copy", check: { result: "accepted-after-mismatch", why: "other-doi" } });
+    const again = await held(pid, e!.id, "discard");
+    expect(again.status).toBe(409);
+    expect(again.json.error.message).toBe("This entry has already been reviewed.");
+    // R282 d: the refusal says WHY in its reason, so the screen can tell "already decided" from any other conflict.
+    expect(again.json.error.reason).toBe("already-decided");
+  });
+
+  it("R282 d: while Find and acquire is paused for the project a decision is a 409 whose reason is paused (not already decided), and the entry stays", async () => {
+    const pid = await newProject();
+    await heldFor(pid);
+    const [e] = (await queue(pid)).items;
+    svc.state.session!.find!.stop(pid);
+    const r = await held(pid, e!.id, "attach");
+    expect(r.status).toBe(409);
+    expect(r.json.error.code).toBe("CONFLICT");
+    expect(r.json.error.reason).toBe("paused");
+    expect(r.json.error.message).toBe(FIND_ROUTE_TEXT.projectStopped);
+    expect((await queue(pid)).total).toBe(1);
+  });
+
+  it("Not this file destroys the held copy and the entry leaves the queue; the held file is gone from the disk (M3)", async () => {
+    const pid = await newProject();
+    const { sid, eid } = await heldFor(pid);
+    const folder = ((await call({ url: "/projects" })).json.projects as Array<{ id: string; folder: string }>).find((p) => p.id === pid)!.folder;
+    const heldDir = join(tmp, "Lib", folder, "find", "held");
+    expect(await readdir(heldDir)).toEqual([`${eid}.pdf`]);
+    const [e] = (await queue(pid)).items;
+    const r = await held(pid, e!.id, "discard");
+    expect(r.status, r.body).toBe(200);
+    expect((await queue(pid)).total).toBe(0);
+    expect((await svc.state.session!.repo.getSource(pid, sid)).assets).toEqual([]);
+    expect(await readdir(heldDir)).toEqual([]);
+  });
+
+  it("a decision that is not attach or discard is refused in words; a locked project is 423 before anything is read; another kind of entry is refused", async () => {
+    const pid = await newProject(true);
+    await heldFor(pid);
+    const [e] = (await queue(pid)).items;
+    const bad = await held(pid, e!.id, "keep");
+    expect(bad.status).toBe(400);
+    expect(bad.json.error.message).toBe('"decision" must be "attach" or "discard".');
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    const locked = await held(pid, e!.id, "attach");
+    expect(locked.status).toBe(423);
+    expect(locked.json.error.code).toBe("PROJECT_LOCKED");
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    const other = await newProject();
+    await attached(other);
+    const [imp] = (await queue(other)).items;
+    const wrong = await held(other, imp!.id, "attach");
+    expect(wrong.status).toBe(400);
+    expect(wrong.body).not.toMatch(/\//u);
   });
 });
