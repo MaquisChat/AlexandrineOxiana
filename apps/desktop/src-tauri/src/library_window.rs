@@ -1128,8 +1128,17 @@ pub fn parse_device(text: &str) -> Option<DeviceState> {
     Some(DeviceState { stay_signed_in: stay, store })
 }
 
+/// The device file read; None as well when it is a symbolic link (R331 h): it is then treated as
+/// unreadable (not kept, a new store id written over the link).
 pub fn read_device(path: &Path) -> Option<DeviceState> {
-    let f = File::open(path).ok()?;
+    let mut o = OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    let f = o.open(path).ok()?;
     let mut text = String::new();
     f.take(4097).read_to_string(&mut text).ok()?;
     if text.len() > 4096 {
@@ -1138,7 +1147,9 @@ pub fn read_device(path: &Path) -> Option<DeviceState> {
     parse_device(&text)
 }
 
-/// Writes the device file atomically (a new 0600 file beside it, flushed, then renamed over it).
+/// Writes the device file atomically (a new 0600 file beside it, flushed, then renamed over it, and
+/// the folder flushed so that the new name survives a power loss — best effort, as the library's
+/// own atomic writes do, packages/library/src/fs/atomic.ts `fsyncDir`; R331 h).
 pub fn write_device(path: &Path, s: &DeviceState) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no folder"))?;
     fs::create_dir_all(dir)?;
@@ -1159,6 +1170,10 @@ pub fn write_device(path: &Path, s: &DeviceState) -> io::Result<()> {
     let renamed = written.and_then(|_| fs::rename(&tmp, path));
     if renamed.is_err() {
         let _ = fs::remove_file(&tmp);
+        return renamed;
+    }
+    if let Ok(folder) = File::open(dir) {
+        let _ = folder.sync_all();
     }
     renamed
 }
@@ -1885,11 +1900,34 @@ mod tests {
         Url::parse(s).unwrap()
     }
 
-    fn tmp(name: &str) -> PathBuf {
+    /// A folder under the temporary folder, removed with all it holds when the test ends, whether it
+    /// passes or fails (R331 h).
+    struct TmpDir(PathBuf);
+
+    impl std::ops::Deref for TmpDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TmpDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(name: &str) -> TmpDir {
         let d = std::env::temp_dir().join(format!("ao-library-window-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
-        d
+        TmpDir(d)
     }
 
     // ----- cookies -----
@@ -2593,6 +2631,29 @@ process.stdout.write(JSON.stringify({{
         fs::remove_dir_all(&d).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_device_file_that_is_a_link_is_not_read() {
+        let d = tmp("device-link");
+        let elsewhere = d.join("elsewhere.json");
+        let kept = DeviceState { stay_signed_in: true, store: [7; 16] };
+        write_device(&elsewhere, &kept).unwrap();
+        let p = d.join(DEVICE_FILE);
+        std::os::unix::fs::symlink(&elsewhere, &p).unwrap();
+        assert_eq!(read_device(&p), None);
+        // At the start it counts as unreadable: not kept, a new store id; what it pointed to is left.
+        let host = FakeHost::new(Some(p.clone()), true);
+        let lib = Library::default();
+        assert!(lib.at_start(&host));
+        assert!(!lib.stay_signed_in());
+        assert!(!fs::symlink_metadata(&p).unwrap().file_type().is_symlink());
+        let now = read_device(&p).unwrap();
+        assert!(!now.stay_signed_in);
+        assert_ne!(now.store, kept.store);
+        assert_eq!(read_device(&elsewhere), Some(kept));
+        fs::remove_dir_all(d).unwrap();
+    }
+
     // ----- the controller -----
 
     struct FakeHost {
@@ -2688,7 +2749,7 @@ process.stdout.write(JSON.stringify({{
     const START: &str = "https://ezproxy.lib.edu/login?url=https://doi.org/10.1/x";
     const PDF: &str = "https://www-jstor-org.ezproxy.lib.edu/stable/pdf/1.pdf";
 
-    fn started(name: &str) -> (Library, FakeHost, PathBuf) {
+    fn started(name: &str) -> (Library, FakeHost, TmpDir) {
         let d = tmp(name);
         let host = FakeHost::new(Some(d.join(DEVICE_FILE)), false);
         let lib = Library::default();
@@ -3120,9 +3181,10 @@ process.stdout.write(JSON.stringify({{
 
     // ----- the fetch, against a local https test server -----
 
+    /// The test server's certificate and key, kept in memory: the folder they are made in is removed
+    /// at once, and each server writes them into its own folder, removed when it stops (R331 h).
     struct TestCert {
-        key: PathBuf,
-        cert: PathBuf,
+        key: Vec<u8>,
         pem: Vec<u8>,
     }
 
@@ -3140,8 +3202,7 @@ process.stdout.write(JSON.stringify({{
                 .output()
                 .expect("openssl");
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-            let pem = fs::read(&cert).unwrap();
-            TestCert { key, cert, pem }
+            TestCert { key: fs::read(&key).unwrap(), pem: fs::read(&cert).unwrap() }
         })
     }
 
@@ -3174,7 +3235,7 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         child: std::process::Child,
         port: u16,
         log: PathBuf,
-        dir: PathBuf,
+        dir: TmpDir,
     }
 
     impl Server {
@@ -3184,10 +3245,13 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
             let dir = tmp(&format!("server-{name}"));
             let log = dir.join("log");
             fs::write(&log, b"").unwrap();
+            let (key, cert) = (dir.join("key.pem"), dir.join("cert.pem"));
+            fs::write(&key, &c.key).unwrap();
+            fs::write(&cert, &c.pem).unwrap();
             let mut child = std::process::Command::new("node")
                 .args(["--input-type=module", "-e", SERVER])
-                .arg(&c.key)
-                .arg(&c.cert)
+                .arg(&key)
+                .arg(&cert)
                 .arg(&log)
                 .stdout(std::process::Stdio::piped())
                 .spawn()
@@ -3215,7 +3279,7 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
-            let _ = fs::remove_dir_all(&self.dir);
+            let _ = fs::remove_dir_all(&*self.dir);
         }
     }
 
@@ -3442,7 +3506,7 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
     }
 
-    fn part_in(name: &str) -> (PathBuf, PartFile) {
+    fn part_in(name: &str) -> (TmpDir, PartFile) {
         let d = tmp(name);
         let inbox = prepare_inbox(&d).unwrap();
         let p = PartFile::new(inbox, GRANT.into());
