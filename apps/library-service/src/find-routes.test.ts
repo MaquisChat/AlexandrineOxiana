@@ -1159,3 +1159,193 @@ describe("F8: an author alone", () => {
     expect((await queue(pid)).entries.length).toBe(500);
   });
 });
+
+// Task F8b (R279): an author's name that is also a title — the entry asks among the works and carries an author offer;
+// `POST …/:eid/author` turns it into the author's flow. Made-up people; "Vexmoor" is looked for in every log line,
+// error and event.
+
+describe("F8b: a name that is also a title", () => {
+  const NAME = "Ottoline Vexmoor";
+  /** A reference work's entry TITLED with the person's name. */
+  const ENTRY: Work = { doi: "10.5555/ao.f8b.entry", title: NAME, family: "Editors", year: 2004 };
+  const person = (n: number, name: string, aff: string) => ({ id: `https://openalex.org/A${n}`, display_name: name, works_count: 12, last_known_institutions: [{ display_name: aff }] });
+  const work = (n: number, title: string, date: string) => ({
+    id: `https://openalex.org/W${n}`,
+    title,
+    display_name: title,
+    publication_year: Number(date.slice(0, 4)),
+    publication_date: date,
+    type: "article",
+    doi: `https://doi.org/10.5555/ao.f8b.r${n}`,
+    primary_location: { source: { display_name: "Journal of Invented Studies" } },
+    authorships: [{ author: { display_name: NAME } }],
+  });
+  const waitState = (pid: string, eid: string, s: string) => until(async () => ((e) => (e?.state === s ? e : undefined))(await entry(pid, eid)), `the entry to be ${s}`);
+  const author = (pid: string, eid: string, body?: unknown) => call({ method: "POST", url: `/projects/${pid}/find/${eid}/author`, ...(body !== undefined ? { body } : {}) });
+
+  /** An entry in "choose" with an author offer: two people (or one) fit the name, and a work is titled with it. */
+  async function offered(o: { one?: boolean; encrypted?: boolean; lib?: string } = {}): Promise<{ pid: string; eid: string; path: string }> {
+    answers.set(NAME, cr(ENTRY, VEX_A));
+    peopleAnswers.set(NAME, { meta: { count: 2 }, results: [person(5001, NAME, "Vexmoor Institute of Made-up Things"), o.one ? person(5002, "Ottoline Vexmoorson", "Elsewhere College") : person(5003, "Ottoline R. Vexmoor", "College of Vexmoor Studies")] });
+    personWorks.set("A5001", Array.from({ length: 4 }, (_, i) => work(3000 + i, `Vexmoor Tide Table ${i}`, `${2020 - i}-01-01`)));
+    await start();
+    const path = await openNewLibrary(o.lib);
+    const pid = await newProject(o.encrypted === true);
+    const [e] = await add(pid, [NAME]);
+    await waitState(pid, e!.id, "choose");
+    return { pid, eid: e!.id, path };
+  }
+
+  it("the author offer carries counts only; the queue's answer holds no name; options answers the candidates only", async () => {
+    const { pid, eid } = await offered();
+    const q = await call({ url: `/projects/${pid}/find` });
+    const e = (q.json as FindQueueResponse).entries.find((x) => x.id === eid)!;
+    expect(e.state).toBe("choose");
+    expect(e.authorOffer).toEqual({ peopleCount: 2 });
+    for (const k of ["people", "peopleCount", "morePeople", "works", "worksCount"]) expect(e).not.toHaveProperty(k);
+    expect(e.candidates!.map((c) => c.identifiers.doi)).toContain(ENTRY.doi);
+    // No person's name, affiliation or OpenAlex id in the queue's answer.
+    for (const w of ["Ottoline R. Vexmoor", "Made-up Things", "College of Vexmoor", "A5001", "A5003"]) expect(q.body.includes(w), w).toBe(false);
+    const o = await call({ url: `/projects/${pid}/find/${eid}/options` });
+    expect(o.status).toBe(200);
+    expect(Object.keys(o.json)).toEqual(["candidates"]);
+  });
+
+  it("author: more than one person → choose-person, the people listed then; a second press is 409 in words, nothing changed", async () => {
+    const { pid, eid } = await offered();
+    const sentBefore = gated.sent.filter((s) => s.service === "openalex").length;
+    const r = await author(pid, eid);
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toMatchObject({ id: eid, state: "choose-person", peopleCount: 2 });
+    expect(r.json).not.toHaveProperty("candidates");
+    expect(r.json).not.toHaveProperty("authorOffer");
+    // No new people search: the people stored are listed.
+    expect(gated.sent.filter((s) => s.service === "openalex").length).toBe(sentBefore);
+    const o = await call({ url: `/projects/${pid}/find/${eid}/options` });
+    expect(o.json.people.map((x: { id: string }) => x.id)).toEqual(["A5001", "A5003"]);
+    const before = await entry(pid, eid);
+    const again = await author(pid, eid);
+    expect(again.status).toBe(409);
+    expect(again.json.error).toMatchObject({ code: "CONFLICT", message: FIND_ROUTE_TEXT.noAuthor, reason: "no-author" });
+    expect(await entry(pid, eid)).toEqual(before);
+    for (const w of ["A5001", "Made-up"]) expect(logs.includes(w), w).toBe(false);
+    for (const ev of events) if (ev.type === "find.progress") expect(Object.keys(ev.data as object).sort()).toEqual(["entryId", "projectId", "state"]);
+  });
+
+  it("author: exactly one person → looking-up with that person, then choose-works", async () => {
+    const { pid, eid } = await offered({ one: true });
+    expect((await entry(pid, eid))!.authorOffer).toEqual({ peopleCount: 1 });
+    const r = await author(pid, eid);
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toMatchObject({ state: "looking-up", chosen: "A5001", peopleCount: 1 });
+    const cw = await waitState(pid, eid, "choose-works");
+    expect(cw).toMatchObject({ worksCount: 4, peopleCount: 1 });
+    expect(cw).not.toHaveProperty("candidates");
+  });
+
+  it("the route: the extension's token, a malformed id, another project's entry, a body field, an entry without the offer", async () => {
+    const { pid, eid } = await offered();
+    const before = await entry(pid, eid);
+    const token = await pairExtension();
+    const ext = await svc!.app.inject({ method: "POST", url: `/projects/${pid}/find/${eid}/author`, headers: { authorization: `Bearer ${token}`, origin: EXT } });
+    errorBodies.push(ext.body);
+    expect(ext.statusCode).toBe(403);
+    expect((await author(pid, "not-an-id")).status).toBe(400);
+    const other = await newProject(false, "Other");
+    const elsewhere = await author(other, eid);
+    expect(elsewhere.status).toBe(404);
+    expect(elsewhere.json.error.message).toBe(FIND_ROUTE_TEXT.entryNotFound);
+    const withBody = await author(pid, eid, { personId: "A5001" });
+    expect(withBody.status).toBe(400);
+    expect(withBody.json.error.code).toBe("VALIDATION");
+    // R285 b: the sentence is the shared one.
+    expect(withBody.json.error.message).toBe(FIND_ROUTE_TEXT.noBody);
+    expect(withBody.body.includes("A5001")).toBe(false);
+    expect(await entry(pid, eid)).toEqual(before);
+    // An entry asking among works with no author offer.
+    const [plain] = await add(pid, [AMBIGUOUS]);
+    await settled(pid, plain!.id);
+    const no = await author(pid, plain!.id);
+    expect(no.status).toBe(409);
+    expect(no.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.noAuthor, reason: "no-author" });
+  });
+
+  it("R285 b: two presses at once end as one change and one refusal in words", async () => {
+    const { pid, eid } = await offered();
+    // The first press is held inside its turn; the second passes the route's own check meanwhile and is refused by
+    // the runner once its turn comes.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let n = 0;
+    runnerSeams.inAct = async () => {
+      if (n++ === 0) await gate;
+    };
+    const first = author(pid, eid);
+    await sleep(50);
+    const second = author(pid, eid);
+    await sleep(50);
+    release();
+    const answers2 = await Promise.all([first, second]);
+    expect(answers2.map((a) => a.status).sort()).toEqual([200, 409]);
+    const refused = answers2.find((a) => a.status === 409)!;
+    expect(refused.json.error).toMatchObject({ code: "CONFLICT", message: FIND_ROUTE_TEXT.noAuthor, reason: "no-author" });
+    expect((await entry(pid, eid))!.state).toBe("choose-person");
+    expect(events.filter((e) => e.type === "find.progress" && (e.data as { entryId: string }).entryId === eid && (e.data as { state: string }).state === "choose-person")).toHaveLength(1);
+  });
+
+  it("R283 a: a people search that fails does not hold back an entry with work candidates: choose with people-unavailable; Try again is accepted and looks again", async () => {
+    answers.set(NAME, cr(ENTRY, VEX_A));
+    // An answer of another shape: the people search fails.
+    peopleAnswers.set(NAME, { results: "not a list" });
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const [e] = await add(pid, [NAME]);
+    const chosen = await waitState(pid, e!.id, "choose");
+    expect(chosen.reason).toEqual({ code: "people-unavailable" });
+    expect(chosen).not.toHaveProperty("authorOffer");
+    expect(FIND_REASON_TEXT["people-unavailable"]).toBe("People of this name could not be looked up just now. “Try again” looks again.");
+    peopleAnswers.set(NAME, { meta: { count: 2 }, results: [person(5001, NAME, "Vexmoor Institute of Made-up Things"), person(5003, "Ottoline R. Vexmoor", "College of Vexmoor Studies")] });
+    const again = await call({ method: "POST", url: `/projects/${pid}/find/${e!.id}/retry` });
+    expect(again.status, again.body).toBe(200);
+    expect(again.json).toMatchObject({ state: "looking-up" });
+    const offeredNow = await until(async () => ((x) => (x?.state === "choose" && x.authorOffer ? x : undefined))(await entry(pid, e!.id)), "the author offer");
+    expect(offeredNow.authorOffer).toEqual({ peopleCount: 2 });
+    expect(offeredNow.reason).toBeUndefined();
+  });
+
+  it("the route: locked is 423, read-only 409, closed 503 — each changing nothing", async () => {
+    // Locked.
+    const { pid, eid } = await offered({ encrypted: true });
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    const locked = await author(pid, eid);
+    expect(locked.status).toBe(423);
+    expect(locked.json.error).toMatchObject({ code: "PROJECT_LOCKED", message: FIND_ROUTE_TEXT.locked });
+    await svc!.close();
+    svc = undefined;
+    // Closed: the press waits for the project's turn (held by another way in), and the library closes meanwhile.
+    const { pid: p2, eid: e2, path } = await offered({ lib: "Lib2" });
+    const s = svc!.state.session!;
+    let free!: () => void;
+    const turn = serialStore(s.repo, p2, () => new Promise<void>((r) => (free = r)));
+    const pressing = author(p2, e2);
+    await sleep(50);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const files = await snapshot(path);
+    free();
+    await turn;
+    const closed = await pressing;
+    expect(closed.status).toBe(503);
+    expect(closed.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.closed, reason: "closed" });
+    await sleep(100);
+    expect(await snapshot(path)).toEqual(files);
+    // Read-only: another device holds the library.
+    const now = new Date().toISOString();
+    await writeFile(join(path, ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).json.mode).toBe("read-only");
+    const ro = await author(p2, e2);
+    expect(ro.status).toBe(409);
+    expect(ro.json.error).toMatchObject({ code: "READ_ONLY", message: FIND_ROUTE_TEXT.readOnly });
+    expect((await entry(p2, e2))!).toMatchObject({ state: "choose", authorOffer: { peopleCount: 2 } });
+  });
+});

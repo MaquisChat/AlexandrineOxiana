@@ -14,6 +14,9 @@
  * their counts); `POST …/:eid/person` and `POST …/:eid/works` take only a person or works stored on THAT entry, so
  * that no request can make the app fetch an arbitrary author or work; no name, title or OpenAlex id is logged or
  * repeated in a refusal (a work already added is named by its position in the request).
+ *
+ * Task F8b (R279): an entry in "choose" with people stored beside its candidates carries `authorOffer` (counts only);
+ * `POST …/:eid/author` (no body) turns it into the author's flow with the people stored.
  */
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { isId } from "@ao/core";
@@ -25,6 +28,7 @@ import {
   FIND_QUEUE_MAX as LIBRARY_QUEUE_MAX,
   FIND_TYPED_MAX,
   FindAlreadyAddedError,
+  FindNoAuthorError,
   FindUnknownOptionError,
   worksAddedFrom,
   isPersonId,
@@ -63,6 +67,7 @@ import {
   FIND_PERSON_WORKS_MAX,
   findAlreadyAddedRefusal,
   findWorkIdRefusal,
+  type FindAuthorOffer,
   type FindOptionsResponse,
   type FindPersonCandidate,
   type FindPersonRequest,
@@ -103,7 +108,7 @@ true satisfies Same<FindStoppedFor["code"] | "index-needs-rebuild", FindStoppedC
 true satisfies Same<WorkCandidate, FindWorkCandidate>;
 true satisfies Same<OfferLink, FindOfferLink>;
 true satisfies Same<LibraryMatch, FindMatch>;
-true satisfies Same<Omit<FindEntry, "people" | "works" | "removed"> & { peopleCount?: number; worksCount?: number; addedCount?: number }, FindEntryView>;
+true satisfies Same<Omit<FindEntry, "people" | "works" | "removed"> & { peopleCount?: number; worksCount?: number; addedCount?: number; authorOffer?: FindAuthorOffer }, FindEntryView>;
 true satisfies Same<PersonCandidate, FindPersonCandidate>;
 true satisfies Same<typeof LIBRARY_PEOPLE_MAX, typeof FIND_PEOPLE_MAX>;
 true satisfies Same<typeof LIBRARY_PERSON_WORKS_MAX, typeof FIND_PERSON_WORKS_MAX>;
@@ -119,12 +124,16 @@ true satisfies Same<typeof REFERENCE_MIN_CHARS, typeof FIND_LINE_MIN_CHARS>;
  * `added` is the set of works added from it, worked out from the queue's live entries (R271 M5; `addedOf`).
  */
 export function entryView(e: FindEntry, added?: ReadonlySet<string>): FindEntryView {
-  const { people, works, removed: _removed, candidates, ...rest } = e;
+  const { people, works, removed: _removed, candidates, morePeople, ...rest } = e;
   const n = works && added ? works.filter((w) => added.has(w.id)).length : 0;
+  // F8b (R279 c): an entry asking among works with people stored beside them carries an author offer — counts only.
+  const offer = e.state === "choose" && people?.length ? { peopleCount: people.length, ...(morePeople ? { morePeople } : {}) } : undefined;
   return {
     ...rest,
     ...(candidates ? { candidates: candidates.slice(0, FIND_CANDIDATES_SENT) } : {}),
-    ...(people ? { peopleCount: people.length } : {}),
+    ...(offer ? { authorOffer: offer } : {}),
+    ...(people && !offer ? { peopleCount: people.length } : {}),
+    ...(morePeople && !offer ? { morePeople } : {}),
     ...(works ? { worksCount: works.length } : {}),
     ...(n > 0 ? { addedCount: n } : {}),
   };
@@ -169,6 +178,8 @@ function said(err: unknown): unknown {
     return err.kind === "person" ? new ApiError(400, "VALIDATION", FIND_ROUTE_TEXT.unknownPerson, "unknown-person") : new ApiError(400, "VALIDATION", FIND_ROUTE_TEXT.unknownWork, "unknown-work");
   }
   if (err instanceof FindAlreadyAddedError) return new ApiError(409, "CONFLICT", findAlreadyAddedRefusal(err.position), "already-added");
+  // Task F8b: "Show this author's works" on an entry that carries no author offer (any more).
+  if (err instanceof FindNoAuthorError) return new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.noAuthor, "no-author");
   // The library's sentences never repeat what was typed.
   if (err instanceof InvalidInputError || err instanceof FindEntryTooLargeError) return new ApiError(400, "VALIDATION", err.message, "line");
   if (err instanceof FindQueueUnwritableError) return new ApiError(503, "UNAVAILABLE", err.message);
@@ -404,6 +415,21 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     // The count is worked out from the queue as it now is (R271 M5).
     const now = await inWords(() => readFindQueueOf(s.repo, projectId));
     return { added: r.added.map((e) => entryView(e)), entry: entryView(r.parent, worksAddedFrom(now.entries.values(), entryId)) };
+  });
+
+  /**
+   * Task F8b (R279 c): "Show this author's works" — for an entry in "choose" that carries an author offer only (else a
+   * 409 in words, nothing changed). No body. It becomes "choose-person" with the people already stored, or "looking-up"
+   * with the one person whose works the runner then fetches ("choose-works", by `find.progress`).
+   */
+  app.post("/projects/:id/find/:eid/author", limit, async (req): Promise<FindEntryView> => {
+    const { s, projectId, entryId } = addressed(req, true);
+    const runner = runnerOf(s);
+    // The request names nothing: a body field is refused, never repeated.
+    if (Object.keys(bodyOf(req)).length > 0) throw badRequest(FIND_ROUTE_TEXT.noBody);
+    const cur = await entryOf(s, projectId, entryId);
+    if (cur.state !== "choose" || !cur.people?.length) throw new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.noAuthor, "no-author");
+    return entryView(await pressed(s, projectId, () => runner.asAuthor(projectId, entryId)));
   });
 
   app.get("/find/screen", async (req): Promise<FindScreenSettings> => {

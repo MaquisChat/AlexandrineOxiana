@@ -22,7 +22,7 @@ import { LookupHttpError } from "../lookup/http.js";
 import { mapOpenAlex } from "../lookup/openalex.js";
 import type { WorkCandidate } from "./candidates.js";
 import { cleanText, segmentsOf, tokensOf, type Reference } from "./reference.js";
-import { BadAnswer, canonDoi, fetchItems, isOpenAlexBudgetSpent, openAlexCandidate, openAlexSearchPaused, pauseOpenAlexSearches, scoreCandidate } from "./search.js";
+import { BadAnswer, canonDoi, decideMatch, fetchItems, isOpenAlexBudgetSpent, openAlexCandidate, openAlexSearchPaused, pauseOpenAlexSearches, scoreCandidate } from "./search.js";
 import { FIND_DOI_MAX, FIND_LINE_MAX_BYTES, type FindEntry, type PersonCandidate } from "./types.js";
 
 /** At most this many people are read from OpenAlex's answer and kept (`per-page=20`). */
@@ -181,42 +181,67 @@ function personWorkOf(v: unknown): WorkCandidate | null {
 // When the people search is asked, and what it decides
 
 /**
- * THE CONDITION (R267 d): the people search is asked only when it can change the outcome — ALL of:
+ * THE CONDITION (R267 d, as changed by R279 a): the people search is asked for every typed line that may be an
+ * author's name and that the works rule cannot settle — ALL of:
  *  1. the line holds no digit (Unicode `Nd`): so no DOI, no ISBN, no year and no number (each of those has a digit);
  *  2. it has at most FIND_PEOPLE_WORDS_MAX (6) words — `segmentsOf` of the typed text: a word, or a run of a script
  *     written without spaces, each counts one;
- *  3. no work candidate of the works search has `titleCover` ≥ FIND_PEOPLE_TITLE_COVER (0.6): then no title is
- *     plainly meant (so the entry is not sure either: being sure needs 0.9).
- * So a line with a clear title costs no people request. The runner also asks it only when OpenAlex is both on in the
- * settings and allowed by the project's rules.
+ *  3. the works rule is NOT sure of it (`decideMatch` is not "sure"): a line it is sure of completes as before and
+ *     costs no people request.
+ * Whether a work candidate's title is covered by what was typed no longer matters here (R279 a): reference works hold
+ * entries TITLED with a person's name, and such an entry must not hide the person. So a short title typed without its
+ * author costs one people request more (accepted). What the people found then decide is the runner's (R279 b, c:
+ * `fitPeople` and `titleCovered`). The runner also asks only when OpenAlex is both on in the settings and allowed by
+ * the project's rules.
  */
 export function peopleSearchWanted(ref: Reference, candidates: WorkCandidate[]): boolean {
   if (!ref.tokens.length || /\p{Nd}/u.test(ref.text)) return false;
   if (segmentsOf(ref.text).length > FIND_PEOPLE_WORDS_MAX) return false;
-  return candidates.every((c) => scoreCandidate(ref, c).titleCover < FIND_PEOPLE_TITLE_COVER);
+  return decideMatch(ref, candidates).kind !== "sure";
 }
 
 export type PersonDecision = { kind: "one"; person: PersonCandidate; byInitial: boolean } | { kind: "several"; people: PersonCandidate[] } | { kind: "none" };
 
+/** R279: a work candidate has a title cover of FIND_PEOPLE_TITLE_COVER (0.6) or more: a title may be what was meant. */
+export function titleCovered(ref: Reference, works: WorkCandidate[]): boolean {
+  return works.some((c) => scoreCandidate(ref, c).titleCover >= FIND_PEOPLE_TITLE_COVER);
+}
+
+/** A typed single letter ("J." is the token "j"): always an initial (R270 d, R273 M10). */
+const isInitial = (t: string) => Array.from(t).length === 1 && /^\p{L}$/u.test(t);
+
+/** R273 M10: the line holds a typed single letter, so whoever fits, the app asks which person is meant. */
+export function hasInitial(ref: Reference): boolean {
+  return ref.tokens.some(isInitial);
+}
+
 /**
  * The Global Constraint's person rule, exactly: a person fits when the tokens of their name (`normalizeTitle` words, as
- * the typed tokens) cover EVERY typed token, and no work candidate has `titleCover` ≥ 0.6. Exactly one person fits:
- * "one" (the runner goes to that person's works); more than one: "several", those that fit, in OpenAlex's order (never
- * a silent choice among them); none: "none" (the entry stays whatever the works search made it).
+ * the typed tokens) cover EVERY typed token, and no work candidate has `titleCover` ≥ 0.6 (`titleCovered`). Exactly one
+ * person fits: "one" (the runner goes to that person's works); more than one: "several", those that fit, in OpenAlex's
+ * order (never a silent choice among them); none: "none" (the entry stays whatever the works search made it).
  * R270 d: a typed single letter is covered by a name token that begins with it ("J. Smith", "P. Bourdieu"); "one"
  * then says `byInitial`, and the runner asks which person is meant even though only one fits.
  */
 export function decidePerson(ref: Reference, people: PersonCandidate[], works: WorkCandidate[]): PersonDecision {
+  if (titleCovered(ref, works)) return { kind: "none" };
+  return fitPeople(ref, people);
+}
+
+/**
+ * R279: the name rule of `decidePerson` alone, whatever the works search found — who fits the typed name. With a work
+ * candidate whose title is covered as well, the runner asks and offers both (the entry is "choose" with an author
+ * offer); never a guess either way.
+ */
+export function fitPeople(ref: Reference, people: PersonCandidate[]): PersonDecision {
   if (!ref.tokens.length) return { kind: "none" };
-  if (works.some((c) => scoreCandidate(ref, c).titleCover >= FIND_PEOPLE_TITLE_COVER)) return { kind: "none" };
   // R270 d: a typed single letter (with or without a full stop: "J." is the token "j") is covered by a name token that
   // begins with it. A person who fits only because a typed word matched as an initial is never chosen in silence.
-  const isInitial = (t: string) => Array.from(t).length === 1 && /^\p{L}$/u.test(t);
   const fitOf = (p: PersonCandidate): { fits: boolean; byInitial: boolean } => {
     const named = tokensOf(cut(p.name, FIND_PERSON_NAME_MAX));
     const set = new Set(named);
     // R273 M10: a typed single letter is always an initial, whatever the name holds.
-    let byInitial = ref.tokens.some(isInitial);
+    let byInitial = hasInitial(ref);
     for (const t of ref.tokens) {
       if (set.has(t)) continue;
       if (isInitial(t) && named.some((n) => n.startsWith(t))) {
@@ -421,6 +446,33 @@ function boundWork(w: WorkCandidate): WorkCandidate {
 const bytes = (v: unknown) => Buffer.byteLength(JSON.stringify(v), "utf8");
 
 /**
+ * Room for what a later line of an author's entry may add (a reason and a time to try again, both "more" flags; R271
+ * M5: no list of works added is stored any more): the line is measured with these set.
+ */
+function withRoom(out: Record<string, unknown>): void {
+  out.reason = { code: "no-legal-basis", by: "settings" };
+  out.nextTryAt = "2026-11-14T00:00:00.000Z";
+  out.attempts = Number.MAX_SAFE_INTEGER;
+  out.morePeople = true;
+  out.moreWorks = true;
+}
+
+/**
+ * R279 c: an entry in "choose" that carries an author offer keeps its work candidates first (the works' outcome as
+ * built) and its people in the room left. The runner fits the candidates against THIS probe — the entry with only its
+ * first person (bounded, without subjects) and the room `fitAuthorEntry` measures with — so that at least that one
+ * person always fits beside them; `fitAuthorEntry` then keeps as many people as fit (`morePeople` when some go).
+ */
+export function authorOfferProbe(e: FindEntry): FindEntry {
+  const out: Record<string, unknown> = { ...e };
+  delete out.works;
+  const first = e.people?.[0];
+  out.people = first ? [{ ...boundPerson(first), subjects: [] }] : [];
+  withRoom(out);
+  return out as unknown as FindEntry;
+}
+
+/**
  * An author's entry (people, works) as the queue keeps it, so that its line fits FIND_LINE_MAX_BYTES by construction
  * (A2: the store refuses a longer line and never cuts it). Every person and work is bounded (a name and an affiliation
  * 200, a work's title 300 and where published 100, its first author only); once a person is chosen only that person
@@ -449,13 +501,7 @@ export function fitAuthorEntry(e: FindEntry): FindEntry {
     if (ps) out.people = ps;
     if (kept) out.works = kept;
     if (probe) {
-      // Room for what a later line of this entry may add (a reason and a time to try again, R271 M5: no list of
-      // works added is stored any more).
-      out.reason = { code: "no-legal-basis", by: "settings" };
-      out.nextTryAt = "2026-11-14T00:00:00.000Z";
-      out.attempts = Number.MAX_SAFE_INTEGER;
-      out.morePeople = true;
-      out.moreWorks = true;
+      withRoom(out);
     } else {
       if (morePeople) out.morePeople = true;
       if (moreWorks || (works && n < works.length)) out.moreWorks = true;
