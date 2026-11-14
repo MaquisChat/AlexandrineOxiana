@@ -167,6 +167,8 @@ const COPY_STATES: ReadonlySet<FindState> = new Set(["record-complete", "looking
  * "looking for a copy" like the others.
  */
 const waitsForPlace = (e: FindEntry): boolean => !!e.sourceId && (e.state === "record-complete" || e.state === "failed") && e.reason?.code === "held-full";
+/** R297 c: waiting for OpenAlex's daily allowance (the record part's wait; a saved key wakes it: `wakeAllowance`). */
+const waitsForAllowance = (e: FindEntry): boolean => e.state === "looking-up" && e.reason?.code === "budget" && !!e.nextTryAt;
 const inCopyPart = (e: FindEntry): boolean => (!!e.sourceId && COPY_STATES.has(e.state)) || waitsForPlace(e);
 
 const VERSION: string = libraryVersion();
@@ -338,6 +340,13 @@ export interface FindRunner {
    * an unlocking. Does nothing for a project the runner is not running (stopped or never resumed).
    */
   wakeHeldFull(projectId: string): Promise<void>;
+  /**
+   * R312 c (R297 c): an OpenAlex key was saved — the project's entries waiting for OpenAlex's daily allowance
+   * ("looking-up", reason "budget", a `nextTryAt`) go on now instead of at the pause's end: their wait is cleared in one
+   * write and they are queued (the allowance's pause is kept per key, so the next search asks with the new key). Nothing
+   * else is touched: no other waiting entry, nothing in flight. Does nothing for a project the runner is not running.
+   */
+  wakeAllowance(projectId: string): Promise<void>;
   /**
    * At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry, and (F11) every entry in the free
    * copy's part — "record-complete" (its source without a file), "looking-for-copy", and "fetching" (which resumes as
@@ -1635,7 +1644,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     if (!live()) return;
     const sources = copySources(s);
     if (!sources.length) {
-      if (entry.state !== "record-complete" || entry.reason) await finish({ state: "record-complete", reason: SETTINGS }, ["nextTryAt"]);
+      // R312 c: every copy service switched off in Search sources: the entry rests with its record complete and says
+      // so ("switched off" by the settings) — a record just made included; written once (nothing when it already says so).
+      if (!(entry.state === "record-complete" && entry.reason?.code === SETTINGS.code)) await finish({ state: "record-complete", reason: SETTINGS }, ["nextTryAt"]);
       return;
     }
     // R296 d: no service is asked and nothing downloaded while FIND_HELD_MAX files already wait for the researcher's
@@ -2032,6 +2043,26 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     for (const e of q.values()) if (waitsForPlace(e)) enqueue(projectId, e.id);
   }
 
+  async function wakeAllowance(projectId: string): Promise<void> {
+    if (closed || readOnly()) return;
+    const r = runs.get(projectId);
+    if (!r || r.stopped) return;
+    let woken: string[];
+    try {
+      woken = await act(projectId, async () => {
+        const waiting = [...(await readFindQueueIn(repo, projectId)).values()].filter(waitsForAllowance);
+        if (waiting.length) await write(projectId, waiting.map((e) => evolve(e, {}, ["nextTryAt", "reason"], stamp())), "update");
+        return waiting.map((e) => e.id);
+      });
+    } catch {
+      return; // stopped, locked or unreadable meanwhile: the pause's end, Try again, the next open or unlock look again
+    }
+    for (const id of woken) {
+      cancelLater(projectId, id);
+      enqueue(projectId, id);
+    }
+  }
+
   function resume(projectId: string): void {
     if (closed || readOnly()) return;
     let unlocked: boolean;
@@ -2277,5 +2308,5 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return w;
   }
 
-  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resolveHeld, wakeHeldFull, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks, asAuthor };
+  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resolveHeld, wakeHeldFull, wakeAllowance, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks, asAuthor };
 }

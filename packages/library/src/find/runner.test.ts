@@ -49,6 +49,7 @@ import {
   type FindRunnerDeps,
 } from "./runner.js";
 import { DEFAULT_SEARCH_SETTINGS, FIND_QUEUE_MAX, type FindEntry, type FindState, type SearchSettings } from "./types.js";
+import { SEARCH_SOURCES_FILE, readSearchSettings, writeSearchSettings } from "./settings.js";
 import { FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT } from "@ao/shared";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -3704,7 +3705,8 @@ describe("F11: the free copy of a record the queue completed", () => {
     files.set("https://arxiv.org/pdf/2101.00001", await good());
     settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: false })) };
     const { p, r, eid } = await recordMade();
-    await until(async () => (await entryOf(p, eid))?.state === "record-complete" && changes.some((c) => c.entryId === eid && c.state === "record-complete"), "the record");
+    // R312 c: with every copy service off the entry rests "record-complete / switched-off" (its second write).
+    await until(async () => (await entryOf(p, eid))?.reason?.code === "switched-off" && changes.filter((c) => c.entryId === eid && c.state === "record-complete").length === 2, "the record");
     const cur = (await entryOf(p, eid))!;
     await appendFindEntries(coreOf(), p.id, [{ ...cur, state: "failed", reason: { code: "held-full" }, updatedAt: new Date(NOW + 1).toISOString() }], "update");
     settings = COPY_ONLY_OPENALEX();
@@ -4151,5 +4153,238 @@ processing:
     await until(async () => (await entryOf(p, eid))?.reason?.code === "copy-no-legal-basis", "the store refusal");
     expect(copyRequests).toEqual([]);
     expect(fileRequests).toEqual([]);
+  });
+
+  // ------------------------------------------------------------------------------------------------------------
+  // R312 c (plan A9 "Still to join"): the copy part reads `copies` and `unpaywallEmail` from F12's settings file
+  // (`search-sources.json`, through the library's own reader and writer), read when an entry's work starts.
+  describe("R312 c: the copy part obeys the researcher's Search sources file", () => {
+    const COPY_HOSTS = ["https://api.unpaywall.org", "https://export.arxiv.org", "https://www.ebi.ac.uk", "https://api.semanticscholar.org", "https://directory.doabooks.org", "https://archive.org"];
+    const EMAIL = "copy-join@example.invalid";
+    /** Every request to a free-copy service other than OpenAlex: its origin and path (OpenAlex's are `copyRequests`). */
+    let copyHits: Array<{ origin: string; path: string }>;
+    const dir = () => join(tmp, "config");
+    const fromFile = async () => (await readSearchSettings(dir())).settings;
+    /** The settings file as F12's writer writes it: the copy services named in `on` switched on, every other off. */
+    const save = (on: string[], unpaywallEmail?: string) =>
+      writeSearchSettings(dir(), { record: DEFAULT_SEARCH_SETTINGS.record.map((x) => ({ ...x })), copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ id: c.id, on: on.includes(c.id) })), ...(unpaywallEmail ? { unpaywallEmail } : {}) }, new Date(NOW));
+    const hostsAsked = () => new Set([...copyHits.map((h) => h.origin), ...(copyRequests.length ? ["https://api.openalex.org"] : [])]);
+    let works = 0;
+    /**
+     * A typed line made into a record (a line and a work of its own DOI each time, so that no answer of an earlier entry
+     * is reused from the client's cache), its copy part run under the FILE.
+     */
+    const LINES = [LINE, LINE_2, "Quillfeather 1999 Zorblatt Grammar of Habitus"];
+    async function recordUnderFile(r?: FindRunner): Promise<{ p: Project; r: FindRunner; eid: string }> {
+      // A line of its own too: the search's answer for a line is cached by the client as well.
+      const line = LINES[works]!;
+      know(line, cr({ ...ZORBLATT, doi: `${ZORBLATT.doi}.${++works}` }));
+      const p = await project();
+      const run = r ?? runner();
+      const { added } = await run.add(p.id, [line]);
+      return { p, r: run, eid: added[0]!.id };
+    }
+
+    beforeEach(async () => {
+      copyHits = [];
+      works = 0;
+      for (const origin of COPY_HOSTS)
+        agent
+          .get(origin)
+          .intercept({ path: () => true, method: "GET" })
+          .reply((o) => {
+            copyHits.push({ origin, path: String(o.path) });
+            return { statusCode: 404, data: "{}" };
+          })
+          .persist();
+      // The runner's settings are the file's, read anew for each entry (as the service gives them).
+      settingsFn = fromFile;
+    });
+
+    it("a copy service switched off in the file is not asked; one switched on is (requests counted per host)", async () => {
+      await save(["europepmc"]);
+      const { p, eid } = await recordUnderFile();
+      await copyDone(p, eid);
+      expect(copyRequests).toEqual([]);
+      expect(copyHits.filter((h) => h.origin === "https://www.ebi.ac.uk").length).toBeGreaterThan(0);
+      expect([...hostsAsked()]).toEqual(["https://www.ebi.ac.uk"]);
+      // The other way round: OpenAlex on, Europe PMC off.
+      copyHits = [];
+      await save(["openalex"]);
+      const second = await recordUnderFile();
+      await copyDone(second.p, second.eid);
+      expect(copyRequests.length).toBe(1);
+      expect(copyHits).toEqual([]);
+    });
+
+    it("every copy service off in the file: the entry rests with its record complete, 'switched off' by the settings, and nothing is asked", async () => {
+      await save([]);
+      const { p, eid } = await recordUnderFile();
+      await until(async () => (await entryOf(p, eid))?.reason?.code === "switched-off", "the settings' refusal");
+      expect((await entryOf(p, eid))!).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+      expect((await entryOf(p, eid))!.sourceId).toBeTruthy();
+      await new Promise((res) => setTimeout(res, 50));
+      expect(copyRequests).toEqual([]);
+      expect(copyHits).toEqual([]);
+      expect(fileRequests).toEqual([]);
+    });
+
+    it("Unpaywall is asked only when it is on AND its e-mail is saved; the e-mail goes to Unpaywall and to no other host", async () => {
+      // On, with its e-mail.
+      await save(["unpaywall", "openalex", "europepmc"], EMAIL);
+      const a = await recordUnderFile();
+      await copyDone(a.p, a.eid);
+      const toUnpaywall = copyHits.filter((h) => h.origin === "https://api.unpaywall.org");
+      expect(toUnpaywall.length).toBe(1);
+      expect(decodeURIComponent(toUnpaywall[0]!.path)).toContain(EMAIL);
+      for (const h of copyHits.filter((x) => x.origin !== "https://api.unpaywall.org")) expect(decodeURIComponent(h.path)).not.toContain(EMAIL);
+      // Every other request of the client (searches, OpenAlex's, the other services', files): the e-mail in none. (The
+      // client's own list `sentF8` holds every request path but the searches, Unpaywall's own included: left out here.)
+      const unpaywallPaths = new Set(toUnpaywall.map((h) => h.path));
+      for (const x of [...copyRequests, ...sentF8.filter((x) => !unpaywallPaths.has(x)), ...fileRequests, ...gated.sent.map((g) => g.text)]) expect(decodeURIComponent(x)).not.toContain(EMAIL);
+      // Off, with its e-mail still saved: not asked.
+      copyHits = [];
+      await save(["openalex", "europepmc"], EMAIL);
+      const b = await recordUnderFile();
+      await copyDone(b.p, b.eid);
+      expect(copyHits.filter((h) => h.origin === "https://api.unpaywall.org")).toEqual([]);
+      // On, with no e-mail (a file written by hand: the service refuses such a save): not asked.
+      copyHits = [];
+      await save(["unpaywall", "openalex"]);
+      expect((await fromFile()).copies!.find((c) => c.id === "unpaywall")!.on).toBe(true);
+      const c = await recordUnderFile();
+      await copyDone(c.p, c.eid);
+      expect(copyHits.filter((h) => h.origin === "https://api.unpaywall.org")).toEqual([]);
+    });
+
+    it("a save of the file takes effect for the next entry, with the same runner (no restart)", async () => {
+      await save([]);
+      const first = await recordUnderFile();
+      await until(async () => (await entryOf(first.p, first.eid))?.reason?.code === "switched-off", "the settings' refusal");
+      expect(copyRequests).toEqual([]);
+      await save(["openalex"]);
+      const second = await recordUnderFile(first.r);
+      await copyDone(second.p, second.eid);
+      expect(copyRequests.length).toBe(1);
+      expect(copyHits).toEqual([]);
+      // The first entry, which rested under the earlier settings, is not touched by the save itself.
+      expect((await entryOf(first.p, first.eid))!).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+    });
+
+    it("no file: F12's defaults for copies — every free-copy service but Unpaywall is asked", async () => {
+      expect(await readdir(dir()).catch(() => [] as string[])).not.toContain(SEARCH_SOURCES_FILE);
+      expect((await fromFile()).copies).toEqual(DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c })));
+      const { p, eid } = await recordUnderFile();
+      await copyDone(p, eid);
+      expect(copyRequests.length).toBe(1);
+      expect(copyHits.filter((h) => h.origin === "https://api.unpaywall.org")).toEqual([]);
+      // Every service the defaults switch on, and only those, could be asked; the DOI-based ones were.
+      for (const h of copyHits) expect(COPY_HOSTS.filter((o) => o !== "https://api.unpaywall.org")).toContain(h.origin);
+      for (const o of ["https://www.ebi.ac.uk", "https://api.semanticscholar.org"]) expect(copyHits.some((h) => h.origin === o), o).toBe(true);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// R312 c with R297 c (plan A9 "Still to join"): a key added wakes the entries waiting for OpenAlex's allowance.
+describe("R297 c: a key added wakes the entries waiting for OpenAlex's daily allowance (wakeAllowance)", () => {
+  const KEY = "oakey-JOIN-RECOGNISABLE-41c7";
+  let key: string | undefined;
+  /** The Authorization header of every request to api.openalex.org, in order ("" for none). */
+  let oaAuth: string[];
+  /** A client like the world's, that sends `key` (when set) to OpenAlex, and records what OpenAlex was sent. */
+  const keyedHttp = () => {
+    const recorder: Dispatcher.DispatcherComposeInterceptor = (dispatch) => (opts, handler) => {
+      if (String(opts.origin).includes("api.openalex.org")) {
+        const h = opts.headers as Record<string, string> | string[] | undefined;
+        const pairs: Array<[string, string]> = Array.isArray(h) ? h.flatMap((x, i) => (i % 2 ? [] : [[String(x), String(h[i + 1])] as [string, string]])) : Object.entries(h ?? {});
+        oaAuth.push(pairs.find(([k]) => k.toLowerCase() === "authorization")?.[1] ?? "");
+      }
+      return dispatch(opts, handler);
+    };
+    return new HttpClient({ libraryRoot: lib.root, dispatcher: gated.compose(recorder), clock: () => timers.now, sleep: async () => {}, env: {}, maxRetries: 0, keyFor: () => key });
+  };
+  beforeEach(() => {
+    key = undefined;
+    oaAuth = [];
+  });
+
+  /** An entry of `line` waiting for OpenAlex's allowance (Crossref finds nothing, OpenAlex's allowance is spent). */
+  async function waitingForAllowance(r: FindRunner, p: Project, line: string): Promise<string> {
+    know(line, cr(), "budget");
+    const { added } = await r.add(p.id, [line]);
+    const id = added[0]!.id;
+    await until(async () => (await entryOf(p, id))?.reason?.code === "budget" && !!(await entryOf(p, id))?.nextTryAt, "the wait for the allowance");
+    return id;
+  }
+
+  it("the entry waiting for the allowance goes on at once (asked with the key), without the clock moving; its timer is let go", async () => {
+    const p = await project();
+    const r = runner({ http: keyedHttp() });
+    const id = await waitingForAllowance(r, p, LINE);
+    expect((await entryOf(p, id))!).toMatchObject({ state: "looking-up", nextTryAt: "2026-11-14T00:00:00.000Z" });
+    expect(oaAuth).toEqual([""]);
+    // The key is saved; OpenAlex, asked with it, has an allowance.
+    key = KEY;
+    know(LINE, cr(), OA_EMPTY);
+    const at = timers.now;
+    await r.wakeAllowance(p.id);
+    await settled(p, id);
+    expect(timers.now).toBe(at);
+    expect((await entryOf(p, id))!).toMatchObject({ state: "not-found" });
+    expect((await entryOf(p, id))!.reason).toBeUndefined();
+    expect(oaAuth).toEqual(["", `Bearer ${KEY}`]);
+    expect(timers.pending.size).toBe(0);
+  });
+
+  it("an entry waiting for another reason is not touched, and a search in flight is neither aborted nor asked again", async () => {
+    const p = await project();
+    const r = runner({ http: keyedHttp() });
+    // An entry waits for an ordinary retry (OpenAlex failed; Crossref found nothing) — before the allowance is spent.
+    know(LINE_2, cr(), "fail");
+    const other = (await r.add(p.id, [LINE_2])).added[0]!.id;
+    await until(async () => (await entryOf(p, other))?.attempts === 1 && !!(await entryOf(p, other))?.nextTryAt, "the other's retry");
+    const otherBefore = (await entryOf(p, other))!;
+    const waiting = await waitingForAllowance(r, p, LINE);
+    // A third entry's search is in flight (held) when the key comes.
+    const third = "Quillfeather 1999 Zorblatt Grammar of Habitus";
+    know(third, cr(ZORBLATT));
+    const release = gated.hold(parseReference(third)!.text);
+    const inFlight = (await r.add(p.id, [third])).added[0]!.id;
+    // (OpenAlex is paused for the client's key in use, none: only Crossref is asked for it, and held.)
+    const thirdAsked = () => gated.sent.filter((s) => s.text === parseReference(third)!.text).length;
+    await until(() => thirdAsked() === 1, "the third's search");
+    key = KEY;
+    know(LINE, cr(), OA_EMPTY);
+    await r.wakeAllowance(p.id);
+    await settled(p, waiting);
+    release();
+    await settled(p, inFlight);
+    expect(thirdAsked()).toBe(1);
+    // Its one search answered as it was (Crossref alone: offered to choose), not started again by the wake.
+    expect((await entryOf(p, inFlight))!.state).toBe("choose");
+    expect(await entryOf(p, other)).toEqual(otherBefore);
+    expect(gated.sent.filter((s) => s.text === parseReference(LINE_2)!.text).length).toBe(2);
+  });
+
+  it("nothing to wake: no write, no request (a stopped project, or none waiting)", async () => {
+    const p = await project();
+    const r = runner({ http: keyedHttp() });
+    know(LINE, cr(), OA_EMPTY);
+    const id = (await r.add(p.id, [LINE])).added[0]!.id;
+    await settled(p, id);
+    const before = await entryOf(p, id);
+    const sent = gated.sent.length;
+    await r.wakeAllowance(p.id);
+    await new Promise((res) => setTimeout(res, 30));
+    expect(await entryOf(p, id)).toEqual(before);
+    expect(gated.sent.length).toBe(sent);
+    // A stopped project: nothing at all.
+    const q = await project();
+    const w = await waitingForAllowance(r, q, LINE_2);
+    const stopped = await entryOf(q, w);
+    r.stop(q.id);
+    await r.wakeAllowance(q.id);
+    expect(await entryOf(q, w)).toEqual(stopped);
   });
 });
