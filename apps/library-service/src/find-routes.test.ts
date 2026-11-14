@@ -686,6 +686,44 @@ describe("refusals", () => {
     expect(asked(NOTHING)).toBe(1);
   });
 
+  it("R310 a: deleting a record whose file was waiting, through the sources route, wakes the project's entries waiting for the limit", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const [a] = await add(pid, [LINE]);
+    const sid = (await until(async () => ((x) => (x?.state === "no-open-copy" && x.sourceId ? x : undefined))(await entry(pid, a!.id)), "the record")).sourceId!;
+    const repo = svc!.state.session!.repo;
+    const at = new Date().toISOString();
+    // Another record, with a file waiting for the researcher's check (held as the runner holds one) …
+    const gone = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: "A Record To Be Deleted" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [],
+      { provenance: { captureMethod: "manual_upload", capturedAt: at, tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    const heldFor: FindEntry = { id: newId(), projectId: pid, typed: "x y", state: "fetching", createdAt: at, updatedAt: at, attempts: 0, sourceId: gone.source.id };
+    // … and an entry waiting because the limit was reached when it was looked at.
+    const waiting: FindEntry = { id: newId(), projectId: pid, typed: "y z", state: "record-complete", reason: { code: "held-full" }, createdAt: at, updatedAt: at, attempts: 0, sourceId: sid };
+    await appendFindEntriesIn(repo, pid, [heldFor, waiting], "add");
+    const pdf = join(tmp, "held.pdf");
+    await writeFile(pdf, await buildPdf({ title: "A Different Paper Entirely", lines: ["A Different Paper Entirely"] }));
+    await holdMismatchedFileIn(repo, pid, {
+      entry: { ...heldFor, state: "needs-check", reason: { code: "file-title-absent" } },
+      sourceId: gone.source.id,
+      fromPath: pdf,
+      facts: { why: "title-absent", kind: "pdf", bytes: 1, acquired: { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at, tool: { name: "find-and-acquire", version: "0" }, access: "public" } },
+    });
+    await sleep(100);
+    expect(await entry(pid, waiting.id)).toMatchObject({ state: "record-complete", reason: { code: "held-full" } });
+    const d = await call({ method: "DELETE", url: `/projects/${pid}/sources/${gone.source.id}` });
+    expect(d.status, d.body).toBe(200);
+    // The deletion's own change resolved the waiting file and said so on its entry (R282 g).
+    expect(await entry(pid, heldFor.id)).toMatchObject({ state: "no-open-copy", reason: { code: "record-removed" } });
+    // Woken without a restart: it looked for a copy again (this world has none).
+    expect((await until(async () => ((x) => (x?.state === "no-open-copy" ? x : undefined))(await entry(pid, waiting.id)), "the waiting entry to go on")).state).toBe("no-open-copy");
+    expect(events.some((e) => e.type === "find.progress" && (e.data as { entryId?: string }).entryId === waiting.id && (e.data as { state?: string }).state === "looking-for-copy")).toBe(true);
+  });
+
   it("a typed line never appears in the log", async () => {
     await start();
     await openNewLibrary();

@@ -509,6 +509,15 @@ export class HeldFileEntryGoneError extends Error {
 }
 
 /**
+ * Whether a record has a file (R305 c, R310 c): an original that is not destroyed. The ONE predicate for it, used by the
+ * hold (inside its change) and by Find and acquire's runner (before it looks for a copy). A linked original whose file
+ * is missing still counts: the researcher linked it, and its absence is said where files are shown.
+ */
+export function sourceHasFile(sf: { assets: readonly Asset[] }): boolean {
+  return sf.assets.some((a) => a.role === "original" && a.status !== "destroyed");
+}
+
+/**
  * R305 c: the record already has a readable file (the researcher's own, added while the copy was downloaded): there is
  * nothing to ask the researcher about, so nothing is held. Checked inside the hold's change; nothing was written.
  */
@@ -593,7 +602,7 @@ export async function holdMismatchedFile(core: RepoCore, projectId: string, inpu
       if (pending.length >= FIND_HELD_MAX) throw new HeldFileLimitError();
       // R305 c: a source that has a readable original (as this change sees it, so a file added at the same moment is
       // either before it — refused here — or after it) gets no waiting file.
-      if ((await readSourceFile(core, tx.state, input.sourceId)).assets.some((a) => a.role === "original" && a.status !== "destroyed")) throw new HeldFileSourceHasFileError();
+      if (sourceHasFile(await readSourceFile(core, tx.state, input.sourceId))) throw new HeldFileSourceHasFileError();
       const rel = `${tx.state.rel}/${held}`;
       await tx.mkdir(`${tx.state.rel}/${FIND_HELD_DIR}`);
       await tx.copyFile(input.fromPath, rel, { encrypt: tx.encrypted, mode: CHANGE_LOG_MODE });

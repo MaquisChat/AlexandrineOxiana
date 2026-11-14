@@ -7,7 +7,7 @@ import { DEFAULT_GOVERNANCE, findDuplicate, newId, type Project, type SourceDraf
 import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { activeTemp } from "../tmp-registry.js";
-import { FIND_HELD_MAX, holdMismatchedFile, readReviewEntries } from "../repo/review.js";
+import { FIND_HELD_MAX, holdMismatchedFile, readReviewEntries, resolveHeldFile } from "../repo/review.js";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
@@ -3510,6 +3510,86 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect((await r.retry(p.id, eid)).state).toBe("looking-for-copy");
     await copyDone(p, eid);
     expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+  });
+
+  /** R310: the project holds FIND_HELD_MAX waiting files and one entry (Zorblatt) waits for a place. */
+  async function atTheLimit(): Promise<{ p: Project; r: FindRunner; eid: string }> {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    await fillHeld(p, await otherRecord(p), FIND_HELD_MAX);
+    const r = runner();
+    const eid = (await r.add(p.id, [LINE])).added[0]!.id;
+    await until(async () => (await entryOf(p, eid))?.reason?.code === "held-full", "the wait");
+    expect(copyRequests).toEqual([]);
+    return { p, r, eid };
+  }
+
+  it("R310 a (I1): removing an entry whose file was waiting frees its place and wakes the entry waiting for the limit; nothing else is asked again", async () => {
+    const { p, r, eid } = await atTheLimit();
+    const [first] = await pendingReviews(p);
+    const gone = (first!.cause as { findEntryId: string }).findEntryId;
+    await r.remove(p.id, gone);
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    expect(copyRequests).toHaveLength(1);
+    expect(fileRequests).toEqual(["https://arxiv.org/pdf/2101.00001"]);
+    expect(await readdir(heldDirOf(p))).toHaveLength(FIND_HELD_MAX);
+    // The other waiting files' entries are as they were.
+    expect(await pendingReviews(p)).toHaveLength(FIND_HELD_MAX);
+  });
+
+  it("R310 a: removing an entry that had no waiting file wakes nothing (zero requests)", async () => {
+    const { p, r, eid } = await atTheLimit();
+    // A place freed without the runner (the library's own decision), so that a wake WOULD make the entry go on.
+    const [first] = await pendingReviews(p);
+    await resolveHeldFile(coreOf(), p.id, first!.id, "discard");
+    const at = new Date(NOW).toISOString();
+    const plain: FindEntry = { id: newId(), projectId: p.id, typed: "q r", state: "not-found", createdAt: at, updatedAt: at, attempts: 0 };
+    await appendFindEntries(coreOf(), p.id, [plain], "add");
+    await r.remove(p.id, plain.id);
+    await new Promise((res) => setTimeout(res, 200));
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "record-complete", reason: { code: "held-full" } });
+    expect(copyRequests).toEqual([]);
+    expect(fileRequests).toEqual([]);
+    // The control: the same entry is one the wake moves.
+    await r.wakeHeldFull(p.id);
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("needs-check");
+  });
+
+  /** R310 b: an entry with its record, stored "failed / held-full" (as builds before R296 d stored it). */
+  async function storedFailedHeldFull(n: number): Promise<{ p: Project; r: FindRunner; eid: string }> {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: false })) };
+    const { p, r, eid } = await recordMade();
+    await until(async () => (await entryOf(p, eid))?.state === "record-complete" && changes.some((c) => c.entryId === eid && c.state === "record-complete"), "the record");
+    await fillHeld(p, await otherRecord(p), n);
+    const cur = (await entryOf(p, eid))!;
+    await appendFindEntries(coreOf(), p.id, [{ ...cur, state: "failed", attempts: 3, reason: { code: "held-full" }, updatedAt: new Date(NOW + 1).toISOString() }], "update");
+    settings = COPY_ONLY_OPENALEX();
+    return { p, r, eid };
+  }
+
+  it("R310 b (M3): an entry stored failed / held-full goes on by itself when a decision frees a place", async () => {
+    const { p, r, eid } = await storedFailedHeldFull(FIND_HELD_MAX);
+    const [first] = await pendingReviews(p);
+    await r.resolveHeld(p.id, first!.id, "discard");
+    await until(async () => (await entryOf(p, eid))?.state === "needs-check", "the entry to go on");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    expect(copyRequests).toHaveLength(1);
+  });
+
+  it("R310 b (M3): an entry stored failed / held-full goes on at the project-wide resume", async () => {
+    const { p, r, eid } = await storedFailedHeldFull(FIND_HELD_MAX - 1);
+    r.resume(p.id);
+    await until(async () => (await entryOf(p, eid))?.state === "needs-check", "the entry to go on");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    expect(copyRequests).toHaveLength(1);
   });
 
   it("no offer: no open copy, with the 'elsewhere' links for Where to get it", async () => {

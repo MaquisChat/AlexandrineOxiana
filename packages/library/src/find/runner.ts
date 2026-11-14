@@ -74,7 +74,7 @@ import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AcquiredFrom, SourceFile } from "@ao/core";
 import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
-import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, type HeldFileFacts } from "../repo/review.js";
+import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, sourceHasFile, type HeldFileFacts } from "../repo/review.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
 import { checkFileAgainstRecord, type FileCheckResult } from "./file-check.js";
@@ -161,9 +161,13 @@ export function cleanAcquiredAddress(raw: string): string {
 
 /** Task F11: the states of the free-copy part of an entry's life (an entry with its record made, and no file yet). */
 const COPY_STATES: ReadonlySet<FindState> = new Set(["record-complete", "looking-for-copy", "fetching"]);
-const inCopyPart = (e: FindEntry): boolean => !!e.sourceId && COPY_STATES.has(e.state);
-/** Whether a source has a readable file: an original that is not destroyed. */
-const hasFile = (sf: SourceFile): boolean => sf.assets.some((a) => a.role === "original" && a.status !== "destroyed");
+/**
+ * An entry with its record waiting for a place among the files waiting for the researcher's check: "record-complete /
+ * held-full", or (R310 b) "failed / held-full" as builds before R296 d stored it — woken alike, and judged again from
+ * "looking for a copy" like the others.
+ */
+const waitsForPlace = (e: FindEntry): boolean => !!e.sourceId && (e.state === "record-complete" || e.state === "failed") && e.reason?.code === "held-full";
+const inCopyPart = (e: FindEntry): boolean => (!!e.sourceId && COPY_STATES.has(e.state)) || waitsForPlace(e);
 
 const VERSION: string = libraryVersion();
 
@@ -317,10 +321,12 @@ export interface FindRunner {
    */
   resolveHeld(projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<FindEntry | null>;
   /**
-   * R305 b: wakes ONLY the project's entries waiting for a place among the waiting files ("record-complete" with
-   * "held-full"); nothing in flight is touched (no download aborted or restarted, no service asked again for an entry
-   * already at work). `resolveHeld` calls it after each decision; the project-wide `resume` stays for a save of the
-   * rules, an opening and an unlocking. Does nothing for a project the runner is not running (stopped or never resumed).
+   * R305 b: wakes ONLY the project's entries waiting for a place among the waiting files ("held-full", stored
+   * "record-complete" or, R310 b, "failed"); nothing in flight is touched (no download aborted or restarted, no service
+   * asked again for an entry already at work). R310 a: every way a waiting file goes calls it — `resolveHeld` after each
+   * decision, `remove` after removing an entry whose file was waiting, and the service after it deletes a record (whose
+   * change resolves that record's waiting file). The project-wide `resume` stays for a save of the rules, an opening and
+   * an unlocking. Does nothing for a project the runner is not running (stopped or never resumed).
    */
   wakeHeldFull(projectId: string): Promise<void>;
   /**
@@ -1530,12 +1536,13 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    *                                                                       nothing held, the file dropped)
    *                                                    ──► no-open-copy  (no offer could be downloaded: its links kept)
    *   record-complete / held-full (R296 d): FIND_HELD_MAX files already wait — looked at BEFORE any free-copy service
-   *   is asked or any file downloaded; the entry waits, asking nothing, until a decision on a waiting file (`resolveHeld`
-   *   → `wakeHeldFull`, R305 b: only such entries), "Try again", opening or unlocking wakes it.
+   *   is asked or any file downloaded; the entry waits, asking nothing, until a waiting file goes — a decision on it,
+   *   the removal of its entry, the deletion of its record (`wakeHeldFull`, R305 b, R310 a: only such entries) — or
+   *   "Try again", opening or unlocking wakes it.
    *
    * Nothing is asked of any free-copy service, and nothing downloaded, unless the rules allow `free_copy` (else the
-   * entry stays "record-complete" with the reason "copy-not-allowed", and is looked at again only at the next open or
-   * unlock). Settings that switch every copy service off leave a "record-complete" entry as it is. A source that has
+   * entry stays "record-complete" with the reason "copy-not-allowed", and is looked at again at a save of the rules,
+   * "Try again", an opening and an unlocking). Settings that switch every copy service off leave a "record-complete" entry as it is. A source that has
    * a readable file is "in-library". A crash, a lock or a close in the middle resumes as "looking-for-copy".
    */
   async function copyOn(
@@ -1559,7 +1566,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       return;
     }
     if (!live()) return;
-    if (hasFile(sf)) {
+    if (sourceHasFile(sf)) {
       // Its source has a readable file already (the researcher's own: added by hand, or a held file used).
       await finish({ state: "in-library" }, ["nextTryAt", "reason"]);
       return;
@@ -1940,7 +1947,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function remove(projectId: string, entryId: string): Promise<void> {
     assertOpen();
     assertId(entryId);
-    await act(projectId, async () => {
+    const freed = await act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       cancelLater(projectId, entryId);
@@ -1948,11 +1955,18 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       if (r) r.pending = r.pending.filter((e) => e !== entryId);
       // Only the entry goes: a source it made stays in the library. A file held for it goes with it, and its review
       // entry is closed, in the same change (F11, R277 c).
-      if (cur.state === "needs-check") await removeFindEntryIn(repo, projectId, cur);
-      else await write(projectId, [cur], "remove");
+      if (cur.state !== "needs-check") {
+        await write(projectId, [cur], "remove");
+        return false;
+      }
+      await removeFindEntryIn(repo, projectId, cur);
+      return true;
     });
     // R282 g (M2): its download in flight is aborted (its folder removed and given up as the work ends).
     downloads.get(keyOfRun(projectId, entryId))?.abort(new Abandoned());
+    // R310 a: its waiting file went with it, so a place is free: the entries waiting for one go on (the same light
+    // wake as after a decision; nothing in flight is touched). An entry that had no waiting file wakes nothing.
+    if (freed) await wakeHeldFull(projectId);
   }
 
   async function resolveHeld(projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<FindEntry | null> {
@@ -1978,7 +1992,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     } catch {
       return; // locked or unreadable meanwhile: the next open or unlock resumes the project
     }
-    for (const e of q.values()) if (e.sourceId && e.state === "record-complete" && e.reason?.code === HELD_FULL.code) enqueue(projectId, e.id);
+    for (const e of q.values()) if (waitsForPlace(e)) enqueue(projectId, e.id);
   }
 
   function resume(projectId: string): void {
