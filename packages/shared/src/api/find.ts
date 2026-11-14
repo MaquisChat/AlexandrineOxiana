@@ -57,7 +57,7 @@ export const FIND_STATES = [
 export type FindState = (typeof FIND_STATES)[number];
 
 /** Why an entry could not go on (the library's FindReasonCode). */
-export const FIND_REASON_CODES = ["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected", "people-unavailable"] as const;
+export const FIND_REASON_CODES = ["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected", "people-unavailable", "needs-key"] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 
@@ -73,6 +73,8 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   unexpected: "Something went wrong while looking this up. Try again.",
   /** F8b (R283 a): on a "choose" entry whose people search could not be had; "Try again" is offered on it. */
   "people-unavailable": "People of this name could not be looked up just now. “Try again” looks again.",
+  /** F12 (R297 a): the only record source switched on (and allowed) needs a key that is not saved (Elicit). "Try again" goes on once it is. */
+  "needs-key": "The only search source switched on needs a key that is not saved. Add it in Search sources.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */

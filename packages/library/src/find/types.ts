@@ -61,7 +61,8 @@ export type OfferLink = {
 
 /** Task F5: why an entry could not go on (the sentences are `FIND_REASON_TEXT` in the shared package). */
 /** F8b (R283 a): `people-unavailable` — on a "choose" entry: people of this name could not be looked up ("Try again" looks again). */
-export type FindReasonCode = "not-allowed" | "no-legal-basis" | "switched-off" | "unreachable" | "locked" | "queue-full" | "budget" | "unexpected" | "people-unavailable";
+/** F12 (R297 a): `needs-key` — the only record source switched on and allowed needs a key that is not saved (`by: "settings"`). */
+export type FindReasonCode = "not-allowed" | "no-legal-basis" | "switched-off" | "unreachable" | "locked" | "queue-full" | "budget" | "unexpected" | "people-unavailable" | "needs-key";
 
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 

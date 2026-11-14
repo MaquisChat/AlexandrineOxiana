@@ -66,7 +66,7 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
 
   it("find and acquire: states, every reason code and every stop code has its one sentence, and the bounds", () => {
     expect(FIND_STATES).toHaveLength(15);
-    expect([...FIND_REASON_CODES]).toEqual(["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected", "people-unavailable"]);
+    expect([...FIND_REASON_CODES]).toEqual(["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected", "people-unavailable", "needs-key"]);
     // Exhaustive by type (Record<FindReasonCode, string>) and checked here at run time: one plain sentence each.
     expect(Object.keys(FIND_REASON_TEXT).sort()).toEqual([...FIND_REASON_CODES].sort());
     for (const c of FIND_REASON_CODES) expect(FIND_REASON_TEXT[c]).toMatch(/^[A-Z].*\.$/);
@@ -110,6 +110,15 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     // @ts-expect-error the offer carries counts, never a list of people
     const wrong: FindAuthorOffer = { peopleCount: 1, people: [] };
     expect(wrong.peopleCount).toBe(1);
+  });
+
+  it("F12 round 2 (R297 a, R298 a): the reason for a source switched on alone without its key; Elicit cannot be moved", () => {
+    expect(FIND_REASON_CODES).toContain("needs-key");
+    expect(FIND_REASON_TEXT["needs-key"]).toBe("The only search source switched on needs a key that is not saved. Add it in Search sources.");
+    expect(FIND_REASON_TEXT["needs-key"]).not.toBe(FIND_REASON_TEXT["switched-off"]);
+    // The screen offers "Move up" / "Move down" only for a source that can be moved: Elicit is always last.
+    expect(Object.fromEntries(SEARCH_RECORD_SOURCES.map((id) => [id, SEARCH_SOURCE_INFO.record[id].movable]))).toEqual({ crossref: true, openalex: true, elicit: false });
+    expect(SEARCH_RECORD_SOURCES[SEARCH_RECORD_SOURCES.length - 1]).toBe("elicit");
   });
 
   it("search sources (F12, R290): the sources shown, the fixed question, and every sentence declared once", () => {

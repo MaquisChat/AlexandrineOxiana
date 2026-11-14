@@ -463,6 +463,14 @@ function merge(a: WorkCandidate, b: WorkCandidate): WorkCandidate {
   };
 }
 
+/**
+ * R298 a: the same work from Elicit as from Crossref or OpenAlex. Elicit supplies and replaces no field of the
+ * bibliographic services' candidate (a gap stays a gap): it only adds its name to the providers.
+ */
+function joinedByElicit(a: WorkCandidate): WorkCandidate {
+  return { ...a, providers: [...new Set([...a.providers, "elicit" as const])] };
+}
+
 function withIds(list: WorkCandidate[]): WorkCandidate[] {
   const used = new Set<string>();
   return list.map((c) => {
@@ -493,11 +501,16 @@ export async function searchWorks(
   const asked = await Promise.all(
     sources.map((s) => (s === "crossref" ? askCrossref(ref, ctx) : s === "openalex" ? askOpenAlex(ref, ctx) : askElicit(ref, opts.elicitKey!, ctx, opts.elicitTimeoutMs))),
   );
+  // R298 a: Crossref and OpenAlex first, in the settings' order (the first one's values win, gaps filled from the
+  // other); Elicit always last, whatever the order: it adds a candidate of its own, or only its name to theirs.
   const merged: WorkCandidate[] = [];
-  for (const c of asked.flatMap((a) => a.found)) {
+  const isElicit = (c: WorkCandidate) => c.providers.length === 1 && c.providers[0] === "elicit";
+  const found = asked.flatMap((a) => a.found);
+  for (const c of [...found.filter((x) => !isElicit(x)), ...found.filter(isElicit)]) {
     const i = merged.findIndex((m) => sameWork(m, c));
-    if (i >= 0) merged[i] = merge(merged[i]!, c);
-    else merged.push(c);
+    if (i < 0) merged.push(c);
+    else if (isElicit(c) && !isElicit(merged[i]!)) merged[i] = joinedByElicit(merged[i]!);
+    else merged[i] = merge(merged[i]!, c);
   }
   const prep = prepare(ref);
   const ranked = merged

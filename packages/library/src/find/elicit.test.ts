@@ -219,6 +219,96 @@ describe("Elicit in the search", () => {
     expect(d.type).toBe("book");
   });
 
+  // R298 a (the review's I1): Elicit never supplies or replaces a field of a candidate that Crossref or OpenAlex gave;
+  // it only adds its name to the candidate's providers, whatever the order of the sources.
+  const TYPED = "Okafor, Upland Taste and Standing 2019";
+  const crossrefSays = (items: unknown[]) => agent.get("https://api.crossref.org").intercept({ path: () => true, method: "GET" }).reply(200, JSON.stringify({ status: "ok", message: { items } }), JSON_H).persist();
+  const openAlexSays = (results: unknown[]) => agent.get("https://api.openalex.org").intercept({ path: () => true, method: "GET" }).reply(200, JSON.stringify({ meta: { count: results.length }, results }), JSON_H).persist();
+  const elicitSays = (papers: unknown[]) => agent.get("https://elicit.com").intercept({ path: "/api/v2/search/papers", method: "POST" }).reply(200, JSON.stringify({ papers }), JSON_H).persist();
+  /** The candidates and the decision without Elicit, then with it (each through a fresh client: nothing cached). */
+  async function withAndWithout(sources: Array<"crossref" | "openalex" | "elicit">) {
+    const without = await searchWorks(ref(TYPED), ctx(client()), { sources: sources.filter((s) => s !== "elicit") });
+    const withE = await searchWorks(ref(TYPED), ctx(client()), { sources, elicitKey: ELICIT_KEY });
+    return { without, withE, dWithout: decideMatch(ref(TYPED), without.candidates), dWith: decideMatch(ref(TYPED), withE.candidates) };
+  }
+
+  it("R298 a, the review's probe 1: Crossref lacks the author and Elicit gives one: the decision is what it is without Elicit, and the author stays absent", async () => {
+    crossrefSays([{ DOI: "10.5555/x.2", type: "journal-article", title: ["Upland Taste and Standing"], issued: { "date-parts": [[2019]] } }]);
+    elicitSays([{ title: "Taste in the Uplands", authors: ["Amara Okafor"], year: 2019, doi: "10.5555/x.2", venue: "Invented Review" }]);
+    const { withE, dWithout, dWith } = await withAndWithout(["crossref", "elicit"]);
+    expect(dWithout.kind).toBe("choose");
+    expect(dWith.kind).toBe(dWithout.kind);
+    const c = withE.candidates.find((x) => x.identifiers.doi === "10.5555/x.2")!;
+    expect(c.providers).toEqual(["crossref", "elicit"]);
+    expect(c.creators).toEqual([]);
+    expect(c.title).toBe("Upland Taste and Standing");
+    expect(c.container).toBeUndefined();
+  });
+
+  it("R298 a, the review's probe 2: Elicit stored first, the same DOI with another title and type: Crossref's fields, the decision as without Elicit", async () => {
+    crossrefSays([{ DOI: "10.5555/x.1", type: "book", title: ["A Completely Different Book on Pottery"], author: [{ given: "Amara", family: "Okafor" }], issued: { "date-parts": [[2019]] } }]);
+    elicitSays([{ title: "Upland Taste and Standing", authors: ["Amara Okafor"], year: 2019, doi: "10.5555/x.1", venue: "Invented Review" }]);
+    const { without, withE, dWithout, dWith } = await withAndWithout(["elicit", "crossref"]);
+    expect(dWith.kind).toBe(dWithout.kind);
+    expect(dWith.kind).not.toBe("sure");
+    expect(withE.candidates).toHaveLength(1);
+    const c = withE.candidates[0]!;
+    const { providers, ...fields } = c;
+    const { providers: p0, ...fields0 } = without.candidates[0]!;
+    expect(p0).toEqual(["crossref"]);
+    expect(providers).toEqual(["crossref", "elicit"]);
+    expect(fields).toEqual(fields0);
+    expect(c.title).toBe("A Completely Different Book on Pottery");
+    expect(c.type).toBe("book");
+  });
+
+  it("R298 a: a field Crossref or OpenAlex did not give stays absent: creators, date, type, container, publisher, DOI (in either order)", async () => {
+    // Crossref: a title and a DOI only (no type: "other"). OpenAlex: the same title, first family and year, no DOI.
+    crossrefSays([{ DOI: "10.5555/x.3", title: ["Upland Taste and Standing"] }]);
+    openAlexSays([{ id: "https://openalex.org/W77", display_name: "Upland Taste and Standing", publication_year: 2019, type: "article", authorships: [{ author: { display_name: "Amara Okafor" } }] }]);
+    for (const order of [["elicit", "crossref", "openalex"], ["crossref", "openalex", "elicit"], ["openalex", "elicit", "crossref"]] as const) {
+      agent.get("https://elicit.com").intercept({ path: "/api/v2/search/papers", method: "POST" }).reply(200, JSON.stringify({
+        papers: [
+          { title: "Upland Taste and Standing", authors: ["Zed Nobody"], year: 1901, doi: "10.5555/x.3", venue: "Invented Review" },
+          { title: "Upland Taste and Standing", authors: ["Amara Okafor"], year: 2019, doi: "10.5555/elicit.only", venue: "Elicit Venue" },
+        ],
+      }), JSON_H);
+      _resetElicitForTests();
+      const without = await searchWorks(ref(TYPED), ctx(client()), { sources: order.filter((s) => s !== "elicit") });
+      const withE = await searchWorks(ref(TYPED), ctx(client()), { sources: [...order], elicitKey: ELICIT_KEY });
+      const cr = withE.candidates.find((x) => x.identifiers.doi === "10.5555/x.3")!;
+      const cr0 = without.candidates.find((x) => x.identifiers.doi === "10.5555/x.3")!;
+      expect(cr.providers, order.join()).toEqual([...cr0.providers, "elicit"]);
+      expect({ ...cr, providers: [] }, order.join()).toEqual({ ...cr0, providers: [] });
+      expect(cr.creators).toEqual([]);
+      expect(cr.issued).toBeUndefined();
+      expect(cr.type).toBe("other");
+      expect(cr.container).toBeUndefined();
+      expect(cr.publisher).toBeUndefined();
+      // OpenAlex's candidate (no DOI) met Elicit's by title, first family and year: it does not take Elicit's DOI.
+      const oa = withE.candidates.find((x) => x.providers.includes("openalex"))!;
+      const oa0 = without.candidates.find((x) => x.providers.includes("openalex"))!;
+      expect(oa.identifiers, order.join()).toEqual(oa0.identifiers);
+      expect(oa.identifiers.doi).toBeUndefined();
+      expect(oa.providers).toEqual([...oa0.providers, "elicit"]);
+      expect({ ...oa, providers: [] }).toEqual({ ...oa0, providers: [] });
+      // No decision is moved by Elicit.
+      expect(decideMatch(ref(TYPED), withE.candidates).kind, order.join()).toBe(decideMatch(ref(TYPED), without.candidates).kind);
+    }
+  });
+
+  it("R298 a: an Elicit-only candidate beside the others' is still offered with Elicit's fields, and never sure", async () => {
+    crossrefSays([{ DOI: "10.5555/x.4", type: "book", title: ["Something Else Entirely"], author: [{ family: "Brackwater" }], issued: { "date-parts": [[1950]] } }]);
+    elicitSays([{ title: "Upland Taste and Standing", authors: ["Amara Okafor"], year: 2019, doi: "10.5555/x.5", venue: "Invented Review" }]);
+    const r = await searchWorks(ref(TYPED), ctx(), { sources: ["elicit", "crossref"], elicitKey: ELICIT_KEY });
+    const e = r.candidates.find((x) => x.identifiers.doi === "10.5555/x.5")!;
+    expect(e.providers).toEqual(["elicit"]);
+    expect(e.title).toBe("Upland Taste and Standing");
+    expect(e.creators.map((x) => x.family)).toEqual(["Okafor"]);
+    expect(e.container).toBe("Invented Review");
+    expect(decideMatch(ref(TYPED), r.candidates).kind).toBe("choose");
+  });
+
   it("Elicit is never asked without a key, and the order of the sources is the settings' order", async () => {
     agent.get("https://api.crossref.org").intercept({ path: crPath(LINE), method: "GET" }).reply(200, fixture("crossref-empty.json"), JSON_H);
     const r = await searchWorks(ref(LINE), ctx(), { sources: ["elicit", "crossref"] });

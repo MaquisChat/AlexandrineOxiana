@@ -30,10 +30,13 @@
  */
 import type { LookupContext } from "../lookup/context.js";
 import { EMAIL_RE, LookupHttpError, type HttpClient } from "../lookup/http.js";
-import { AppSettingUnreadableError, readAppSettingStrict, setAppSettingAside, updateAppSettingStrict } from "../app-settings.js";
+import { AppSettingUnreadableError, setAppSettingAside, updateAppSettingStrict } from "../app-settings.js";
 import { encodeDoi } from "../lookup/crossref.js";
 import { DEFAULT_GOVERNANCE } from "@ao/core";
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import * as fsp from "node:fs/promises";
+import { join } from "node:path";
 import { elicitAsk } from "./elicit.js";
 import type { FreeCopySource } from "./free-copy.js";
 import { crossrefSearchUrl, openAlexSearchUrl } from "./search.js";
@@ -45,6 +48,12 @@ export const SEARCH_SOURCES_FILE = "search-sources.json";
 export const SEARCH_SOURCES_VERSION = 1;
 /** The longest e-mail address kept. */
 export const SEARCH_EMAIL_MAX = 254;
+/**
+ * R298 f: the file is read up to this many bytes; a larger one is unreadable (the defaults, said so; set aside by the
+ * next save) without being read whole. The bound is this file's own: the general settings reader (app-settings.ts) is
+ * shared with the other settings files, whose behaviour it does not change.
+ */
+export const SEARCH_SOURCES_MAX_BYTES = 64 * 1024;
 /** A file naming more sources than this in a group is not of this shape. */
 const SOURCES_IN_FILE_MAX = 64;
 const SOURCE_NAME_MAX = 64;
@@ -94,8 +103,8 @@ function isStored(v: unknown): v is StoredFile {
 
 /** Written by a newer version of the app: an object whose `v` is a whole number above this version. */
 const isNewer = (v: unknown): boolean => isObj(v) && Number.isSafeInteger(v.v) && (v.v as number) > SEARCH_SOURCES_VERSION;
-/** Anything that parses: for a read that tells the cases apart itself. */
-const anyJson = (v: unknown): v is unknown => v !== undefined;
+/** Nothing: for setting aside a file this version cannot use at all (larger than the bound). */
+const refuseAll = (_v: unknown): _v is never => false;
 
 /** The known sources of a group in the file's order, a repeated or unknown one dropped, a missing one added at the end with its default. */
 function rowsOf<T extends string>(rows: Array<{ id: string; on: boolean }>, known: readonly T[], defaults: ReadonlyArray<{ id: T; on: boolean }>): Array<{ id: T; on: boolean }> {
@@ -105,10 +114,15 @@ function rowsOf<T extends string>(rows: Array<{ id: string; on: boolean }>, know
   return out;
 }
 
+/** R298 a: Elicit is always the last of the record sources (it cannot be moved), whatever order is stored or sent. */
+function elicitLast<T extends { id: string }>(rows: T[]): T[] {
+  return [...rows.filter((x) => x.id !== "elicit"), ...rows.filter((x) => x.id === "elicit")];
+}
+
 /** The settings a stored file gives (normalised). */
 function settingsOf(f: StoredFile): SearchSettings {
   return {
-    record: rowsOf(f.record, RECORD_IDS, DEFAULT_SEARCH_SETTINGS.record),
+    record: elicitLast(rowsOf(f.record, RECORD_IDS, DEFAULT_SEARCH_SETTINGS.record)),
     copies: rowsOf(f.copies, COPY_IDS, DEFAULT_SEARCH_SETTINGS.copies ?? []),
     ...(f.crossrefEmail !== undefined ? { crossrefEmail: f.crossrefEmail } : {}),
     ...(f.unpaywallEmail !== undefined ? { unpaywallEmail: f.unpaywallEmail } : {}),
@@ -132,11 +146,50 @@ function fileOf(s: SearchSettings): StoredFile {
   };
 }
 
+/** Thrown by `readBounded` for a file that is there but cannot be used (too large, not a file, not JSON). */
+class Unusable extends Error {}
+
+/**
+ * The file's parsed content, or undefined when it is missing; Unusable when it is there but larger than
+ * SEARCH_SOURCES_MAX_BYTES (decided by its size, then by the bytes read: never more than the bound plus one is read),
+ * not a regular file, or not JSON. Opened without waiting on a pipe.
+ */
+async function readBounded(dir: string): Promise<unknown> {
+  let fh: fsp.FileHandle;
+  try {
+    fh = await fsp.open(join(dir, SEARCH_SOURCES_FILE), fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Unusable();
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile() || st.size > SEARCH_SOURCES_MAX_BYTES) throw new Unusable();
+    const buf = Buffer.alloc(SEARCH_SOURCES_MAX_BYTES + 1);
+    let n = 0;
+    for (;;) {
+      const { bytesRead } = await fh.read(buf, n, buf.length - n, n);
+      if (bytesRead === 0) break;
+      n += bytesRead;
+      if (n > SEARCH_SOURCES_MAX_BYTES) throw new Unusable(); // it grew since its size was taken
+    }
+    try {
+      return JSON.parse(buf.subarray(0, n).toString("utf8")) as unknown;
+    } catch {
+      throw new Unusable();
+    }
+  } catch (err) {
+    throw err instanceof Unusable ? err : new Unusable();
+  } finally {
+    await fh.close().catch(() => undefined);
+  }
+}
+
 /** The settings of this computer, read anew (a save takes effect for the next read). Never throws. */
 export async function readSearchSettings(dir: string): Promise<SearchSettingsRead> {
   let raw: unknown;
   try {
-    raw = await readAppSettingStrict(dir, SEARCH_SOURCES_FILE, anyJson);
+    raw = await readBounded(dir);
   } catch {
     return { settings: defaults(), problem: "unreadable" };
   }
@@ -159,6 +212,15 @@ export async function writeSearchSettings(dir: string, next: SearchSettings, now
       if (cur !== undefined && isNewer(cur)) throw new SearchSettingsNewerError();
       return file;
     });
+  // R298 f: a file this read cannot use (over the bound included: never "newer") is set aside, then written. (Setting
+  // it aside goes through the general reader, which reads it once, at this save only.)
+  let unusable = false;
+  try {
+    await readBounded(dir);
+  } catch {
+    unusable = true;
+  }
+  if (unusable) await setAppSettingAside(dir, SEARCH_SOURCES_FILE, refuseAll, now).catch(() => undefined);
   try {
     await write();
   } catch (err) {
@@ -193,7 +255,8 @@ const TEST_FAMILY = "Bourdieu";
 export const FIND_SOURCE_TEST_TIMEOUT_MS = 30_000;
 
 export type SearchSourceTestGroup = "record" | "copies";
-export type SearchSourceTestResult = "answered" | "unreachable" | "key-refused" | "plan-cap" | "needs-key" | "needs-email";
+/** `paused` (R298 c): Elicit is in its five-minute pause after a 429, so nothing was asked. */
+export type SearchSourceTestResult = "answered" | "unreachable" | "key-refused" | "plan-cap" | "needs-key" | "needs-email" | "paused";
 
 const enc = (s: string) => encodeURIComponent(s).replace(/[!'()*]/gu, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 
@@ -243,7 +306,7 @@ async function within<T>(p: Promise<T>, ms: number, onLate: T): Promise<T> {
  * Asks one source its fixed question with `http` (the caller gives a fresh client, so that nothing cached answers in
  * the service's place; its `keyFor` adds OpenAlex's key by host): "answered" when the service answered (a 404 is an
  * answer), "key-refused" when it refused a key it was sent (401 or 403), "plan-cap" (Elicit's 400 for its plan),
- * "unreachable" otherwise — and, asking nothing, "needs-key" (Elicit without `key`) or "needs-email" (Unpaywall
+ * "unreachable" otherwise — and, asking nothing, "paused" (Elicit during its five-minute pause), "needs-key" (Elicit without `key`) or "needs-email" (Unpaywall
  * without a well-formed `email`). Never throws.
  */
 export async function testSearchSource(
@@ -260,6 +323,7 @@ export async function testSearchSource(
     if (out.kind === "answered") return "answered";
     if (out.kind === "key-refused") return "key-refused";
     if (out.kind === "plan-cap") return "plan-cap";
+    if (out.kind === "paused") return "paused";
     return "unreachable";
   }
   let target: { url: string; json: boolean; query?: Record<string, string>; host: string };

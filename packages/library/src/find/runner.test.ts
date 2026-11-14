@@ -3072,13 +3072,13 @@ describe("F12: Search sources and Elicit in the runner", () => {
     expect(elicitBodies).toEqual([]);
   });
 
-  it("only Elicit on: without a key the entry is switched off by the settings; with a key that fails, the ordinary retries", async () => {
+  it("only Elicit on: without a key the entry says the key is missing (R297 a); with a key that fails, the ordinary retries", async () => {
     settings = elicitOn(false);
     const p = await project({ gov: ELICIT_GOV() });
     const noKey = runner(keyed(null));
     const a = (await noKey.add(p.id, [LINE])).added[0]!;
     await settled(p, a.id);
-    expect((await entryOf(p, a.id))!).toMatchObject({ state: "failed", reason: { code: "switched-off", by: "settings" } });
+    expect((await entryOf(p, a.id))!).toMatchObject({ state: "failed", reason: { code: "needs-key", by: "settings" } });
     await noKey.stopAll();
     elicitAnswer = { status: 503, body: "down" };
     const withKey = runner(keyed());
@@ -3086,6 +3086,56 @@ describe("F12: Search sources and Elicit in the runner", () => {
     await until(async () => (await entryOf(p, b.id))?.attempts === 1, "the first failure");
     expect((await entryOf(p, b.id))!.state).toBe("looking-up");
     expect(asked).toEqual([]);
+  });
+});
+
+describe("F12 round 2 (R297 a): the only source switched on needs a key that is not saved", () => {
+  let elicitBodies: string[];
+  let key: string | undefined;
+  const ELICIT_GOV = () => GOV("vendors:\n  - id: elicit\n").replace("[crossref, openalex]", "[crossref, openalex, elicit]");
+  const onlyElicit = (): SearchSettings => ({ record: DEFAULT_SEARCH_SETTINGS.record.map((s) => ({ ...s, on: s.id === "elicit" })) });
+  beforeEach(async () => {
+    const { _resetElicitForTests } = await import("./elicit.js");
+    _resetElicitForTests();
+    elicitBodies = [];
+    key = undefined;
+    agent
+      .get("https://elicit.com")
+      .intercept({ path: "/api/v2/search/papers", method: "POST" })
+      .reply((o) => {
+        elicitBodies.push(String(o.body));
+        return { statusCode: 200, data: JSON.stringify({ papers: [] }), responseOptions: { headers: { "content-type": "application/json" } } };
+      })
+      .persist();
+  });
+
+  it("Elicit the only source on and allowed, no key: its own reason and sentence, nothing asked; a key saved later lets Try again go on", async () => {
+    settings = onlyElicit();
+    const p = await project({ gov: ELICIT_GOV() });
+    const r = runner({ elicitKey: async () => key });
+    const a = (await r.add(p.id, [LINE])).added[0]!;
+    await settled(p, a.id);
+    const e = (await entryOf(p, a.id))!;
+    expect(e).toMatchObject({ state: "failed", reason: { code: "needs-key", by: "settings" } });
+    expect(e.nextTryAt).toBeUndefined();
+    expect(elicitBodies).toEqual([]);
+    expect(asked).toEqual([]);
+    // The key is saved: "Try again" is accepted (as for "switched off") and Elicit is asked.
+    key = "elk-RECOGNISABLE-55e1b0";
+    await r.retry(p.id, a.id);
+    await until(() => elicitBodies.length === 1, "Elicit asked after the key was saved");
+    await settled(p, a.id);
+    expect((await entryOf(p, a.id))!.reason?.code).not.toBe("needs-key");
+  });
+
+  it("every source off is still \"switched off\", whatever the keys", async () => {
+    settings = { record: DEFAULT_SEARCH_SETTINGS.record.map((s) => ({ ...s, on: false })) };
+    const p = await project({ gov: ELICIT_GOV() });
+    const r = runner({ elicitKey: async () => undefined });
+    const a = (await r.add(p.id, [LINE])).added[0]!;
+    await settled(p, a.id);
+    expect((await entryOf(p, a.id))!).toMatchObject({ state: "failed", reason: { code: "switched-off", by: "settings" } });
+    expect(elicitBodies).toEqual([]);
   });
 });
 

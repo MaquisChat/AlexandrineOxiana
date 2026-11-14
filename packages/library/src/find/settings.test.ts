@@ -92,7 +92,8 @@ describe("the settings file", () => {
     const before = await readFile(file(), "utf8");
     // A hard link to the first file keeps its content: the second write did not change that file in place.
     await link(file(), join(tmp, "old-link"));
-    const next: SearchSettings = { record: [...DEFAULT_SEARCH_SETTINGS.record].reverse(), copies: DEFAULT_SEARCH_SETTINGS.copies!, unpaywallEmail: UNPAYWALL_EMAIL };
+    // Reversed, Elicit kept last (R298 a: it cannot be moved).
+    const next: SearchSettings = { record: [...DEFAULT_SEARCH_SETTINGS.record.filter((x) => x.id !== "elicit")].reverse().concat(DEFAULT_SEARCH_SETTINGS.record.filter((x) => x.id === "elicit")), copies: DEFAULT_SEARCH_SETTINGS.copies!, unpaywallEmail: UNPAYWALL_EMAIL };
     await writeSearchSettings(dir, next, new Date());
     expect(await readFile(join(tmp, "old-link"), "utf8")).toBe(before);
     if (process.platform !== "win32") expect((await stat(file())).mode & 0o777).toBe(0o600);
@@ -149,8 +150,48 @@ describe("the settings file", () => {
     );
     const r = await readSearchSettings(dir);
     expect(r.problem).toBeUndefined();
-    expect(ids(r.settings)).toEqual(["elicit:true", "openalex:false", "crossref:true", "openlibrary:true", "loc:true"]);
+    // R298 a: Elicit is always the last of the record sources, whatever the file holds.
+    expect(ids(r.settings)).toEqual(["openalex:false", "crossref:true", "openlibrary:true", "loc:true", "elicit:true"]);
     expect(r.settings.copies!.map((x) => `${x.id}:${x.on}`)).toEqual(["doab:false", "arxiv:true", "openalex:true", "unpaywall:false", "europepmc:true", "semanticscholar:true", "internetarchive:true"]);
+  });
+
+  it("R298 a: Elicit is always the last record source: a file naming it first is read with it last, and a save naming it first stores it last", async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(file(), JSON.stringify({ v: 1, record: [{ id: "elicit", on: true }, { id: "crossref", on: true }, { id: "openalex", on: false }, { id: "openlibrary", on: true }, { id: "loc", on: true }], copies: [] }));
+    const r = await readSearchSettings(dir);
+    expect(r.problem).toBeUndefined();
+    expect(ids(r.settings)).toEqual(["crossref:true", "openalex:false", "openlibrary:true", "loc:true", "elicit:true"]);
+    const saved = await writeSearchSettings(dir, { record: [{ id: "elicit", on: false }, { id: "openalex", on: true }, { id: "crossref", on: true }], copies: [] }, new Date());
+    expect(ids(saved)).toEqual(["openalex:true", "crossref:true", "openlibrary:true", "loc:true", "elicit:false"]);
+    expect(JSON.parse(await readFile(file(), "utf8")).record.map((x: { id: string }) => x.id)).toEqual(["openalex", "crossref", "openlibrary", "loc", "elicit"]);
+  });
+
+  it("R298 f: the file is read up to 64 KiB; a larger one is unreadable (the defaults, said so), never read whole, and set aside by the next save", async () => {
+    await mkdir(dir, { recursive: true });
+    const { SEARCH_SOURCES_MAX_BYTES } = await import("./settings.js");
+    expect(SEARCH_SOURCES_MAX_BYTES).toBe(64 * 1024);
+    // A well-formed file of this shape, padded past the bound with spaces (still valid JSON), and one exactly at it.
+    const body = JSON.stringify({ v: 1, record: [{ id: "crossref", on: false }], copies: [] });
+    await writeFile(file(), body.padEnd(SEARCH_SOURCES_MAX_BYTES, " "));
+    expect((await readSearchSettings(dir)).problem).toBeUndefined();
+    expect(ids((await readSearchSettings(dir)).settings)[0]).toBe("crossref:false");
+    const big = body.padEnd(SEARCH_SOURCES_MAX_BYTES + 1, " ");
+    await writeFile(file(), big);
+    const r = await readSearchSettings(dir);
+    expect(r.problem).toBe("unreadable");
+    expect(ids(r.settings)).toEqual(ids(DEFAULT_SEARCH_SETTINGS));
+    expect(await readFile(file(), "utf8")).toBe(big);
+    // Never read whole: a file of 50 MB is refused at once (its size, not its parse).
+    await writeFile(file(), body.padEnd(50 * 1024 * 1024, " "));
+    const t0 = Date.now();
+    for (let i = 0; i < 10; i++) expect((await readSearchSettings(dir)).problem).toBe("unreadable");
+    expect(Date.now() - t0).toBeLessThan(500);
+    // A newer version's file over the bound is unreadable too (not "newer"): the next save sets it aside and writes.
+    await writeFile(file(), JSON.stringify({ v: 2, record: [], copies: [] }).padEnd(SEARCH_SOURCES_MAX_BYTES + 10, " "));
+    expect((await readSearchSettings(dir)).problem).toBe("unreadable");
+    await writeSearchSettings(dir, DEFAULT_SEARCH_SETTINGS as SearchSettings, new Date("2026-11-14T10:00:00Z"));
+    expect((await readdir(dir)).some((n) => n.startsWith(`${SEARCH_SOURCES_FILE}.unreadable-`))).toBe(true);
+    expect((await readSearchSettings(dir)).problem).toBeUndefined();
   });
 
   it("holds no key: a key is never a field of the file", async () => {
@@ -240,6 +281,14 @@ describe("Test (R290 g)", () => {
     expect(await testSearchSource("record", "elicit", { http: client(), key: ELICIT_KEY })).toBe("key-refused");
     agent.get("https://elicit.com").intercept({ path: () => true, method: "POST" }).reply(400, JSON.stringify({ error: "maxResults exceeds your plan's limit" }));
     expect(await testSearchSource("record", "elicit", { http: client(), key: ELICIT_KEY })).toBe("plan-cap");
+  });
+
+  it("R298 c: a Test of Elicit during its five-minute pause asks nothing and says the pause", async () => {
+    agent.get("https://elicit.com").intercept({ path: () => true, method: "POST" }).reply(429, "slow down");
+    expect(await testSearchSource("record", "elicit", { http: client(), key: ELICIT_KEY })).toBe("unreachable");
+    requests = [];
+    expect(await testSearchSource("record", "elicit", { http: client(), key: ELICIT_KEY })).toBe("paused");
+    expect(requests).toEqual([]);
   });
 
   it("a test without the key or the e-mail it needs asks nothing", async () => {

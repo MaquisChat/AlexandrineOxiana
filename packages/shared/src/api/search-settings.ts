@@ -47,7 +47,7 @@ export interface SearchCopyRow {
   allowedByRules?: boolean;
 }
 
-/** `GET` and `PUT /settings/search-sources`. Rows in the order they are asked. */
+/** `GET` and `PUT /settings/search-sources`. Rows in the order they are asked; Elicit's row is always the last of `record`. */
 export interface SearchSourcesResponse {
   record: SearchRecordRow[];
   copies: SearchCopyRow[];
@@ -65,7 +65,8 @@ export interface SearchSourcesResponse {
 
 /**
  * `PUT /settings/search-sources`: every source of each group exactly once, in the order to ask them. An e-mail that
- * is absent or null is removed. Unpaywall cannot be on without its e-mail.
+ * is absent or null is removed. Unpaywall cannot be on without its e-mail. Elicit named anywhere but last is accepted
+ * and stored last (it cannot be moved: SEARCH_SOURCE_INFO.record.elicit.movable).
  */
 export interface SearchSourcesRequest {
   record: Array<{ id: SearchRecordSource; on: boolean }>;
@@ -98,15 +99,19 @@ export function isSearchApiKeyShape(v: unknown): v is string {
 /** The secret names of the two keys (beside the Zotero key), and the source each belongs to. */
 export const SEARCH_KEY_SECRETS = { elicit: "elicit-api-key", openalex: "openalex-api-key" } as const;
 
-/** What each source receives and whether it needs an account (for the screen's lines "Sends: …" and "Needs an account"). */
+/**
+ * What each source receives and whether it needs an account (for the screen's lines "Sends: …" and "Needs an account").
+ * `movable` (record sources, R298 a): whether the screen offers "Move up" and "Move down" for it. Elicit cannot be
+ * moved: it is always the last of the record sources (the service returns and stores it last whatever order is sent).
+ */
 export const SEARCH_SOURCE_INFO: {
-  record: Record<SearchRecordSource, { sends: "words"; account: boolean; key?: "required" | "optional"; email?: "optional" }>;
+  record: Record<SearchRecordSource, { sends: "words"; account: boolean; movable: boolean; key?: "required" | "optional"; email?: "optional" }>;
   copies: Record<SearchCopySource, { sends: "doi-or-title"; account: boolean; key?: "optional"; email?: "required" }>;
 } = {
   record: {
-    crossref: { sends: "words", account: false, email: "optional" },
-    openalex: { sends: "words", account: false, key: "optional" },
-    elicit: { sends: "words", account: true, key: "required" },
+    crossref: { sends: "words", account: false, movable: true, email: "optional" },
+    openalex: { sends: "words", account: false, movable: true, key: "optional" },
+    elicit: { sends: "words", account: true, movable: false, key: "required" },
   },
   copies: {
     openalex: { sends: "doi-or-title", account: false, key: "optional" },

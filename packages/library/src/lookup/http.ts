@@ -22,8 +22,11 @@
  *    carries no e-mail. `; mailto:<email>` is added inside the parentheses only on requests to a host for which
  *    `contactEmailFor(host)` gives a well-formed address (F12, R290 e: Crossref's, to api.crossref.org only).
  *  - Keys (F12, R290 a): a key travels in the `Authorization: Bearer` header only, never in an address, and only to
- *    a host of KEYED_HOSTS reached over https on its default port: `keyFor(host)` (OpenAlex's) or a request's own key
- *    bound to its host (`PostOptions.key`, Elicit's). ONE place decides it (the private `keyFor`). A request that
+ *    a host of KEYED_HOSTS reached over https on its default port, each host bound to its own key in the client itself
+ *    (R298 b): `keyFor(host)` is asked for api.openalex.org only (OpenAlex's key), and elicit.com gets only a request's
+ *    own key bound to it (`PostOptions.key`, Elicit's). ONE place decides it (the private `keyFor`). Before a GET to
+ *    api.openalex.org the client awaits `keyReady(host)` (R297 b: the caller's lazy, bounded read of the key; a failure
+ *    of it sends the request without a key). A request that
  *    carries a key is never redirected (any 3xx is refused, the same site included); its answer is cached under the
  *    caller's `cacheKey`, which holds no header, and is served from the cache whatever the key; an answer that holds
  *    the key or the e-mail sent is not cached; no error's message or property carries the key (the library's own
@@ -75,6 +78,8 @@ export const DEFAULT_CONCURRENCY: Readonly<Record<string, number>> = {
  * on the default port only. A key function that answers for another host is never even asked.
  */
 export const KEYED_HOSTS: ReadonlySet<string> = new Set(["api.openalex.org", "elicit.com"]);
+/** The one host whose key `keyFor(host)` gives (OpenAlex's); every other keyed host takes only a request's own key (R298 b). */
+const KEY_FOR_HOST = "api.openalex.org";
 /** A key the client sends: visible ASCII without spaces, at most 4,096 characters (nothing that could change a header). */
 const KEY_SHAPE = /^[\x21-\x7e]{1,4096}$/u;
 /** The start of a 429's body shown to the caller's decision. */
@@ -144,6 +149,12 @@ export interface HttpClientOptions {
    * at each request (a key added or changed is used by the next request). Never stored by the client.
    */
   keyFor?: (host: string) => string | undefined;
+  /**
+   * F12 (R297 b): awaited before each GET to api.openalex.org, before `keyFor` is asked: the caller's chance to read
+   * the key lazily (one read shared by every request) within its own short bound. Never asked for another host. A
+   * rejection is ignored: the request goes, without a key if none is held.
+   */
+  keyReady?: (host: string) => Promise<void>;
   /** undici dispatcher (tests pass a MockAgent). */
   dispatcher?: Dispatcher;
   /** Milliseconds since the epoch (rate limits and cache age). */
@@ -217,6 +228,7 @@ export class HttpClient {
   readonly userAgent: string = USER_AGENT;
   private readonly contactEmailFor?: (host: string) => string | undefined;
   private readonly keyForHost?: (host: string) => string | undefined;
+  private readonly keyReady?: (host: string) => Promise<void>;
   private readonly cacheDir: string;
   /**
    * R247 (c): whether the library's root folder existed when the client was made. If it did, a cache write never
@@ -247,6 +259,7 @@ export class HttpClient {
   constructor(opts: HttpClientOptions) {
     this.contactEmailFor = opts.contactEmailFor;
     this.keyForHost = opts.keyFor;
+    this.keyReady = opts.keyReady;
     this.cacheDir = join(opts.libraryRoot, ".cache", "lookups");
     this.rootExisted = existsSync(opts.libraryRoot);
     this.dispatcher = opts.dispatcher;
@@ -398,13 +411,14 @@ export class HttpClient {
   /**
    * THE one place that decides a key (R290 a): for an https address on its default port, with no user name, whose
    * host is in KEYED_HOSTS, the request's own key when one is given and bound to that host (a key given for another
-   * host gives none), else `keyFor(host)`; a key that is not of KEY_SHAPE is never sent. Undefined for every other
-   * address.
+   * host gives none), else `keyFor(host)` — asked for api.openalex.org only (R298 b: elicit.com takes only a request's
+   * own key); a key that is not of KEY_SHAPE is never sent. Undefined for every other address.
    */
   private keyFor(u: URL, own?: { host: string; value: string }): string | undefined {
     if (u.protocol !== "https:" || u.port !== "" || u.username !== "" || u.password !== "" || !KEYED_HOSTS.has(u.hostname)) return undefined;
     let key: string | undefined;
     if (own) key = own.host === u.hostname ? own.value : undefined;
+    else if (u.hostname !== KEY_FOR_HOST) key = undefined;
     else {
       try {
         key = this.keyForHost?.(u.hostname);
@@ -571,6 +585,13 @@ export class HttpClient {
   ): Promise<{ status: 200 | 404; body: string | null; sent?: Record<string, string> }> {
     if (this.recorded) return this.recorded.answer(url);
     const first = new URL(url);
+    if (this.keyReady && first.hostname === KEY_FOR_HOST && this.keyForHost) {
+      try {
+        await this.keyReady(first.hostname);
+      } catch {
+        // The key could not be read: the request goes without it (never failing because of the key).
+      }
+    }
     const key = this.keyFor(first);
     const { ua, email } = this.userAgentFor(first.hostname);
     /** What was sent that an answer must not be cached with (an answer that echoes it is not kept). */

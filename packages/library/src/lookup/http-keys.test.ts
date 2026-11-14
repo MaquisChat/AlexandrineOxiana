@@ -203,6 +203,54 @@ describe("a key by the request's host (R290 a)", () => {
     expect(requests.map((r) => r.headers.authorization)).toEqual([undefined, `Bearer ${OA_KEY}`, "Bearer second-key-1234"]);
   });
 
+  it("R298 b (the review's M1): each keyed host is bound to its own key in the client: a key function that answers for any host gives nothing to elicit.com on a GET", async () => {
+    agent.get("https://elicit.com").intercept({ path: "/api/v2/anything", method: "GET" }).reply(200, "{}", JSON_H);
+    const asked: string[] = [];
+    const http = client({
+      keyFor: (h) => {
+        asked.push(h);
+        return keyEverywhere();
+      },
+    });
+    await http.getJson("https://elicit.com/api/v2/anything", { cacheKey: "k:elicit-get", sensitive: true });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.headers.authorization).toBeUndefined();
+    expect(JSON.stringify(requests[0])).not.toContain(OA_KEY);
+    expect(http.keyTag("elicit.com")).toBe("");
+    // The key function is asked for api.openalex.org only.
+    expect(asked).toEqual([]);
+    expect(http.keyTag("api.openalex.org")).not.toBe("");
+    expect(asked).toEqual(["api.openalex.org"]);
+  });
+
+  it("R297 b: `keyReady` is awaited before a request to api.openalex.org (only), so the first request carries a key read just then; one that fails or rejects sends the request without a key", async () => {
+    agent.get("https://api.openalex.org").intercept({ path: (p) => p.startsWith("/works/R"), method: "GET" }).reply(200, "{}", JSON_H).persist();
+    agent.get("https://api.crossref.org").intercept({ path: "/works/10.5555/r", method: "GET" }).reply(200, "{}", JSON_H);
+    let held: string | undefined;
+    const readyFor: string[] = [];
+    const http = client({
+      keyFor: (h) => (h === "api.openalex.org" ? held : undefined),
+      keyReady: async (h) => {
+        readyFor.push(h);
+        await new Promise((r) => setTimeout(r, 20));
+        held = OA_KEY;
+      },
+    });
+    await http.getJson("https://api.openalex.org/works/R1", { cacheKey: "r1", sensitive: true });
+    await http.getJson("https://api.crossref.org/works/10.5555/r", { cacheKey: "r2", sensitive: true });
+    expect(readyFor).toEqual(["api.openalex.org"]);
+    expect(requests.map((r) => r.headers.authorization)).toEqual([`Bearer ${OA_KEY}`, undefined]);
+    requests = [];
+    const failing = client({
+      keyFor: () => undefined,
+      keyReady: async () => {
+        throw new Error(`the store failed ${OA_KEY}`);
+      },
+    });
+    expect(await failing.getJson("https://api.openalex.org/works/R3", { cacheKey: "r3", sensitive: true })).toEqual({});
+    expect(requests.map((r) => r.headers.authorization)).toEqual([undefined]);
+  });
+
   it("the key's tag is a digest (never the key), empty without a key, and changes with the key", () => {
     let current: string | undefined;
     const http = client({ keyFor: (h) => (h === "api.openalex.org" ? current : undefined) });

@@ -855,6 +855,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return without.result === "deny" && withBasis.result !== "deny" ? NO_LEGAL_BASIS : RULES;
   }
   const SETTINGS: FindReason = { code: "switched-off", by: "settings" };
+  /** R297 a: the only record source switched on and allowed needs a key that is not saved (Elicit). */
+  const NEEDS_KEY: FindReason = { code: "needs-key", by: "settings" };
 
   // ------------------------------------------------------------------------------------------------------------
   // Completing an entry with a candidate: the duplicate check and the creation in one store turn.
@@ -1158,8 +1160,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     const sources = allowed.filter((x) => x !== "elicit" || elicitKey !== undefined);
     if (!sources.length) {
-      // Only Elicit was on and allowed, and it has no key: as if it were off (the screen says "Needs your Elicit API key").
-      await finish({ state: "failed", reason: SETTINGS }, ["nextTryAt"]);
+      // Only Elicit was on and allowed, and it has no key (R297 a): said so, and ends as "switched off" ends ("Try again"
+      // goes on once the key is saved).
+      await finish({ state: "failed", reason: NEEDS_KEY }, ["nextTryAt"]);
       return;
     }
 
