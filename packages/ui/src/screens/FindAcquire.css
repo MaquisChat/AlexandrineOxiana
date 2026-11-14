@@ -185,3 +185,19 @@
   overflow-wrap: anywhere;
   font-family: var(--font-mono);
 }
+
+/* Task F18b (R340): through the researcher's library. The service's sentence for the library part of the view, what the
+   sign-in window reported for the row, and why a control that needs the desktop app is unavailable (in words). */
+.ao-find__library,
+.ao-find__library-note {
+  margin: 0 0 var(--space-1);
+}
+
+.ao-find__unavailable {
+  font-weight: 700;
+  margin: 0;
+}
+
+.ao-find .ao-find__unavailable-act[aria-disabled="true"] {
+  cursor: not-allowed;
+}

@@ -25,15 +25,39 @@
  *
  * The states of later slices are said in words, with "Remove from the queue" (and "Open" when the entry has a
  * record), and no control of a later slice.
+ *
+ * Through the researcher's library (Task F18b; R340, R301): "Get through my library" is on a row exactly when its view
+ * says a start is offered (`library.canStart === true`) — the row works out nothing; a view saying no library is set
+ * gives the service's sentence and a link to "Your library"; the view's `lastFile` gives the service's sentence for a
+ * file that was not kept (none for a code this build does not know). A row waiting in the sign-in window has "Add the
+ * PDF showing in the sign-in window" and "Cancel". Outside the desktop app the two controls that need the shell are
+ * shown unavailable ("Only in the desktop app"), stay reachable by keyboard, and a press does nothing. What the shell
+ * reported for the row is the screen's `note`. "Where to get it" is WhereToGetIt, on every row whose view carries links
+ * (never on a record removed from the library).
  */
-import { FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindOfferLink, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
-import { Component, memo, useState, type ReactNode } from "react";
+import { FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, FIND_LIBRARY_TEXT, FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindLibraryFileOutcome, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
+import { Component, memo, useId, type ReactNode } from "react";
 import { creatorsText, isKnownState, kindWords, usableCandidates, yearOf } from "../api/find";
 import { inDesktopShell } from "../desktopShell";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
+import { WhereToGetIt } from "./WhereToGetIt";
 
-export type FindActKind = "choose" | "choose-person" | "choose-works" | "open" | "open-there" | "add-here" | "same" | "different" | "retry" | "remove";
+export type FindActKind =
+  | "choose"
+  | "choose-person"
+  | "choose-works"
+  | "open"
+  | "open-there"
+  | "add-here"
+  | "same"
+  | "different"
+  | "retry"
+  | "remove"
+  // Task F18b (R340): through the researcher's library.
+  | "library"
+  | "library-take"
+  | "library-cancel";
 
 /** What the researcher pressed on a row. */
 export interface FindAction {
@@ -75,13 +99,18 @@ export const FIND_TEXT = {
   originGone: "Added from an author's works",
   // Task F11: the copy part.
   checkFile: "Check the file",
-  whereToGetIt: "Where to get it",
-  // R311 a: the desktop app cannot open an outside address yet, so each place is copied rather than linked.
-  pasteHint: "Paste an address into your browser.",
-  copyAddress: "Copy address",
-  addressCopied: "Address copied.",
-  /** R315 c: a copy that did not work; the address is then shown under its place, to select. */
-  copyFailed: "Copying did not work here. Select the address and copy it.",
+  // Task F18b (R340): through the researcher's library. None of these says or implies that the app adds a file (R301).
+  yourLibrary: "Your library",
+  onlyDesktop: "Only in the desktop app",
+  windowNotOpened: "The sign-in window could not be opened. Nothing was changed.",
+  windowClosed: "The sign-in window was closed.",
+  fetching: "Fetching the PDF…",
+  notAPdf: "That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check.",
+  fetchPause: "The sign-in window rests for a few seconds between files. Try again shortly.",
+  fetchBusy: "The PDF is already being fetched.",
+  fetchFailed: "The PDF could not be fetched. Try again in the sign-in window.",
+  handedOver: "The file was fetched and is being checked.",
+  appSilent: "The app did not answer. Try again.",
 } as const;
 
 /** Reasons on "record-complete" that "Try again" takes (F11: the rules, the store part, the waiting files' limit; R326 adds "switched off" by the settings in `actionsOf`). */
@@ -91,30 +120,25 @@ const COPY_RETRY_REASONS: ReadonlySet<string> = new Set<FindReasonCode>(["copy-n
 export const reviewEntryHref = (e: FindEntryView): string =>
   `${PATHS.reviewQueue}?project=${encodeURIComponent(e.projectId)}${typeof e.sourceId === "string" ? `&source=${encodeURIComponent(e.sourceId)}` : ""}`;
 
-/**
- * The entry's offers that may be shown as links: well-formed, an https: address with no name or password in it. The
- * service promises https: only; this screen does not rely on it — anything else is left out. R313 h: each is named by
- * the host its address really leads to (parsed here), never by the `host` the service sent.
- */
-export function safeOffers(e: FindEntryView): FindOfferLink[] {
-  const list: unknown = e.offers;
-  if (!Array.isArray(list)) return [];
-  const out: FindOfferLink[] = [];
-  for (const o of list) {
-    if (!o || typeof o !== "object") continue;
-    const { label, url } = o as Record<string, unknown>;
-    if (typeof label !== "string" || typeof url !== "string" || !label) continue;
-    let u: URL;
-    try {
-      u = new URL(url);
-    } catch {
-      continue;
-    }
-    if (u.protocol !== "https:" || u.username || u.password || !u.host) continue;
-    out.push({ ...(o as FindOfferLink), host: u.host });
-  }
-  return out;
-}
+/** The view's library part, read defensively (a later build's shape is no part). */
+const libraryOf = (e: FindEntryView): Record<string, unknown> | undefined => {
+  const l: unknown = e.library;
+  return l && typeof l === "object" && !Array.isArray(l) ? (l as Record<string, unknown>) : undefined;
+};
+/** R340 a: the service says a start is offered — exactly `canStart: true`. */
+export const libraryOffered = (e: FindEntryView): boolean => libraryOf(e)?.canStart === true;
+/** R340 a: the service says no library is set. */
+const noLibrarySet = (e: FindEntryView): boolean => {
+  const l = libraryOf(e);
+  return l?.canStart === false && l.reason === "no-library";
+};
+/** R340 c: the service's code for a file from the library that was not kept, when this build knows it. */
+const lastFileOf = (e: FindEntryView): FindLibraryFileOutcome | undefined => {
+  const f = libraryOf(e)?.lastFile;
+  return typeof f === "string" && (FIND_LIBRARY_FILE_OUTCOMES as readonly string[]).includes(f) ? (f as FindLibraryFileOutcome) : undefined;
+};
+/** The acts that need the desktop shell: outside it they are shown unavailable and do nothing (R340 a). */
+const SHELL_ACTS: ReadonlySet<FindActKind> = new Set(["library", "library-take"]);
 
 /** A record removed from the library: its entry offers only its removal (R282 g). */
 const recordRemoved = (e: FindEntryView): boolean => e.reason?.code === "record-removed";
@@ -285,8 +309,19 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
       if (e.reason?.code === "copy-some-unreachable") out.push("retry");
       if (e.sourceId) out.push("open");
       break;
+    case "waiting-sign-in":
+      // R340 b: the shell's take, the service's cancel; "Open" and removal as before.
+      out.push("library-take", "library-cancel");
+      if (e.sourceId && !recordRemoved(e)) out.push("open");
+      break;
     default:
       if (e.sourceId && !recordRemoved(e)) out.push("open");
+  }
+  // R340 a: "Get through my library" exactly where the service offers a start (it decides; the row works out nothing),
+  // after "Try again" and before the acts that open or remove.
+  if (libraryOffered(e) && e.state !== "waiting-sign-in") {
+    const at = out.findIndex((k) => k === "open" || k === "open-there");
+    out.splice(at === -1 ? out.length : at, 0, "library");
   }
   out.push("remove");
   return out;
@@ -306,8 +341,22 @@ const ACT_TEXT: Record<FindActKind, string> = {
   different: "It is a different work",
   retry: "Try again",
   remove: "Remove from the queue",
+  library: "Get through my library",
+  "library-take": "Add the PDF showing in the sign-in window",
+  "library-cancel": "Cancel",
 };
-const BUSY_TEXT: Partial<Record<FindActKind, string>> = { choose: "Choosing…", "add-here": "Adding…", same: "Saving…", different: "Saving…", retry: "Trying again…", remove: "Removing…", "open-there": "Opening…" };
+const BUSY_TEXT: Partial<Record<FindActKind, string>> = {
+  choose: "Choosing…",
+  "add-here": "Adding…",
+  same: "Saving…",
+  different: "Saving…",
+  retry: "Trying again…",
+  remove: "Removing…",
+  "open-there": "Opening…",
+  library: "Opening the sign-in window…",
+  "library-take": "Asking the sign-in window…",
+  "library-cancel": "Cancelling…",
+};
 /** Acts that only read: allowed in a read-only library. */
 const READS: ReadonlySet<FindActKind> = new Set(["open", "open-there"]);
 
@@ -329,6 +378,8 @@ export interface FindEntryRowProps {
    * no longer in the queue (R271 M7). Undefined for any other entry.
    */
   origin?: string | null | undefined;
+  /** What the sign-in window reported for this row, or what became of its start, in the screen's words (R340 b). */
+  note?: string | undefined;
 }
 
 function Matched({ c }: { c: FindWorkCandidate }) {
@@ -355,7 +406,8 @@ function Matched({ c }: { c: FindWorkCandidate }) {
   );
 }
 
-function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, stopped = false, error, origin }: FindEntryRowProps) {
+function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, stopped = false, error, origin, note }: FindEntryRowProps) {
+  const unavailableId = useId();
   const short = shortTyped(e.typed);
   /** An entry made from an author's entry (R281 a): named as a work, with where it came from. */
   const added = typeof e.parentId === "string" && origin !== undefined;
@@ -368,40 +420,33 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
   const author = known && isAuthorEntry(e);
   const morePeople = known && e.state === "choose-person" && e.morePeople === true;
   const actions = actionsOf(e, place);
-  // "Where to get it": an entry with no open copy, unless its record was removed (R282 g).
-  const offers = known && e.state === "no-open-copy" && !recordRemoved(e) ? safeOffers(e) : [];
-  // R311 a: in the desktop app a link there would do nothing; each address is copied instead (said once below).
-  const copyOnly = offers.length > 0 && inDesktopShell();
-  const [copySaid, setCopySaid] = useState<string | undefined>();
-  /** R315 c: the place whose address could not be copied: it shows the address itself, to select and copy. */
-  const [copyFailedAt, setCopyFailedAt] = useState<number | undefined>();
-  const copyAddress = async (address: string, at: number) => {
-    setCopySaid(undefined);
-    setCopyFailedAt(undefined);
-    try {
-      if (!navigator.clipboard) throw new Error("no clipboard");
-      await navigator.clipboard.writeText(address);
-      setCopySaid(FIND_TEXT.addressCopied);
-    } catch {
-      setCopyFailedAt(at);
-    }
-  };
+  // "Where to get it" (R340 d): wherever the view carries links — never on a record removed from the library (R282 g).
+  const showOffers = known && !recordRemoved(e) && Array.isArray(e.offers);
+  // R340 a, c: the service's sentences for the library part of the view (never one of the row's own).
+  const lastFile = known ? lastFileOf(e) : undefined;
+  const noLibrary = known && noLibrarySet(e);
+  // Outside the desktop app the acts that need the shell are shown unavailable, with why (R340 a).
+  const desktop = inDesktopShell();
+  const unavailable = !desktop && actions.some((k) => SHELL_ACTS.has(k));
   const button = (kind: FindActKind) => {
     const working = busy === kind;
     const waiting = !!busy && !working;
+    const noShell = !desktop && SHELL_ACTS.has(kind);
     const text = working ? (BUSY_TEXT[kind] ?? ACT_TEXT[kind]) : ACT_TEXT[kind];
     return (
       <button
         key={kind}
         type="button"
-        className={kind === "remove" ? "ao-find__remove" : undefined}
+        className={kind === "remove" ? "ao-find__remove" : noShell ? "ao-find__unavailable-act" : undefined}
         data-act={kind}
         aria-label={short ? `${text}: ${label}` : text}
         disabled={readOnly && !READS.has(kind)}
-        aria-disabled={working || waiting || undefined}
+        aria-disabled={working || waiting || noShell || undefined}
         aria-busy={working || undefined}
+        aria-describedby={noShell ? unavailableId : undefined}
         onClick={() => {
-          if (working || waiting) return;
+          // Outside the desktop app the press does nothing: no request, no call (R340 a).
+          if (working || waiting || noShell) return;
           onAction({ kind, entry: e });
         }}
       >
@@ -442,50 +487,26 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
       </p>
       {morePeople && <p className="ao-find__reason">{FIND_TEXT.morePeople}</p>}
       {reason && <p className="ao-find__reason">{reason}</p>}
+      {lastFile && (
+        <p className="ao-find__library">
+          <span className="ao-find__library-text">{FIND_LIBRARY_FILE_TEXT[lastFile]}</span>
+        </p>
+      )}
+      {noLibrary && (
+        <p className="ao-find__library">
+          <span className="ao-find__library-text">{FIND_LIBRARY_TEXT.noLibrary}</span>{" "}
+          <a href={PATHS.yourLibrary} onClick={inAppLink} data-act="your-library" aria-label={short ? `${FIND_TEXT.yourLibrary}: ${label}` : FIND_TEXT.yourLibrary}>
+            {FIND_TEXT.yourLibrary}
+          </a>
+        </p>
+      )}
+      {note && <p className="ao-find__library-note">{note}</p>}
       {error && (
         <p role="alert" className="ao-error">
           <UserText>{error}</UserText>
         </p>
       )}
-      {offers.length > 0 && (
-        <div className="ao-find__where">
-          <p className="ao-find__where-title">{FIND_TEXT.whereToGetIt}</p>
-          {copyOnly && <p className="ao-find__where-hint">{FIND_TEXT.pasteHint}</p>}
-          <ul aria-label={short ? `${FIND_TEXT.whereToGetIt}: ${label}` : FIND_TEXT.whereToGetIt}>
-            {offers.map((o, i) =>
-              copyOnly ? (
-                <li key={`${i}:${o.url}`}>
-                  <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>){" "}
-                  <button type="button" data-act="copy-address" aria-label={short ? `${FIND_TEXT.copyAddress}: ${o.label} (${o.host}): ${label}` : `${FIND_TEXT.copyAddress}: ${o.label} (${o.host})`} onClick={() => void copyAddress(o.url, i)}>
-                    {FIND_TEXT.copyAddress}
-                  </button>
-                  <div aria-live="polite">
-                    {copyFailedAt === i && (
-                      <>
-                        <p className="ao-error">{FIND_TEXT.copyFailed}</p>
-                        <UserText as="p" className="ao-find__address">
-                          {o.url}
-                        </UserText>
-                      </>
-                    )}
-                  </div>
-                </li>
-              ) : (
-                <li key={`${i}:${o.url}`}>
-                  <a href={o.url} target="_blank" rel="noopener noreferrer" aria-label={short ? `${o.label} (${o.host}): ${label}` : `${o.label} (${o.host})`}>
-                    <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>)
-                  </a>
-                </li>
-              ),
-            )}
-          </ul>
-          {copyOnly && (
-            <div aria-live="polite">
-              {copySaid && <p className="ao-ok">{copySaid}</p>}
-            </div>
-          )}
-        </div>
-      )}
+      {showOffers && <WhereToGetIt offers={e.offers} {...(short ? { name: label } : {})} />}
       <div className="ao-actions ao-find__actions">
         {offersCheck(e) && (
           <a href={reviewEntryHref(e)} onClick={inAppLink} data-act="check" aria-label={short ? `${FIND_TEXT.checkFile}: ${label}` : FIND_TEXT.checkFile}>
@@ -494,6 +515,11 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
         )}
         {actions.map(button)}
       </div>
+      {unavailable && (
+        <p id={unavailableId} className="ao-find__unavailable">
+          {FIND_TEXT.onlyDesktop}
+        </p>
+      )}
     </li>
   );
 }

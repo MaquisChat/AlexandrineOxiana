@@ -46,12 +46,30 @@
  *   - R272 b: the result of the researcher's own act ("Added 2 references.", "Added 3 works.", "Removed …") is said
  *     first and stays for ACT_SAID_MS; rows' changes arriving meanwhile are said after it — each row's latest as
  *     shown then, never the same change twice.
+ *
+ * Through the researcher's library (Task F18b; R340, R301; F15's start and cancel, F16's shell, F17's outcome):
+ *   - Every library step is the researcher's press on that row: nothing is started on focus, on hover, on a timer, on
+ *     an event or when the screen opens. "Get through my library" is ONE `POST …/library/start` (no body); with its
+ *     answer the shell opens the sign-in window (`openLibraryWindow(ticket, url)`). If the shell does not take it
+ *     (anything but `true`, or no answer in LIBRARY_SHELL_TIMEOUT_MS), the start is cancelled at the service and the
+ *     row says so. A refusal is the service's sentence on the row (said once, as every act's refusal is).
+ *   - **The ticket and the address go to the shell and nowhere else**: they live in the press's own variables; the
+ *     ticket alone is kept, in memory (a ref, never a state, the page's address, storage, an element or the console),
+ *     for as long as the row waits, to know which of the shell's events are this row's. An event is the row's when it
+ *     carries that ticket — or, when the screen holds none (the page was loaded afresh), when the row is the one row
+ *     that waits; any other event changes nothing.
+ *   - What the shell reports is shown on the row and said once (R340 b); the row's state itself is always what the
+ *     service says. The window closed while the entry still waits: the start is cancelled at the service (a 409 because
+ *     it no longer waits is not an error: the file is being checked). "Cancel" is the service's cancel, then the
+ *     window is closed. "Add the PDF showing in the sign-in window" is the shell's take: the shell fetches the PDF and
+ *     hands it to the service, where it waits in the review queue for the researcher's check.
  */
 import {
   FIND_ROUTE_TEXT,
   type FindAddResponse,
   type FindChosenPerson,
   type FindEntryView,
+  type FindLibraryStartResponse,
   type FindPersonCandidate,
   type FindPersonWork,
   type FindQueueResponse,
@@ -65,8 +83,9 @@ import { isProjectLocked, libraryApi, type Collection, type LibraryApi, type Lib
 import { ChoosePersonDialog } from "../components/ChoosePersonDialog";
 import { ChooseWorkDialog } from "../components/ChooseWorkDialog";
 import { ChooseWorksDialog } from "../components/ChooseWorksDialog";
-import { authorOfferOf, entryLabel, FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
+import { authorOfferOf, entryLabel, FIND_TEXT, FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
 import { UserText } from "../components/UserText";
+import { desktopShell, type LibraryWindowEvent } from "../desktopShell";
 import "../components/library.css";
 import { inAppLink, navigate, projectInQuery, type AppLocation } from "../navigation";
 import { searchSourcesHref } from "./SearchSources";
@@ -114,6 +133,65 @@ const READ_GAP_MS = 400;
 const ADD_TIMEOUT_MS = 60_000;
 /** A change of the switch with no answer for this long is given up (R281 c). */
 export const SWITCH_TIMEOUT_MS = 60_000;
+/** A call to the desktop shell with no answer for this long is given up (the house's limit, as on Your library). */
+export const LIBRARY_SHELL_TIMEOUT_MS = 60_000;
+
+/**
+ * F15's start and cancel (apps/library-service/src/routes/your-library.ts), as their handlers take them: no body. Ids
+ * are checked before they go into a path, as every find route's are.
+ */
+export function findLibraryApi(client: ApiClient) {
+  const path = (pid: string, eid: string, act: "start" | "cancel") => {
+    if (!isValidId(pid) || !isValidId(eid)) throw new Error("That is not a valid id.");
+    return `/projects/${encodeURIComponent(pid)}/find/${encodeURIComponent(eid)}/library/${act}`;
+  };
+  return {
+    /** The library's address for the work and a one-time ticket: handed to the shell, and nowhere else. */
+    start: (pid: string, eid: string) => client.request<FindLibraryStartResponse>("POST", path(pid, eid, "start")),
+    /** The entry back to what it was; 409 "entry-state" when it no longer waits. */
+    cancel: (pid: string, eid: string) => client.request<FindEntryView>("POST", path(pid, eid, "cancel")),
+  };
+}
+export type FindLibraryApi = ReturnType<typeof findLibraryApi>;
+
+/** What came of a call to the shell given at most `ms`: its answer, or "gave-up" (its late answer is ignored); a throw is `false`. */
+function shellWithin<V>(p: Promise<V>, ms = LIBRARY_SHELL_TIMEOUT_MS): Promise<V | false | "gave-up"> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve("gave-up"), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(false);
+      },
+    );
+  });
+}
+
+/** R340 b: what the shell reports for the row, in words (said once each). `opened` and `closed` have their own handling. */
+function windowSentence(e: LibraryWindowEvent): string | undefined {
+  switch (e.state) {
+    case "fetching":
+      return FIND_TEXT.fetching;
+    case "not-a-pdf":
+      return FIND_TEXT.notAPdf;
+    case "failed":
+      return e.reason === "pause" ? FIND_TEXT.fetchPause : e.reason === "busy" ? FIND_TEXT.fetchBusy : FIND_TEXT.fetchFailed;
+    case "handed-over":
+      return FIND_TEXT.handedOver;
+    default:
+      return undefined;
+  }
+}
+
+/** A sentence shown on a row about its fetch through the library: `whileWaiting` ones go when the row stops waiting. */
+interface LibraryNote {
+  text: string;
+  whileWaiting: boolean;
+}
 
 /**
  * How a change of the switch ended, for an add that waited for it (R272 a, R281 c, R291 a): "ok" — the service holds the
@@ -173,6 +251,7 @@ interface QueueBus {
 
 export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocation }) {
   const api = useMemo(() => findApi(client), [client]);
+  const libApi = useMemo(() => findLibraryApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
   const ids = useId();
   const [projects, setProjects] = useState<ProjectSummary[] | undefined>();
@@ -739,6 +818,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           key={`${epoch}\u0000${projectId}`}
           bus={bus}
           api={api}
+          libApi={libApi}
           lib={lib}
           project={project}
           collectionId={collectionId}
@@ -795,11 +875,17 @@ const Rows = memo(function Rows(props: {
   places: Record<string, FindPlace>;
   busy: Record<string, FindActKind>;
   errors: Record<string, string>;
+  notes: Record<string, LibraryNote>;
   readOnly: boolean;
   stopped: boolean;
   onAction: (a: FindAction) => void;
 }) {
-  const { entries, places, busy, errors, readOnly, stopped, onAction } = props;
+  const { entries, places, busy, errors, notes, readOnly, stopped, onAction } = props;
+  /** A note about the window is shown while the row waits; one about how the start ended, until the next press. */
+  const noteOf = (e: FindEntryView): string | undefined => {
+    const n = notes[e.id];
+    return n && (!n.whileWaiting || e.state === "waiting-sign-in") ? n.text : undefined;
+  };
   // An entry made from an author's entry says where it came from (R271 M7): that entry's typed text, or null when gone.
   const typedOf = new Map(entries.map((e) => [e.id, e.typed] as const));
   const originOf = (e: FindEntryView): string | null | undefined => {
@@ -810,7 +896,7 @@ const Rows = memo(function Rows(props: {
   return (
     <>
       {entries.map((e) => (
-        <FindEntryRow key={e.id} entry={e} onAction={onAction} place={places[e.id]} busy={busy[e.id]} readOnly={readOnly} stopped={stopped} error={errors[e.id]} origin={originOf(e)} />
+        <FindEntryRow key={e.id} entry={e} onAction={onAction} place={places[e.id]} busy={busy[e.id]} readOnly={readOnly} stopped={stopped} error={errors[e.id]} origin={originOf(e)} note={noteOf(e)} />
       ))}
     </>
   );
@@ -819,6 +905,7 @@ const Rows = memo(function Rows(props: {
 function ProjectQueue(props: {
   bus: QueueBus;
   api: FindApi;
+  libApi: FindLibraryApi;
   lib: LibraryApi;
   project: ProjectSummary;
   collectionId: string;
@@ -833,7 +920,9 @@ function ProjectQueue(props: {
   /** A change of "Check everything I have" still out: an add waits for it (R272 a). */
   waitForSwitch: () => Promise<SwitchResult> | undefined;
 }) {
-  const { bus, api, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch } = props;
+  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch } = props;
+  /** The desktop shell's bridge (F16); undefined outside the desktop app. */
+  const shell = useMemo(() => desktopShell(), []);
   const projectId = project.id;
   const ids = useId();
 
@@ -847,6 +936,7 @@ function ProjectQueue(props: {
   const [offline, setOffline] = useState<string | undefined>();
   const [busy, setBusyState] = useState<Record<string, FindActKind>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [notes, setNotes] = useState<Record<string, LibraryNote>>({});
   const [places, setPlaces] = useState<Record<string, FindPlace>>({});
   const [dialog, setDialogState] = useState<DialogState | null>(null);
   const [openSource, setOpenSource] = useState<{ projectId: string; sourceId: string; from: HTMLElement | null } | null>(null);
@@ -897,6 +987,19 @@ function ProjectQueue(props: {
   const readOnceRef = useRef<() => Promise<void>>(async () => {});
   /** When the last coalesced read started (R258 M7). */
   const lastSoon = useRef(0);
+  /**
+   * R340 a, b: the ticket of the window this page opened, for the row that waits in it — in memory only, while it waits.
+   * `handedOver`: the shell handed the file over (its ticket ended there; a later close is not a cancel).
+   */
+  const libTicket = useRef<{ entryId: string; ticket: string; handedOver?: boolean } | null>(null);
+  /** The ticket whose row has been seen waiting (from then on, the row's leaving the wait forgets the ticket). */
+  const seenWaiting = useRef<string | null>(null);
+  /** Tickets whose window this page no longer follows (cancelled, closed, or never opened): their events change nothing. */
+  const endedTickets = useRef(new Set<string>());
+  /** Rows whose file the shell handed over while the page held no ticket (loaded afresh): a later close is not a cancel. */
+  const handedOverRows = useRef(new Set<string>());
+  /** What each row's note last said (a note is said once; the same words again are not said again). */
+  const notesRef = useRef<Record<string, LibraryNote>>({});
 
   useEffect(() => {
     alive.current = true;
@@ -1354,6 +1457,211 @@ function ProjectQueue(props: {
     }
   };
 
+  // ---- through the researcher's library (R340): every step a press on that row ----
+
+  /** A row's note: shown on the row, and said once — words the row already shows are not said again. */
+  const setNoteFor = (id: string, n: LibraryNote | undefined) => {
+    const before = notesRef.current[id];
+    const next = { ...notesRef.current };
+    if (n) next[id] = n;
+    else delete next[id];
+    notesRef.current = next;
+    setNotes(next);
+    if (!n || before?.text === n.text) return;
+    const v = held.current.get(id)?.view;
+    sayAct([...(v ? [...entryLabel(v, originOf(v)), ": "] : []), n.text]);
+  };
+  /** The page no longer follows the window of this row: its ticket is forgotten, and its events change nothing. */
+  const endTicketOf = (id: string) => {
+    const t = libTicket.current;
+    if (!t || t.entryId !== id) return;
+    endedTickets.current.add(t.ticket);
+    libTicket.current = null;
+  };
+  // The ticket is held only while its row waits: once the row was seen waiting and no longer does, it is forgotten.
+  useEffect(() => {
+    const t = libTicket.current;
+    if (!t) return;
+    const v = held.current.get(t.entryId)?.view;
+    if (v?.state === "waiting-sign-in") seenWaiting.current = t.ticket;
+    else if (!v || seenWaiting.current === t.ticket) endTicketOf(t.entryId);
+  });
+
+  /**
+   * "Get through my library": ONE start at the service; with its answer, the sign-in window opened by the shell. The
+   * ticket and the address live only in this press's variables and the one call to the shell (the ticket also in
+   * `libTicket` while the row waits). A window that did not open leaves nothing waiting: the start is cancelled.
+   */
+  const startLibrary = async (e: FindEntryView) => {
+    if (!shell || busyRef.current[e.id] || readOnly) return;
+    setBusyFor(e.id, "library");
+    acting.current.add(e.id);
+    setErrorFor(e.id, undefined);
+    setNoteFor(e.id, undefined);
+    handedOverRows.current.delete(e.id);
+    const g = gen.current;
+    const live = () => alive.current && g === gen.current;
+    try {
+      let got: FindLibraryStartResponse;
+      try {
+        got = await libApi.start(projectId, e.id);
+      } catch (err) {
+        if (!live() || refused(err)) return;
+        setErrorFor(e.id, sentenceOf(err, "That could not be done. Try again."));
+        return;
+      }
+      const ticket = typeof got?.ticket === "string" ? got.ticket : "";
+      const address = typeof got?.url === "string" ? got.url : "";
+      let opened = false;
+      // The screen was left (or the library changed) meanwhile: no window is opened, and the start is cancelled below.
+      if (live() && ticket && address) {
+        const before = libTicket.current;
+        if (before) endedTickets.current.add(before.ticket);
+        libTicket.current = { entryId: e.id, ticket };
+        opened = (await shellWithin(shell.openLibraryWindow(ticket, address))) === true;
+      }
+      if (opened) {
+        // The start's answer is no view of the entry: the control stays busy until the queue is read again, so a second
+        // press of a double click finds the row waiting and sends nothing.
+        // The row's change that read shows is said as any row's change is.
+        acting.current.delete(e.id);
+        if (live()) await readOnce();
+        return;
+      }
+      // Not opened (refused, failed, or no answer in time): the page forgets the ticket, and the entry goes back.
+      if (ticket) endedTickets.current.add(ticket);
+      if (libTicket.current?.ticket === ticket) libTicket.current = null;
+      try {
+        const back = await libApi.cancel(projectId, e.id);
+        if (!live()) return;
+        const t = takeOne(back);
+        setNoteFor(e.id, { text: FIND_TEXT.windowNotOpened, whileWaiting: false });
+        if (t.changed) sayRows([e.id]);
+        readSoon();
+      } catch (err) {
+        // The cancel itself failed: the row shows what the service then says of the entry.
+        if (live() && !refused(err)) readSoon();
+      }
+    } finally {
+      acting.current.delete(e.id);
+      if (alive.current) setBusyFor(e.id, undefined);
+    }
+  };
+
+  /** "Add the PDF showing in the sign-in window": the shell's take (what came of it, the shell's events say). */
+  const takePdf = async (e: FindEntryView) => {
+    if (!shell || busyRef.current[e.id] || readOnly) return;
+    setBusyFor(e.id, "library-take");
+    setErrorFor(e.id, undefined);
+    setNoteFor(e.id, undefined);
+    const r = await shellWithin(shell.libraryWindowTakePdf());
+    if (!alive.current) return;
+    setBusyFor(e.id, undefined);
+    if (r === "gave-up") setNoteFor(e.id, { text: FIND_TEXT.appSilent, whileWaiting: true });
+  };
+
+  /** "Cancel": the service's cancel; when it has answered, the window is closed. */
+  const cancelLibrary = async (e: FindEntryView) => {
+    if (busyRef.current[e.id] || readOnly) return;
+    setBusyFor(e.id, "library-cancel");
+    acting.current.add(e.id);
+    setErrorFor(e.id, undefined);
+    const g = gen.current;
+    const closeWindow = () => {
+      endTicketOf(e.id);
+      if (shell) void shellWithin(shell.closeLibraryWindow());
+    };
+    try {
+      const v = await libApi.cancel(projectId, e.id);
+      if (!alive.current || g !== gen.current) return;
+      setNoteFor(e.id, undefined);
+      const t = takeOne(v);
+      if (t.changed) sayAct(saidFor(t.shown), e.id);
+      closeWindow();
+      readSoon();
+    } catch (err) {
+      if (!alive.current || g !== gen.current || refused(err)) return;
+      setErrorFor(e.id, sentenceOf(err, "That could not be done. Try again."));
+      // It no longer waits (its file is being checked, or it went back): the window has nothing left to do.
+      if (err instanceof ApiClientError && err.status === 409 && err.reason === "entry-state") closeWindow();
+    } finally {
+      acting.current.delete(e.id);
+      if (alive.current) setBusyFor(e.id, undefined);
+    }
+  };
+
+  /** The window was closed while the entry still waits: the start is cancelled, so that the entry returns. */
+  const windowClosed = async (v: FindEntryView) => {
+    const g = gen.current;
+    setNoteFor(v.id, { text: FIND_TEXT.windowClosed, whileWaiting: false });
+    try {
+      const back = await libApi.cancel(projectId, v.id);
+      if (!alive.current || g !== gen.current) return;
+      if (takeOne(back).changed) sayRows([v.id]);
+      readSoon();
+    } catch (err) {
+      if (!alive.current || g !== gen.current) return;
+      if (isProjectLocked(err)) {
+        markLocked();
+        return;
+      }
+      readSoon();
+      // A 409 because it no longer waits is not an error: the file is being checked.
+      if (!(err instanceof ApiClientError && err.status === 409)) setErrorFor(v.id, sentenceOf(err, "That could not be done. Try again."));
+    }
+  };
+
+  /** The shell's `library-window` events: only this page's window's, or — holding none — the one waiting row's. */
+  const onWindowRef = useRef<(ev: LibraryWindowEvent) => void>(() => {});
+  onWindowRef.current = (ev: LibraryWindowEvent) => {
+    if (ev.ticket !== null && endedTickets.current.has(ev.ticket)) return;
+    const mine = libTicket.current;
+    let id: string;
+    if (mine) {
+      // After the hand-over the shell's ticket has ended: the window's close then comes without one.
+      if (ev.ticket === mine.ticket || (mine.handedOver && ev.ticket === null && ev.state === "closed")) id = mine.entryId;
+      else return;
+    } else {
+      const waitingNow = [...held.current.values()].map((h) => h.view).filter((v) => v.state === "waiting-sign-in");
+      if (waitingNow.length !== 1) return;
+      id = waitingNow[0]!.id;
+    }
+    const v = held.current.get(id)?.view;
+    if (!v || ev.state === "opened") return;
+    if (ev.state === "closed") {
+      const handed = !!mine?.handedOver || handedOverRows.current.has(id);
+      if (mine) endTicketOf(id);
+      handedOverRows.current.delete(id);
+      if (!handed && v.state === "waiting-sign-in") void windowClosed(v);
+      return;
+    }
+    const text = windowSentence(ev);
+    if (!text) return;
+    if (ev.state === "handed-over") {
+      if (mine) libTicket.current = { ...mine, handedOver: true };
+      else handedOverRows.current.add(id);
+      readSoon();
+    }
+    setNoteFor(id, { text, whileWaiting: true });
+  };
+  useEffect(() => {
+    if (!shell) return;
+    let on = true;
+    let stop: (() => void) | undefined;
+    void shell
+      .onLibraryWindow((ev) => {
+        if (on && alive.current) onWindowRef.current(ev);
+      })
+      .then((s) => {
+        if (on) stop = s;
+        else s();
+      });
+    return () => {
+      on = false;
+      stop?.();
+    };
+  }, [shell]);
+
   // Stable for the memoised rows: reads what it needs from refs and the latest closure.
   const actRef = useRef<(a: FindAction) => void>(() => {});
   actRef.current = (a: FindAction) => {
@@ -1392,6 +1700,15 @@ function ProjectQueue(props: {
         return;
       case "remove":
         void remove(e);
+        return;
+      case "library":
+        void startLibrary(e);
+        return;
+      case "library-take":
+        void takePdf(e);
+        return;
+      case "library-cancel":
+        void cancelLibrary(e);
         return;
     }
   };
@@ -1730,7 +2047,7 @@ function ProjectQueue(props: {
         <>
           {!entries && !loadError && <p>{FIND_SCREEN_TEXT.loading}</p>}
           <ul ref={listRef} className="ao-find__queue" aria-labelledby={`${ids}-queue`} data-count={entries?.length ?? 0}>
-            {entries && <Rows entries={entries} places={places} busy={busy} errors={errors} readOnly={readOnly} stopped={!!stopped} onAction={onAction} />}
+            {entries && <Rows entries={entries} places={places} busy={busy} errors={errors} notes={notes} readOnly={readOnly} stopped={!!stopped} onAction={onAction} />}
           </ul>
           {entries && entries.length === 0 && <p>{FIND_SCREEN_TEXT.empty}</p>}
         </>

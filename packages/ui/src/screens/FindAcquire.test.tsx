@@ -5,6 +5,8 @@
  * dialog (R145) and the one polite status region.
  */
 import {
+  FIND_LIBRARY_FILE_TEXT,
+  FIND_LIBRARY_TEXT,
   FIND_REASON_TEXT,
   FIND_ROUTE_TEXT,
   FIND_STOPPED_TEXT,
@@ -23,10 +25,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { findApi } from "../api/find";
 import { routeFor } from "../App";
 import { PATHS } from "../navigation";
+import type { LibraryWindowEvent } from "../desktopShell";
+import { fakeShell, type FakeShell } from "../test/desktopShell";
 import { SOURCE_FILE, server, testClient, url, useMockService } from "../test/service";
-import { ACT_SAID_MS, FindAcquire, SWITCH_TIMEOUT_MS } from "./FindAcquire";
+import { ACT_SAID_MS, FindAcquire, LIBRARY_SHELL_TIMEOUT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
 
 useMockService();
+
+// The desktop shell's bridge (F16): absent (a browser) unless a test sets the stand-in (R340: the desktop app).
+const fake = vi.hoisted(() => ({ shell: undefined as FakeShell | undefined }));
+vi.mock("../desktopShell", async (original) => ({ ...(await original<typeof import("../desktopShell")>()), desktopShell: () => fake.shell, inDesktopShell: () => !!fake.shell }));
+afterEach(() => {
+  fake.shell = undefined;
+});
 
 const PID = "0190a000-0000-7000-8000-0000000000a1";
 const PID_LOCKED = "0190a000-0000-7000-8000-0000000000a2";
@@ -2835,8 +2846,7 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     expect(within(row("removed with offers")).queryAllByRole("link")).toHaveLength(0);
   });
 
-  describe("R311 a: in the desktop app, Where to get it is never a dead link", () => {
-    const g = globalThis as { isTauri?: unknown };
+  describe("R311 a, R340 d: in the desktop app, Where to get it is never a dead link", () => {
     const offers = [
       { label: "Publisher's page", url: "https://doi.org/10.5555/ao.where", host: "doi.org" },
       { label: "WorldCat", url: "http://www.worldcat.org/search?q=x", host: "www.worldcat.org" },
@@ -2851,14 +2861,15 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
       return writeText;
     };
     beforeEach(() => {
-      g.isTauri = true;
+      fake.shell = fakeShell();
     });
     afterEach(() => {
-      delete g.isTauri;
       Reflect.deleteProperty(navigator, "clipboard");
     });
 
-    it("each place is its label and host with Copy address; no link; the hint above the list; a press copies exactly that address and says so once, focus kept", async () => {
+    // R340 d changed this test: each place now has "Open in my browser" beside "Copy address", so R311's line "Paste an
+    // address into your browser." above the list (written for a list that could only be copied) is gone.
+    it("each place is its label and host with Open in my browser and Copy address; no link; a press copies exactly that address and says so once, focus kept", async () => {
       useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
       const user = userEvent.setup(); // installs its own clipboard: stubbed after it
       const writeText = stubClipboard();
@@ -2868,9 +2879,11 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
       const list = within(r).getByRole("list", { name: "Where to get it: “with offers”" });
       expect(within(r).queryAllByRole("link").filter((a) => a.getAttribute("data-act") !== "check")).toHaveLength(0);
       expect(r.querySelector("a[target=_blank]")).toBeNull();
-      expect(r.textContent).toContain("Paste an address into your browser.");
-      const hint = within(r).getByText("Paste an address into your browser.");
-      expect(hint.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(r.textContent).not.toContain("Paste an address into your browser.");
+      expect(within(list).getAllByRole("button", { name: /^Open in my browser: / }).map((b) => b.getAttribute("aria-label"))).toEqual([
+        "Open in my browser: Publisher's page (doi.org): “with offers”",
+        "Open in my browser: Your library's catalogue (catalogue.example.edu): “with offers”",
+      ]);
       const copies = within(list).getAllByRole("button", { name: /^Copy address: / });
       // R318 e: each Copy address is named with its row, as the links are.
       expect(copies.map((b) => b.getAttribute("aria-label"))).toEqual([
@@ -2924,7 +2937,7 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     });
 
     it("in a browser the links stay (no Copy address, no hint)", async () => {
-      delete g.isTauri;
+      fake.shell = undefined;
       useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
       show();
       await waitFor(() => expect(rows()).toHaveLength(1));
@@ -2935,7 +2948,7 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     });
 
     it("R313 h: in a browser too, the link is named by the host its address leads to", async () => {
-      delete g.isTauri;
+      fake.shell = undefined;
       const lying = [{ label: "Publisher's page", url: "https://evil.example.net/a.pdf", host: "doi.org" }] as FindEntryView["offers"];
       useService({ queues: { [PID]: queue([entry({ typed: "lying offer", ...noc(), offers: lying })]) } });
       show();
@@ -2974,5 +2987,621 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     await user.dblClick(within(row("waiting for a place")).getByRole("button", { name: "Try again: “waiting for a place”" }));
     await waitFor(() => expect(row("waiting for a place").querySelector(".ao-find__state")?.textContent).toBe("Looking for a copy"));
     expect(calls.slice(before).filter((c) => c.method === "POST")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/retry`, body: undefined }]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F18b (R340 a–d): "Get through my library", the waiting row, the shell's events. Requests against F15's start and
+// cancel (apps/library-service/src/routes/your-library.ts: no body; `{ url, ticket }`; 409 with a `reason`; the cancel
+// answers the entry's view, 409 "entry-state" when it no longer waits) and the shell as F16's bridge gives it.
+
+describe("FindAcquire: Get through my library (F18b; R340)", () => {
+  const TICKET = "0123456789abcdef0123456789abcdef";
+  const OTHER_TICKET = "fedcba9876543210fedcba9876543210";
+  const LIB_URL = "https://ezproxy.lib.example.edu/login?url=https://doi.org/10.5555/ao.through.zq7";
+  const T = (s: string) => `“${s}”`;
+  const withSource = (o: Partial<FindEntryView>): Partial<FindEntryView> => ({ sourceId: SID, chosen: "c1", candidates: [cand({ id: "c1" })], ...o });
+  const noc = (o: Partial<FindEntryView> = {}): Partial<FindEntryView> => withSource({ state: "no-open-copy", ...o });
+  const startable = (o: Partial<FindEntryView> = {}) => noc({ library: { canStart: true }, ...o });
+  const waiting = (o: Partial<FindEntryView> = {}) => withSource({ state: "waiting-sign-in", ...o });
+  const later = (v: FindEntryView, o: Partial<FindEntryView>, at = "2026-11-13T11:00:00.000Z"): FindEntryView => {
+    const next = { ...v, ...o, updatedAt: at } as FindEntryView;
+    for (const k of Object.keys(o) as Array<keyof FindEntryView>) if (o[k] === undefined) delete next[k];
+    return next;
+  };
+  const posts = (suffix: string) => calls.filter((c) => c.method === "POST" && c.path.endsWith(suffix));
+  const say = async (e: LibraryWindowEvent) => {
+    await waitFor(() => expect(fake.shell!.onLibraryWindow).toHaveBeenCalled());
+    act(() => fake.shell!.libraryWindow(e));
+  };
+  const btn = (typed: string, name: string) => within(row(typed)).getByRole("button", { name: `${name}: ${T(typed)}` });
+  const libLine = (typed: string) => row(typed).querySelector(".ao-find__library-text")?.textContent ?? undefined;
+  const note = (typed: string) => row(typed).querySelector(".ao-find__library-note")?.textContent ?? undefined;
+  /** The queue as the service holds it now (changed by the tests as the service would change it). */
+  let current: FindEntryView[];
+  function serve(entries: FindEntryView[], o: { start?: () => Response | Promise<Response>; cancel?: (eid: string) => Response | Promise<Response> } = {}) {
+    current = entries;
+    useService({ queues: { [PID]: () => HttpResponse.json(queue(current)) } });
+    server.use(
+      http.post(url("/projects/:id/find/:eid/library/start"), () => (o.start ? o.start() : HttpResponse.json({ url: LIB_URL, ticket: TICKET }))),
+      http.post(url("/projects/:id/find/:eid/library/cancel"), ({ params }) => (o.cancel ? o.cancel(String(params.eid)) : refusal(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state"))),
+    );
+  }
+  /** The service's own change: the queue now holds `v` in place of its older version. */
+  const becomes = (v: FindEntryView) => {
+    current = current.map((x) => (x.id === v.id ? v : x));
+  };
+
+  beforeEach(() => {
+    fake.shell = fakeShell();
+  });
+
+  type Case = { typed: string; o: Partial<FindEntryView>; phrase: string; sentence?: string; libText?: string; controls: string[] };
+  const cases: Case[] = [
+    { typed: "startable", o: startable(), phrase: "No open copy", controls: ["library", "open", "remove"] },
+    { typed: "startable unreachable", o: startable({ reason: { code: "copy-some-unreachable" } }), phrase: "No open copy", sentence: FIND_REASON_TEXT["copy-some-unreachable"], controls: ["try", "library", "open", "remove"] },
+    { typed: "startable rules", o: withSource({ state: "record-complete", reason: { code: "copy-not-allowed" }, library: { canStart: true } }), phrase: "Record complete", sentence: FIND_REASON_TEXT["copy-not-allowed"], controls: ["try", "library", "open", "remove"] },
+    { typed: "startable switched off", o: withSource({ state: "record-complete", reason: { code: "switched-off", by: "settings" }, library: { canStart: true } }), phrase: "Record complete", sentence: FIND_REASON_TEXT["switched-off"], controls: ["try", "library", "open", "remove"] },
+    { typed: "no library", o: noc({ library: { canStart: false, reason: "no-library" } }), phrase: "No open copy", libText: FIND_LIBRARY_TEXT.noLibrary, controls: ["open", "remove"] },
+    { typed: "not offered kept", o: noc({ library: { canStart: false, reason: "not-offered", lastFile: "rules-store" } }), phrase: "No open copy", libText: FIND_LIBRARY_FILE_TEXT["rules-store"], controls: ["open", "remove"] },
+    { typed: "again after a file", o: startable({ library: { canStart: true, lastFile: "not-pdf" } }), phrase: "No open copy", libText: FIND_LIBRARY_FILE_TEXT["not-pdf"], controls: ["library", "open", "remove"] },
+    { typed: "a later outcome", o: startable({ library: { canStart: true, lastFile: "from-a-later-build" as never } }), phrase: "No open copy", controls: ["library", "open", "remove"] },
+    { typed: "a later reason", o: noc({ library: { canStart: false, reason: "from-a-later-build" as never } }), phrase: "No open copy", controls: ["open", "remove"] },
+    { typed: "no library part", o: noc(), phrase: "No open copy", controls: ["open", "remove"] },
+    { typed: "not startable true", o: noc({ library: { canStart: "yes" as never } }), phrase: "No open copy", controls: ["open", "remove"] },
+    { typed: "waiting", o: waiting(), phrase: "Waiting for you in the sign-in window", controls: ["take", "cancel", "open", "remove"] },
+    { typed: "back unfinished", o: noc({ reason: { code: "library-unfinished" }, library: { canStart: true } }), phrase: "No open copy", sentence: FIND_REASON_TEXT["library-unfinished"], controls: ["library", "open", "remove"] },
+  ];
+  const NAMES: Record<string, string> = { try: "Try again", library: "Get through my library", open: "Open", remove: "Remove from the queue", take: "Add the PDF showing in the sign-in window", cancel: "Cancel" };
+
+  it("the table: each library part of the view gives its phrase, the service's sentence and exactly its controls (the screen works out nothing)", async () => {
+    serve(cases.map((c) => entry({ typed: c.typed, ...c.o })));
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(cases.length));
+    for (const c of cases) {
+      const r = row(c.typed);
+      expect(r.querySelector(".ao-find__state")?.textContent, c.typed).toBe(c.phrase);
+      expect(r.querySelector(".ao-find__reason")?.textContent, c.typed).toBe(c.sentence);
+      expect(libLine(c.typed), c.typed).toBe(c.libText);
+      const controls = [...r.querySelectorAll(".ao-find__actions button, .ao-find__actions a")].map((el) => el.getAttribute("aria-label"));
+      expect(controls, c.typed).toEqual(c.controls.map((k) => `${NAMES[k]}: ${T(c.typed)}`));
+      // In the desktop app no control is shown unavailable, and no code is shown.
+      for (const b of r.querySelectorAll(".ao-find__actions button")) expect(b.getAttribute("aria-disabled"), c.typed).toBeNull();
+      expect(r.textContent, c.typed).not.toMatch(/Only in the desktop app|not-offered|no-library|rules-store|not-pdf|from-a-later-build/u);
+    }
+    // "No library": the service's sentence and a link to the Your library screen (outside the row's acts).
+    const link = within(row("no library")).getByRole("link", { name: `Your library: ${T("no library")}` });
+    expect(link.textContent).toBe("Your library");
+    expect(link.getAttribute("href")).toBe(PATHS.yourLibrary);
+    expect(link.closest(".ao-find__actions")).toBeNull();
+    for (const c of cases.filter((x) => x.typed !== "no library")) expect(within(row(c.typed)).queryByRole("link", { name: /^Your library/ }), c.typed).toBeNull();
+    // Nothing was asked of the service or the shell by showing the rows.
+    expect(posts("/library/start")).toHaveLength(0);
+    expect(fake.shell!.openLibraryWindow).not.toHaveBeenCalled();
+  });
+
+  it("the link Your library leads to the settings screen", async () => {
+    serve([entry({ typed: "no library", ...noc({ library: { canStart: false, reason: "no-library" } }) })]);
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await user.click(within(row("no library")).getByRole("link", { name: /^Your library/ }));
+    expect(window.location.pathname).toBe(PATHS.yourLibrary);
+  });
+
+  it("R340 d: a row resting Record complete shows Where to get it when its view carries links", async () => {
+    const offers = [{ label: "Publisher's page", url: "https://doi.org/10.5555/ao.rc", host: "doi.org" }] as FindEntryView["offers"];
+    serve([entry({ typed: "rc with offers", ...withSource({ state: "record-complete", reason: { code: "copy-not-allowed" }, offers, library: { canStart: true } }) })]);
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const list = within(row("rc with offers")).getByRole("list", { name: `Where to get it: ${T("rc with offers")}` });
+    expect(within(list).getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual([
+      `Open in my browser: Publisher's page (doi.org): ${T("rc with offers")}`,
+      `Copy address: Publisher's page (doi.org): ${T("rc with offers")}`,
+    ]);
+  });
+
+  it("a press: ONE start with no body; the shell opens the window with exactly the ticket and the address; the row follows the service", async () => {
+    const e = entry({ typed: "through", ...startable() });
+    serve([e], {
+      start: () => {
+        becomes(later(e, { state: "waiting-sign-in", library: undefined }));
+        return HttpResponse.json({ url: LIB_URL, ticket: TICKET });
+      },
+    });
+    fake.shell!.openLibraryWindow.mockResolvedValue(true);
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const h = heard();
+    await user.dblClick(btn("through", "Get through my library"));
+    await waitFor(() => expect(row("through").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+    expect(posts("/library/start")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/library/start`, body: undefined }]);
+    expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([[TICKET, LIB_URL]]);
+    expect(posts("/library/cancel")).toHaveLength(0);
+    await waitFor(() => expect(h.said).toContain("“through”: Waiting for you in the sign-in window."));
+    expect(within(row("through")).getByRole("button", { name: `Add the PDF showing in the sign-in window: ${T("through")}` })).toBeTruthy();
+    h.stop();
+  });
+
+  for (const [how, answer] of [
+    ["answers false", async () => false],
+    ["throws", async () => Promise.reject(new Error("no"))],
+  ] as const) {
+    it(`the shell ${how}: the start is cancelled at the service and the row says so, once`, async () => {
+      const e = entry({ typed: "not opened", ...startable() });
+      serve([e], {
+        start: () => {
+          becomes(later(e, { state: "waiting-sign-in", library: undefined }));
+          return HttpResponse.json({ url: LIB_URL, ticket: TICKET });
+        },
+        cancel: () => {
+          becomes(later(e, {}, "2026-11-13T12:00:00.000Z"));
+          return HttpResponse.json(current[0]);
+        },
+      });
+      fake.shell!.openLibraryWindow.mockImplementation(answer);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const h = heard();
+      const b = btn("not opened", "Get through my library");
+      await user.click(b);
+      const SAID = "The sign-in window could not be opened. Nothing was changed.";
+      await waitFor(() => expect(note("not opened")).toBe(SAID));
+      expect(posts("/library/cancel")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/library/cancel`, body: undefined }]);
+      expect(row("not opened").querySelector(".ao-find__state")?.textContent).toBe("No open copy");
+      await waitFor(() => expect(h.said.filter((s) => s.includes(SAID))).toHaveLength(1));
+      await new Promise((r) => setTimeout(r, ACT_SAID_MS + 200));
+      expect(h.said.filter((s) => s.includes(SAID))).toHaveLength(1);
+      expect(document.activeElement).toBe(btn("not opened", "Get through my library"));
+      h.stop();
+    });
+  }
+
+  it("the shell gives no answer within the time limit: the start is cancelled and the row says so", async () => {
+    const e = entry({ typed: "silent shell", ...startable() });
+    serve([e], { cancel: () => HttpResponse.json(later(e, {})) });
+    fake.shell!.openLibraryWindow.mockReturnValue(new Promise<boolean>(() => {}));
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const b = btn("silent shell", "Get through my library");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      fireEvent.click(b);
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(LIBRARY_SHELL_TIMEOUT_MS - 1_000);
+      expect(posts("/library/cancel")).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1_500);
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+    await waitFor(() => expect(note("silent shell")).toBe("The sign-in window could not be opened. Nothing was changed."));
+    expect(LIBRARY_SHELL_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it("the cancel after a window that did not open fails: the row shows what the service then says of the entry", async () => {
+    const e = entry({ typed: "cancel fails", ...startable() });
+    serve([e], {
+      start: () => {
+        becomes(later(e, { state: "waiting-sign-in", library: undefined }));
+        return HttpResponse.json({ url: LIB_URL, ticket: TICKET });
+      },
+      cancel: () => refusal(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed"),
+    });
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await user.click(btn("cancel fails", "Get through my library"));
+    await waitFor(() => expect(row("cancel fails").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+    expect(posts("/library/cancel")).toHaveLength(1);
+  });
+
+  const REFUSALS: Array<[string, () => Response]> = [
+    [FIND_LIBRARY_TEXT.busy, () => refusal(409, "CONFLICT", FIND_LIBRARY_TEXT.busy, "library-busy")],
+    ["Ready in 12 seconds.", () => refusal(409, "CONFLICT", "Ready in 12 seconds.", "library-pause")],
+    [FIND_LIBRARY_TEXT.heldFull, () => refusal(409, "CONFLICT", FIND_LIBRARY_TEXT.heldFull, "library-held-full")],
+    [FIND_LIBRARY_TEXT.notOffered, () => refusal(409, "CONFLICT", FIND_LIBRARY_TEXT.notOffered, "library-not-offered")],
+    [FIND_LIBRARY_TEXT.noLibrary, () => refusal(409, "CONFLICT", FIND_LIBRARY_TEXT.noLibrary, "no-library")],
+    [FIND_ROUTE_TEXT.readOnly, () => refusal(409, "READ_ONLY", FIND_ROUTE_TEXT.readOnly, "read-only")],
+    [FIND_ROUTE_TEXT.projectStopped, () => refusal(409, "CONFLICT", FIND_ROUTE_TEXT.projectStopped, "stopped")],
+    [FIND_ROUTE_TEXT.closed, () => refusal(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed")],
+    [FIND_ROUTE_TEXT.entryNotFound, () => refusal(404, "NOT_FOUND", FIND_ROUTE_TEXT.entryNotFound)],
+  ];
+  it("every refusal of the start shows the service's sentence exactly on that row, said once, focus kept on the control; no window is opened", async () => {
+    const e = entry({ typed: "refused", ...startable() });
+    let answer: () => Response = REFUSALS[0]![1];
+    serve([e], { start: () => answer() });
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    for (const [sentence, give] of REFUSALS) {
+      answer = give;
+      const before = posts("/library/start").length;
+      const b = btn("refused", "Get through my library");
+      await user.click(b);
+      await waitFor(() => expect(within(row("refused")).getByRole("alert").textContent).toBe(sentence));
+      expect(within(row("refused")).getAllByRole("alert")).toHaveLength(1);
+      expect(posts("/library/start").length - before).toBe(1);
+      expect(document.activeElement).toBe(btn("refused", "Get through my library"));
+    }
+    expect(fake.shell!.openLibraryWindow).not.toHaveBeenCalled();
+    expect(posts("/library/cancel")).toHaveLength(0);
+  });
+
+  it("a locked project refusing the start offers the unlock, as every act does", async () => {
+    const e = entry({ typed: "locked start", ...startable() });
+    serve([e], { start: () => refusal(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked") });
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await user.click(btn("locked start", "Get through my library"));
+    expect(await screen.findByText(FIND_ROUTE_TEXT.locked)).toBeTruthy();
+    expect(fake.shell!.openLibraryWindow).not.toHaveBeenCalled();
+  });
+
+  it("the second Get through my library waits out the pause and says so", async () => {
+    const a = entry({ typed: "first work", ...startable() });
+    const b = entry({ typed: "second work", ...startable() });
+    let paused = true;
+    serve([a, b], {
+      start: () => {
+        if (current.some((x) => x.state === "waiting-sign-in" || x.state === "needs-check") && paused) return refusal(409, "CONFLICT", "Ready in 14 seconds.", "library-pause");
+        const which = current.find((x) => x.state === "no-open-copy")!;
+        becomes(later(which, { state: "waiting-sign-in", library: undefined }));
+        return HttpResponse.json({ url: LIB_URL, ticket: TICKET });
+      },
+    });
+    fake.shell!.openLibraryWindow.mockResolvedValue(true);
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    // The first: through the window, handed over, waiting for the check.
+    await user.click(btn("first work", "Get through my library"));
+    await waitFor(() => expect(row("first work").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+    await say({ ticket: TICKET, state: "fetching" });
+    await say({ ticket: TICKET, state: "handed-over" });
+    becomes(later(current[0]!, { state: "needs-check", reason: { code: "file-looks-right" } }, "2026-11-13T12:00:00.000Z"));
+    events.push({ type: "find.progress", data: { projectId: PID, entryId: a.id, state: "needs-check" } });
+    await waitFor(() => expect(row("first work").querySelector(".ao-find__state")?.textContent).toBe("Needs your check"));
+    // The second, at once: the service says how long the pause still is; the row says so, and no window is opened.
+    const second = btn("second work", "Get through my library");
+    await user.click(second);
+    await waitFor(() => expect(within(row("second work")).getByRole("alert").textContent).toBe("Ready in 14 seconds."));
+    expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(btn("second work", "Get through my library"));
+    // Pressed again once the pause is over: it goes through.
+    paused = false;
+    await user.click(btn("second work", "Get through my library"));
+    await waitFor(() => expect(row("second work").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+    expect(within(row("second work")).queryByRole("alert")).toBeNull();
+    expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2);
+    expect(posts("/library/start")).toHaveLength(3);
+  });
+
+  it("R340 a: the ticket and the address go to the shell and nowhere else — not the page's address or history, storage, any element, the console", async () => {
+    const e = entry({ typed: "kept out", ...startable() });
+    serve([e], {
+      start: () => {
+        becomes(later(e, { state: "waiting-sign-in", library: undefined }));
+        return HttpResponse.json({ url: LIB_URL, ticket: TICKET });
+      },
+      cancel: () => {
+        becomes(later(e, {}, "2026-11-13T12:00:00.000Z"));
+        return HttpResponse.json(current[0]);
+      },
+    });
+    fake.shell!.openLibraryWindow.mockResolvedValue(true);
+    fake.shell!.libraryWindowTakePdf.mockResolvedValue(true);
+    const spies = (["log", "info", "warn", "error", "debug", "trace"] as const).map((k) => vi.spyOn(console, k));
+    const pushState = vi.spyOn(window.history, "pushState");
+    const replaceState = vi.spyOn(window.history, "replaceState");
+    const user = userEvent.setup();
+    try {
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const h = heard();
+      const seen: string[] = [];
+      const mo = new MutationObserver(() => seen.push(document.documentElement.outerHTML));
+      mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      await user.click(btn("kept out", "Get through my library"));
+      await waitFor(() => expect(row("kept out").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+      for (const s of ["opened", "fetching", "not-a-pdf"] as const) await say({ ticket: TICKET, state: s });
+      await say({ ticket: TICKET, state: "failed", reason: "pause" });
+      await user.click(btn("kept out", "Add the PDF showing in the sign-in window"));
+      await user.click(btn("kept out", "Cancel"));
+      await waitFor(() => expect(row("kept out").querySelector(".ao-find__state")?.textContent).toBe("No open copy"));
+      mo.disconnect();
+      h.stop();
+      seen.push(document.documentElement.outerHTML, ...h.said, window.location.href, JSON.stringify(window.history.state));
+      for (const store of [localStorage, sessionStorage]) for (let i = 0; i < store.length; i++) seen.push(store.key(i)!, store.getItem(store.key(i)!) ?? "");
+      for (const sp of [...spies, pushState, replaceState]) seen.push(JSON.stringify(sp.mock.calls.map((c) => c.map(String))));
+      const all = seen.join("\n");
+      for (const secret of [TICKET, LIB_URL, "ezproxy.lib.example.edu", "ao.through.zq7"]) expect(all.includes(secret), secret).toBe(false);
+      // The two calls to the shell that carry them, and no other (the take and the close carry nothing).
+      expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([[TICKET, LIB_URL]]);
+      expect(fake.shell!.libraryWindowTakePdf.mock.calls).toEqual([[]]);
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[]]);
+      expect(fake.shell!.openInBrowser).not.toHaveBeenCalled();
+      // No request after the start carries them.
+      expect(JSON.stringify(calls.filter((c) => !c.path.endsWith("/library/start")))).not.toMatch(/0123456789abcdef0123456789abcdef|ezproxy/u);
+    } finally {
+      for (const sp of [...spies, pushState, replaceState]) sp.mockRestore();
+    }
+  });
+
+  it("R340 a: nothing starts by itself — not on opening, focus, hover, time passing, the shell's events or the service's events", async () => {
+    const a = entry({ typed: "can start", ...startable() });
+    const w = entry({ typed: "waits", ...waiting() });
+    serve([a, w]);
+    fake.shell!.openLibraryWindow.mockResolvedValue(true);
+    fake.shell!.libraryWindowTakePdf.mockResolvedValue(true);
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    await waitFor(() => expect(events.open()).toBe(true));
+    // Focus and hover on every control of the two rows.
+    for (const b of [...row("can start").querySelectorAll("button"), ...row("waits").querySelectorAll("button")]) {
+      act(() => (b as HTMLElement).focus());
+      await user.hover(b);
+    }
+    for (const s of ["opened", "fetching", "not-a-pdf", "failed"] as const) await say({ ticket: TICKET, state: s });
+    await say({ ticket: null, state: "failed", reason: "no-ticket" });
+    events.push(
+      { type: "find.progress", data: { projectId: PID, entryId: a.id, state: "no-open-copy" } },
+      { type: "find.progress", data: { projectId: PID, entryId: w.id, state: "waiting-sign-in" } },
+    );
+    await new Promise((r) => setTimeout(r, 600));
+    expect(posts("/library/start")).toHaveLength(0);
+    expect(posts("/library/cancel")).toHaveLength(0);
+    expect(fake.shell!.openLibraryWindow).not.toHaveBeenCalled();
+    expect(fake.shell!.libraryWindowTakePdf).not.toHaveBeenCalled();
+    expect(fake.shell!.closeLibraryWindow).not.toHaveBeenCalled();
+    expect(fake.shell!.openInBrowser).not.toHaveBeenCalled();
+  });
+
+  describe("the waiting row and the shell's events (R340 b)", () => {
+    /** A page that pressed "Get through my library" itself: it holds the ticket. */
+    async function pressed(typed: string) {
+      const e = entry({ typed, ...startable() });
+      serve([e], {
+        start: () => {
+          becomes(later(e, { state: "waiting-sign-in", library: undefined }));
+          return HttpResponse.json({ url: LIB_URL, ticket: TICKET });
+        },
+        cancel: () => {
+          if (current[0]!.state !== "waiting-sign-in") return refusal(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
+          becomes(later(e, {}, "2026-11-13T12:00:00.000Z"));
+          return HttpResponse.json(current[0]);
+        },
+      });
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await user.click(btn(typed, "Get through my library"));
+      await waitFor(() => expect(row(typed).querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+      return { e, user };
+    }
+
+    const SENTENCES: Array<[LibraryWindowEvent, string]> = [
+      [{ ticket: TICKET, state: "fetching" }, "Fetching the PDF…"],
+      [{ ticket: TICKET, state: "not-a-pdf" }, "That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check."],
+      [{ ticket: TICKET, state: "failed", reason: "pause" }, "The sign-in window rests for a few seconds between files. Try again shortly."],
+      [{ ticket: TICKET, state: "failed", reason: "busy" }, "The PDF is already being fetched."],
+      [{ ticket: TICKET, state: "failed" }, "The PDF could not be fetched. Try again in the sign-in window."],
+      [{ ticket: TICKET, state: "failed", reason: "not-https" }, "The PDF could not be fetched. Try again in the sign-in window."],
+      [{ ticket: TICKET, state: "fetching" }, "Fetching the PDF…"],
+      [{ ticket: TICKET, state: "failed", reason: "sign-in-address" }, "The PDF could not be fetched. Try again in the sign-in window."],
+    ];
+    it("each thing the shell reports is shown on the row and said once, exactly as R340 b gives it; the phrase stays", async () => {
+      await pressed("events");
+      const h = heard();
+      for (const [ev, sentence] of SENTENCES) {
+        await say(ev);
+        await waitFor(() => expect(note("events")).toBe(sentence));
+        expect(row("events").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window");
+      }
+      await new Promise((r) => setTimeout(r, ACT_SAID_MS + 200));
+      // Each change of what the row says is said once (two failures in a row with the same words are one sentence).
+      expect(h.said.filter((s) => s === "“events”: Fetching the PDF…")).toHaveLength(2);
+      expect(h.said.filter((s) => s.includes("rests for a few seconds"))).toHaveLength(1);
+      expect(h.said.filter((s) => s === "“events”: The PDF is already being fetched.")).toHaveLength(1);
+      expect(h.said.filter((s) => s === "“events”: The PDF could not be fetched. Try again in the sign-in window.")).toHaveLength(2);
+      // No sentence says the app adds a file by itself (R301).
+      for (const s of h.said) expect(s).not.toMatch(/\badd(s|ed)?\b/iu);
+      h.stop();
+      expect(posts("/library/cancel")).toHaveLength(0);
+    });
+
+    it("not-a-pdf says Open the PDF in the sign-in window and the app will fetch it for you to check", async () => {
+      await pressed("an html page");
+      await say({ ticket: TICKET, state: "not-a-pdf" });
+      await waitFor(() => expect(note("an html page")).toBe("That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check."));
+      await waitFor(() => expect(live().textContent).toBe("“an html page”: That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check."));
+    });
+
+    it("an event for another ticket changes nothing", async () => {
+      await pressed("mine");
+      await say({ ticket: OTHER_TICKET, state: "not-a-pdf" });
+      await say({ ticket: OTHER_TICKET, state: "closed" });
+      await say({ ticket: null, state: "closed" });
+      await new Promise((r) => setTimeout(r, 200));
+      expect(note("mine")).toBeUndefined();
+      expect(posts("/library/cancel")).toHaveLength(0);
+      expect(row("mine").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window");
+    });
+
+    it("handed-over: said, then the row follows the service — Needs your check with Check the file; a later close cancels nothing", async () => {
+      const { e } = await pressed("handed");
+      const h = heard();
+      await say({ ticket: TICKET, state: "handed-over" });
+      await waitFor(() => expect(note("handed")).toBe("The file was fetched and is being checked."));
+      becomes(later(current[0]!, { state: "needs-check", reason: { code: "file-looks-right" } }, "2026-11-13T12:00:00.000Z"));
+      events.push({ type: "find.progress", data: { projectId: PID, entryId: e.id, state: "needs-check" } });
+      await waitFor(() => expect(row("handed").querySelector(".ao-find__state")?.textContent).toBe("Needs your check"));
+      expect(within(row("handed")).getByRole("link", { name: `Check the file: ${T("handed")}` })).toBeTruthy();
+      expect(note("handed")).toBeUndefined();
+      await say({ ticket: null, state: "closed" });
+      await new Promise((r) => setTimeout(r, ACT_SAID_MS + 200));
+      expect(posts("/library/cancel")).toHaveLength(0);
+      expect(h.said.filter((s) => s.includes("The file was fetched and is being checked."))).toHaveLength(1);
+      expect(h.said.filter((s) => s.includes("Needs your check"))).toHaveLength(1);
+      expect(h.said.join(" ")).not.toContain("The sign-in window was closed.");
+      h.stop();
+    });
+
+    it("handed-over, and the file was not kept: back at rest with the service's sentence for it, and Get through my library again", async () => {
+      const { e } = await pressed("not kept");
+      await say({ ticket: TICKET, state: "handed-over" });
+      becomes(later(current[0]!, { state: "no-open-copy", library: { canStart: true, lastFile: "too-large" } }, "2026-11-13T12:00:00.000Z"));
+      events.push({ type: "find.progress", data: { projectId: PID, entryId: e.id, state: "no-open-copy" } });
+      await waitFor(() => expect(row("not kept").querySelector(".ao-find__state")?.textContent).toBe("No open copy"));
+      expect(libLine("not kept")).toBe(FIND_LIBRARY_FILE_TEXT["too-large"]);
+      expect(btn("not kept", "Get through my library")).toBeTruthy();
+      expect(note("not kept")).toBeUndefined();
+    });
+
+    it("handed-over, and the record had a file meanwhile: In your library", async () => {
+      const { e } = await pressed("had a file");
+      await say({ ticket: TICKET, state: "handed-over" });
+      becomes(later(current[0]!, { state: "in-library" }, "2026-11-13T12:00:00.000Z"));
+      events.push({ type: "find.progress", data: { projectId: PID, entryId: e.id, state: "in-library" } });
+      await waitFor(() => expect(row("had a file").querySelector(".ao-find__state")?.textContent).toBe("In your library"));
+    });
+
+    it("the window closed while the entry still waits: ONE cancel at the service, the entry returns, and the row says so once", async () => {
+      await pressed("closed");
+      const h = heard();
+      await say({ ticket: TICKET, state: "closed" });
+      await waitFor(() => expect(row("closed").querySelector(".ao-find__state")?.textContent).toBe("No open copy"));
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(note("closed")).toBe("The sign-in window was closed.");
+      expect(within(row("closed")).queryByRole("alert")).toBeNull();
+      await new Promise((r) => setTimeout(r, ACT_SAID_MS + 200));
+      expect(h.said.filter((s) => s.includes("The sign-in window was closed."))).toHaveLength(1);
+      expect(fake.shell!.closeLibraryWindow).not.toHaveBeenCalled();
+      h.stop();
+    });
+
+    it("the window closed when the entry no longer waits (409): not an error", async () => {
+      const { e } = await pressed("being checked");
+      // The service is taking the file: its cancel answers 409.
+      becomes(later(current[0]!, { state: "needs-check", reason: { code: "file-looks-right" } }, "2026-11-13T12:00:00.000Z"));
+      await say({ ticket: TICKET, state: "closed" });
+      await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+      events.push({ type: "find.progress", data: { projectId: PID, entryId: e.id, state: "needs-check" } });
+      await waitFor(() => expect(row("being checked").querySelector(".ao-find__state")?.textContent).toBe("Needs your check"));
+      expect(within(row("being checked")).queryByRole("alert")).toBeNull();
+    });
+
+    it("Cancel: ONE cancel at the service; when it has answered, the window is closed; the row follows and is said", async () => {
+      const { e, user } = await pressed("cancel me");
+      let answered = false;
+      let closedAfterAnswer: boolean | undefined;
+      fake.shell!.closeLibraryWindow.mockImplementation(async () => {
+        closedAfterAnswer = answered;
+      });
+      server.use(
+        http.post(url(`/projects/${PID}/find/${e.id}/library/cancel`), () => {
+          becomes(later(e, {}, "2026-11-13T12:00:00.000Z"));
+          answered = true;
+          return HttpResponse.json(current[0]);
+        }),
+      );
+      const h = heard();
+      await user.dblClick(btn("cancel me", "Cancel"));
+      await waitFor(() => expect(row("cancel me").querySelector(".ao-find__state")?.textContent).toBe("No open copy"));
+      await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      expect(closedAfterAnswer).toBe(true);
+      expect(posts("/library/cancel")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/library/cancel`, body: undefined }]);
+      await waitFor(() => expect(h.said).toContain("“cancel me”: No open copy."));
+      // The window's own close that follows changes nothing more.
+      await say({ ticket: TICKET, state: "closed" });
+      await new Promise((r) => setTimeout(r, 200));
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(note("cancel me")).toBeUndefined();
+      h.stop();
+    });
+
+    it("Cancel refused (the entry no longer waits): the service's sentence on the row; the window is closed", async () => {
+      const { e, user } = await pressed("too late");
+      becomes(later(current[0]!, { state: "needs-check", reason: { code: "file-looks-right" } }, "2026-11-13T12:00:00.000Z"));
+      await user.click(btn("too late", "Cancel"));
+      await waitFor(() => expect(within(row("too late")).getByRole("alert").textContent).toBe(FIND_ROUTE_TEXT.entryState));
+      await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      events.push({ type: "find.progress", data: { projectId: PID, entryId: e.id, state: "needs-check" } });
+      await waitFor(() => expect(row("too late").querySelector(".ao-find__state")?.textContent).toBe("Needs your check"));
+    });
+
+    it("Add the PDF showing in the sign-in window: the shell's take, once per press, and no request to the service", async () => {
+      const { user } = await pressed("take it");
+      let release!: (v: boolean) => void;
+      fake.shell!.libraryWindowTakePdf.mockReturnValue(new Promise<boolean>((r) => (release = r)));
+      const before = calls.length;
+      await user.dblClick(btn("take it", "Add the PDF showing in the sign-in window"));
+      expect(fake.shell!.libraryWindowTakePdf).toHaveBeenCalledTimes(1);
+      expect(fake.shell!.libraryWindowTakePdf).toHaveBeenCalledWith();
+      release(true);
+      await say({ ticket: TICKET, state: "fetching" });
+      await waitFor(() => expect(note("take it")).toBe("Fetching the PDF…"));
+      expect(calls.slice(before).filter((c) => c.method !== "GET")).toEqual([]);
+    });
+  });
+
+  it("a page loaded afresh holds no ticket: an event goes to the one waiting row (and closing cancels it)", async () => {
+    const w = entry({ typed: "from before", ...waiting() });
+    serve([w], {
+      cancel: () => {
+        becomes(later(w, { state: "no-open-copy", library: { canStart: true } }, "2026-11-13T12:00:00.000Z"));
+        return HttpResponse.json(current[0]);
+      },
+    });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await say({ ticket: OTHER_TICKET, state: "fetching" });
+    await waitFor(() => expect(note("from before")).toBe("Fetching the PDF…"));
+    await say({ ticket: OTHER_TICKET, state: "closed" });
+    await waitFor(() => expect(row("from before").querySelector(".ao-find__state")?.textContent).toBe("No open copy"));
+    expect(posts("/library/cancel")).toHaveLength(1);
+  });
+
+  it("a page loaded afresh with two waiting rows (a later state of the service): an event is nobody's", async () => {
+    serve([entry({ typed: "one", ...waiting() }), entry({ typed: "two", ...waiting() })]);
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    await say({ ticket: TICKET, state: "closed" });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(posts("/library/cancel")).toHaveLength(0);
+    expect(note("one")).toBeUndefined();
+  });
+
+  it("outside the desktop app: the controls are shown unavailable with Only in the desktop app, reachable by keyboard, and a press makes no request", async () => {
+    fake.shell = undefined;
+    serve([entry({ typed: "in a browser", ...startable() }), entry({ typed: "waiting in a browser", ...waiting() })]);
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    const start = btn("in a browser", "Get through my library");
+    const take = btn("waiting in a browser", "Add the PDF showing in the sign-in window");
+    for (const b of [start, take]) {
+      expect(b.getAttribute("aria-disabled")).toBe("true");
+      expect((b as HTMLButtonElement).disabled).toBe(false);
+      const why = b.getAttribute("aria-describedby")!.split(" ").map((id) => document.getElementById(id)?.textContent);
+      expect(why).toContain("Only in the desktop app");
+      act(() => b.focus());
+      expect(document.activeElement).toBe(b);
+    }
+    expect(row("in a browser").textContent).toContain("Only in the desktop app");
+    const before = calls.length;
+    await user.click(start);
+    await user.keyboard("{Enter}");
+    await user.click(take);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(calls.slice(before).filter((c) => c.method !== "GET")).toEqual([]);
+    // Cancel is the service's own act: it works wherever the row is.
+    expect(btn("waiting in a browser", "Cancel").getAttribute("aria-disabled")).toBeNull();
   });
 });
