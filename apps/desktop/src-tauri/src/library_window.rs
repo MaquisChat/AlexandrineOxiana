@@ -18,8 +18,10 @@
 //! What the shell fetches, and when (R325 b, c). Only while a ticket is open (the page passes it with
 //! `open_library_window`; it is the service's, F15), one fetch at a time, at most ONE file per ticket,
 //! and not within PAUSE of the last hand-over. A fetch starts when a page finishes loading at an
-//! address that `looks_like_pdf_address` and is not a `sign_in_address`, or when the researcher
-//! presses "Add the PDF showing in the sign-in window" (`library_window_take_pdf`). The one request
+//! address that `looks_like_pdf_address` and is not a `sign_in_address`, when the window asks to
+//! start a download (its own download is refused; the download's address is fetched instead, R331 g),
+//! or when the researcher presses "Add the PDF showing in the sign-in window"
+//! (`library_window_take_pdf`). The one request
 //! path is `fetch_pdf` (plan A1, point 8: it can later be replaced by the web view's own download):
 //! https on every hop, at most MAX_REDIRECTS redirects followed by hand, each hop's host resolved by
 //! the shell, checked (`address_allowed`) and connected TO THAT ADDRESS (reqwest's resolve override,
@@ -1393,11 +1395,36 @@ impl Library {
             let previous = g.previous.clone();
             Self::begin(&mut g, url, previous, now)
         };
+        self.run_automatic(host, job);
+    }
+
+    /// A fetch the window itself started (a page load or a download): run, or said only when it waits
+    /// for the pause.
+    fn run_automatic(&self, host: &dyn Host, job: Result<Job, (Option<String>, State, Reason)>) {
         match job {
             Ok(job) => self.run(host, job),
             Err((ticket, state, Reason::Pause)) => host.emit(&LibraryEvent::refused(ticket.as_deref(), state, Reason::Pause)),
             Err(_) => {}
         }
+    }
+
+    /// The window asked to start a download (R331 g; on the main thread: nothing here blocks). The
+    /// window's own download is refused (`TauriHost::create_window`); its address is taken as the
+    /// PDF's address and goes the same way as a page that reached a PDF's address (`page_loaded`):
+    /// only while a ticket is open, nothing is being fetched and the pause is over, https only, never
+    /// a sign-in address, at most one file per ticket, and through the one request path (`fetch_pdf`)
+    /// with all its rules, the window's current page as its `Referer`. The window has not moved, so
+    /// its current page stays as it was. Nothing is said when nothing is fetched, except the pause.
+    pub fn download_requested(&self, host: &dyn Host, url: &Url, now: Instant) {
+        let job = {
+            let mut g = self.lock();
+            if g.ticket.is_none() || g.fetching.is_some() || host.stopping() {
+                return;
+            }
+            let previous = g.current.clone();
+            Self::begin(&mut g, url, previous, now)
+        };
+        self.run_automatic(host, job);
     }
 
     /// `library_window_take_pdf()`: from the main window only; fetches the window's current address
@@ -1674,8 +1701,9 @@ impl Host for TauriHost {
     }
 
     fn create_window(&self, url: &Url, store: [u8; 16]) -> bool {
-        use tauri::webview::{NewWindowResponse, PageLoadEvent};
+        use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
         let loaded = self.clone();
+        let downloads = self.clone();
         let opened = self.app.clone();
         let builder = tauri::WebviewWindowBuilder::new(&self.app, LABEL, tauri::WebviewUrl::External(url.clone()))
             .title(TITLE)
@@ -1686,8 +1714,14 @@ impl Host for TauriHost {
             .on_navigation(navigation_allowed)
             // The web view itself never saves a file: a download it would start is refused (the
             // shell's own fetch is the only way a file is kept; WebKitGTK shows no PDF and would
-            // otherwise save it to the Downloads folder).
-            .on_download(|_webview, _event| false)
+            // otherwise save it to the Downloads folder). Its address is taken as the PDF's address
+            // and fetched by the shell under every rule of its one request path (R331 g).
+            .on_download(move |_webview, event| {
+                if let DownloadEvent::Requested { url, .. } = event {
+                    downloads.library.download_requested(&downloads, &url, Instant::now());
+                }
+                false
+            })
             .on_new_window(move |u, _features| {
                 if let Some(target) = new_window_target(&u) {
                     // Off the web view's own callback: the navigation is posted to the main thread.
@@ -2926,6 +2960,62 @@ process.stdout.write(JSON.stringify({{
         assert!(!lib.take_pdf(&host, "main", t0 + Duration::from_secs(60)));
         assert_eq!(host.last(), LibraryEvent::refused(None, State::Failed, Reason::NoTicket));
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_download_the_window_would_start_is_fetched_by_the_shell_under_every_rule() {
+        let (lib, host, d) = started("download");
+        let t0 = Instant::now();
+        let page = "https://www-jstor-org.ezproxy.lib.edu/stable/1";
+        // An address that does not look like a PDF's: a download is taken as the PDF all the same.
+        let dl = "https://www-jstor-org.ezproxy.lib.edu/stable/get/1?attachment=1";
+        // Without a ticket: nothing, and nothing said.
+        lib.download_requested(&host, &u(dl), t0);
+        assert_eq!(host.jobs(), 0);
+        assert!(host.events().is_empty());
+        lib.open(&host, "main", TICKET, START);
+        lib.page_loaded(&host, &u(page), t0);
+        // Not https, a sign-in address, not a web address: nothing, and nothing said.
+        let n = host.events().len();
+        for no in ["http://p.test/a.pdf", "https://ezproxy.lib.edu/x.pdf", "https://p.test/login/file.pdf", "https://p.test/x.pdf?SAMLart=1", "data:application/pdf;base64,JVBERi0=", "blob:https://p.test/1"] {
+            lib.download_requested(&host, &u(no), t0);
+        }
+        assert_eq!(host.jobs(), 0);
+        assert_eq!(host.events().len(), n);
+        // With an open ticket: ONE fetch of that address, the window's current page as its Referer.
+        lib.download_requested(&host, &u(dl), t0);
+        assert_eq!(host.jobs(), 1);
+        assert_eq!(host.last(), LibraryEvent::new(Some(TICKET), State::Fetching));
+        // A second download while it runs: nothing.
+        lib.download_requested(&host, &u("https://www-jstor-org.ezproxy.lib.edu/stable/get/2"), t0);
+        lib.page_loaded(&host, &u(PDF), t0);
+        assert_eq!(host.jobs(), 1);
+        let job = host.jobs.lock().unwrap().remove(0);
+        assert_eq!(job.ticket, TICKET);
+        assert_eq!(job.input.url, u(dl));
+        assert_eq!(job.input.previous, Some(u(page)));
+        assert_eq!(job.input.user_agent, USER_AGENT);
+        assert_eq!(job.input.proxy_host.as_deref(), Some("ezproxy.lib.edu"));
+        // After the ticket's file was handed over: nothing more for it.
+        lib.finish(&host, job.generation, TICKET, Outcome::HandedOver, t0);
+        lib.download_requested(&host, &u(dl), t0 + Duration::from_secs(30));
+        assert_eq!(host.jobs(), 0);
+        // The next ticket waits for the pause, which is said.
+        lib.open(&host, "main", TICKET2, START);
+        lib.download_requested(&host, &u(dl), t0 + Duration::from_secs(10));
+        assert_eq!(host.jobs(), 0);
+        assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET2), State::Failed, Reason::Pause));
+        lib.download_requested(&host, &u(dl), t0 + Duration::from_secs(21));
+        assert_eq!(host.jobs(), 1);
+        // Nothing starts while the app closes.
+        let (lib2, host2, d2) = started("download-stopping");
+        lib2.open(&host2, "main", TICKET, START);
+        host2.stopping.store(true, Ordering::SeqCst);
+        lib2.download_requested(&host2, &u(dl), t0);
+        assert_eq!(host2.jobs(), 0);
+        for x in [d, d2] {
+            fs::remove_dir_all(x).unwrap();
+        }
     }
 
     #[test]
