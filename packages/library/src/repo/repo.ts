@@ -78,7 +78,7 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
-import { hasSettledCaptureEntries, hasUnlistedConflicts, readReviewEntries, reviewedAfterWithdrawal, type ReviewEntry } from "./review.js";
+import { hasSettledCaptureEntries, hasUnlistedConflicts, holdMismatchedFile, readReviewEntries, removeFindEntryWithHeld, resolveHeldFile, reviewedAfterWithdrawal, type HoldInput, type ReviewEntry } from "./review.js";
 import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegisterEntry } from "./watch-register.js";
 import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
@@ -1324,6 +1324,21 @@ export function readFindQueueDetailedIn(repo: Repo, projectId: string): Promise<
  */
 export function appendFindEntriesIn(repo: Repo, projectId: string, entries: FindEntry[], op: "add" | "update" | "remove", alongside: FindEntry[] = []): Promise<void> {
   return appendFindEntries(cores.get(repo)!, projectId, entries, op, alongside);
+}
+
+/** Package-internal (Find and acquire F11): the held file, its review entry and the entry's line, in one change (review.ts). */
+export function holdMismatchedFileIn(repo: Repo, projectId: string, input: HoldInput): Promise<{ reviewId: string; held: string }> {
+  return holdMismatchedFile(cores.get(repo)!, projectId, input);
+}
+
+/** Package-internal (F11): "Use this file" / "Not this file" on a held file, one change each (review.ts). */
+export function resolveHeldFileIn(repo: Repo, projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<{ entry: FindEntry | null; asset?: Asset }> {
+  return resolveHeldFile(cores.get(repo)!, projectId, reviewId, decision);
+}
+
+/** Package-internal (F11, R277 c): removes a queue entry, its held file and its review entry in one change (review.ts). */
+export function removeFindEntryIn(repo: Repo, projectId: string, entry: FindEntry): Promise<void> {
+  return removeFindEntryWithHeld(cores.get(repo)!, projectId, entry);
 }
 
 /**

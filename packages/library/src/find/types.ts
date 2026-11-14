@@ -59,7 +59,26 @@ export type OfferLink = {
 };
 
 /** Task F5: why an entry could not go on (the sentences are `FIND_REASON_TEXT` in the shared package). */
-export type FindReasonCode = "not-allowed" | "no-legal-basis" | "switched-off" | "unreachable" | "locked" | "queue-full" | "budget" | "unexpected";
+export type FindReasonCode =
+  | "not-allowed"
+  | "no-legal-basis"
+  | "switched-off"
+  | "unreachable"
+  | "locked"
+  | "queue-full"
+  | "budget"
+  | "unexpected"
+  // Task F11: the free copy. The rules refuse the acquiring method `free_copy` (the entry stays "record-complete"
+  // and is not tried again until the rules change); FIND_HELD_MAX files already wait ("failed", with "Try again");
+  // the researcher said the held file was not this work ("no-open-copy"); and why a held file did not match
+  // ("needs-check": one code per reason of the file check).
+  | "copy-not-allowed"
+  | "held-full"
+  | "not-this-file"
+  | "file-other-doi"
+  | "file-title-absent"
+  | "file-no-text"
+  | "file-other-version";
 
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 
