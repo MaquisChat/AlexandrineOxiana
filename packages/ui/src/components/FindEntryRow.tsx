@@ -10,15 +10,20 @@
  * second press; the row's other acts wait. While the library is read-only every act that would change it is
  * disabled ("Open" stays). Everything typed or sent by a service is shown through UserText.
  *
- * Slice 1 only: the states of later slices are said in words, with "Remove from the queue" (and "Open" when the
- * entry has a record), and no control of a later slice.
+ * An author alone (Task F9; R267, R270, R271): an author's entry reads "Author: <typed>" with "N people match" and
+ * "Choose the person", or "Choose works" (and "N added" once works were added from it; it stays so until removed).
+ * An entry made from an author's entry says where it came from — "Added from “<what was typed for the author>”", or
+ * "Added from an author's works" when that entry is gone — so a line the app built is never shown as typed alone.
+ *
+ * The states of later slices are said in words, with "Remove from the queue" (and "Open" when the entry has a
+ * record), and no control of a later slice.
  */
-import { FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
+import { FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
 import { Component, memo, type ReactNode } from "react";
 import { creatorsText, isKnownState, kindWords, usableCandidates, yearOf } from "../api/find";
 import { UserText } from "./UserText";
 
-export type FindActKind = "choose" | "open" | "open-there" | "add-here" | "same" | "different" | "retry" | "remove";
+export type FindActKind = "choose" | "choose-person" | "choose-works" | "open" | "open-there" | "add-here" | "same" | "different" | "retry" | "remove";
 
 /** What the researcher pressed on a row. */
 export interface FindAction {
@@ -49,7 +54,23 @@ export const FIND_TEXT = {
   elsewhereLocked: "Already in another project that is locked now.",
   maybeElsewhereLocked: "Possibly already in another project that is locked now.",
   noMatches: "No possible matches.",
+  // Task F9 (R267, R271): an author alone.
+  authorLead: "Author: ",
+  /** The plan's words (FIND_MORE_PEOPLE_TEXT), as a sentence. */
+  morePeople: `${FIND_MORE_PEOPLE_TEXT}.`,
+  noWorks: "No works are listed for this person.",
+  /** An entry made from an author's entry whose parent is no longer in the queue (R271 M7). */
+  originGone: "Added from an author's works",
 } as const;
+
+/** A count from the service, or undefined when it is not a whole number of at least 0. */
+const countOf = (v: unknown): number | undefined => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined);
+
+/**
+ * An author's entry (F8, R267): one that holds people or works — its counts say so — or asks for a person or works.
+ * It stays one after the person is chosen (while the works are fetched, and after works were added from it).
+ */
+export const isAuthorEntry = (e: FindEntryView): boolean => e.state === "choose-person" || e.state === "choose-works" || countOf(e.peopleCount) !== undefined || countOf(e.worksCount) !== undefined;
 
 /** An entry this build can show: a known state and text that was typed (else "needs a newer version", R258 M6). */
 export const entryKnown = (e: FindEntryView): boolean => isKnownState(e.state) && typeof e.typed === "string";
@@ -73,7 +94,7 @@ const STATE_WORDS = {
 } as const;
 
 /** Decoration beside the state (the design's mock-up); hidden from screen readers. */
-const MARKS: Partial<Record<string, string>> = { "looking-up": "●", choose: "?", "maybe-duplicate": "≈", "record-complete": "✓", already: "=", "not-found": "∅", failed: "!" };
+const MARKS: Partial<Record<string, string>> = { "looking-up": "●", choose: "?", "choose-person": "?", "choose-works": "?", "maybe-duplicate": "≈", "record-complete": "✓", already: "=", "not-found": "∅", failed: "!" };
 
 const knownReason = (code: unknown): code is FindReasonCode => typeof code === "string" && (FIND_REASON_CODES as readonly string[]).includes(code);
 
@@ -90,6 +111,16 @@ export function stateWords(e: FindEntryView, ctx: { stopped?: boolean; place?: F
       const k = candidatesOf(e).length;
       if (k === 0) return [FIND_TEXT.noMatches];
       return [k === 1 ? "1 possible match" : `${k} possible matches`];
+    }
+    case "choose-person": {
+      const k = countOf(e.peopleCount);
+      if (k === undefined) return [STATE_WORDS["choose-person"]];
+      return [k === 1 ? "1 person matches" : `${k} people match`];
+    }
+    case "choose-works": {
+      if (countOf(e.worksCount) === 0) return [FIND_TEXT.noWorks];
+      const added = countOf(e.addedCount);
+      return [added ? `${STATE_WORDS["choose-works"]} · ${added} added` : STATE_WORDS["choose-works"]];
     }
     case "failed": {
       const why = reasonSentence(e);
@@ -118,7 +149,7 @@ export function shortTyped(typed: unknown): string {
 /** The candidate the entry was matched to, if any. */
 export const matchedWork = (e: FindEntryView): FindWorkCandidate | undefined => (e.chosen ? candidatesOf(e).find((c) => c.id === e.chosen) : undefined);
 
-/** The acts a row offers, in order. Slice 1 only. */
+/** The acts a row offers, in order. */
 export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
   if (!entryKnown(e)) return ["remove"];
   const out: FindActKind[] = [];
@@ -141,6 +172,13 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
     case "looking-up":
       if (e.nextTryAt) out.push("retry");
       break;
+    case "choose-person":
+      out.push("choose-person");
+      break;
+    case "choose-works":
+      // Nothing to choose from: no dialog.
+      if (countOf(e.worksCount) !== 0) out.push("choose-works");
+      break;
     case "not-found":
     case "failed":
       out.push("retry");
@@ -154,6 +192,8 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
 
 const ACT_TEXT: Record<FindActKind, string> = {
   choose: "Choose",
+  "choose-person": "Choose the person",
+  "choose-works": "Choose works",
   open: "Open",
   "open-there": "Open it there",
   "add-here": "Add it to this project as well",
@@ -179,6 +219,11 @@ export interface FindEntryRowProps {
   stopped?: boolean;
   /** The service's sentence for this entry's last refused act. */
   error?: string | undefined;
+  /**
+   * For an entry made from an author's entry (`parentId`): what was typed for that author, or null when that entry is
+   * no longer in the queue (R271 M7). Undefined for any other entry.
+   */
+  origin?: string | null | undefined;
 }
 
 function Matched({ c }: { c: FindWorkCandidate }) {
@@ -205,20 +250,34 @@ function Matched({ c }: { c: FindWorkCandidate }) {
   );
 }
 
-function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, stopped = false, error }: FindEntryRowProps) {
+function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, stopped = false, error, origin }: FindEntryRowProps) {
   const short = shortTyped(e.typed);
   const known = entryKnown(e);
   const words = stateWords(e, { stopped, place });
   const work = known ? matchedWork(e) : undefined;
   const reason = known && e.state !== "failed" ? reasonSentence(e) : undefined;
   const mark = known ? MARKS[e.state] : undefined;
+  const author = known && isAuthorEntry(e);
+  const morePeople = known && e.state === "choose-person" && e.morePeople === true;
   return (
     <li className="ao-find__entry" data-entry-id={e.id}>
       <p className="ao-find__typed">
         <span tabIndex={-1} data-entry-text="" className="ao-find__typed-text">
+          {author && <span className="ao-find__lead">{FIND_TEXT.authorLead}</span>}
           {typeof e.typed === "string" && <UserText>{e.typed}</UserText>}
         </span>
       </p>
+      {known && typeof e.parentId === "string" && origin !== undefined && (
+        <p className="ao-find__origin">
+          {typeof origin === "string" ? (
+            <>
+              Added from “<UserText>{origin}</UserText>”
+            </>
+          ) : (
+            FIND_TEXT.originGone
+          )}
+        </p>
+      )}
       {work && <Matched c={work} />}
       <p className="ao-find__status">
         {mark && (
@@ -230,6 +289,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
           <WordsView words={words} />
         </span>
       </p>
+      {morePeople && <p className="ao-find__reason">{FIND_TEXT.morePeople}</p>}
       {reason && <p className="ao-find__reason">{reason}</p>}
       {error && (
         <p role="alert" className="ao-error">
@@ -246,6 +306,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
               key={kind}
               type="button"
               className={kind === "remove" ? "ao-find__remove" : undefined}
+              data-act={kind}
               aria-label={short ? `${text}: “${short}”` : text}
               disabled={readOnly && !READS.has(kind)}
               aria-disabled={working || waiting || undefined}

@@ -10,6 +10,8 @@ import {
   FIND_STOPPED_TEXT,
   findLineRefusal,
   type FindEntryView,
+  type FindPersonCandidate,
+  type FindPersonWork,
   type FindQueueResponse,
   type FindScreenSettings,
   type FindWorkCandidate,
@@ -1598,6 +1600,22 @@ describe("FindAcquire: the contract (each request exactly as the handler takes i
       { method: "PUT", path: "/find/screen", body: { checkEverything: false }, query: "" },
     ]);
   });
+  // Task F9: the three routes of an author's entry (F8's handlers, routes/find.ts: options, person, works).
+  it("GET …/:eid/options (no body)", async () => {
+    const seen = record();
+    await api().options(PID, E);
+    expect(seen).toEqual([{ method: "GET", path: `/projects/${PID}/find/${E}/options`, body: undefined, query: "" }]);
+  });
+  it("POST …/:eid/person { personId }", async () => {
+    const seen = record();
+    await api().person(PID, E, "A5055013655");
+    expect(seen).toEqual([{ method: "POST", path: `/projects/${PID}/find/${E}/person`, body: { personId: "A5055013655" }, query: "" }]);
+  });
+  it("POST …/:eid/works { workIds }", async () => {
+    const seen = record();
+    await api().works(PID, E, ["W2038217319", "W2621405455"]);
+    expect(seen).toEqual([{ method: "POST", path: `/projects/${PID}/find/${E}/works`, body: { workIds: ["W2038217319", "W2621405455"] }, query: "" }]);
+  });
   it("a malformed id is refused before anything is sent, and the error does not repeat it", async () => {
     const seen = record();
     expect(() => api().retry(PID, "Zorblatt")).toThrow();
@@ -1607,5 +1625,442 @@ describe("FindAcquire: the contract (each request exactly as the handler takes i
       expect(String(err)).not.toContain("Zorblatt");
     }
     expect(seen).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task F9 (R267, R270–R272): an author alone — the rows' words, the two dialogs on the screen, and the two
+// improvements to the screen that its reviews left for this task (an add waits for the switch; the result of the
+// researcher's own act is said first and stays). The service is mocked exactly as F8's handlers answer
+// (apps/library-service/src/routes/find.ts: options, person, works).
+
+describe("FindAcquire: an author alone (F9)", () => {
+  const PERSON_A = "A5055013655";
+  const PERSON_B = "A5108208998";
+  const person = (o: Partial<FindPersonCandidate> & { id: string; name: string }): FindPersonCandidate => ({ worksCount: 10, subjects: [], ...o });
+  const work = (o: Partial<FindPersonWork> & { id: string; title: string }): FindPersonWork => ({
+    creators: [{ family: "Stark", role: "author" }],
+    issued: "2015",
+    type: "article-journal",
+    identifiers: {},
+    providers: ["openalex"],
+    ...o,
+  });
+  const PEOPLE = [
+    person({ id: PERSON_A, name: "David Stark", worksCount: 160, subjects: ["Post-Communist Economic and Political Transition", "Eastern European Communism and Reforms", "Management and Organizational Studies"] }),
+    person({ id: PERSON_B, name: "David Stark", affiliation: "The People of the United Methodist Church", worksCount: 46, subjects: ["Colonialism, slavery, and trade"] }),
+  ];
+  const WORKS = [
+    work({ id: "W3015927993", title: "Put to the test: For a new sociology of testing", issued: "2020-04-19", container: "British Journal of Sociology", creators: [{ family: "Marres", role: "author" }] }),
+    work({ id: "W2621405455", title: "For What It’s Worth", issued: "2017-06-01", type: "chapter", container: "Research in the sociology of organizations" }),
+    work({ id: "W2038217319", title: "Game Changer: The Topology of Creativity", issued: "2015-01-01", container: "American Journal of Sociology", creators: [{ family: "Vaan", role: "author" }] }),
+    work({ id: "W2588831772", title: "The Sense of Dissonance: Accounts of Worth in Economic Life", issued: "2009-12-31", type: "book", container: "Princeton University Press eBooks" }),
+  ];
+  const stateText = (r: HTMLElement) => r.querySelector(".ao-find__state")?.textContent;
+  const authorRow = (typed: string) => row(`Author: ${typed}`);
+  const progress = (e: FindEntryView, state = e.state) => events.push({ type: "find.progress", data: { projectId: PID, entryId: e.id, state } });
+
+  it("an author's row says Author: … and N people match; Choose works with N added; Remove stays offered", async () => {
+    const a = entry({ typed: "David Stark", state: "choose-person", peopleCount: 2, morePeople: true });
+    const b = entry({ typed: "Ann Swidler", state: "choose-person", peopleCount: 1 });
+    const c = entry({ typed: "Mario Small", state: "choose-works", peopleCount: 1, chosen: PERSON_A, worksCount: 12, addedCount: 3 });
+    const d = entry({ typed: "Nobody Known", state: "choose-works", peopleCount: 1, chosen: PERSON_B, worksCount: 0 });
+    const e = entry({ typed: "Viviana Zelizer", state: "choose-works", peopleCount: 1, chosen: PERSON_A, worksCount: 7 });
+    const f = entry({ typed: "Gary Fine", state: "looking-up", peopleCount: 1, chosen: PERSON_A });
+    useService({ queues: { [PID]: queue([a, b, c, d, e, f]) } });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(6));
+    expect(stateText(authorRow("David Stark"))).toBe("2 people match");
+    expect(authorRow("David Stark").textContent).toContain("More people have this name; add a word from a title to narrow it.");
+    expect(within(authorRow("David Stark")).getByRole("button", { name: "Choose the person: “David Stark”" })).toBeTruthy();
+    expect(stateText(authorRow("Ann Swidler"))).toBe("1 person matches");
+    expect(authorRow("Ann Swidler").textContent).not.toContain("More people have this name");
+    expect(stateText(authorRow("Mario Small"))).toBe("Choose works · 3 added");
+    expect(within(authorRow("Mario Small")).getByRole("button", { name: "Choose works: “Mario Small”" })).toBeTruthy();
+    expect(stateText(authorRow("Viviana Zelizer"))).toBe("Choose works");
+    // A person with no works listed: said, and nothing to choose from.
+    expect(stateText(authorRow("Nobody Known"))).toBe("No works are listed for this person.");
+    expect(within(authorRow("Nobody Known")).queryByRole("button", { name: /Choose works/ })).toBeNull();
+    // After the person was chosen, while the works are fetched.
+    expect(stateText(authorRow("Gary Fine"))).toBe("Looking it up");
+    for (const r of rows()) expect(within(r).getByRole("button", { name: /^Remove from the queue: “/ })).toBeTruthy();
+    // What was typed is outside text: through UserText, and the prefix is not part of it.
+    const typed = authorRow("David Stark").querySelector("[data-entry-text] [dir=auto]")!;
+    expect(typed.textContent).toBe("David Stark");
+  });
+
+  it("a row made from an author's entry says where it came from, never as if it had been typed", async () => {
+    const parent = entry({ typed: "David Stark", state: "choose-works", peopleCount: 1, chosen: PERSON_A, worksCount: 4, addedCount: 2 });
+    const w = WORKS[2]!;
+    const child = entry({ typed: "Game Changer: The Topology of Creativity, Vaan", state: "looking-up", parentId: parent.id, work: w.id, chosen: w.id, candidates: [w] });
+    const orphan = entry({ typed: "For What It’s Worth, Stark", state: "record-complete", sourceId: SID, parentId: eid(), work: "W2621405455", chosen: "W2621405455", candidates: [WORKS[1]!] });
+    useService({ queues: { [PID]: queue([parent, child, orphan]) } });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    const c = row("Game Changer: The Topology of Creativity, Vaan");
+    const origin = c.querySelector(".ao-find__origin")!;
+    expect(origin.textContent).toBe("Added from “David Stark”");
+    expect(origin.querySelector("[dir=auto]")?.textContent).toBe("David Stark");
+    // The work it was made from is shown beside it.
+    expect(c.querySelector(".ao-find__match")?.textContent).toContain("Game Changer: The Topology of Creativity");
+    // Its parent removed: it still says where it came from, without inventing the line.
+    expect(row("For What It’s Worth, Stark").querySelector(".ao-find__origin")?.textContent).toBe("Added from an author's works");
+    // An ordinary row says nothing of the kind.
+    expect(authorRow("David Stark").querySelector(".ao-find__origin")).toBeNull();
+    expect(within(c).getByRole("button", { name: "Remove from the queue: “Game Changer: The Topology of Creativity, Vaan”" })).toBeTruthy();
+  });
+
+  it("the lists are read from options when the dialog opens (the dialog says so while they load), and are not kept after it closes", async () => {
+    const a = entry({ typed: "David Stark", state: "choose-person", peopleCount: 2 });
+    useService({ queues: { [PID]: queue([a]) } });
+    const hold = held<void>();
+    let asked = 0;
+    server.use(
+      http.get(url(`/projects/${PID}/find/${a.id}/options`), async () => {
+        asked++;
+        if (asked === 1) await hold.p;
+        return HttpResponse.json({ people: PEOPLE });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    // The queue's answer carries counts only: nothing asked before the press.
+    expect(asked).toBe(0);
+    const opener = within(authorRow("David Stark")).getByRole("button", { name: "Choose the person: “David Stark”" });
+    await user.click(opener);
+    const dialog = await screen.findByRole("dialog", { name: "Choose the person for “David Stark”" });
+    expect(within(dialog).getByText("Reading the people of this name…")).toBeTruthy();
+    expect(within(dialog).queryAllByRole("radio")).toHaveLength(0);
+    hold.release();
+    await waitFor(() => expect(within(dialog).getAllByRole("radio")).toHaveLength(2));
+    expect(within(dialog).queryByText("Reading the people of this name…")).toBeNull();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    // Opened again: read again.
+    await user.click(opener);
+    const again = await screen.findByRole("dialog");
+    await waitFor(() => expect(within(again).getAllByRole("radio")).toHaveLength(2));
+    expect(asked).toBe(2);
+    expect(calls.filter((c) => c.path === `/projects/${PID}/find/${a.id}/options`).every((c) => c.method === "GET" && c.body === undefined)).toBe(true);
+  });
+
+  it("a failed options read shows the service's sentence in the dialog, and nothing else changes", async () => {
+    const a = entry({ typed: "David Stark", state: "choose-person", peopleCount: 2 });
+    const b = entry({ typed: "Ann Swidler", state: "choose-works", peopleCount: 1, chosen: PERSON_A, worksCount: 3 });
+    useService({ queues: { [PID]: queue([a, b]) } });
+    server.use(
+      http.get(url(`/projects/${PID}/find/${a.id}/options`), () => refusal(404, "NOT_FOUND", FIND_ROUTE_TEXT.entryNotFound)),
+      // An entry that no longer holds the list asked for (another state now): said in the service's words for that.
+      http.get(url(`/projects/${PID}/find/${b.id}/options`), () => HttpResponse.json({})),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    await user.click(within(authorRow("David Stark")).getByRole("button", { name: "Choose the person: “David Stark”" }));
+    let dialog = await screen.findByRole("dialog");
+    expect((await within(dialog).findByRole("alert")).textContent).toBe(FIND_ROUTE_TEXT.entryNotFound);
+    expect(within(dialog).queryAllByRole("radio")).toHaveLength(0);
+    expect((within(dialog).getByRole("button", { name: "This is the person" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(stateText(authorRow("David Stark"))).toBe("2 people match");
+    await user.keyboard("{Escape}");
+    await user.click(within(authorRow("Ann Swidler")).getByRole("button", { name: "Choose works: “Ann Swidler”" }));
+    dialog = await screen.findByRole("dialog");
+    expect((await within(dialog).findByRole("alert")).textContent).toBe(FIND_ROUTE_TEXT.entryState);
+    expect(within(dialog).queryAllByRole("checkbox")).toHaveLength(0);
+    expect(calls.filter((c) => c.method === "POST")).toEqual([]);
+  });
+
+  it("This is the person: the person's id in the body; the dialog closes, the row says Looking it up then Choose works; focus on the row's next control", async () => {
+    const a = entry({ typed: "David Stark", state: "choose-person", peopleCount: 2, morePeople: true });
+    useService({ queues: { [PID]: queue([a]) } });
+    let body: unknown;
+    server.use(
+      http.get(url(`/projects/${PID}/find/${a.id}/options`), () => HttpResponse.json({ people: PEOPLE })),
+      http.post(url(`/projects/${PID}/find/${a.id}/person`), async ({ request }) => {
+        body = await request.json();
+        const next: FindEntryView = { ...a, state: "looking-up", chosen: PERSON_A, peopleCount: 1, updatedAt: "2026-11-13T11:00:00.000Z" };
+        delete next.morePeople;
+        queues[PID] = queue([next]);
+        return HttpResponse.json(next);
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(events.open()).toBe(true));
+    await user.click(within(authorRow("David Stark")).getByRole("button", { name: "Choose the person: “David Stark”" }));
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(within(dialog).getAllByRole("radio")).toHaveLength(2));
+    await user.click(within(dialog).getAllByRole("radio")[0]!);
+    await user.click(within(dialog).getByRole("button", { name: "This is the person" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(body).toEqual({ personId: PERSON_A });
+    await waitFor(() => expect(stateText(authorRow("David Stark"))).toBe("Looking it up"));
+    expect(authorRow("David Stark").textContent).not.toContain("More people have this name");
+    // Focus: the row's next control, never the page.
+    await waitFor(() => expect(document.activeElement).toBe(within(authorRow("David Stark")).getByRole("button", { name: "Remove from the queue: “David Stark”" })));
+    // The works have come: the event, a read, "Choose works".
+    const ready: FindEntryView = { ...a, state: "choose-works", chosen: PERSON_A, peopleCount: 1, worksCount: 4, updatedAt: "2026-11-13T11:00:05.000Z" };
+    delete ready.morePeople;
+    queues[PID] = queue([ready]);
+    progress(a, "choose-works");
+    await waitFor(() => expect(stateText(authorRow("David Stark"))).toBe("Choose works"));
+    expect(within(authorRow("David Stark")).getByRole("button", { name: "Choose works: “David Stark”" })).toBeTruthy();
+  });
+
+  it("Choose works: ticked works sent; new rows that say where they came from; the status says Added 3 works.; focus on Choose works", async () => {
+    const a = entry({ typed: "David Stark", state: "choose-works", peopleCount: 1, chosen: PERSON_A, worksCount: 4 });
+    useService({ queues: { [PID]: queue([a]) } });
+    let body: { workIds: string[] } | undefined;
+    server.use(
+      http.get(url(`/projects/${PID}/find/${a.id}/options`), () => HttpResponse.json({ works: WORKS, person: { name: "David Stark", subjects: ["Management and Organizational Studies"] } })),
+      http.post(url(`/projects/${PID}/find/${a.id}/works`), async ({ request }) => {
+        body = (await request.json()) as { workIds: string[] };
+        const added = body.workIds.map((id) => {
+          const w = WORKS.find((x) => x.id === id)!;
+          return entry({ typed: `${w.title}, ${w.creators[0]!.family}`, state: "looking-up", parentId: a.id, work: id, chosen: id, candidates: [w] });
+        });
+        const parent: FindEntryView = { ...a, addedCount: added.length, updatedAt: "2026-11-13T11:00:00.000Z" };
+        queues[PID] = queue([parent, ...added]);
+        return HttpResponse.json({ added, entry: parent });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const h = heard();
+    await user.click(within(authorRow("David Stark")).getByRole("button", { name: "Choose works: “David Stark”" }));
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(within(dialog).getAllByRole("checkbox")).toHaveLength(4));
+    for (const i of [0, 1, 2]) await user.click(within(dialog).getAllByRole("checkbox")[i]!);
+    await user.click(within(dialog).getByRole("button", { name: "Add the chosen works (3)" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(body).toEqual({ workIds: ["W3015927993", "W2621405455", "W2038217319"] });
+    await waitFor(() => expect(rows()).toHaveLength(4));
+    for (const r of rows().slice(1)) expect(r.querySelector(".ao-find__origin")?.textContent).toBe("Added from “David Stark”");
+    expect(stateText(authorRow("David Stark"))).toBe("Choose works · 3 added");
+    await waitFor(() => expect(h.said).toContain("Added 3 works."));
+    expect(document.activeElement).toBe(within(authorRow("David Stark")).getByRole("button", { name: "Choose works: “David Stark”" }));
+    h.stop();
+  });
+
+  it("a 409 in either dialog is said in the dialog in the service's words, and changes nothing", async () => {
+    const a = entry({ typed: "David Stark", state: "choose-person", peopleCount: 2 });
+    const b = entry({ typed: "Ann Swidler", state: "choose-works", peopleCount: 1, chosen: PERSON_A, worksCount: 4 });
+    useService({ queues: { [PID]: queue([a, b]) } });
+    server.use(
+      http.get(url(`/projects/${PID}/find/${a.id}/options`), () => HttpResponse.json({ people: PEOPLE })),
+      http.get(url(`/projects/${PID}/find/${b.id}/options`), () => HttpResponse.json({ works: WORKS, person: { name: "Ann Swidler", subjects: [] } })),
+      http.post(url(`/projects/${PID}/find/${a.id}/person`), () => refusal(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state")),
+      http.post(url(`/projects/${PID}/find/${b.id}/works`), () => refusal(409, "CONFLICT", FIND_ROUTE_TEXT.queueFull, "queue-full")),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    await user.click(within(authorRow("David Stark")).getByRole("button", { name: "Choose the person: “David Stark”" }));
+    let dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(within(dialog).getAllByRole("radio")).toHaveLength(2));
+    await user.click(within(dialog).getAllByRole("radio")[1]!);
+    await user.click(within(dialog).getByRole("button", { name: "This is the person" }));
+    expect((await within(dialog).findByRole("alert")).textContent).toBe(FIND_ROUTE_TEXT.entryState);
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    expect(stateText(authorRow("David Stark"))).toBe("2 people match");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await user.click(within(authorRow("Ann Swidler")).getByRole("button", { name: "Choose works: “Ann Swidler”" }));
+    dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(within(dialog).getAllByRole("checkbox")).toHaveLength(4));
+    await user.click(within(dialog).getAllByRole("checkbox")[0]!);
+    await user.click(within(dialog).getByRole("button", { name: "Add the chosen works (1)" }));
+    expect((await within(dialog).findByRole("alert")).textContent).toBe(FIND_ROUTE_TEXT.queueFull);
+    // Nothing half-shown: the tick stays, no row was added, the row says what it said.
+    expect((within(dialog).getAllByRole("checkbox")[0] as HTMLInputElement).checked).toBe(true);
+    expect(rows()).toHaveLength(2);
+    expect(stateText(authorRow("Ann Swidler"))).toBe("Choose works");
+  });
+
+  it("focus after a dialog closes on a row that changed or vanished meanwhile: the row's next control, else the next row", async () => {
+    const a = entry({ typed: "David Stark", state: "choose-person", peopleCount: 2 });
+    const b = entry({ typed: "Merton", state: "not-found" });
+    useService({ queues: { [PID]: queue([a, b]) } });
+    server.use(http.get(url(`/projects/${PID}/find/:eid/options`), () => HttpResponse.json({ people: PEOPLE })));
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    await waitFor(() => expect(events.open()).toBe(true));
+    await user.click(within(authorRow("David Stark")).getByRole("button", { name: "Choose the person: “David Stark”" }));
+    let dialog = await screen.findByRole("dialog");
+    // The entry is removed elsewhere while the dialog is open.
+    queues[PID] = queue([b]);
+    progress(a);
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(document.activeElement).toBe(row("Merton").querySelector("[data-entry-text]")));
+    // The row changed state while open (its opener gone): the row's next control.
+    const c = entry({ typed: "Ann Swidler", state: "choose-person", peopleCount: 2 });
+    queues[PID] = queue([b, c]);
+    progress(c);
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    await user.click(within(authorRow("Ann Swidler")).getByRole("button", { name: "Choose the person: “Ann Swidler”" }));
+    dialog = await screen.findByRole("dialog");
+    queues[PID] = queue([b, { ...c, state: "not-found", updatedAt: "2026-11-13T12:00:00.000Z" }]);
+    progress(c, "not-found");
+    await waitFor(() => expect(stateText(authorRow("Ann Swidler"))).toBe("Not found"));
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(document.activeElement).toBe(within(authorRow("Ann Swidler")).getByRole("button", { name: "Try again: “Ann Swidler”" })));
+  });
+
+  it("another library opened closes the dialog and forgets its lists", async () => {
+    const a = entry({ typed: "David Stark", state: "choose-works", peopleCount: 1, chosen: PERSON_A, worksCount: 4 });
+    useService({ queues: { [PID]: queue([a]) } });
+    const late = held<void>();
+    let asked = 0;
+    server.use(
+      http.get(url(`/projects/${PID}/find/${a.id}/options`), async () => {
+        asked++;
+        if (asked === 2) await late.p;
+        return HttpResponse.json({ works: WORKS, person: { name: "David Stark", subjects: [] } });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(events.open()).toBe(true));
+    events.push({ type: "library.state", data: { open: true, libraryId: "lib-1", name: "L", mode: "read-write" } });
+    await user.click(within(authorRow("David Stark")).getByRole("button", { name: "Choose works: “David Stark”" }));
+    let dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(within(dialog).getAllByRole("checkbox")).toHaveLength(4));
+    // Closed and opened again: the second read is held when another library opens.
+    await user.keyboard("{Escape}");
+    await user.click(within(authorRow("David Stark")).getByRole("button", { name: "Choose works: “David Stark”" }));
+    dialog = await screen.findByRole("dialog");
+    const PID_NEW = "0190a000-0000-7000-8000-0000000000a9";
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: PID_NEW, name: "Grant 2025", folder: "Grant 2025", encrypted: false, unlocked: true }] })));
+    queues[PID_NEW] = queue([entry({ typed: "new row", projectId: PID_NEW })]);
+    events.push({ type: "library.state", data: { open: true, libraryId: "lib-2", name: "L2", mode: "read-write" } });
+    await waitFor(() => expect(rows().map((r) => r.querySelector("[data-entry-text]")?.textContent)).toEqual(["new row"]));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    late.release();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByText("Game Changer: The Topology of Creativity")).toBeNull();
+  });
+
+  it("an add waits for the switch: sent once its change is confirmed, and not sent (the text kept, the failure said) if it fails", async () => {
+    useService();
+    const put = held<void>();
+    let added: unknown[] = [];
+    server.use(
+      http.put(url("/find/screen"), async ({ request }) => {
+        const b = (await request.json()) as FindScreenSettings;
+        await put.p;
+        screenSettings = b;
+        return HttpResponse.json(b);
+      }),
+      http.post(url(`/projects/${PID}/find`), async ({ request }) => {
+        added.push({ body: await request.json(), check: screenSettings.checkEverything });
+        const e = entry({ typed: "Weber" });
+        return HttpResponse.json({ added: [e], mergedLines: 0 });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(box().disabled).toBe(false));
+    const sw = screen.getByRole("switch", { name: "Check everything I have" }) as HTMLInputElement;
+    await user.click(sw);
+    expect(sw.checked).toBe(true);
+    expect(sw.getAttribute("aria-busy")).toBe("true");
+    await user.type(box(), "Weber");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    await new Promise((r) => setTimeout(r, 100));
+    // Not sent while the switch's change is out; the box is read-only meanwhile.
+    expect(added).toEqual([]);
+    expect(box().readOnly).toBe(true);
+    put.release();
+    await waitFor(() => expect(added).toHaveLength(1));
+    expect(added[0]).toEqual({ body: { lines: ["Weber"] }, check: true });
+    await waitFor(() => expect(box().value).toBe(""));
+    // The switch's change fails: the add is not sent; the text is kept; the failure is said.
+    added = [];
+    const put2 = held<void>();
+    server.use(
+      http.put(url("/find/screen"), async () => {
+        await put2.p;
+        return refusal(503, "LIBRARY_OFFLINE", "The library's folder is not reachable.");
+      }),
+    );
+    await user.click(sw);
+    expect(sw.checked).toBe(false);
+    await user.type(box(), "Simmel");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    await new Promise((r) => setTimeout(r, 100));
+    expect(added).toEqual([]);
+    put2.release();
+    await waitFor(() => expect(sw.checked).toBe(true));
+    // Said beside the box (tied to it) and in the status region.
+    await waitFor(() => {
+      const ids = (box().getAttribute("aria-describedby") ?? "").split(" ");
+      expect(ids.map((i) => document.getElementById(i)?.textContent ?? "").some((t) => t.startsWith("Nothing was added, because “Check everything I have” could not be changed."))).toBe(true);
+    });
+    await waitFor(() => expect(live().textContent).toMatch(/^Nothing was added, because “Check everything I have” could not be changed\./));
+    expect(box().value).toBe("Simmel");
+    expect(box().readOnly).toBe(false);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(added).toEqual([]);
+  });
+
+  it("the result of an act stays a second; rows' changes follow it, the latest per row, never twice and never older than shown", async () => {
+    const x = entry({ typed: "Simmel" });
+    const y = entry({ typed: "Merton" });
+    useService({ queues: { [PID]: queue([x, y]) } });
+    server.use(
+      http.post(url(`/projects/${PID}/find`), () => {
+        const e = entry({ typed: "Weber" });
+        queues[PID] = queue([x, y, e]);
+        return HttpResponse.json({ added: [e], mergedLines: 0 });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    await waitFor(() => expect(events.open()).toBe(true));
+    await user.type(box(), "Weber");
+    const h = heard();
+    /** Fake time in small steps, so that the mocked service's answers come in between. */
+    const step = async (ms: number) => {
+      for (let t = 0; t < ms; t += 10) await vi.advanceTimersByTimeAsync(10);
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      fireEvent.keyDown(box(), { key: "Enter", ctrlKey: true });
+      // The add's answer (the mocked service answers on its own timers): the act's result is said.
+      for (let i = 0; i < 50 && !live().textContent; i++) await vi.advanceTimersByTimeAsync(5);
+      expect(live().textContent).toBe("Added 1 reference.");
+      // Rows change meanwhile: Simmel twice (only its latest is said), Merton once.
+      const weber = (queues[PID] as FindQueueResponse).entries[2]!;
+      queues[PID] = queue([{ ...x, state: "not-found", updatedAt: "2026-11-13T11:00:00.000Z" }, { ...y, state: "record-complete", sourceId: SID, updatedAt: "2026-11-13T11:00:00.000Z" }, weber]);
+      progress(x, "not-found");
+      await step(450);
+      expect(row("Simmel").querySelector(".ao-find__state")?.textContent).toBe("Not found");
+      expect(live().textContent).toBe("Added 1 reference.");
+      queues[PID] = queue([{ ...x, state: "record-complete", sourceId: SID, updatedAt: "2026-11-13T11:00:01.000Z" }, { ...y, state: "record-complete", sourceId: SID, updatedAt: "2026-11-13T11:00:00.000Z" }, weber]);
+      progress(x, "record-complete");
+      await step(450);
+      expect(row("Simmel").querySelector(".ao-find__state")?.textContent).toBe("Record complete");
+      expect(live().textContent).toBe("Added 1 reference.");
+      await step(200);
+      // After a second: each row's latest, once.
+      expect(live().textContent).toBe("“Simmel”: Record complete. “Merton”: Record complete.");
+      // The same state read again is not said again.
+      progress(y, "record-complete");
+      await step(1000);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(h.said.filter((s) => s.includes("Not found"))).toEqual([]);
+    expect(h.said.filter((s) => s.includes("“Simmel”: Record complete."))).toHaveLength(1);
+    expect(h.said[0]).toBe("Added 1 reference.");
+    h.stop();
   });
 });

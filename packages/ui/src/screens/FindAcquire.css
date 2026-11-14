@@ -128,3 +128,43 @@
   display: block;
   color: var(--ink-2);
 }
+
+/* Task F9: an author alone. The row's lead ("Author: ") and where an added entry came from. */
+.ao-find__lead {
+  font-weight: 400;
+}
+
+.ao-find__origin {
+  color: var(--ink-2);
+}
+
+/* The two author dialogs: each detail on a line of its own; the filters wrap; long names, titles and venues wrap. */
+.ao-find__line {
+  display: block;
+}
+
+.ao-find__person {
+  color: var(--ink-2);
+}
+
+.ao-find__filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.ao-find__filters input,
+.ao-find__filters select {
+  max-width: 100%;
+}
+
+.ao-find__count,
+.ao-find__added {
+  font-weight: 700;
+}
+
+.ao-find__works input[aria-disabled="true"] {
+  cursor: not-allowed;
+}
