@@ -82,17 +82,23 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
     return asPairing((await storage.get(KEY))[KEY]);
   }
 
-  async function call<T>(port: number, path: string, init: { method: "GET" | "POST"; body?: unknown; token?: string; signal?: AbortSignal; only200?: boolean }): Promise<T> {
+  async function call<T>(
+    port: number,
+    path: string,
+    init: { method: "GET" | "POST"; body?: unknown; token?: string; signal?: AbortSignal; only200?: boolean; file?: { body: Blob; type: string; headers: Record<string, string> } },
+  ): Promise<T> {
     if (!path.startsWith("/") || /[?#]/.test(path)) throw new ApiError("BAD_PATH", "Internal error: bad request path.");
     const headers: Record<string, string> = { accept: "application/json" };
     if (init.token) headers.authorization = `Bearer ${init.token}`;
     if (init.body !== undefined) headers["content-type"] = "application/json";
+    // A file's bytes (the browser's fallback, R348 f): its own type and headers, the Blob as the body.
+    if (init.file) Object.assign(headers, init.file.headers, { "content-type": init.file.type });
     let res: Response;
     try {
       res = await doFetch(`http://127.0.0.1:${port}${path}`, {
         method: init.method,
         headers,
-        ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+        ...(init.file ? { body: init.file.body } : init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
         credentials: "omit",
         cache: "no-store",
         redirect: "error",
@@ -121,11 +127,11 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
   }
 
   /** A call with the stored token; a token the service no longer accepts is forgotten. */
-  async function authed<T>(path: string, method: "GET" | "POST", body?: unknown): Promise<T> {
+  async function authed<T>(path: string, method: "GET" | "POST", body?: unknown, more: { signal?: AbortSignal; file?: { body: Blob; type: string; headers: Record<string, string> } } = {}): Promise<T> {
     const p = await getPairing();
     if (!p) throw new ApiError("NOT_PAIRED", "Pair the extension with the desktop app first.");
     try {
-      return await call<T>(p.port, path, { method, token: p.token, ...(body !== undefined ? { body } : {}) });
+      return await call<T>(p.port, path, { method, token: p.token, ...(body !== undefined ? { body } : {}), ...(more.signal ? { signal: more.signal } : {}), ...(more.file ? { file: more.file } : {}) });
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) await storage.remove(KEY);
       throw e;
@@ -211,6 +217,25 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
     queueLinks(projectId: string, urls: string[]): Promise<{ queueId: string }> {
       // R111: the extension-scoped route (the extension token cannot use POST /projects/:id/capture).
       return authed<{ queueId: string }>("/capture/browser/links", "POST", { projectId, urls });
+    },
+
+    /**
+     * Find and acquire, the browser's fallback (R348 f 1): the works waiting for a PDF from this browser. A POST with
+     * exactly `{}` (Chrome sends no Origin on a GET, and the route needs the paired Origin). The answer as it came:
+     * find.ts's parseWaiting reads it.
+     */
+    findWaiting(opts: { signal?: AbortSignal } = {}): Promise<unknown> {
+      return authed<unknown>("/find/browser/waiting", "POST", {}, opts.signal ? { signal: opts.signal } : {});
+    },
+
+    /**
+     * R348 f 2: ONE POST of the PDF for the waiting work — the ticket in the path (as the service's route has it), the
+     * token in the Authorization header only, `Content-Type: application/pdf` (the only type the route takes), the
+     * tab's address in `x-ao-page`, the bytes as the body. The 200 answer as it came (find.ts's parseFileAnswer reads it).
+     */
+    sendFindPdf(ticket: string, page: string, body: Blob, opts: { signal?: AbortSignal } = {}): Promise<unknown> {
+      if (!/^[0-9a-f]{32}$/.test(ticket)) return Promise.reject(new ApiError("BAD_PATH", "Internal error: bad request path."));
+      return authed<unknown>(`/find/browser/file/${ticket}`, "POST", undefined, { ...(opts.signal ? { signal: opts.signal } : {}), file: { body, type: "application/pdf", headers: { "x-ao-page": page } } });
     },
   };
 }
