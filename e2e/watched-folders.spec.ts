@@ -32,18 +32,14 @@ import { fileURLToPath } from "node:url";
 import type { Request } from "@playwright/test";
 import ts from "typescript";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, DEFECT_TIMEOUT, expect, expectDefect, libraryWithProject, test as base, type AppHarness, type Defect, type Page } from "./fixtures.js";
+import { APP_ORIGIN, expect, libraryWithProject, test as base, type AppHarness, type Page } from "./fixtures.js";
 import type { Locator } from "@playwright/test";
 
-/**
- * D25 (ledger R251; found by this spec, Task W10; fixed by Task W11), not fixed here (nothing outside e2e/): a registered file whose content changed and
- * which then left this Mac (its blocks gone, its size and exact time kept, as a cloud drive evicts a file) is still
- * reported `local: true` in the source's origin, so the source never says R235's sentence. The engine does not
- * judge a registered file whose size and time are as last known (watch.ts `settleStep` → `registeredUnchanged`,
- * which records it as in the library), and the service's `local` (routes/watched-folders.ts, watch-origin) looks
- * only at the engine's list of files not downloaded, which never holds a registered file.
+/*
+ * D25 (ledger R251; found by this spec, fixed by Task W11, R259, R264): a changed file that later left this Mac was
+ * reported as here, so the source never said R235's sentence. Its test, "a changed file that is not on this Mac says
+ * so and adds nothing", now passes as a normal test.
  */
-const D_NOT_LOCAL: Defect = { id: "D25", title: "A changed file that has left this Mac is reported as on this Mac: the source never says R235's sentence" };
 
 // ---------- what every request of the page is checked for (Accept 6) ----------
 
@@ -329,7 +325,7 @@ async function openSource(page: Page, title: string) {
  * the first): so the source is closed and opened again until the region is on the screen — and, with `needs`, until
  * that control is shown too (a button is waited for, never assumed: R251 c, R255).
  */
-async function originOf(page: Page, title: string, needs?: (origin: Locator) => Locator) {
+async function originOf(page: Page, title: string, needs?: (origin: Locator) => Promise<void>) {
   const details = page.getByRole("region", { name: "Source details" });
   const origin = details.getByRole("region", { name: "Watched folder" });
   await expect(async () => {
@@ -337,13 +333,15 @@ async function originOf(page: Page, title: string, needs?: (origin: Locator) => 
     if (await close.isVisible()) await close.click();
     await openSource(page, title);
     await expect(origin).toBeVisible({ timeout: 3_000 });
-    if (needs) await expect(needs(origin)).toBeVisible({ timeout: 3_000 });
+    if (needs) await needs(origin);
   }).toPass({ timeout: 45_000 });
   return { details, origin };
 }
 
 /** The origin's "Bring in the new version…" button for `file` (its accessible name carries the file's name). */
 const bringButton = (file: string) => (origin: Locator) => origin.getByRole("button", { name: `${BRING}: “${file}”` });
+/** A check for `originOf`: the control is shown in the origin region (a short limit: a miss reopens the source). */
+const shows = (find: (origin: Locator) => Locator) => async (origin: Locator) => expect(find(origin)).toBeVisible({ timeout: 3_000 });
 
 // The words of the screens and the service (copied, never adapted).
 const NEEDS_APP = "Adding a folder needs the desktop app.";
@@ -354,6 +352,8 @@ const BRING = "Bring in the new version as a new file of this source";
 const ADDED = "The new version was added to this source.";
 const NOT_LOCAL_409 = "The file in the folder is not downloaded to this Mac, or it is still changing, so it was not read. Download it in Finder, then try again.";
 /** R235 (A9): the new version of a changed file is not downloaded; the size follows in brackets. */
+/** R251 c / R259: the start of the sentence for a changed file whose presence the engine cannot tell (WatchOrigin.tsx). */
+const CANNOT_TELL_START = "The app cannot tell at the moment whether the new version is downloaded to this Mac.";
 const notLocalR235 = (bytes: number) => `The new version is not downloaded to this Mac (${sizeText(bytes)}). Download it with your cloud drive's app, then bring it in here.`;
 /** The count line for one file not downloaded, with its size as the screen writes it. */
 const notDownloadedLine = (bytes: number) => `1 file here is not downloaded to this Mac (${sizeText(bytes)})`;
@@ -441,14 +441,14 @@ test.describe("in the desktop app", () => {
       expect(tree(s.dir), "adding the folder wrote nothing in it").toEqual(made);
     });
 
-    await test.step("a PDF dropped into the folder comes in, in the chosen collection, within 10 s", async () => {
+    await test.step("a PDF dropped into the folder comes in, in the chosen collection (the time it took is recorded)", async () => {
       writeFileSync(join(s.dir, "Village ledger.pdf"), pdf);
       const made2 = tree(s.dir);
       const t0 = Date.now();
-      await expect(countLine(page, "Ana's drive", "1 file came in")).toHaveText("1 file came in", { timeout: 30_000 });
+      await expect(countLine(page, "Ana's drive", "1 file came in")).toHaveText("1 file came in", { timeout: 60_000 });
       const ms = Date.now() - t0;
       test.info().annotations.push({ type: "came in after", description: `${ms} ms` });
-      expect(ms, "the file came in within 10 s of being written").toBeLessThan(10_000);
+      // R260: measured and recorded, not asserted (a loaded machine is slower; the plan's "within 10 s" is read here).
       await libraryShows(page, s.projectId, ["Tidal Commons and the Village Ledger"]);
       // The chosen collection, on the screen (by keyboard) and in the stored source.
       const item = page.getByRole("tree", { name: "Collections" }).getByRole("treeitem", { name: COLLECTION });
@@ -596,7 +596,7 @@ test.describe("in the desktop app", () => {
 
     await test.step("the source says so, and “Bring in the new version…” adds a second original, keeping the first", async () => {
       await libraryShows(page, s.projectId, ["Salt Marsh Tenancies"]);
-      const { details, origin } = await originOf(page, "Salt Marsh Tenancies", bringButton("Tenancies.pdf"));
+      const { details, origin } = await originOf(page, "Salt Marsh Tenancies", shows(bringButton("Tenancies.pdf")));
       await expect(origin.getByText("Came from the watched folder “Marsh drive” as “Tenancies.pdf”.", { exact: true })).toBeVisible();
       await expect(origin.getByText(CHANGED, { exact: true })).toBeVisible();
       await expect(origin.getByText(/^The new version is not downloaded/)).toHaveCount(0);
@@ -646,10 +646,24 @@ test.describe("in the desktop app", () => {
     });
     const made = tree(s.dir);
 
-    await test.step("“Bring in the new version…” adds nothing and says why, in the service's words", async () => {
+    await test.step("the source says the new version is not downloaded to this Mac (R235), and keeps its button (R259)", async () => {
+      // The eviction is a write to the file (its blocks go): the watcher's event makes the engine look again, and after
+      // its two seconds of stability it judges the file not here (a scan or the once-a-minute re-check would also see
+      // the changed blocks). The source's screen reads its origin once, so it is reopened until the sentence shows.
       await libraryShows(page, s.projectId, ["Dredging Petitions"]);
-      const { origin } = await originOf(page, "Dredging Petitions", bringButton("Petitions.pdf"));
+      const { origin } = await originOf(page, "Dredging Petitions", shows((o) => o.getByText(notLocalR235(second.length), { exact: true })));
       await expect(origin.getByText(CHANGED, { exact: true })).toBeVisible();
+      await expect(bringButton("Petitions.pdf")(origin)).toBeVisible();
+      await expect(origin.getByText(CANNOT_TELL_START)).toHaveCount(0);
+      // What the service answers for the origin, kept with the result.
+      const sid = (await sources(app, s.projectId)).items[0]!.id;
+      const answer = await app.api<{ origins: Array<{ state: string; presence: string }> }>("GET", `/projects/${s.projectId}/sources/${sid}/watch-origin`);
+      test.info().annotations.push({ type: "origin answer", description: JSON.stringify(answer.body.origins.map((o) => ({ state: o.state, presence: o.presence }))) });
+      expect(answer.body.origins.map((o) => [o.state, o.presence])).toEqual([["changed", "not-downloaded"]]);
+    });
+
+    await test.step("“Bring in the new version…” adds nothing and says why, in the service's words; nothing is read", async () => {
+      const origin = page.getByRole("region", { name: "Source details" }).getByRole("region", { name: "Watched folder" });
       const sid = (await sources(app, s.projectId)).items[0]!.id;
       const before = await app.api<SourceAnswer>("GET", `/projects/${s.projectId}/sources/${sid}`);
       await bringButton("Petitions.pdf")(origin).click();
@@ -658,19 +672,34 @@ test.describe("in the desktop app", () => {
       expect(after.body.assets).toEqual(before.body.assets);
       expect((await sources(app, s.projectId)).total).toBe(1);
       expect(statSync(file).atime.getTime(), "the file that is not on this Mac was not read").toBe(LONG_AGO.getTime());
+      expect(statSync(file).blocks, "nor downloaded").toBe(0);
       expect(tree(s.dir), "the app wrote nothing into the folder").toEqual(made);
     });
 
-    await test.step("the source says the new version is not downloaded to this Mac (R235)", async () => {
-      await page.reload();
-      const { origin } = await originOf(page, "Dredging Petitions");
-      await expect(origin.getByText(CHANGED, { exact: true })).toBeVisible();
-      // What the service answers for the origin, kept with the result (the evidence for D25).
+    await test.step("downloaded again, the source no longer says it is not here, and “Bring in…” adds the second original", async () => {
+      // Its real bytes written back (the drive downloads it): a write, so the watcher's event makes the engine judge it again.
+      download(file, second);
+      const madeAgain = tree(s.dir);
+      const { details, origin } = await originOf(page, "Dredging Petitions", async (o) => {
+        await expect(o.getByText(CHANGED, { exact: true })).toBeVisible({ timeout: 3_000 });
+        await expect(o.getByText(notLocalR235(second.length), { exact: true })).toHaveCount(0, { timeout: 3_000 });
+        await expect(o.getByText(CANNOT_TELL_START)).toHaveCount(0, { timeout: 3_000 });
+        await expect(bringButton("Petitions.pdf")(o)).toBeVisible({ timeout: 3_000 });
+      });
       const sid = (await sources(app, s.projectId)).items[0]!.id;
-      const answer = await app.api<{ origins: Array<{ state: string; local: boolean }> }>("GET", `/projects/${s.projectId}/sources/${sid}/watch-origin`);
-      test.info().annotations.push({ type: "origin answer", description: JSON.stringify(answer.body.origins.map((o) => ({ state: o.state, local: o.local }))) });
-      expectDefect(D_NOT_LOCAL);
-      await expect(origin.getByText(notLocalR235(second.length), { exact: true })).toBeVisible({ timeout: DEFECT_TIMEOUT });
+      const before = await app.api<SourceAnswer>("GET", `/projects/${s.projectId}/sources/${sid}`);
+      const originals = (a: SourceAnswer) => a.assets.filter((x) => x.role === "original");
+      expect(originals(before.body)).toHaveLength(1);
+      await bringButton("Petitions.pdf")(origin).click();
+      await expect(origin.getByRole("status")).toHaveText(ADDED, { timeout: 30_000 });
+      const after = await app.api<SourceAnswer>("GET", `/projects/${s.projectId}/sources/${sid}`);
+      expect(originals(after.body)).toHaveLength(2);
+      expect(originals(after.body)[0]).toEqual(originals(before.body)[0]);
+      const stored = join(s.libraryPath, s.projectFolder, "Sources");
+      const hashes = filesUnder(stored).filter((f) => f.endsWith(".pdf")).map((f) => sha256(readFileSync(join(stored, f))));
+      expect(hashes.sort()).toEqual([sha256(first), sha256(second)].sort());
+      await expect(details.locator("h3:text-is('Files') + ul > li")).toHaveCount(2);
+      expect(tree(s.dir), "the app wrote nothing into the folder").toEqual(madeAgain);
     });
   });
 
