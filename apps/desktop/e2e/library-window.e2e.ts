@@ -335,10 +335,14 @@ async function readyApp(run: Parameters<typeof startDesktop>[0], works: Work[]):
   await s.click(encrypt);
   await s.click(await d.byRole("button", "Create project", { within: dialog }));
   await until("the dialog to close", 30_000, async () => (await d.countByRole("dialog", "New project")) === 0);
+  // The new project selected (the screen settles on it before anything else is pressed).
+  const listed = await d.byRole("button", "Coastal records", { within: await d.byRole("navigation", "Projects"), timeoutMs: 30_000 });
+  await until("the new project to be selected", 30_000, async () => (await s.execute<string | null>("return arguments[0].getAttribute('aria-current')", [s.element(listed)])) === "true");
 
   // Your library, on its screen: a link pasted, the address worked out, saved.
   const proxyHost = `${HOSTS.proxy}:${st.port}`;
   await s.click(await d.byRole("link", "Your library"));
+  await d.byRole("heading", "Your library", { level: 1, timeoutMs: 30_000 });
   await s.sendKeys(await d.byRole("textbox", WORDS.linkLabel, { timeoutMs: 30_000 }), `${st.origin(HOSTS.proxy)}/login?url=https://doi.org/10.5555/ao.f19.any`);
   await s.click(await d.byRole("button", WORDS.derive));
   await until("the address worked out", STATE_TIMEOUT, () => pageHas(d, WORDS.address(proxyHost)));
