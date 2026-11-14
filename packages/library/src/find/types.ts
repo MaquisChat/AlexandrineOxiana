@@ -44,7 +44,10 @@ export const FIND_STATES: readonly FindState[] = [
   "failed",
 ];
 
-/** Task F8: a person the author's name might mean. */
+/**
+ * Task F8: a person the author's name might mean (OpenAlex's author `A<digits>`): name and affiliation at most 200
+ * characters each, at most 3 sample titles. For choosing only: shown through UserText, never audited.
+ */
 export type PersonCandidate = { id: string; name: string; affiliation?: string; worksCount: number; sampleTitles: string[] };
 
 /** Tasks F10 and F15: a link under "Where to get it". */
@@ -88,6 +91,12 @@ export interface FindEntry {
   nextTryAt?: string;
   parentId?: string;
   offers?: OfferLink[];
+  /** Task F8 (R267): OpenAlex reported more people of this name than the 20 kept ("More people have this name …"). */
+  morePeople?: true;
+  /** Task F8 (R267): the person has more works than those kept for choosing (at most 200, fewer if the line would not fit). */
+  moreWorks?: true;
+  /** Task F8 (R267): the works (their `works` ids) already added from this entry as entries of their own, in the order added. */
+  added?: string[];
   /** Only ever on the line that takes an entry out of the queue (written by the "remove" operation). */
   removed?: true;
 }
