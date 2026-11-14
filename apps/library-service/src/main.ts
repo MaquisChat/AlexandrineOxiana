@@ -34,13 +34,18 @@
  *   AO_CONFIG_DIR     the app settings folder (default: the platform's usual place)
  *   AO_NO_WORKER=1    run without the media worker (capture, transcription, proxies and OCR wait)
  *
+ * Test-only (honoured ONLY when NODE_ENV is exactly "test"; otherwise not looked at; Task Z11, R289 a):
+ *   AO_SECRETS=memory     keys are kept in this process's memory only (a restart forgets them)
+ *   AO_ZOTERO_API_ORIGIN  exactly http://127.0.0.1:<port>: a stand-in for Zotero, the API and the only file origin
+ * In test mode a value not in that exact form refuses the start, naming the variable.
+ *
  * Once listening it prints `AO_SERVICE_READY port=<n>` on stdout. On SIGTERM (or SIGINT) it refuses
  * new requests, pauses running imports (left `paused`, resumable), closes the library (releasing
  * its lock), stops watchers and the media worker, and exits 0. If that takes longer than
  * FORCE_EXIT_MS (longer than the worst-case close: an import reaching a safe point, 60 s, plus the
  * rest) it exits 1. The end of standard input starts the same shutdown.
  */
-import { openLibrary } from "@ao/library";
+import { openLibrary, useSecretsFromEnv, useZoteroApiOriginFromEnv } from "@ao/library";
 import { listenOnRememberedPort } from "./port-memory.js";
 import { createService } from "./server.js";
 import { FolderGrants, grantLineHandler } from "./folder-grants.js";
@@ -58,6 +63,10 @@ async function main(): Promise<void> {
   const rawPort = process.env.AO_SERVICE_PORT ?? "0";
   const port = Number(rawPort);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("AO_SERVICE_PORT must be a port number");
+  // The test-only switches (Task Z11, R289 a), read here once: honoured only when NODE_ENV is exactly "test"; a
+  // value not in its exact form refuses the start with a sentence naming the variable.
+  useSecretsFromEnv(process.env);
+  useZoteroApiOriginFromEnv(process.env);
   const folderGrants = new FolderGrants();
   const svc = await createService({ token, folderGrants, ...(process.env.AO_NO_WORKER === "1" ? { worker: null } : {}) });
 

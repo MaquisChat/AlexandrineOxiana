@@ -11,7 +11,9 @@
  *        encrypted project, Accept 4), host NAMES of refused redirect hosts (at most 5) and the back-off time.
  *
  * Both are 0600 in the 0700 settings folder, written atomically through updateAppSettingStrict, one write at a time
- * per file in this process, and read strictly (Accept 5): a missing file is "nothing yet"; a file that is there but
+ * per file in this process and, across processes (the app's service and the command line both change them, R299 c),
+ * under the file's lock (withFileLock, `<name>.lock`: held only for the read, the change and the atomic write); they are
+ * read strictly (Accept 5): a missing file is "nothing yet"; a file that is there but
  * cannot be read (permissions, an I/O error) is refused (ZoteroSyncFileUnreadableError) and nothing is written on its
  * strength; DAMAGED content (not JSON, the wrong shape, an entry this app cannot use, an unknown field) is set aside
  * as `<name>.unreadable-<stamp>` (never deleted or overwritten) and the file starts again empty:
@@ -27,8 +29,10 @@
  */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { AppSettingUnreadableError, setAppSettingAside, updateAppSettingStrict } from "../app-settings.js";
+import { AppSettingUnreadableError, ensurePrivateDir, readAppSettingStrict, setAppSettingAside } from "../app-settings.js";
 import { raiseDeviceNotice } from "../device-notices.js";
+import { writeFileAtomic } from "../fs/atomic.js";
+import { FileLockBusyError, FileLockUnavailableError, withFileLock } from "../fs/file-lock.js";
 import { InvalidInputError } from "../repo/errors.js";
 
 export const ZOTERO_SYNC_FILE = "zotero-sync.json";
@@ -73,7 +77,9 @@ export type ZoteroSyncReason =
    */
   | "changes-incomplete"
   /** R244 (b): `failed` — this link's unfinished batch could never be resumed and was ended (what came in stays); `note` holds the engine's sentence. */
-  | "batch-ended";
+  | "batch-ended"
+  /** R295 (b): `failed` — the project's rules refused the sync (at a batch's start or its resumption); nothing was changed. */
+  | "rules-denied";
 
 export const ZOTERO_SYNC_REASONS: readonly ZoteroSyncReason[] = [
   "offline",
@@ -96,6 +102,7 @@ export const ZOTERO_SYNC_REASONS: readonly ZoteroSyncReason[] = [
   "deletions-unconfirmed",
   "changes-incomplete",
   "batch-ended",
+  "rules-denied",
 ];
 
 export type ZoteroSyncPause = "key-refused" | "library-gone" | "undone";
@@ -184,6 +191,23 @@ export class ZoteroSyncFileUnreadableError extends Error {
   constructor(readonly fileName: string) {
     super(`This computer's Zotero sync file "${fileName}" could not be read, so it was not changed. Check that the app's settings folder can be read and try again.`);
     this.name = "ZoteroSyncFileUnreadableError";
+  }
+}
+
+/** R299 c: the sentence for a change that waited for another program's lock on the file and gave up (no path). */
+export const ZOTERO_SYNC_BUSY_SENTENCE = "The Zotero sync settings are in use by another program. Try again.";
+
+/**
+ * R299 c: another program (the app's service, or the command line) held the file's lock for the whole wait
+ * (FILE_LOCK_WAIT_MS): nothing was read or written. It is a kind of ZoteroSyncFileUnreadableError on purpose, so every
+ * caller ends it exactly as it ends a file that could not be changed (the service's and the command line's words for
+ * that; the runner's debug note); its own message is the sentence above.
+ */
+export class ZoteroSyncFileBusyError extends ZoteroSyncFileUnreadableError {
+  constructor(fileName: string) {
+    super(fileName);
+    this.message = ZOTERO_SYNC_BUSY_SENTENCE;
+    this.name = "ZoteroSyncFileBusyError";
   }
 }
 
@@ -299,6 +323,28 @@ function inTurn<T>(dir: string, name: string, step: () => Promise<T>): Promise<T
   return run;
 }
 
+/**
+ * R299 c: `step` (a read-modify-write of the file, or the setting aside of its damaged content) under the file's lock,
+ * which holds across processes. Called inside the file's in-process turn; the lock is held only while `step` runs, and
+ * `step` only reads, changes and writes (the notices it gives rise to are raised after the lock is released). A read
+ * alone never takes it: the file is replaced atomically, so a reader sees the old file or the new one, whole. A lock
+ * that stays taken ends as ZoteroSyncFileBusyError; one that cannot be made at all as ZoteroSyncFileUnreadableError.
+ */
+async function underLock<T>(dir: string, name: string, step: (stillMine: () => Promise<boolean>) => Promise<T>): Promise<T> {
+  try {
+    ensurePrivateDir(dir);
+  } catch {
+    throw new ZoteroSyncFileUnreadableError(name);
+  }
+  try {
+    return await withFileLock(join(dir, name), step);
+  } catch (err) {
+    if (err instanceof FileLockBusyError) throw new ZoteroSyncFileBusyError(name);
+    if (err instanceof FileLockUnavailableError) throw new ZoteroSyncFileUnreadableError(name);
+    throw err;
+  }
+}
+
 /** Settings files of a newer version already told about in this process (R246 M-b: a dismissed notice stays dismissed). */
 const newerTold = new Set<string>();
 /** Said once per process for the file (never on every read or refused write) when the settings were written by a newer version; never throws. */
@@ -309,53 +355,103 @@ function newerNotice(dir: string, name: string, o: ZoteroSyncFileOptions): Promi
   return raiseDeviceNotice(dir, "zotero-sync-settings-newer", (o.now ?? (() => new Date()))());
 }
 
-async function setAside(dir: string, name: string, check: (v: unknown) => v is unknown, o: ZoteroSyncFileOptions): Promise<void> {
-  let keptAs: string;
-  const now = (o.now ?? (() => new Date()))();
+/** A set-aside done (under the lock), to be told about once the lock is released. */
+interface SetAside {
+  keptAs: string;
+  at: Date;
+}
+
+/** Renames damaged content aside (the caller holds the lock); undefined when it was put right (or removed) meanwhile. */
+async function setAside(dir: string, name: string, check: (v: unknown) => v is unknown, o: ZoteroSyncFileOptions): Promise<SetAside | undefined> {
+  const at = (o.now ?? (() => new Date()))();
   try {
-    keptAs = await setAppSettingAside(dir, name, check, now);
+    return { keptAs: await setAppSettingAside(dir, name, check, at), at };
   } catch (err) {
-    if ((err as Error)?.name === "AppSettingReadableError") return; // put right (or removed) meanwhile
+    if ((err as Error)?.name === "AppSettingReadableError") return undefined; // put right (or removed) meanwhile
     throw new ZoteroSyncFileUnreadableError(name);
   }
-  // The settings: the researcher is told through the device notices (R242; never throws). The history: no notice.
-  if (name === ZOTERO_SYNC_FILE) await raiseDeviceNotice(dir, "zotero-sync-settings-set-aside", now);
-  o.onSetAside?.(name, keptAs);
+}
+
+/** Tells of a set-aside, after the lock is released: the settings through the device notices (R242; never throws), the history with none; then the caller. */
+async function toldSetAside(dir: string, name: string, done: SetAside, o: ZoteroSyncFileOptions): Promise<void> {
+  if (name === ZOTERO_SYNC_FILE) await raiseDeviceNotice(dir, "zotero-sync-settings-set-aside", done.at);
+  o.onSetAside?.(name, done.keptAs);
 }
 
 /** The file's content (undefined: missing, set aside just now, or written by a newer version: nothing is read from it). */
 function readFileStrict<T>(dir: string, name: string, check: (v: unknown) => v is T, o: ZoteroSyncFileOptions): Promise<T | undefined> {
   return inTurn(dir, name, async () => {
+    // The read itself takes no lock (the file is replaced atomically).
     const got = await classify(dir, name, check);
     if (got === "newer") {
       await newerNotice(dir, name, o);
       return undefined;
     }
     if (got !== "damaged") return got;
-    await setAside(dir, name, check, o);
+    // Setting damaged content aside changes the file: under the lock (setAppSettingAside checks again that it is still damaged).
+    const done = await underLock(dir, name, () => setAside(dir, name, check, o));
+    if (done) await toldSetAside(dir, name, done, o);
     return undefined;
   });
 }
 
+/** R309 a: the holder's lock was taken over (or removed) before it wrote: nothing was written. */
+class LockLost extends Error {}
+
 /**
  * A read-modify-write of the file in its turn; damaged content is set aside first (then `edit` gets undefined). A file
  * written by a newer version is never changed: ZoteroSyncFileNewerError.
+ *
+ * R309 a: the last thing before the atomic write is to ask whether the lock is still this holder's. A holder that was
+ * stopped past the stale bound (its lock taken over meanwhile) writes NOTHING and makes the whole change again, from the
+ * read, under a new lock — once; lost a second time, it ends as a busy file does (ZoteroSyncFileBusyError). What remains
+ * is the instant between that check and the write.
  */
 function updateFile<T>(dir: string, name: string, check: (v: unknown) => v is T, edit: (cur: T | undefined) => T, o: ZoteroSyncFileOptions): Promise<T> {
   return inTurn(dir, name, async () => {
-    for (let attempt = 0; ; attempt++) {
-      // A file there but unreadable (not damaged) is refused before anything is set aside or written.
-      const got = await classify(dir, name, check);
-      if (got === "newer") {
-        await newerNotice(dir, name, o);
-        throw new ZoteroSyncFileNewerError(name);
-      }
-      if (got === "damaged") await setAside(dir, name, check, o);
+    // Told once the lock is released (R299 c: the lock is held for the read, the change and the write only).
+    const asides: SetAside[] = [];
+    let newer = false;
+    const once = () =>
+      underLock(dir, name, async (stillMine) => {
+        for (let attempt = 0; ; attempt++) {
+          // A file there but unreadable (not damaged) is refused before anything is set aside or written.
+          const got = await classify(dir, name, check);
+          if (got === "newer") {
+            newer = true;
+            throw new ZoteroSyncFileNewerError(name);
+          }
+          if (got === "damaged") {
+            const done = await setAside(dir, name, check, o);
+            if (done) asides.push(done);
+          }
+          let cur: T | undefined;
+          try {
+            cur = await readAppSettingStrict(dir, name, check);
+          } catch (err) {
+            if (!(err instanceof AppSettingUnreadableError) || attempt >= 2) throw err instanceof AppSettingUnreadableError ? new ZoteroSyncFileUnreadableError(name) : err;
+            continue;
+          }
+          const next = edit(cur);
+          if (!(await stillMine())) throw new LockLost();
+          await writeFileAtomic(join(dir, name), `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+          return next;
+        }
+      });
+    try {
       try {
-        return await updateAppSettingStrict(dir, name, check, edit);
+        return await once();
       } catch (err) {
-        if (!(err instanceof AppSettingUnreadableError) || attempt >= 2) throw err instanceof AppSettingUnreadableError ? new ZoteroSyncFileUnreadableError(name) : err;
+        if (!(err instanceof LockLost)) throw err;
       }
+      try {
+        return await once();
+      } catch (err) {
+        throw err instanceof LockLost ? new ZoteroSyncFileBusyError(name) : err;
+      }
+    } finally {
+      if (newer) await newerNotice(dir, name, o);
+      for (const done of asides) await toldSetAside(dir, name, done, o);
     }
   });
 }
@@ -528,6 +624,20 @@ function settled(r: ZoteroSyncRun): ZoteroSyncRun {
 export async function readZoteroSyncHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<ZoteroSyncRun[]> {
   const f = await readFileStrict(dir, ZOTERO_SYNC_HISTORY_FILE, isHistoryFile, o);
   return (own(f?.libraries, libraryId) ?? []).map((r) => settled(structuredClone(r)));
+}
+
+/**
+ * R295 (a): the latest back-off any record of the history carries (ms since the epoch), so a back-off outlives a restart
+ * of the service and is seen by the command line. Undefined when no record carries one; an unreadable date is ignored.
+ * The caller gives it to `zoteroSyncBackoff` (the clock rule) or to the runner as `backoffUntil`.
+ */
+export function zoteroHistoryBackoff(runs: readonly Pick<ZoteroSyncRun, "backoffUntil">[]): number | undefined {
+  let max: number | undefined;
+  for (const r of runs) {
+    const t = r.backoffUntil ? Date.parse(r.backoffUntil) : NaN;
+    if (Number.isFinite(t)) max = Math.max(max ?? t, t);
+  }
+  return max;
 }
 
 /**

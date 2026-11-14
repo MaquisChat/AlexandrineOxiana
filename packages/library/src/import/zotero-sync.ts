@@ -53,7 +53,7 @@
 import { newId } from "@ao/core";
 import type { Dispatcher } from "undici";
 import { isClosed } from "../library.js";
-import { ProjectLockedError } from "../repo/errors.js";
+import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { projectEncrypted, repoLibrary, type Repo } from "../repo/repo.js";
 import { SecretStoreUnavailableError, getSecret } from "../secrets.js";
 import { BOOKKEEPING, activeBatches, batchDirs, countOutcomes, findBatch, latestByKey, readBatchAt, readJournal, writeBatchRecord, type BatchRecord, type JournalEntry } from "./bulk/batch.js";
@@ -573,6 +573,9 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     let end: Ending;
     if (err instanceof Ending) end = err;
     else if (isAbort(err, o.signal)) end = new Ending("stopped", stopReason(o.signal));
+    // R295 b: the project's RULES refused (a new batch, or the resumption of the link's own): said as such; the engine's
+    // own text may name a raw method and is neither kept nor shown. Only these: everything else stays as it was.
+    else if (err instanceof PolicyDeniedError || (err instanceof BatchRefusedError && (err.denied || err.kind === "denied"))) end = new Ending("failed", "rules-denied");
     else if (err instanceof BatchRefusedError) end = new Ending("failed", err.kind === "locked" ? "project-locked" : err.kind === "running" ? "import-running" : "error");
     else if (err instanceof ProjectLockedError) end = new Ending("failed", "project-locked");
     else {

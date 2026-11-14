@@ -70,6 +70,23 @@ export {
   findFreeCopies,
 } from "./free-copy.js";
 export type { CopyOffer, ElsewhereLink, FreeCopySource } from "./free-copy.js";
+// Task F12: "Search sources" — the settings file, the e-mails by service, the keys wanted, "Test", and Elicit.
+export {
+  FIND_SOURCE_TEST_DOI,
+  FIND_SOURCE_TEST_TIMEOUT_MS,
+  FIND_SOURCE_TEST_WORDS,
+  SEARCH_EMAIL_MAX,
+  SEARCH_SOURCES_FILE,
+  SearchSettingsNewerError,
+  readSearchSettings,
+  isSearchEmail,
+  searchContactEmail,
+  searchKeyWanted,
+  testSearchSource,
+  writeSearchSettings,
+} from "./settings.js";
+export type { SearchSettingsProblem, SearchSettingsRead, SearchSourceTestGroup, SearchSourceTestResult } from "./settings.js";
+export { ELICIT_MAX_RESULTS, ELICIT_PAUSE_MS, ELICIT_TIMEOUT_MS, ELICIT_URL, elicitLastRefusal, elicitPausedUntil, elicitSearch, forgetElicitRefusal } from "./elicit.js";
 export { FETCH_FILE_CONCURRENCY, FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FETCH_FILE_MAX_REDIRECTS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
 export type { FetchFileErrorCode } from "./fetch-file.js";
 // Task F11: the file check, the free copy into its source, and a mismatch held for the review queue.

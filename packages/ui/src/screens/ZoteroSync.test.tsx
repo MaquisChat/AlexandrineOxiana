@@ -386,6 +386,15 @@ describe("ZoteroSync", () => {
     expect(liveText()).toMatch(/Could not sync/);
   });
 
+  it("R295 b: a run the project's rules refused shows the shared sentence, as a failure", async () => {
+    const denied = run({ outcome: "failed", reason: "rules-denied", counts: undefined as never });
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1, lastRun: denied }] }, [denied]);
+    await show(svc);
+    const sentence = ZOTERO_SYNC_REASON_TEXT["rules-denied"];
+    expect((await screen.findAllByText(new RegExp(sentence.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"))).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/up to date|nothing has changed/iu)).toBeNull();
+  });
+
   it("a history row and a link's line are the service's words", async () => {
     const runs = Array.from({ length: 25 }, (_, i) => run({ startedAt: at(100 - i), finishedAt: at(99 - i), counts: { ...ZERO, new: i } }));
     const svc = useSvc({ links: [{ ref: "user:42", projectId: P1, lastRun: runs[0], status: "The service's own line for this link." }] }, runs);

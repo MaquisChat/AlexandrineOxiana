@@ -7,7 +7,7 @@
  *     answers 304 to when nothing changed.
  *
  * Neither writes anything anywhere: no library, no file, no setting, no log line. Nothing but GET is
- * sent, and only to https://api.zotero.org. They reuse the Web import's request machinery
+ * sent, and only to https://api.zotero.org (in test mode, to AO_ZOTERO_API_ORIGIN; zotero-web.ts). They reuse the Web import's request machinery
  * (`ZoteroApi` in zotero-web.ts: the key as a header read from the password store, Backoff, Retry-After,
  * retries), so the two cannot disagree about how Zotero is spoken to.
  *
@@ -46,7 +46,7 @@
  */
 import type { Dispatcher } from "undici";
 import { getSecret } from "../secrets.js";
-import { ZOTERO_API_ORIGIN, ZOTERO_WEB_REASONS, ZoteroApi, ZoteroWebError, type ZoteroWebScanResult } from "./zotero-web.js";
+import { ZOTERO_WEB_REASONS, ZoteroApi, ZoteroWebError, zoteroApiOrigin, type ZoteroWebScanResult } from "./zotero-web.js";
 
 /** The most one call may sleep in all (retries and a Backoff it waits out), so that a screen is never kept waiting for minutes. */
 export const ZOTERO_ACCOUNT_MAX_WAIT_MS = 10_000;
@@ -345,7 +345,7 @@ export async function zoteroLibraryUnchanged(o: CallOptions & { ref: string; sin
   if (!Number.isSafeInteger(o.since) || o.since < 0) throw new TypeError("since must be a library version (a non-negative integer)");
   const prefix = `/${m[1] === "user" ? "users" : "groups"}/${m[2]}`;
   return withApi(o, "library-gone", ZOTERO_UNCHANGED_TIMEOUT_MS, async (api, seen) => {
-    const url = new URL(`${prefix}/items/top?limit=1&format=keys`, ZOTERO_API_ORIGIN);
+    const url = new URL(`${prefix}/items/top?limit=1&format=keys`, zoteroApiOrigin());
     const res = await api.get(url, true, (s) => s === 200 || s === 304, { "if-modified-since-version": String(o.since) });
     await res.body.dump().catch(() => {});
     let unchanged = false;

@@ -3,7 +3,8 @@
  * `zotero_import` (tool "zotero-web-import"); legal-basis category 'zotero-import'.
  *
  * Talking to Zotero:
- *   - only `https://api.zotero.org` (API v3: `Zotero-API-Version: 3`), with the user's key in the
+ *   - only `https://api.zotero.org` (API v3: `Zotero-API-Version: 3`; under NODE_ENV=test only, the loopback
+ *     origin of AO_ZOTERO_API_ORIGIN, which is then also the only file origin: Task Z11), with the user's key in the
  *     `Zotero-API-Key` header. The key is read from the OS keyring (secrets.ts) when the scan starts
  *     and is never written anywhere, put in a URL, an error, a report or a log;
  *   - API responses are never redirected; a JSON page is at most 10 MB; pages of `limit=100`;
@@ -125,6 +126,61 @@ export function zoteroFileHostAllowed(u: URL): boolean {
   const h = u.hostname.toLowerCase();
   if (h === "zoterofilestorage.s3.amazonaws.com" || h === "files.zotero.net") return true;
   return h === "s3.amazonaws.com" && u.pathname.startsWith(STORAGE_PATH) && u.pathname.length > STORAGE_PATH.length;
+}
+
+// ---- test-only switches (Task Z11, Ruling R289 a) -------------------------------------------------------------
+// Each is honoured ONLY when NODE_ENV is exactly "test" (as AO_LOOKUP_FIXTURES, R47): in any other mode its value
+// is not looked at. Each is read once, at the service's start (apps/library-service/src/main.ts), by a function
+// that takes the environment; in test mode a value not in its exact form refuses the start, naming the variable.
+
+/** `AO_ZOTERO_API_ORIGIN=http://127.0.0.1:<port>`: a stand-in for Zotero's servers on this computer. */
+export const ZOTERO_API_ORIGIN_ENV = "AO_ZOTERO_API_ORIGIN";
+
+const LOOPBACK_ORIGIN = /^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/u;
+
+/**
+ * The stand-in's origin when the switch is on; undefined otherwise (always outside test mode). In test mode a
+ * value that is not exactly `http://127.0.0.1:<port>` (port 1–65535; no other host, no "localhost", no https, no
+ * path — not even "/" —, no query, no credentials) throws a sentence that names the variable but never its value.
+ */
+export function zoteroApiOriginFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  if (env.NODE_ENV !== "test") return undefined;
+  const value = env[ZOTERO_API_ORIGIN_ENV];
+  if (value === undefined) return undefined;
+  const m = LOOPBACK_ORIGIN.exec(value);
+  if (!m || Number(m[1]) > 65535) {
+    throw new Error(`${ZOTERO_API_ORIGIN_ENV} must be exactly http://127.0.0.1:<port> with a port from 1 to 65535 (test mode), so the library service was not started.`);
+  }
+  return value;
+}
+
+/**
+ * The loopback origin in force (set only by useZoteroApiOriginFromEnv at the service's start): as typed (the API
+ * base) and as parsed once, which is what a redirect is compared with (a parsed origin drops a default port, so
+ * `http://127.0.0.1:80` is the origin `http://127.0.0.1`; R307 c).
+ */
+let testOrigin: { typed: string; parsed: string } | undefined;
+
+/**
+ * Applies the origin switch at the service's start. With it on, that one loopback origin is Zotero's API AND the
+ * only origin a file may be fetched from (Zotero's real storage hosts are then refused, R289 a); with it off, the
+ * product's origin and zoteroFileHostAllowed apply unchanged. Returns the API origin now in force.
+ */
+export function useZoteroApiOriginFromEnv(env: NodeJS.ProcessEnv): string {
+  const typed = zoteroApiOriginFromEnv(env);
+  testOrigin = typed === undefined ? undefined : { typed, parsed: new URL(typed).origin };
+  return zoteroApiOrigin();
+}
+
+/** The API origin in force: ZOTERO_API_ORIGIN, or the test switch's loopback origin. Package-internal. */
+export function zoteroApiOrigin(): string {
+  return testOrigin?.typed ?? ZOTERO_API_ORIGIN;
+}
+
+/** Whether a file redirect may be followed: the product's rule, or (test switch on) the loopback origin only. */
+function fileRedirectAllowed(u: URL): boolean {
+  if (testOrigin === undefined) return zoteroFileHostAllowed(u);
+  return u.origin === testOrigin.parsed && !u.username && !u.password;
 }
 
 export const MAX_ZOTERO_PAGE_BYTES = 10 * 1024 * 1024;
@@ -384,7 +440,7 @@ export class ZoteroApi {
 
   /** A JSON document from the API, with its headers. */
   async json(path: string, query: Record<string, string | number> = {}, versioned = false): Promise<{ body: unknown; headers: Headers }> {
-    const url = new URL(path, ZOTERO_API_ORIGIN);
+    const url = new URL(path, zoteroApiOrigin());
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, String(v));
     // An answer cut in the middle of its body (or unreadable as JSON) is asked for again, like a dropped one (M7).
     for (let attempt = 0; ; attempt++) {
@@ -472,7 +528,7 @@ export class ZoteroApi {
     if ((await free()) < SPACE_MARGIN) return note(ZOTERO_WEB_FILE_NOTES.noSpace);
     let res: Dispatcher.ResponseData;
     try {
-      res = await this.get(new URL(`${prefix}/items/${attKey}/file`, ZOTERO_API_ORIGIN), true, (s) => s === 200 || (s >= 300 && s < 400));
+      res = await this.get(new URL(`${prefix}/items/${attKey}/file`, zoteroApiOrigin()), true, (s) => s === 200 || (s >= 300 && s < 400));
     } catch (err) {
       if (err instanceof ZoteroWebError) {
         if (err.reason === ZOTERO_WEB_REASONS.notFound) return note(ZOTERO_WEB_FILE_NOTES.notInStorage);
@@ -498,12 +554,12 @@ export class ZoteroApi {
       const loc = header(res.headers, "location");
       let next: URL;
       try {
-        next = new URL(loc ?? "", ZOTERO_API_ORIGIN);
+        next = new URL(loc ?? "", zoteroApiOrigin());
       } catch {
         return note(ZOTERO_WEB_FILE_NOTES.redirectRefused);
       }
       if (!loc || hop >= MAX_REDIRECTS) return note(ZOTERO_WEB_FILE_NOTES.redirectRefused);
-      if (!zoteroFileHostAllowed(next)) {
+      if (!fileRedirectAllowed(next)) {
         this.refusedHost(next); // its name only: the path and query carry the signature
         return note(ZOTERO_WEB_FILE_NOTES.redirectRefused);
       }

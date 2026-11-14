@@ -640,12 +640,12 @@ describe("every way a run ends leaves one honest record", () => {
     expect(zoteroWebSince(repo, p.id, U)).toBeUndefined();
   });
 
-  it("a throw from something it calls (the project's rules refuse the import) is failed / error, never up to date", async () => {
+  it("a throw from something it calls (the project's rules refuse the import) is failed / rules-denied (R295 b), never up to date", async () => {
     const p = await project({ gov: GOV.replace("captureMethods: [zotero_import]", "captureMethods: [manual_upload]") });
     await articles(1);
     const r = await sync(await linked(linkOf(p)));
-    expect(r).toMatchObject({ outcome: "failed", reason: "error" });
-    expect((await history())[0]).toMatchObject({ id: r.id, outcome: "failed", reason: "error", finishedAt: expect.any(String) });
+    expect(r).toMatchObject({ outcome: "failed", reason: "rules-denied" });
+    expect((await history())[0]).toMatchObject({ id: r.id, outcome: "failed", reason: "rules-denied", finishedAt: expect.any(String) });
   });
 
   it("a started record without an end becomes stopped/app-closed when next read (a crash, a kill)", async () => {
@@ -1077,7 +1077,7 @@ describe("R244 (b) M4: an own batch that can never be resumed", () => {
     const stopped = await stoppedFirstSync(p);
     await setGov(p, GOV.replace("captureMethods: [zotero_import]", "captureMethods: [manual_upload]"));
     const r = await sync(await stored());
-    expect(r).toMatchObject({ outcome: "failed", reason: "error" });
+    expect(r).toMatchObject({ outcome: "failed", reason: "rules-denied" });
     expect((await findBatch(repo, p.id, stopped.batchId!))!.state).toBe("paused");
     await setGov(p, GOV);
     const resumed = await sync(await stored());
@@ -1280,5 +1280,52 @@ describe("R244 (d) M9: the runner finds its unfinished batch without reading eve
     await writeFile(join(config, ZOTERO_SYNC_FILE), "{ damaged");
     const r = await sync(linkOf(p));
     expect(r).toMatchObject({ outcome: "finished", batchId: stopped.batchId });
+  });
+});
+
+describe("R295 b: a sync the project's rules refuse says so", () => {
+  const DENY = GOV.replace("captureMethods: [zotero_import]", "captureMethods: [downloader]");
+  const pages = () => z.requests.filter((r) => /\/items(\?|$)/u.test(r.path) && /format=json|include=data/u.test(r.path));
+
+  it("the rules refuse a new batch: failed / rules-denied, nothing changed here, no request after the refusal", async () => {
+    const p = await project({ gov: DENY });
+    await articles(3);
+    await linked(linkOf(p));
+    const r = await sync(await stored());
+    expect(r).toMatchObject({ outcome: "failed", reason: "rules-denied" });
+    expect(r.batchId).toBeUndefined();
+    expect(r.note).toBeUndefined();
+    expect(pages()).toEqual([]);
+    expect(sourceCount(p)).toBe(0);
+    // The engine's own refusal text is neither in the record nor in the file.
+    expect(JSON.stringify(await history())).not.toMatch(/capture|downloader|governance/iu);
+    // (The engine audits the denial itself; no batch, no source.)
+    expect(await batchDirs(repo, p.id)).toHaveLength(0);
+  });
+
+  it("the rules refuse the resumption of the link's own batch: failed / rules-denied, the batch left as it was", async () => {
+    const p = await project();
+    const stopped = await stoppedFirstSync(p);
+    await setGov(p, DENY);
+    const n = pages().length;
+    const r = await sync(await stored());
+    expect(r).toMatchObject({ outcome: "failed", reason: "rules-denied" });
+    expect(r.note).toBeUndefined();
+    expect(pages().length).toBe(n);
+    // Not "ended for good": the rules can be changed back, and the same batch resumes.
+    await setGov(p, GOV);
+    const again = await sync(await stored());
+    expect(again).toMatchObject({ outcome: "finished", batchId: stopped.batchId });
+  });
+
+  it("an older record with a reason this build knows reads as before", async () => {
+    const p = await project();
+    await articles(1);
+    await linked(linkOf(p));
+    z.failNext(50, 500);
+    const r = await sync(await stored());
+    expect(r.outcome).toBe("failed");
+    expect(r.reason).not.toBe("rules-denied");
+    expect((await history())[0]!.reason).toBe(r.reason);
   });
 });

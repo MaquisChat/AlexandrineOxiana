@@ -8,6 +8,7 @@ import type { FastifyInstance } from "fastify";
 import type { ImportOptionsInput } from "@ao/core";
 import {
   adapterFor,
+  ZoteroSyncFileBusyError,
   pauseLink,
   researcherName,
   researcherNameOk,
@@ -178,8 +179,9 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     try {
       // Said only when a link was in fact paused (R250 d): none when the Zotero library is no longer linked.
       if ((await pauseLink(state.deps.appConfigDir, s.lib.id, run.ref, "undone")) > 0) note = { paused: true, message: ZOTERO_SYNC_SENTENCES.undonePaused };
-    } catch {
-      note = { paused: false, message: ZOTERO_SYNC_SENTENCES.undoNotPaused };
+    } catch (err) {
+      // R306 b: another program held the settings' lock: why it was not paused is said too, in the lock's sentence.
+      note = { paused: false, message: err instanceof ZoteroSyncFileBusyError ? `${ZOTERO_SYNC_SENTENCES.undoNotPaused} ${err.message}` : ZOTERO_SYNC_SENTENCES.undoNotPaused };
     }
     return note ? { ...r, zoteroSync: note } : r;
   });

@@ -46,7 +46,8 @@ export type ZoteroSyncReason =
   | "sync-undone"
   | "deletions-unconfirmed"
   | "changes-incomplete"
-  | "batch-ended";
+  | "batch-ended"
+  | "rules-denied";
 
 export type ZoteroSyncOutcome = "up-to-date" | "finished" | "finished-with-problems" | "stopped" | "failed";
 export type ZoteroSyncPause = "key-refused" | "library-gone" | "undone";
@@ -194,6 +195,7 @@ export const ZOTERO_SYNC_REASONS_LIST: readonly ZoteroSyncReason[] = [
   "deletions-unconfirmed",
   "changes-incomplete",
   "batch-ended",
+  "rules-denied",
 ];
 
 /**
@@ -223,6 +225,8 @@ export const ZOTERO_SYNC_REASON_TEXT: Readonly<Record<ZoteroSyncReason, string>>
   "deletions-unconfirmed": "This sync could not confirm which items were deleted in Zotero, so the next sync will read the whole library again.",
   "changes-incomplete": "This sync could not read everything that changed in Zotero. The next sync asks for the same changes again.",
   "batch-ended": "An unfinished sync could not be continued, so it was closed. The next sync starts again from the beginning.",
+  /** R295 b: the engine's own refusal text is never shown (it may name a raw method). */
+  "rules-denied": "This project's rules do not allow this sync. Change them in the project's Governance settings.",
 };
 
 /** The service's own sentences about syncing. */

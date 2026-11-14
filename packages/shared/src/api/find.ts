@@ -68,6 +68,8 @@ export const FIND_REASON_CODES = [
   "unexpected",
   // F8b (R283 a): on a "choose" entry whose people search could not be had ("Try again" looks again).
   "people-unavailable",
+  // F12 (R297 a, R308): the only record source switched on (and allowed) needs a key and none is available.
+  "needs-key",
   // Task F11: the free copy. "copy-not-allowed" (the entry stays "record-complete"; looked at again when the rules
   // change, at the next open or unlock); "held-full" (R296 d: FIND_HELD_MAX files already wait; the entry waits
   // "record-complete" and goes on by itself after a decision on a waiting file, "Try again", opening or unlocking —
@@ -112,6 +114,8 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   unexpected: "Something went wrong while looking this up. Try again.",
   /** F8b (R283 a): on a "choose" entry whose people search could not be had; "Try again" is offered on it. */
   "people-unavailable": "People of this name could not be looked up just now. “Try again” looks again.",
+  /** F12 (R297 a, R308): the only record source switched on (and allowed) needs a key (Elicit) and none is available — not saved, or the password store could not be read. "Try again" goes on once one is. */
+  "needs-key": "The only search source switched on needs a key, and none is available. Add it in Search sources, then try again.",
   "copy-not-allowed": "This project's rules do not allow fetching free copies of works.",
   "held-full": `${FIND_HELD_MAX} files are already waiting for your check. This one goes on by itself when you have decided on some of them.`,
   "not-this-file": "You said the file found was not this work.",

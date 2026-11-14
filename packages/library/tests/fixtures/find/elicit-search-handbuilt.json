@@ -1,0 +1,26 @@
+{
+  "papers": [
+    {
+      "title": "Distinction: A Social Critique of the Judgement of Taste",
+      "authors": ["Pierre Bourdieu"],
+      "year": 1984,
+      "doi": "10.5555/ao.find.distinction.1984",
+      "venue": "Fixture University Press",
+      "fullTextUrl": "https://elicit-fulltext.example/distinction.pdf"
+    },
+    {
+      "title": "Distinction Revisited in Upland Villages",
+      "authors": ["Amara Okafor", "Henrik Lindqvist"],
+      "year": 2021,
+      "doi": "10.5555/ao.find.elicit.only.2021",
+      "venue": "Journal of Upland Studies",
+      "abstract": "A made-up abstract that the app never keeps."
+    },
+    {
+      "title": "Taste, Bourdieu and Distinction",
+      "authors": [{ "name": "Ottoline Mirabel" }],
+      "year": "2019",
+      "venue": "Journal of Invented Studies"
+    }
+  ]
+}

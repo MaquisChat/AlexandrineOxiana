@@ -1,7 +1,7 @@
 // Task 47: the constants both the service and the interface used to keep their own copy of, now
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
-import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin } from "../index.js";
+import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin, SEARCH_RECORD_SOURCES, SEARCH_COPY_SOURCES, SEARCH_SOURCE_GROUPS, SEARCH_SOURCE_INFO, SEARCH_KEY_SECRETS, SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI, SEARCH_TEST_TEXT, SEARCH_SETTINGS_TEXT, searchEmailRefusal, isSearchApiKeyShape, type SearchSourcesResponse, type SearchRecordRow } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
   it("the service's error codes, each once", () => {
@@ -76,6 +76,8 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "budget",
       "unexpected",
       "people-unavailable",
+      // F12 (R297 a): the only record source switched on needs a key.
+      "needs-key",
       // Task F11: the free copy.
       "copy-not-allowed",
       "held-full",
@@ -148,5 +150,42 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     // @ts-expect-error the offer carries counts, never a list of people
     const wrong: FindAuthorOffer = { peopleCount: 1, people: [] };
     expect(wrong.peopleCount).toBe(1);
+  });
+
+  it("F12 round 2 (R297 a, R298 a): the reason for a source switched on alone without its key; Elicit cannot be moved", () => {
+    expect(FIND_REASON_CODES).toContain("needs-key");
+    expect(FIND_REASON_TEXT["needs-key"]).toBe("The only search source switched on needs a key, and none is available. Add it in Search sources, then try again.");
+    expect(FIND_REASON_TEXT["needs-key"]).not.toBe(FIND_REASON_TEXT["switched-off"]);
+    // The screen offers "Move up" / "Move down" only for a source that can be moved: Elicit is always last.
+    expect(Object.fromEntries(SEARCH_RECORD_SOURCES.map((id) => [id, SEARCH_SOURCE_INFO.record[id].movable]))).toEqual({ crossref: true, openalex: true, elicit: false });
+    expect(SEARCH_RECORD_SOURCES[SEARCH_RECORD_SOURCES.length - 1]).toBe("elicit");
+  });
+
+  it("search sources (F12, R290): the sources shown, the fixed question, and every sentence declared once", () => {
+    expect([...SEARCH_RECORD_SOURCES]).toEqual(["crossref", "openalex", "elicit"]);
+    expect([...SEARCH_COPY_SOURCES]).toEqual(["openalex", "unpaywall", "arxiv", "europepmc", "semanticscholar", "doab", "internetarchive"]);
+    expect([...SEARCH_SOURCE_GROUPS]).toEqual(["record", "copies"]);
+    expect(Object.keys(SEARCH_SOURCE_INFO.record).sort()).toEqual([...SEARCH_RECORD_SOURCES].sort());
+    expect(Object.keys(SEARCH_SOURCE_INFO.copies).sort()).toEqual([...SEARCH_COPY_SOURCES].sort());
+    expect(SEARCH_KEY_SECRETS).toEqual({ elicit: "elicit-api-key", openalex: "openalex-api-key" });
+    expect([SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI]).toEqual(["Distinction Bourdieu", "10.1038/171737a0"]);
+    // The plan's Accept 3 and 4, word for word.
+    expect(SEARCH_TEST_TEXT.answered).toBe("Answered");
+    expect(SEARCH_TEST_TEXT.unreachable).toBe("Could not be reached");
+    expect(SEARCH_TEST_TEXT.keyRefused).toBe("Did not accept the key");
+    expect(SEARCH_TEST_TEXT.needsElicitKey).toBe("Needs your Elicit API key (Pro plan or higher)");
+    expect(SEARCH_TEST_TEXT.elicitPlanCap).toBe("Your Elicit plan does not allow this many results");
+    expect(SEARCH_SETTINGS_TEXT.elicitKeyRefused).toBe("Elicit did not accept the key");
+    // Every sentence once: no two keys carry the same words.
+    const all = [...Object.values(SEARCH_TEST_TEXT), ...Object.values(SEARCH_SETTINGS_TEXT)];
+    expect(new Set(all).size).toBe(all.length);
+    expect(searchEmailRefusal("crossrefEmail")).toBe('"crossrefEmail" is not an e-mail address. Nothing was changed.');
+    expect(isSearchApiKeyShape("elk-made-up-0001")).toBe(true);
+    for (const bad of ["short", "has a space here", "line\nbreak-0001", "x".repeat(257), 42]) expect(isSearchApiKeyShape(bad)).toBe(false);
+    const view: SearchSourcesResponse = { record: [{ id: "elicit", on: false, allowedByRules: false }], copies: [] };
+    expect(view.record[0]!.id).toBe("elicit");
+    // @ts-expect-error Open Library is not a source the screen shows
+    const wrongRow: SearchRecordRow = { id: "openlibrary", on: true };
+    expect(wrongRow.on).toBe(true);
   });
 });

@@ -23,6 +23,7 @@ import {
   setZoteroSyncUnfinished,
   updateZoteroSyncSettings,
   writeZoteroSyncSettings,
+  zoteroHistoryBackoff,
   type ZoteroSyncLink,
   type ZoteroSyncRun,
   type ZoteroSyncSettings,
@@ -369,5 +370,23 @@ describe("Z10 (R269 c): the module itself says it refused a file as newer", () =
     expect(await readZoteroSyncHistory(dir, LIB, { onNewer: (f) => void toldH.push(f) })).toEqual([]);
     expect(toldH).toEqual([ZOTERO_SYNC_HISTORY_FILE]);
     await deviceNoticesIdle();
+  });
+});
+
+describe("R295 a: zoteroHistoryBackoff", () => {
+  const rec = (backoffUntil?: string): Pick<ZoteroSyncRun, "backoffUntil"> => (backoffUntil === undefined ? {} : { backoffUntil });
+  const T1 = "2027-03-12T15:10:00.000Z";
+  const T2 = "2027-03-13T09:05:00.000Z";
+  it("no record, or none with a back-off: nothing", () => {
+    expect(zoteroHistoryBackoff([])).toBeUndefined();
+    expect(zoteroHistoryBackoff([rec(), rec()] as ZoteroSyncRun[])).toBeUndefined();
+  });
+  it("several: the latest wins, whatever their order", () => {
+    expect(zoteroHistoryBackoff([rec(T1), rec(), rec(T2)] as ZoteroSyncRun[])).toBe(Date.parse(T2));
+    expect(zoteroHistoryBackoff([rec(T2), rec(T1)] as ZoteroSyncRun[])).toBe(Date.parse(T2));
+  });
+  it("an unreadable date is ignored", () => {
+    expect(zoteroHistoryBackoff([rec("not a date"), rec(T1)] as ZoteroSyncRun[])).toBe(Date.parse(T1));
+    expect(zoteroHistoryBackoff([rec("not a date")] as ZoteroSyncRun[])).toBeUndefined();
   });
 });

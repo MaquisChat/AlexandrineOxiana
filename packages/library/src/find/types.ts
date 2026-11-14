@@ -71,6 +71,8 @@ export type FindReasonCode =
   | "unexpected"
   // F8b (R283 a): on a "choose" entry: people of this name could not be looked up ("Try again" looks again).
   | "people-unavailable"
+  // F12 (R297 a): the only record source switched on and allowed needs a key that is not saved (`by: "settings"`).
+  | "needs-key"
   // Task F11: the free copy. The rules refuse the acquiring method `free_copy` (the entry stays "record-complete"
   // and is not tried again until the rules change); FIND_HELD_MAX files already wait (R296 d: "record-complete",
   // woken by a decision on a waiting file, "Try again", opening and unlocking; an entry stored "failed" with it by an
@@ -160,6 +162,8 @@ export type SearchSettings = {
   record: Array<{ id: RecordSearchSource; on: boolean }>;
   copies?: Array<{ id: FreeCopySource; on: boolean }>;
   unpaywallEmail?: string;
+  /** F12 (R290 e): sent to Crossref only, in the User-Agent of its requests (`contactEmailFor`). */
+  crossrefEmail?: string;
 };
 
 /**

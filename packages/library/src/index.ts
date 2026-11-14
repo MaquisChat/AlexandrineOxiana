@@ -191,6 +191,10 @@ export {
   zoteroFileHostAllowed,
   zoteroWebAdapter,
   zoteroWebSince,
+  // Test-only switches, honoured under NODE_ENV=test only and read once at the service's start (Task Z11, R289).
+  ZOTERO_API_ORIGIN_ENV,
+  useZoteroApiOriginFromEnv,
+  zoteroApiOriginFromEnv,
 } from "./import/zotero-web.js";
 export type { ZoteroWebAdapter, ZoteroWebOptions, ZoteroWebScanResult } from "./import/zotero-web.js";
 export { clearZoteroWebVersion } from "./repo/repo.js";
@@ -225,6 +229,7 @@ export {
   ZOTERO_SYNC_MAX_LINKS,
   ZOTERO_SYNC_NEWER_SENTENCE,
   ZOTERO_SYNC_REASONS,
+  ZoteroSyncFileBusyError,
   ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
   pauseAllZoteroSyncLinks,
@@ -233,6 +238,7 @@ export {
   readZoteroSyncSettings,
   updateZoteroSyncSettings,
   writeZoteroSyncSettings,
+  zoteroHistoryBackoff,
 } from "./import/zotero-sync-settings.js";
 export type {
   ZoteroSyncCounts,
@@ -245,6 +251,7 @@ export type {
   ZoteroSyncSettings,
 } from "./import/zotero-sync-settings.js";
 export { SECRET_NAMES, SECRET_SERVICE, SECRET_STORE_UNAVAILABLE, SecretStoreUnavailableError, deleteSecret, getSecret, setSecret } from "./secrets.js";
+export { SECRETS_ENV, secretsBackendFromEnv, useSecretsFromEnv } from "./secrets.js"; // test-only switch (Task Z11, R289)
 export type { SecretName } from "./secrets.js";
 export { DEIDENTIFIED_NOTE, REFMAN_FORMATS, exportRefman, writeRefmanExport } from "./export/refman-export.js";
 export type { RefmanExportOptions, RefmanExportResult, RefmanFormat } from "./export/refman-export.js";

@@ -72,6 +72,9 @@ importers:
       '@ao/library':
         specifier: workspace:*
         version: link:../../packages/library
+      '@ao/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
       commander:
         specifier: ^15.1.0
         version: 15.1.0

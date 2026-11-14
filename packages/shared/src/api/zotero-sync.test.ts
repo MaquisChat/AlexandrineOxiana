@@ -31,12 +31,21 @@ const AT = "2027-03-12T14:32:00.000Z";
 const NOW = new Date("2027-03-12T18:00:00.000Z");
 const run = (o: Partial<ZoteroSyncRun>): ZoteroSyncRun => ({ id: "r1", ref: "user:42", projectId: "p1", trigger: "manual", startedAt: AT, finishedAt: AT, outcome: "finished", ...o });
 
+describe("R295 b: a run the project's rules refuse", () => {
+  it("reads as a failure that names itself, in the shared words; an older reason reads as before", () => {
+    const line = zoteroSyncStatusLine(run({ outcome: "failed", reason: "rules-denied" }), NOW);
+    expect(line).toBe(`Could not sync with Zotero at 14:32 today: ${ZOTERO_SYNC_REASON_TEXT["rules-denied"]} Nothing here was changed.`);
+    expect(zoteroSyncReasonText("rules-denied", NOW)).toBe("This project's rules do not allow this sync. Change them in the project's Governance settings.");
+    expect(zoteroSyncStatusLine(run({ outcome: "failed", reason: "offline" }), NOW)).toBe(`Could not sync with Zotero at 14:32 today: ${ZOTERO_SYNC_REASON_TEXT.offline} Nothing here was changed.`);
+  });
+});
+
 describe("every reason has its sentence", () => {
   it("one sentence for every reason, at run time as by type", () => {
     // By type: a reason without a sentence does not compile (Record<ZoteroSyncReason, string>).
     const keys = Object.keys(ZOTERO_SYNC_REASON_TEXT).sort();
     expect(keys).toEqual([...ZOTERO_SYNC_REASONS_LIST].sort());
-    expect(ZOTERO_SYNC_REASONS_LIST).toHaveLength(20);
+    expect(ZOTERO_SYNC_REASONS_LIST).toHaveLength(21);
     for (const r of ZOTERO_SYNC_REASONS_LIST) expect(ZOTERO_SYNC_REASON_TEXT[r], r).toMatch(/^[A-Z].*\.$/u);
   });
 
@@ -58,6 +67,8 @@ describe("every reason has its sentence", () => {
       // R248
       "batch-ended": "An unfinished sync could not be continued, so it was closed. The next sync starts again from the beginning.",
       "library-closed": "The library was closed or moved during the sync; it continues next time.",
+      // R295 b
+      "rules-denied": "This project's rules do not allow this sync. Change them in the project's Governance settings.",
     };
     for (const [k, v] of Object.entries(want)) expect(ZOTERO_SYNC_REASON_TEXT[k as ZoteroSyncReason], k).toBe(v);
   });

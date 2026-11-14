@@ -16,11 +16,11 @@ import { lstat, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import nativePath, { isAbsolute, join } from "node:path";
 import type { FastifyInstance } from "fastify";
-import { SECRET_STORE_UNAVAILABLE, SecretStoreUnavailableError, deleteSecret, getSecret, setSecret } from "@ao/library";
-import { isZoteroApiKeyShape, type SecretDeleteResponse, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
-import { ApiError, badRequest } from "../errors.js";
+import { isZoteroApiKeyShape, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
+import { ApiError } from "../errors.js";
 import { readSmallRegularFile } from "./safe-file.js";
-import { bodyOf, type Ctx } from "./util.js";
+import { registerSecretKey } from "./search-settings.js";
+import { type Ctx } from "./util.js";
 
 /** Zotero's prefs.js is a few kilobytes; anything far larger is not read. */
 const PREFS_MAX_BYTES = 1024 * 1024;
@@ -134,47 +134,21 @@ export async function findZoteroDataFolders(o: { platform: string; home: string;
   return out;
 }
 
-/** The password store's refusal, in words that fit what was asked. */
-function storeError(e: unknown, message: string): unknown {
-  return e instanceof SecretStoreUnavailableError ? new ApiError(503, "UNAVAILABLE", message) : e;
-}
+const ONLY_DESKTOP_APP = "Only the desktop app can do this.";
 
 export function registerZotero(app: FastifyInstance, ctx: Ctx): void {
   const uiOnly = (caller: string | undefined) => {
-    if (caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Only the desktop app can do this.");
+    if (caller !== "ui") throw new ApiError(403, "FORBIDDEN", ONLY_DESKTOP_APP);
   };
 
-  // ---- the Zotero Web API key (R78): write-only ----
-  app.get("/secrets/zotero-api-key", async (req): Promise<SecretStatusResponse> => {
-    uiOnly(req.caller);
-    try {
-      return { stored: (await getSecret("zotero-api-key")) !== null };
-    } catch (e) {
-      throw storeError(e, NO_STORE_FOR_STATUS);
-    }
-  });
-
-  app.put("/secrets/zotero-api-key", async (req): Promise<SecretStatusResponse> => {
-    uiOnly(req.caller);
-    const b = bodyOf(req);
-    if (Object.keys(b).some((k) => k !== "apiKey")) throw badRequest('Only "apiKey" can be sent here.');
-    // The value is never echoed: the message describes the rule, not what was sent.
-    if (!isZoteroApiKeyShape(b.apiKey)) throw badRequest("That does not look like a Zotero API key: it is 24 letters and digits, from zotero.org, Settings, Security.");
-    try {
-      await setSecret("zotero-api-key", b.apiKey);
-    } catch (e) {
-      throw storeError(e, SECRET_STORE_UNAVAILABLE);
-    }
-    return { stored: true };
-  });
-
-  app.delete("/secrets/zotero-api-key", async (req): Promise<SecretDeleteResponse> => {
-    uiOnly(req.caller);
-    try {
-      return { removed: await deleteSecret("zotero-api-key") };
-    } catch (e) {
-      throw storeError(e, NO_STORE_FOR_STATUS);
-    }
+  // ---- the Zotero Web API key (R78): write-only, through the one implementation of a kept key's routes (R297 d) ----
+  registerSecretKey(app, {
+    name: "zotero-api-key",
+    uiOnly: ONLY_DESKTOP_APP,
+    noStoreForStatus: NO_STORE_FOR_STATUS,
+    keyFields: 'Only "apiKey" can be sent here.',
+    keyShape: "That does not look like a Zotero API key: it is 24 letters and digits, from zotero.org, Settings, Security.",
+    isShape: isZoteroApiKeyShape,
   });
 
   // ---- the Zotero data folder ----

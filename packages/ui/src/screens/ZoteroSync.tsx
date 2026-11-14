@@ -49,6 +49,7 @@ import { UserText } from "../components/UserText";
 import { ZoteroKeyField } from "../components/ZoteroKeyField";
 import "../components/library.css";
 import { inAppLink } from "../navigation";
+import { LOCKED_TEXT, MY_LIBRARY, PAUSED_UNKNOWN_TEXT, ZoteroProgressText, hasUnknownPause, labelOfRef, num, refLabel } from "./zoteroWords";
 import { reportHref } from "./import/shared";
 import { projectQueueHref } from "./import/ReviewQueue";
 import { defaultOptions } from "./import/StepOptions";
@@ -65,8 +66,8 @@ export const ZOTERO_TEXT = {
   beforeCheck: "Press “Check the key” to see the names of your Zotero libraries; until then, linked libraries are shown by their Zotero number.",
   notListed: "The last key check did not list this library.",
   goneRemedy: "When the key can read this library again, “Check the key” turns syncing of it back on.",
-  locked: "Unlock the project to sync.",
-  pausedUnknown: "Syncing of this library is paused.",
+  locked: LOCKED_TEXT,
+  pausedUnknown: PAUSED_UNKNOWN_TEXT,
   noLinks: "No Zotero library is linked to a project yet.",
   noHistory: "No sync has been recorded on this computer yet.",
   chooseProject: "Choose a project",
@@ -86,15 +87,7 @@ const PROGRESS_EVERY_MS = 1000;
 const RECONNECT_MS = 2000;
 /** "Sync with Zotero now" and "Stop syncing" are one button: a press this soon after its last act ended is the rest of a double click. */
 const SECOND_PRESS_MS = 500;
-/** Personal library: "My library" (Accept 3). */
-const MY_LIBRARY = "My library";
-
-const num = (n: number) => n.toLocaleString("en-GB");
-/** A library the last check did not name: by its Zotero number. */
-export const refLabel = (ref: string): string => {
-  const [type, id] = ref.split(":");
-  return type === "group" ? `Zotero group ${id ?? ""}` : `Zotero library ${ref}`;
-};
+export { refLabel };
 /** A save with no answer in this long is given up (R269 N1 b; as FindAcquire gives up an unanswered add). */
 const SAVE_TIMEOUT_MS = 60_000;
 
@@ -635,16 +628,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
   const progressLine = (): ReactNode => {
     if (!shown) return null;
     if (!shown.ref) return ZOTERO_TEXT.starting;
-    const label = <UserText>{labelOfRef(shown.ref, access)}</UserText>;
-    return shown.total > 0 ? (
-      <>
-        Syncing “{label}”: {num(shown.done)} of {num(shown.total)} items
-      </>
-    ) : (
-      <>
-        Syncing “{label}”: {ZOTERO_TEXT.totalUnknown}
-      </>
-    );
+    return <ZoteroProgressText label={labelOfRef(shown.ref, access)} done={shown.done} total={shown.total} unknown={ZOTERO_TEXT.totalUnknown} />;
   };
   const backoffText = state?.backoffUntil ? zoteroSyncReasonText("backing-off", new Date(), state.backoffUntil) : "";
   const shownHistory = (history ?? []).slice(0, HISTORY_SHOWN);
@@ -843,12 +827,6 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
   );
 }
 
-/** A library's name for this visit: from the last key check, else by its Zotero number. */
-function labelOfRef(ref: string, access: ZoteroKeyCheckResponse | undefined): string {
-  if (access?.personal.library && ref === `user:${access.userId}`) return MY_LIBRARY;
-  return access?.groups.find((g) => g.ref === ref)?.name ?? refLabel(ref);
-}
-
 // ---------------------------------------------------------------------------------------------
 // One library
 
@@ -882,15 +860,13 @@ function ForName({ label }: { label: string }) {
   );
 }
 
-const KNOWN_PAUSES: readonly string[] = ["undone", "key-refused", "library-gone"];
-
 function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projects, errors, busy, saving, waitingNow, onKeep, onProject, onResume, onCheck }: RowProps) {
   const headingId = `${ids}-h`;
   const keepErr = errors[`keep:${refName}`];
   const projectErr = errors[`project:${refName}`];
   const last = link?.lastRun;
   // R268 M6: a pause this build does not know is still a pause.
-  const unknownPause = !!link && ((!!link.paused && !KNOWN_PAUSES.includes(link.paused)) || (link.waitingFor === "paused" && !link.paused));
+  const unknownPause = hasUnknownPause(link);
   // R269 N2: the number is the project's queue, so the link's name is the project's, not the library's.
   const projectName = link ? projects.find((p) => p.id === link.projectId)?.name : undefined;
   const linkable = !!last?.batchId && isValidId(last.projectId) && isValidId(last.batchId);
