@@ -929,9 +929,9 @@ describe("ZoteroSync", () => {
     const r = row("Zotero library user:42");
     expect(within(r).getByRole("link", { name: "Import report for “Zotero library user:42”" }).getAttribute("href")).toBe(`/import?project=${P1}&batch=${B1}`);
     // N is what the project's queue holds now (not the run's 3), and it goes to that queue.
-    const review = await within(r).findByRole("link", { name: "Review 5 waiting for “Zotero library user:42”" });
+    const review = await within(r).findByRole("link", { name: "Review 5 waiting in “Dissertation”" });
     expect(review.getAttribute("href")).toBe(`/import/review?project=${P1}`);
-    expect(within(row("Zotero group 7")).getByRole("link", { name: "Review 5 waiting for “Zotero group 7”" })).toBeTruthy();
+    expect(within(row("Zotero group 7")).getByRole("link", { name: "Review 5 waiting in “Dissertation”" })).toBeTruthy();
     // 0 waiting: no link. The status line stays the service's.
     expect(within(row("Zotero group 8")).queryByRole("link", { name: /^Review/ })).toBeNull();
     expect(within(r).getByText(svc.state.links[0]!.status)).toBeTruthy();
@@ -944,8 +944,19 @@ describe("ZoteroSync", () => {
     await push(svc, "zotero.sync", { ref: "user:42", projectId: P1, state: "running", done: 1, total: 2 });
     expect(counts()).toHaveLength(2);
     await push(svc, "zotero.sync", { ref: "user:42", projectId: P1, state: "finished", run: last });
-    expect(await within(row("Zotero library user:42")).findByRole("link", { name: "Review 2 waiting for “Zotero library user:42”" })).toBeTruthy();
+    expect(await within(row("Zotero library user:42")).findByRole("link", { name: "Review 2 waiting in “Dissertation”" })).toBeTruthy();
     expect(counts()).toHaveLength(4);
+  });
+
+  it("R269 N2: two libraries linked to one project: both review links are named for the project, not the library", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1 }, { ref: "group:7", projectId: P1 }] });
+    svc.waiting = { [P1]: 4 };
+    await show(svc);
+    for (const name of ["Zotero library user:42", "Zotero group 7"]) {
+      const link = await within(row(name)).findByRole("link", { name: "Review 4 waiting in “Dissertation”" });
+      expect(link.textContent).toContain("Review 4 waiting");
+    }
+    expect(screen.queryByRole("link", { name: /Review 4 waiting for/ })).toBeNull();
   });
 
   it("R268 I1: a save's answer wins over a read that started before it arrived; one fresh read follows; Saved. once; a second Save sends the saved values", async () => {
@@ -1133,6 +1144,81 @@ describe("ZoteroSync", () => {
     expect(screen.queryByRole("region", { name: "My library" })).toBeNull();
     expect(screen.queryByTestId("zotero-key-result")).toBeNull();
     expect((screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement).value).toBe("30");
+  });
+
+  it("R269 N1 a: a save still out for the old library does not lock the next library's form; its late answer changes nothing", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1 }] });
+    await show(svc);
+    const user = userEvent.setup();
+    await push(svc, "library.state", { open: true, libraryId: "lib-1", mode: "read-write" });
+    const gate = held();
+    svc.onSave = async () => {
+      await gate.p;
+      return HttpResponse.json(stateOf({ links: [{ ref: "user:42", projectId: P1 }], everyMinutes: 240 }));
+    };
+    await user.selectOptions(screen.getByRole("combobox", { name: "How often" }), "240");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1));
+    expect((screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement).disabled).toBe(true);
+    svc.state = stateOf({ links: [{ ref: "group:55", projectId: P3 }], everyMinutes: 30 });
+    await push(svc, "library.state", { open: true, libraryId: "lib-2", mode: "read-write" });
+    await screen.findByRole("region", { name: "Zotero group 55" });
+    const often = screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement;
+    expect(often.disabled).toBe(false);
+    expect(often.value).toBe("30");
+    expect(screen.getByRole("button", { name: "Save" }).getAttribute("aria-disabled")).toBeNull();
+    const before = document.body.innerHTML;
+    await act(async () => {
+      gate.release();
+      await new Promise((r) => setTimeout(r, 100));
+    });
+    expect(document.body.innerHTML).toBe(before);
+    expect(liveText()).not.toBe("Saved.");
+  });
+
+  it.each([
+    ["Save", { links: [{ ref: "user:42", projectId: P1 }] }, "Save"],
+    ["Turn syncing on again", { links: [{ ref: "user:42", projectId: P1, paused: "undone" as const }] }, "Turn syncing on again for “Zotero library user:42”"],
+  ])("R269 N1 b: a save (%s) with no answer in 60 s is given up: draft kept, one sentence, one read, a late answer ignored", async (_n, init, buttonName) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], shouldAdvanceTime: true });
+    const svc = useSvc(init);
+    await show(svc);
+    const gate = held();
+    svc.onSave = async () => {
+      await gate.p;
+      return HttpResponse.json(stateOf({ ...init, everyMinutes: 30 }));
+    };
+    const often = () => screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement;
+    await act(async () => {
+      fireEvent.change(often(), { target: { value: "240" } });
+    });
+    await act(async () => screen.getByRole("button", { name: buttonName }).click());
+    await waitFor(() => expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1));
+    expect(often().disabled).toBe(true);
+    const reads = svc.count("GET", "/zotero/sync");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(59_000);
+    });
+    expect(often().disabled).toBe(true);
+    expect(screen.queryByTestId("zotero-save-error")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    const sentence = "The service did not answer. Check the settings shown before saving again.";
+    await waitFor(() => expect(screen.getByTestId("zotero-save-error").textContent).toBe(sentence));
+    expect(liveText()).toBe(sentence);
+    expect(often().disabled).toBe(false);
+    expect(often().value).toBe("240");
+    expect(screen.getByRole("button", { name: "Save" }).getAttribute("aria-disabled")).toBeNull();
+    await waitFor(() => expect(svc.count("GET", "/zotero/sync")).toBe(reads + 1));
+    await act(async () => {
+      gate.release();
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(liveText()).toBe(sentence);
+    expect(often().value).toBe("240");
+    expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1);
+    expect(svc.count("GET", "/zotero/sync")).toBe(reads + 1);
   });
 
   it("R268 M7: after the event stream comes back, the state is read again", async () => {

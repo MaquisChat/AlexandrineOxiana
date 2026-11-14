@@ -70,6 +70,7 @@ export const ZOTERO_TEXT = {
   noHistory: "No sync has been recorded on this computer yet.",
   chooseProject: "Choose a project",
   saved: "Saved.",
+  saveTimedOut: "The service did not answer. Check the settings shown before saving again.",
   starting: "Starting the sync…",
   totalUnknown: "the number of items is not known yet.",
   loading: "Reading the Zotero sync settings…",
@@ -93,6 +94,9 @@ export const refLabel = (ref: string): string => {
   const [type, id] = ref.split(":");
   return type === "group" ? `Zotero group ${id ?? ""}` : `Zotero library ${ref}`;
 };
+/** A save with no answer in this long is given up (R269 N1 b; as FindAcquire gives up an unanswered add). */
+const SAVE_TIMEOUT_MS = 60_000;
+
 /** The service's own sentence for a refusal. */
 const sentenceOf = (err: unknown, fallback: string) => (err instanceof ApiClientError && err.message ? err.message : fallback);
 
@@ -240,6 +244,9 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
   /** The library went away (closed, or another opened): nothing of it stays, and every answer still out is dropped. */
   const forget = useCallback(() => {
     gen.current++;
+    // R269 N1 a: a save still out belongs to the library that went; its answer is dropped, and the next form is free.
+    saveBusy.current = false;
+    setSaving(false);
     reading.current = null;
     stateRef.current = undefined;
     accessRef.current = undefined;
@@ -529,6 +536,18 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     setSaveError(undefined);
     setFieldErrors({});
     const g = gen.current;
+    // R269 N1 b: no answer within SAVE_TIMEOUT_MS: given up, the draft kept, the form free, the state read once. The
+    // client's saveSettings takes no abort signal, so the request is not aborted; its late answer is ignored.
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      if (!alive.current || g !== gen.current) return;
+      timedOut = true;
+      saveBusy.current = false;
+      setSaving(false);
+      setSaveError(ZOTERO_TEXT.saveTimedOut);
+      say(ZOTERO_TEXT.saveTimedOut);
+      void read();
+    }, SAVE_TIMEOUT_MS);
     try {
       const body =
         which === "draft"
@@ -537,11 +556,11 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
               ...r,
               links: r.links.map((l) => (l.ref === which.resume ? { ...l, resume: true as const } : l)),
             }));
-      if (!alive.current || g !== gen.current) return;
+      if (!alive.current || g !== gen.current || timedOut) return;
       const ev = eventSeq.current;
       try {
         const s = await api.saveSettings(body);
-        if (!alive.current || g !== gen.current) return;
+        if (!alive.current || g !== gen.current || timedOut) return;
         // R268 I1: a write's answer is numbered when it arrives, so it wins over every read that started before it.
         applyState(s, ++readSeq.current, ev);
         if (which === "draft") setDraft(null);
@@ -549,7 +568,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
         // Exactly one fresh reading follows (one already out is overruled, and the coalesced read asks once more).
         void read();
       } catch (err) {
-        if (!alive.current || g !== gen.current) return;
+        if (!alive.current || g !== gen.current || timedOut) return;
         const msg = sentenceOf(err, "The settings could not be saved.");
         const field = err instanceof ApiClientError && err.status === 400 ? refusedField(msg, body.links) : undefined;
         if (field) {
@@ -559,8 +578,12 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
         if (err instanceof ApiClientError && (err.code === "READ_ONLY" || err.code === "LIBRARY_OFFLINE")) void read();
       }
     } finally {
-      saveBusy.current = false;
-      if (alive.current) setSaving(false);
+      clearTimeout(timer);
+      // Released here only while this save still holds the lock: after a give-up or another library, it is not ours.
+      if (!timedOut && g === gen.current) {
+        saveBusy.current = false;
+        if (alive.current) setSaving(false);
+      }
     }
   };
 
@@ -865,6 +888,8 @@ function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projec
   const last = link?.lastRun;
   // R268 M6: a pause this build does not know is still a pause.
   const unknownPause = !!link && ((!!link.paused && !KNOWN_PAUSES.includes(link.paused)) || (link.waitingFor === "paused" && !link.paused));
+  // R269 N2: the number is the project's queue, so the link's name is the project's, not the library's.
+  const projectName = link ? projects.find((p) => p.id === link.projectId)?.name : undefined;
   const linkable = !!last?.batchId && isValidId(last.projectId) && isValidId(last.batchId);
   return (
     <section className="ao-zotero__lib" aria-labelledby={headingId} data-row-ref={refName}>
@@ -969,7 +994,11 @@ function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projec
           {waitingNow > 0 && (
             <a href={projectQueueHref(link.projectId)} onClick={inAppLink}>
               Review {num(waitingNow)} waiting{" "}
-              <ForName label={label} />
+              {projectName !== undefined && (
+                <span className="ao-visually-hidden">
+                  in “<UserText>{projectName}</UserText>”
+                </span>
+              )}
             </a>
           )}
         </p>
