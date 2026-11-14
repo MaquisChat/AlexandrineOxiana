@@ -1513,6 +1513,257 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     });
   });
 
+  // R322: a deciding control takes a press by mouse only where the researcher pointed at it; by touch or pen only after
+  // it has stood still for the quiet's time; by keyboard as built.
+  //
+  // The page's geometry is modelled (jsdom gives every element a zero rectangle): `getBoundingClientRect` is mocked so
+  // that the section starts at 500 px, 300 px lower while the list of other entries (`.ao-review__layout`) is shown above
+  // it, plus `geo.extra` (another part above that may go away); each card is 300 px tall, its "Use this file" at x 0 and
+  // its "Not this file" at x 150 of the card's top line (100 × 30); the panel's "Accept" stands at y 500. A pointer
+  // resting at a point presses whatever control's rectangle holds that point (a hidden stand-in is not hit).
+  describe("R322: a press is taken only where the researcher pointed", () => {
+    const MOVED = "That press was not taken, because what is under the pointer had just moved. Look at the file, then press again.";
+    const geo = { extra: 0 };
+    const rectFor = (el: Element): DOMRect => {
+      const top = 500 + (document.querySelector(".ao-review__layout") ? 300 : 0) + geo.extra;
+      if (el instanceof HTMLButtonElement && el.closest(".ao-review__layout") && el.textContent === "Accept") return new DOMRect(0, 500, 100, 30);
+      const li = el instanceof HTMLButtonElement ? el.closest(".ao-review__file") : null;
+      if (li) {
+        const k = [...document.querySelectorAll(".ao-review__found .ao-review__file")].indexOf(li);
+        const ghost = !!el.closest("[aria-hidden='true']");
+        const col = [...li.querySelectorAll("button")].filter((b) => !!b.closest("[aria-hidden='true']") === ghost).indexOf(el as HTMLButtonElement);
+        return new DOMRect(col * 150, top + k * 300, 100, 30);
+      }
+      return new DOMRect(0, 0, 0, 0);
+    };
+    beforeEach(() => {
+      geo.extra = 0;
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+        return rectFor(this);
+      });
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+    /** The control a pointer resting at (x, y) would press now (none where nothing reachable stands). */
+    const controlAt = (x: number, y: number) =>
+      [...document.querySelectorAll<HTMLButtonElement>("button")].find((b) => {
+        if (b.closest("[aria-hidden='true']")) return false;
+        const r = rectFor(b);
+        return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+      });
+    /** The pointer moves over a control. */
+    const moveOver = (el: Element, pointerType = "mouse") => fireEvent.pointerMove(el, { pointerType });
+    /** A press by a pointer (no movement before it): down, up, and the click it makes. */
+    const pressBy = (el: Element | undefined, pointerType = "mouse") => {
+      if (!el) return;
+      fireEvent.pointerDown(el, { pointerType, button: 0 });
+      fireEvent.pointerUp(el, { pointerType, button: 0 });
+      fireEvent.click(el);
+    };
+    /** A press at a resting point. */
+    const pressAt = (x: number, y: number, pointerType = "mouse") => pressBy(controlAt(x, y), pointerType);
+
+    it("R322 a: a mouse press on a control the pointer moved over, where it stands, is taken", async () => {
+      open(mixed());
+      await ready("Right Two");
+      moveOver(use("Right One"));
+      pressBy(use("Right One"));
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+    });
+
+    it("R322 a: after the control moved without a pointer movement (the section jumped), a mouse press is not taken and is said once; after a movement over it, it is taken", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const h = listen();
+      const u = use("Right Two");
+      moveOver(u);
+      // The part above the section goes away: the control is 300 px higher; the pointer has not moved.
+      geo.extra = -300;
+      pressBy(u);
+      pressBy(u);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      expect(u.getAttribute("aria-busy")).toBeNull();
+      expect(h.said).toEqual([MOVED]);
+      // The pointer moves over it where it now stands; a press (after the quiet those presses renewed) is taken.
+      passGuard();
+      moveOver(u);
+      pressBy(u);
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r10"]));
+      h.stop();
+    });
+
+    it("R322 a: a control the pointer never moved over, pressed by mouse, is not taken", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const h = listen();
+      pressBy(use("Right One"));
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      expect(h.said).toEqual([MOVED]);
+      h.stop();
+    });
+
+    it("R322 a, b: a double press on the last Accept above, the second falling on a found file's Use this file, does not decide the found file", async () => {
+      const o = project();
+      o.projectReview = { [P1]: [item(1, { batchId: undefined, title: "Dropped file" }), rightItem(8, "Right One")] };
+      o.sources = { s1: source(1, "Dropped file"), s8: source(8, "Right One") };
+      const { m } = open(o);
+      await ready("Right One");
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      await waitFor(() => expect((accept as HTMLButtonElement).disabled).toBe(false));
+      // The pointer rests on Accept (it moved there), and presses twice.
+      const P = { x: 10, y: 510 };
+      expect(controlAt(P.x, P.y)).toBe(accept);
+      moveOver(accept);
+      pressAt(P.x, P.y);
+      // The import entry is decided: the list above goes, and the section moves up 300 px — its first card's Use this
+      // file now stands under the resting pointer.
+      await waitFor(() => expect(document.querySelector(".ao-review__layout")).toBeNull());
+      expect(controlAt(P.x, P.y)).toBe(use("Right One"));
+      pressAt(P.x, P.y);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(m.calls.filter((c) => c.path === "/review/r1/decide")).toHaveLength(1);
+      expect(heldCalls).toHaveLength(0);
+      expect(use("Right One").getAttribute("aria-busy")).toBeNull();
+    });
+
+    it("R322 b: a decision on an entry of another kind above starts the quiet for the found files' controls (by key too)", async () => {
+      const o = project();
+      o.projectReview = { [P1]: [item(1, { batchId: undefined, title: "Dropped file" }), rightItem(8, "Right One")] };
+      o.sources = { s1: source(1, "Dropped file"), s8: source(8, "Right One") };
+      const { user } = open(o);
+      await ready("Right One");
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      await waitFor(() => expect((accept as HTMLButtonElement).disabled).toBe(false));
+      await user.click(accept);
+      await waitFor(() => expect(document.querySelector(".ao-review__layout")).toBeNull());
+      const u = use("Right One");
+      u.focus();
+      fireEvent.keyDown(u, { key: "Enter", code: "Enter" });
+      fireEvent.click(u);
+      fireEvent.keyUp(u, { key: "Enter", code: "Enter" });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      passGuard();
+      fireEvent.keyDown(u, { key: "Enter", code: "Enter" });
+      fireEvent.click(u);
+      fireEvent.keyUp(u, { key: "Enter", code: "Enter" });
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+    });
+
+    it("R322 a: a touch press on a control that moved within the last 600 ms is not taken; after 600 ms of stillness it is", async () => {
+      open(mixedSlow(200));
+      await ready("Right Two");
+      moving();
+      await tick(DECIDE_SETTLE_MS + 100);
+      const h = listen();
+      // Something above went away: the control moved.
+      geo.extra = -300;
+      pressBy(use("Right One"), "touch");
+      await tick(10);
+      expect(heldCalls).toHaveLength(0);
+      expect(h.said).toEqual([MOVED]);
+      await tick(300);
+      pressBy(use("Right One"), "touch");
+      await tick(10);
+      expect(heldCalls).toHaveLength(0);
+      // 600 ms after the last press, the control having stood still since it moved: taken. A pen likewise.
+      await tick(DECIDE_SETTLE_MS + 100);
+      pressBy(use("Right One"), "touch");
+      await tick(10);
+      expect(heldCalls.map((c) => c.id)).toEqual(["r8"]);
+      pressBy(use("Right Two"), "pen");
+      await tick(10);
+      expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
+      h.stop();
+    });
+
+    it("R322 a: a keyboard press (Enter, Space) on the focused control is not affected: never moved over, its rectangle changed", async () => {
+      open(mixed());
+      await ready("Right Two");
+      geo.extra = -300;
+      const u = use("Right One");
+      u.focus();
+      fireEvent.keyDown(u, { key: "Enter", code: "Enter" });
+      fireEvent.click(u);
+      fireEvent.keyUp(u, { key: "Enter", code: "Enter" });
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+      geo.extra = -600;
+      const n = not("Right Two");
+      n.focus();
+      fireEvent.keyDown(n, { key: " ", code: "Space" });
+      fireEvent.keyUp(n, { key: " ", code: "Space" });
+      fireEvent.click(n);
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]));
+    });
+
+    it("R322 a: a mouse press is never taken for a keyboard one: a key down and up on the control, then a mouse press without a movement, is not taken", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const u = use("Right One");
+      u.focus();
+      fireEvent.keyDown(u, { key: "Enter", code: "Enter" });
+      fireEvent.keyUp(u, { key: "Enter", code: "Enter" });
+      pressBy(u);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+    });
+
+    it("R322 b: a refusal's sentence is shown below the card's two controls", async () => {
+      const GONE = "The record this file was found for is no longer in the library. Nothing was changed.";
+      const o = project();
+      o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: GONE, reason: "source-gone" } }, { status: 409 }))];
+      open(o);
+      await ready(RECORD);
+      fireEvent.click(use(RECORD));
+      const alert = await within(card(RECORD)).findByRole("alert");
+      for (const b of [use(RECORD), not(RECORD)]) expect(b.compareDocumentPosition(alert) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it("R322 b: the Creators and Year rows have their place from the card's first showing, before the record is read", async () => {
+      const o = project();
+      o.projectReview = { [P1]: [rightItem(8, "Right One")] };
+      o.sources = { s8: source(8, "Right One") };
+      o.extra = [http.get(`${SERVICE}/projects/:id/sources/:sid`, () => new Promise<Response>(() => {})), ...(o.extra ?? [])];
+      open(o);
+      const c = await waitFor(() => card("Right One"));
+      const dts = [...c.querySelectorAll("dt")].map((d) => d.textContent);
+      expect(dts.slice(0, 2)).toEqual(["Creators", "Year"]);
+      expect([...c.querySelectorAll("dl")[0]!.querySelectorAll("dd")].map((d) => d.textContent)).toEqual(["…", "…"]);
+    });
+
+    // The reviewer's probe: the pointer rests at the place of the first card's Use this file (it moved there once), the
+    // part of the page above the section goes away during the pressing, and the presses go on at every rhythm.
+    it.each([200, 1_000, 3_000])(
+      "R322 + R319 g: a press resting at the place of the first card's Use this file while the part above the section goes away, at every rhythm, against an answer of %i ms, decides ONE file",
+      async (answer) => {
+        for (const every of [100, 250, 550, 650, 1_000, 2_000]) {
+          heldCalls = [];
+          geo.extra = 300;
+          open(mixedSlow(answer));
+          await ready("Right Two");
+          moving();
+          const P = { x: 10, y: 810 };
+          expect(controlAt(P.x, P.y)).toBe(use("Right One"));
+          moveOver(use("Right One"));
+          for (let t = 0; t < 15_000; t += every) {
+            if (t >= 3_000) geo.extra = 0; // the part above goes away: every card is 300 px higher under the pointer
+            pressAt(P.x, P.y);
+            await tick(every);
+          }
+          await tick(answer + 100);
+          expect({ every, decided: heldCalls.map((c) => c.id) }).toEqual({ every, decided: ["r8"] });
+          cleanup();
+          vi.useRealTimers();
+          vi.useFakeTimers({ toFake: ["Date"] });
+        }
+      },
+      60_000,
+    );
+  });
+
   // R319 b changes what this asserts: the entry leaves the queue, but its card stays in its place, without controls, saying so.
   it("R282 d: a 409 whose reason says already decided takes the entry out of the queue; R319 b: its card stays, saying so, without controls", async () => {
     const o = project();

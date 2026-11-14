@@ -37,7 +37,7 @@
  * controls; files that arrive are counted on a line and come in only by "Show them". After a decision focus goes to
  * the next waiting card's heading (R313 a), else to the section's heading, or to the message that nothing is waiting.
  */
-import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type KeyboardEvent, type ReactNode, type Ref } from "react";
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type Ref } from "react";
 import { ApiClientError, type ApiClient } from "../../api/client";
 import {
   importApi,
@@ -164,6 +164,12 @@ export const HELD_DECISION_TIMEOUT_MS = 60_000;
 export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
 /** R318 c: said once per quiet, in the polite region, when a press was swallowed by the quiet. */
 export const PRESS_NOT_TAKEN_TEXT = "That press was not taken, because the list had just changed. Look at the file, then press again.";
+/** R322 a: said once per quiet, in the polite region, when a pointer press fell on a control that had moved under it. */
+export const PRESS_MOVED_TEXT = "That press was not taken, because what is under the pointer had just moved. Look at the file, then press again.";
+/** R322 a: how far (in CSS pixels, either way, on each axis) a control may stand from where it stood and still be "where it stood" (rounding). */
+export const PRESS_PLACE_TOLERANCE_PX = 1;
+/** R322 a: what FileCard found of a press — taken as built ("ok"), or by a pointer on a control that moved under it ("moved"). */
+export type PressCheck = "ok" | "moved";
 /** A waiting file's two controls: their words at rest, and while that decision is out (R318 a). */
 export const HELD_DECIDE_WORDS: Readonly<Record<HeldFileDecision, { idle: string; working: string }>> = {
   attach: { idle: "Use this file", working: "Using this file…" },
@@ -318,9 +324,14 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const quietUntil = useRef(0);
   /** R318 c: the quiet in force has already said that a press was not taken. */
   const quietSaid = useRef(false);
+  /** R322 a: the quiet in force has already said that a press fell on a control that had moved. */
+  const movedSaid = useRef(false);
   /** R318 b: the quiet runs (again) for DECIDE_SETTLE_MS from `now`; a quiet that had ended starts afresh, unsaid. */
   const holdQuiet = useCallback((now: number) => {
-    if (now >= quietUntil.current) quietSaid.current = false;
+    if (now >= quietUntil.current) {
+      quietSaid.current = false;
+      movedSaid.current = false;
+    }
     quietUntil.current = Math.max(quietUntil.current, now + DECIDE_SETTLE_MS);
   }, []);
   /** R313 e: after a decision was given up and the queue read again, focus goes back to that file's heading. */
@@ -434,10 +445,10 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           const files = list.filter(isFound) as HeldItem[];
           putLayout({ items: files, ended: {} });
           if (files.length) holdQuiet(Date.now());
-        } else if (shown.items.length) {
+        } else {
           // Read again during the visit: the cards stay as laid out (a file no longer listed keeps its card, R319 b; one
           // that arrived is only counted, R319 c). The section was gone while the queue was read and is shown again,
-          // in the same order, so the quiet holds (R313 c).
+          // in the same order, and what is above it may have changed: the quiet holds (R313 c, R322 b: any re-read).
           holdQuiet(Date.now());
         }
         setItems(list);
@@ -540,6 +551,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const next = shownGone ? (restListed[Math.min(lat, restListed.length - 1)]?.id ?? null) : shown;
     itemsRef.current = rest;
     currentRef.current = next;
+    // R322 b: an entry of another kind left the list above the found files: the section may have moved; the quiet holds.
+    holdQuiet(Date.now());
     setItems(rest);
     setCurrent(next);
     setSelected((s) => s.filter((x) => !gone.has(x)));
@@ -707,7 +720,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       t === ":empty" ? emptyNote.current : t === ":title" ? title.current : t === ":section" ? (foundHead.current ?? title.current) : (fileHeads.current.get(t) ?? title.current);
     el?.focus();
   }, [fileFocus]);
-  const decideHeld = async (item: ReviewItem, decision: HeldFileDecision) => {
+  const decideHeld = async (item: ReviewItem, decision: HeldFileDecision, how: PressCheck = "ok") => {
     // R319 a: a file decided here, or no longer listed, has no control that decides; nothing may decide it again.
     if (laidRef.current?.ended[item.id] || !(itemsRef.current ?? []).some((x) => x.id === item.id)) return;
     const now = Date.now();
@@ -715,6 +728,16 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     // says nothing more (its button already says it is working).
     if (heldBusyRef.current.has(item.id)) {
       holdQuiet(now);
+      return;
+    }
+    // R322 a: a pointer press on a control that is not where the researcher pointed at it (it moved under the pointer,
+    // or the pointer never moved over it): not taken; it starts the quiet again (R318 b) and is said once per quiet.
+    if (how === "moved") {
+      holdQuiet(now);
+      if (!movedSaid.current) {
+        movedSaid.current = true;
+        setStatus(PRESS_MOVED_TEXT);
+      }
       return;
     }
     // R313 c, R318 b, c: inside the quiet a press does nothing but start the quiet again from this press, and say,
@@ -979,7 +1002,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           sectionRef={foundHead}
           headRef={headRefFor}
           cardRef={cardRefFor}
-          onDecide={(i, d) => void decideHeld(i, d)}
+          failed={failed}
+          onDecide={(i, d, how) => void decideHeld(i, d, how)}
           onShowArrived={layOutAgain}
         />
       )}
@@ -1162,7 +1186,9 @@ interface FoundFilesProps {
   headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
   sectionRef: Ref<HTMLHeadingElement>;
-  onDecide(item: HeldItem, decision: HeldFileDecision): void;
+  /** Sources whose record could not be read. */
+  failed: ReadonlySet<string>;
+  onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
   onShowArrived(): void;
 }
 
@@ -1192,7 +1218,7 @@ function describeRecord(item: HeldItem, record: SourceFile | undefined): string 
  * and stays). Files that arrive are only counted, on a line in a place kept for it above the groups (laid out whether
  * or not it says anything, so its appearing moves nothing); "Show them" lays the section out afresh.
  */
-function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, headRef, cardRef, onDecide, onShowArrived }: FoundFilesProps) {
+function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, headRef, cardRef, onDecide, onShowArrived }: FoundFilesProps) {
   // Re-rendered when a record is read: the names depend on every waiting file's record.
   useSyncExternalStore(store.subscribe, store.version);
   const right = items.filter(looksRight);
@@ -1226,6 +1252,8 @@ function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, secti
               store={store}
               named={names.get(i.id)!}
               end={ended[i.id] ?? (waiting.has(i.id) ? undefined : "gone")}
+              unread={!!i.sourceId && failed.has(i.sourceId)}
+              epoch={waiting}
               busy={busy[i.id]}
               error={errors[i.id]}
               headRef={headRef}
@@ -1280,10 +1308,27 @@ interface FileCardProps {
   error: string | undefined;
   /** R319: what became of this file — decided here, found already decided, or no longer listed; undefined while it waits. */
   end: FileEnd | "gone" | undefined;
+  /** R322 b: its record could not be read. */
+  unread: boolean;
+  /** R322 a: new at every change of the queue the screen knows of (a re-render, so the card measures where it stands). */
+  epoch: unknown;
   headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
-  onDecide(item: HeldItem, decision: HeldFileDecision): void;
+  onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
 }
+
+/** R322 a: where a control stands, in the viewport (as the pointer sees it) or in the page (scrolling left out). */
+interface Spot {
+  x: number;
+  y: number;
+}
+const spotOf = (el: Element, page: boolean): Spot => {
+  const r = el.getBoundingClientRect();
+  return page ? { x: r.left + window.scrollX, y: r.top + window.scrollY } : { x: r.left, y: r.top };
+};
+const sameSpot = (a: Spot, b: Spot): boolean => Math.abs(a.x - b.x) <= PRESS_PLACE_TOLERANCE_PX && Math.abs(a.y - b.y) <= PRESS_PLACE_TOLERANCE_PX;
+/** R322 b: the Creators and Year rows before the record is read, when it has none, and when it could not be read. */
+export const RECORD_ROW_TEXT = { reading: "…", none: "—", unread: "This source's record could not be loaded." } as const;
 
 /**
  * One waiting file: the record it was found for (title, creators, year — its source's, once read), the entry's own
@@ -1294,7 +1339,7 @@ interface FileCardProps {
  * "Removing this file…" and looks busy, the other looks unavailable; R318 b: the press renews the quiet); R313 b — a key held down never decides: a repeated keydown
  * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
-const FileCard = memo(function FileCard({ item, store, named, end, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
+const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
   const h = item.heldFile;
   const record = useRecord(store, item.sourceId);
   const s = record?.source;
@@ -1304,8 +1349,54 @@ const FileCard = memo(function FileCard({ item, store, named, end, busy, error, 
   const advice = adviceOf(h);
   /** A repeated keydown was seen and not yet let go: the click it makes is not a press (R313 b). */
   const repeating = useRef(false);
+  /**
+   * R322 a: how a press came, per control.
+   *  - `seen`: where the control stood in the viewport when a mouse last MOVED over it (pointermove). A mouse press is
+   *    taken only if the mouse moved over this control and it still stands there (± PRESS_PLACE_TOLERANCE_PX). So a
+   *    control that slid under a resting pointer — the section jumped, a card above grew, the list was read again, the
+   *    window was resized, or the page was scrolled by the wheel under the resting pointer (viewport positions: the
+   *    control moved under it) — takes no press until the pointer moves over it again.
+   *  - `still`: where it stood in the page (scrolling left out: a finger lands after the scroll ends) and since when. It
+   *    is measured after every render of the card (`epoch` re-renders every card at each change of the queue the screen
+   *    knows of) and compared again at a touch or pen pointerdown; a change found there counts as a move at that moment.
+   *    A touch or pen press is taken only if the control has stood still for DECIDE_SETTLE_MS before it.
+   *  - `down`: the pointerdown seen on this control for the click to come (its pointer type and, for touch/pen, whether
+   *    it stood still). A click with no pointerdown before it is the click a key (or an assistive tool) makes: as built.
+   *    A mouse press always has its pointerdown on this control (a click goes to the element both down and up were on),
+   *    so it never passes as a key's; a click whose own event says it came from a pointer but whose pointerdown was not
+   *    seen is not taken.
+   */
+  const seen = useRef<Partial<Record<HeldFileDecision, Spot>>>({});
+  const still = useRef<Partial<Record<HeldFileDecision, Spot & { since: number }>>>({});
+  const down = useRef<{ d: HeldFileDecision; type: string; still: boolean } | null>(null);
+  const buttons = useRef<Partial<Record<HeldFileDecision, HTMLButtonElement | null>>>({});
+  /** Measures where a control stands now: true when it has stood there for the quiet's time; a change is a move, now. */
+  const measure = (d: HeldFileDecision, now: number): boolean => {
+    const el = buttons.current[d];
+    if (!el) return false;
+    const at = spotOf(el, true);
+    const was = still.current[d];
+    if (was && sameSpot(was, at)) return now - was.since >= DECIDE_SETTLE_MS;
+    still.current[d] = { ...at, since: now };
+    return false;
+  };
+  // After every render (and so at every change of the queue the screen knows of: `epoch`).
+  useLayoutEffect(() => {
+    const now = Date.now();
+    measure("attach", now);
+    measure("discard", now);
+  });
+  void epoch;
+  const onPointerMove = (d: HeldFileDecision) => (e: PointerEvent<HTMLButtonElement>) => {
+    if (e.pointerType === "mouse") seen.current[d] = spotOf(e.currentTarget, false);
+  };
+  const onPointerDown = (d: HeldFileDecision) => (e: PointerEvent<HTMLButtonElement>) => {
+    down.current = { d, type: e.pointerType, still: e.pointerType !== "mouse" && measure(d, Date.now()) };
+  };
   const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
     if (e.key !== "Enter" && e.key !== " ") return;
+    // A key on this control: a pointerdown seen before is not this press's.
+    down.current = null;
     if (e.repeat) {
       e.preventDefault();
       repeating.current = true;
@@ -1316,9 +1407,19 @@ const FileCard = memo(function FileCard({ item, store, named, end, busy, error, 
     if (e.key === "Enter" || e.key === " ") repeating.current = false;
   };
   // Every press goes to the screen, also while this file's decision is out: one that is not taken renews the quiet (R318 b).
-  const press = (d: HeldFileDecision) => () => {
+  const press = (d: HeldFileDecision) => (e: MouseEvent<HTMLButtonElement>) => {
     if (repeating.current) return;
-    onDecide(item, d);
+    const p = down.current;
+    down.current = null;
+    const type = (e.nativeEvent as { pointerType?: unknown }).pointerType;
+    let how: PressCheck = "ok";
+    if (p && p.d === d) {
+      if (p.type === "mouse") {
+        const was = seen.current[d];
+        how = was && sameSpot(was, spotOf(e.currentTarget, false)) ? "ok" : "moved";
+      } else how = p.still ? "ok" : "moved";
+    } else if (type === "mouse" || type === "touch" || type === "pen") how = "moved";
+    onDecide(item, d, how);
   };
   /** R318 a: the pressed control says it is working; its name still says which file. */
   const words = (d: HeldFileDecision) => (busy === d ? HELD_DECIDE_WORDS[d].working : HELD_DECIDE_WORDS[d].idle);
@@ -1327,26 +1428,14 @@ const FileCard = memo(function FileCard({ item, store, named, end, busy, error, 
       <h4 className="ao-review__title ao-review__file-title" tabIndex={-1} ref={(el) => headRef(item.id, el)}>
         <UserText>{recordTitle || "Untitled"}</UserText>
       </h4>
-      {(creators || year) && (
-        <dl className="ao-review__fields">
-          {creators && (
-            <>
-              <dt>Creators</dt>
-              <dd>
-                <UserText>{creators}</UserText>
-              </dd>
-            </>
-          )}
-          {year && (
-            <>
-              <dt>Year</dt>
-              <dd>
-                <UserText>{year}</UserText>
-              </dd>
-            </>
-          )}
-        </dl>
-      )}
+      {/* R322 b: the rows have their place from the first showing: "…" while the record is being read (not known yet),
+          "—" when the record has none, and the screen's sentence when it could not be read. */}
+      <dl className="ao-review__fields">
+        <dt>Creators</dt>
+        <dd>{record ? creators ? <UserText>{creators}</UserText> : RECORD_ROW_TEXT.none : !item.sourceId ? RECORD_ROW_TEXT.none : unread ? RECORD_ROW_TEXT.unread : RECORD_ROW_TEXT.reading}</dd>
+        <dt>Year</dt>
+        <dd>{record ? year ? <UserText>{year}</UserText> : RECORD_ROW_TEXT.none : !item.sourceId || unread ? RECORD_ROW_TEXT.none : RECORD_ROW_TEXT.reading}</dd>
+      </dl>
       {item.reasons[0] && <UserText as="p">{item.reasons[0]}</UserText>}
       <dl className="ao-review__fields">
         {advice && (
@@ -1413,42 +1502,49 @@ const FileCard = memo(function FileCard({ item, store, named, end, busy, error, 
         </div>
       ) : (
         <>
-        {error && (
-          <p role="alert" className="ao-error">
-            {error === HELD_NO_ANSWER_TEXT ? (
-              HELD_NO_ANSWER_TEXT
-            ) : (
-              <>
-                The decision was not recorded. <UserText>{error}</UserText>
-              </>
-            )}
-          </p>
-        )}
-        <div className="ao-import__actions">
-          <button
-            type="button"
-            className="ao-import__primary"
-            aria-label={`${words("attach")} for ${named}`}
-            aria-disabled={busy ? true : undefined}
-            aria-busy={busy === "attach" || undefined}
-            onKeyDown={onKeyDown}
-            onKeyUp={onKeyUp}
-            onClick={press("attach")}
-          >
-            {words("attach")}
-          </button>
-          <button
-            type="button"
-            aria-label={`${words("discard")} for ${named}`}
-            aria-disabled={busy ? true : undefined}
-            aria-busy={busy === "discard" || undefined}
-            onKeyDown={onKeyDown}
-            onKeyUp={onKeyUp}
-            onClick={press("discard")}
-          >
-            {words("discard")}
-          </button>
-        </div>
+          <div className="ao-import__actions">
+            <button
+              type="button"
+              className="ao-import__primary"
+              aria-label={`${words("attach")} for ${named}`}
+              aria-disabled={busy ? true : undefined}
+              aria-busy={busy === "attach" || undefined}
+              ref={(el) => void (buttons.current.attach = el)}
+              onPointerMove={onPointerMove("attach")}
+              onPointerDown={onPointerDown("attach")}
+              onKeyDown={onKeyDown}
+              onKeyUp={onKeyUp}
+              onClick={press("attach")}
+            >
+              {words("attach")}
+            </button>
+            <button
+              type="button"
+              aria-label={`${words("discard")} for ${named}`}
+              aria-disabled={busy ? true : undefined}
+              aria-busy={busy === "discard" || undefined}
+              ref={(el) => void (buttons.current.discard = el)}
+              onPointerMove={onPointerMove("discard")}
+              onPointerDown={onPointerDown("discard")}
+              onKeyDown={onKeyDown}
+              onKeyUp={onKeyUp}
+              onClick={press("discard")}
+            >
+              {words("discard")}
+            </button>
+          </div>
+          {/* R322 b: a refusal's or a give-up's sentence comes BELOW the two controls, so they do not move. */}
+          {error && (
+            <p role="alert" className="ao-error">
+              {error === HELD_NO_ANSWER_TEXT ? (
+                HELD_NO_ANSWER_TEXT
+              ) : (
+                <>
+                  The decision was not recorded. <UserText>{error}</UserText>
+                </>
+              )}
+            </p>
+          )}
         </>
       )}
     </li>
