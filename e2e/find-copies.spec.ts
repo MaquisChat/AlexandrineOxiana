@@ -21,7 +21,9 @@
  *  - the copy services, for each work, in the services' own shapes: OpenAlex by DOI 404; arXiv by first author and
  *    title an empty feed (`arxiv-query-empty-handbuilt.xml`, already there); Europe PMC by DOI an empty result
  *    (`europepmc-search-empty-handbuilt.json`, already there) — except for RIGHT, an open-access result with a made-up
- *    PMC id (`europepmc-search-f14-right-handbuilt.json`); Semantic Scholar by DOI 404 — except for WRONG, PAIR_A and
+ *    PMC id, PMC955550001 — made up, and far beyond the range of real ids (in the code's own nine-digit limit,
+ *    `^PMC\d{1,9}$`), so that the recorded address is no real article's (R332 e)
+ *    (`europepmc-search-f14-right-handbuilt.json`); Semantic Scholar by DOI 404 — except for WRONG, PAIR_A and
  *    PAIR_B, an open-access PDF on arxiv.org under a made-up identifier (`semanticscholar-f14-<work>-handbuilt.json`);
  *  - the files (`files`): RIGHT's Europe PMC address redirects (302) to a made-up address on www.ncbi.nlm.nih.gov,
  *    which serves `f14-right-handbuilt.pdf`; arxiv.org/pdf/5555.01402–01404 serve `f14-wrong-handbuilt.pdf`,
@@ -51,6 +53,13 @@
  * would show "Not taken. Look at the file, then move the pointer and press again." on the card; `decide` accepts only
  * the quiet's sentence as a reason to press again, so that one fails the scenario.
  *
+ * **"Not asked" (R332 c).** That a copy service was not asked is read from what the service already writes: its lookup
+ * cache, where every answer a lookup of a project without identifiable data gets is kept under the hash of the request's
+ * cache key (`copyServicesAsked`). The rules scenario and the Search sources scenario assert there is no copy service's
+ * answer for the work while the rules or the settings stop it, and — as the control that the look sees an ask — that
+ * the answers of the services then asked are there. The library's unit test of the same rule is runner.test.ts's
+ * "nothing is asked and nothing downloaded when the rules do not allow free_copy, and the entry says so in words".
+ *
  * **Search sources (R326, R330 c).** A save of "Search sources" wakes the entries those settings had stopped, and
  * "Try again" is offered on them. Scenario 7 proves it end to end: with every copy service off the row rests "Record
  * complete" with "Switched off in Search sources." and "Try again"; "Try again" while they are still off leaves it so,
@@ -59,6 +68,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import { parseGovernance } from "../packages/core/src/governance/schema.js";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
 import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LOOKUP_FIXTURES } from "./paths.js";
@@ -519,7 +529,7 @@ test("a found file waits for the researcher and is used", async ({ page, app }) 
         via: "service",
         service: "europepmc",
         // The address the copy was offered at, without its query (cleanAcquiredAddress), not the redirect's target.
-        address: "https://europepmc.org/articles/PMC5555001",
+        address: "https://europepmc.org/articles/PMC955550001",
         access: "public",
         check: { result: "match", by: "title" },
       },
@@ -698,7 +708,10 @@ test("two found files are each decided by their own act (by keyboard)", async ({
 /**
  * "Save changes" on the Governance screen, then what the screen shows once the save is answered: the button disabled
  * (nothing left to save). "Saved." is shown too, but the screen's re-read of the rules after the save clears it, so on a
- * loaded machine it can come and go between two looks (seen once in WebKit). What the service holds is then read.
+ * loaded machine it can come and go between two looks (seen once in WebKit). What the service holds is then read as
+ * data (R332 d): the project's rules parsed by the product's own parser (`parseGovernance`, @ao/core), whose
+ * `acquireMethods` holds `free_copy` or lacks it. Each save flips it from what it was (the set-up's rules name no list,
+ * which is every way), so the poll is answered only by the save itself.
  */
 async function saveRules(page: Page, app: AppHarness, projectId: string, freeCopies: boolean): Promise<void> {
   await page.getByRole("button", { name: "Save changes" }).click();
@@ -707,10 +720,25 @@ async function saveRules(page: Page, app: AppHarness, projectId: string, freeCop
   await expect
     .poll(async () => {
       const yaml = (await app.api<{ yaml: string }>("GET", `/projects/${projectId}/governance`)).body.yaml;
-      return /acquireMethods/.test(yaml) && /free_copy/.test(yaml);
+      // The rules as data, read by the product's own parser (a project whose rules name no list has every way).
+      return parseGovernance(yaml).acquireMethods.includes("free_copy");
     }, { timeout: STATE_TIMEOUT })
     .toBe(freeCopies);
 }
+
+/**
+ * R332 c (M5): which copy services were ASKED for a work, by what the service already writes — its lookup cache. For a
+ * project without identifiable data (these rules) every answer a lookup gets is written to the library's
+ * `.cache/lookups/<sha256 of the request's cache key>.json` (lookup/http.ts `get`, `writeCache`), a not-found answer
+ * included; the copy services' keys are free-copy.ts's own: `openalex:doi:<doi>`, `free-copy:europepmc:<doi>`,
+ * `free-copy:semanticscholar:<doi>` (the DOI in lower case). True for each service whose answer is there.
+ */
+function copyServicesAsked(libraryPath: string, w: Work): { openalex: boolean; europepmc: boolean; semanticscholar: boolean } {
+  const cached = (key: string) => existsSync(join(libraryPath, ".cache", "lookups", `${sha256(Buffer.from(key, "utf8"))}.json`));
+  const doi = w.doi.toLowerCase();
+  return { openalex: cached(`openalex:doi:${doi}`), europepmc: cached(`free-copy:europepmc:${doi}`), semanticscholar: cached(`free-copy:semanticscholar:${doi}`) };
+}
+const NONE_ASKED = { openalex: false, europepmc: false, semanticscholar: false };
 
 test("the project's rules switch free copies off", async ({ page, app }) => {
   test.setTimeout(240_000);
@@ -720,7 +748,7 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
   const card = () => page.getByRole("region", { name: WORDS.findCard });
   const box = () => card().getByRole("checkbox", { name: WORDS.freeCopies });
 
-  await test.step("set-up; on the Governance screen's card, free copies unticked (nothing asked) and saved", async () => {
+  await test.step("set-up; on the Governance screen's card, free copies unticked (no reason asked) and saved", async () => {
     const made = await libraryWithProject(app, page, { library: "Rules library", project: "Rules first", governanceYaml: LOOKUP_RULES });
     projectId = made.projectId;
     libraryPath = made.libraryPath;
@@ -735,7 +763,7 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
     await saveRules(page, app, projectId, false);
   });
 
-  await test.step("the next reference rests “Record complete” with the sentence that the rules do not allow it; nothing downloaded, nothing waits", async () => {
+  await test.step("the next reference rests “Record complete” with the sentence that the rules do not allow it; no copy service asked, nothing downloaded, nothing waits", async () => {
     await openFind(page, projectId);
     await addLines(page, [PAIR_A.typed]);
     await expect(stateOfRow(page, PAIR_A)).toHaveText(WORDS.recordComplete, { timeout: STATE_TIMEOUT });
@@ -745,16 +773,28 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
     expect(placesOf(libraryPath, fileBytes("PAIR_A"))).toEqual([]);
     expect(filesUnder(join(projectRoot, "find", "held"))).toEqual([]);
     expect(filesUnder(join(libraryPath, ".tmp")).filter((f) => f.startsWith("find-"))).toEqual([]);
+    // Nothing asked of a copy service: the lookup cache holds the record's lookups, but no copy service's answer.
+    expect(filesUnder(join(libraryPath, ".cache", "lookups")).length).toBeGreaterThan(0);
+    expect(copyServicesAsked(libraryPath, PAIR_A)).toEqual(NONE_ASKED);
   });
 
-  await test.step("“Try again” under the same rules: still not allowed, still nothing downloaded", async () => {
+  await test.step("“Try again” under the same rules: still not allowed, still nothing asked or downloaded", async () => {
+    const before = (await entryOf(app, projectId, PAIR_A)).updatedAt;
     const retry = rowOf(page, PAIR_A).getByRole("button", { name: act(WORDS.tryAgain, PAIR_A.typed) });
     await retry.click();
     // The act answered: the button no longer says "Trying again…".
     await expect(retry).toHaveText(WORDS.tryAgain, { timeout: STATE_TIMEOUT });
+    // Through the service: the entry was taken up again (written anew) and rests again for the same reason.
+    await expect
+      .poll(async () => {
+        const e = await entryOf(app, projectId, PAIR_A);
+        return e.updatedAt !== before && e.state === "record-complete" ? e.reason?.code : null;
+      }, { timeout: STATE_TIMEOUT })
+      .toBe("copy-not-allowed");
     await expect(reasonOfRow(page, PAIR_A)).toHaveText(WORDS.copyNotAllowed, { timeout: STATE_TIMEOUT });
     await expect(stateOfRow(page, PAIR_A)).toHaveText(WORDS.recordComplete);
     expect(placesOf(libraryPath, fileBytes("PAIR_A"))).toEqual([]);
+    expect(copyServicesAsked(libraryPath, PAIR_A)).toEqual(NONE_ASKED);
   });
 
   await test.step("free copies ticked again (the reason asked and given) and saved: the entry is looked at again and the file found waits", async () => {
@@ -775,6 +815,8 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
     expect(await filesOfRecord(app, projectId, PAIR_A)).toEqual([]);
     const e = await entryOf(app, projectId, PAIR_A);
     expect(placesOf(projectRoot, fileBytes("PAIR_A"))).toEqual([`find/held/${e.id}.pdf`]);
+    // The control: now that the copy services were asked, their answers are in the cache (so the look above sees an ask).
+    expect(copyServicesAsked(libraryPath, PAIR_A)).toEqual({ openalex: true, europepmc: true, semanticscholar: true });
   });
 });
 
@@ -810,11 +852,12 @@ test("a copy service switched off in Search sources is not asked; switched on ag
   }
   /**
    * Nothing of RIGHT's file anywhere in the library, no other file waiting than PAIR_B's (found before), no download's
-   * part file: no copy service was asked for it.
+   * part file, and no copy service's answer for it in the lookup cache: no copy service was asked for it.
    */
   async function nothingFetched(): Promise<void> {
     expect(placesOf(libraryPath, fileBytes("RIGHT"))).toEqual([]);
     expect(filesUnder(join(projectRoot, "find", "held"))).toEqual([`${(await entryOf(app, projectId, PAIR_B)).id}.pdf`]);
+    expect(copyServicesAsked(libraryPath, RIGHT)).toEqual(NONE_ASKED);
     expect(filesUnder(join(libraryPath, ".tmp")).filter((f) => f.startsWith("find-"))).toEqual([]);
   }
   const retryOf = (w: Work) => rowOf(page, w).getByRole("button", { name: act(WORDS.tryAgain, w.typed) });
@@ -835,6 +878,8 @@ test("a copy service switched off in Search sources is not asked; switched on ag
     // "Try again" is not offered on "No open copy" when every service asked answered (FindEntryRow, F11).
     await expect(retryOf(WRONG)).toHaveCount(0);
     expect(placesOf(libraryPath, fileBytes("WRONG"))).toEqual([]);
+    // By the lookup cache (see copyServicesAsked): Europe PMC, on, was asked; Semantic Scholar and OpenAlex, off, were not.
+    expect(copyServicesAsked(libraryPath, WRONG)).toEqual({ openalex: false, europepmc: true, semanticscholar: false });
   });
 
   await test.step("Semantic Scholar switched on and saved; a new reference whose copy is there: the file is found and waits", async () => {
@@ -884,6 +929,7 @@ test("a copy service switched off in Search sources is not asked; switched on ag
     expect(e).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
     expect(placesOf(projectRoot, fileBytes("RIGHT"))).toEqual([`find/held/${e.id}.pdf`]);
     expect(await filesOfRecord(app, projectId, RIGHT)).toEqual([]);
+    expect(copyServicesAsked(libraryPath, RIGHT)).toEqual({ openalex: false, europepmc: true, semanticscholar: false });
     // The others are as they were: the first still has no open copy, PAIR_B's file still waits.
     await expect(stateOfRow(page, WRONG)).toHaveText(WORDS.noOpenCopy);
     await expect(stateOfRow(page, PAIR_B)).toHaveText(WORDS.needsCheck);

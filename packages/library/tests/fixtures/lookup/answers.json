@@ -65,8 +65,8 @@
     "https://api.semanticscholar.org/graph/v1/paper/DOI:10.5555/ao.f14.pair-b?fields=openAccessPdf": { "status": 200, "file": "semanticscholar-f14-pairB-handbuilt.json" }
   },
   "files": {
-    "https://europepmc.org/articles/PMC5555001?pdf=render": { "status": 302, "location": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5555001/pdf/f14-right.pdf" },
-    "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5555001/pdf/f14-right.pdf": { "status": 200, "file": "f14-right-handbuilt.pdf" },
+    "https://europepmc.org/articles/PMC955550001?pdf=render": { "status": 302, "location": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC955550001/pdf/f14-right.pdf" },
+    "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC955550001/pdf/f14-right.pdf": { "status": 200, "file": "f14-right-handbuilt.pdf" },
     "https://arxiv.org/pdf/5555.01402": { "status": 200, "file": "f14-wrong-handbuilt.pdf" },
     "https://arxiv.org/pdf/5555.01403": { "status": 200, "file": "f14-pair-a-handbuilt.pdf" },
     "https://arxiv.org/pdf/5555.01404": { "status": 200, "file": "f14-pair-b-handbuilt.pdf" }
