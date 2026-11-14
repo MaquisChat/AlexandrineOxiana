@@ -200,6 +200,8 @@ function registerSearchKey(app: FastifyInstance, state: ServiceState, name: KeyN
     changed: (value) => {
       state.searchKeyChanged(name, value);
       if (name === "elicit-api-key") forgetElicitRefusal();
+      // R312 c (R297 c): an OpenAlex key saved wakes the entries waiting for its spent allowance (a DELETE wakes nothing).
+      if (name === "openalex-api-key" && value !== null) state.wakeFindAllowance();
     },
   });
 }

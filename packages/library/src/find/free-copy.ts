@@ -196,7 +196,7 @@ function firstFamily(w: WorkCandidate): string | undefined {
 const contentWords = (t: string): string[] => segmentsOf(t.slice(0, 4000)).flatMap(segmentTokens).filter((x) => !STOP_WORDS.has(x));
 
 /** True when two titles have the same content words in the same order, nothing extra on either side (R257 a, R261). */
-function sameTitle(a: string, b: string): boolean {
+export function sameTitle(a: string, b: string): boolean {
   const A = contentWords(a);
   const B = contentWords(b);
   return A.length > 0 && A.length === B.length && A.every((x, i) => x === B[i]);
@@ -482,12 +482,15 @@ async function fromInternetArchive(w: WorkCandidate, ctx: LookupContext): Promis
     return j.response.docs.slice(0, RESULTS_READ).flatMap((d) => (isRecord(d) && typeof d.identifier === "string" && IA_ID.test(d.identifier) ? [d.identifier] : []));
   });
   const out: Raw[] = [];
+  // M11 (R292): an item whose details could not be had (refused, 5xx, timed out, unreadable; a 404 is not that).
+  let itemFailed: unknown;
   for (const id of ids ?? []) {
     if (out.length >= FREE_COPY_OFFERS_PER_SOURCE) break;
     let item: Record<string, unknown> | null;
     try {
       item = await ask(ctx, `https://archive.org/metadata/${id}`, `free-copy:internetarchive:metadata:${id}`, recordOf);
     } catch (e) {
+      itemFailed = e;
       // A failed item never throws away what the earlier items found (R256 a); a 429 stops asking for more.
       if (e instanceof Throttled) {
         ctx.debug?.("free copy via internetarchive: it asked the app to slow down; no more items asked");
@@ -502,6 +505,8 @@ async function fromInternetArchive(w: WorkCandidate, ctx: LookupContext): Promis
     if (pdf) out.push({ url: `https://archive.org/download/${id}/${encodeURIComponent(pdf)}`, kind: "pdf", built: true });
     if (epub) out.push({ url: `https://archive.org/download/${id}/${encodeURIComponent(epub)}`, kind: "epub", built: true });
   }
+  // M11: the search answered but an item failed and no offer came of it: the service counts as failed (R282 e).
+  if (itemFailed !== undefined && !out.length) throw itemFailed;
   return out;
 }
 
@@ -513,16 +518,19 @@ const rank = (v: CopyOffer["version"]) => (v ? RANK[v]! : 3);
 /**
  * Where free copies of `work` are, from the services in `sources` (asked in parallel; offers in the plan's order).
  * `email` is sent to Unpaywall only, and Unpaywall is not asked without one. Never rejects: a service that fails is
- * skipped (a debug note names the service and an HTTP status, never an address or the e-mail).
+ * skipped (a debug note names the service and an HTTP status, never an address or the e-mail), and named in `failed`
+ * (R282 e: its request failed, timed out, was refused or answered something unreadable — never a service that
+ * answered "nothing", nor one that was not asked).
  */
 export async function findFreeCopies(
   work: WorkCandidate,
   ctx: LookupContext,
   sources: FreeCopySource[],
   email?: string,
-): Promise<{ offers: CopyOffer[]; elsewhere: Array<{ host: string; url: string }> }> {
+): Promise<{ offers: CopyOffer[]; elsewhere: Array<{ host: string; url: string }>; failed: FreeCopySource[] }> {
   const wanted = new Set(Array.isArray(sources) ? sources : []);
   const order = FREE_COPY_SOURCES.filter((s) => wanted.has(s));
+  const failedSet = new Set<FreeCopySource>();
   const askOne = async (s: FreeCopySource): Promise<Raw[]> => {
     try {
       switch (s) {
@@ -545,6 +553,7 @@ export async function findFreeCopies(
       const why =
         e instanceof Throttled ? "it asked the app to slow down (left alone for now)" : e instanceof BadAnswer ? "its answer was not of the expected shape" : e instanceof LookupHttpError && e.status ? `HTTP ${e.status}` : "it could not be reached";
       ctx.debug?.(`free copy via ${s} skipped: ${why}`);
+      failedSet.add(s);
       return [];
     }
   };
@@ -584,5 +593,5 @@ export async function findFreeCopies(
       offered.add(o.url);
     }
   });
-  return { offers, elsewhere };
+  return { offers, elsewhere, failed: order.filter((s) => failedSet.has(s)) };
 }

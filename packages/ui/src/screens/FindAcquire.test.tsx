@@ -156,7 +156,8 @@ function show(search = "") {
 
 const live = () => screen.getByTestId("find-live");
 const queueList = () => screen.getByRole("list", { name: "Queue" });
-const rows = () => within(queueList()).queryAllByRole("listitem");
+/** The queue's rows (a row's own lists, such as "Where to get it", are not rows). */
+const rows = () => [...queueList().querySelectorAll<HTMLElement>(":scope > li")];
 const row = (typed: string) => {
   const r = rows().find((li) => li.querySelector("[data-entry-text]")?.textContent === typed);
   if (!r) throw new Error(`no row for ${typed}`);
@@ -2715,5 +2716,262 @@ describe("FindAcquire: round 3 (R291, R287 c)", () => {
     await waitFor(() => expect(document.activeElement).toBe(within(row("Ann Swidler")).getByRole("button", { name: "Remove from the queue: “Ann Swidler”" })));
     await waitFor(() => expect(h.said.join(" | ")).toContain("“Ann Swidler”: Looking it up."));
     h.stop();
+  });
+});
+
+describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
+  type Case = { typed: string; o: Partial<FindEntryView>; phrase: string; sentence?: string; controls: string[] };
+  const T = (s: string) => `“${s}”`;
+  const tryAgain = (t: string) => `Try again: ${T(t)}`;
+  const open = (t: string) => `Open: ${T(t)}`;
+  const removeIt = (t: string) => `Remove from the queue: ${T(t)}`;
+  const check = (t: string) => `Check the file: ${T(t)}`;
+  const withSource = (o: Partial<FindEntryView>): Partial<FindEntryView> => ({ sourceId: SID, chosen: "c1", candidates: [cand({ id: "c1" })], ...o });
+  const rc = (code: string) => withSource({ state: "record-complete", reason: { code: code as never } });
+  const nc = (code: string) => withSource({ state: "needs-check", reason: { code: code as never } });
+  const noc = (code?: string) => withSource({ state: "no-open-copy", ...(code ? { reason: { code: code as never } } : {}) });
+  // The engine's list ("What the screens must now show"): every state and reason, its phrase, its sentence, exactly its controls.
+  const cases: Case[] = [
+    ...["copy-not-allowed", "copy-store-not-allowed", "copy-no-legal-basis", "held-full"].map((code) => ({ typed: `rc ${code}`, o: rc(code), phrase: "Record complete", sentence: FIND_REASON_TEXT[code as keyof typeof FIND_REASON_TEXT], controls: ["try", "open", "remove"] })),
+    { typed: "rc switched-off", o: rc("switched-off"), phrase: "Record complete", sentence: FIND_REASON_TEXT["switched-off"], controls: ["open", "remove"] },
+    { typed: "rc plain", o: withSource({ state: "record-complete" }), phrase: "Record complete", controls: ["open", "remove"] },
+    { typed: "looking for copy", o: withSource({ state: "looking-for-copy" }), phrase: "Looking for a copy", controls: ["open", "remove"] },
+    { typed: "copy next try", o: withSource({ state: "looking-for-copy", nextTryAt: "2026-11-14T12:00:00.000Z" }), phrase: "Looking for a copy", controls: ["try", "open", "remove"] },
+    { typed: "fetching", o: withSource({ state: "fetching" }), phrase: "Fetching", controls: ["open", "remove"] },
+    ...["file-looks-right", "file-other-doi", "file-title-absent", "file-no-text", "file-other-version", "file-other-kind"].map((code) => ({ typed: `nc ${code}`, o: nc(code), phrase: "Needs your check", sentence: FIND_REASON_TEXT[code as keyof typeof FIND_REASON_TEXT], controls: ["check", "open", "remove"] })),
+    { typed: "no copy", o: noc(), phrase: "No open copy", controls: ["open", "remove"] },
+    { typed: "no copy unreachable", o: noc("copy-some-unreachable"), phrase: "No open copy", sentence: FIND_REASON_TEXT["copy-some-unreachable"], controls: ["try", "open", "remove"] },
+    { typed: "no copy not this file", o: noc("not-this-file"), phrase: "No open copy", sentence: FIND_REASON_TEXT["not-this-file"], controls: ["open", "remove"] },
+    { typed: "no copy removed", o: noc("record-removed"), phrase: "No open copy", sentence: FIND_REASON_TEXT["record-removed"], controls: ["remove"] },
+    { typed: "failed unreachable", o: withSource({ state: "failed", reason: { code: "unreachable" } }), phrase: `Could not be done: ${FIND_REASON_TEXT.unreachable}`, controls: ["try", "remove"] },
+    { typed: "failed unexpected", o: withSource({ state: "failed", reason: { code: "unexpected" } }), phrase: `Could not be done: ${FIND_REASON_TEXT.unexpected}`, controls: ["try", "remove"] },
+    { typed: "failed held-full", o: withSource({ state: "failed", reason: { code: "held-full" } }), phrase: `Could not be done: ${FIND_REASON_TEXT["held-full"]}`, controls: ["try", "remove"] },
+    { typed: "in library", o: withSource({ state: "in-library" }), phrase: "In your library", controls: ["open", "remove"] },
+    { typed: "rc unknown reason", o: rc("from-a-later-build"), phrase: "Record complete", controls: ["open", "remove"] },
+  ];
+  const nameOf = (kind: string, t: string) => ({ try: tryAgain, open, remove: removeIt, check })[kind]!(t);
+
+  it("each state and reason of the copy part: its phrase, the service's sentence and exactly its controls", async () => {
+    useService({ queues: { [PID]: queue(cases.map((c) => entry({ typed: c.typed, ...c.o }))) } });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(cases.length));
+    for (const c of cases) {
+      const r = row(c.typed);
+      expect(r.querySelector(".ao-find__state")?.textContent, c.typed).toBe(c.phrase);
+      const reason = r.querySelector(".ao-find__reason")?.textContent;
+      // A failed entry says its sentence in its phrase; every other says it beside the phrase.
+      expect(reason, c.typed).toBe(c.sentence && !c.phrase.startsWith("Could not") ? c.sentence : undefined);
+      // The controls, in order, buttons and links alike; never a code in the row.
+      const controls = [...r.querySelectorAll(".ao-find__actions button, .ao-find__actions a")].map((el) => el.getAttribute("aria-label"));
+      expect(controls, c.typed).toEqual(c.controls.map((k) => nameOf(k, c.typed)));
+      const shown = r.textContent!.replace(r.querySelector("[data-entry-text]")!.textContent!, "");
+      expect(shown, c.typed).not.toMatch(/copy-|file-|held-full|not-this-file|record-removed|switched-off|from-a-later-build/u);
+      // No offers were given: no "Where to get it".
+      expect(r.textContent, c.typed).not.toContain("Where to get it");
+    }
+  });
+
+  it("Check the file leads to that file's review entry", async () => {
+    const e = entry({ typed: "a found file", ...nc("file-looks-right") });
+    useService({ queues: { [PID]: queue([e]) } });
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const link = within(row("a found file")).getByRole("link", { name: "Check the file: “a found file”" });
+    expect(link.textContent).toBe("Check the file");
+    const want = `${PATHS.reviewQueue}?project=${encodeURIComponent(PID)}&source=${encodeURIComponent(SID)}`;
+    expect(link.getAttribute("href")).toBe(want);
+    await user.click(link);
+    expect(`${window.location.pathname}${window.location.search}`).toBe(want);
+    // The app's route table shows the review queue there, for that record's entries only.
+    expect(routeFor({ pathname: window.location.pathname, search: window.location.search }, testClient())).toBeTruthy();
+  });
+
+  it("Where to get it lists the offers as links and refuses a link that is not https", async () => {
+    const offers = [
+      { label: "Publisher's page", url: "https://doi.org/10.5555/ao.where", host: "doi.org" },
+      { label: "WorldCat", url: "http://www.worldcat.org/search?q=x", host: "www.worldcat.org" },
+      { label: "Open Library", url: "javascript:alert(1)", host: "openlibrary.org" },
+      { label: "A free copy may be at", url: "https://user:secret@files.example.org/a.pdf", host: "files.example.org" },
+      { label: "A free copy may be at", url: "not an address", host: "nowhere" },
+      { label: "Your library's catalogue", url: "https://catalogue.example.edu/search?q=Distinction", host: "<b>catalogue.example.edu</b>" },
+    ] as FindEntryView["offers"];
+    const refusedOnly = [{ label: "WorldCat", url: "ftp://worldcat.org/x", host: "worldcat.org" }] as FindEntryView["offers"];
+    useService({
+      queues: {
+        [PID]: queue([
+          entry({ typed: "with offers", ...noc(), offers }),
+          entry({ typed: "only refused", ...noc(), offers: refusedOnly }),
+          entry({ typed: "unreachable with offers", ...noc("copy-some-unreachable"), offers }),
+          entry({ typed: "removed with offers", ...noc("record-removed"), offers }),
+        ]),
+      },
+    });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(4));
+    const list = within(row("with offers")).getByRole("list", { name: "Where to get it: “with offers”" });
+    const links = within(list).getAllByRole("link");
+    expect(links.map((a) => [a.getAttribute("href"), a.getAttribute("aria-label")])).toEqual([
+      ["https://doi.org/10.5555/ao.where", "Publisher's page (doi.org): “with offers”"],
+      // R313 h: the host named is the address's own, never the one the service sent.
+      ["https://catalogue.example.edu/search?q=Distinction", "Your library's catalogue (catalogue.example.edu): “with offers”"],
+    ]);
+    for (const a of links) {
+      expect(a.getAttribute("target")).toBe("_blank");
+      expect(a.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+    // Label and host are outside text (UserText): markup is shown as text.
+    expect(list.querySelector("b")).toBeNull();
+    expect(links[1]!.querySelectorAll("[dir=auto]").length).toBeGreaterThan(0);
+    expect(row("with offers").textContent).toContain("Where to get it");
+    expect(queueList().innerHTML).not.toMatch(/javascript:|secret|ftp:|http:\/\/www\.worldcat/u);
+    // Nothing left after the refusals: no "Where to get it".
+    expect(row("only refused").textContent).not.toContain("Where to get it");
+    expect(within(row("only refused")).queryAllByRole("link")).toHaveLength(0);
+    // Beside Try again; and never on a record that was removed.
+    expect(within(row("unreachable with offers")).getAllByRole("link")).toHaveLength(2);
+    expect(row("removed with offers").textContent).not.toContain("Where to get it");
+    expect(within(row("removed with offers")).queryAllByRole("link")).toHaveLength(0);
+  });
+
+  describe("R311 a: in the desktop app, Where to get it is never a dead link", () => {
+    const g = globalThis as { isTauri?: unknown };
+    const offers = [
+      { label: "Publisher's page", url: "https://doi.org/10.5555/ao.where", host: "doi.org" },
+      { label: "WorldCat", url: "http://www.worldcat.org/search?q=x", host: "www.worldcat.org" },
+      { label: "Open Library", url: "javascript:alert(1)", host: "openlibrary.org" },
+      { label: "Your library's catalogue", url: "https://catalogue.example.edu/search?q=Distinction", host: "<b>catalogue.example.edu</b>" },
+    ] as FindEntryView["offers"];
+    const stubClipboard = (fail = false) => {
+      const writeText = vi.fn(async (_: string) => {
+        if (fail) throw new Error("denied");
+      });
+      Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+      return writeText;
+    };
+    beforeEach(() => {
+      g.isTauri = true;
+    });
+    afterEach(() => {
+      delete g.isTauri;
+      Reflect.deleteProperty(navigator, "clipboard");
+    });
+
+    it("each place is its label and host with Copy address; no link; the hint above the list; a press copies exactly that address and says so once, focus kept", async () => {
+      useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
+      const user = userEvent.setup(); // installs its own clipboard: stubbed after it
+      const writeText = stubClipboard();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("with offers");
+      const list = within(r).getByRole("list", { name: "Where to get it: “with offers”" });
+      expect(within(r).queryAllByRole("link").filter((a) => a.getAttribute("data-act") !== "check")).toHaveLength(0);
+      expect(r.querySelector("a[target=_blank]")).toBeNull();
+      expect(r.textContent).toContain("Paste an address into your browser.");
+      const hint = within(r).getByText("Paste an address into your browser.");
+      expect(hint.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      const copies = within(list).getAllByRole("button", { name: /^Copy address: / });
+      // R318 e: each Copy address is named with its row, as the links are.
+      expect(copies.map((b) => b.getAttribute("aria-label"))).toEqual([
+        "Copy address: Publisher's page (doi.org): “with offers”",
+        "Copy address: Your library's catalogue (catalogue.example.edu): “with offers”",
+      ]);
+      for (const b of copies) expect(b.textContent).toBe("Copy address");
+      // Label and host shown as outside text (UserText): markup stays text.
+      expect(list.querySelector("b")).toBeNull();
+      expect(list.querySelectorAll("[dir=auto]").length).toBeGreaterThan(0);
+      expect(r.innerHTML).not.toMatch(/javascript:|http:\/\/www\.worldcat|openlibrary/u);
+      await user.click(copies[1]!);
+      await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+      expect(writeText).toHaveBeenCalledWith("https://catalogue.example.edu/search?q=Distinction");
+      await waitFor(() => expect(within(r).getAllByText("Address copied.")).toHaveLength(1));
+      expect(within(r).getByText("Address copied.").closest("[aria-live=polite]")).toBeTruthy();
+      expect(document.activeElement).toBe(copies[1]);
+    });
+
+    it("R315 c: a copy that fails shows that place's address as text to select, with the sentence, once; focus kept", async () => {
+      useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
+      const user = userEvent.setup();
+      stubClipboard(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("with offers");
+      const [first, second] = within(r).getAllByRole("button", { name: /^Copy address: / });
+      await user.click(first!);
+      const SAID = "Copying did not work here. Select the address and copy it.";
+      await waitFor(() => expect(within(r).getAllByText(SAID)).toHaveLength(1));
+      // Under that place, not another: the address itself, as outside text, never a link.
+      const place = first!.closest("li")!;
+      expect(within(place).getByText(SAID)).toBeTruthy();
+      const address = within(place).getByText("https://doi.org/10.5555/ao.where");
+      expect(address.closest("[dir=auto]")).toBeTruthy();
+      expect(address.closest("a")).toBeNull();
+      expect(within(second!.closest("li")!).queryByText(/catalogue\.example\.edu\/search/u)).toBeNull();
+      expect(within(r).queryByText("Address copied.")).toBeNull();
+      expect(document.activeElement).toBe(first);
+    });
+
+    it("R313 h: an offer whose host says one site and whose address leads to another is named by the address's host", async () => {
+      const lying = [{ label: "Publisher's page", url: "https://evil.example.net/a.pdf", host: "doi.org" }] as FindEntryView["offers"];
+      useService({ queues: { [PID]: queue([entry({ typed: "lying offer", ...noc(), offers: lying })]) } });
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("lying offer");
+      expect(within(r).getByRole("button", { name: "Copy address: Publisher's page (evil.example.net): “lying offer”" })).toBeTruthy();
+      expect(within(r).getByText("evil.example.net")).toBeTruthy();
+      expect(r.textContent).not.toContain("doi.org");
+    });
+
+    it("in a browser the links stay (no Copy address, no hint)", async () => {
+      delete g.isTauri;
+      useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("with offers");
+      expect(within(r).queryAllByRole("button", { name: /^Copy address/ })).toHaveLength(0);
+      expect(r.textContent).not.toContain("Paste an address into your browser.");
+      expect(within(within(r).getByRole("list", { name: "Where to get it: “with offers”" })).getAllByRole("link")).toHaveLength(2);
+    });
+
+    it("R313 h: in a browser too, the link is named by the host its address leads to", async () => {
+      delete g.isTauri;
+      const lying = [{ label: "Publisher's page", url: "https://evil.example.net/a.pdf", host: "doi.org" }] as FindEntryView["offers"];
+      useService({ queues: { [PID]: queue([entry({ typed: "lying offer", ...noc(), offers: lying })]) } });
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("lying offer");
+      const link = within(r).getByRole("link", { name: "Publisher's page (evil.example.net): “lying offer”" });
+      expect(link.getAttribute("href")).toBe("https://evil.example.net/a.pdf");
+      expect(r.textContent).not.toContain("doi.org");
+    });
+  });
+
+  it("a row's change to needs-check is said once", async () => {
+    const e = entry({ typed: "Bourdieu, Distinction 1984", ...withSource({ state: "fetching" }) });
+    useService({ queues: { [PID]: queue([e]) } });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(events.open()).toBe(true));
+    const h = heard();
+    queues[PID] = queue([{ ...e, state: "needs-check", reason: { code: "file-looks-right" }, updatedAt: "2026-11-13T11:00:00.000Z" }]);
+    events.push(...Array.from({ length: 5 }, () => ({ type: "find.progress", data: { projectId: PID, entryId: e.id, state: "needs-check" } })));
+    await waitFor(() => expect(row("Bourdieu, Distinction 1984").querySelector(".ao-find__state")?.textContent).toBe("Needs your check"));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(h.said.filter((s) => s === "“Bourdieu, Distinction 1984”: Needs your check.")).toHaveLength(1);
+    expect(row("Bourdieu, Distinction 1984").querySelector(".ao-find__reason")?.textContent).toBe(FIND_REASON_TEXT["file-looks-right"]);
+    h.stop();
+  });
+
+  it("Try again on a record waiting for a place among the waiting files sends one retry", async () => {
+    const e = entry({ typed: "waiting for a place", ...rc("held-full") });
+    useService({ queues: { [PID]: queue([e]) } });
+    server.use(http.post(url(`/projects/${PID}/find/${e.id}/retry`), () => HttpResponse.json({ ...e, state: "looking-for-copy", reason: undefined, updatedAt: "2026-11-13T11:00:00.000Z" })));
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const before = calls.length;
+    await user.dblClick(within(row("waiting for a place")).getByRole("button", { name: "Try again: “waiting for a place”" }));
+    await waitFor(() => expect(row("waiting for a place").querySelector(".ao-find__state")?.textContent).toBe("Looking for a copy"));
+    expect(calls.slice(before).filter((c) => c.method === "POST")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/retry`, body: undefined }]);
   });
 });

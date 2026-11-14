@@ -564,7 +564,7 @@ function romanValue(s: string): number | undefined {
  * "3rd", "1st", "4th"); a bare roman numeral ii–xx; or any roman numeral right after a volume
  * word (volume, vol, part, book, edition, ed, band, tome, tomo). Ordinal words ("second") are not.
  */
-function numberValue(word: string, prev: string | undefined): number | undefined {
+export function numberValue(word: string, prev: string | undefined): number | undefined {
   if (/^\d{1,12}$/u.test(word)) return Number(word);
   const o = /^(\d{1,12})(?:st|nd|rd|th)$/u.exec(word);
   if (o) return Number(o[1]);

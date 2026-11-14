@@ -15,12 +15,22 @@
  * An entry made from an author's entry says where it came from — "Added from “<what was typed for the author>”", or
  * "Added from an author's works" when that entry is gone — so a line the app built is never shown as typed alone.
  *
+ * The copy part (Task F11; R282, R296, R301, R303): "Try again" where the engine takes it (a record whose copy the
+ * rules or the waiting files' limit stopped; no open copy because some services could not be reached; a copy wait);
+ * "Needs your check" offers the link "Check the file" to that record's entry in the review queue — the app never
+ * attaches a found file by itself; "No open copy" lists the entry's offers under "Where to get it" (https: only, any
+ * other address refused here); a record removed from the library offers only "Remove from the queue". In the desktop
+ * app, which cannot open an outside address yet (R311 a), each place is its label and host with "Copy address" — no
+ * link — under the line "Paste an address into your browser."; a copy is said once in the list's polite region.
+ *
  * The states of later slices are said in words, with "Remove from the queue" (and "Open" when the entry has a
  * record), and no control of a later slice.
  */
-import { FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
-import { Component, memo, type ReactNode } from "react";
+import { FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindOfferLink, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
+import { Component, memo, useState, type ReactNode } from "react";
 import { creatorsText, isKnownState, kindWords, usableCandidates, yearOf } from "../api/find";
+import { inDesktopShell } from "../desktopShell";
+import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
 
 export type FindActKind = "choose" | "choose-person" | "choose-works" | "open" | "open-there" | "add-here" | "same" | "different" | "retry" | "remove";
@@ -63,7 +73,51 @@ export const FIND_TEXT = {
   noWorks: "No works are listed for this person.",
   /** An entry made from an author's entry whose parent is no longer in the queue (R271 M7). */
   originGone: "Added from an author's works",
+  // Task F11: the copy part.
+  checkFile: "Check the file",
+  whereToGetIt: "Where to get it",
+  // R311 a: the desktop app cannot open an outside address yet, so each place is copied rather than linked.
+  pasteHint: "Paste an address into your browser.",
+  copyAddress: "Copy address",
+  addressCopied: "Address copied.",
+  /** R315 c: a copy that did not work; the address is then shown under its place, to select. */
+  copyFailed: "Copying did not work here. Select the address and copy it.",
 } as const;
+
+/** Reasons on "record-complete" that "Try again" takes (F11: the rules, the store part, the waiting files' limit). */
+const COPY_RETRY_REASONS: ReadonlySet<string> = new Set<FindReasonCode>(["copy-not-allowed", "copy-store-not-allowed", "copy-no-legal-basis", "held-full"]);
+
+/** The record's entry in the project's review queue (the queue opened at that record's entries). */
+export const reviewEntryHref = (e: FindEntryView): string =>
+  `${PATHS.reviewQueue}?project=${encodeURIComponent(e.projectId)}${typeof e.sourceId === "string" ? `&source=${encodeURIComponent(e.sourceId)}` : ""}`;
+
+/**
+ * The entry's offers that may be shown as links: well-formed, an https: address with no name or password in it. The
+ * service promises https: only; this screen does not rely on it — anything else is left out. R313 h: each is named by
+ * the host its address really leads to (parsed here), never by the `host` the service sent.
+ */
+export function safeOffers(e: FindEntryView): FindOfferLink[] {
+  const list: unknown = e.offers;
+  if (!Array.isArray(list)) return [];
+  const out: FindOfferLink[] = [];
+  for (const o of list) {
+    if (!o || typeof o !== "object") continue;
+    const { label, url } = o as Record<string, unknown>;
+    if (typeof label !== "string" || typeof url !== "string" || !label) continue;
+    let u: URL;
+    try {
+      u = new URL(url);
+    } catch {
+      continue;
+    }
+    if (u.protocol !== "https:" || u.username || u.password || !u.host) continue;
+    out.push({ ...(o as FindOfferLink), host: u.host });
+  }
+  return out;
+}
+
+/** A record removed from the library: its entry offers only its removal (R282 g). */
+const recordRemoved = (e: FindEntryView): boolean => e.reason?.code === "record-removed";
 
 /** A count from the service, or undefined when it is not a whole number of at least 0. */
 const countOf = (v: unknown): number | undefined => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined);
@@ -217,12 +271,28 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
     case "failed":
       out.push("retry");
       break;
-    default:
+    case "record-complete":
+      if (COPY_RETRY_REASONS.has(String(e.reason?.code))) out.push("retry");
       if (e.sourceId) out.push("open");
+      break;
+    case "looking-for-copy":
+      if (e.nextTryAt) out.push("retry");
+      if (e.sourceId) out.push("open");
+      break;
+    case "no-open-copy":
+      if (recordRemoved(e)) break;
+      if (e.reason?.code === "copy-some-unreachable") out.push("retry");
+      if (e.sourceId) out.push("open");
+      break;
+    default:
+      if (e.sourceId && !recordRemoved(e)) out.push("open");
   }
   out.push("remove");
   return out;
 }
+
+/** "Needs your check": the link to the file waiting in the review queue (shown before the row's buttons). */
+const offersCheck = (e: FindEntryView): boolean => entryKnown(e) && e.state === "needs-check" && !recordRemoved(e);
 
 const ACT_TEXT: Record<FindActKind, string> = {
   choose: "Choose",
@@ -296,6 +366,48 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
   const mark = known ? MARKS[e.state] : undefined;
   const author = known && isAuthorEntry(e);
   const morePeople = known && e.state === "choose-person" && e.morePeople === true;
+  const actions = actionsOf(e, place);
+  // "Where to get it": an entry with no open copy, unless its record was removed (R282 g).
+  const offers = known && e.state === "no-open-copy" && !recordRemoved(e) ? safeOffers(e) : [];
+  // R311 a: in the desktop app a link there would do nothing; each address is copied instead (said once below).
+  const copyOnly = offers.length > 0 && inDesktopShell();
+  const [copySaid, setCopySaid] = useState<string | undefined>();
+  /** R315 c: the place whose address could not be copied: it shows the address itself, to select and copy. */
+  const [copyFailedAt, setCopyFailedAt] = useState<number | undefined>();
+  const copyAddress = async (address: string, at: number) => {
+    setCopySaid(undefined);
+    setCopyFailedAt(undefined);
+    try {
+      if (!navigator.clipboard) throw new Error("no clipboard");
+      await navigator.clipboard.writeText(address);
+      setCopySaid(FIND_TEXT.addressCopied);
+    } catch {
+      setCopyFailedAt(at);
+    }
+  };
+  const button = (kind: FindActKind) => {
+    const working = busy === kind;
+    const waiting = !!busy && !working;
+    const text = working ? (BUSY_TEXT[kind] ?? ACT_TEXT[kind]) : ACT_TEXT[kind];
+    return (
+      <button
+        key={kind}
+        type="button"
+        className={kind === "remove" ? "ao-find__remove" : undefined}
+        data-act={kind}
+        aria-label={short ? `${text}: ${label}` : text}
+        disabled={readOnly && !READS.has(kind)}
+        aria-disabled={working || waiting || undefined}
+        aria-busy={working || undefined}
+        onClick={() => {
+          if (working || waiting) return;
+          onAction({ kind, entry: e });
+        }}
+      >
+        {text}
+      </button>
+    );
+  };
   return (
     <li className="ao-find__entry" data-entry-id={e.id}>
       <p className="ao-find__typed">
@@ -334,30 +446,52 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
           <UserText>{error}</UserText>
         </p>
       )}
+      {offers.length > 0 && (
+        <div className="ao-find__where">
+          <p className="ao-find__where-title">{FIND_TEXT.whereToGetIt}</p>
+          {copyOnly && <p className="ao-find__where-hint">{FIND_TEXT.pasteHint}</p>}
+          <ul aria-label={short ? `${FIND_TEXT.whereToGetIt}: ${label}` : FIND_TEXT.whereToGetIt}>
+            {offers.map((o, i) =>
+              copyOnly ? (
+                <li key={`${i}:${o.url}`}>
+                  <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>){" "}
+                  <button type="button" data-act="copy-address" aria-label={short ? `${FIND_TEXT.copyAddress}: ${o.label} (${o.host}): ${label}` : `${FIND_TEXT.copyAddress}: ${o.label} (${o.host})`} onClick={() => void copyAddress(o.url, i)}>
+                    {FIND_TEXT.copyAddress}
+                  </button>
+                  <div aria-live="polite">
+                    {copyFailedAt === i && (
+                      <>
+                        <p className="ao-error">{FIND_TEXT.copyFailed}</p>
+                        <UserText as="p" className="ao-find__address">
+                          {o.url}
+                        </UserText>
+                      </>
+                    )}
+                  </div>
+                </li>
+              ) : (
+                <li key={`${i}:${o.url}`}>
+                  <a href={o.url} target="_blank" rel="noopener noreferrer" aria-label={short ? `${o.label} (${o.host}): ${label}` : `${o.label} (${o.host})`}>
+                    <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>)
+                  </a>
+                </li>
+              ),
+            )}
+          </ul>
+          {copyOnly && (
+            <div aria-live="polite">
+              {copySaid && <p className="ao-ok">{copySaid}</p>}
+            </div>
+          )}
+        </div>
+      )}
       <div className="ao-actions ao-find__actions">
-        {actionsOf(e, place).map((kind) => {
-          const working = busy === kind;
-          const waiting = !!busy && !working;
-          const text = working ? (BUSY_TEXT[kind] ?? ACT_TEXT[kind]) : ACT_TEXT[kind];
-          return (
-            <button
-              key={kind}
-              type="button"
-              className={kind === "remove" ? "ao-find__remove" : undefined}
-              data-act={kind}
-              aria-label={short ? `${text}: ${label}` : text}
-              disabled={readOnly && !READS.has(kind)}
-              aria-disabled={working || waiting || undefined}
-              aria-busy={working || undefined}
-              onClick={() => {
-                if (working || waiting) return;
-                onAction({ kind, entry: e });
-              }}
-            >
-              {text}
-            </button>
-          );
-        })}
+        {offersCheck(e) && (
+          <a href={reviewEntryHref(e)} onClick={inAppLink} data-act="check" aria-label={short ? `${FIND_TEXT.checkFile}: ${label}` : FIND_TEXT.checkFile}>
+            {FIND_TEXT.checkFile}
+          </a>
+        )}
+        {actions.map(button)}
       </div>
     </li>
   );
