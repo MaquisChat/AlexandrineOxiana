@@ -492,6 +492,11 @@ export interface YourLibrary {
   staySignedIn: boolean;
 }
 export interface YourLibraryResponse extends YourLibrary {
+  /**
+   * R336 i: the service's own sentence for the stored address — the same words "derive" gives for it ("Your library's
+   * address: <host> (EZproxy)"; a resolver: "<host><path>") — absent when no library is set. The screen makes none.
+   */
+  addressSentence?: string;
   /** The file could not be used: shown as not set ("unreadable", replaced by the next save) or read-only ("newer"). */
   problem?: { code: "unreadable" | "newer"; text: string };
 }
@@ -508,6 +513,19 @@ export interface FindLibraryStartResponse {
   url: string;
   ticket: string;
 }
+/**
+ * Task F18a (R334 b): `POST /settings/your-library/test` (no body) — the library's address for the one fixed, well-known
+ * work `YOUR_LIBRARY_TEST_DOI`, by the stored access; nothing typed, nothing of a project. The page opens the sign-in
+ * window there with a ticket of its own (no ticket of the service), so whatever the window might fetch is discarded.
+ * Refused (409) with FIND_LIBRARY_TEXT.noLibrary (reason "no-library") when no library is set, and with
+ * YOUR_LIBRARY_TEXT.unreadable / .newer when the settings file cannot be used. The address is in no log, audit,
+ * event or error.
+ */
+export interface YourLibraryTestResponse {
+  url: string;
+}
+/** The fixed work of "Test" (the same well-known DOI the Search sources' tests ask about). */
+export const YOUR_LIBRARY_TEST_DOI = "10.1038/171737a0";
 /** R324 a: on the entry's view (`FindEntryView.library`). */
 export type FindLibraryChance = (
   | { canStart: true }
@@ -573,6 +591,8 @@ export const YOUR_LIBRARY_TEXT = {
   newer: "These Your library settings were written by a newer version of the app. Update the app to change them.",
   unreadable: "Your library settings could not be read, so no library is set. Saving them again replaces the file (the old one is kept beside it).",
   noBody: "This request takes no body. Nothing was changed.",
+  /** F18a (R334 b): the stored address gives no address for the test's work (not expected: a stored access is checked). */
+  testNoAddress: "No address for the test could be made from your library's settings. Use “Work out the address” again, then save.",
 } as const;
 
 /** A start through the library refused (its `reason` → its sentence; the pause's sentence is `libraryReadyIn`). */

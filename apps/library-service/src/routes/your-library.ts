@@ -7,6 +7,7 @@
  *   GET  /settings/your-library                  → YourLibraryResponse (the file read anew; a problem said)
  *   PUT  /settings/your-library                  YourLibrary → YourLibraryResponse
  *   POST /settings/your-library/derive           { link } → { access, sentence } (200 whether or not an address is found)
+ *   POST /settings/your-library/test             no body → { url } (Task F18a, R334 b: the address of one fixed work)
  *   POST /projects/:id/find/:eid/library/start   no body → { url, ticket }
  *   POST /projects/:id/find/:eid/library/cancel  no body → FindEntryView
  *
@@ -39,6 +40,7 @@ import {
   deriveLibraryAccessWhy,
   isLibraryAccess,
   libraryAccessPlace,
+  libraryAddressFor,
   readFindQueueOf,
   readYourLibrary,
   writeYourLibrary,
@@ -56,6 +58,7 @@ import {
   YOUR_LIBRARY_DERIVE_TEXT,
   YOUR_LIBRARY_LINK_MAX,
   YOUR_LIBRARY_NAME_MAX,
+  YOUR_LIBRARY_TEST_DOI,
   YOUR_LIBRARY_TEXT,
   yourLibraryAddressSentence,
   type FindEntryView,
@@ -65,6 +68,7 @@ import {
   type YourLibraryDeriveRefusal,
   type YourLibraryDeriveResponse,
   type YourLibraryResponse,
+  type YourLibraryTestResponse,
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
 import type { ServiceState, Session } from "../state.js";
@@ -91,6 +95,8 @@ function objectBody(req: FastifyRequest, sentence: string): Obj {
 
 const responseOf = (s: YourLibraryHere, problem?: "unreadable" | "newer"): YourLibraryResponse => ({
   ...s,
+  // R336 i: the stored address named in the derive's own words (none when no library is set).
+  ...(s.access ? { addressSentence: yourLibraryAddressSentence(libraryAccessPlace(s.access), s.access.kind) } : {}),
   ...(problem ? { problem: { code: problem, text: problem === "newer" ? YOUR_LIBRARY_TEXT.newer : YOUR_LIBRARY_TEXT.unreadable } } : {}),
 });
 
@@ -150,6 +156,26 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
     const r = deriveLibraryAccessWhy(b.link);
     if ("refused" in r) return { access: null, sentence: YOUR_LIBRARY_DERIVE_TEXT[r.refused] };
     return { access: r.access, sentence: yourLibraryAddressSentence(libraryAccessPlace(r.access), r.access.kind) };
+  });
+
+  /**
+   * Task F18a (R334 b): "Test" — the library's address for ONE fixed, well-known work, by the stored access. It takes
+   * nothing (no link, no DOI, no project) and gives no ticket: the page opens the sign-in window with a ticket of its
+   * own, which no hand-over can match, so nothing the window might fetch is ever kept. The address is in the answer
+   * only (`no-store`): no log line (bodies are never logged), audit entry, event or error carries it.
+   */
+  app.post("/settings/your-library/test", limit, async (req, reply): Promise<YourLibraryTestResponse> => {
+    uiOnly(req);
+    // R336 f: every answer of this route, its refusals included, is no-store.
+    reply.header("Cache-Control", "no-store");
+    if (Object.keys(objectBody(req, YOUR_LIBRARY_TEXT.noBody)).length) throw badRequest(YOUR_LIBRARY_TEXT.noBody);
+    const r = await readYourLibrary(state.deps.appConfigDir);
+    if (r.problem === "newer") throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.newer);
+    if (r.problem === "unreadable") throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.unreadable);
+    if (!r.settings.access) throw new ApiError(409, "CONFLICT", FIND_LIBRARY_TEXT.noLibrary, "no-library");
+    const url = libraryAddressFor(r.settings.access, { id: "your-library-test", title: "", creators: [], type: "article-journal", identifiers: { doi: YOUR_LIBRARY_TEST_DOI }, providers: [] });
+    if (!url) throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.testNoAddress);
+    return { url };
   });
 
   // ------------------------------------------------------------------------------------------------------------
