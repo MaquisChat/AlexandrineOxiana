@@ -11,10 +11,12 @@ export {
   FIND_SETTINGS_TIMEOUT_MS,
   FIND_STOP_SETTLE_MS,
   FIND_TOOL,
+  FindAlreadyAddedError,
   FindEntryStateError,
   FindIndexNotReadyError,
   FindProjectStoppedError,
   FindRunnerClosedError,
+  FindUnknownOptionError,
   createFindRunner,
   readFindQueueOf,
 } from "./runner.js";
@@ -34,6 +36,22 @@ export type {
   WorkCandidate,
 } from "./types.js";
 export { REFERENCE_MAX_CHARS, REFERENCE_MIN_CHARS } from "./reference.js";
+// Task F8: an author alone — the people of a name, then a person's works.
+export {
+  FIND_CHOOSE_WORKS_MAX,
+  FIND_PEOPLE_MAX,
+  FIND_PERSON_NAME_MAX,
+  FIND_PERSON_TITLE_MAX,
+  FIND_PERSON_VENUE_MAX,
+  FIND_PERSON_WORKS_MAX,
+  FindPeopleError,
+  childTyped,
+  decidePerson,
+  isPersonId,
+  isWorkId,
+  peopleSearchWanted,
+} from "./people.js";
+export type { PersonDecision } from "./people.js";
 // Task F10: where a free copy is, and its bounded download (used by the runner in F11).
 export {
   FREE_COPY_ELSEWHERE_MAX,

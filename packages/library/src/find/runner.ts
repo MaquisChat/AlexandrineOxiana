@@ -71,6 +71,7 @@ import {
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
 import type { WorkCandidate } from "./candidates.js";
+import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, childTyped, decidePerson, fetchWork, fitAuthorEntry, isPersonId, isWorkId, peopleSearchWanted, searchPeople, worksOf } from "./people.js";
 import { FindQueueUnreadableError, sanitizeEntry } from "./queue-store.js";
 import { parseReference, type Reference } from "./reference.js";
 import { decideMatch, openAlexSearchPausedUntil, scoreCandidate, searchWorks, type SearchSource } from "./search.js";
@@ -156,6 +157,25 @@ export class FindProjectStoppedError extends Error {
 }
 
 /**
+ * Task F8: a person or a work that is not one of THOSE stored on the entry (no request can make the app fetch an
+ * arbitrary author or work). Nothing was changed.
+ */
+export class FindUnknownOptionError extends Error {
+  override name = "FindUnknownOptionError";
+  constructor(readonly kind: "person" | "work") {
+    super(kind === "person" ? "That is not one of the people offered for this entry. Nothing was changed." : "That is not one of the works offered for this entry. Nothing was added.");
+  }
+}
+
+/** Task F8: a work already added from this entry, named by its position in the request only. Nothing was added. */
+export class FindAlreadyAddedError extends Error {
+  override name = "FindAlreadyAddedError";
+  constructor(readonly position: number) {
+    super(`Work ${position} was already added from this entry. Nothing was added.`);
+  }
+}
+
+/**
  * Test seams (R47: honoured only under NODE_ENV=test): run just before and just after a record's creation; `inAct`,
  * awaited inside a researcher's act, in its store turn, right after its check (R245); and `inCreate`, awaited inside
  * the store turn just before a record is made (R247 d).
@@ -209,6 +229,23 @@ export interface FindRunner {
   addHereAsWell(projectId: string, entryId: string): Promise<FindEntry>;
   /** Writes the entry back to "looking-up" (refused after `stop` or `stopAll`, R245). */
   retry(projectId: string, entryId: string): Promise<FindEntry>;
+  /**
+   * Task F8: the researcher's person, for an entry in "choose-person" only; `personId` must be one of THAT entry's
+   * people (else FindUnknownOptionError; not `A<digits>`: InvalidInputError). The entry is written "looking-up" with
+   * that person (`chosen`) at once; the runner then fetches the person's works and makes it "choose-works" (a failure
+   * or the spent allowance: the ordinary retries, or the wait). A second press, or one on another state:
+   * FindEntryStateError. Nothing is asked in the press itself.
+   */
+  choosePerson(projectId: string, entryId: string, personId: string): Promise<FindEntry>;
+  /**
+   * Task F8 (R267): for an entry in "choose-works" only; 1 to 50 ids, each one of THAT entry's works (else
+   * FindUnknownOptionError; not `W<digits>`: InvalidInputError) and not already added from it (FindAlreadyAddedError
+   * with its position); a repeated id counts once. Each becomes a NEW entry ("looking-up", `parentId`, `chosen` = the
+   * work id, the typed line `childTyped`), written in ONE governed change with the parent's own new line (`added`);
+   * a full queue refuses the whole (FindQueueFullError). The parent STAYS "choose-works". Each new entry's record is
+   * then made from a fresh request for that one work by its id, through the duplicate check, as a chosen candidate.
+   */
+  chooseWorks(projectId: string, entryId: string, workIds: string[]): Promise<{ added: FindEntry[]; parent: FindEntry }>;
   remove(projectId: string, entryId: string): Promise<void>;
   /** At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry (nothing else). */
   resume(projectId: string): void;
@@ -291,7 +328,9 @@ function boundCandidate(c: WorkCandidate): WorkCandidate {
  * least likely candidates (never the chosen one) dropped, then names cut down, so the store never refuses a size the
  * runner could have known.
  */
-function fit(e: FindEntry): FindEntry {
+function fit(given: FindEntry): FindEntry {
+  // An author's entry (F8): its people and works bounded so that the line fits by construction.
+  const e = given.people || given.works ? fitAuthorEntry(given) : given;
   if (!e.candidates) return e;
   let candidates = e.candidates.slice(0, CANDIDATES_KEPT).map(boundCandidate);
   const size = (cs: WorkCandidate[]) => Buffer.byteLength(JSON.stringify({ ...e, candidates: cs }), "utf8");
@@ -555,9 +594,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   // ------------------------------------------------------------------------------------------------------------
   // Writing an entry: one governed change, then the event.
 
-  async function write(pid: string, next: FindEntry[], op: "add" | "update" | "remove"): Promise<FindEntry[]> {
-    const fitted = next.map(fit);
-    await appendFindEntriesIn(repo, pid, fitted, op);
+  /** `alongside` (with an add only, F8): new lines of live entries written in the same governed change; returned after `next`. */
+  async function write(pid: string, next: FindEntry[], op: "add" | "update" | "remove", alongside: FindEntry[] = []): Promise<FindEntry[]> {
+    const fitted = [...next.map(fit), ...alongside.map(fit)];
+    await appendFindEntriesIn(repo, pid, fitted.slice(0, next.length), op, fitted.slice(next.length));
     if (op !== "remove") {
       for (const e of fitted) {
         if (e.state !== "looking-up") madeHere.delete(e.id);
@@ -915,16 +955,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         return w!;
       })) ?? null;
 
-    /** No answer this time: tried again after the next delay, then "failed" with `code`. */
-    const tryLater = async (code: FindReasonCode) => {
+    /**
+     * No answer this time: tried again after the next delay, then "failed" with `code`. `patch` is what was decided
+     * before the failure and is kept for the next try (F8: the one person found, whose works did not come).
+     */
+    const tryLater = async (code: FindReasonCode, patch: Partial<FindEntry> = {}) => {
       const attempts = at0.attempts + 1;
       const delay = FIND_RETRY_DELAYS_MS[attempts - 1];
       if (delay === undefined) {
-        await finish({ state: "failed", attempts, reason: { code } }, ["nextTryAt"]);
+        await finish({ ...patch, state: "failed", attempts, reason: { code } }, ["nextTryAt"]);
         return;
       }
       const at = new Date(now().getTime() + delay).toISOString();
-      const w = await finish({ attempts, nextTryAt: at }, ["reason"]);
+      const w = await finish({ ...patch, attempts, nextTryAt: at }, ["reason"]);
       if (w && live()) later(pid, eid, at);
     };
 
@@ -957,8 +1000,33 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     r: Run,
     live: () => boolean,
     finish: (patch: Partial<FindEntry>, drop?: Array<keyof FindEntry>) => Promise<FindEntry | null>,
-    tryLater: (code: FindReasonCode) => Promise<void>,
+    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>) => Promise<void>,
   ): Promise<void> {
+    /**
+     * OpenAlex's daily allowance is used up: the entry waits for the pause's end (never less than the first retry
+     * delay, so a clock that disagrees cannot make it spin), saying why; no attempt is counted. `patch` is kept (F8).
+     */
+    const waitForAllowance = async (patch: Partial<FindEntry> = {}) => {
+      const pausedUntil = openAlexSearchPausedUntil(http);
+      const midnight = new Date(now().getTime());
+      midnight.setUTCHours(24, 0, 0, 0);
+      const at = new Date(Math.max(pausedUntil ?? midnight.getTime(), now().getTime() + FIND_RETRY_DELAYS_MS[0]!)).toISOString();
+      const w = await finish({ ...patch, nextTryAt: at, reason: { code: "budget" } });
+      if (w && live()) later(pid, eid, at);
+    };
+    /** A people search, a person's works or a single work that did not come: the wait (budget) or the ordinary retries. */
+    const notHad = async (err: unknown, patch: Partial<FindEntry> = {}): Promise<boolean> => {
+      if (err instanceof FindPeopleError && err.code === "budget") {
+        await waitForAllowance(patch);
+        return true;
+      }
+      if (err instanceof FindPeopleError || err instanceof TimedOut) {
+        if (err instanceof TimedOut) debug("find: an OpenAlex request did not answer in time");
+        await tryLater("unreachable", patch);
+        return true;
+      }
+      return false;
+    };
     // A source already made for this entry (a crash or a stop between its creation and its line): adopted
     // before anything is asked.
     if (madeFor(pid, eid)) {
@@ -1003,6 +1071,59 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       await finish({ state: "failed", reason: RULES }, ["nextTryAt"]);
       return;
     }
+
+    // Task F8: a work added from a person's list, or a person chosen. Both are OpenAlex's alone.
+    const addedWork = entry.parentId !== undefined && isWorkId(entry.chosen);
+    const chosenPerson = !addedWork && isPersonId(entry.chosen) && !!entry.people?.some((x) => x.id === entry.chosen);
+    if (addedWork || chosenPerson) {
+      if (!on.includes("openalex")) {
+        await finish({ state: "failed", reason: SETTINGS }, ["nextTryAt"]);
+        return;
+      }
+      if (!sources.includes("openalex")) {
+        await finish({ state: "failed", reason: RULES }, ["nextTryAt"]);
+        return;
+      }
+    }
+    if (addedWork) {
+      // Its record is made from a fresh request for that one work by its OpenAlex id (free of the allowance), checked
+      // and bounded as a search's candidate — never from the trimmed line kept for choosing (R267 c); then the
+      // duplicate check and the record, exactly as for a chosen candidate.
+      let got: WorkCandidate | null;
+      try {
+        got = await guard(r, fetchWork(entry.chosen!, ctx), FIND_LOOKUP_TIMEOUT_MS);
+      } catch (err) {
+        if (await notHad(err)) return;
+        throw err;
+      }
+      if (!live()) return;
+      if (!got) {
+        await finish({ state: "not-found" }, ["nextTryAt", "reason"]);
+        return;
+      }
+      const work = got;
+      try {
+        await inTurn(r, pid, live, () => completeIn(pid, eid, work, { match: { method: "find-chosen", confidence: 1 }, expect: (cur) => sameVersion(cur, entry), live }));
+      } catch (err) {
+        if (!(err instanceof FindIndexNotReadyError)) throw err;
+        enqueue(pid, eid);
+      }
+      return;
+    }
+    if (chosenPerson) {
+      // The person is known (chosen by the researcher, or the one that fitted): their works, then "choose-works".
+      let got: Awaited<ReturnType<typeof worksOf>>;
+      try {
+        got = await guard(r, worksOf(entry.chosen!, ctx), FIND_LOOKUP_TIMEOUT_MS);
+      } catch (err) {
+        if (await notHad(err)) return;
+        throw err;
+      }
+      if (!live()) return;
+      await finish({ state: "choose-works", works: got.works, ...(got.more ? { moreWorks: true as const } : {}) }, ["nextTryAt", "reason", "candidates", "moreWorks"]);
+      return;
+    }
+
     const ref: Reference | null = parseReference(entry.typed);
     if (!ref) {
       await finish({ state: "not-found" }, ["nextTryAt", "reason"]);
@@ -1022,6 +1143,43 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // A late answer (after a stop or a lock) is not acted on.
     if (!live()) return;
 
+    // Task F8 (R267 d): an author alone? The people search is asked only when it can change the outcome (the exact
+    // condition is `peopleSearchWanted`: no digit, at most 6 words, no work candidate covering 0.6 of its title), and
+    // only when OpenAlex is on and allowed. A failure or the spent allowance: the retries or the wait, never a guess.
+    if (sources.includes("openalex") && peopleSearchWanted(ref, res.candidates)) {
+      let found: Awaited<ReturnType<typeof searchPeople>>;
+      try {
+        found = await guard(r, searchPeople(ref, ctx), FIND_LOOKUP_TIMEOUT_MS);
+      } catch (err) {
+        if (await notHad(err)) return;
+        throw err;
+      }
+      if (!live()) return;
+      const who = decidePerson(ref, found.people, res.candidates);
+      const more = found.more ? { morePeople: true as const } : {};
+      const drop: Array<keyof FindEntry> = ["nextTryAt", "reason", "candidates", "chosen", "works", "morePeople", "moreWorks", "match"];
+      // More people than the 20 read may fit as well: the one that fitted is offered, never chosen in silence.
+      if (who.kind === "several" || (who.kind === "one" && found.more)) {
+        await finish({ state: "choose-person", people: who.kind === "one" ? [who.person] : who.people, ...more }, drop);
+        return;
+      }
+      if (who.kind === "one") {
+        const person = { people: [who.person], chosen: who.person.id };
+        let got: Awaited<ReturnType<typeof worksOf>>;
+        try {
+          got = await guard(r, worksOf(who.person.id, ctx), FIND_LOOKUP_TIMEOUT_MS);
+        } catch (err) {
+          // The person is kept for the next try (which asks only for the works); no work is kept from half an answer.
+          if (await notHad(err, person)) return;
+          throw err;
+        }
+        if (!live()) return;
+        await finish({ state: "choose-works", ...person, works: got.works, ...(got.more ? { moreWorks: true as const } : {}) }, drop);
+        return;
+      }
+      // Nobody of that name: the entry stays whatever the works search makes it.
+    }
+
     const failed = sources.filter((x) => res.notes.includes(`${x}-failed`));
     const budget = sources.includes("openalex") && res.notes.includes("openalex-budget");
     /** Every source asked answered: the list is complete (one source left by the rules or the settings counts). */
@@ -1033,14 +1191,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         await tryLater("unreachable");
         return;
       }
-      // OpenAlex is paused for the day: the entry waits for the pause's end (never less than the first retry delay,
-      // so a clock that disagrees cannot make it spin), saying why; no attempt is counted.
-      const pausedUntil = openAlexSearchPausedUntil(http);
-      const midnight = new Date(now().getTime());
-      midnight.setUTCHours(24, 0, 0, 0);
-      const at = new Date(Math.max(pausedUntil ?? midnight.getTime(), now().getTime() + FIND_RETRY_DELAYS_MS[0]!)).toISOString();
-      const w = await finish({ nextTryAt: at, reason: { code: "budget" } });
-      if (w && live()) later(pid, eid, at);
+      // OpenAlex is paused for the day: the entry waits for the pause's end.
+      await waitForAllowance();
       return;
     }
     if (decision.kind === "none") {
@@ -1194,11 +1346,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const waiting = cur.state === "looking-up" && !!cur.nextTryAt;
       if (cur.state !== "failed" && cur.state !== "not-found" && !waiting) throw new FindEntryStateError();
       cancelLater(projectId, entryId);
-      const [next] = await write(
-        projectId,
-        [evolve(cur, { state: "looking-up", attempts: 0 }, ["reason", "nextTryAt", "candidates", "chosen", "duplicateOf", "elsewhere", "match"], stamp())],
-        "update",
-      );
+      // F8: a work added from a person's list keeps its work (it is asked again by its id, never searched by text),
+      // and an author's entry keeps the person whose works did not come.
+      const keepChosen = (cur.parentId !== undefined && isWorkId(cur.chosen)) || (isPersonId(cur.chosen) && !!cur.people?.some((x) => x.id === cur.chosen));
+      const drop: Array<keyof FindEntry> = ["reason", "nextTryAt", "candidates", "duplicateOf", "elsewhere", "match", ...(keepChosen ? [] : (["chosen"] as const))];
+      const [next] = await write(projectId, [evolve(cur, { state: "looking-up", attempts: 0 }, drop, stamp())], "update");
       return next!;
     });
     enqueue(projectId, entryId);
@@ -1361,5 +1513,68 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return null;
   }
 
-  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor };
+  async function choosePerson(projectId: string, entryId: string, personId: string): Promise<FindEntry> {
+    assertOpen();
+    assertId(entryId);
+    if (!isPersonId(personId)) throw new InvalidInputError("That is not a person's id that OpenAlex gives. Nothing was changed.");
+    const w = await act(projectId, async () => {
+      const cur = await current(projectId, entryId);
+      if (!cur) throw new NotFoundError("Queue entry", entryId);
+      // Only an entry asking which person: a second press, or a press on any other state, changes nothing.
+      if (cur.state !== "choose-person") throw new FindEntryStateError();
+      // One of THAT entry's people: no request can make the app fetch an arbitrary author (R267 e).
+      if (!cur.people?.some((x) => x.id === personId)) throw new FindUnknownOptionError("person");
+      cancelLater(projectId, entryId);
+      const [next] = await write(projectId, [evolve(cur, { state: "looking-up", chosen: personId, attempts: 0 }, ["reason", "nextTryAt", "works", "moreWorks"], stamp())], "update");
+      return next!;
+    });
+    // The person's works are asked by the runner's own work, like every lookup (time-limited, retried, waiting for the allowance).
+    enqueue(projectId, entryId);
+    return w;
+  }
+
+  async function chooseWorks(projectId: string, entryId: string, workIds: string[]): Promise<{ added: FindEntry[]; parent: FindEntry }> {
+    assertOpen();
+    assertId(entryId);
+    if (!Array.isArray(workIds) || workIds.length === 0) throw new InvalidInputError("Tick at least one work. Nothing was added.");
+    if (workIds.length > FIND_CHOOSE_WORKS_MAX) throw new InvalidInputError(`At most ${FIND_CHOOSE_WORKS_MAX} works can be added at once. Nothing was added.`);
+    workIds.forEach((id, i) => {
+      if (!isWorkId(id)) throw new InvalidInputError(`Work ${i + 1} is not a work's id that OpenAlex gives. Nothing was added.`);
+    });
+    // A work ticked twice in one call is added once.
+    const ids = [...new Set(workIds)];
+    const done = await act(projectId, async () => {
+      const cur = await current(projectId, entryId);
+      if (!cur) throw new NotFoundError("Queue entry", entryId);
+      if (cur.state !== "choose-works") throw new FindEntryStateError();
+      const offered = new Map((cur.works ?? []).map((x) => [x.id, x]));
+      const already = new Set(cur.added ?? []);
+      workIds.forEach((id, i) => {
+        // One of THAT entry's works (R267 e), and not one already added from it (named by its position only).
+        if (!offered.has(id)) throw new FindUnknownOptionError("work");
+        if (already.has(id)) throw new FindAlreadyAddedError(i + 1);
+      });
+      const at = stamp();
+      const kids: FindEntry[] = ids.map((id) => ({
+        id: newId(),
+        projectId,
+        ...(cur.collectionId ? { collectionId: cur.collectionId } : {}),
+        typed: childTyped(offered.get(id)!),
+        state: "looking-up",
+        createdAt: at,
+        updatedAt: at,
+        attempts: 0,
+        parentId: entryId,
+        chosen: id,
+      }));
+      // The new entries and the parent's own new line in ONE governed change: a crash leaves all of it or none. The
+      // parent stays "choose-works" (more of that person's works can be added later; it ends when it is removed).
+      const written = await write(projectId, kids, "add", [evolve(cur, { added: [...(cur.added ?? []), ...ids] }, [], at)]);
+      return { added: written.slice(0, kids.length), parent: written[kids.length]! };
+    });
+    for (const k of done.added) enqueue(projectId, k.id);
+    return done;
+  }
+
+  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks };
 }
