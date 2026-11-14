@@ -877,7 +877,9 @@ describe("R312 c: the copy part obeys the saved Search sources (through the serv
     await put({ ...ALL_ON, copies: copies(["openalex"]) });
     const second = await addAndSettle(await newProject("Second"), LINE);
     expect(second.state).toBe("no-open-copy");
-    expect([...copyAsked().entries()]).toEqual([["https://api.openalex.org", 1]]);
+    // R326: the save also woke the first entry (resting "switched off"): OpenAlex is asked for it as well (or its answer
+    // for the same work is the client's cached one) — never any other host.
+    expect([...copyAsked().keys()]).toEqual(["https://api.openalex.org"]);
   });
 
   it("no settings saved: F12's defaults for copies — every free-copy service but Unpaywall may be asked; Unpaywall is not", async () => {
