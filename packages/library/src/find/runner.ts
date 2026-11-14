@@ -176,6 +176,14 @@ const waitsForPlace = (e: FindEntry): boolean => !!e.sourceId && (e.state === "r
 /** R297 c: waiting for OpenAlex's daily allowance (the record part's wait; a saved key wakes it: `wakeAllowance`). */
 const waitsForAllowance = (e: FindEntry): boolean => e.state === "looking-up" && e.reason?.code === "budget" && !!e.nextTryAt;
 const inCopyPart = (e: FindEntry): boolean => (!!e.sourceId && COPY_STATES.has(e.state)) || waitsForPlace(e);
+/**
+ * R326: an entry resting because the researcher's Search sources switch off what its part needs ("switched off" by the
+ * settings): in the copy part "record-complete" (every copy service off), in the record part "failed" with no record
+ * (every source that could give one off). A save of those settings wakes exactly these (`wakeSettings`).
+ */
+const restsSwitchedOff = (e: FindEntry): boolean => e.reason?.code === "switched-off" && e.reason.by === "settings";
+const copyRestsSwitchedOff = (e: FindEntry): boolean => !!e.sourceId && e.state === "record-complete" && restsSwitchedOff(e);
+const recordRestsSwitchedOff = (e: FindEntry): boolean => !e.sourceId && e.state === "failed" && restsSwitchedOff(e);
 
 const VERSION: string = libraryVersion();
 
@@ -592,6 +600,15 @@ export interface FindRunner {
    * else is touched: no other waiting entry, nothing in flight. Does nothing for a project the runner is not running.
    */
   wakeAllowance(projectId: string): Promise<void>;
+  /**
+   * R326: the researcher's "Search sources" were saved — the project's entries resting "switched off" by the settings
+   * (the copy part's "record-complete", the record part's "failed" with no record) are put back to work when the
+   * settings now switch on what they need: a copy entry is queued (it looks for a copy), a record entry goes back to
+   * "looking-up" in one write. An entry the settings still stop is left as it is (nothing asked, nothing written). Entries
+   * the project's rules stopped, waiting entries, and everything in flight are not touched. Does nothing for a project the
+   * runner is not running, a locked project or a read-only library.
+   */
+  wakeSettings(projectId: string): Promise<void>;
   /**
    * At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry, and (F11) every entry in the free
    * copy's part — "record-complete" (its source without a file), "looking-for-copy", and "fetching" (which resumes as
@@ -2235,7 +2252,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // waiting because FIND_HELD_MAX files wait (the limit is looked at again, before anything is asked).
       const copyAgain =
         !!cur.sourceId &&
-        ((cur.state === "no-open-copy" && cur.reason?.code === "copy-some-unreachable") || (cur.state === "record-complete" && (STOPPED_BY_RULES.has(cur.reason?.code ?? "") || cur.reason?.code === HELD_FULL.code)));
+        ((cur.state === "no-open-copy" && cur.reason?.code === "copy-some-unreachable") ||
+          (cur.state === "record-complete" && (STOPPED_BY_RULES.has(cur.reason?.code ?? "") || cur.reason?.code === HELD_FULL.code)) ||
+          copyRestsSwitchedOff(cur));
       // R283 a: a "choose" made while people of the name could not be looked up: Try again looks again (afresh).
       const peopleUnseen = cur.state === "choose" && cur.reason?.code === "people-unavailable";
       if (cur.state !== "failed" && cur.state !== "not-found" && !waiting && !copyAgain && !peopleUnseen) throw new FindEntryStateError();
@@ -2328,6 +2347,39 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       });
     } catch {
       return; // stopped, locked or unreadable meanwhile: the pause's end, Try again, the next open or unlock look again
+    }
+    for (const id of woken) {
+      cancelLater(projectId, id);
+      enqueue(projectId, id);
+    }
+  }
+
+  async function wakeSettings(projectId: string): Promise<void> {
+    if (closed || readOnly()) return;
+    const r = runs.get(projectId);
+    if (!r || r.stopped) return;
+    // The settings are read once, before the project's turn is taken: what they switch on decides who is woken.
+    let s: SearchSettings;
+    try {
+      s = await guard(r, deps.settings(), FIND_SETTINGS_TIMEOUT_MS);
+    } catch {
+      return; // stopped, or the settings did not answer: "Try again", the next open or unlock look again
+    }
+    const copiesOn = copySources(s).length > 0;
+    const recordOn = new Set(s.record.filter((x) => x.on && (x.id === "crossref" || x.id === "openalex" || x.id === "elicit")).map((x) => x.id));
+    // The record part needs OpenAlex for a work added from a person's list or a person chosen (as `workOn` decides).
+    const recordNeeds = (e: FindEntry) => (workOfAdded(e) !== undefined || (isPersonId(e.chosen) && !!e.people?.some((x) => x.id === e.chosen)) ? recordOn.has("openalex") : recordOn.size > 0);
+    let woken: string[];
+    try {
+      woken = await act(projectId, async () => {
+        const q = [...(await readFindQueueIn(repo, projectId)).values()];
+        const copy = copiesOn ? q.filter(copyRestsSwitchedOff) : [];
+        const record = q.filter(recordRestsSwitchedOff).filter(recordNeeds);
+        if (record.length) await write(projectId, record.map((e) => evolve(e, { state: "looking-up", attempts: 0 }, ["reason", "nextTryAt"], stamp())), "update");
+        return [...copy, ...record].map((e) => e.id);
+      });
+    } catch {
+      return; // stopped, locked or unreadable meanwhile: "Try again", the next open or unlock look again
     }
     for (const id of woken) {
       cancelLater(projectId, id);
@@ -2734,6 +2786,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     resolveHeld,
     wakeHeldFull,
     wakeAllowance,
+    wakeSettings,
     resume,
     stop,
     stopAll,

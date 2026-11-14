@@ -325,6 +325,8 @@ export function registerSearchSettings(app: FastifyInstance, ctx: Ctx): void {
       throw err;
     }
     state.searchSourcesSaved(saved);
+    // R326: the entries the settings had stopped go on when they now allow it (the save does not wait for it).
+    state.wakeFindSettings();
     return responseOf(saved, undefined);
   });
 
