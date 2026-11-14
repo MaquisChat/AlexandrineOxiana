@@ -7,6 +7,7 @@ import { makeApi, server, url, useMsw } from "../test/msw-governance";
 import { CAPTURE_METHODS } from "@ao/core/governance/schema";
 import { GovernanceSettings } from "./GovernanceSettings";
 import { CAPTURE_LABEL, DEFAULTS } from "./governanceModel";
+import { ACQUIRE_LABEL } from "./governanceModel";
 
 useMsw();
 
@@ -620,5 +621,147 @@ describe("capture methods, smaller points (Task 64 review)", () => {
     const note = within(card("Capture methods")).getByRole("note", { name: /What a capture from the web also needs/ });
     expect(note.textContent).toMatch(/platforms the protocol approves/);
     expect(note.textContent).not.toMatch(/Nothing else/);
+  });
+});
+
+describe("How Find and acquire may get works (Find and acquire Task F13; R301, R302 b; plan Amendment A3)", () => {
+  const FIND = "How Find and acquire may get works";
+  const ELICIT = "Elicit (a commercial service; it receives the words you type and nothing about this project)";
+  const findCard = () => within(card(FIND));
+  const way = (label: string) => findCard().getByRole("checkbox", { name: label }) as HTMLInputElement;
+  const lookups = () => within(card("Processing location")).getByRole("textbox", { name: "Metadata lookups" }) as HTMLInputElement;
+  const reason = async (user: ReturnType<typeof userEvent.setup>, text: string) => {
+    const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Reason" }), text);
+    await user.type(within(dialog).getByRole("textbox", { name: "Approved by" }), "Dr Ana Souza");
+    await user.click(within(dialog).getByRole("button", { name: "Record reason" }));
+  };
+
+  it("the three ways, ticked by default, and the one line R301 fixed for good", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    for (const m of ["reference_lookup", "free_copy", "library_access"] as const) expect(way(ACQUIRE_LABEL[m]).checked, m).toBe(true);
+    expect(card(FIND).textContent).toContain("A file found for a record is never added without your confirmation.");
+    expect(way(ELICIT).checked).toBe(false);
+    expect(card(FIND).textContent).not.toMatch(/free_copy|reference_lookup|library_access/);
+  });
+
+  it("unticking free copies writes acquireMethods without free_copy, with no reason asked", async () => {
+    const cap = serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.click(way(ACQUIRE_LABEL.free_copy));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(way(ACQUIRE_LABEL.free_copy).checked).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    const saved = parse(cap.puts[0]!.body.yaml);
+    expect(saved.acquireMethods).toEqual(["reference_lookup", "library_access"]);
+    expect(cap.puts[0]!.body.reason).toBeUndefined();
+    expect(cap.puts[0]!.body.yaml).toMatch(/^# Rules reviewed by the IRB office/);
+  });
+
+  it("ticking it asks for a reason, as the other loosenings do, and the PUT carries it", async () => {
+    const cap = serve({ yaml: "acquireMethods: [reference_lookup, library_access]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    expect(way(ACQUIRE_LABEL.free_copy).checked).toBe(false);
+    await user.click(way(ACQUIRE_LABEL.free_copy));
+    expect(screen.getByRole("dialog", { name: "Record a reason" }).textContent).toMatch(/loosens the project's rules/);
+    await reason(user, "Open-access copies are fine here");
+    expect(way(ACQUIRE_LABEL.free_copy).checked).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    expect(parse(cap.puts[0]!.body.yaml).acquireMethods).toEqual(["reference_lookup", "free_copy", "library_access"]);
+    expect(cap.puts[0]!.body.reason).toBe("Open-access copies are fine here (Dr Ana Souza)");
+  });
+
+  it("the Elicit box and the vendors field agree both ways; ticking asks for a reason and declares the vendor", async () => {
+    const cap = serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    // Tick the box: the field shows it.
+    await user.click(way(ELICIT));
+    await reason(user, "Elicit is in the protocol");
+    expect(way(ELICIT).checked).toBe(true);
+    expect(lookups().value).toBe("crossref, openalex, openlibrary, loc, elicit");
+    // Edit the field: the box follows.
+    await user.clear(lookups());
+    await user.type(lookups(), "crossref, openalex");
+    await user.tab();
+    expect(way(ELICIT).checked).toBe(false);
+    await user.clear(lookups());
+    await user.type(lookups(), "crossref, elicit");
+    await user.tab();
+    // Through the field it is the same loosening, with the same reason asked.
+    await reason(user, "Elicit is in the protocol");
+    expect(way(ELICIT).checked).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    const saved = parse(cap.puts[0]!.body.yaml);
+    expect(saved.processing.metadata_lookup).toEqual(["crossref", "elicit"]);
+    expect(saved.vendors).toEqual([{ id: "elicit" }]);
+  });
+
+  it("unticking Elicit removes it from metadata lookups and nothing else; the vendors stay byte for byte; no reason asked", async () => {
+    const vendors = "vendors:\n  - id: deepl # translation, DPA signed 2026-03\n    dpa: true\n  - id: elicit\n    dpa: true\n";
+    const yaml = `${YAML}processing:\n  metadata_lookup: [crossref, elicit, openalex]\n  translation: [deepl]\n${vendors}`;
+    const cap = serve({ yaml });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    expect(way(ELICIT).checked).toBe(true);
+    await user.click(way(ELICIT));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(lookups().value).toBe("crossref, openalex");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    const text: string = cap.puts[0]!.body.yaml;
+    expect(parse(text).processing).toEqual({ metadata_lookup: ["crossref", "openalex"], translation: ["deepl"] });
+    expect(text).toContain(vendors);
+  });
+
+  it("ticking Elicit where a vendor of that name is already declared keeps its declaration as it is", async () => {
+    const vendors = "vendors:\n  - id: elicit # DPA signed\n    dpa: true\n";
+    const cap = serve({ yaml: `${YAML}${vendors}` });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.click(way(ELICIT));
+    await reason(user, "Approved");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    const text: string = cap.puts[0]!.body.yaml;
+    expect(text).toContain(vendors);
+    expect(parse(text).vendors).toEqual([{ id: "elicit", dpa: true }]);
+    expect(parse(text).processing.metadata_lookup).toEqual(["crossref", "openalex", "openlibrary", "loc", "elicit"]);
+  });
+
+  it("the reference-lookup legal basis is there: set in the form (a governed loosening) and written under its category", async () => {
+    const cap = serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = findCard().getByRole("textbox", { name: /Default legal basis for records made from typed references/ });
+    const hint = document.getElementById(field.getAttribute("aria-describedby") ?? "");
+    expect(hint?.textContent).toMatch(/For records made from references you type into Find and acquire/);
+    await user.type(field, "Legitimate interest, GDPR Art. 6(1)(f)");
+    await user.tab();
+    await reason(user, "Bibliographic records only");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    expect(parse(cap.puts[0]!.body.yaml).consent.defaultLegalBasis).toEqual({ "reference-lookup": "Legitimate interest, GDPR Art. 6(1)(f)" });
+  });
+
+  it("a locked project shows the boxes but cannot change them", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason="This project is locked. Unlock it in the library to change its rules." />);
+    await loaded();
+    for (const b of findCard().getAllByRole("checkbox") as HTMLInputElement[]) expect(b.disabled).toBe(true);
+    expect((findCard().getByRole("textbox", { name: /Default legal basis/ }) as HTMLInputElement).disabled).toBe(true);
   });
 });

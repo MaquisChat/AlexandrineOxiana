@@ -9,12 +9,16 @@
  * the card of their control. Also: protocol approval documents and the retention list.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { isMap, isScalar, isSeq, parseDocument, type Document } from "yaml";
 import { ApiClientError } from "../api/client";
 import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
 import { FileDrop } from "../components/FileDrop";
 import { ConfirmDialog, ReasonDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import {
+  ACQUIRE_LABEL,
+  ACQUIRE_METHODS,
+  type AcquireMethod,
   CAPTURE_LABEL,
   CAPTURE_METHODS,
   WEB_CAPTURE_METHODS,
@@ -141,15 +145,19 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
 
   const cfg = parsed.cfg;
 
-  /** One control changed through the form; `said` names the change in plain words for the reason dialog. */
-  const change = (control: string, value: unknown, said?: ReactNode) => {
+  /**
+   * One control changed through the form; `said` names the change in plain words for the reason dialog. `write`, when
+   * given, makes the edit to the text in place of setting `control` to `value` (the Elicit box: the same value, written
+   * so that everything else in the file stays as it is); the reason is asked exactly as for any other control.
+   */
+  const change = (control: string, value: unknown, said?: ReactNode, write?: (text: string) => string) => {
     if (!cfg || readOnlyReason) return;
     setStatus(null);
     const profile = belowProfile(cfg, control, value);
     const needsException = profile !== null && !hasException(cfg, control, value);
     const looser = savedCfg ? isLooser(control, getPath(savedCfg, control), value) : true;
     if (!needsException && !looser) {
-      setText((t) => setIn(t, control, value));
+      setText((t) => (write ? write(t) : setIn(t, control, value)));
       return;
     }
     setPending({
@@ -163,7 +171,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
           )
           : `Setting ${control} to ${describe(value)} loosens the project's rules, so it needs a reason.`,
       apply: (reason: string, by: string) => {
-        let next = setIn(text, control, value);
+        let next = write ? write(text) : setIn(text, control, value);
         if (needsException) next = addException(next, { control, value, reason, by, at: nowUtc() });
         return next;
       },
@@ -312,6 +320,20 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
 
         <ControlCard violations={violations} title="Capture methods" controls={["captureMethods", "consent.defaultLegalBasis"]}>
           <CaptureMethods
+            cfg={cfg}
+            disabled={off}
+            {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})}
+            cancelled={cancelled}
+            onChange={change}
+            onClearDefault={(path) => {
+              setStatus(null);
+              setText((t) => removeIn(t, path));
+            }}
+          />
+        </ControlCard>
+
+        <ControlCard violations={violations} title="How Find and acquire may get works" controls={["acquireMethods", `consent.defaultLegalBasis.${FIND_LEGAL_CATEGORY}`]}>
+          <FindAcquireWays
             cfg={cfg}
             disabled={off}
             {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})}
@@ -562,6 +584,160 @@ function CaptureMethods({
         <legend>How sources may come in from files and other programs</legend>
         {CAPTURE_METHODS.filter((m) => !WEB_CAPTURE_METHODS.includes(m)).map((m) => box(m))}
       </fieldset>
+    </>
+  );
+}
+
+/** The data category of records made from typed references (the library's FIND_LEGAL_CATEGORY; plan Amendment A3). */
+const FIND_LEGAL_CATEGORY = "reference-lookup";
+/** The provider name a project's rules give Elicit under metadata lookups, with a vendor of that id (F12's report; R302 b). */
+const ELICIT = "elicit";
+const ELICIT_LABEL = "Elicit (a commercial service; it receives the words you type and nothing about this project)";
+/** What the profiles' vendor rules mean for Elicit (core merge.ts: a vendor without the agreement is dropped). */
+const ELICIT_PROFILE_NOTE: Partial<Record<Profile, string>> = {
+  gdpr: "Under GDPR, Elicit is used only once its entry under vendors in governance.yaml records a data processing agreement (dpa: true).",
+  hipaa: "Under HIPAA, Elicit is used only once its entry under vendors in governance.yaml records a business associate agreement (baa: true).",
+};
+
+/** Edits the YAML text in place with one parse, keeping comments and layout elsewhere. */
+function editYaml(text: string, fn: (doc: Document) => void): string {
+  const doc = parseDocument(text, { uniqueKeys: true }) as Document;
+  if (doc.errors.length) throw new Error(doc.errors[0]!.message.split("\n")[0]);
+  if (!isMap(doc.contents)) doc.contents = doc.createNode({}) as never;
+  fn(doc);
+  return String(doc);
+}
+
+/**
+ * Elicit added to or taken out of `processing.metadata_lookup`: in the list as written when there is one (its other
+ * entries untouched), else the list in force (`current`) written with or without it. Added, a vendor `elicit` is
+ * declared unless one is already (an existing declaration, with its agreements, is kept as it is). Taken out, nothing
+ * else changes: the vendors stay byte for byte (a declared vendor that no operation names allows nothing).
+ */
+function writeElicit(text: string, on: boolean, current: string[]): string {
+  return editYaml(text, (doc) => {
+    const path = ["processing", "metadata_lookup"];
+    const list = doc.getIn(path, true);
+    const isElicit = (n: unknown) => isScalar(n) && n.value === ELICIT;
+    if (isSeq(list)) {
+      if (on && !list.items.some(isElicit)) list.add(doc.createNode(ELICIT));
+      if (!on) list.items = list.items.filter((n) => !isElicit(n));
+    } else {
+      const rest = current.filter((x) => x !== ELICIT);
+      doc.setIn(path, doc.createNode(on ? [...rest, ELICIT] : rest));
+    }
+    if (!on) return;
+    const vendors = doc.getIn(["vendors"], true);
+    if (isSeq(vendors)) {
+      if (!vendors.items.some((v) => isMap(v) && v.get("id") === ELICIT)) vendors.add(doc.createNode({ id: ELICIT }));
+    } else if (vendors === undefined || vendors === null || (isScalar(vendors) && vendors.value === null)) {
+      doc.setIn(["vendors"], doc.createNode([{ id: ELICIT }]));
+    }
+  });
+}
+
+/**
+ * How Find and acquire may get works (Find and acquire Task F13; R225 2, R301, R302 b): the three ways, written to
+ * `acquireMethods` through the same governed change as every other control (adding one is a loosening: a reason is
+ * asked); Elicit, allowed per project by one box that writes what the "Metadata lookups" field of "Processing location"
+ * writes (the provider `elicit`, with its vendor declared), so the two always agree; and the default legal basis for
+ * records made from typed references.
+ */
+function FindAcquireWays({
+  cfg,
+  disabled,
+  whyId,
+  cancelled,
+  onChange,
+  onClearDefault,
+}: {
+  cfg: Config | null;
+  disabled: boolean;
+  whyId?: string;
+  cancelled: number;
+  onChange: (control: string, value: unknown, said?: ReactNode, write?: (text: string) => string) => void;
+  onClearDefault: (path: string) => void;
+}) {
+  const id = useId();
+  const listed = cfg?.acquireMethods ?? [];
+  const on = new Set(listed);
+  const toggle = (m: AcquireMethod, checked: boolean) => {
+    if (!cfg) return;
+    const next = ACQUIRE_METHODS.filter((x) => (x === m ? checked : on.has(x)));
+    // Ways the rules file names that this version does not know are kept as written.
+    const unknown = listed.filter((x) => !(ACQUIRE_METHODS as readonly string[]).includes(x));
+    onChange("acquireMethods", [...next, ...unknown], `${checked ? "Allowing" : "Not allowing"} “${ACQUIRE_LABEL[m]}”`);
+  };
+  const lookups = cfg?.processing.metadata_lookup ?? [];
+  const elicitOn = lookups.includes(ELICIT);
+  const vendors = cfg ? getPath(cfg, "vendors") : undefined;
+  const declared = Array.isArray(vendors) && vendors.some((v) => typeof v === "object" && v !== null && (v as { id?: unknown }).id === ELICIT);
+  const toggleElicit = (checked: boolean) => {
+    if (!cfg) return;
+    const next = checked ? [...lookups.filter((x) => x !== ELICIT), ELICIT] : lookups.filter((x) => x !== ELICIT);
+    onChange("processing.metadata_lookup", next, `${checked ? "Allowing" : "Not allowing"} Elicit`, (t) => writeElicit(t, checked, lookups));
+  };
+  const profileNotes = (cfg?.profiles ?? []).flatMap((p) => (ELICIT_PROFILE_NOTE[p] ? [ELICIT_PROFILE_NOTE[p]!] : []));
+  const basisPath = `consent.defaultLegalBasis.${FIND_LEGAL_CATEGORY}`;
+  const basis = cfg?.consent.defaultLegalBasis?.[FIND_LEGAL_CATEGORY] ?? "";
+  return (
+    <>
+      <fieldset className="ao-fieldset" aria-describedby={whyId}>
+        <legend>Ways allowed in this project</legend>
+        {ACQUIRE_METHODS.map((m) => (
+          <label key={m} className="ao-choice">
+            <input type="checkbox" disabled={disabled || !cfg} checked={on.has(m)} onChange={(e) => toggle(m, e.target.checked)} />
+            {ACQUIRE_LABEL[m]}
+          </label>
+        ))}
+      </fieldset>
+      <p className="ao-hint">A file found for a record is never added without your confirmation.</p>
+      <fieldset className="ao-fieldset" aria-describedby={whyId}>
+        <legend>Search services that need this project's permission</legend>
+        <label className="ao-choice">
+          <input
+            type="checkbox"
+            disabled={disabled || !cfg}
+            checked={elicitOn}
+            aria-describedby={[`${id}-elicit`, profileNotes.length ? `${id}-elicit-profiles` : "", elicitOn && !declared ? `${id}-elicit-undeclared` : ""].filter(Boolean).join(" ")}
+            onChange={(e) => toggleElicit(e.target.checked)}
+          />
+          {ELICIT_LABEL}
+        </label>
+        <p id={`${id}-elicit`} className="ao-hint">
+          The same setting as “elicit” in Metadata lookups under Processing location. Elicit is asked only when it is also switched on in Search sources and its key is saved there.
+        </p>
+        {elicitOn && !declared ? (
+          <p id={`${id}-elicit-undeclared`} className="ao-warning">
+            Elicit is named under Metadata lookups but not declared under vendors in governance.yaml, so these rules cannot be saved as they are. Untick the box and tick it again to declare it.
+          </p>
+        ) : null}
+        {profileNotes.length ? (
+          <ul id={`${id}-elicit-profiles`} className="ao-list">
+            {profileNotes.map((n) => (
+              <li key={n}>{n}</li>
+            ))}
+          </ul>
+        ) : null}
+      </fieldset>
+      <CommitInput
+        key={cancelled}
+        label="Default legal basis for records made from typed references (recorded with each such record)"
+        hint="For records made from references you type into Find and acquire. For example: Legitimate interest, GDPR Art. 6(1)(f). Setting or changing it loosens the rules, so it asks for a reason."
+        disabled={disabled}
+        value={basis}
+        onCommit={(v) =>
+          v
+            ? onChange(
+                basisPath,
+                v,
+                <>
+                  Setting the default legal basis for records made from typed references to “<UserText>{v}</UserText>”
+                </>,
+              )
+            : onClearDefault(basisPath)
+        }
+      />
     </>
   );
 }
