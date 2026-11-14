@@ -103,6 +103,8 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     safeYamlCheck(yaml);
     const r = await s.repo.setGovernance(projectId, yaml, { baseSha256, ...(reason ? { reason } : {}) });
     state.publishState();
+    // R282 f: the project's Find and acquire entries the rules had stopped are looked at again under the new rules.
+    state.resumeFind(s, projectId);
     return { violations: r.violations, loosened: r.loosened, sha256: r.sha256 };
   });
 

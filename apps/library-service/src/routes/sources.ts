@@ -220,6 +220,10 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const sid = paramsOf(req).sid ?? "";
     await sourceOf(ctx, projectId, sid);
     await s.repo.deleteSource(projectId, sid);
+    // R310 a: the deletion's own change resolved a file waiting for the researcher's check that was found for this
+    // record (the library cannot tell the runner): the entries waiting for a place go on — the light wake, nothing in
+    // flight touched; still at the limit, they go back to waiting having asked nothing.
+    await s.find?.wakeHeldFull(projectId);
     return { deleted: true };
   });
 
