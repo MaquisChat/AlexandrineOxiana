@@ -9,7 +9,10 @@
  *    (`/login?url=<target>`). Without its session cookie: a sign-in form (made-up reader, made-up
  *    password). The form posts to a SAML-like path (`/saml/SSO`) carrying a one-time assertion; that
  *    path sets the session cookie FOR THE PROXY'S PARENT DOMAIN (`Domain=proxy.ao-library-standin.test`,
- *    so that it also reaches the hyphenated hosts) and sends the window back to `/login`, which then
+ *    so that it also reaches the hyphenated hosts) and a second cookie for the stand-in's WHOLE made-up
+ *    domain (`Domain=ao-library-standin.test`, so that it reaches the third host too: the control that
+ *    shows the proxy's cookie is kept from the third host by the shell's rule, not by accident), and
+ *    sends the window back to `/login`, which then
  *    sends it on to the target through the proxy. The SAML-like path accepts each assertion once: a
  *    second request with it is a REPLAY and fails the scenario, and so does any request the shell
  *    itself makes to this host (the shell must never fetch a sign-in address).
@@ -22,20 +25,29 @@
  *                             look like one (`/content/unmarked/fulltext`, inline);
  *      `/article/attachment`    a page WITH the mark → `/files/attachment`, a PDF sent with
  *                             `Content-Disposition: attachment` at an address that does not look like one;
- *      `/article/redirect`    a page WITH the mark → `/pdf/redirect.pdf`, which redirects to the third host.
+ *      `/article/redirect`    a page WITHOUT the mark (reached with a query, `?from=doi&visit=…`), showing a
+ *                             link to `/content/redirect/fulltext`: to the WINDOW an inline PDF (so the
+ *                             window never meets a redirect), to THE SHELL a 302 to the third host
+ *                             (R346 b: the shell's own request meets the redirect).
  *  - `cdn.ao-library-standin.test` — a third host, NOT under the proxy's domain: `/<slug>.pdf` (inline);
  *    records which cookies it is sent.
  * No page's path holds what the shell takes for a PDF's address (`/download`, `/pdf/`, `.pdf`, …;
  * library_window.rs `looks_like_pdf_address`) except where a PDF is meant to be seen there: the shell
  * would fetch such a page as soon as it loaded.
  *
- * Every request is recorded (`requests()`): when, host, method, path, who made it, and the NAMES of the
- * cookies it carried — never their values, and nothing of it is printed. Who: the shell's own request
- * asks `Accept: application/pdf` and nothing else (library_window.rs `fetch_pdf`); the web view's
- * navigations ask for HTML first. The pages' only script is a beacon (`/ready?…`) that says the page
+ * Every request is recorded (`requests()`): when, host, method, path, who made it, the NAMES of the
+ * cookies it carried (sorted) — never their values — and its `Referer`; nothing of it is printed. Who
+ * (R346 f), by TWO independent marks that must agree: the shell's own request asks
+ * `Accept: application/pdf` and nothing else (library_window.rs `fetch_pdf`) AND carries no
+ * `Sec-Fetch-Mode`, which the web view (WebKitGTK) sends with every request it makes — its
+ * navigations, its sub-resources and the beacon alike — and the shell never does (seen in the
+ * recorded headers of real runs: the shell sends Accept, Cookie, Host, Referer and User-Agent only). A
+ * request whose two marks disagree is recorded as "unclear", and fails every scenario
+ * (`violations()`). The pages' only script is a beacon (`/ready?…`) that says the page
  * is shown with its first control focused, so that the scenario types only once a person could.
  * `violations()` lists what fails a scenario whatever it checks: a replayed assertion, the shell at
- * the sign-in host or the SAML-like path, a wrong sign-in.
+ * the sign-in host or the SAML-like path, a wrong sign-in, a request that is neither plainly the
+ * shell's nor plainly the window's.
  */
 import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:https";
@@ -53,6 +65,10 @@ export const HOSTS = {
 export const STANDIN_NAMES: string[] = Object.values(HOSTS);
 /** The proxy's session cookie (its name; its value is random per sign-in and never recorded). */
 export const SESSION_COOKIE = "ezproxy";
+/** A cookie the sign-in sets for the stand-in's whole made-up domain (it reaches every host, the third one too). */
+export const WIDE_COOKIE = "invented-wide";
+/** The cookies a signed-in request to a proxied host carries (sorted, as recorded). */
+export const SIGNED_IN_COOKIES = [SESSION_COOKIE, WIDE_COOKIE].sort();
 /** The made-up reader's sign-in (a stand-in's; no real account). */
 export const READER = { user: "test-only-reader", password: "not-a-real-password" };
 export const SAML_PATH = "/saml/SSO";
@@ -65,10 +81,15 @@ export interface StandinRequest {
   host: string;
   method: string;
   path: string;
-  /** "shell": the shell's own request (Accept: application/pdf alone); "window": the sign-in window. */
-  by: "shell" | "window";
-  /** The names of the cookies the request carried (never their values). */
+  /**
+   * "shell": the shell's own request (Accept: application/pdf alone AND no Sec-Fetch-Mode); "window":
+   * the sign-in window (another Accept AND Sec-Fetch-Mode); "unclear": the two marks disagree.
+   */
+  by: "shell" | "window" | "unclear";
+  /** The names of the cookies the request carried, sorted (never their values). */
   cookies: string[];
+  /** The `Referer` it carried, if any. */
+  referer?: string;
 }
 
 export interface Standin {
@@ -80,6 +101,17 @@ export interface Standin {
   /** The bytes the stand-in serves as the work's PDF for `kind`. */
   pdf(kind: PageKind): Buffer;
   close(): Promise<void>;
+}
+
+/**
+ * Who made a request, by two independent marks (R346 f): `Accept` exactly `application/pdf` (the
+ * shell's `fetch_pdf` asks nothing else; the web view never asks that alone), and `Sec-Fetch-Mode`
+ * absent (the web view sends it with every request; the shell never does).
+ */
+export function whoAsked(headers: Record<string, string | string[] | undefined>): StandinRequest["by"] {
+  const pdfAlone = headers.accept === "application/pdf";
+  const noFetchMetadata = headers["sec-fetch-mode"] === undefined;
+  return pdfAlone && noFetchMetadata ? "shell" : !pdfAlone && !noFetchMetadata ? "window" : "unclear";
 }
 
 const html = (title: string, body: string, head = "") =>
@@ -123,9 +155,10 @@ export async function startStandin(tls: { certPem: string; keyPem: string }, pdf
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     const host = String(req.headers.host ?? "").replace(/:\d+$/, "").toLowerCase();
     const url = new URL(req.url ?? "/", "https://x");
-    const accept = String(req.headers.accept ?? "");
-    const by: StandinRequest["by"] = accept === "application/pdf" ? "shell" : "window";
-    log.push({ at: Date.now(), host, method: req.method ?? "", path: url.pathname, by, cookies: [...cookiesOf(req).keys()] });
+    const by = whoAsked(req.headers);
+    const referer = typeof req.headers.referer === "string" ? req.headers.referer : undefined;
+    log.push({ at: Date.now(), host, method: req.method ?? "", path: url.pathname, by, cookies: [...cookiesOf(req).keys()].sort(), ...(referer === undefined ? {} : { referer }) });
+    if (by === "unclear") violations.push(`a request whose two marks disagree (Accept and Sec-Fetch-Mode): ${req.method} ${host}${url.pathname}`);
     let body = "";
     for await (const chunk of req) body += chunk;
 
@@ -148,7 +181,7 @@ export async function startStandin(tls: { certPem: string; keyPem: string }, pdf
         }
         const value = randomBytes(16).toString("hex");
         sessions.add(value);
-        res.setHeader("set-cookie", `${SESSION_COOKIE}=${value}; Domain=${PROXY_DOMAIN}; Path=/; Secure; HttpOnly; SameSite=Lax`);
+        res.setHeader("set-cookie", [`${SESSION_COOKIE}=${value}; Domain=${PROXY_DOMAIN}; Path=/; Secure; HttpOnly; SameSite=Lax`, `${WIDE_COOKIE}=${randomBytes(8).toString("hex")}; Domain=${STANDIN_DOMAIN}; Path=/; Secure; HttpOnly; SameSite=Lax`]);
         return redirect(res, `/login?url=${encodeURIComponent(form.get("relay") ?? "")}`, 303);
       }
       if (url.pathname === "/login") {
@@ -174,7 +207,8 @@ export async function startStandin(tls: { certPem: string; keyPem: string }, pdf
       const doi = url.pathname.slice(1);
       const kind = kindOf(/^10\.5555\/ao\.f19\.([a-z-]+)$/.exec(doi)?.[1]?.replace(/^restart$/, "unmarked").replace(/^close$/, "marked") ?? "");
       if (!signedIn(req)) return toSignIn(res, `https://doi.org/${doi}`);
-      return kind ? redirect(res, `${origin(HOSTS.publisher)}/article/${kind}`) : send(res, 404, "");
+      // The redirect work's page is reached with a query (what a Referer must never carry on).
+      return kind ? redirect(res, `${origin(HOSTS.publisher)}/article/${kind}${kind === "redirect" ? `?from=doi&visit=${randomBytes(4).toString("hex")}` : ""}`) : send(res, 404, "");
     }
     if (host === HOSTS.publisher) {
       if (!signedIn(req)) return toSignIn(res, "https://doi.org/");
@@ -184,13 +218,14 @@ export async function startStandin(tls: { certPem: string; keyPem: string }, pdf
         if (!kind) return send(res, 404, "");
         const mark = (to: string) => `<meta name="citation_pdf_url" content="${origin(HOSTS.publisher)}${to}">`;
         const title = `An invented article (${kind})`;
-        if (kind === "unmarked") return send(res, 200, html(title, `<h1>${title}</h1><p><a id="pdf" href="/content/unmarked/fulltext">Full text (PDF)</a></p>${ready("unmarked", "pdf")}`));
+        if (kind === "unmarked" || kind === "redirect") return send(res, 200, html(title, `<h1>${title}</h1><p><a id="pdf" href="/content/${kind}/fulltext">Full text (PDF)</a></p>${ready(kind, "pdf")}`));
         const to = kind === "attachment" ? "/files/attachment" : `/pdf/${kind}.pdf`;
         return send(res, 200, html(title, `<h1>${title}</h1><p><a href="${to}">PDF</a></p>${ready(kind)}`, mark(to)));
       }
       if (url.pathname === "/content/unmarked/fulltext") return pdf(res, "unmarked");
+      // To the window: the PDF, inline (it meets no redirect). To the shell: a redirect to the third host.
+      if (url.pathname === "/content/redirect/fulltext") return by === "shell" ? redirect(res, `${origin(HOSTS.third)}/redirect.pdf`) : by === "window" ? pdf(res, "redirect") : send(res, 400, "");
       if (url.pathname === "/files/attachment") return pdf(res, "attachment", true);
-      if (url.pathname === "/pdf/redirect.pdf") return redirect(res, `${origin(HOSTS.third)}/redirect.pdf`);
       const p = /^\/pdf\/([a-z]+)\.pdf$/.exec(url.pathname);
       const k = p ? kindOf(p[1]!) : undefined;
       return k ? pdf(res, k) : send(res, 404, "");

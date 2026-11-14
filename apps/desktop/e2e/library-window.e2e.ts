@@ -7,7 +7,9 @@
  * library and a publisher are stood in for by `library-standin.ts`, over https at made-up names, which
  * this machine resolves and trusts only for the run (`system-setup.ts`, only with
  * AO_E2E_SYSTEM_SETUP=1; without it every scenario here is reported NOT RUN, with the reason, never as
- * passed). Nothing of the product is relaxed for it.
+ * passed; with it, a set-up that cannot be made FAILS the run, R346 c). With the switch, the whole run is
+ * in a network namespace with only the loopback interface (`netns.mjs`, R346 d): no outside server can
+ * be reached. Nothing of the product is relaxed for it.
  *
  * What is real: the app's window and its interface (the Find and acquire screen's "Get through my
  * library", the waiting row, "Add the PDF showing in the sign-in window", the review queue's "Use this
@@ -46,8 +48,8 @@ import { join, relative } from "node:path";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { startDesktop, until, type Desktop } from "./desktop.js";
 import { expect, test } from "./fixtures.js";
-import { HOSTS, READER, SAML_PATH, SESSION_COOKIE, STANDIN_NAMES, startStandin, type PageKind, type Standin, type StandinRequest } from "./library-standin.js";
-import { SystemSetup } from "./system-setup.js";
+import { HOSTS, READER, SAML_PATH, SESSION_COOKIE, SIGNED_IN_COOKIES, STANDIN_NAMES, startStandin, WIDE_COOKIE, type PageKind, type Standin, type StandinRequest } from "./library-standin.js";
+import { decide, machineObstacle, SETUP_FAILED, SystemSetup } from "./system-setup.js";
 import { elementId } from "./webdriver.js";
 
 // ---------- the screens' words, copied from the product ----------
@@ -164,9 +166,20 @@ const undoOnSignal = () => {
 };
 
 test.beforeAll(async () => {
-  notRun = SystemSetup.obstacle();
-  if (notRun) return;
-  setup = SystemSetup.apply(STANDIN_NAMES);
+  // Not asked for: NOT RUN, with the reason. Asked for and impossible here: the run FAILS (R346 c).
+  const outcome = decide(process.env, machineObstacle);
+  if (outcome.kind === "not-run") {
+    notRun = outcome.reason;
+    return;
+  }
+  if (outcome.kind === "fail") throw new Error(outcome.reason);
+  // The lock, an earlier killed run's leftovers put back from its record, then the set-up (R346 a, e).
+  try {
+    setup = SystemSetup.prepare(STANDIN_NAMES);
+  } catch (err) {
+    throw new Error(`${SETUP_FAILED} ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (setup.restored) process.stdout.write(`  the machine's set-up first ${setup.restored}\n`);
   // Interrupted (Ctrl+C, a stop, a closed terminal) or ended any other way: the machine is put back.
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, undoOnSignal);
   process.on("exit", undoOnSignal);
@@ -186,6 +199,12 @@ test.afterAll(async () => {
 test.beforeEach(() => {
   test.skip(notRun !== undefined, notRun);
   test.setTimeout(600_000); // a hang detector, not a budget (R150): the app is started, a library made, a window signed in
+});
+
+// Every scenario fails if any request was neither plainly the shell's nor plainly the window's (R346 f).
+test.afterEach(() => {
+  if (!standin) return;
+  expect(standin.requests().filter((q) => q.by === "unclear"), "requests whose two marks (Accept, Sec-Fetch-Mode) disagree").toEqual([]);
 });
 
 // ---------- the main window ----------
@@ -487,7 +506,7 @@ test("signed in, marked page, file handed over: it waits for the researcher's ch
   });
   await test.step("the shell fetches the PDF by itself: ONE request of its own, with the session cookie, and none to the sign-in", async () => {
     const shellPdf = await recorded("the shell's request for the PDF", pressed, (q) => q.by === "shell");
-    expect(shellPdf).toMatchObject({ host: HOSTS.publisher, method: "GET", path: "/pdf/marked.pdf", cookies: [SESSION_COOKIE] });
+    expect(shellPdf).toMatchObject({ host: HOSTS.publisher, method: "GET", path: "/pdf/marked.pdf", cookies: SIGNED_IN_COOKIES });
     await rowUntil(r.d, w, `say “${WORDS.needsCheck}”`, (x) => x.state === WORDS.needsCheck);
     expect(since(pressed).filter((q) => q.by === "shell"), "one request of the shell's own").toHaveLength(1);
     expectNoViolation(pressed);
@@ -528,13 +547,13 @@ test("a page without the mark needs “Add the PDF showing in the sign-in window
   // The researcher opens the PDF in the window (Return on its link); the window shows it.
   await r.d.typeInto(SIGN_IN_TITLE, [{ key: "Return" }]);
   const shown = await recorded("the window's own request for the PDF", pressed, (q) => q.by === "window" && q.path === "/content/unmarked/fulltext");
-  expect(shown.cookies).toEqual([SESSION_COOKIE]);
+  expect(shown.cookies).toEqual(SIGNED_IN_COOKIES);
   const row = await rowOf(r.d, w);
   expect(row?.state).toBe(WORDS.waiting);
   expect(since(pressed).filter((q) => q.by === "shell"), "nothing fetched by the shell before the press").toEqual([]);
   const take = await pressAct(r.d, w, "library-take");
   const shellPdf = await recorded("the shell's request for the PDF showing", pressed, (q) => q.by === "shell");
-  expect(shellPdf).toMatchObject({ host: HOSTS.publisher, path: "/content/unmarked/fulltext", cookies: [SESSION_COOKIE] });
+  expect(shellPdf).toMatchObject({ host: HOSTS.publisher, path: "/content/unmarked/fulltext", cookies: SIGNED_IN_COOKIES });
   expect(shellPdf.at, "the shell's request came after the press").toBeGreaterThanOrEqual(take);
   await expectWaitingFile(r, w);
   await expectSaidInOrder(r, w, take);
@@ -549,28 +568,58 @@ test("a PDF sent as a download is fetched by the shell", async ({ run }) => {
   await signIn(r, pressed);
   // The page's mark leads the window to an address that does not look like a PDF, answered as a download.
   const own = await recorded("the window's request for the download", pressed, (q) => q.by === "window" && q.path === "/files/attachment");
-  expect(own.cookies).toEqual([SESSION_COOKIE]);
+  expect(own.cookies).toEqual(SIGNED_IN_COOKIES);
   const shellPdf = await recorded("the shell's request for the download's address", pressed, (q) => q.by === "shell");
-  expect(shellPdf).toMatchObject({ host: HOSTS.publisher, path: "/files/attachment", cookies: [SESSION_COOKIE] });
+  expect(shellPdf).toMatchObject({ host: HOSTS.publisher, path: "/files/attachment", cookies: SIGNED_IN_COOKIES });
   await expectWaitingFile(r, w);
   await expectSaidInOrder(r, w, pressed);
   expect(since(pressed).filter((q) => q.by === "shell")).toHaveLength(1);
   expectNoViolation(pressed);
 });
 
-test("a publisher redirecting to another host hands over no file without the check: the third host is sent no cookie of the proxy", async ({ run }) => {
+// R346 b. (It replaces the first round's redirect scenario, in which the WINDOW followed a marked
+// page's redirect to the third host and the shell then fetched the third host's address directly, in
+// one hop: the browser's own cookie rules kept the proxy's cookie away, and the shell's handling of a
+// redirect was never met.) Here the window shows the PDF inline at an address that does not look like a
+// PDF's — it meets no redirect — and only THE SHELL, asked by "Add the PDF showing in the sign-in
+// window", is answered with a 302 to the third host, outside the proxy's domain.
+test("the shell's own request meets a redirect to another host: the proxy's cookie stays behind, a cookie of the whole domain goes on, the Referer holds no query, and the file waits", async ({ run }) => {
   const w = WORKS.redirect;
   const r = await readyApp(run, [w]);
   const pressed = await startThroughLibrary(r, w);
   await signIn(r, pressed);
-  await recorded("the publisher's redirect to the third host", pressed, (q) => q.host === HOSTS.publisher && q.path === "/pdf/redirect.pdf");
-  await recorded("the shell's request for the PDF", pressed, (q) => q.by === "shell");
+  await recorded("the publisher's page without the mark (reached with a query), its link focused", pressed, (q) => q.path === "/ready" && q.host === HOSTS.publisher);
+  const page = since(pressed, HOSTS.publisher).find((q) => q.path === "/article/redirect")!;
+  expect(page.by).toBe("window");
+  // The researcher opens the PDF in the window; the window is given the PDF itself, no redirect.
+  await r.d.typeInto(SIGN_IN_TITLE, [{ key: "Return" }]);
+  const shown = await recorded("the window's own request for the PDF", pressed, (q) => q.by === "window" && q.path === "/content/redirect/fulltext");
+  expect(shown.cookies).toEqual(SIGNED_IN_COOKIES);
+  expect(shown.referer ?? "", "the page before held a query (the window's own Referer shows it)").toMatch(/\/article\/redirect\?from=doi&visit=/);
+  expect((await rowOf(r.d, w))?.state).toBe(WORDS.waiting);
+  expect(since(pressed).filter((q) => q.by === "shell"), "nothing fetched by the shell before the press").toEqual([]);
+  expect(since(pressed, HOSTS.third), "the window never met the redirect").toEqual([]);
+
+  const take = await pressAct(r.d, w, "library-take");
+  const hop1 = await recorded("the shell's request to the publisher", take, (q) => q.by === "shell" && q.host === HOSTS.publisher);
+  const hop2 = await recorded("the shell's request to the third host, after the redirect", take, (q) => q.by === "shell" && q.host === HOSTS.third);
+  // Hop 1, to the publisher through the proxy: the proxy's session cookie (and the domain's).
+  expect(hop1).toMatchObject({ method: "GET", path: "/content/redirect/fulltext", cookies: SIGNED_IN_COOKIES });
+  // Hop 2, to the third host: NO cookie of the proxy; the cookie of the whole made-up domain DID go
+  // there — so the proxy's is kept back by the shell's per-hop rule, not by an accident of the set-up.
+  expect(hop2).toMatchObject({ method: "GET", path: "/redirect.pdf", cookies: [WIDE_COOKIE] });
+  expect(hop2.cookies).not.toContain(SESSION_COOKIE);
+  expect(hop2.at).toBeGreaterThanOrEqual(hop1.at);
+  // The Referer the shell sent holds no query, on either hop (the third host hears the origin only).
+  for (const hop of [hop1, hop2]) expect(hop.referer ?? "", `${hop.host}${hop.path}`).not.toContain("?");
+  expect(hop2.referer, "the third host hears the publisher's origin only").toBe(`${standin!.origin(HOSTS.publisher)}/`);
+  expect(hop1.referer).toBe(`${standin!.origin(HOSTS.publisher)}/article/redirect`);
+  // The file waits for the researcher's check; the record has no file.
   await expectWaitingFile(r, w);
-  const third = since(pressed, HOSTS.third);
-  expect(third.length, "the third host was asked").toBeGreaterThan(0);
-  expect(third.filter((q) => q.cookies.length > 0), "no cookie of the proxy (nor any) reached the third host").toEqual([]);
-  expect(third.some((q) => q.by === "shell"), "the shell's request reached the third host").toBe(true);
-  expect(since(pressed).filter((q) => q.by === "shell" && q.host !== HOSTS.third && q.host !== HOSTS.publisher)).toEqual([]);
+  await expectSaidInOrder(r, w, take);
+  const shell = since(pressed).filter((q) => q.by === "shell");
+  expect(shell.map((q) => `${q.host}${q.path}`), "the shell's two hops, and nothing else").toEqual([`${HOSTS.publisher}/content/redirect/fulltext`, `${HOSTS.third}/redirect.pdf`]);
+  expect(since(pressed, HOSTS.third).every((q) => q.by === "shell"), "only the shell reached the third host").toBe(true);
   expectNoViolation(pressed);
 });
 
@@ -588,6 +637,10 @@ test("closing the sign-in window while the entry waits returns the entry, and a 
   expectNoViolation(first);
 });
 
+// On Linux this check CANNOT FAIL (R346 g): the sign-in window is private there (an ephemeral store,
+// wry's incognito web view), so its cookies die with the app's process whatever the shell does. It is
+// kept for the Mac, where the window's store is kept by identifier and must be removed at quit (the
+// owner's Mac list).
 test("after quit the stand-in sees no cookie: a new start with “Stay signed in” off opens the sign-in afresh", async ({ run }) => {
   const w = WORKS.restart;
   const r = await readyApp(run, [w]);
