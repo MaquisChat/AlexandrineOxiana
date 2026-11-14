@@ -3287,7 +3287,7 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
     expect(posts("/library/start")).toHaveLength(3);
   });
 
-  it("R340 a: the ticket and the address go to the shell and nowhere else — not the page's address or history, storage, any element, the console", async () => {
+  it("R340 a: the ticket and the address go to the shell and nowhere else — not the page's address or history, storage, any element, the console (R342 b: also when a leftover window is closed and the shell asked again)", async () => {
     const e = entry({ typed: "kept out", ...startable() });
     serve([e], {
       start: () => {
@@ -3299,7 +3299,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
         return HttpResponse.json(current[0]);
       },
     });
-    fake.shell!.openLibraryWindow.mockResolvedValue(true);
+    // R342 b: a window left over from before refuses the first open; the page closes it and asks once more.
+    fake.shell!.openLibraryWindow.mockResolvedValueOnce(false).mockResolvedValue(true);
     fake.shell!.libraryWindowTakePdf.mockResolvedValue(true);
     const spies = (["log", "info", "warn", "error", "debug", "trace"] as const).map((k) => vi.spyOn(console, k));
     const pushState = vi.spyOn(window.history, "pushState");
@@ -3326,10 +3327,14 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       for (const sp of [...spies, pushState, replaceState]) seen.push(JSON.stringify(sp.mock.calls.map((c) => c.map(String))));
       const all = seen.join("\n");
       for (const secret of [TICKET, LIB_URL, "ezproxy.lib.example.edu", "ao.through.zq7"]) expect(all.includes(secret), secret).toBe(false);
-      // The two calls to the shell that carry them, and no other (the take and the close carry nothing).
-      expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([[TICKET, LIB_URL]]);
+      // The calls to the shell that carry them — the open, and R342 b's second open — and no other (the take and the
+      // closes, the leftover's and Cancel's, carry nothing).
+      expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([
+        [TICKET, LIB_URL],
+        [TICKET, LIB_URL],
+      ]);
       expect(fake.shell!.libraryWindowTakePdf.mock.calls).toEqual([[]]);
-      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[]]);
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[], []]);
       expect(fake.shell!.openInBrowser).not.toHaveBeenCalled();
       // No request after the start carries them.
       expect(JSON.stringify(calls.filter((c) => !c.path.endsWith("/library/start")))).not.toMatch(/0123456789abcdef0123456789abcdef|ezproxy/u);
