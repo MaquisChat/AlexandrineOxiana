@@ -131,6 +131,15 @@ export interface WatchedFolderFilesResponse {
   items: WatchedFolderFileItem[];
 }
 
+/**
+ * Whether the new version of a source's file is on this computer, as the engine last judged it (R251): "local",
+ * "not-downloaded", or "unknown" whenever the engine cannot say (the watch is stopped, paused, cannot reach the folder
+ * or is locked; the folder is not set up on this computer; the engine has not judged this file yet; or its check
+ * could not tell).
+ */
+export const WATCHED_FILE_PRESENCES = ["local", "not-downloaded", "unknown"] as const;
+export type WatchedFilePresence = (typeof WATCHED_FILE_PRESENCES)[number];
+
 export interface WatchedSourceOrigin {
   watchId: string;
   /** The folder's label, else the name the service gives it (never an absolute path); "" once the folder is removed. */
@@ -139,8 +148,12 @@ export interface WatchedSourceOrigin {
   file: string;
   state: WatchedFileState;
   newBytes?: number;
-  /** The file's content was on this computer when the engine last judged it. */
-  local: boolean;
+  /**
+   * For a file noted "changed" or "may-have-changed": the engine's last judgement of whether its new version is on
+   * this computer, from memory (the file is never looked at for this answer). "unknown" for every other state (the
+   * engine keeps no judgement for them). A hint: "Bring in" is still refused if the file has left meanwhile (409).
+   */
+  presence: WatchedFilePresence;
 }
 
 export interface SourceWatchOriginResponse {
