@@ -4262,6 +4262,37 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       await waitFor(() => expect(live().textContent).toBe(`“link waits”: ${SAID}`));
     });
 
+    it("R347 f (R342 j for a link): two presses in the same moment on one link's control send ONE start", async () => {
+      waitsOnPress("one link twice");
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const b = here("one link twice");
+      act(() => {
+        b.click();
+        b.click();
+      });
+      await waitFor(() => expect(row("one link twice").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+      expect(linkPosts()).toEqual([{ method: "POST", path: expect.stringMatching(/\/link\/start$/u), body: { url: REPO } }]);
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+    });
+
+    it("R347 f (R342 j for a link): presses in the same moment on two different links of one row send ONE start", async () => {
+      waitsOnPress("two links at once");
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const first = here("two links at once");
+      const second = here("two links at once", "Publisher's page (doi.org)");
+      act(() => {
+        first.click();
+        second.click();
+      });
+      await waitFor(() => expect(row("two links at once").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+      expect(linkPosts()).toEqual([{ method: "POST", path: expect.stringMatching(/\/link\/start$/u), body: { url: REPO } }]);
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+    });
+
     it("R347 d: for a link's start too, the shell's refusal says its true reason; \"not a PDF\" as round 1 chose it when it looked and found none", async () => {
       waitsOnPress("link refused");
       fake.shell!.openLibraryWindow.mockResolvedValue(true);
