@@ -1,6 +1,6 @@
 /** Sources: create (capture + store), read, update, delete; source.json / source.json.enc and manifest.json. */
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, statSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
@@ -633,6 +633,23 @@ export async function getSourceRecordWithAssets(core: RepoCore, projectId: strin
   } else text = raw.toString("utf8");
   const sf = SourceFile.parse(JSON.parse(text));
   return { source: sf.source, assets: sf.assets };
+}
+
+/**
+ * Task F15 (R328 e): a stamp of a source's record file — its inode, size, and modification and change times — or null
+ * when the record is not (or no longer) there. It reads nothing of the file (one `stat`), so a list may ask it for
+ * every row to know whether what it read before still stands: a write by the app (atomic, so a new file) and a change
+ * made outside the app both change it. Refused for a locked project, as a read is.
+ */
+export function sourceRecordStamp(core: RepoCore, projectId: string, id: string): string | null {
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const folder = st.sources.get(id);
+  if (!folder) return null;
+  // Synchronous on purpose: one `stat` is a few microseconds, far less than a promise through the thread pool, and a
+  // list asks it for every row.
+  const s = statSync(core.abs(core.encrypted(st) ? `${folder}/source.json.enc` : `${folder}/source.json`), { bigint: true, throwIfNoEntry: false });
+  return s ? `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}` : null;
 }
 
 export function listSourceIds(core: RepoCore, projectId: string): string[] {

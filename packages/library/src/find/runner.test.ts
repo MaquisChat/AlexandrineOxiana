@@ -4760,6 +4760,83 @@ describe("F15: a fetch through the researcher's library", () => {
     expect((await r2.libraryStart(p.id, b.id, EZ)).ticket).toMatch(/^[0-9a-f]{32}$/u);
   });
 
+  describe("R328 e: the queue's view reads a record only when it changed", () => {
+    /** How many records of `projectId` were read since the last call. */
+    const reads = (projectId: string) => {
+      const spy = vi.spyOn(repo, "getSource");
+      return () => {
+        const n = spy.mock.calls.filter(([pid]) => pid === projectId).length;
+        spy.mockClear();
+        return n;
+      };
+    };
+
+    it("a second read with nothing changed reads no record; a changed DOI is read once and seen; a deleted record is gone", async () => {
+      const p = await project({ gov: NO_FREE });
+      const entries = [await resting(p, RESTING[0]!), await resting(p, RESTING[1]!), await resting(p, RESTING[3]!)];
+      const r = runner();
+      const count = reads(p.id);
+      const first = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(3);
+      for (const e of entries) expect(first.get(e.id)!.chance).toBe("yes");
+      const second = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(0);
+      expect([...second.entries()]).toEqual([...first.entries()]);
+      // The DOI edited: that record (only) is read again, and its new DOI is in the view.
+      await repo.updateSource(p.id, entries[0]!.sourceId!, { identifiers: { doi: "10.5555/ao.f15.changed" } });
+      const third = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(1);
+      expect(third.get(entries[0]!.id)!.work.identifiers.doi).toBe("10.5555/ao.f15.changed");
+      // The DOI removed: no start (the address needs it).
+      await repo.updateSource(p.id, entries[1]!.sourceId!, { identifiers: {} });
+      const fourth = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(1);
+      expect(fourth.get(entries[1]!.id)!.work.identifiers.doi).toBeUndefined();
+      expect(fourth.get(entries[1]!.id)!.chance).toBeUndefined();
+      // The record deleted: the entry has no view parts.
+      await repo.deleteSource(p.id, entries[2]!.sourceId!);
+      expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).has(entries[2]!.id)).toBe(false);
+      // A record changed outside the app (its file rewritten) is read again too.
+      const before = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      count();
+      const file = join(lib.root, (await repo.getSource(p.id, entries[0]!.sourceId!)).source.folder, "source.json");
+      count();
+      const text = await readFile(file, "utf8");
+      await writeFile(file, text.replace("10.5555/ao.f15.changed", "10.5555/ao.f15.outside"));
+      const after = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(1);
+      expect(after.get(entries[0]!.id)!.work.identifiers.doi).toBe("10.5555/ao.f15.outside");
+      expect(before.get(entries[0]!.id)!.work.identifiers.doi).toBe("10.5555/ao.f15.changed");
+    });
+
+    it("what is kept is what the view needs; never another project's record; nothing after a lock or a close", async () => {
+      const p = await project({ gov: NO_FREE, encrypted: true });
+      const q = await project({ gov: NO_FREE });
+      const e = await resting(p, RESTING[0]!);
+      const f = await resting(q, RESTING[0]!, e.sourceId); // the same id asked for in another project: never served from p's
+      const r = runner();
+      const countP = reads(p.id);
+      const v = (await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!;
+      expect(Object.keys(v.work).sort()).toEqual(["creators", "id", "identifiers", "providers", "title", "type"]);
+      expect(v.work.providers).toEqual([]);
+      expect(v.work.creators).toEqual([{ role: "author", family: ZORBLATT.family }]);
+      expect(countP()).toBe(1);
+      expect((await r.libraryChances(q.id, (await queue(q)).values(), EZ)).has(f.id)).toBe(false);
+      // Locked: nothing is given, from the cache or otherwise; at the unlock the record is read anew (it was dropped).
+      r.stop(p.id);
+      repo.lockProject(p.id);
+      expect((await r.libraryChances(p.id, [e], EZ)).size).toBe(0);
+      await repo.unlockProject(p.id, "pw");
+      countP();
+      expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!.chance).toBe("yes");
+      expect(countP()).toBe(1);
+      // Closed: nothing at all.
+      await r.stopAll();
+      await expect(r.libraryChances(p.id, (await queue(p)).values(), EZ)).rejects.toBeInstanceOf(FindRunnerClosedError);
+      expect(countP()).toBe(0);
+    });
+  });
+
   it("an expired ticket is not taken by the seam, and its entry comes back", async () => {
     const p = await project({ gov: NO_FREE });
     const e = await resting(p, RESTING[0]!);

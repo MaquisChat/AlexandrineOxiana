@@ -164,7 +164,8 @@ export type LibraryParts = { offers: OfferLink[]; library?: FindLibraryChance };
  * copy services' links first, then the publisher's page, the catalogue, Open Library and WorldCat; the hosts parsed
  * from the addresses) and `library` (whether "Get through my library" may start, or "no-library"). "Your library" is
  * read anew; the rules, each resting entry's record and the runner's work are asked by the library's
- * `libraryChancesOf`. A project that cannot be read now gives nothing (the view is then as before).
+ * `libraryChancesOf` — through the runner's `libraryChances`, which reads a record only when its file changed (R328 e).
+ * A project that cannot be read now gives nothing (the view is then as before).
  */
 export async function libraryPartsOf(appConfigDir: string, s: Session, projectId: string, entries: Iterable<FindEntry>): Promise<Map<string, LibraryParts>> {
   const out = new Map<string, LibraryParts>();
@@ -174,7 +175,9 @@ export async function libraryPartsOf(appConfigDir: string, s: Session, projectId
   const runner = s.find;
   let chances: Awaited<ReturnType<typeof libraryChancesOf>>;
   try {
-    chances = await libraryChancesOf(s.repo, projectId, list, { access: settings.access, ...(runner ? { atWork: (id: string) => runner.atWork(projectId, id) } : {}) });
+    // R328 e: through the open library's runner, a record is read only when its file changed since it was last read
+    // (a read-only library has no runner: its records are read each time).
+    chances = runner ? await runner.libraryChances(projectId, list, settings.access) : await libraryChancesOf(s.repo, projectId, list, { access: settings.access });
   } catch {
     return out;
   }

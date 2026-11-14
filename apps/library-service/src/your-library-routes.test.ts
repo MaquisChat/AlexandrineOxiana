@@ -404,6 +404,39 @@ describe("the queue's view: Where to get it, and whether a start is offered (R32
   });
 });
 
+describe("R328 e: the queue's read reads a record only when it changed", () => {
+  it("a second GET reads no record; a DOI changed is read once and shown; a locked project's entries are not served after the lock", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject({ encrypted: true });
+    await setLibrary();
+    const a = await resting(pid, { state: "no-open-copy" });
+    const b = await resting(pid, { state: "no-open-copy" });
+    const spy = vi.spyOn(repo(), "getSource");
+    const reads = () => {
+      const n = spy.mock.calls.filter(([p]) => p === pid).length;
+      spy.mockClear();
+      return n;
+    };
+    await queue(pid);
+    expect(reads()).toBe(2);
+    await queue(pid);
+    expect(reads()).toBe(0);
+    await repo().updateSource(pid, a.sourceId!, { identifiers: { doi: "10.5555/ao.f15.second" } });
+    reads();
+    const v = await view(pid, a.id);
+    expect(reads()).toBe(1);
+    expect(v.offers!.find((o) => o.label === "Publisher's page")!.url).toBe("https://doi.org/10.5555/ao.f15.second");
+    // Locked: the queue cannot be read (as before), and nothing read before is served; at the unlock it is read anew.
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    expect((await call({ url: `/projects/${pid}/find` })).status).toBe(423);
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    reads();
+    expect((await view(pid, b.id)).library).toEqual({ canStart: true });
+    expect(reads()).toBe(2);
+  });
+});
+
 describe("R328 g: \"no library set\" only where a library could give an address", () => {
   it("an ISBN alone carries no `library` field while no library is set; once a resolver is set it may start", async () => {
     await start();

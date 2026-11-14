@@ -67,6 +67,7 @@ import {
   readFindQueueDetailedIn,
   readFindQueueIn,
   repoLibrary,
+  sourceRecordStampIn,
   type Repo,
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
@@ -89,6 +90,7 @@ import { decideMatch, openAlexSearchPausedUntil, scoreCandidate, searchWorks, ty
 import {
   FIND_DOI_MAX,
   FIND_LINE_MAX_BYTES,
+  FIND_QUEUE_MAX,
   FIND_TYPED_MAX,
   type FindEntry,
   type FindMatch,
@@ -290,17 +292,19 @@ export function restsForLibrary(e: FindEntry): boolean {
 }
 
 type PolicyInfo = Awaited<ReturnType<typeof lookupPolicyInfo>>;
+/** What the store of a record's file is asked with: its provenance's identifiable flag and legal basis. */
+type StoreFacts = { identifiable: boolean; legalBasis?: string };
 /**
  * Whether the rules allow a fetch through the library for this record AND would let its file be kept: the capture of
  * `library_access` and the store of the file as the copy part asks them before a download (identifiable data, the legal
  * basis). Fails closed (no rules, or a rule that cannot be evaluated).
  */
-function libraryAllowedBy(info: PolicyInfo, projectId: string, prov: Provenance): boolean {
+function libraryAllowedBy(info: PolicyInfo, projectId: string, facts: StoreFacts): boolean {
   if (!info.policy) return false;
   const base = { projectId, actor: info.actor, now: info.clock().toISOString(), ...(info.tz ? { tz: info.tz } : {}) };
   try {
     if (evaluate(info.policy, { ...base, action: "capture", capture: { method: "library_access" } }).result === "deny") return false;
-    const store = { identifiable: prov.identifiable, hasLocation: false, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) };
+    const store = { identifiable: facts.identifiable, hasLocation: false, ...(facts.legalBasis ? { legalBasis: facts.legalBasis } : {}) };
     return evaluate(info.policy, { ...base, action: "store", store }).result !== "deny";
   } catch {
     return false;
@@ -309,6 +313,85 @@ function libraryAllowedBy(info: PolicyInfo, projectId: string, prov: Provenance)
 
 /** Task F15: what the entry's view says of the library (R324 a, d). `chance` absent: no start offered. */
 export type FindLibraryChanceOf = { work: WorkCandidate; chance?: "yes" | "no-library" };
+
+/**
+ * R328 e: what the queue's view needs of a record, and nothing more — the work as "Where to get it" and a library
+ * address use it (its id, title, type, DOI and ISBNs, and the one creator's name the catalogue's query takes), whether
+ * the record has a file, and the two facts the store of a file is asked with.
+ */
+type RecordFacts = { work: WorkCandidate; hasFile: boolean; store: StoreFacts };
+
+function factsOf(sf: SourceFile): RecordFacts {
+  const w = workOfSourceFile(sf);
+  // The name the catalogue's query takes (whereToGetIt): the first family name, else the first creator's literal one.
+  const named = w.creators.find((c) => c.family);
+  const creator = named ? { role: named.role, family: named.family } : w.creators[0]?.literal ? { role: w.creators[0].role, literal: w.creators[0].literal } : undefined;
+  const prov = sf.source.provenance;
+  return {
+    work: { id: w.id, title: w.title, creators: creator ? [creator] : [], type: w.type, identifiers: w.identifiers, providers: [] },
+    hasFile: sourceHasFile(sf),
+    store: { identifiable: prov.identifiable, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) },
+  };
+}
+
+/** At most this many records' facts are kept (four full queues); the one used longest ago goes first. */
+export const RECORD_FACTS_MAX = 4 * FIND_QUEUE_MAX;
+
+/**
+ * R328 e: the records' facts the queue's view read last, each with the stamp of its file when it was read (a `stat`:
+ * inode, size, modification and change times). Kept by the runner — one per open library, in memory only — per
+ * project; a project's are dropped at its lock (`stop`) and all at the close (`stopAll`). Never shared between
+ * projects: a record is looked up under the project it was read in.
+ */
+interface RecordFactsCache {
+  get(projectId: string, sourceId: string, stamp: string): RecordFacts | undefined;
+  set(projectId: string, sourceId: string, stamp: string, facts: RecordFacts): void;
+  dropProject(projectId: string): void;
+  clear(): void;
+}
+
+function createRecordFactsCache(max = RECORD_FACTS_MAX): RecordFactsCache {
+  const byProject = new Map<string, Map<string, { stamp: string; facts: RecordFacts }>>();
+  /** Every key kept, in the order of its last use (`projectId \0 sourceId`): the bound. */
+  const order = new Map<string, [string, string]>();
+  const key = (p: string, id: string) => `${p}\u0000${id}`;
+  const forget = (p: string, id: string) => {
+    byProject.get(p)?.delete(id);
+    if (byProject.get(p)?.size === 0) byProject.delete(p);
+    order.delete(key(p, id));
+  };
+  return {
+    get(p, id, stamp) {
+      const hit = byProject.get(p)?.get(id);
+      if (!hit) return undefined;
+      if (hit.stamp !== stamp) {
+        forget(p, id);
+        return undefined;
+      }
+      order.delete(key(p, id));
+      order.set(key(p, id), [p, id]);
+      return hit.facts;
+    },
+    set(p, id, stamp, facts) {
+      forget(p, id);
+      let m = byProject.get(p);
+      if (!m) byProject.set(p, (m = new Map()));
+      m.set(id, { stamp, facts });
+      order.set(key(p, id), [p, id]);
+      while (order.size > max) {
+        const [oldest] = order.values();
+        forget(oldest![0], oldest![1]);
+      }
+    },
+    dropProject(p) {
+      for (const id of [...(byProject.get(p)?.keys() ?? [])]) forget(p, id);
+    },
+    clear() {
+      byProject.clear();
+      order.clear();
+    },
+  };
+}
 
 /**
  * Task F15 (R324 a, d): for each entry of `entries` that rests as R324 a names and whose record is still in the library,
@@ -324,7 +407,7 @@ export async function libraryChancesOf(
   repo: Repo,
   projectId: string,
   entries: Iterable<FindEntry>,
-  o: { access: LibraryAccess | null; atWork?: (entryId: string) => boolean; only?: string },
+  o: { access: LibraryAccess | null; atWork?: (entryId: string) => boolean; only?: string; records?: RecordFactsCache },
 ): Promise<Map<string, FindLibraryChanceOf>> {
   const out = new Map<string, FindLibraryChanceOf>();
   const all = [...entries];
@@ -338,21 +421,47 @@ export async function libraryChancesOf(
     throw err;
   }
   const waitingFor = new Set(all.filter((e) => e.state === "needs-check" && e.sourceId).map((e) => e.sourceId!));
-  for (const e of resting) {
-    let sf: SourceFile;
-    try {
-      sf = await repo.getSource(projectId, e.sourceId!);
-    } catch (err) {
-      if (err instanceof NotFoundError) continue;
-      throw err;
+  // The rules' answer depends only on the two facts the store is asked with: asked once per kind in this read (R328 e).
+  const asked = new Map<string, boolean>();
+  const allowed = (f: StoreFacts): boolean => {
+    const k = JSON.stringify([f.identifiable, f.legalBasis ?? null]);
+    let v = asked.get(k);
+    if (v === undefined) asked.set(k, (v = libraryAllowedBy(info, projectId, f)));
+    return v;
+  };
+  // R328 e: with the runner's cache, each record's file is stat'ed (first, all of them) and read only when its stamp
+  // changed.
+  const cache = o.records;
+  let stamps: Array<string | null> = [];
+  try {
+    if (cache) stamps = resting.map((e) => sourceRecordStampIn(repo, projectId, e.sourceId!));
+  } catch (err) {
+    if (err instanceof ProjectLockedError) return new Map();
+    throw err;
+  }
+  for (const [i, e] of resting.entries()) {
+    let facts: RecordFacts | undefined;
+    const stamp = cache ? stamps[i] : undefined;
+    if (cache && stamp === null) continue; // the record is not there (deleted)
+    if (cache && stamp) facts = cache.get(projectId, e.sourceId!, stamp);
+    if (!facts) {
+      let sf: SourceFile;
+      try {
+        sf = await repo.getSource(projectId, e.sourceId!);
+      } catch (err) {
+        if (err instanceof NotFoundError) continue;
+        throw err;
+      }
+      facts = factsOf(sf);
+      if (cache && stamp) cache.set(projectId, e.sourceId!, stamp, facts);
     }
-    const work = workOfSourceFile(sf);
+    const work = facts.work;
     const ids = idsOf(work);
-    const free = !sourceHasFile(sf) && !waitingFor.has(e.sourceId!) && !(o.atWork?.(e.id) ?? false);
+    const free = !facts.hasFile && !waitingFor.has(e.sourceId!) && !(o.atWork?.(e.id) ?? false);
     // R328 g: with no library set, a DOI is needed for the promise "set your library" (every kind of library gives an
     // address for a DOI; an ISBN alone gives one only through a link resolver).
     const target = o.access ? libraryAddressFor(o.access, work) !== null : !!ids.doi;
-    const may = free && target && libraryAllowedBy(info, projectId, sf.source.provenance);
+    const may = free && target && allowed(facts.store);
     out.set(e.id, { work, ...(may ? { chance: o.access ? ("yes" as const) : ("no-library" as const) } : {}) });
   }
   return out;
@@ -527,6 +636,13 @@ export interface FindRunner {
   libraryHandedOver(ticket: unknown): { projectId: string; entryId: string } | null;
   /** Task F15: whether the runner is working on the entry, or has it queued or waiting for a retry (no start is offered then). */
   atWork(projectId: string, entryId: string): boolean;
+  /**
+   * Task F15 (R328 e): `libraryChancesOf` for the queue's view, with this runner's `atWork` and its cache of the
+   * records' facts: a record's file is read only when its stamp (one `stat`) changed since it was last read; the cache
+   * holds only what the view needs, per project, dropped at the project's `stop` (a lock) and at `stopAll` (a close).
+   * A locked project gives nothing; after `stopAll`, FindRunnerClosedError.
+   */
+  libraryChances(projectId: string, entries: Iterable<FindEntry>, access: LibraryAccess | null): Promise<Map<string, FindLibraryChanceOf>>;
 }
 
 /**
@@ -2332,6 +2448,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   function stop(projectId: string): void {
     stopRun(projectId);
+    // F15 (R328 e): nothing read from a locked project's records is kept.
+    records.dropProject(projectId);
     // F15 (R324 b): a lock ends the project's open ticket; its entry comes back at the next resume (nothing can be
     // written for a locked project now).
     if (libTicket?.projectId === projectId) dropTicket();
@@ -2341,6 +2459,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     closed = true;
     // F15 (R324 b, c): a close ends the open ticket at once (in memory only); its entry comes back at the next open.
     dropTicket();
+    // F15 (R328 e): nothing read from the records outlives the close.
+    records.clear();
     for (const pid of runs.keys()) stopRun(pid);
     if (indexWait !== undefined) {
       timers.clearTimeout(indexWait);
@@ -2502,6 +2622,18 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
   const ticketFor = (pid: string, eid: string) => libTicket !== undefined && libTicket.projectId === pid && libTicket.entryId === eid;
 
+  /** R328 e: the records' facts the queue's view read last (see `libraryChances`). */
+  const records = createRecordFactsCache();
+
+  async function libraryChances(projectId: string, entries: Iterable<FindEntry>, access: LibraryAccess | null): Promise<Map<string, FindLibraryChanceOf>> {
+    assertOpen();
+    const out = await libraryChancesOf(repo, projectId, entries, { access, atWork: (id) => atWork(projectId, id), records });
+    // Closed or the project locked while it was read: what was read is not kept.
+    if (closed) records.clear();
+    else if (!repo.isUnlocked(projectId)) records.dropProject(projectId);
+    return out;
+  }
+
   function atWork(projectId: string, entryId: string): boolean {
     const r = runs.get(projectId);
     return running.has(keyOfRun(projectId, entryId)) || !!r?.pending.includes(entryId) || !!r?.timers.has(entryId);
@@ -2615,5 +2747,6 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     libraryCancel,
     libraryHandedOver,
     atWork,
+    libraryChances,
   };
 }

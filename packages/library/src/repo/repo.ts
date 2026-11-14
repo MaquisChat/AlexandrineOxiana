@@ -69,6 +69,7 @@ import {
   getSourceRecordWithAssets,
   listSourceIds,
   relinkLinkedAsset as relinkLinkedAssetIn,
+  sourceRecordStamp,
   updateSource,
   type CreateInTx,
   type CreateSourceOptions,
@@ -1278,6 +1279,11 @@ export async function lookupPolicyInfo(
   const st = core.state(projectId);
   const policy = await projectPolicy(repo, projectId);
   return { policy, actor: core.actor, tz: core.zoneOf(st.project), clock: core.clock, sensitive: core.encrypted(st) };
+}
+
+/** Package-internal (Task F15, R328 e): a stamp of a source's record file (one `stat`, nothing read), or null when it is gone. */
+export function sourceRecordStampIn(repo: Repo, projectId: string, id: string): string | null {
+  return sourceRecordStamp(cores.get(repo)!, projectId, id);
 }
 
 /** Package-internal (Zotero Web import): records the library version a finished import saw (governed, audited). */
