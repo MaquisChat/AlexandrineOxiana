@@ -153,10 +153,12 @@ const LIBRARY_GOOD = {
 };
 
 describe("the library window may call nothing (Task F19, R343 b)", () => {
-  it("every command of the app, the event system and the folder chooser is expected to be denied there", () => {
+  it("every command of the app, the event system, the folder chooser and one command of each other core family (image, resources, menu, tray) and of the dialog's ask and confirm is expected to be denied there (R346 h)", () => {
     assert.deepEqual(Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).sort(), [
       "app.version",
       "browser.open",
+      "dialog.ask",
+      "dialog.confirm",
       "dialog.message",
       "dialog.open",
       "dialog.save",
@@ -165,12 +167,16 @@ describe("the library window may call nothing (Task F19, R343 b)", () => {
       "event.listen",
       "event.unlisten",
       "fs.readFile",
+      "image.new",
       "library.close",
       "library.open",
       "library.signOut",
       "library.stay",
       "library.take",
+      "menu.new",
       "path.resolveDirectory",
+      "resources.close",
+      "tray.new",
       "watch.pick",
       "webview.print",
       "window.close",

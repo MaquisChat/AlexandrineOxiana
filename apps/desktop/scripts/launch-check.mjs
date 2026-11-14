@@ -124,7 +124,8 @@ export const NOT_PROBED_IPC = {
 /**
  * What a page in the sign-in window may call (Task F19, R343 b): nothing. Every command of the app
  * (the main window's table above, the six library commands among them), the event system's listen,
- * unlisten, emit and emit-to, and the file and folder choosers; the sign-in window's probe
+ * unlisten, emit and emit-to, the file and folder choosers, the dialog's ask and confirm, and one
+ * command each of the image, resources, menu and tray families; the sign-in window's probe
  * (`src-tauri/src/library_probe.js`) tries each and reports what happened. Each must be refused.
  */
 export const EXPECTED_LIBRARY_WINDOW_IPC = Object.fromEntries(
@@ -148,6 +149,14 @@ export const EXPECTED_LIBRARY_WINDOW_IPC = Object.fromEntries(
     "window.close",
     "webview.print",
     "app.version",
+    // One command of each core family the main window is not granted either, and the dialog's other
+    // two (R346 h).
+    "image.new",
+    "resources.close",
+    "menu.new",
+    "tray.new",
+    "dialog.ask",
+    "dialog.confirm",
   ].map((k) => [k, "denied"]),
 );
 

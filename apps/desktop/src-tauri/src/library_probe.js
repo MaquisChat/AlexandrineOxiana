@@ -5,7 +5,8 @@
 // as an outside page's own script would, and tries every command of the app through what such a page
 // can reach: Tauri's `__TAURI_INTERNALS__` (if the page sees it) for each command of the app (the
 // sign-in window's six, the main window's own, the folder chooser), the event system's listen,
-// unlisten, emit and emit-to, and the file dialogs; then the IPC's raw entry points without the
+// unlisten, emit and emit-to, the file dialogs and the dialog's ask and confirm, one command each of
+// the image, resources, menu and tray families; then the IPC's raw entry points without the
 // invoke key (`window.ipc.postMessage` and the `ipc:` protocol). Each outcome is reported, by
 // navigating to the report address with the results as JSON in `r`:
 //   "allowed"      the command answered
@@ -98,6 +99,14 @@
     await try_("window.close", "plugin:window|close", { label: "main" });
     await try_("webview.print", "plugin:webview|print", { label: "main" });
     await try_("app.version", "plugin:app|version", {});
+    // One command of each core family no window of the app is granted, and the dialog's other two
+    // (R346 h): a picture, a resource, a menu, a tray icon; asking and confirming.
+    await try_("image.new", "plugin:image|new", { rgba: [0, 0, 0, 0], width: 1, height: 1 });
+    await try_("resources.close", "plugin:resources|close", { rid: 1 });
+    await try_("menu.new", "plugin:menu|new", { kind: "Menu", options: {} });
+    await try_("tray.new", "plugin:tray|new", { options: {} });
+    await try_("dialog.ask", "plugin:dialog|ask", { message: "x" });
+    await try_("dialog.confirm", "plugin:dialog|confirm", { message: "x" });
 
     // The raw entry points, without the invoke key Tauri's own script keeps to itself. What they would
     // do (start the researcher's browser) is printed by the shell in test mode: the check looks for it.
