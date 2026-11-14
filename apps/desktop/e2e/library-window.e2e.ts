@@ -79,6 +79,8 @@ const WORDS = {
   address: (host: string) => `Your library's address: ${host} (EZproxy)`,
   saved: "Saved.",
   stayOnlyOnMac: "Only on a Mac",
+  /** SourceDetail.tsx */
+  noFiles: "No files attached.",
   /** SourceDetail.tsx acquiredWords */
   fetchedThrough: (host: string) => `Fetched through your library (${host}).`,
   checkSaid: "The app's check had said it looked like the right file.",
@@ -489,6 +491,12 @@ test("signed in, marked page, file handed over: it waits for the researcher's ch
   await test.step("the row said, in order, the fetch and the hand-over; the entry needs the researcher's check and the record has NO file", async () => {
     await expectSaidInOrder(r, w, pressed);
     await expectWaitingFile(r, w);
+    // On the screen too: the record opened from its row shows no file.
+    await pressAct(r.d, w, "open");
+    const record = await r.d.byRole("region", "Record", { timeoutMs: STATE_TIMEOUT });
+    const detail = await r.d.byRole("region", "Source details", { within: record, timeoutMs: STATE_TIMEOUT });
+    await r.d.byRole("heading", w.title, { level: 2, within: detail, timeoutMs: STATE_TIMEOUT });
+    expect(await r.d.session.execute<string>("return arguments[0].innerText", [r.d.session.element(detail)])).toContain(WORDS.noFiles);
   });
   await test.step("the review queue holds it under “Files that look right (1)”; “Use this file” adds it, got through the library", async () => {
     await useTheFile(r, w);
