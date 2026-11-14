@@ -11,6 +11,7 @@ import { registerList } from "./commands/list.js";
 import { registerProject } from "./commands/project.js";
 import { registerRecheck } from "./commands/recheck.js";
 import { registerTools } from "./commands/tools.js";
+import { registerZotero } from "./commands/zotero.js";
 import { registerTranscribe } from "./commands/transcribe.js";
 import { lastIntegrityWarnings } from "./commands/common.js";
 import { EXIT, describeError } from "./errors.js";
@@ -21,7 +22,7 @@ export const packageName = "@ao/cli";
 
 export function buildProgram(): Command {
   const program = new Command("ao")
-    .description("Alexandrine Oxiana: capture links and profiles, and import or export references, in a governed research library")
+    .description("Alexandrine Oxiana: capture links and profiles, and import or export references (and keep Zotero libraries in step), in a governed research library")
     .option("--library <path>", "the library folder (default: AO_LIBRARY, else the one you used last)")
     .option("--json", "print machine-readable JSON instead of text")
     .showHelpAfterError()
@@ -37,6 +38,7 @@ export function buildProgram(): Command {
   registerExport(program);
   registerMaintenance(program);
   registerSecrets(program);
+  registerZotero(program);
   return program;
 }
 
