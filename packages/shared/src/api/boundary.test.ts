@@ -2,7 +2,7 @@
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
 import { YOUR_LIBRARY_TEST_DOI, type YourLibraryResponse, type YourLibraryTestResponse } from "../index.js";
-import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, FIND_LIBRARY_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, WHERE_TO_GET_IT_MAX, WHERE_TO_GET_IT_URL_MAX, YOUR_LIBRARY_DERIVE_REFUSALS, YOUR_LIBRARY_DERIVE_TEXT, YOUR_LIBRARY_LINK_MAX, YOUR_LIBRARY_NAME_MAX, YOUR_LIBRARY_TEXT, libraryReadyIn, yourLibraryAddressSentence, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin, SEARCH_RECORD_SOURCES, SEARCH_COPY_SOURCES, SEARCH_SOURCE_GROUPS, SEARCH_SOURCE_INFO, SEARCH_KEY_SECRETS, SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI, SEARCH_TEST_TEXT, SEARCH_SETTINGS_TEXT, searchEmailRefusal, isSearchApiKeyShape, type SearchSourcesResponse, type SearchRecordRow } from "../index.js";
+import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, FIND_LIBRARY_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, WHERE_TO_GET_IT_MAX, WHERE_TO_GET_IT_URL_MAX, YOUR_LIBRARY_DERIVE_REFUSALS, YOUR_LIBRARY_DERIVE_TEXT, YOUR_LIBRARY_LINK_MAX, YOUR_LIBRARY_NAME_MAX, YOUR_LIBRARY_TEXT, libraryReadyIn, yourLibraryAddressSentence, FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, LIBRARY_FILE_MAX_BYTES, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin, SEARCH_RECORD_SOURCES, SEARCH_COPY_SOURCES, SEARCH_SOURCE_GROUPS, SEARCH_SOURCE_INFO, SEARCH_KEY_SECRETS, SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI, SEARCH_TEST_TEXT, SEARCH_SETTINGS_TEXT, searchEmailRefusal, isSearchApiKeyShape, type SearchSourcesResponse, type SearchRecordRow } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
   it("the service's error codes, each once", () => {
@@ -209,6 +209,18 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect([LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, YOUR_LIBRARY_LINK_MAX, YOUR_LIBRARY_NAME_MAX, WHERE_TO_GET_IT_MAX, WHERE_TO_GET_IT_URL_MAX]).toEqual([20_000, 1_800_000, 4096, 200, 12, 2048]);
     const chance: FindEntryView["library"] = { canStart: false, reason: "no-library" };
     expect(chance.canStart).toBe(false);
+  });
+
+  it("The file from your library (F17, R329 g): what became of it, in words, and the limit", () => {
+    expect([...FIND_LIBRARY_FILE_OUTCOMES]).toEqual(["not-pdf", "too-large", "unreadable", "rules-method", "rules-store", "rules-legal-basis"]);
+    expect(Object.keys(FIND_LIBRARY_FILE_TEXT).sort()).toEqual([...FIND_LIBRARY_FILE_OUTCOMES].sort());
+    for (const t of Object.values(FIND_LIBRARY_FILE_TEXT)) expect(t).toMatch(/^The file from your library .*\.$/u);
+    expect(FIND_LIBRARY_FILE_TEXT["too-large"]).toBe("The file from your library was not kept: it is larger than 200 MB.");
+    expect(LIBRARY_FILE_MAX_BYTES).toBe(200 * 1024 * 1024);
+    // On the entry's view, beside or without a chance to start.
+    const after: FindEntryView["library"] = { canStart: true, lastFile: "not-pdf" };
+    const only: FindEntryView["library"] = { canStart: false, reason: "not-offered", lastFile: "rules-store" };
+    expect([after.lastFile, only.lastFile]).toEqual(["not-pdf", "rules-store"]);
   });
 
   it("Your library's Test (F18a, R334 b): one fixed, well-known work — the Search sources' tests' own — and its sentence", () => {
