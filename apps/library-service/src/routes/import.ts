@@ -8,6 +8,7 @@ import type { FastifyInstance } from "fastify";
 import type { ImportOptionsInput } from "@ao/core";
 import {
   adapterFor,
+  pauseLink,
   researcherName,
   researcherNameOk,
   resumeZoteroWebImport,
@@ -17,6 +18,7 @@ import {
   proxyQueueFor,
   type ImportSourceAdapter,
 } from "@ao/library";
+import { ZOTERO_SYNC_SENTENCES, type ZoteroSyncUndoNote } from "@ao/shared";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { ServiceState } from "../state.js";
 import { registerZotero } from "./zotero.js";
@@ -33,8 +35,11 @@ function adapterSpec(o: Obj | undefined): AdapterSpec {
   if (kind === "zotero-web") {
     const libraryType = str(o, "libraryType", 8);
     if (libraryType !== "user" && libraryType !== "group") throw badRequest('"libraryType" must be "user" or "group".');
-    const libraryId = str(o, "libraryId", 12);
-    if (!/^\d{1,12}$/.test(libraryId)) throw badRequest('"libraryId" must be a number.');
+    const given = str(o, "libraryId", 12);
+    if (!/^\d{1,12}$/.test(given)) throw badRequest('"libraryId" must be a number.');
+    // Canonical before anything uses it (R250 a): "042" is library 42.
+    const libraryId = String(Number(given));
+    if (libraryId === "0") throw badRequest('"libraryId" must be a number.');
     return { web: true, libraryType, libraryId, full: optBool(o, "full") === true };
   }
   if (!PATH_KINDS.has(kind)) throw badRequest(`"${kind}" is not an import source. Use one of: ${[...PATH_KINDS, "zotero-web"].join(", ")}.`);
@@ -67,6 +72,12 @@ export async function batchProject(state: ServiceState, batchId: string): Promis
 
 export function registerImport(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
+  /** Claims a Zotero library for a manual import (R250 a), or refuses with the existing sentence. */
+  const claimed = (s: Parameters<ServiceState["zoteroSync"]["claim"]>[1], ref: string) => {
+    const release = state.zoteroSync.claim(ref, s);
+    if (!release) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.importRunning);
+    return release;
+  };
   // Before an import: the Zotero Web key and where the Zotero data folder is (Task 57).
   registerZotero(app, ctx);
 
@@ -89,9 +100,19 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const spec = adapterSpec(optObj(b, "adapter"));
     const options = (optObj(b, "options") ?? {}) as ImportOptionsInput;
-    const h = spec.web
-      ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
-      : await s.bulk.startBatch(projectId, spec.adapter, options);
+    // One Zotero library is read by one import or sync at a time, whatever the project (A10, R250 a): claimed before
+    // anything is awaited, given up when the batch ends (or at once when it cannot start).
+    const release = spec.web ? claimed(s, `${spec.libraryType}:${spec.libraryId}`) : undefined;
+    let h: Awaited<ReturnType<typeof startZoteroWebImport>>;
+    try {
+      h = spec.web
+        ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
+        : await s.bulk.startBatch(projectId, spec.adapter, options);
+    } catch (err) {
+      release?.();
+      throw err;
+    }
+    if (release) void h.done.then(release, release);
     state.followBatch(s, projectId, h);
     return { batchId: h.batchId };
   });
@@ -110,19 +131,31 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
       const batchId = paramsOf(req).batchId ?? "";
       const projectId = await batchProject(state, batchId);
       const running = s.batches.get(batchId);
+      // A sync's batch is the sync's to pause and resume (R250 k).
+      if (action !== "cancel" && state.zoteroSync.ownsBatch(batchId)) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.belongsToSync);
       if (running) {
         running.handle[action]();
         return { batchId, action };
       }
       const listed = (await s.bulk.listBatches(projectId)).find((b) => b.batchId === batchId);
       const shown = listed?.state;
+      if (action !== "cancel" && listed?.origin === "zotero-sync") throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.belongsToSync);
       if (action !== "resume") throw new ApiError(409, "CONFLICT", "This import is not running.", shown);
       if (shown === "finished" || shown === "undone") throw new ApiError(409, "CONFLICT", "This import has already finished.", shown);
+      // Not while an import or sync of the same Zotero library runs (R250 a): claimed in this same step.
+      const release = listed?.ref ? claimed(s, listed.ref) : undefined;
       // A Zotero Web batch resumes with the version it started from and records the new one when done (Z2).
-      const h =
-        listed?.kind === "zotero-web"
-          ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, batchId)
-          : await s.bulk.resumeBatch(projectId, batchId);
+      let h: Awaited<ReturnType<typeof resumeZoteroWebImport>>;
+      try {
+        h =
+          listed?.kind === "zotero-web"
+            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, batchId)
+            : await s.bulk.resumeBatch(projectId, batchId);
+      } catch (err) {
+        release?.();
+        throw err;
+      }
+      if (release) void h.done.then(release, release);
       state.followBatch(s, projectId, h);
       return { batchId, action };
     });
@@ -132,10 +165,23 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const batchId = paramsOf(req).batchId ?? "";
     const projectId = await batchProject(state, batchId);
+    // The batch says itself whether it is the sync's, and of which Zotero library (its own record, R248).
+    const listed = (await s.bulk.listBatches(projectId)).find((b) => b.batchId === batchId);
     const r = await s.bulk.undoBatch(projectId, batchId);
     s.batches.delete(batchId);
     state.publishState();
-    return r;
+    // An undo of a sync's batch pauses its link in the same request, so the next sync does not at once bring back what
+    // was undone (R206 4, R242 b).
+    const run = listed?.origin === "zotero-sync" && listed.ref ? { ref: listed.ref } : undefined;
+    if (!run) return r;
+    let note: ZoteroSyncUndoNote | undefined;
+    try {
+      // Said only when a link was in fact paused (R250 d): none when the Zotero library is no longer linked.
+      if ((await pauseLink(state.deps.appConfigDir, s.lib.id, run.ref, "undone")) > 0) note = { paused: true, message: ZOTERO_SYNC_SENTENCES.undonePaused };
+    } catch {
+      note = { paused: false, message: ZOTERO_SYNC_SENTENCES.undoNotPaused };
+    }
+    return note ? { ...r, zoteroSync: note } : r;
   });
 
   app.get("/imports/:batchId/report", async (req) => {
