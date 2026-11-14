@@ -37,7 +37,6 @@
  * Test-only (honoured ONLY when NODE_ENV is exactly "test"; otherwise not looked at; Task Z11, R289 a):
  *   AO_SECRETS=memory     keys are kept in this process's memory only (a restart forgets them)
  *   AO_ZOTERO_API_ORIGIN  exactly http://127.0.0.1:<port>: a stand-in for Zotero, the API and the only file origin
- *   AO_ZOTERO_TICK_MS     100..60000: the automatic sync scheduler's tick
  * In test mode a value not in that exact form refuses the start, naming the variable.
  *
  * Once listening it prints `AO_SERVICE_READY port=<n>` on stdout. On SIGTERM (or SIGINT) it refuses
@@ -46,7 +45,7 @@
  * FORCE_EXIT_MS (longer than the worst-case close: an import reaching a safe point, 60 s, plus the
  * rest) it exits 1. The end of standard input starts the same shutdown.
  */
-import { openLibrary, useSecretsFromEnv, useZoteroApiOriginFromEnv, zoteroTickMsFromEnv } from "@ao/library";
+import { openLibrary, useSecretsFromEnv, useZoteroApiOriginFromEnv } from "@ao/library";
 import { listenOnRememberedPort } from "./port-memory.js";
 import { createService } from "./server.js";
 import { FolderGrants, grantLineHandler } from "./folder-grants.js";
@@ -66,11 +65,10 @@ async function main(): Promise<void> {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("AO_SERVICE_PORT must be a port number");
   // The test-only switches (Task Z11, R289 a), read here once: honoured only when NODE_ENV is exactly "test"; a
   // value not in its exact form refuses the start with a sentence naming the variable.
-  const zoteroTickMs = zoteroTickMsFromEnv(process.env);
   useSecretsFromEnv(process.env);
   useZoteroApiOriginFromEnv(process.env);
   const folderGrants = new FolderGrants();
-  const svc = await createService({ token, folderGrants, ...(process.env.AO_NO_WORKER === "1" ? { worker: null } : {}), ...(zoteroTickMs !== undefined ? { zoteroTickMs } : {}) });
+  const svc = await createService({ token, folderGrants, ...(process.env.AO_NO_WORKER === "1" ? { worker: null } : {}) });
 
   let stopping = false;
   const stop = (signal: string) => {

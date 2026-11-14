@@ -4,10 +4,10 @@
  * against a stand-in for Zotero's servers on this computer.
  *
  * The stand-in (e2e/zotero-standin.ts) is the library tests' own fake Zotero behind a small server on 127.0.0.1 in
- * this process. The service reaches it through its three test-only switches, honoured only under NODE_ENV=test (which
+ * this process. The service reaches it through its two test-only switches, honoured only under NODE_ENV=test (which
  * the harness sets): AO_ZOTERO_API_ORIGIN (the stand-in is then Zotero's API and the only origin a file may come
- * from, so nothing here can reach a real Zotero server), AO_SECRETS=memory (the key is kept in the service's memory
- * only; a restart forgets it), and in one scenario AO_ZOTERO_TICK_MS (the scheduler's tick).
+ * from, so nothing here can reach a real Zotero server) and AO_SECRETS=memory (the key is kept in the service's
+ * memory only; a restart forgets it). The scheduler runs on the product's own 60-second tick.
  *
  * The key is a made-up string in the shape the product accepts (24 letters and digits); it is never a real key.
  *
@@ -48,11 +48,9 @@ interface Account {
 /** Generous: a sync, its reads and the screen's reads run in the service on a machine that may be loaded. */
 const STATE_TIMEOUT = 60_000;
 
-type Fixtures = { zotero: Account & { standIn: ZoteroStandIn }; zoteroTick: number | undefined };
+type Fixtures = { zotero: Account & { standIn: ZoteroStandIn } };
 
 const test = base.extend<Fixtures>({
-  /** The scheduler's tick for this test's service (AO_ZOTERO_TICK_MS); undefined: the product's 60 seconds. */
-  zoteroTick: [undefined, { option: true }],
   zotero: async ({}, use) => {
     const account = await makeAccount();
     const standIn = await startZoteroStandIn(account.z);
@@ -63,12 +61,11 @@ const test = base.extend<Fixtures>({
       await account.z.agent.close();
     }
   },
-  // Started before the service: the service is given the stand-in's origin and the other switches.
-  serviceEnv: async ({ zotero, zoteroTick }, use) => {
+  // Started before the service: the service is given the stand-in's origin and the other switch.
+  serviceEnv: async ({ zotero }, use) => {
     await use({
       AO_SECRETS: "memory",
       AO_ZOTERO_API_ORIGIN: zotero.standIn.origin,
-      ...(zoteroTick !== undefined ? { AO_ZOTERO_TICK_MS: String(zoteroTick) } : {}),
     });
   },
 });
@@ -656,19 +653,20 @@ test("the key is nowhere it should not be", async ({ page, app, zotero }) => {
   });
 });
 
-// ---------- the scheduler, with a one-second tick ----------
+// ---------- the scheduler, on the product's own 60-second tick ----------
 
-test.describe("with the scheduler's tick at one second (AO_ZOTERO_TICK_MS=1000)", () => {
-  test.use({ zoteroTick: 1000 });
+/** The scheduler's tick in the product (ZOTERO_SYNC_TICK_MS, apps/library-service/src/zotero-sync-scheduler.ts): there is no switch for it. */
+const SCHEDULER_TICK_MS = 60_000;
 
+test.describe("the scheduler, on the product's own 60-second tick", () => {
   test("back-off holds automatic runs", async ({ page, app, zotero, browserName }) => {
     test.skip(browserName !== "chromium", "R289 b: this scenario proves the service's scheduler; it runs in Chromium only.");
     test.setTimeout(10 * 60_000);
     const { projectId } = await libraryWithProject(app, page, { library: "Zotero library", project: "Market studies", governanceYaml: OPEN_RULES });
     // The library was opened (and the scheduler started, with its 2-minute rule) before this instant.
     const openedBy = Date.now();
-    /** What Zotero asks for on the manual run's last API answer (seconds). */
-    const BACKOFF_S = 150;
+    /** What Zotero asks for on the manual run's last API answer (seconds): chosen just before that run, from the clock. */
+    let backoffS = 150;
 
     await test.step("the key saved and checked; library A (the personal library) linked alone and saved; automatic off", async () => {
       await openZoteroScreen(page);
@@ -686,8 +684,12 @@ test.describe("with the scheduler's tick at one second (AO_ZOTERO_TICK_MS=1000)"
     let askedAt = 0;
     let manualEnd = 0;
     let record: ZoteroSyncRun | undefined;
-    await test.step(`A synced by hand; Zotero answers the run's last API request (the file's address) with “Backoff: ${BACKOFF_S}”`, async () => {
-      zotero.standIn.backoffOn(/^\/users\/42\/items\/[^/?]+\/file/u, BACKOFF_S);
+    await test.step("A synced by hand; Zotero answers the run's last API request (the file's address) with a Backoff chosen from the clock", async () => {
+      // Chosen only now, after the set-up, so that the precondition below holds by construction whatever the set-up
+      // took: Zotero's wait ends 15 seconds or more after “opened + 2 minutes” (and is never shorter than 150 seconds).
+      // The request that carries it is made after this instant, so its end is later still.
+      backoffS = Math.max(150, Math.ceil((openedBy + 120_000 + 15_000 - Date.now()) / 1000));
+      zotero.standIn.backoffOn(/^\/users\/42\/items\/[^/?]+\/file/u, backoffS);
       await page.getByRole("button", { name: "Sync with Zotero now" }).click();
       record = (await settled(app, 1))[0]!;
       expect([record.ref, record.trigger, record.outcome]).toEqual([MY, "manual", "finished"]);
@@ -700,10 +702,9 @@ test.describe("with the scheduler's tick at one second (AO_ZOTERO_TICK_MS=1000)"
       expect(Date.parse(record.backoffUntil!)).toBeLessThanOrEqual(Date.now() + 60 * 60_000 + 5_000);
     });
 
-    const zoteroEnd = () => askedAt + BACKOFF_S * 1000;
+    const zoteroEnd = () => askedAt + backoffS * 1000;
     await test.step("precondition: Zotero's own wait ends clearly (15 s or more) after “library opened + 2 minutes”, so it is the back-off that holds B", async () => {
       expect(zoteroEnd() - (openedBy + 120_000)).toBeGreaterThanOrEqual(15_000);
-      expect(Date.now()).toBeLessThan(openedBy + 120_000);
     });
 
     let state: ZoteroSyncStateResponse | undefined;
@@ -730,7 +731,12 @@ test.describe("with the scheduler's tick at one second (AO_ZOTERO_TICK_MS=1000)"
 
     await test.step("timed observation: from the end of the manual run until well past B's due time and Zotero's own wait, Zotero is asked nothing", async () => {
       // The one wait on the clock in this spec (R289 b): the log is read every half second until that instant.
-      const until = Math.max(zoteroEnd(), openedBy + 120_000) + 20_000;
+      // Which assertion catches what: the request count (nothing asked after the manual run) catches a request made
+      // during the wait; the history (only A's record) and the "Next automatic sync" line (still the back-off's end)
+      // catch a scheduler that ignores the wait, since the holder and the engine refuse during a back-off before any
+      // request is made. The scheduler looks only once every tick (60 seconds in the product), so the window runs one
+      // tick past B's due time and Zotero's own wait, plus 20 seconds, for a pass to have come after both.
+      const until = Math.max(zoteroEnd(), openedBy + 120_000) + SCHEDULER_TICK_MS + 20_000;
       while (Date.now() < until) {
         expect(zotero.standIn.requests().filter((r) => r.at > manualEnd)).toEqual([]);
         await page.waitForTimeout(500);
@@ -781,6 +787,8 @@ test.describe("with the scheduler's tick at one second (AO_ZOTERO_TICK_MS=1000)"
 
     let failed: ZoteroSyncRun | undefined;
     await test.step("2 minutes after the library opened again, the automatic run is recorded failed for want of a key, in the service's words", async () => {
+      // On the product's 60-second tick the run comes at “opened + 2 minutes” plus up to one tick, so at most 3 minutes
+      // after the library opened (during the restart, before this wait begins): 4 minutes leave a minute to spare.
       await expect.poll(async () => (await runs(app)).length, { timeout: 4 * 60_000, intervals: [1000] }).toBe(1);
       failed = (await runs(app))[0]!;
       expect([failed.ref, failed.trigger, failed.outcome, failed.reason]).toEqual([MY, "automatic", "failed", "key-missing"]);

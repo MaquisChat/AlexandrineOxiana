@@ -1,6 +1,5 @@
 /**
- * The three test-only switches of Task Z11 (Ruling R289 a): `AO_SECRETS=memory`, `AO_ZOTERO_API_ORIGIN` and
- * `AO_ZOTERO_TICK_MS`. Each is read once, at the service's start, by one function that takes the environment as
+ * The two test-only switches of Task Z11 (Ruling R289 a, R307 a): `AO_SECRETS=memory` and `AO_ZOTERO_API_ORIGIN`. Each is read once, at the service's start, by one function that takes the environment as
  * an argument; each is honoured ONLY when NODE_ENV is exactly "test" (as AO_LOOKUP_FIXTURES is, R47); outside
  * test mode its value is not even looked at; in test mode a value not in its exact form refuses the start with a
  * sentence that names the variable (never the origin's value).
@@ -20,11 +19,9 @@ import { checkZoteroKey } from "./zotero-web-account.js";
 import {
   ZOTERO_API_ORIGIN,
   ZOTERO_API_ORIGIN_ENV,
-  ZOTERO_TICK_ENV,
   ZOTERO_WEB_FILE_NOTES,
   useZoteroApiOriginFromEnv,
   zoteroApiOriginFromEnv,
-  zoteroTickMsFromEnv,
   zoteroWebAdapter,
 } from "./zotero-web.js";
 import type { ScanItem } from "./bulk/scan.js";
@@ -179,10 +176,16 @@ describe("AO_ZOTERO_API_ORIGIN", () => {
       const { items, result } = await scanWith(z, agent, async (parent) => {
         n++;
         // 1: the account's own redirect (the loopback origin); 2: Zotero's real file host, allowed in the product;
-        // 3: the loopback address on another port; 4: Amazon's storage host.
-        const redirect = [undefined, "https://files.zotero.net/files/", "http://127.0.0.1:47124/zoterofilestorage/", "https://zoterofilestorage.s3.amazonaws.com/zoterofilestorage/"][n - 1];
+        // 3: the loopback address on another port; 4: Amazon's storage host; 5: the same origin but WITH credentials.
+        const redirect = [
+          undefined,
+          "https://files.zotero.net/files/",
+          "http://127.0.0.1:47124/zoterofilestorage/",
+          "https://zoterofilestorage.s3.amazonaws.com/zoterofilestorage/",
+          "http://u:p@127.0.0.1:47123/zoterofilestorage/",
+        ][n - 1];
         await attach(z, parent, redirect);
-      }, 4);
+      }, 5);
       const [loopback, ...refused] = items;
       expect(loopback!.files).toHaveLength(1);
       expect(loopback!.fileNotes).toBeUndefined();
@@ -191,6 +194,46 @@ describe("AO_ZOTERO_API_ORIGIN", () => {
       // Nothing was asked of any other host: every request the stand-in saw came to the loopback origin.
       expect(z.requests.length).toBe(seen.length);
       expect(z.requests.some((r) => r.path.startsWith("/files/"))).toBe(false);
+      expect(seen.filter((p) => p.startsWith("/zoterofilestorage/"))).toHaveLength(1);
+    } finally {
+      await agent.close();
+      await z.agent.close();
+    }
+  });
+});
+
+describe("AO_ZOTERO_API_ORIGIN with the default port (R307 c)", () => {
+  it("http://127.0.0.1:80 is accepted and compared as the parsed origin: a file redirect to it is followed, one to any other is refused", async () => {
+    const ORIGIN_80 = "http://127.0.0.1:80";
+    expect(useZoteroApiOriginFromEnv({ NODE_ENV: "test", [ZOTERO_API_ORIGIN_ENV]: ORIGIN_80 })).toBe(ORIGIN_80);
+    const z = new FakeZotero();
+    // A parsed origin has no default port, so that is how a redirect to the same server is written (and how it is compared).
+    z.redirectBase = "http://127.0.0.1/zoterofilestorage/";
+    const agent = new MockAgent();
+    agent.disableNetConnect();
+    const seen: string[] = [];
+    agent
+      .get("http://127.0.0.1")
+      .intercept({ path: () => true, method: () => true })
+      .reply((opts) => {
+        seen.push(String(opts.path));
+        const h: Record<string, string> = {};
+        for (const [k, v] of Object.entries((opts.headers ?? {}) as Record<string, string>)) h[k] = String(v);
+        const r = fakeZoteroHandler(z)({ method: String(opts.method), path: String(opts.path), headers: h });
+        return { statusCode: r.status, data: typeof r.body === "string" ? r.body : Buffer.from(r.body), responseOptions: { headers: r.headers } };
+      })
+      .persist();
+    try {
+      let n = 0;
+      const { items, result } = await scanWith(z, agent, async (parent) => {
+        n++;
+        // 1: the account's own redirect (the same origin); 2: the same host on another port; 3: Zotero's real file host.
+        await attach(z, parent, [undefined, "http://127.0.0.1:81/zoterofilestorage/", "https://files.zotero.net/files/"][n - 1]);
+      }, 3);
+      expect(items[0]!.files).toHaveLength(1);
+      expect(items[0]!.fileNotes).toBeUndefined();
+      for (const it of items.slice(1)) expect(it.fileNotes, it.key).toEqual([ZOTERO_WEB_FILE_NOTES.redirectRefused]);
+      expect([...result.refusedHosts].sort()).toEqual(["127.0.0.1", "files.zotero.net"]);
       expect(seen.filter((p) => p.startsWith("/zoterofilestorage/"))).toHaveLength(1);
     } finally {
       await agent.close();
@@ -239,32 +282,6 @@ describe("AO_SECRETS", () => {
       useSecretsFromEnv({ NODE_ENV: "test", [SECRETS_ENV]: "memory" });
       expect(await getSecret("zotero-api-key")).toBeNull();
       expect(keyring.loads).toBe(0);
-    }
-  });
-});
-
-describe("AO_ZOTERO_TICK_MS", () => {
-  it("the tick switch is ignored unless NODE_ENV=test", () => {
-    for (const env of NOT_TEST) {
-      for (const value of ["1000", "5", "abc", ""]) expect(zoteroTickMsFromEnv({ ...env, [ZOTERO_TICK_ENV]: value }), JSON.stringify(env)).toBeUndefined();
-    }
-    expect(zoteroTickMsFromEnv({ NODE_ENV: "test" })).toBeUndefined();
-    expect(zoteroTickMsFromEnv({ NODE_ENV: "test", [ZOTERO_TICK_ENV]: "100" })).toBe(100);
-    expect(zoteroTickMsFromEnv({ NODE_ENV: "test", [ZOTERO_TICK_ENV]: "1000" })).toBe(1000);
-    expect(zoteroTickMsFromEnv({ NODE_ENV: "test", [ZOTERO_TICK_ENV]: "60000" })).toBe(60_000);
-  });
-
-  it("a tick out of range refuses the start", () => {
-    for (const value of ["99", "60001", "0", "-1000", "1e3", "1000.5", "0100", " 1000", "1000ms", ""]) {
-      let thrown: unknown;
-      try {
-        zoteroTickMsFromEnv({ NODE_ENV: "test", [ZOTERO_TICK_ENV]: value });
-      } catch (e) {
-        thrown = e;
-      }
-      expect(thrown, value).toBeInstanceOf(Error);
-      expect((thrown as Error).message, value).toContain(ZOTERO_TICK_ENV);
-      expect((thrown as Error).message, value).toMatch(/not started/u);
     }
   });
 });

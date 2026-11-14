@@ -193,10 +193,8 @@ export {
   zoteroWebSince,
   // Test-only switches, honoured under NODE_ENV=test only and read once at the service's start (Task Z11, R289).
   ZOTERO_API_ORIGIN_ENV,
-  ZOTERO_TICK_ENV,
   useZoteroApiOriginFromEnv,
   zoteroApiOriginFromEnv,
-  zoteroTickMsFromEnv,
 } from "./import/zotero-web.js";
 export type { ZoteroWebAdapter, ZoteroWebOptions, ZoteroWebScanResult } from "./import/zotero-web.js";
 export { clearZoteroWebVersion } from "./repo/repo.js";

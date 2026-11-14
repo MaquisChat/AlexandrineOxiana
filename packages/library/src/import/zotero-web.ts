@@ -135,8 +135,6 @@ export function zoteroFileHostAllowed(u: URL): boolean {
 
 /** `AO_ZOTERO_API_ORIGIN=http://127.0.0.1:<port>`: a stand-in for Zotero's servers on this computer. */
 export const ZOTERO_API_ORIGIN_ENV = "AO_ZOTERO_API_ORIGIN";
-/** `AO_ZOTERO_TICK_MS=<100..60000>`: the tick of the automatic sync's scheduler (StateOptions.zoteroTickMs). */
-export const ZOTERO_TICK_ENV = "AO_ZOTERO_TICK_MS";
 
 const LOOPBACK_ORIGIN = /^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/u;
 
@@ -156,8 +154,12 @@ export function zoteroApiOriginFromEnv(env: NodeJS.ProcessEnv): string | undefin
   return value;
 }
 
-/** The loopback origin in force (set only by useZoteroApiOriginFromEnv at the service's start). */
-let testOrigin: string | undefined;
+/**
+ * The loopback origin in force (set only by useZoteroApiOriginFromEnv at the service's start): as typed (the API
+ * base) and as parsed once, which is what a redirect is compared with (a parsed origin drops a default port, so
+ * `http://127.0.0.1:80` is the origin `http://127.0.0.1`; R307 c).
+ */
+let testOrigin: { typed: string; parsed: string } | undefined;
 
 /**
  * Applies the origin switch at the service's start. With it on, that one loopback origin is Zotero's API AND the
@@ -165,32 +167,20 @@ let testOrigin: string | undefined;
  * product's origin and zoteroFileHostAllowed apply unchanged. Returns the API origin now in force.
  */
 export function useZoteroApiOriginFromEnv(env: NodeJS.ProcessEnv): string {
-  testOrigin = zoteroApiOriginFromEnv(env);
+  const typed = zoteroApiOriginFromEnv(env);
+  testOrigin = typed === undefined ? undefined : { typed, parsed: new URL(typed).origin };
   return zoteroApiOrigin();
 }
 
 /** The API origin in force: ZOTERO_API_ORIGIN, or the test switch's loopback origin. Package-internal. */
 export function zoteroApiOrigin(): string {
-  return testOrigin ?? ZOTERO_API_ORIGIN;
+  return testOrigin?.typed ?? ZOTERO_API_ORIGIN;
 }
 
 /** Whether a file redirect may be followed: the product's rule, or (test switch on) the loopback origin only. */
 function fileRedirectAllowed(u: URL): boolean {
   if (testOrigin === undefined) return zoteroFileHostAllowed(u);
-  return u.origin === testOrigin && !u.username && !u.password;
-}
-
-/**
- * The scheduler's tick when the switch is on; undefined otherwise (always outside test mode). In test mode a value
- * that is not a whole number from 100 to 60000 written plainly (digits only, no leading zero) throws, naming the variable.
- */
-export function zoteroTickMsFromEnv(env: NodeJS.ProcessEnv): number | undefined {
-  if (env.NODE_ENV !== "test") return undefined;
-  const value = env[ZOTERO_TICK_ENV];
-  if (value === undefined) return undefined;
-  const ms = /^[1-9][0-9]*$/u.test(value) ? Number(value) : NaN;
-  if (!(ms >= 100 && ms <= 60_000)) throw new Error(`${ZOTERO_TICK_ENV} must be a whole number of milliseconds from 100 to 60000 (test mode), so the library service was not started.`);
-  return ms;
+  return u.origin === testOrigin.parsed && !u.username && !u.password;
 }
 
 export const MAX_ZOTERO_PAGE_BYTES = 10 * 1024 * 1024;

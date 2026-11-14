@@ -1,10 +1,9 @@
 /**
- * The service's side of the three test-only switches (Task Z11, Ruling R289 a): main.ts reads AO_SECRETS,
- * AO_ZOTERO_API_ORIGIN and AO_ZOTERO_TICK_MS once at its start (the library's readers, tested in
+ * The service's side of the two test-only switches (Task Z11, Ruling R289 a, R307 a): main.ts reads AO_SECRETS
+ * and AO_ZOTERO_API_ORIGIN once at its start (the library's readers, tested in
  * packages/library/src/import/test-switches.test.ts), refuses to start in test mode on a value not in its exact
- * form with a sentence naming the variable, ignores all three outside test mode, and passes the tick on through
- * `ServiceOptions.zoteroTickMs`. Nothing here reaches any host but 127.0.0.1: the "Zotero" is a local server that
- * answers `/keys/current` itself.
+ * form with a sentence naming the variable, and ignores both outside test mode. Nothing here reaches any host but
+ * 127.0.0.1: the "Zotero" is a local server that answers `/keys/current` itself.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -14,8 +13,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { deviceDeps } from "@ao/library";
-import { createService } from "./server.js";
 
 const TOKEN = "switch-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const ENTRY = fileURLToPath(new URL("./main.ts", import.meta.url));
@@ -92,7 +89,6 @@ describe("the test-only switches at the service's start (Task Z11, R289 a)", () 
       ["AO_ZOTERO_API_ORIGIN", "http://localhost:4567"],
       ["AO_ZOTERO_API_ORIGIN", "https://10.20.30.40:4567"],
       ["AO_SECRETS", "keyring"],
-      ["AO_ZOTERO_TICK_MS", "50"],
     ];
     for (const [name, value] of cases) {
       const r = run(env({ NODE_ENV: "test", [name]: value }));
@@ -105,9 +101,9 @@ describe("the test-only switches at the service's start (Task Z11, R289 a)", () 
     }
   }, 120_000);
 
-  it("outside test mode all three are ignored: wrong values start the service as usual", async () => {
+  it("outside test mode both are ignored: wrong values start the service as usual", async () => {
     for (const mode of [undefined, "production", "development"]) {
-      const r = run(env({ ...(mode ? { NODE_ENV: mode } : {}), AO_ZOTERO_API_ORIGIN: "http://localhost:4567", AO_SECRETS: "keyring", AO_ZOTERO_TICK_MS: "5" }));
+      const r = run(env({ ...(mode ? { NODE_ENV: mode } : {}), AO_ZOTERO_API_ORIGIN: "http://localhost:4567", AO_SECRETS: "keyring" }));
       await ready(r);
       expect(await stop(r), String(mode)).toBe(0);
     }
@@ -131,7 +127,7 @@ describe("the test-only switches at the service's start (Task Z11, R289 a)", () 
     await new Promise<void>((done) => zotero.listen(0, "127.0.0.1", done));
     const origin = `http://127.0.0.1:${(zotero.address() as AddressInfo).port}`;
     try {
-      const r = run(env({ NODE_ENV: "test", AO_ZOTERO_API_ORIGIN: origin, AO_SECRETS: "memory", AO_ZOTERO_TICK_MS: "1000" }));
+      const r = run(env({ NODE_ENV: "test", AO_ZOTERO_API_ORIGIN: origin, AO_SECRETS: "memory" }));
       const port = await ready(r);
       expect((await call(port, "PUT", "/secrets/zotero-api-key", { apiKey: KEY })).status).toBe(200);
       const check = await call(port, "POST", "/zotero/key-check");
@@ -151,13 +147,4 @@ describe("the test-only switches at the service's start (Task Z11, R289 a)", () 
     }
   }, 120_000);
 
-  it("createService passes zoteroTickMs on to the scheduler's options", async () => {
-    const deps = { ...deviceDeps(join(tmp, "config")), settleMs: 0 };
-    const withTick = await createService({ token: TOKEN, deps, worker: null, logLevel: "silent", zoteroTickMs: 1000 });
-    expect(withTick.state.opts.zoteroTickMs).toBe(1000);
-    await withTick.close();
-    const without = await createService({ token: TOKEN, deps, worker: null, logLevel: "silent" });
-    expect(without.state.opts.zoteroTickMs).toBeUndefined();
-    await without.close();
-  });
 });

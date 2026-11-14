@@ -461,7 +461,7 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl
   shellStub: [false, { option: true }],
   /**
    * Task Z11: more environment for every service this test starts (a restart included), on top of the harness's own,
-   * e.g. the test-only switches AO_SECRETS, AO_ZOTERO_API_ORIGIN and AO_ZOTERO_TICK_MS (honoured only under
+   * e.g. the test-only switches AO_SECRETS and AO_ZOTERO_API_ORIGIN (honoured only under
    * NODE_ENV=test, which the harness sets). A spec may override it with a fixture that depends on its own (a stand-in's port).
    */
   serviceEnv: [{}, { option: true }],
