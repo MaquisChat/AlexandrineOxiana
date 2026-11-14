@@ -462,14 +462,19 @@ describe("Round 2 (R328 b): a link resolver's path keeps no parameter and no ses
       "/openurl/0123456789abcdef",
       "/openurl/0123456789ABCDEF0123",
       "/openurl/aGVsbG8td29ybGQtMTIz",
-      "/openurl/ab_cd-efgh_ijkl-mn",
+      "/openurl/0123456789abcdef",
+      "/openurl/DEADBEEFDEADBEEFDEADBEEF",
+      "/openurl/eyJhbGciOiJIUzI1NiJ9abc",
+      "/(S(abc123))/openurl",
       "/0123456789abcdef0123;jsessionid=x/openurl",
     ]) {
       expect(deriveLibraryAccessWhy(ou(path)), path).toEqual({ refused: "session-key" });
     }
   });
   it("an ordinary resolver's path is kept", () => {
-    for (const path of ["/openurl", "/sfxlcl41", "/discovery/openurl", "/openurl/44EX", "/sfx_local"]) {
+    for (const path of ["/openurl", "/sfxlcl41", "/discovery/openurl", "/openurl/44EX", "/sfx_local",
+      "/primo_library/libweb/action/openurl", "/openurl/01ABC_INST/01ABC_INST:Services",
+      "/primo_library_openurl", "/INSTITUTIONAL_RESOLVER_PATH", "/resolver-2024-edition-x", "/openurl/ab_cd-efgh_ijkl-mn"]) {
       expect(deriveLibraryAccess(ou(path)), path).toEqual({ kind: "openurl", base: `https://resolver.example.edu${path}` });
     }
   });
@@ -477,6 +482,12 @@ describe("Round 2 (R328 b): a link resolver's path keeps no parameter and no ses
     expect(isLibraryAccess({ kind: "openurl", base: "https://resolver.example.edu/(S(lit3py55t21z5v55vlm25s55))/openurl" })).toBe(false);
     expect(isLibraryAccess({ kind: "openurl", base: "https://resolver.example.edu/openurl/0123456789abcdef" })).toBe(false);
     expect(isLibraryAccess({ kind: "openurl", base: "https://resolver.example.edu/discovery/openurl" })).toBe(true);
+    for (const path of ["/openurl/DEADBEEFDEADBEEFDEADBEEF", "/openurl/eyJhbGciOiJIUzI1NiJ9abc", "/(S(abc123))/openurl"]) {
+      expect(isLibraryAccess({ kind: "openurl", base: `https://resolver.example.edu${path}` }), path).toBe(false);
+    }
+    for (const path of ["/primo_library_openurl", "/INSTITUTIONAL_RESOLVER_PATH", "/resolver-2024-edition-x", "/openurl/01ABC_INST/01ABC_INST:Services"]) {
+      expect(isLibraryAccess({ kind: "openurl", base: `https://resolver.example.edu${path}` }), path).toBe(true);
+    }
   });
   it("what the sentence names: host and path for a resolver, the host alone otherwise", () => {
     expect(libraryAccessPlace(OU)).toBe("resolver.example.edu/openurl/44EX");

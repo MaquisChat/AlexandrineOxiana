@@ -89,11 +89,16 @@ const addressOk = (u: URL): boolean => hostOk(u.hostname) && u.port !== "0";
 const authorityOf = (u: URL): string => u.host;
 
 /**
- * R328 b: a path segment that looks like a session's key — 16 or more characters of hex or base64url alone (letters,
- * digits, `-`, `_`; hex is a part of it), or ASP.NET's `(S(…))`.
+ * R328 b, narrowed by R333 b: a path segment that looks like a session's key — 16 or more hexadecimal digits alone, or
+ * 20 or more characters of letters, digits, `-` and `_` holding a lower-case letter, an upper-case letter and a digit,
+ * or ASP.NET's `(S(…))`. A long plain word is not one.
  */
-const SESSION_SEGMENT = /^(?:[A-Za-z0-9_-]{16,}|\(S\(.*\)\))$/u;
-const holdsSessionKey = (path: string): boolean => path.split("/").some((seg) => SESSION_SEGMENT.test(seg));
+const HEX_KEY = /^[0-9A-Fa-f]{16,}$/u;
+const MIXED_KEY = /^[A-Za-z0-9_-]{20,}$/u;
+const ASPNET_KEY = /^\(S\(.*\)\)$/u;
+const sessionLike = (seg: string): boolean =>
+  HEX_KEY.test(seg) || (MIXED_KEY.test(seg) && /[a-z]/u.test(seg) && /[A-Z]/u.test(seg) && /\d/u.test(seg)) || ASPNET_KEY.test(seg);
+const holdsSessionKey = (path: string): boolean => path.split("/").some(sessionLike);
 
 /** The labels of an EZproxy hyphenated first label, or null when it does not read as a host with dots. */
 function hyphenHost(label: string): string[] | null {
