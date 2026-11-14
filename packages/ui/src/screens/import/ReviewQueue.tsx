@@ -168,6 +168,29 @@ export const PRESS_NOT_TAKEN_TEXT = "That press was not taken, because the list 
 export const PRESS_MOVED_TEXT = "That press was not taken, because what is under the pointer had just moved. Look at the file, then press again.";
 /** R322 a: how far (in CSS pixels, either way, on each axis) a control may stand from where it stood and still be "where it stood" (rounding). */
 export const PRESS_PLACE_TOLERANCE_PX = 1;
+/** R323 b: shown on the card, under its controls, where a press was not taken (until the pointer moves over the card, or a press there is taken). */
+export const PRESS_SHOWN_TEXT = {
+  moved: "Not taken: the page had just moved. Move the pointer onto the button and press again.",
+  quiet: "Not taken: the list had just changed. Look at the file, then press again.",
+} as const;
+export type PressNotice = keyof typeof PRESS_SHOWN_TEXT;
+
+/**
+ * R323 a: what the screen knows of the pointer, shared by every card.
+ *  - `moved`: the `pointermove` events in which the pointer really moved — its `clientX`/`clientY` differ from the last
+ *    ones the screen saw for that `pointerId` (window listener, capture phase, so it sees every pointermove first).
+ *    Client coordinates, not `movementX`/`movementY`: WebKit sends pointermoves after a scroll at the same point (with
+ *    movement 0), and the engines do not agree on what `movementX/Y` hold; the same point twice is no movement in
+ *    both. The first pointermove the screen sees of a pointer has nothing to differ from: it is not a movement.
+ *  - `scrolls`: moved on by every `scroll` event of the window or of any element (capture phase, so an inner scroller
+ *    is seen too): a place remembered before it is forgotten.
+ */
+interface Pointing {
+  moved: WeakSet<Event>;
+  last: Map<number, { x: number; y: number }>;
+  scrolls: number;
+}
+
 /** R322 a: what FileCard found of a press — taken as built ("ok"), or by a pointer on a control that moved under it ("moved"). */
 export type PressCheck = "ok" | "moved";
 /** A waiting file's two controls: their words at rest, and while that decision is out (R318 a). */
@@ -307,6 +330,31 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   }, []);
   /** The found files' section's heading: focus goes there after "Show them", and after the last waiting file. */
   const foundHead = useRef<HTMLHeadingElement>(null);
+  /** R323 b: a press not taken, shown on its card. */
+  const [heldNotices, setHeldNotices] = useState<Readonly<Record<string, PressNotice>>>({});
+  /** R323 a: the pointer's real movements and the scrolls (see Pointing). */
+  const pointing = useMemo<Pointing>(() => ({ moved: new WeakSet(), last: new Map(), scrolls: 0 }), []);
+  useEffect(() => {
+    const onMove = (e: globalThis.PointerEvent) => {
+      const was = pointing.last.get(e.pointerId);
+      if (was && (was.x !== e.clientX || was.y !== e.clientY)) pointing.moved.add(e);
+      pointing.last.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    };
+    const onScroll = () => void pointing.scrolls++;
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [pointing]);
+  const notice = useCallback((id: string, n: PressNotice | null) => {
+    setHeldNotices((cur) => {
+      if ((cur[id] ?? null) === n) return cur;
+      const { [id]: _drop, ...rest } = cur;
+      return n ? { ...rest, [id]: n } : rest;
+    });
+  }, []);
 
   /** The project's queue is locked (PROJECT_LOCKED): nothing of it is shown until it is unlocked here. */
   const [locked, setLocked] = useState(false);
@@ -404,6 +452,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     setError(null);
     setHeldBusy({});
     setHeldErrors({});
+    setHeldNotices({});
     // Nothing of the found files' section outlives a lock: unlocked, it is laid out afresh.
     putLayout(null);
     setStore(recordStore());
@@ -734,6 +783,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     // or the pointer never moved over it): not taken; it starts the quiet again (R318 b) and is said once per quiet.
     if (how === "moved") {
       holdQuiet(now);
+      notice(item.id, "moved");
       if (!movedSaid.current) {
         movedSaid.current = true;
         setStatus(PRESS_MOVED_TEXT);
@@ -744,6 +794,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     // once per quiet, that it was not taken.
     if (now < quietUntil.current) {
       holdQuiet(now);
+      notice(item.id, "quiet");
       if (!quietSaid.current) {
         quietSaid.current = true;
         setStatus(PRESS_NOT_TAKEN_TEXT);
@@ -751,6 +802,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       return;
     }
     heldBusyRef.current.add(item.id);
+    notice(item.id, null);
     const g = gen.current;
     setHeldBusy((cur) => ({ ...cur, [item.id]: decision }));
     setHeldErrors((cur) => withoutKey(cur, item.id));
@@ -1003,6 +1055,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           headRef={headRefFor}
           cardRef={cardRefFor}
           failed={failed}
+          notices={heldNotices}
+          pointing={pointing}
+          onPointedAt={(id) => notice(id, null)}
           onDecide={(i, d, how) => void decideHeld(i, d, how)}
           onShowArrived={layOutAgain}
         />
@@ -1188,6 +1243,11 @@ interface FoundFilesProps {
   sectionRef: Ref<HTMLHeadingElement>;
   /** Sources whose record could not be read. */
   failed: ReadonlySet<string>;
+  /** R323 b: presses not taken, shown on their cards. */
+  notices: Readonly<Record<string, PressNotice>>;
+  pointing: Pointing;
+  /** R323 b: the pointer moved over a card that shows a press not taken. */
+  onPointedAt(id: string): void;
   onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
   onShowArrived(): void;
 }
@@ -1218,7 +1278,7 @@ function describeRecord(item: HeldItem, record: SourceFile | undefined): string 
  * and stays). Files that arrive are only counted, on a line in a place kept for it above the groups (laid out whether
  * or not it says anything, so its appearing moves nothing); "Show them" lays the section out afresh.
  */
-function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, headRef, cardRef, onDecide, onShowArrived }: FoundFilesProps) {
+function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived }: FoundFilesProps) {
   // Re-rendered when a record is read: the names depend on every waiting file's record.
   useSyncExternalStore(store.subscribe, store.version);
   const right = items.filter(looksRight);
@@ -1253,6 +1313,9 @@ function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, secti
               named={names.get(i.id)!}
               end={ended[i.id] ?? (waiting.has(i.id) ? undefined : "gone")}
               unread={!!i.sourceId && failed.has(i.sourceId)}
+              notice={notices[i.id]}
+              pointing={pointing}
+              onPointedAt={onPointedAt}
               epoch={waiting}
               busy={busy[i.id]}
               error={errors[i.id]}
@@ -1310,6 +1373,10 @@ interface FileCardProps {
   end: FileEnd | "gone" | undefined;
   /** R322 b: its record could not be read. */
   unread: boolean;
+  /** R323 b: a press on it that was not taken, shown under its controls. */
+  notice: PressNotice | undefined;
+  pointing: Pointing;
+  onPointedAt(id: string): void;
   /** R322 a: new at every change of the queue the screen knows of (a re-render, so the card measures where it stands). */
   epoch: unknown;
   headRef(id: string, el: HTMLHeadingElement | null): void;
@@ -1339,7 +1406,7 @@ export const RECORD_ROW_TEXT = { reading: "…", none: "—", unread: "This sour
  * "Removing this file…" and looks busy, the other looks unavailable; R318 b: the press renews the quiet); R313 b — a key held down never decides: a repeated keydown
  * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
-const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
+const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
   const h = item.heldFile;
   const record = useRecord(store, item.sourceId);
   const s = record?.source;
@@ -1366,7 +1433,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch
    *    so it never passes as a key's; a click whose own event says it came from a pointer but whose pointerdown was not
    *    seen is not taken.
    */
-  const seen = useRef<Partial<Record<HeldFileDecision, Spot>>>({});
+  const seen = useRef<Partial<Record<HeldFileDecision, Spot & { scrolls: number }>>>({});
   const still = useRef<Partial<Record<HeldFileDecision, Spot & { since: number }>>>({});
   const down = useRef<{ d: HeldFileDecision; type: string; still: boolean } | null>(null);
   const buttons = useRef<Partial<Record<HeldFileDecision, HTMLButtonElement | null>>>({});
@@ -1387,9 +1454,16 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch
     measure("discard", now);
   });
   void epoch;
+  // R323 a: only a pointermove in which the pointer really moved is pointing; a scroll since then forgets it.
   const onPointerMove = (d: HeldFileDecision) => (e: PointerEvent<HTMLButtonElement>) => {
-    if (e.pointerType === "mouse") seen.current[d] = spotOf(e.currentTarget, false);
+    if (e.pointerType === "mouse" && pointing.moved.has(e.nativeEvent)) seen.current[d] = { ...spotOf(e.currentTarget, false), scrolls: pointing.scrolls };
   };
+  /** R323 b: the pointer moving over the card takes away the line saying a press was not taken. */
+  const onCardPointerMove = (e: PointerEvent<HTMLLIElement>) => {
+    if (notice && pointing.moved.has(e.nativeEvent)) onPointedAt(item.id);
+  };
+  const noticeId = `${useId()}-not-taken`;
+  const describedBy = notice ? noticeId : undefined;
   const onPointerDown = (d: HeldFileDecision) => (e: PointerEvent<HTMLButtonElement>) => {
     down.current = { d, type: e.pointerType, still: e.pointerType !== "mouse" && measure(d, Date.now()) };
   };
@@ -1416,7 +1490,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch
     if (p && p.d === d) {
       if (p.type === "mouse") {
         const was = seen.current[d];
-        how = was && sameSpot(was, spotOf(e.currentTarget, false)) ? "ok" : "moved";
+        how = was && was.scrolls === pointing.scrolls && sameSpot(was, spotOf(e.currentTarget, false)) ? "ok" : "moved";
       } else how = p.still ? "ok" : "moved";
     } else if (type === "mouse" || type === "touch" || type === "pen") how = "moved";
     onDecide(item, d, how);
@@ -1424,7 +1498,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch
   /** R318 a: the pressed control says it is working; its name still says which file. */
   const words = (d: HeldFileDecision) => (busy === d ? HELD_DECIDE_WORDS[d].working : HELD_DECIDE_WORDS[d].idle);
   return (
-    <li className={end ? "ao-review__file ao-review__file--ended" : "ao-review__file"} ref={(el) => cardRef(item.id, el)}>
+    <li className={end ? "ao-review__file ao-review__file--ended" : "ao-review__file"} ref={(el) => cardRef(item.id, el)} onPointerMove={onCardPointerMove}>
       <h4 className="ao-review__title ao-review__file-title" tabIndex={-1} ref={(el) => headRef(item.id, el)}>
         <UserText>{recordTitle || "Untitled"}</UserText>
       </h4>
@@ -1509,6 +1583,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch
               aria-label={`${words("attach")} for ${named}`}
               aria-disabled={busy ? true : undefined}
               aria-busy={busy === "attach" || undefined}
+              aria-describedby={describedBy}
               ref={(el) => void (buttons.current.attach = el)}
               onPointerMove={onPointerMove("attach")}
               onPointerDown={onPointerDown("attach")}
@@ -1523,6 +1598,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch
               aria-label={`${words("discard")} for ${named}`}
               aria-disabled={busy ? true : undefined}
               aria-busy={busy === "discard" || undefined}
+              aria-describedby={describedBy}
               ref={(el) => void (buttons.current.discard = el)}
               onPointerMove={onPointerMove("discard")}
               onPointerDown={onPointerDown("discard")}
@@ -1533,20 +1609,32 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, epoch
               {words("discard")}
             </button>
           </div>
-          {/* R322 b: a refusal's or a give-up's sentence comes BELOW the two controls, so they do not move. */}
-          {error && (
-            <p role="alert" className="ao-error">
-              {error === HELD_NO_ANSWER_TEXT ? (
-                HELD_NO_ANSWER_TEXT
-              ) : (
-                <>
-                  The decision was not recorded. <UserText>{error}</UserText>
-                </>
-              )}
-            </p>
-          )}
         </>
       )}
+      {/*
+       * R322 b, R323 c: the line under the two controls — a refusal's or a give-up's sentence, and a press not taken
+       * (R323 b: not an alert; the control is described by it while it is shown). Its place is kept on every card from
+       * its first showing (two lines of the theme's text), so a sentence shown there moves nothing; a longer one may
+       * still grow the card.
+       */}
+      <div className="ao-review__file-note">
+        {!end && error && (
+          <p role="alert" className="ao-error">
+            {error === HELD_NO_ANSWER_TEXT ? (
+              HELD_NO_ANSWER_TEXT
+            ) : (
+              <>
+                The decision was not recorded. <UserText>{error}</UserText>
+              </>
+            )}
+          </p>
+        )}
+        {!end && notice && (
+          <p id={noticeId} className="ao-review__not-taken">
+            {PRESS_SHOWN_TEXT[notice]}
+          </p>
+        )}
+      </div>
     </li>
   );
 });

@@ -548,6 +548,20 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
   const noUse = (title: string) => screen.queryByRole("button", { name: named("Use this file", title) });
   /** The card's heading (the record's title), where focus goes after a decision (R313 a). */
   const head = (title: string) => card(title).querySelector("h4")!;
+  /**
+   * R323 a: a press by mouse is taken only after the pointer really moved over the control (its client coordinates
+   * changed). user-event's own click moves to the element without new coordinates, so a press here travels: from a point
+   * on the page to a new point on the control, then the button goes down and up there.
+   */
+  let travel = 0;
+  const point = async (user: ReturnType<typeof userEvent.setup>, el: Element) => {
+    travel += 10;
+    await user.pointer([
+      { target: document.body, coords: { clientX: travel, clientY: travel } },
+      { target: el, coords: { clientX: travel + 3, clientY: travel + 2 } },
+      { keys: "[MouseLeft]", target: el },
+    ]);
+  };
   /** R319 d: the quiet holds at the screen's opening; a test that presses waits for the card, then lets the quiet pass. */
   const ready = async (title: string) => {
     const c = await waitFor(() => card(title));
@@ -642,10 +656,10 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     for (const el of within(section).queryAllByRole("button")) expect(el.getAttribute("aria-label") ?? el.textContent).not.toMatch(/\ball\b|every|selected/iu);
     expect(within(section).queryAllByRole("checkbox")).toHaveLength(0);
     // One file per request: two files decided one after the other make two requests, each for its own file.
-    await user.click(use("Right One"));
+    await point(user, use("Right One"));
     await waitFor(() => expect(noUse("Right One")).toBeNull());
     passGuard();
-    await user.click(not("Doubted Two"));
+    await point(user, not("Doubted Two"));
     await waitFor(() => expect(screen.queryByRole("button", { name: named("Not this file", "Doubted Two") })).toBeNull());
     expect(heldCalls).toEqual([
       { id: "r8", body: { projectId: P1, decision: "attach" } },
@@ -669,8 +683,11 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     const { user } = open(o);
     await ready("Right Two");
     // The answer is held back, so both presses fall on the same file while its decision is out.
-    await user.dblClick(use("Right One"));
-    await user.click(not("Right One"));
+    // R323 a: a double press after a real movement onto the control (user-event's dblClick does not move the pointer).
+    const first = use("Right One");
+    await point(user, first);
+    await user.pointer({ keys: "[MouseLeft]", target: first });
+    await point(user, not("Right One"));
     await waitFor(() => expect(heldCalls).toHaveLength(1));
     await new Promise((r) => setTimeout(r, 50));
     release();
@@ -684,7 +701,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     const { user } = open(mixed());
     await ready("Right Two");
     // The next in the same group: its heading, focusable, never its "Use this file".
-    await user.click(use("Right One"));
+    await point(user, use("Right One"));
     await waitFor(() => expect(document.activeElement).toBe(head("Right Two")));
     expect(head("Right Two").getAttribute("tabindex")).toBe("-1");
     expect(screen.getByRole("status").textContent).toBe("File added to its record: Right One");
@@ -693,18 +710,18 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(document.activeElement).toBe(use("Right Two"));
     // The last of its group: the first file of the other group.
     passGuard();
-    await user.click(use("Right Two"));
+    await point(user, use("Right Two"));
     await waitFor(() => expect(document.activeElement).toBe(head(RECORD)));
     // R319 a: the group whose files are all decided stays in its place, counting none.
     expect(screen.getByRole("heading", { name: "Files that look right (0)" })).toBeTruthy();
     // Not this file moves on the same way.
     passGuard();
-    await user.click(not(RECORD));
+    await point(user, not(RECORD));
     await waitFor(() => expect(document.activeElement).toBe(head("Doubted Two")));
     expect(screen.getByRole("status").textContent).toBe(`File removed; the record keeps no file: ${RECORD}`);
     // The last file of all: the message that says nothing is waiting.
     passGuard();
-    await user.click(use("Doubted Two"));
+    await point(user, use("Doubted Two"));
     const empty = await screen.findByText("Nothing is waiting for review in this project.");
     await waitFor(() => expect(document.activeElement).toBe(empty));
     expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10", "r7", "r9"]);
@@ -718,7 +735,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     o.sources = { s1: source(1, "Dropped file"), s8: source(8, "Right One") };
     const { user } = open(o);
     await ready("Right One");
-    await user.click(use("Right One"));
+    await point(user, use("Right One"));
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Files found for records" })));
     expect(within(card("Right One")).getByText("Decided")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Files that look right (0)" })).toBeTruthy();
@@ -814,7 +831,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     const { user } = open(mixed());
     await ready("Right Two");
     const first = card("Right One");
-    await user.click(use("Right One"));
+    await point(user, use("Right One"));
     await waitFor(() => expect(noUse("Right One")).toBeNull());
     // At the first one's place: the same card, with no control a person can reach; a press on what is there does nothing.
     expect(document.querySelector(".ao-review__found .ao-review__file")).toBe(first);
@@ -949,10 +966,10 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       for (const r of recs) for (const n of r.addedNodes) if (n.textContent) said.push(n.textContent);
     });
     mo.observe(region, { childList: true, subtree: true, characterData: true });
-    await user.click(screen.getByRole("button", { name: "Use this file for Same Title (Smith, 2020, file 1 of 2)" }));
+    await point(user, screen.getByRole("button", { name: "Use this file for Same Title (Smith, 2020, file 1 of 2)" }));
     await waitFor(() => expect(said).toHaveLength(1));
     passGuard();
-    await user.click(screen.getByRole("button", { name: /^Use this file for Same Title/u }));
+    await point(user, screen.getByRole("button", { name: /^Use this file for Same Title/u }));
     await waitFor(() => expect(said).toEqual(["File added to its record: Same Title", "File added to its record: Same Title"]));
     mo.disconnect();
   });
@@ -970,7 +987,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     ];
     const { user } = open(o);
     await ready("Right Two");
-    await user.click(use("Right One"));
+    await point(user, use("Right One"));
     await waitFor(() => expect(heldCalls).toHaveLength(1));
     // Meanwhile the researcher goes to another file.
     head(RECORD).focus();
@@ -993,7 +1010,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     ];
     const { user } = open(o);
     await ready("Right Two");
-    await user.click(use("Right One"));
+    await point(user, use("Right One"));
     await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
     // Its two buttons are busy and cannot be pressed again; focus stays on the one pressed (its words say it is
     // working, R318 a: held by its element).
@@ -1002,12 +1019,12 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(u.getAttribute("aria-busy")).toBe("true");
     expect(n.getAttribute("aria-disabled")).toBe("true");
     expect(document.activeElement).toBe(u);
-    await user.click(u);
-    await user.click(n);
+    await point(user, u);
+    await point(user, n);
     // Another file is decided meanwhile — deliberately, after the quiet those two presses started again (R318 b).
     passGuard();
     expect(use("Right Two").getAttribute("aria-disabled")).toBeNull();
-    await user.click(use("Right Two"));
+    await point(user, use("Right Two"));
     await waitFor(() => expect(noUse("Right Two")).toBeNull());
     expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
     release();
@@ -1021,7 +1038,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: GONE, reason: "source-gone" } }, { status: 409 }))];
     const { user } = open(o);
     await ready(RECORD);
-    await user.click(use(RECORD));
+    await point(user, use(RECORD));
     const alert = await within(card(RECORD)).findByRole("alert");
     expect(alert.textContent).toContain(GONE);
     expect(use(RECORD)).toBeTruthy();
@@ -1037,7 +1054,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: PAUSED, reason: "paused" } }, { status: 409 }))];
     const { user } = open(o);
     await ready(RECORD);
-    await user.click(use(RECORD));
+    await point(user, use(RECORD));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain(PAUSED);
     expect(use(RECORD)).toBeTruthy();
@@ -1275,7 +1292,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       await waitFor(() => expect(within(card("Right One")).getByText("Ann Smith")).toBeTruthy());
       const before = cards();
       expect(before.map((c) => c.querySelector("h4")?.textContent)).toEqual(["Right One", "Right Two", RECORD, "Doubted Two"]);
-      await user.click(use("Right One"));
+      await point(user, use("Right One"));
       await waitFor(() => expect(within(card("Right One")).getByText("File added to its record.")).toBeTruthy());
       // The same cards, the same elements, in the same order: the element at the decided card's place is the decided card.
       expect(cards()).toEqual(before);
@@ -1298,7 +1315,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       const { user } = open(mixed());
       await ready("Doubted Two");
       const before = cards();
-      await user.click(not(RECORD));
+      await point(user, not(RECORD));
       await waitFor(() => expect(within(card(RECORD)).getByText("File removed; the record keeps no file.")).toBeTruthy());
       expect(cards()).toEqual(before);
       const c = card(RECORD);
@@ -1313,9 +1330,9 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       const { user } = open(mixed());
       await ready("Right Two");
       const before = cards();
-      await user.click(use("Right One"));
+      await point(user, use("Right One"));
       await waitFor(() => expect(screen.getByRole("heading", { name: "Files that look right (1)" })).toBeTruthy());
-      await user.click(use("Right Two"));
+      await point(user, use("Right Two"));
       await waitFor(() => expect(screen.getByRole("heading", { name: "Files that look right (0)" })).toBeTruthy());
       // The group stays, with both its cards; the other group's cards have not moved.
       expect(within(group(/^Files that look right/u)).getAllByRole("listitem").map((li) => li.querySelector("h4")?.textContent)).toEqual(["Right One", "Right Two"]);
@@ -1327,14 +1344,14 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       const { user } = open(mixed());
       await ready("Right Two");
       // The last of its group: the one before it.
-      await user.click(use("Right Two"));
+      await point(user, use("Right Two"));
       await waitFor(() => expect(document.activeElement).toBe(head("Right One")));
-      await user.click(not(RECORD));
+      await point(user, not(RECORD));
       await waitFor(() => expect(document.activeElement).toBe(head("Doubted Two")));
       // Nothing waits in its group: the other group's first WAITING card (RECORD, decided, is skipped).
-      await user.click(use("Right One"));
+      await point(user, use("Right One"));
       await waitFor(() => expect(document.activeElement).toBe(head("Doubted Two")));
-      await user.click(use("Doubted Two"));
+      await point(user, use("Doubted Two"));
       const empty = await screen.findByText("Nothing is waiting for review in this project.");
       await waitFor(() => expect(document.activeElement).toBe(empty));
       // Every card is still there, decided.
@@ -1552,8 +1569,18 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
         const r = rectFor(b);
         return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
       });
-    /** The pointer moves over a control. */
-    const moveOver = (el: Element, pointerType = "mouse") => fireEvent.pointerMove(el, { pointerType });
+    /** Where the pointer is (client coordinates): R323 a — a movement is a change of these. */
+    const pointer = { x: 1, y: 1 };
+    /** The pointer really moves over a control (to a new point). */
+    const moveOver = (el: Element, pointerType = "mouse") => {
+      // From where it was (seen by the screen) to a new point on the control.
+      fireEvent.pointerMove(document.body, { pointerType, pointerId: 1, clientX: pointer.x, clientY: pointer.y });
+      pointer.x += 3;
+      pointer.y += 2;
+      fireEvent.pointerMove(el, { pointerType, pointerId: 1, clientX: pointer.x, clientY: pointer.y });
+    };
+    /** A pointermove that reports no movement (WebKit sends these after a scroll, to update what is hovered). */
+    const stillMove = (el: Element) => fireEvent.pointerMove(el, { pointerType: "mouse", pointerId: 1, clientX: pointer.x, clientY: pointer.y });
     /** A press by a pointer (no movement before it): down, up, and the click it makes. */
     const pressBy = (el: Element | undefined, pointerType = "mouse") => {
       if (!el) return;
@@ -1563,6 +1590,115 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     };
     /** A press at a resting point. */
     const pressAt = (x: number, y: number, pointerType = "mouse") => pressBy(controlAt(x, y), pointerType);
+
+    it("R323 a: a pointermove that reports no movement does not arm the control: after the control moved, a press is not taken; after a real movement it is", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const h = listen();
+      const u = use("Right Two");
+      moveOver(u);
+      // The page scrolls (by the wheel, say) under the resting pointer: the control moved; the engine sends a pointermove
+      // at the same point.
+      geo.extra = -300;
+      stillMove(u);
+      pressBy(u);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      expect(h.said).toEqual([MOVED]);
+      passGuard();
+      moveOver(u);
+      pressBy(u);
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r10"]));
+      h.stop();
+    });
+
+    it("R323 a: a scroll — of the window, or of any scrolling ancestor of the section — forgets where the controls stood; after a real movement a press is taken", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const u = use("Right One");
+      moveOver(u);
+      fireEvent.scroll(window);
+      pressBy(u);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      // An inner scroller (an ancestor of the section).
+      passGuard();
+      moveOver(u);
+      fireEvent.scroll(section().parentElement!);
+      pressBy(u);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      passGuard();
+      moveOver(u);
+      pressBy(u);
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+    });
+
+    const MOVED_SHOWN = "Not taken: the page had just moved. Move the pointer onto the button and press again.";
+    const QUIET_SHOWN = "Not taken: the list had just changed. Look at the file, then press again.";
+    /** The line under a card's two controls (R323 c). */
+    const note = (title: string) => card(title).querySelector<HTMLElement>(".ao-review__file-note");
+
+    it("R323 b: a press not taken is shown on its card, under its controls, tied to the control, until the pointer moves over the card", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const u = use("Right One");
+      pressBy(u);
+      await waitFor(() => expect(note("Right One")?.textContent).toBe(MOVED_SHOWN));
+      const shown = within(note("Right One")!).getByText(MOVED_SHOWN);
+      expect(shown.closest("[role='alert']")).toBeNull();
+      expect(u.getAttribute("aria-describedby")).toBe(shown.id);
+      expect(shown.id).not.toBe("");
+      // Only that card shows it.
+      expect(note("Right Two")?.textContent).toBe("");
+      // The pointer moves over the card: it goes.
+      moveOver(card("Right One"));
+      await waitFor(() => expect(note("Right One")?.textContent).toBe(""));
+      expect(u.getAttribute("aria-describedby")).toBeNull();
+    });
+
+    it("R323 b: a press swallowed by the quiet is shown on its card; it goes when a press there is taken", async () => {
+      open(mixed());
+      await waitFor(() => card("Right Two"));
+      // Inside the opening's quiet: by key.
+      const u = use("Right One");
+      u.focus();
+      const enter = () => {
+        fireEvent.keyDown(u, { key: "Enter", code: "Enter" });
+        fireEvent.click(u);
+        fireEvent.keyUp(u, { key: "Enter", code: "Enter" });
+      };
+      enter();
+      await waitFor(() => expect(note("Right One")?.textContent).toBe(QUIET_SHOWN));
+      expect(heldCalls).toHaveLength(0);
+      passGuard();
+      enter();
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+      await waitFor(() => expect(note("Right One")?.textContent).toBe(""));
+    });
+
+    it("R323 c: the line under the controls is there from the first showing, empty; a sentence comes into it, and nothing is put above or between the controls", async () => {
+      const GONE = "The record this file was found for is no longer in the library. Nothing was changed.";
+      const o = project();
+      o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: GONE, reason: "source-gone" } }, { status: 409 }))];
+      open(o);
+      const c = await waitFor(() => card(RECORD));
+      const slot = c.querySelector(".ao-review__file-note")!;
+      expect(slot).toBeTruthy();
+      expect(slot.textContent).toBe("");
+      for (const b of within(c).getAllByRole("button")) expect(b.compareDocumentPosition(slot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      const children = [...c.children];
+      const actions = within(c).getAllByRole("button")[0]!.parentElement!;
+      const inActions = [...actions.children];
+      passGuard();
+      moveOver(use(RECORD));
+      pressBy(use(RECORD));
+      const alert = await within(c).findByRole("alert");
+      expect(slot.contains(alert)).toBe(true);
+      expect(alert.textContent).toContain(GONE);
+      expect([...c.children]).toEqual(children);
+      expect([...actions.children]).toEqual(inActions);
+    });
 
     it("R322 a: a mouse press on a control the pointer moved over, where it stands, is taken", async () => {
       open(mixed());
@@ -1637,7 +1773,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       await ready("Right One");
       const accept = await screen.findByRole("button", { name: "Accept" });
       await waitFor(() => expect((accept as HTMLButtonElement).disabled).toBe(false));
-      await user.click(accept);
+      await point(user, accept);
       await waitFor(() => expect(document.querySelector(".ao-review__layout")).toBeNull());
       const u = use("Right One");
       u.focus();
@@ -1770,7 +1906,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: "This entry has already been reviewed.", reason: "already-decided" } }, { status: 409 }))];
     const { user } = open(o);
     await ready(RECORD);
-    await user.click(use(RECORD));
+    await point(user, use(RECORD));
     await waitFor(() => expect(noUse(RECORD)).toBeNull());
     expect(screen.getByRole("status").textContent).toMatch(/had already been decided, so it left the queue: Rivers and Memory/u);
     expect(within(card(RECORD)).getByText("This entry had already been decided, so it left the queue.")).toBeTruthy();

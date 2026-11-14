@@ -609,3 +609,15 @@ span.ao-import__hint {
   font-weight: 600;
   padding: 0 var(--space-1);
 }
+
+/*
+ * R323 c: the line under a card's two controls (a refusal, a give-up, a press not taken) has its place from the card's
+ * first showing: two lines of the theme's text. A longer sentence may still grow the card.
+ */
+.ao-review__file-note {
+  min-height: calc(2em * var(--line-spacing));
+}
+
+.ao-review__file-note > p {
+  margin: 0;
+}
