@@ -2870,6 +2870,28 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         Arc::new(MapResolver(HashMap::from([("a.test", lo), ("b.test", lo), ("c.test", "10.0.0.1".parse().unwrap())])))
     }
 
+    /// A host that answers several addresses.
+    struct ListResolver(HashMap<&'static str, Vec<IpAddr>>);
+
+    impl HostResolver for ListResolver {
+        fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+            self.0.get(host).map(|ips| ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect()).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+    }
+
+    #[test]
+    fn a_host_answering_an_allowed_and_a_refused_address_is_refused_in_either_order() {
+        let s = Server::start("multi");
+        let (lo, private): (IpAddr, IpAddr) = ("127.0.0.1".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        let two: Arc<dyn HostResolver> = Arc::new(ListResolver(HashMap::from([("a.test", vec![lo, private]), ("b.test", vec![private, lo])])));
+        for host in ["a.test", "b.test"] {
+            let read: Box<dyn FnOnce() -> Vec<Cookie<'static>> + Send> = Box::new(jar);
+            let got = tauri::async_runtime::block_on(fetch_pdf(input(s.url(host, "/paper.pdf"), None), read, &rules(), two.clone(), &mut Vec::new()));
+            assert_eq!(got, Err(FetchError::Refused), "{host}");
+        }
+        assert!(s.paths().is_empty(), "{:?}", s.paths());
+    }
+
     fn rules() -> FetchRules {
         let mut r = FetchRules::for_shell(true);
         r.roots = vec![reqwest::Certificate::from_pem(&test_cert().pem).unwrap()];
