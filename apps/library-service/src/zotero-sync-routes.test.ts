@@ -143,7 +143,7 @@ async function newProject(encrypted = false, name = "Study"): Promise<string> {
   return r.json.project.id as string;
 }
 const linkOf = (ref: string, projectId: string) => ({ ref, projectId, structure: "collections", duplicates: "merge" });
-async function saveSettings(links: Array<ReturnType<typeof linkOf>>, o: { automatic?: boolean; everyMinutes?: number } = {}) {
+async function saveSettings(links: Array<ReturnType<typeof linkOf> & { resume?: unknown }>, o: { automatic?: boolean; everyMinutes?: number } = {}) {
   return call({ method: "PUT", url: "/zotero/sync/settings", body: { automatic: o.automatic ?? false, everyMinutes: o.everyMinutes ?? 60, links } });
 }
 const addItems = (ref: string, n: number, prefix = "Item") => {
@@ -337,6 +337,30 @@ describe("settings (Accept 3)", () => {
     expect(await readFile(path, "utf8")).toBe(newer);
   });
 
+  it("R268 M4: the state says when the settings were written by a newer version (settingsNewer), exactly then", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    const path = join(deps.appConfigDir, "zotero-sync.json");
+    // No file, and a file of this version: false.
+    expect((await state()).settingsNewer).toBe(false);
+    expect((await saveSettings([linkOf(U, pid)])).json.settingsNewer).toBe(false);
+    expect((await state()).settingsNewer).toBe(false);
+    // A newer version's file: true; the file stays as it was; the sentence is the shared one the screen shows.
+    const newer = JSON.stringify({ v: 3, libraries: {} });
+    await writeFile(path, newer, { mode: 0o600 });
+    const st = await state();
+    expect(st.settingsNewer).toBe(true);
+    expect(st.links).toEqual([]);
+    expect(await readFile(path, "utf8")).toBe(newer);
+    const refused = await saveSettings([linkOf(U, pid)]);
+    expect(refused.json.error.message).toBe(ZOTERO_SYNC_SENTENCES.settingsNewer);
+    // A damaged file is set aside by the library module: not "newer".
+    await writeFile(path, "{ not json", { mode: 0o600 });
+    expect((await state()).settingsNewer).toBe(false);
+    await writeFile(path, JSON.stringify({ v: 1.5, libraries: {} }), { mode: 0o600 });
+    expect((await state()).settingsNewer).toBe(false);
+  });
+
   it("nothing runs by itself after a settings write with automatic on, an unlock or a library open (the clock moved a day on each time)", async () => {
     // Every timer the service makes from here on is a fake one (the clock also moves on with real time, so the
     // service works): a start delayed by minutes or hours would fire when the clock is moved on.
@@ -504,7 +528,7 @@ describe("running (Accept 3–5)", () => {
     expect(st.links[0]).toMatchObject({ paused: "key-refused", waitingFor: "paused" });
   });
 
-  it("R248: a successful key check clears the key-refused pause of every link, also after a restart; a failed one clears nothing; a save clears undone only", async () => {
+  it("R248: a successful key check clears the key-refused pause of every link, also after a restart; a failed one clears nothing; a save clears undone only for a link it names with resume: true (R265)", async () => {
     const libPath = await openLibrary();
     const a = await newProject(false, "A");
     const b = await newProject(false, "B");
@@ -532,11 +556,86 @@ describe("running (Accept 3–5)", () => {
       [undefined, undefined],
       [undefined, undefined],
     ]);
-    // An undone pause: cleared by the researcher's save (and not by a key check).
+    // An undone pause: not cleared by a key check, nor by a plain save; cleared by a save that names the link with
+    // `resume: true` (R265, D26).
     await (await import("@ao/library")).pauseLink(deps.appConfigDir, svc.state.session!.lib.id, U, "undone");
     expect((await call({ method: "POST", url: "/zotero/key-check", body: {} })).status).toBe(200);
     expect((await state()).links[0].paused).toBe("undone");
-    expect((await saveSettings([linkOf(U, a), linkOf(G, b)])).json.links[0].paused).toBeUndefined();
+    expect((await saveSettings([linkOf(U, a), linkOf(G, b)])).json.links[0].paused).toBe("undone");
+    expect((await saveSettings([{ ...linkOf(U, a), resume: true }, linkOf(G, b)])).json.links[0].paused).toBeUndefined();
+  });
+
+  describe("R265 (D26): a save clears the pause undone only for a link it names with resume: true", () => {
+    const pause = async (ref: string, reason: "undone" | "key-refused" | "library-gone") =>
+      (await import("@ao/library")).pauseLink(deps.appConfigDir, svc.state.session!.lib.id, ref, reason);
+    const pauses = async () => (await state()).links.map((l: { ref: string; paused?: string }) => [l.ref, l.paused]);
+
+    it("a save without resume keeps undone — after changing everyMinutes, automatic, another link", async () => {
+      await openLibrary();
+      const a = await newProject(false, "A");
+      const b = await newProject(false, "B");
+      await saveSettings([linkOf(U, a), linkOf(G, b)]);
+      await pause(U, "undone");
+      const r1 = await saveSettings([linkOf(U, a), linkOf(G, b)], { everyMinutes: 240 });
+      expect(r1.status, r1.body).toBe(200);
+      expect(r1.json.links[0]).toMatchObject({ paused: "undone", waitingFor: "paused" });
+      expect((await saveSettings([linkOf(U, a), linkOf(G, b)], { automatic: true, everyMinutes: 240 })).json.links[0].paused).toBe("undone");
+      // Another link changed, added and removed; this link's options and project changed.
+      expect((await saveSettings([linkOf(U, a), { ...linkOf(G, a), structure: "tags" }, linkOf("group:12", b)])).json.links[0].paused).toBe("undone");
+      expect((await saveSettings([{ ...linkOf(U, b), duplicates: "skip" }])).json.links[0].paused).toBe("undone");
+      expect(await pauses()).toEqual([[U, "undone"]]);
+      // A library unlinked, then linked again in a later save, is a new link without a pause.
+      expect((await saveSettings([])).status).toBe(200);
+      expect((await saveSettings([linkOf(U, a)])).json.links[0].paused).toBeUndefined();
+      expect(z.requests).toEqual([]);
+    });
+
+    it("resume: true clears undone for that link only, another undone link stays paused", async () => {
+      await openLibrary();
+      const a = await newProject(false, "A");
+      await saveSettings([linkOf(U, a), linkOf(G, a)]);
+      await pause(U, "undone");
+      await pause(G, "undone");
+      const r = await saveSettings([{ ...linkOf(U, a), resume: true }, linkOf(G, a)]);
+      expect(r.status, r.body).toBe(200);
+      expect(r.json.links.map((l: { paused?: string }) => l.paused)).toEqual([undefined, "undone"]);
+      expect(await pauses()).toEqual([
+        [U, undefined],
+        [G, "undone"],
+      ]);
+      // The device file keeps no `resume`.
+      const file = JSON.parse(await readFile(join(deps.appConfigDir, "zotero-sync.json"), "utf8"));
+      expect(JSON.stringify(file)).not.toContain("resume");
+    });
+
+    it("resume with any other value is refused naming the field", async () => {
+      await openLibrary();
+      const a = await newProject(false, "A");
+      await saveSettings([linkOf(U, a)]);
+      await pause(U, "undone");
+      for (const v of [false, "true", null, 1, {}]) {
+        const r = await saveSettings([linkOf(G, a), { ...linkOf(U, a), resume: v }]);
+        expect(r.status, JSON.stringify(v)).toBe(400);
+        expect(r.json.error.code).toBe("VALIDATION");
+        expect(r.json.error.message).toBe('"links[1].resume" must be true, or left out.');
+      }
+      expect(await pauses()).toEqual([[U, "undone"]]);
+    });
+
+    it("resume does not clear key-refused or library-gone", async () => {
+      await openLibrary();
+      const a = await newProject(false, "A");
+      await saveSettings([linkOf(U, a), linkOf(G, a)]);
+      await pause(U, "key-refused");
+      await pause(G, "library-gone");
+      const r = await saveSettings([{ ...linkOf(U, a), resume: true }, { ...linkOf(G, a), resume: true }]);
+      expect(r.status, r.body).toBe(200);
+      expect(r.json.links.map((l: { paused?: string }) => l.paused)).toEqual(["key-refused", "library-gone"]);
+      expect(await pauses()).toEqual([
+        [U, "key-refused"],
+        [G, "library-gone"],
+      ]);
+    });
   });
 
   it("close during a run leaves a stopped record and a paused batch, and nothing is written after the lock is released", async () => {

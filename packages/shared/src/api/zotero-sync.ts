@@ -110,6 +110,11 @@ export interface ZoteroSyncLinkDto {
 
 export interface ZoteroSyncStateResponse {
   readOnly: boolean;
+  /**
+   * This computer's sync settings were written by a newer version of the app (R268 M4): they are left as they are, not
+   * read (so `links` is empty and nothing runs) and not changed (a save is refused with `ZOTERO_SYNC_SENTENCES.settingsNewer`).
+   */
+  settingsNewer: boolean;
   /** Whether a key is saved; null when the password store cannot be asked. */
   keyStored: boolean | null;
   /** Stored as the researcher chose; no run starts by itself yet (no scheduler in this version). */
@@ -124,7 +129,12 @@ export interface ZoteroSyncStateResponse {
 export interface ZoteroSyncSettingsRequest {
   automatic: boolean;
   everyMinutes: ZoteroSyncEveryMinutes;
-  links: Array<{ ref: string; projectId: string; structure: ZoteroSyncStructure; duplicates: ZoteroSyncDuplicates }>;
+  /**
+   * `resume: true` turns syncing of that link on again after an undo: its "undone" pause is cleared by this save
+   * (R265, D26). Without it an existing "undone" is kept, whatever else the save changes. "key-refused" and
+   * "library-gone" are never cleared by a save (a successful key check clears them).
+   */
+  links: Array<{ ref: string; projectId: string; structure: ZoteroSyncStructure; duplicates: ZoteroSyncDuplicates; resume?: true }>;
 }
 
 export interface ZoteroSyncRunRequest {
@@ -223,6 +233,8 @@ export const ZOTERO_SYNC_SENTENCES = {
   belongsToSync: "This import belongs to a Zotero sync. Stop it or run it again from the Zotero screen.",
   keyNotChecked: "Only the saved key can be checked. Save the key first, then check it.",
   settingsUnreadable: "This computer's Zotero sync settings could not be read, so nothing was changed. Try again in a moment.",
+  /** The library module's own sentence for a settings file of a newer version (the service checks they are one). */
+  settingsNewer: "These sync settings were written by a newer version of the app. Update the app to change them.",
 } as const;
 
 const timeOf = (d: Date) => new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(d);
