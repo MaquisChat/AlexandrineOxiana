@@ -19,14 +19,17 @@
  * rules or the waiting files' limit stopped; no open copy because some services could not be reached; a copy wait);
  * "Needs your check" offers the link "Check the file" to that record's entry in the review queue — the app never
  * attaches a found file by itself; "No open copy" lists the entry's offers under "Where to get it" (https: only, any
- * other address refused here); a record removed from the library offers only "Remove from the queue".
+ * other address refused here); a record removed from the library offers only "Remove from the queue". In the desktop
+ * app, which cannot open an outside address yet (R311 a), each place is its label and host with "Copy address" — no
+ * link — under the line "Paste an address into your browser."; a copy is said once in the list's polite region.
  *
  * The states of later slices are said in words, with "Remove from the queue" (and "Open" when the entry has a
  * record), and no control of a later slice.
  */
 import { FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindOfferLink, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
-import { Component, memo, type ReactNode } from "react";
+import { Component, memo, useState, type ReactNode } from "react";
 import { creatorsText, isKnownState, kindWords, usableCandidates, yearOf } from "../api/find";
+import { inDesktopShell } from "../desktopShell";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
 
@@ -73,6 +76,12 @@ export const FIND_TEXT = {
   // Task F11: the copy part.
   checkFile: "Check the file",
   whereToGetIt: "Where to get it",
+  // R311 a: the desktop app cannot open an outside address yet, so each place is copied rather than linked.
+  pasteHint: "Paste an address into your browser.",
+  copyAddress: "Copy address",
+  addressCopied: "Address copied.",
+  /** The app's words for a copy that did not work (as the Cite panel says them). */
+  copyFailed: "Copying is not available here.",
 } as const;
 
 /** Reasons on "record-complete" that "Try again" takes (F11: the rules, the store part, the waiting files' limit). */
@@ -356,6 +365,19 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
   const actions = actionsOf(e, place);
   // "Where to get it": an entry with no open copy, unless its record was removed (R282 g).
   const offers = known && e.state === "no-open-copy" && !recordRemoved(e) ? safeOffers(e) : [];
+  // R311 a: in the desktop app a link there would do nothing; each address is copied instead (said once below).
+  const copyOnly = offers.length > 0 && inDesktopShell();
+  const [copySaid, setCopySaid] = useState<string | undefined>();
+  const copyAddress = async (address: string) => {
+    setCopySaid(undefined);
+    try {
+      if (!navigator.clipboard) throw new Error("no clipboard");
+      await navigator.clipboard.writeText(address);
+      setCopySaid(FIND_TEXT.addressCopied);
+    } catch {
+      setCopySaid(FIND_TEXT.copyFailed);
+    }
+  };
   const button = (kind: FindActKind) => {
     const working = busy === kind;
     const waiting = !!busy && !working;
@@ -420,15 +442,30 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
       {offers.length > 0 && (
         <div className="ao-find__where">
           <p className="ao-find__where-title">{FIND_TEXT.whereToGetIt}</p>
+          {copyOnly && <p className="ao-find__where-hint">{FIND_TEXT.pasteHint}</p>}
           <ul aria-label={short ? `${FIND_TEXT.whereToGetIt}: ${label}` : FIND_TEXT.whereToGetIt}>
-            {offers.map((o, i) => (
-              <li key={`${i}:${o.url}`}>
-                <a href={o.url} target="_blank" rel="noopener noreferrer" aria-label={short ? `${o.label} (${o.host}): ${label}` : `${o.label} (${o.host})`}>
-                  <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>)
-                </a>
-              </li>
-            ))}
+            {offers.map((o, i) =>
+              copyOnly ? (
+                <li key={`${i}:${o.url}`}>
+                  <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>){" "}
+                  <button type="button" data-act="copy-address" aria-label={`${FIND_TEXT.copyAddress}: ${o.label} (${o.host})`} onClick={() => void copyAddress(o.url)}>
+                    {FIND_TEXT.copyAddress}
+                  </button>
+                </li>
+              ) : (
+                <li key={`${i}:${o.url}`}>
+                  <a href={o.url} target="_blank" rel="noopener noreferrer" aria-label={short ? `${o.label} (${o.host}): ${label}` : `${o.label} (${o.host})`}>
+                    <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>)
+                  </a>
+                </li>
+              ),
+            )}
           </ul>
+          {copyOnly && (
+            <div aria-live="polite">
+              {copySaid && <p className={copySaid === FIND_TEXT.addressCopied ? "ao-ok" : "ao-error"}>{copySaid}</p>}
+            </div>
+          )}
         </div>
       )}
       <div className="ao-actions ao-find__actions">

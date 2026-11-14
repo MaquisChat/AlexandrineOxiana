@@ -2833,6 +2833,83 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     expect(within(row("removed with offers")).queryAllByRole("link")).toHaveLength(0);
   });
 
+  describe("R311 a: in the desktop app, Where to get it is never a dead link", () => {
+    const g = globalThis as { isTauri?: unknown };
+    const offers = [
+      { label: "Publisher's page", url: "https://doi.org/10.5555/ao.where", host: "doi.org" },
+      { label: "WorldCat", url: "http://www.worldcat.org/search?q=x", host: "www.worldcat.org" },
+      { label: "Open Library", url: "javascript:alert(1)", host: "openlibrary.org" },
+      { label: "Your library's catalogue", url: "https://catalogue.example.edu/search?q=Distinction", host: "<b>catalogue.example.edu</b>" },
+    ] as FindEntryView["offers"];
+    const stubClipboard = (fail = false) => {
+      const writeText = vi.fn(async (_: string) => {
+        if (fail) throw new Error("denied");
+      });
+      Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+      return writeText;
+    };
+    beforeEach(() => {
+      g.isTauri = true;
+    });
+    afterEach(() => {
+      delete g.isTauri;
+      Reflect.deleteProperty(navigator, "clipboard");
+    });
+
+    it("each place is its label and host with Copy address; no link; the hint above the list; a press copies exactly that address and says so once, focus kept", async () => {
+      useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
+      const user = userEvent.setup(); // installs its own clipboard: stubbed after it
+      const writeText = stubClipboard();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("with offers");
+      const list = within(r).getByRole("list", { name: "Where to get it: “with offers”" });
+      expect(within(r).queryAllByRole("link").filter((a) => a.getAttribute("data-act") !== "check")).toHaveLength(0);
+      expect(r.querySelector("a[target=_blank]")).toBeNull();
+      expect(r.textContent).toContain("Paste an address into your browser.");
+      const hint = within(r).getByText("Paste an address into your browser.");
+      expect(hint.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      const copies = within(list).getAllByRole("button", { name: /^Copy address: / });
+      expect(copies.map((b) => b.getAttribute("aria-label"))).toEqual(["Copy address: Publisher's page (doi.org)", "Copy address: Your library's catalogue (<b>catalogue.example.edu</b>)"]);
+      for (const b of copies) expect(b.textContent).toBe("Copy address");
+      // Label and host shown as outside text (UserText): markup stays text.
+      expect(list.querySelector("b")).toBeNull();
+      expect(list.querySelectorAll("[dir=auto]").length).toBeGreaterThan(0);
+      expect(r.innerHTML).not.toMatch(/javascript:|http:\/\/www\.worldcat|openlibrary/u);
+      await user.click(copies[1]!);
+      await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+      expect(writeText).toHaveBeenCalledWith("https://catalogue.example.edu/search?q=Distinction");
+      await waitFor(() => expect(within(r).getAllByText("Address copied.")).toHaveLength(1));
+      expect(within(r).getByText("Address copied.").closest("[aria-live=polite]")).toBeTruthy();
+      expect(document.activeElement).toBe(copies[1]);
+    });
+
+    it("a copy that fails says the app's words for it, once", async () => {
+      useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
+      const user = userEvent.setup();
+      stubClipboard(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("with offers");
+      const [first] = within(r).getAllByRole("button", { name: /^Copy address: / });
+      await user.click(first!);
+      await waitFor(() => expect(within(r).getAllByText("Copying is not available here.")).toHaveLength(1));
+      expect(within(r).queryByText("Address copied.")).toBeNull();
+      expect(document.activeElement).toBe(first);
+    });
+
+    it("in a browser the links stay (no Copy address, no hint)", async () => {
+      delete g.isTauri;
+      useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("with offers");
+      expect(within(r).queryAllByRole("button", { name: /^Copy address/ })).toHaveLength(0);
+      expect(r.textContent).not.toContain("Paste an address into your browser.");
+      expect(within(within(r).getByRole("list", { name: "Where to get it: “with offers”" })).getAllByRole("link")).toHaveLength(2);
+    });
+  });
+
   it("a row's change to needs-check is said once", async () => {
     const e = entry({ typed: "Bourdieu, Distinction 1984", ...withSource({ state: "fetching" }) });
     useService({ queues: { [PID]: queue([e]) } });
