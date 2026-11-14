@@ -14,6 +14,8 @@
  *   GET    /projects/:id/find/:eid/options       → FindOptionsResponse (F8: the entry's lists, for its dialog)
  *   POST   /projects/:id/find/:eid/person        FindPersonRequest → FindEntryView (F8: "choose-person" only)
  *   POST   /projects/:id/find/:eid/works         FindWorksRequest → FindWorksResponse (F8: "choose-works" only)
+ *   POST   /projects/:id/find/:eid/author        no body → FindEntryView (F8b: "choose" with an `authorOffer` only; else
+ *                                                409 CONFLICT, reason "no-author", FIND_ROUTE_TEXT.noAuthor)
  *   GET    /find/screen                          → FindScreenSettings
  *   PUT    /find/screen                          FindScreenSettings → FindScreenSettings
  *
@@ -55,7 +57,7 @@ export const FIND_STATES = [
 export type FindState = (typeof FIND_STATES)[number];
 
 /** Why an entry could not go on (the library's FindReasonCode). */
-export const FIND_REASON_CODES = ["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected"] as const;
+export const FIND_REASON_CODES = ["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected", "people-unavailable"] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 
@@ -69,6 +71,8 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "queue-full": "The queue holds 500 entries. Remove some finished ones first.",
   budget: "OpenAlex's free daily allowance is used up; searching Crossref only until tomorrow.",
   unexpected: "Something went wrong while looking this up. Try again.",
+  /** F8b (R283 a): on a "choose" entry whose people search could not be had; "Try again" is offered on it. */
+  "people-unavailable": "People of this name could not be looked up just now. “Try again” looks again.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */
@@ -108,6 +112,8 @@ export const FIND_REFUSAL_REASONS = [
   // R271 M9: a `personId` that is not OpenAlex's form; `workIds` that are not a list of 1 to 50 of OpenAlex's work ids.
   "person-id",
   "work-ids",
+  // Task F8b (R279): "Show this author's works" on an entry that carries no author offer (any more).
+  "no-author",
 ] as const;
 export type FindRefusalReason = (typeof FIND_REFUSAL_REASONS)[number];
 
@@ -138,6 +144,10 @@ export const FIND_ROUTE_TEXT = {
   personId: "That is not a person's id that OpenAlex gives. Nothing was changed.",
   noWorks: "Tick at least one work. Nothing was added.",
   tooManyWorks: "At most 50 works can be added at once. Nothing was added.",
+  /** Task F8b (R279): `POST …/:eid/author` on an entry that is not "choose" with an author offer (409); nothing changed. */
+  noAuthor: "This entry has no author to show.",
+  /** Task F8b (R285 b): a body sent to a route that takes none (400); the field is never repeated. */
+  noBody: "This request takes no body. Nothing was changed.",
 } as const;
 
 /** Work `n` (counting from 1, in the request) was already added from this entry: the whole tick is refused (409). Never its title. */
@@ -259,10 +269,25 @@ export interface FindEntryView {
   morePeople?: true;
   moreWorks?: true;
   /**
+   * Task F8b (R279 c): on an entry in "choose" only, when what was typed may also be an author's name — a person's name
+   * covers every typed word while a work's title is covered too. COUNTS only (no name): how many people fit, and
+   * whether more exist than are listed. The people are listed only after `POST …/:eid/author` ("choose-person").
+   * Such an entry carries neither `peopleCount` nor `morePeople` at the top.
+   */
+  authorOffer?: FindAuthorOffer;
+  /**
    * F8: on an entry made from an author's entry (`parentId`), the OpenAlex id of the work it was made from. Its `typed`
    * was built by the app (title, family name), not typed: F9 says where it came from (R271 M7).
    */
   work?: string;
+}
+
+/** Task F8b (R279 c): an author of the typed name offered beside the works ("Show this author's works"). Counts only. */
+export interface FindAuthorOffer {
+  /** How many people's names cover every typed word (1 to FIND_PEOPLE_MAX). */
+  peopleCount: number;
+  /** More people of that name exist than are listed. */
+  morePeople?: true;
 }
 
 /** Task F8: a person an author's name may mean (OpenAlex's author `A<digits>`). Every string is outside text. */

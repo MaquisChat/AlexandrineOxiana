@@ -339,3 +339,35 @@ describe("fix round 1 (R244)", () => {
     expect((await readZoteroSyncSettings(dir, LIB)).links[0]!.unfinished).toBeUndefined();
   });
 });
+
+describe("Z10 (R269 c): the module itself says it refused a file as newer", () => {
+  it("a newer settings file: the read says so through onNewer (every read, also after the notice), and nothing else is newer", async () => {
+    const told: string[] = [];
+    const o = { onNewer: (f: string) => void told.push(f) };
+    // No file, a file of this version, v 1.5, damaged content: not newer.
+    await readZoteroSyncSettings(dir, LIB, o);
+    await writeZoteroSyncSettings(dir, LIB, settings([link("user:42")]));
+    await readZoteroSyncSettings(dir, LIB, o);
+    await writeFile(join(dir, ZOTERO_SYNC_FILE), JSON.stringify({ v: 1.5, libraries: {} }));
+    await readZoteroSyncSettings(dir, LIB, o);
+    await writeFile(join(dir, ZOTERO_SYNC_FILE), "{ not json");
+    await readZoteroSyncSettings(dir, LIB, o);
+    expect(told).toEqual([]);
+    // A newer version's file: said on every read (the device notice is raised once), and the file is left as it is.
+    const newer = JSON.stringify({ v: 2, libraries: {} });
+    await writeFile(join(dir, ZOTERO_SYNC_FILE), newer);
+    expect(await readZoteroSyncSettings(dir, LIB, o)).toEqual({ automatic: false, everyMinutes: 60, links: [] });
+    expect(await readZoteroSyncSettings(dir, LIB, o)).toEqual({ automatic: false, everyMinutes: 60, links: [] });
+    expect(told).toEqual([ZOTERO_SYNC_FILE, ZOTERO_SYNC_FILE]);
+    // A refused write says so too.
+    await expect(writeZoteroSyncSettings(dir, LIB, settings([]), o)).rejects.toBeInstanceOf(ZoteroSyncFileNewerError);
+    expect(told).toEqual([ZOTERO_SYNC_FILE, ZOTERO_SYNC_FILE, ZOTERO_SYNC_FILE]);
+    expect(await readFile(join(dir, ZOTERO_SYNC_FILE), "utf8")).toBe(newer);
+    // The history file of a newer version: its own name.
+    await writeFile(join(dir, ZOTERO_SYNC_HISTORY_FILE), JSON.stringify({ v: 4, libraries: {} }));
+    const toldH: string[] = [];
+    expect(await readZoteroSyncHistory(dir, LIB, { onNewer: (f) => void toldH.push(f) })).toEqual([]);
+    expect(toldH).toEqual([ZOTERO_SYNC_HISTORY_FILE]);
+    await deviceNoticesIdle();
+  });
+});

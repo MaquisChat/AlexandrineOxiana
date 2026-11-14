@@ -117,12 +117,17 @@ export interface ZoteroSyncStateResponse {
   settingsNewer: boolean;
   /** Whether a key is saved; null when the password store cannot be asked. */
   keyStored: boolean | null;
-  /** Stored as the researcher chose; no run starts by itself yet (no scheduler in this version). */
+  /** Stored as the researcher chose; while on, the service's scheduler (Z10) starts a linked library's sync when it is due. */
   automatic: boolean;
   everyMinutes: ZoteroSyncEveryMinutes;
   links: Array<ZoteroSyncLinkDto & { status: string; lastRun?: ZoteroSyncRun; waitingFor?: "project-locked" | "paused" }>;
   running?: { ref: string; done: number; total: number };
   backoffUntil?: string;
+  /**
+   * Z10 (R274 c): the earliest time (ISO) at which the scheduler would start a run for any link — "not before" (said by
+   * `zoteroNextSyncLine`). Absent when automatic sync is off, or no link can become due (every link paused or its
+   * project locked, the library read-only, the settings written by a newer version).
+   */
   nextRunAt?: string;
 }
 
@@ -247,6 +252,15 @@ function whenSaid(iso: string, now: Date): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "at an unknown time";
   return sameDay(d, now) ? `at ${timeOf(d)} today` : `on ${dateOf(d)} at ${timeOf(d)}`;
+}
+
+/**
+ * Z10 (R274 c): the state's `nextRunAt` in words, its time said as the status lines say times: "Next automatic sync: not
+ * before 15:10 today." or "… not before 13 March 2027 at 00:10." — "not before", because a run that is due may still
+ * wait for another one, an import of the same Zotero library, or the next tick.
+ */
+export function zoteroNextSyncLine(nextRunAt: string, now: Date): string {
+  return `Next automatic sync: not before ${whenSaid(nextRunAt, now).replace(/^(at|on) /u, "")}.`;
 }
 
 /** A reason's sentence; for `backing-off`, with the time Zotero asked for ("15:10", or "09:05 on 13 March 2027"). */
