@@ -53,7 +53,7 @@ describe("SourceDetail", () => {
     server.use(
       ...handlers(),
       http.get(url("/projects/:id/sources/:sid/watch-origin"), () =>
-        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: "in-library", local: true }] }),
+        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: "in-library", presence: "unknown" }] }),
       ),
     );
     render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
@@ -68,7 +68,7 @@ describe("SourceDetail", () => {
       http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(added ? withNew : SOURCE_FILE)),
       http.get(url("/styles"), () => HttpResponse.json(STYLES)),
       http.get(url("/projects/:id/sources/:sid/watch-origin"), () =>
-        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: added ? "in-library" : "changed", local: true }] }),
+        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: added ? "in-library" : "changed", presence: added ? "unknown" : "local" }] }),
       ),
       http.post(url("/projects/:id/sources/:sid/watch-origin/action"), () => {
         added = true;

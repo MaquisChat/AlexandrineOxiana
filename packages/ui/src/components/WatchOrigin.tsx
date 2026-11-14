@@ -9,9 +9,11 @@
  * Nothing happens without a press: the component makes ONE read (the origins) when the source is
  * shown, and no changing request fires by itself. A source from no watched folder shows nothing at
  * all. A failed read shows a quiet line and "Try again", never an error that hides the source.
- * The screen does not download a changed file (A9): when the origin's `local` hint is false it says
- * so and still offers the button, because the hint can be out of date; the service's own sentence
- * (409) is shown if the file really is not here. After an act the origins are read again and shown
+ * The screen does not download a changed file (A9) and says what is known of the new version (R251,
+ * the engine's `presence`): "not-downloaded" says so with its size (R235); "unknown" says the app
+ * cannot tell now and links to Watched folders. The button is offered in all three cases (R259):
+ * the origin is read once, so the hint can be out of date, and the press is always guarded by the
+ * service — its own sentence (409) is shown if the file is not here, and nothing is added. After an act the origins are read again and shown
  * as the service now gives them (never a guess). Answers for another source, or after unmount, are
  * dropped. Folder labels and file names come from other people: UserText only.
  */
@@ -19,7 +21,8 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../api/client";
 import { formatSize } from "../api/tools";
 import type { WatchedSourceOrigin } from "@ao/shared";
-import type { WatchedFoldersApi } from "../api/watchedFolders";
+import { watchedFoldersHref, type WatchedFoldersApi } from "../api/watchedFolders";
+import { navigate } from "../navigation";
 import { UserText } from "./UserText";
 import "./WatchOrigin.css";
 
@@ -190,9 +193,25 @@ export function WatchOrigin({ api, projectId, sourceId, readOnly, onChanged }: W
               </p>
             )}
             {o.state === "changed" && <p>The file in the folder has changed since it was brought in. The library's copy is unchanged.</p>}
-            {o.state === "changed" && !o.local && !o.folderRemoved && (
+            {o.state === "changed" && o.presence === "not-downloaded" && !o.folderRemoved && (
               <p>
                 The new version is not downloaded to this Mac{typeof o.newBytes === "number" ? ` (${formatSize(o.newBytes)})` : ""}. Download it with your cloud drive's app, then bring it in here.
+              </p>
+            )}
+            {o.state === "changed" && o.presence !== "local" && o.presence !== "not-downloaded" && !o.folderRemoved && (
+              <p>
+                The app cannot tell at the moment whether the new version is downloaded to this Mac. Open{" "}
+                <a
+                  href={watchedFoldersHref(projectId)}
+                  onClick={(e) => {
+                    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                    e.preventDefault();
+                    navigate(watchedFoldersHref(projectId));
+                  }}
+                >
+                  Watched folders
+                </a>{" "}
+                to see how this folder is doing.
               </p>
             )}
             {o.state === "may-have-changed" && (

@@ -55,6 +55,7 @@ import {
   type FolderWatch,
   type WatchDeps,
   type WatchEvent,
+  type WatchFs,
   type WatchStatus,
 } from "./watch.js";
 
@@ -3338,4 +3339,518 @@ describe("W7 fix round 2 (R234): one call per folder however often it is restart
     const w = await adding;
     expect(repo.getProject(p.id).watchedFolders?.map((x) => x.id)).toEqual([w.id]);
   }, 30_000);
+});
+
+describe("R251 (Task W11): whether a changed file's new version is on this computer, kept by the engine", () => {
+  const W = { stabilityMs: 200, pollMs: 50, registerFlushMs: 100 } as const;
+  /** Every wait below is for the engine's own state, with this generous limit (R264 f): never a fixed time. */
+  const LONG = 30_000;
+  const sha256 = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
+  const regOf = (p: Project, wid: string) => repo.watchRegister(p.id, wid);
+  const stateOf = async (p: Project, wid: string, key: string) => (await regOf(p, wid)).get(key)?.state;
+  async function untilAsync(cond: () => Promise<boolean>, ms = LONG): Promise<void> {
+    const end = Date.now() + ms;
+    while (!(await cond())) {
+      if (Date.now() > end) throw new Error("timed out");
+      await sleep(50);
+    }
+  }
+  /** Exact whole seconds: a time restored with `utimes` is then the same to the nanosecond, as a provider keeps it. */
+  const T1 = 1_750_000_000;
+  const T2 = T1 + 100;
+  const LONG_AGO = 1_000_000_000;
+  /** A stand-in for `fs.watch` whose events the test gives (so that a test decides which looks are made by an event). */
+  function fakeWatch() {
+    const emitters: EventEmitter[] = [];
+    const fn = (() => {
+      const e = Object.assign(new EventEmitter(), { close: () => {}, ref: () => e, unref: () => e });
+      emitters.push(e);
+      return e;
+    }) as unknown as typeof fs.watch;
+    return { emitters, fn, tell: (name: string) => void emitters.at(-1)?.emit("change", "rename", name) };
+  }
+  /**
+   * The engine's own presence check (watch-local's `contentState`), counted per path — the engine's judgements are
+   * the counter the tests wait on — and, from a chosen judgement on, answering `flip` for a path.
+   */
+  function countedPresence() {
+    const counts = new Map<string, number>();
+    const flips = new Map<string, { from: number; to: "not-downloaded" | "unknown" | null }>();
+    const fn: typeof contentState = async (paths, o) => {
+      const m = await contentState(paths, o);
+      for (const k of paths) {
+        const n = (counts.get(k) ?? 0) + 1;
+        counts.set(k, n);
+        const f = flips.get(k);
+        const got = m.get(k);
+        if (f && f.to && n >= f.from) m.set(k, f.to === "unknown" || !got || !("ino" in got) ? { presence: "unknown" } : { ...got, presence: f.to });
+      }
+      return m;
+    };
+    return {
+      fn,
+      count: (abs: string) => counts.get(abs) ?? 0,
+      /** From the n-th judgement of `abs` on (counting from now), the check answers `to` (null: the real answer again). */
+      flip: (abs: string, to: "not-downloaded" | "unknown" | null, after = 0) => flips.set(abs, { from: (counts.get(abs) ?? 0) + 1 + after, to }),
+    };
+  }
+  /** Puts `data` in place as `name`, whole (written aside, its time set to `t`, moved in). */
+  async function put(name: string, data: Buffer | string, t: number): Promise<void> {
+    const aside = join(tmp, `aside-${Math.random().toString(36).slice(2)}`);
+    await writeFile(aside, data);
+    await utimes(aside, t, t);
+    await rename(aside, join(inbox, name));
+  }
+  /** Puts a version of `size` bytes that is not on this computer (Linux's stand-in: no blocks), its time `t`. */
+  async function putNotLocal(name: string, size: number, t: number): Promise<void> {
+    const aside = join(tmp, `aside-${Math.random().toString(36).slice(2)}`);
+    await sparse(aside, size);
+    await utimes(aside, LONG_AGO, t);
+    await rename(aside, join(inbox, name));
+  }
+  /** What a cloud drive does when it evicts a file: its blocks go; its inode, size and exact time stay. Its access time is put far back. */
+  async function evict(name: string): Promise<void> {
+    const f = join(inbox, name);
+    const before = await fsp.lstat(f, { bigint: true });
+    await truncate(f, 0);
+    await truncate(f, Number(before.size));
+    await utimes(f, LONG_AGO, Number(before.mtimeNs / 1_000_000_000n));
+    const after = await fsp.lstat(f, { bigint: true });
+    expect([after.ino, after.size, after.mtimeNs, after.blocks]).toEqual([before.ino, before.size, before.mtimeNs, 0n]);
+  }
+  /** What a cloud drive does when it downloads a file: its bytes written into it in place; its time kept. */
+  async function download(name: string, data: Buffer): Promise<void> {
+    const f = join(inbox, name);
+    const fh = await realFspOpen(f, "r+");
+    try {
+      await fh.write(data, 0, data.length, 0);
+    } finally {
+      await fh.close();
+    }
+    lastWrite = Date.now();
+    const st = await fsp.lstat(f);
+    await utimes(f, st.atime, T2);
+  }
+  /** One file comes in; its source id. */
+  async function cameIn(p: Project, wid: string, tell: (n: string) => void, name: string, data: Buffer, events: WatchEvent[]): Promise<string> {
+    await put(name, data, T1);
+    tell(name);
+    await until(() => events.some((e) => e.kind === "imported" && e.file === name), LONG);
+    await untilAsync(async () => (await stateOf(p, wid, name)) === "in-library");
+    return (await regOf(p, wid)).get(name)!.sourceId;
+  }
+
+  it("a registered file changed while it is on this computer is judged local; nothing is kept for other states, nor after the stop", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder" });
+    await w.ready;
+    await cameIn(p, wid, fake.tell, "paper.pdf", await buildPdf({ title: "Paper one", extra: "r251-a1" }), events);
+    expect(w.presence("paper.pdf")).toBe("unknown"); // "in-library": the engine keeps no judgement for it
+    expect(w.presence("not-in-the-register.pdf")).toBe("unknown");
+    const v2 = await buildPdf({ title: "Paper two", extra: "r251-a2" });
+    await put("paper.pdf", v2, T2);
+    fake.tell("paper.pdf");
+    await untilAsync(async () => (await stateOf(p, wid, "paper.pdf")) === "changed");
+    expect((await regOf(p, wid)).get("paper.pdf")).toMatchObject({ newSha256: sha256(v2), newSize: v2.length });
+    expect(w.presence("paper.pdf")).toBe("local");
+    await w.stop();
+    expect(w.presence("paper.pdf")).toBe("unknown"); // a stopped watch cannot say
+  }, 60_000);
+
+  for (const how of ["a watcher event", "a scan"] as const) {
+    it(`a changed file that then leaves this computer (same size and time, no blocks) is judged not downloaded without any further act (${how})`, async () => {
+      const p = await project();
+      const wid = newId();
+      const fake = fakeWatch();
+      const viaScan = how === "a scan";
+      const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", ...(viaScan ? { rescanMs: 300 } : {}) });
+      await w.ready;
+      await cameIn(p, wid, fake.tell, "report.pdf", await buildPdf({ title: "Report one", extra: "r251-b1" }), events);
+      await put("report.pdf", await buildPdf({ title: "Report two", extra: "r251-b2" }), T2);
+      fake.tell("report.pdf");
+      await untilAsync(async () => (await stateOf(p, wid, "report.pdf")) === "changed");
+      expect(w.presence("report.pdf")).toBe("local");
+      const opened = readSpies();
+      await evict("report.pdf");
+      if (!viaScan) fake.tell("report.pdf");
+      await until(() => w.presence("report.pdf") === "not-downloaded", LONG);
+      // Still "changed" (the content last read is what the register says), nothing read, nothing counted twice.
+      expect(await stateOf(p, wid, "report.pdf")).toBe("changed");
+      expect(opened(join(await realpath(inbox), "report.pdf"))).toEqual([]);
+      expect(w.status().counts).toMatchObject({ cameIn: 1, notDownloaded: 0, changed: 1 });
+      expect(w.problems({ offset: 0, limit: 10 }).total).toBe(0);
+    }, 60_000);
+  }
+
+  it("a file changed while it is not on this computer is judged not downloaded, and local once it is downloaded, within the engine's re-check", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", recheckMs: 300 });
+    await w.ready;
+    await cameIn(p, wid, fake.tell, "notes.pdf", await buildPdf({ title: "Notes one", extra: "r251-c1" }), events);
+    const v2 = await buildPdf({ title: "Notes two", extra: "r251-c2" });
+    await putNotLocal("notes.pdf", v2.length, T2);
+    fake.tell("notes.pdf");
+    await untilAsync(async () => (await stateOf(p, wid, "notes.pdf")) === "may-have-changed");
+    expect(w.presence("notes.pdf")).toBe("not-downloaded");
+    // Downloaded by the cloud drive's app, with no event and no scan (the default rescan is minutes away): the
+    // re-check finds it; it is read through the whole order, noted "changed" with its new content, and judged local.
+    await download("notes.pdf", v2);
+    await untilAsync(async () => (await stateOf(p, wid, "notes.pdf")) === "changed");
+    expect((await regOf(p, wid)).get("notes.pdf")).toMatchObject({ newSha256: sha256(v2) });
+    expect(w.presence("notes.pdf")).toBe("local");
+    // Evicted again (told by an event), then downloaded again with no event: the re-check sees it.
+    await evict("notes.pdf");
+    fake.tell("notes.pdf");
+    await until(() => w.presence("notes.pdf") === "not-downloaded", LONG);
+    await download("notes.pdf", v2);
+    await until(() => w.presence("notes.pdf") === "local", LONG);
+    expect(await stateOf(p, wid, "notes.pdf")).toBe("changed");
+  }, 90_000);
+
+  it("a may-have-changed file downloaded with the SAME content as the library's copy is in the library again: no change noted, no judgement kept", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", recheckMs: 300 });
+    await w.ready;
+    const v1 = await buildPdf({ title: "Same one", extra: "r251-s1" });
+    const sid = await cameIn(p, wid, fake.tell, "same.pdf", v1, events);
+    await putNotLocal("same.pdf", v1.length, T2); // replaced (a new time) by a version not on this computer
+    fake.tell("same.pdf");
+    await untilAsync(async () => (await stateOf(p, wid, "same.pdf")) === "may-have-changed");
+    expect(w.presence("same.pdf")).toBe("not-downloaded");
+    // Downloaded with no event: the re-check finds it, it is read through the whole order, and its content is the
+    // library's copy.
+    await download("same.pdf", v1);
+    await untilAsync(async () => (await stateOf(p, wid, "same.pdf")) === "in-library");
+    const e = (await regOf(p, wid)).get("same.pdf")!;
+    expect(e).toMatchObject({ sourceId: sid, sha256: sha256(v1), size: v1.length, mtimeNs: `${T2}000000000` });
+    expect(e.newSha256).toBeUndefined();
+    expect(e.newSize).toBeUndefined();
+    expect(w.presence("same.pdf")).toBe("unknown"); // "in-library": no judgement is kept
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+    expect((await repo.getSource(p.id, sid)).assets.map((a) => a.sha256)).toEqual([sha256(v1)]);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, changed: 0, notDownloaded: 0 });
+  }, 60_000);
+
+  it("a check that cannot tell says unknown, and is asked again by the re-check until it can", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const counted = countedPresence();
+    const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", presence: counted.fn, recheckMs: 200 });
+    await w.ready;
+    const f = join(await realpath(inbox), "draft.pdf");
+    await cameIn(p, wid, fake.tell, "draft.pdf", await buildPdf({ title: "Draft one", extra: "r251-d1" }), events);
+    await put("draft.pdf", await buildPdf({ title: "Draft two", extra: "r251-d2" }), T2);
+    fake.tell("draft.pdf");
+    await untilAsync(async () => (await stateOf(p, wid, "draft.pdf")) === "changed");
+    expect(w.presence("draft.pdf")).toBe("local");
+    counted.flip(f, "unknown");
+    await evict("draft.pdf");
+    fake.tell("draft.pdf");
+    await until(() => w.presence("draft.pdf") === "unknown", LONG);
+    // Three more judgements of the file by the re-check (counted, not timed): still cannot tell.
+    const n = counted.count(f);
+    await until(() => counted.count(f) >= n + 3, LONG);
+    expect(w.presence("draft.pdf")).toBe("unknown");
+    expect(await stateOf(p, wid, "draft.pdf")).toBe("changed");
+    // Once the check can tell again, the re-check says so without any act.
+    counted.flip(f, null);
+    await until(() => w.presence("draft.pdf") === "not-downloaded", LONG);
+  }, 60_000);
+
+  it("no extra file-system call per unchanged registered file per scan (the engine's call counter over many files)", async () => {
+    const p = await project();
+    const wid = newId();
+    // One real source of this watch, which the seeded entries name.
+    const fake = fakeWatch();
+    const first = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder" });
+    await first.w.ready;
+    const sid = await cameIn(p, wid, fake.tell, "real.pdf", await buildPdf({ title: "The real one", extra: "r251-e1" }), first.events);
+    await first.w.stop();
+    await unlink(join(inbox, "real.pdf"));
+    // 60 registered files as last known: 50 "in-library", 10 "changed" (their new version on this computer).
+    const N_IN = 50;
+    const N_CHANGED = 10;
+    const names = Array.from({ length: N_IN + N_CHANGED }, (_, i) => `f${String(i).padStart(3, "0")}.txt`);
+    const lines: string[] = [];
+    for (const [i, n] of names.entries()) {
+      await writeFile(join(inbox, n), "0123456789");
+      await utimes(join(inbox, n), T1, T1);
+      const changed = i >= N_IN;
+      lines.push(JSON.stringify({ key: n, file: n, sourceId: sid, sha256: sha256(`old ${n}`), size: 10, mtimeNs: `${T1}000000000`, state: changed ? "changed" : "in-library", ...(changed ? { newSha256: sha256(`new ${n}`), newSize: 10 } : {}), at: new Date().toISOString() }));
+    }
+    await fsp.writeFile(join(lib.root, p.folder, "watched", `${wid}.jsonl`), lines.join("\n") + "\n", { mode: 0o600 });
+    const real = await realpath(inbox);
+    const log: Array<[string, string]> = [];
+    const counted: Partial<WatchFs> = {
+      lstat: (q) => (log.push(["lstat", q]), fsp.lstat(q, { bigint: true })),
+      readdir: (q) => (log.push(["readdir", q]), fsp.readdir(q, { withFileTypes: true })),
+      stat: (q) => (log.push(["stat", q]), fsp.stat(q)),
+      realpath: (q) => (log.push(["realpath", q]), fsp.realpath(q)),
+      open: (q, f) => (log.push(["open", q]), realFspOpen(q, f)),
+    };
+    const { w } = start(p, { ...W, watchId: wid, fsWatch: fakeWatch().fn, watcherForm: "per-folder", rescanMs: 400, fs: counted });
+    await w.ready;
+    // The first look at each changed file judges it (once, when the watch first sees it).
+    await until(() => names.slice(N_IN).every((n) => w.presence(n) === "local") && !w.status().scanning, LONG);
+    const listingsAt = (i: number) => log.slice(0, i + 1).filter(([k, q]) => k === "readdir" && q === real).length;
+    const mark = listingsAt(log.length - 1);
+    await until(() => listingsAt(log.length - 1) >= mark + 2, LONG); // one whole rescan lies between these two listings
+    const from = log.findIndex((_, i) => listingsAt(i) === mark + 1);
+    const to = log.findIndex((_, i) => listingsAt(i) === mark + 2);
+    const scan = log.slice(from, to);
+    const perFile = new Map<string, number>();
+    for (const [k, q] of scan) if (k === "lstat") perFile.set(q, (perFile.get(q) ?? 0) + 1);
+    // Exactly one `lstat` per file per scan — the listing's own reading — for the changed files as for the others.
+    expect([...perFile.keys()].sort()).toEqual(names.map((n) => join(real, n)).sort());
+    expect([...perFile.values()].every((c) => c === 1)).toBe(true);
+    expect(scan.filter(([k]) => k === "open" || k === "realpath")).toEqual([]);
+    expect(scan.filter(([k, q]) => k === "stat" && q !== real && q !== inbox)).toEqual([]);
+    expect(names.slice(N_IN).every((n) => w.presence(n) === "local")).toBe(true);
+    // For the report (R251): the calls of one rescan of 60 registered files.
+    console.info(`R251 call count: one rescan of ${names.length} registered files made ${scan.filter(([k]) => k === "lstat").length} lstat, ${scan.filter(([k]) => k === "readdir").length} readdir, ${scan.filter(([k]) => k === "stat").length} stat, ${scan.filter(([k]) => k === "open").length} open`);
+  }, 90_000);
+
+  it("N1: a changed or may-have-changed file whose source was removed costs one lstat per scan, over three scans, and no open", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const first = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder" });
+    await first.w.ready;
+    const sid = await cameIn(p, wid, fake.tell, "real.pdf", await buildPdf({ title: "The real one N1", extra: "n1-e1" }), first.events);
+    await first.w.stop();
+    await unlink(join(inbox, "real.pdf"));
+    // Four groups of 6 files, all unchanged on disk: in the library; changed; changed, source missing; may-have-changed, source missing.
+    const groups = [
+      { tag: "a", state: "in-library", sid },
+      { tag: "b", state: "changed", sid },
+      { tag: "c", state: "changed", sid: newId() },
+      { tag: "d", state: "may-have-changed", sid: newId() },
+    ] as const;
+    const byGroup = new Map<string, string[]>();
+    const lines: string[] = [];
+    for (const g of groups) {
+      const ns = Array.from({ length: 6 }, (_, i) => `${g.tag}${String(i).padStart(2, "0")}.txt`);
+      byGroup.set(g.tag, ns);
+      for (const n of ns) {
+        await writeFile(join(inbox, n), "0123456789");
+        await utimes(join(inbox, n), T1, T1);
+        lines.push(JSON.stringify({ key: n, file: n, sourceId: g.sid, sha256: sha256(`old ${n}`), size: 10, mtimeNs: `${T1}000000000`, state: g.state, ...(g.state === "changed" ? { newSha256: sha256(`new ${n}`), newSize: 10 } : {}), at: new Date().toISOString() }));
+      }
+    }
+    await fsp.writeFile(join(lib.root, p.folder, "watched", `${wid}.jsonl`), lines.join("\n") + "\n", { mode: 0o600 });
+    const real = await realpath(inbox);
+    const log: Array<[string, string]> = [];
+    const counted: Partial<WatchFs> = {
+      lstat: (q) => (log.push(["lstat", q]), fsp.lstat(q, { bigint: true })),
+      readdir: (q) => (log.push(["readdir", q]), fsp.readdir(q, { withFileTypes: true })),
+      stat: (q) => (log.push(["stat", q]), fsp.stat(q)),
+      realpath: (q) => (log.push(["realpath", q]), fsp.realpath(q)),
+      open: (q, f) => (log.push(["open", q]), realFspOpen(q, f)),
+    };
+    const { w } = start(p, { ...W, watchId: wid, fsWatch: fakeWatch().fn, watcherForm: "per-folder", rescanMs: 400, fs: counted });
+    await w.ready;
+    await until(() => byGroup.get("b")!.every((n) => w.presence(n) === "local") && !w.status().scanning, LONG);
+    const listingsAt = (i: number) => log.slice(0, i + 1).filter(([k, q]) => k === "readdir" && q === real).length;
+    const mark = listingsAt(log.length - 1);
+    await until(() => listingsAt(log.length - 1) >= mark + 4, LONG); // three whole rescans lie between these listings
+    const all = [...byGroup.values()].flat();
+    for (let s = 1; s <= 3; s++) {
+      const from = log.findIndex((_, i) => listingsAt(i) === mark + s);
+      const to = log.findIndex((_, i) => listingsAt(i) === mark + s + 1);
+      const scan = log.slice(from, to);
+      const perFile = new Map<string, number>();
+      for (const [k, q] of scan) if (k === "lstat") perFile.set(q, (perFile.get(q) ?? 0) + 1);
+      expect([...perFile.keys()].sort()).toEqual(all.map((n) => join(real, n)).sort());
+      for (const [tag, ns] of byGroup) expect({ tag, counts: ns.map((n) => perFile.get(join(real, n))) }).toEqual({ tag, counts: ns.map(() => 1) });
+      expect(scan.filter(([k]) => k === "open" || k === "realpath")).toEqual([]);
+    }
+  }, 90_000);
+
+  it("a not-downloaded file's access time is unchanged after the engine's looks", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const counted = countedPresence();
+    const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", presence: counted.fn, recheckMs: 100, rescanMs: 300 });
+    await w.ready;
+    await cameIn(p, wid, fake.tell, "kept.pdf", await buildPdf({ title: "Kept one", extra: "r251-f1" }), events);
+    await put("kept.pdf", await buildPdf({ title: "Kept two", extra: "r251-f2" }), T2);
+    fake.tell("kept.pdf");
+    await untilAsync(async () => (await stateOf(p, wid, "kept.pdf")) === "changed");
+    const f = join(inbox, "kept.pdf");
+    const judgedPath = join(await realpath(inbox), "kept.pdf");
+    const opened = readSpies();
+    await evict("kept.pdf");
+    const before = await fsp.lstat(f, { bigint: true });
+    fake.tell("kept.pdf");
+    await until(() => w.presence("kept.pdf") === "not-downloaded", LONG);
+    // Five more judgements of the file (re-checks and an event), counted.
+    const n = counted.count(judgedPath);
+    fake.tell("kept.pdf");
+    await until(() => counted.count(judgedPath) >= n + 5, LONG);
+    const after = await fsp.lstat(f, { bigint: true });
+    expect(after.atimeNs).toBe(before.atimeNs);
+    expect(after.blocks).toBe(0n);
+    expect(opened(judgedPath)).toEqual([]);
+    expect(w.presence("kept.pdf")).toBe("not-downloaded");
+  }, 60_000);
+
+  // ---- Round 3 (R264) ----------------------------------------------------------------------------------------------
+
+  for (const how of ["lock", "pause", "unreachable", "restart"] as const) {
+    it(`R264 a: after a ${how}, a changed file not on this computer is judged again in the walk that follows, and its re-check goes on`, async () => {
+      const p = await project(how === "lock");
+      const wid = newId();
+      const fake = fakeWatch();
+      const ch: WatchChoices = { paused: false, notDownloaded: "leave", confirmedBytes: 0 };
+      const seams = { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", recheckMs: 300, choices: async () => ({ ...ch }) } as const;
+      let { w, events } = start(p, seams);
+      await w.ready;
+      const v2 = await buildPdf({ title: `Moved about two (${how})`, extra: `r264-a2-${how}` });
+      await cameIn(p, wid, fake.tell, "moved.pdf", await buildPdf({ title: `Moved about one (${how})`, extra: `r264-a1-${how}` }), events);
+      await put("moved.pdf", v2, T2);
+      fake.tell("moved.pdf");
+      await untilAsync(async () => (await stateOf(p, wid, "moved.pdf")) === "changed");
+      await evict("moved.pdf");
+      fake.tell("moved.pdf");
+      await until(() => w.presence("moved.pdf") === "not-downloaded", LONG);
+      const aside = join(tmp, "Inbox-away");
+      if (how === "lock") {
+        repo.lockProject(p.id);
+        await until(() => w.status().state === "locked", LONG);
+        expect(w.presence("moved.pdf")).toBe("unknown");
+        await repo.unlockProject(p.id, "pw");
+      } else if (how === "pause") {
+        ch.paused = true;
+        await w.refreshChoices();
+        await until(() => w.status().state === "paused", LONG);
+        expect(w.presence("moved.pdf")).toBe("unknown");
+        ch.paused = false;
+        await w.refreshChoices();
+      } else if (how === "unreachable") {
+        await rename(inbox, aside);
+        await until(() => w.status().state === "unreachable", LONG);
+        expect(w.presence("moved.pdf")).toBe("unknown");
+        await rename(aside, inbox);
+      } else {
+        await w.stop();
+        ({ w, events } = start(p, seams));
+        await w.ready;
+      }
+      await until(() => w.status().state === "watching", LONG);
+      // Judged again in the walk that follows (no event, no act), and its once-a-minute re-check goes on.
+      await until(() => w.presence("moved.pdf") === "not-downloaded", LONG);
+      await download("moved.pdf", v2);
+      await until(() => w.presence("moved.pdf") === "local", LONG);
+      expect(await stateOf(p, wid, "moved.pdf")).toBe("changed");
+    }, 90_000);
+  }
+
+  it("R264 b: the press's own judgement is kept: a wrong \"local\" is corrected by a refused \"Bring in\", which adds and opens nothing", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const counted = countedPresence();
+    const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", presence: counted.fn });
+    await w.ready;
+    const sid = await cameIn(p, wid, fake.tell, "press.pdf", await buildPdf({ title: "Press one", extra: "r264-b1" }), events);
+    await put("press.pdf", await buildPdf({ title: "Press two", extra: "r264-b2" }), T2);
+    fake.tell("press.pdf");
+    await untilAsync(async () => (await stateOf(p, wid, "press.pdf")) === "changed");
+    expect(w.presence("press.pdf")).toBe("local");
+    // The file leaves this computer in a way the engine does not see (no event, no change of its reading).
+    const f = join(await realpath(inbox), "press.pdf");
+    counted.flip(f, "not-downloaded");
+    expect(w.presence("press.pdf")).toBe("local");
+    const opened = readSpies();
+    const assets = (await repo.getSource(p.id, sid)).assets.length;
+    await expect(bringInNewVersion({ repo, http, lib, presence: counted.fn }, p.id, wid, "press.pdf")).rejects.toBeInstanceOf(WatchFileNotLocalError);
+    expect(w.presence("press.pdf")).toBe("not-downloaded");
+    expect((await repo.getSource(p.id, sid)).assets.length).toBe(assets);
+    expect(opened(f)).toEqual([]);
+    expect(await stateOf(p, wid, "press.pdf")).toBe("changed");
+  }, 60_000);
+
+  for (const same of [true, false]) {
+    it(`R264 c: a may-have-changed file here again with its registered size and time is compared: ${same ? "the same content is in the library again" : "other content is \"changed\""}, and is not re-checked any more`, async () => {
+      const p = await project();
+      const wid = newId();
+      const fake = fakeWatch();
+      let rounds = 0;
+      const perPath = new Map<string, number>();
+      const counted: Partial<WatchFs> = {
+        lstat: (q) => (perPath.set(q, (perPath.get(q) ?? 0) + 1), fsp.lstat(q, { bigint: true })),
+        stat: (q) => (rounds++, fsp.stat(q)),
+      };
+      const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", recheckMs: 200, fs: counted });
+      await w.ready;
+      const v1 = await buildPdf({ title: "Restored one", extra: `r264-c1-${same}` });
+      const sid = await cameIn(p, wid, fake.tell, "restored.pdf", v1, events);
+      await putNotLocal("restored.pdf", v1.length + 5000, T2);
+      fake.tell("restored.pdf");
+      await untilAsync(async () => (await stateOf(p, wid, "restored.pdf")) === "may-have-changed");
+      expect(w.presence("restored.pdf")).toBe("not-downloaded");
+      // The old version put back with its old time (a restored revision): its registered size and time.
+      const back = Buffer.from(v1);
+      if (!same) back[back.length - 3] = back[back.length - 3]! ^ 1;
+      await put("restored.pdf", back, T1);
+      fake.tell("restored.pdf");
+      const want = same ? "in-library" : "changed";
+      await untilAsync(async () => (await stateOf(p, wid, "restored.pdf")) === want);
+      const e = (await regOf(p, wid)).get("restored.pdf")!;
+      if (same) {
+        expect(e).toMatchObject({ sourceId: sid, sha256: sha256(v1), size: v1.length, mtimeNs: `${T1}000000000` });
+        expect(e.newSha256).toBeUndefined();
+        await until(() => w.presence("restored.pdf") === "unknown", LONG);
+      } else {
+        expect(e).toMatchObject({ sourceId: sid, sha256: sha256(v1), newSha256: sha256(back), newSize: back.length });
+        await until(() => w.presence("restored.pdf") === "local", LONG);
+      }
+      expect(repo.listSourceIds(p.id)).toEqual([sid]);
+      // Bounded: over the next 20 polls (several re-check rounds, counted by the engine's root checks) the file is not
+      // looked at again.
+      const f = join(await realpath(inbox), "restored.pdf");
+      await until(() => !w.status().scanning, LONG);
+      const calls = perPath.get(f) ?? 0;
+      const r0 = rounds;
+      await until(() => rounds >= r0 + 20, LONG);
+      expect(perPath.get(f) ?? 0).toBe(calls);
+    }, 90_000);
+  }
+
+  it("R264 d: a registered file found not here just before its read is noted may-have-changed, never opened", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const counted = countedPresence();
+    const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", presence: counted.fn });
+    await w.ready;
+    const v1 = await buildPdf({ title: "Window one", extra: "r264-d1" });
+    const sid = await cameIn(p, wid, fake.tell, "window.pdf", v1, events);
+    const f = join(await realpath(inbox), "window.pdf");
+    const v2 = await buildPdf({ title: "Window two", extra: "r264-d2" });
+    // The next judgement (when it has settled) says "local"; the one after it (just before the read) "not downloaded":
+    // evicted between its settling and its read.
+    counted.flip(f, "not-downloaded", 1);
+    const opened = readSpies();
+    await put("window.pdf", v2, T2);
+    fake.tell("window.pdf");
+    await untilAsync(async () => (await stateOf(p, wid, "window.pdf")) === "may-have-changed");
+    const e = (await regOf(p, wid)).get("window.pdf")!;
+    expect(e).toMatchObject({ sourceId: sid, sha256: sha256(v1), newSize: v2.length });
+    expect(e.newSha256).toBeUndefined();
+    expect(counted.count(f)).toBeGreaterThanOrEqual(2);
+    expect(w.presence("window.pdf")).toBe("not-downloaded");
+    expect(opened(f)).toEqual([]);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, notDownloaded: 0, changed: 1 });
+    expect(w.problems({ offset: 0, limit: 10 }).total).toBe(0);
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+  }, 60_000);
 });

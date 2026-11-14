@@ -11,11 +11,15 @@
  * whatever Zotero's servers said goes nowhere but a bounded debug note.
  */
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { FastifyInstance } from "fastify";
 import {
   SecretStoreUnavailableError,
   ZOTERO_SYNC_MAX_BACKOFF_MS,
+  ZOTERO_SYNC_FILE,
   ZOTERO_SYNC_MIN_BACKOFF_MS,
+  ZOTERO_SYNC_NEWER_SENTENCE,
   ZoteroAccountError,
   ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
@@ -66,6 +70,7 @@ import { bodyOf, type Ctx, type Obj, type Same } from "./util.js";
 true satisfies Same<LibraryReason, ZoteroSyncReason>;
 true satisfies Same<LibraryRun, ZoteroSyncRun>;
 true satisfies Same<Omit<LibraryKeyAccess, "backoffUntil">, ZoteroKeyAccess>;
+true satisfies Same<typeof ZOTERO_SYNC_NEWER_SENTENCE, (typeof ZOTERO_SYNC_SENTENCES)["settingsNewer"]>;
 
 const REF = /^(user|group):[1-9]\d{0,11}$/u;
 const STRUCTURES = ["collections", "tags", "none"] as const;
@@ -364,6 +369,20 @@ async function readHistory(dir: string, libraryId: string): Promise<LibraryRun[]
   }
 }
 
+/**
+ * Whether this computer's sync settings file was written by a newer version of the app (R268 M4): the library module's
+ * own rule for refusing it (an object whose `v` is a whole number above 1, R244 M7), read without changing anything.
+ * Missing, unreadable or damaged is not "newer" (the module reads those as nothing, or sets the damaged one aside).
+ */
+async function settingsNewer(dir: string): Promise<boolean> {
+  try {
+    const v = JSON.parse(await readFile(join(dir, ZOTERO_SYNC_FILE), "utf8")) as unknown;
+    return typeof v === "object" && v !== null && !Array.isArray(v) && Number.isSafeInteger((v as Obj).v) && ((v as Obj).v as number) > 1;
+  } catch {
+    return false;
+  }
+}
+
 /** Whether a key is saved (the value dropped at once); null when the password store cannot be asked. */
 async function keyStored(): Promise<boolean | null> {
   try {
@@ -389,7 +408,7 @@ function settingsRequest(b: Obj, s: Session, stored: ZoteroSyncSettings): Zotero
     const f = (name: string) => `"links[${i}].${name}"`;
     if (!l || typeof l !== "object" || Array.isArray(l)) throw badRequest(`"links[${i}]" must be an object.`);
     const o = l as Obj;
-    for (const k of Object.keys(o)) if (!["ref", "projectId", "structure", "duplicates"].includes(k)) throw badRequest(`${f(k)} cannot be sent here.`);
+    for (const k of Object.keys(o)) if (!["ref", "projectId", "structure", "duplicates", "resume"].includes(k)) throw badRequest(`${f(k)} cannot be sent here.`);
     if (typeof o.ref !== "string" || !REF.test(o.ref)) throw badRequest(`${f("ref")} must be user:<number> or group:<number>.`);
     if (refs.has(o.ref)) throw badRequest(`${f("ref")}: each Zotero library can be linked to one project only.`);
     refs.add(o.ref);
@@ -399,7 +418,9 @@ function settingsRequest(b: Obj, s: Session, stored: ZoteroSyncSettings): Zotero
     if (!kept && lockedNow(s, o.projectId)) throw badRequest(`${f("projectId")}: the project is locked. Unlock it first.`);
     if (!(STRUCTURES as readonly unknown[]).includes(o.structure)) throw badRequest(`${f("structure")} must be collections, tags or none.`);
     if (!(DUPLICATES as readonly unknown[]).includes(o.duplicates)) throw badRequest(`${f("duplicates")} must be merge, skip or keep-both.`);
-    return { ref: o.ref, projectId: o.projectId, structure: o.structure as (typeof STRUCTURES)[number], duplicates: o.duplicates as (typeof DUPLICATES)[number] };
+    // R265 (D26): only `true`, and only for the link it names, turns syncing on again after an undo.
+    if ("resume" in o && o.resume !== true) throw badRequest(`${f("resume")} must be true, or left out.`);
+    return { ref: o.ref, projectId: o.projectId, structure: o.structure as (typeof STRUCTURES)[number], duplicates: o.duplicates as (typeof DUPLICATES)[number], ...(o.resume === true ? { resume: true as const } : {}) };
   });
   return { automatic: b.automatic, everyMinutes: b.everyMinutes as ZoteroSyncSettingsRequest["everyMinutes"], links };
 }
@@ -415,7 +436,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
 
   /** The state, built from this computer's settings and history at request time (point 8). */
   async function stateOf(s: Session): Promise<ZoteroSyncStateResponse> {
-    const [settings, history, stored] = await Promise.all([readSettings(dir(), s.lib.id), readHistory(dir(), s.lib.id), keyStored()]);
+    const [settings, history, stored, newer] = await Promise.all([readSettings(dir(), s.lib.id), readHistory(dir(), s.lib.id), keyStored(), settingsNewer(dir())]);
     const running = holder.running;
     const current = inProgressId(history, running?.ref);
     const links: ZoteroSyncStateResponse["links"] = [];
@@ -439,6 +460,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     const backoff = holder.backoffInForce(now().getTime(), historyBackoff(history));
     return {
       readOnly: s.lib.mode === "read-only",
+      settingsNewer: newer,
       keyStored: stored,
       automatic: settings.automatic,
       everyMinutes: settings.everyMinutes,
@@ -500,7 +522,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     if (access.backoffUntil !== undefined) holder.noteAsked(access.backoffUntil, now().getTime());
     // R248: a key that works again clears the pauses Zotero's refusals set, for every link of the open library at once
     // (one settings write): `key-refused` everywhere, `library-gone` where the key now reads the library. A failed
-    // check (above) clears nothing; `undone` is the researcher's own and only a settings save clears it.
+    // check (above) clears nothing; `undone` is the researcher's own: only a settings save that names the link with `resume: true` clears it (R265).
     const open = state.session;
     if (open && open.lib.mode === "read-write") await clearRefusals(open, access);
     const out: ZoteroKeyAccess = {
@@ -528,8 +550,11 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
         everyMinutes: r.everyMinutes,
         links: r.links.map((l) => {
           const was = cur.links.find((x) => x.ref === l.ref && x.projectId === l.projectId);
-          // A save clears `undone`; `key-refused` and `library-gone` are cleared only by a successful key check (R248).
-          const keep = was?.paused && was.paused !== "undone" ? was.paused : undefined;
+          // A pause belongs to the Zotero library while it stays linked, whatever else the save changes (its project
+          // included). R265 (D26): `undone` is cleared only for a link the request names with `resume: true`;
+          // `key-refused` and `library-gone` only by a successful key check (R248), never by a save.
+          const paused = cur.links.find((x) => x.ref === l.ref)?.paused;
+          const keep = paused && !(paused === "undone" && l.resume) ? paused : undefined;
           return { ref: l.ref, projectId: l.projectId, fullDone: was?.fullDone ?? false, options: { structure: l.structure, duplicates: l.duplicates }, ...(keep ? { paused: keep } : {}) };
         }),
       }));
