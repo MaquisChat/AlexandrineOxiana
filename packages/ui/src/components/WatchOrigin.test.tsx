@@ -18,13 +18,15 @@ const origin = (o: Partial<WatchedSourceOrigin> = {}): WatchedSourceOrigin => ({
   file: "Interviews/ana.pdf",
   state: "changed",
   newBytes: 2_000_000,
-  local: true,
+  presence: "local",
   ...o,
 });
 
 const CHANGED = "The file in the folder has changed since it was brought in. The library's copy is unchanged.";
 const BRING = "Bring in the new version as a new file of this source";
 const KEEP = "Keep the library's copy as it is";
+const NOT_HERE = "The new version is not downloaded to this Mac (2 MB). Download it with your cloud drive's app, then bring it in here.";
+const CANNOT_TELL = "The app cannot tell at the moment whether the new version is downloaded to this Mac. Open Watched folders to see how this folder is doing.";
 
 /** A scripted service: the origins it answers now, and every request it saw. */
 function service(first: WatchedSourceOrigin[] | (() => WatchedSourceOrigin[])) {
@@ -203,11 +205,12 @@ describe("WatchOrigin", () => {
   });
 
   it("a removed folder offers no bring-in and no download advice, only keeping", async () => {
-    service([origin({ folderRemoved: true, folderLabel: "", local: false })]);
+    service([origin({ folderRemoved: true, folderLabel: "", presence: "unknown" })]);
     render(ui());
     const region = await screen.findByRole("region", { name: "Watched folder" });
     expect(within(region).queryByRole("button", { name: new RegExp(`^${BRING}`) })).toBeNull();
     expect(region.textContent).not.toContain("Download it with your cloud drive's app");
+    expect(region.textContent).not.toContain(CANNOT_TELL); // no folder to look at on Watched folders
     expect(within(region).getByRole("button", { name: new RegExp(`^${KEEP}`) })).toBeTruthy();
   });
 
@@ -258,12 +261,14 @@ describe("WatchOrigin", () => {
   });
 
   it("may-have-changed offers no reading: the sentence and no button at all", async () => {
-    service([origin({ state: "may-have-changed", local: false })]);
+    service([origin({ state: "may-have-changed", presence: "not-downloaded" })]);
     render(ui());
     const region = await screen.findByRole("region", { name: "Watched folder" });
     expect(region.textContent).toContain(
       "The file in the folder was replaced or edited, but it is not downloaded to this Mac, so the app cannot yet tell what changed. The library's copy is unchanged.",
     );
+    expect(region.textContent).not.toContain(NOT_HERE);
+    expect(region.textContent).not.toContain(CANNOT_TELL);
     expect(within(region).queryByRole("button")).toBeNull();
   });
 
@@ -276,14 +281,67 @@ describe("WatchOrigin", () => {
     expect(within(region).getByRole("button", { name: new RegExp(`^${KEEP}`) })).toBeTruthy();
   });
 
-  it("a changed file not on this Mac says so, keeps the button, and shows the service's 409 sentence", async () => {
-    const svc = service([origin({ local: false })]);
+  it("R251: presence \"local\" offers the button and says nothing about downloading", async () => {
+    service([origin({ presence: "local" })]);
+    render(ui());
+    const region = await screen.findByRole("region", { name: "Watched folder" });
+    expect(region.textContent).toContain(CHANGED);
+    expect((within(region).getByRole("button", { name: new RegExp(`^${BRING}`) }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(region).getByRole("button", { name: new RegExp(`^${KEEP}`) })).toBeTruthy();
+    expect(region.textContent).not.toContain("not downloaded to this Mac");
+    expect(region.textContent).not.toContain(CANNOT_TELL);
+  });
+
+  it("R251/R259: presence \"not-downloaded\" says R235's sentence exactly, and both buttons stay", async () => {
+    service([origin({ presence: "not-downloaded" })]);
+    render(ui());
+    const region = await screen.findByRole("region", { name: "Watched folder" });
+    expect(region.textContent).toContain(CHANGED);
+    expect(within(region).getByText(NOT_HERE).textContent).toBe(NOT_HERE);
+    expect((within(region).getByRole("button", { name: new RegExp(`^${BRING}`) }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(region).getByRole("button", { name: new RegExp(`^${KEEP}`) })).toBeTruthy();
+    expect(region.textContent).not.toContain(CANNOT_TELL);
+  });
+
+  it("R251/R259: presence \"unknown\" says the app cannot tell, links to Watched folders, and both buttons stay", async () => {
+    service([origin({ presence: "unknown" })]);
+    render(ui());
+    const region = await screen.findByRole("region", { name: "Watched folder" });
+    expect(region.textContent).toContain(CHANGED);
+    expect(region.textContent).toContain(CANNOT_TELL);
+    const link = within(region).getByRole("link", { name: "Watched folders" });
+    expect(link.getAttribute("href")).toBe("/settings/watched-folders?project=p1");
+    expect(link.closest("p")!.textContent).toBe(CANNOT_TELL);
+    expect((within(region).getByRole("button", { name: new RegExp(`^${BRING}`) }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(region).getByRole("button", { name: new RegExp(`^${KEEP}`) })).toBeTruthy();
+    expect(region.textContent).not.toContain("not downloaded to this Mac (");
+  });
+
+  for (const presence of ["not-downloaded", "unknown"] as const) {
+    it(`R259: a press with presence "${presence}" that the service refuses shows the service's sentence and adds nothing`, async () => {
+      const svc = service([origin({ presence })]);
+      svc.acting(() => serviceError(409, "CONFLICT", "That file is not downloaded to this Mac, so it was not read."));
+      const changed = vi.fn();
+      const user = userEvent.setup();
+      render(ui({ onChanged: changed }));
+      await user.click(await screen.findByRole("button", { name: new RegExp(`^${BRING}`) }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toBe("That file is not downloaded to this Mac, so it was not read.");
+      expect(svc.seen.acts).toEqual([{ watchId: "w1", action: "bring-in-new-version" }]);
+      expect(svc.seen.reads).toBe(1);
+      expect(changed).not.toHaveBeenCalled();
+      expect(screen.queryByRole("status")?.textContent ?? "").toBe("");
+      expect(screen.getByRole("button", { name: new RegExp(`^${BRING}`) })).toBeTruthy();
+    });
+  }
+
+  it("a changed file judged on this Mac whose hint is out of date: the press shows the service's 409 sentence and changes nothing", async () => {
+    const svc = service([origin({ presence: "local" })]);
     svc.acting(() => serviceError(409, "CONFLICT", "That file is not downloaded to this Mac, so it was not read."));
     const user = userEvent.setup();
     render(ui());
     const region = await screen.findByRole("region", { name: "Watched folder" });
     expect(region.textContent).toContain(CHANGED);
-    expect(region.textContent).toContain("The new version is not downloaded to this Mac (2 MB). Download it with your cloud drive's app, then bring it in here.");
     const bring = within(region).getByRole("button", { name: new RegExp(`^${BRING}`) }) as HTMLButtonElement;
     expect(bring.disabled).toBe(false);
     await user.click(bring);
@@ -296,7 +354,7 @@ describe("WatchOrigin", () => {
   });
 
   it("says it without a size when the size is not known", async () => {
-    const { newBytes: _n, ...noSize } = origin({ local: false });
+    const { newBytes: _n, ...noSize } = origin({ presence: "not-downloaded" });
     service([noSize]);
     render(ui());
     const region = await screen.findByRole("region", { name: "Watched folder" });
@@ -305,7 +363,7 @@ describe("WatchOrigin", () => {
   });
 
   it("no changing request fires without a click", async () => {
-    const svc = service([origin({ local: false }), origin({ watchId: "w2", state: "gone" })]);
+    const svc = service([origin({ presence: "not-downloaded" }), origin({ watchId: "w2", state: "gone" }), origin({ watchId: "w3", presence: "unknown" })]);
     svc.acting(() => HttpResponse.json({ done: "settled", sourceId: "s1" }));
     render(ui());
     await screen.findByRole("region", { name: "Watched folder" });
