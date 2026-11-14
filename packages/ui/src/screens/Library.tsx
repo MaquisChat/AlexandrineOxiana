@@ -23,6 +23,7 @@ import { PendingWritesDialog } from "../components/PendingWritesDialog";
 import { StatusBanner, bannersFor, useNoticeDismiss, volumeOf } from "../components/StatusBanner";
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
+import { findHref } from "../api/find";
 import { watchedFoldersHref } from "../api/watchedFolders";
 import "../components/library.css";
 import { navigate as goTo, PATHS } from "../navigation";
@@ -546,6 +547,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           {!locked && !readOnly && project && (
             <a href={captureHref(project.id)} onClick={(e) => follow(e, captureHref(project.id))}>
               Capture from the web
+            </a>
+          )}
+          {!locked && !readOnly && project && (
+            <a href={findHref(project.id)} onClick={(e) => follow(e, findHref(project.id))}>
+              Find and acquire
             </a>
           )}
           {/* What the ways in left for the researcher to decide (Task 67): after Import and Capture. */}
