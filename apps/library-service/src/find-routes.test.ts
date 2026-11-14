@@ -595,6 +595,23 @@ describe("refusals", () => {
     expect(FIND_REASON_TEXT["copy-not-allowed"]).not.toContain("free_copy");
   });
 
+  it("R282 f: rules that forbid free copies stop the entry; saving rules that allow them wakes it, without a restart", async () => {
+    await start();
+    await openNewLibrary();
+    const made = await call({ method: "POST", url: "/projects", body: { name: "Rules", governanceYaml: `${GOV}acquireMethods: [reference_lookup]\n`, encryption: { enabled: false } } });
+    expect(made.status, made.body).toBe(200);
+    const pid = made.json.project.id as string;
+    const [e] = await add(pid, [LINE]);
+    await until(async () => ((x) => x?.reason?.code === "copy-not-allowed")(await entry(pid, e!.id)), "the rules' refusal");
+    const doiAsked = () => gated.sent.filter((x) => x.service === "openalex").length;
+    const before = doiAsked();
+    const g = await call({ url: `/projects/${pid}/governance` });
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: `${GOV}acquireMethods: [reference_lookup, free_copy]\n`, reason: "free copies allowed" }, headers: { "if-match": String(g.headers.etag) } });
+    expect(put.status, put.body).toBe(200);
+    expect((await until(async () => ((x) => (x?.state === "no-open-copy" ? x : undefined))(await entry(pid, e!.id)), "the entry to go on")).state).toBe("no-open-copy");
+    expect(doiAsked()).toBeGreaterThan(before);
+  });
+
   it("a typed line never appears in the log", async () => {
     await start();
     await openNewLibrary();
