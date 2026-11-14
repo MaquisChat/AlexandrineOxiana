@@ -38,6 +38,37 @@
     "https://api.openalex.org/works/doi:10.1086/681213": { "status": 404 },
     "https://export.arxiv.org/api/query?search_query=au:vaan+AND+ti:%22game+changer+the+topology+of+creativity%22&max_results=5": { "status": 200, "file": "arxiv-query-empty-handbuilt.xml" },
     "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI%3A%2210.1086%2F681213%22&resultType=core&format=json": { "status": 200, "file": "europepmc-search-empty-handbuilt.json" },
-    "https://api.semanticscholar.org/graph/v1/paper/DOI:10.1086/681213?fields=openAccessPdf": { "status": 404 }
+    "https://api.semanticscholar.org/graph/v1/paper/DOI:10.1086/681213?fields=openAccessPdf": { "status": 404 },
+    "https://api.crossref.org/works?query.bibliographic=Penhallow%2C%20Tidewater%20Ledgers%20and%20the%20Memory%20of%20Small%20Harbours%202019&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-f14-right-handbuilt.json" },
+    "https://api.openalex.org/works?search=Penhallow%2C%20Tidewater%20Ledgers%20and%20the%20Memory%20of%20Small%20Harbours%202019&per-page=5": { "status": 200, "file": "openalex-search-empty-handbuilt.json" },
+    "https://api.crossref.org/works?query.bibliographic=Calloway%2C%20Salt%20Roads%20and%20Seasonal%20Labour%20in%20Upland%20Parishes%202017&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-f14-wrong-handbuilt.json" },
+    "https://api.openalex.org/works?search=Calloway%2C%20Salt%20Roads%20and%20Seasonal%20Labour%20in%20Upland%20Parishes%202017&per-page=5": { "status": 200, "file": "openalex-search-empty-handbuilt.json" },
+    "https://api.crossref.org/works?query.bibliographic=Quorn%2C%20Lamplight%20Schools%20and%20Evening%20Reading%20in%20Mill%20Towns%202015&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-f14-pairA-handbuilt.json" },
+    "https://api.openalex.org/works?search=Quorn%2C%20Lamplight%20Schools%20and%20Evening%20Reading%20in%20Mill%20Towns%202015&per-page=5": { "status": 200, "file": "openalex-search-empty-handbuilt.json" },
+    "https://api.crossref.org/works?query.bibliographic=Wendle%2C%20Ferry%20Timetables%20as%20Records%20of%20Rural%20Mobility%202021&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-f14-pairB-handbuilt.json" },
+    "https://api.openalex.org/works?search=Wendle%2C%20Ferry%20Timetables%20as%20Records%20of%20Rural%20Mobility%202021&per-page=5": { "status": 200, "file": "openalex-search-empty-handbuilt.json" },
+    "https://api.openalex.org/works/doi:10.5555/ao.f14.right": { "status": 404 },
+    "https://export.arxiv.org/api/query?search_query=au:penhallow+AND+ti:%22tidewater+ledgers+and+the+memory+of+small+harbours%22&max_results=5": { "status": 200, "file": "arxiv-query-empty-handbuilt.xml" },
+    "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI%3A%2210.5555%2Fao.f14.right%22&resultType=core&format=json": { "status": 200, "file": "europepmc-search-f14-right-handbuilt.json" },
+    "https://api.semanticscholar.org/graph/v1/paper/DOI:10.5555/ao.f14.right?fields=openAccessPdf": { "status": 404 },
+    "https://api.openalex.org/works/doi:10.5555/ao.f14.wrong": { "status": 404 },
+    "https://export.arxiv.org/api/query?search_query=au:calloway+AND+ti:%22salt+roads+and+seasonal+labour+in+upland+parishes%22&max_results=5": { "status": 200, "file": "arxiv-query-empty-handbuilt.xml" },
+    "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI%3A%2210.5555%2Fao.f14.wrong%22&resultType=core&format=json": { "status": 200, "file": "europepmc-search-empty-handbuilt.json" },
+    "https://api.semanticscholar.org/graph/v1/paper/DOI:10.5555/ao.f14.wrong?fields=openAccessPdf": { "status": 200, "file": "semanticscholar-f14-wrong-handbuilt.json" },
+    "https://api.openalex.org/works/doi:10.5555/ao.f14.pair-a": { "status": 404 },
+    "https://export.arxiv.org/api/query?search_query=au:quorn+AND+ti:%22lamplight+schools+and+evening+reading+in+mill+towns%22&max_results=5": { "status": 200, "file": "arxiv-query-empty-handbuilt.xml" },
+    "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI%3A%2210.5555%2Fao.f14.pair-a%22&resultType=core&format=json": { "status": 200, "file": "europepmc-search-empty-handbuilt.json" },
+    "https://api.semanticscholar.org/graph/v1/paper/DOI:10.5555/ao.f14.pair-a?fields=openAccessPdf": { "status": 200, "file": "semanticscholar-f14-pairA-handbuilt.json" },
+    "https://api.openalex.org/works/doi:10.5555/ao.f14.pair-b": { "status": 404 },
+    "https://export.arxiv.org/api/query?search_query=au:wendle+AND+ti:%22ferry+timetables+as+records+of+rural+mobility%22&max_results=5": { "status": 200, "file": "arxiv-query-empty-handbuilt.xml" },
+    "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI%3A%2210.5555%2Fao.f14.pair-b%22&resultType=core&format=json": { "status": 200, "file": "europepmc-search-empty-handbuilt.json" },
+    "https://api.semanticscholar.org/graph/v1/paper/DOI:10.5555/ao.f14.pair-b?fields=openAccessPdf": { "status": 200, "file": "semanticscholar-f14-pairB-handbuilt.json" }
+  },
+  "files": {
+    "https://europepmc.org/articles/PMC5555001?pdf=render": { "status": 302, "location": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5555001/pdf/f14-right.pdf" },
+    "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5555001/pdf/f14-right.pdf": { "status": 200, "file": "f14-right-handbuilt.pdf" },
+    "https://arxiv.org/pdf/5555.01402": { "status": 200, "file": "f14-wrong-handbuilt.pdf" },
+    "https://arxiv.org/pdf/5555.01403": { "status": 200, "file": "f14-pair-a-handbuilt.pdf" },
+    "https://arxiv.org/pdf/5555.01404": { "status": 200, "file": "f14-pair-b-handbuilt.pdf" }
   }
 }
