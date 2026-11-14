@@ -46,7 +46,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, chownSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants, cpSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FullResult, Reporter, Suite, TestCase, TestResult } from "@playwright/test/reporter";
@@ -293,6 +293,32 @@ function stateFolder(m: Machine): void {
   }
   const st = lstatSync(m.state);
   if (!st.isDirectory() || st.uid !== process.getuid?.()) throw new Error(`${m.state} is not a folder of this user's`);
+  if ((st.mode & 0o7777) !== 0o700) refuse(m, "the state folder", `has mode ${(st.mode & 0o7777).toString(8)}, not 0700`);
+}
+
+/**
+ * The refusal of a record (or of the folder it is in) that is not exactly what `apply` writes: it
+ * names the field, and says that nothing was changed and where the clean-up by hand is described (R350).
+ */
+function refuse(m: Machine, field: string, why: string): never {
+  throw new Error(
+    `the record of an earlier run in ${m.state} is refused: ${field} ${why}; nothing was changed (no file, link, mode, owner or time; the record and the state folder are as they were). apps/desktop/README.md, "If such a run was killed outright", says how to clean up by hand`,
+  );
+}
+
+/** A file of the state folder, read only when it is a regular file (not a link) of this user's: lstat, then O_NOFOLLOW, then the descriptor's own fstat must be the same file. */
+function readStateFile(m: Machine, name: string): Buffer {
+  const p = join(m.state, name);
+  const st = lstatSync(p);
+  if (!st.isFile() || st.uid !== process.getuid?.()) refuse(m, name, "is not a regular file (or a link, or not this user's)");
+  const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const open = fstatSync(fd);
+    if (open.dev !== st.dev || open.ino !== st.ino) refuse(m, name, "changed while it was being opened");
+    return readFileSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -348,10 +374,52 @@ function releaseLock(m: Machine, runId: string): void {
   }
 }
 
+const isObject = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
+const isTimes = (t: unknown): t is Times => isObject(t) && typeof t.a === "string" && /^\d+\.\d{9}$/.test(t.a) && typeof t.m === "string" && /^\d+\.\d{9}$/.test(t.m);
+const isPair = (x: unknown): x is [string, string] => Array.isArray(x) && x.length === 2 && typeof x[0] === "string" && typeof x[1] === "string";
+
+/** The record read from the state folder, and checked against exactly what `apply` writes, before anything is done with it (R350). */
+function parseRecord(m: Machine, text: string): SetupRecord {
+  let r: unknown;
+  try {
+    r = JSON.parse(text);
+  } catch {
+    return refuse(m, RECORD, "is not valid JSON");
+  }
+  if (!isObject(r)) return refuse(m, RECORD, "is not an object");
+  if (r.v !== 1) refuse(m, "the version (v)", `is ${JSON.stringify(r.v)}, not 1`);
+  if (typeof r.runId !== "string" || !/^[0-9a-f]{12}$/.test(r.runId)) refuse(m, "runId", "is not twelve lower-case hexadecimal digits");
+  const runId = r.runId;
+  if (!Number.isSafeInteger(r.pid) || (r.pid as number) < 0) refuse(m, "pid", "is not a process id");
+  if (!Array.isArray(r.names) || !r.names.every((n) => typeof n === "string") || !standinNamesOk(r.names as string[])) refuse(m, "names", "are not only the stand-in's own names");
+  const h = r.hosts;
+  if (!isObject(h) || !isTimes(h.times)) refuse(m, "hosts", "is not a mode, owner and well-formed times");
+  const hosts = h as Record<string, unknown>;
+  if (!Number.isInteger(hosts.mode) || ((hosts.mode as number) & ~0o644) !== 0) refuse(m, "hosts.mode", `is ${String(hosts.mode)}: not a plain permission no wider than 0644`);
+  const now = statSync(m.hosts);
+  for (const [k, present] of [["uid", now.uid], ["gid", now.gid]] as const)
+    if (hosts[k] !== present && hosts[k] !== 0) refuse(m, `hosts.${k}`, `is ${String(hosts[k])}: neither the hosts file's present ${k} (${present}) nor 0`);
+  if (r.caFile !== join(m.localCa, `${MARK}-${runId}.crt`)) refuse(m, "caFile", `is ${String(r.caFile)}, not ${join(m.localCa, `${MARK}-${runId}.crt`)}`);
+  if (r.pem !== `${MARK}-${runId}.pem`) refuse(m, "pem", `is ${String(r.pem)}, not ${MARK}-${runId}.pem`);
+  if (r.work !== join(m.tmp, `ao-e2e-system-setup-${runId}`)) refuse(m, "work", `is ${String(r.work)}, not the run's own folder`);
+  const allowed = [m.etcCerts, join(m.etcCerts, "ca-certificates.crt"), m.localCa];
+  if (!Array.isArray(r.times) || !r.times.every((t) => Array.isArray(t) && t.length === 2 && typeof t[0] === "string" && allowed.includes(t[0]) && isTimes(t[1])))
+    refuse(m, "times", `names a path other than ${allowed.join(", ")}, or has times that are not well formed`);
+  for (const k of ["storeBefore", "localBefore"]) if (!Array.isArray(r[k]) || !(r[k] as unknown[]).every(isPair)) refuse(m, k, "is not a list of name and description pairs");
+  return r as unknown as SetupRecord;
+}
+
+/** The earlier run's record, if there is one: the record, `hosts.orig` and the state folder checked before anything is restored. */
 function readRecord(m: Machine): SetupRecord | undefined {
-  const p = join(m.state, RECORD);
-  if (!existsSync(p)) return undefined;
-  return JSON.parse(readFileSync(p, "utf8")) as SetupRecord;
+  try {
+    lstatSync(join(m.state, RECORD));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+  const rec = parseRecord(m, readStateFile(m, RECORD).toString("utf8"));
+  readStateFile(m, HOSTS_ORIG);
+  return rec;
 }
 
 /**
@@ -372,7 +440,7 @@ function restore(m: Machine, rec: SetupRecord): string[] {
   const origPath = join(m.state, HOSTS_ORIG);
   let orig: Buffer | undefined;
   step("the hosts file", () => {
-    orig = readFileSync(origPath);
+    orig = readStateFile(m, HOSTS_ORIG);
     const now = readFileSync(m.hosts);
     if (!now.equals(orig)) {
       // Only the run's own block is taken out: anything else is not this run's to undo.

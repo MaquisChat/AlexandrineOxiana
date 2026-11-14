@@ -3,7 +3,7 @@
 // throw-away certificates (made with the system's openssl in a temporary folder; nothing of the
 // machine is touched here).
 import { spawnSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -314,4 +314,85 @@ describe.skipIf(!TOOLS)("the set-up in a sandbox (R346 a, e, g)", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+describe.skipIf(!TOOLS)("a killed run's record is checked before anything is restored (R350)", () => {
+  type Rec = Record<string, unknown> & { hosts: { mode: number } };
+  interface Ctx {
+    root: string;
+    m: Machine;
+    edit: (f: (r: Rec) => void) => void;
+  }
+  const cases: Array<{ name: string; field: string; tamper: (c: Ctx) => void; kept?: (c: Ctx) => string }> = [
+    {
+      name: "caFile naming the machine's own authority in the local authorities' folder",
+      field: "caFile",
+      tamper: (c) => {
+        writeFileSync(join(c.m.localCa, "machine-local.crt"), "the machine's own authority");
+        c.edit((r) => (r.caFile = join(c.m.localCa, "machine-local.crt")));
+      },
+      kept: (c) => join(c.m.localCa, "machine-local.crt"),
+    },
+    {
+      name: "caFile naming an unrelated file outside",
+      field: "caFile",
+      tamper: (c) => {
+        writeFileSync(join(c.root, "unrelated.txt"), "not ours");
+        c.edit((r) => (r.caFile = join(c.root, "unrelated.txt")));
+      },
+      kept: (c) => join(c.root, "unrelated.txt"),
+    },
+    { name: "pem naming another store link", field: "pem", tamper: (c) => c.edit((r) => (r.pem = readdirSync(c.m.etcCerts).find((n) => n.endsWith(".pem") && !n.startsWith(MARK))!)) },
+    { name: "hosts.mode 0o666", field: "hosts\\.mode", tamper: (c) => c.edit((r) => (r.hosts.mode = 0o666)) },
+    { name: "a times path outside the three", field: "times", tamper: (c) => c.edit((r) => (r.times = [...(r.times as unknown[]), [join(c.root, "etc/hosts.other"), { a: "1.000000000", m: "1.000000000" }]])) },
+    { name: "a wrong version", field: "version", tamper: (c) => c.edit((r) => (r.v = 2)) },
+    { name: "a run id with a path separator", field: "runId", tamper: (c) => c.edit((r) => (r.runId = "aaaaaa/aaaaa")) },
+    {
+      name: "record.json replaced by a symbolic link to a valid record elsewhere",
+      field: "record\\.json",
+      tamper: (c) => {
+        const p = join(c.m.state, "record.json");
+        renameSync(p, join(c.root, "elsewhere.json"));
+        symlinkSync(join(c.root, "elsewhere.json"), p);
+      },
+    },
+    { name: "the state folder with mode 0755", field: "state folder", tamper: (c) => chmodSync(c.m.state, 0o755) },
+  ];
+  const lookAll = (m: Machine) => {
+    const h = statSync(m.hosts);
+    const rec = join(m.state, "record.json");
+    return { ...look(m), mode: h.mode, uid: h.uid, gid: h.gid, tmp: readdirSync(m.tmp), record: readFileSync(rec, "utf8"), recordIsLink: lstatSync(rec).isSymbolicLink(), orig: readFileSync(join(m.state, "hosts.orig"), "utf8") };
+  };
+  for (const c of cases)
+    it(`${c.name}: refused with words, and nothing is changed`, () => {
+      const { root, m } = sandbox();
+      try {
+        SystemSetup.prepare(STANDIN_NAMES, m, deadPid());
+        const rec = join(m.state, "record.json");
+        const ctx: Ctx = {
+          root,
+          m,
+          edit: (f) => {
+            const r = JSON.parse(readFileSync(rec, "utf8")) as Rec;
+            f(r);
+            writeFileSync(rec, JSON.stringify(r));
+          },
+        };
+        c.tamper(ctx);
+        const before = lookAll(m);
+        let message = "";
+        try {
+          SystemSetup.prepare(STANDIN_NAMES, m);
+        } catch (err) {
+          message = (err as Error).message;
+        }
+        expect(message).toMatch(new RegExp(`refused: .*${c.field}`));
+        expect(message).toMatch(/nothing was changed/);
+        expect(message).toMatch(/killed outright/);
+        expect(lookAll(m)).toEqual(before);
+        if (c.kept) expect(existsSync(c.kept(ctx)), "the named file is still there").toBe(true);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
 });

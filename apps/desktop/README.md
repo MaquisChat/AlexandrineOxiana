@@ -170,8 +170,11 @@ Then, before the scenarios (`e2e/system-setup.ts`, in this order):
 2. **An earlier run's leftovers** (a run killed outright) are put back from that run's record
    (`/var/lib/ao-e2e-library-standin/record.json` and `hosts.orig`): the hosts file exactly, the
    authority's file and links removed and the store rebuilt with an empty hooks folder, the times, its
-   work folder. If that cannot be done exactly (the hosts file was changed by something else meanwhile,
-   say), the run fails and says what it found; leftovers with no record are refused, not guessed at.
+   work folder. The record is checked first, field by field, against exactly what the set-up writes
+   (and the record, `hosts.orig` and the state folder must be plain files and a folder of the run's
+   user, mode 0700, not links): a record that does not match is refused with nothing changed. If the
+   put-back cannot be done exactly (the hosts file was changed by something else meanwhile, say), the
+   run fails and says what it found; leftovers with no record are refused, not guessed at.
 3. **The record** of what this run will change and how to put it back is written, before anything is
    changed.
 4. A throw-away certificate authority is made with `openssl` in a private folder
@@ -218,7 +221,11 @@ python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print("run", r["
 #    as "If a run was killed" above says. (The e2e command itself, `node e2e/netns.mjs` inside the
 #    namespace, and Playwright's runner end by themselves once their worker is gone; the namespace goes
 #    with the last of these processes.)
-# 2. the hosts file: its original bytes written back in place, then its two times
+# 2. the hosts file: first check what differs. The only difference must be that run's own block, the
+#    lines from `# ao-e2e-library-standin <run> begin ...` to `# ao-e2e-library-standin <run> end`;
+#    if anything else differs, STOP and merge by hand (the original would overwrite someone's change)
+diff $S/hosts.orig /etc/hosts
+#    then its original bytes written back in place, then its two times
 cat $S/hosts.orig > /etc/hosts
 touch -a -d @<a> /etc/hosts; touch -m -d @<m> /etc/hosts
 # 3. the authority's file and its two links (the .pem link and the hash link to it), then the store
