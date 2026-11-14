@@ -35,6 +35,7 @@ import { registerWatchedFolders } from "./routes/watched-folders.js";
 import { registerFind } from "./routes/find.js";
 import { registerZoteroSync } from "./routes/zotero-sync.js";
 import { registerSearchSettings } from "./routes/search-settings.js";
+import { registerYourLibrary } from "./routes/your-library.js";
 
 export type { ServiceWorker, WorkerProvider } from "./state.js";
 
@@ -117,7 +118,7 @@ const EXTENSION_NO_ORIGIN_ROUTES = new Set(["GET /projects"]);
 const OPEN_ROUTES = new Set(["POST /extension/pair/confirm"]);
 
 /** Log redaction (R96): credentials never reach the log, whatever object carries them. */
-const REDACT = ["authorization", "secret", "passphrase", "recoveryCode", "apiKey", "token", "code", "cookie"].flatMap((k) => [k, `*.${k}`, `*.*.${k}`, `req.headers.${k}`]);
+const REDACT = ["authorization", "secret", "passphrase", "recoveryCode", "apiKey", "token", "code", "cookie", "ticket", "link"].flatMap((k) => [k, `*.${k}`, `*.*.${k}`, `req.headers.${k}`]);
 
 export async function createService(opts: ServiceOptions): Promise<LibraryService> {
   const deps = opts.deps ?? deviceDeps(appConfigDir());
@@ -321,6 +322,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerFind(app, ctx);
   registerZoteroSync(app, ctx);
   registerSearchSettings(app, ctx);
+  registerYourLibrary(app, ctx);
 
   let closing: Promise<void> | undefined;
   return {

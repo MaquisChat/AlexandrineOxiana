@@ -94,4 +94,25 @@ export { FIND_CHECK_TIMEOUT_MS, FIND_DOWNLOAD_TIMEOUT_MS, cleanAcquiredAddress }
 export { FILE_CHECK_EVIDENCE_CHARS, FILE_CHECK_TEXT_CHARS, checkFileAgainstRecord } from "./file-check.js";
 export type { FileCheckRecord, FileCheckResult, FileEvidence, FileMismatchWhy } from "./file-check.js";
 export { FIND_HELD_DIR, FIND_HELD_MAX, HELD_FILE_REASON, HeldFileLimitError, HeldFileSourceGoneError, HeldFileSourceHasFileError } from "../repo/review.js";
+// Task F15: "Your library" — the address, "Where to get it", and starting a fetch through the library.
+export {
+  CATALOGUE_QUERY_MAX,
+  LIBRARY_BASE_MAX,
+  LIBRARY_LINK_MAX,
+  WHERE_TO_GET_IT_MAX,
+  WHERE_URL_MAX,
+  catalogueTemplateOk,
+  deriveLibraryAccess,
+  deriveLibraryAccessWhy,
+  isLibraryAccess,
+  libraryAccessHost,
+  libraryAddressFor,
+  whereToGetIt,
+} from "./where.js";
+export type { DeriveRefusal, LibraryAccess } from "./where.js";
+export { YOUR_LIBRARY_FILE, YOUR_LIBRARY_NAME_MAX, YourLibraryNewerError, readYourLibrary, writeYourLibrary, yourLibraryNameOk } from "./settings.js";
+export type { YourLibrary, YourLibraryRead } from "./settings.js";
+export { FindLibraryRefusedError, libraryChancesOf, restsForLibrary } from "./runner.js";
+export type { FindLibraryChanceOf } from "./runner.js";
+export type { FindReturnTo } from "./types.js";
 export type { HeldFileCause, HeldFileFacts, HeldFileWhy } from "../repo/review.js";
