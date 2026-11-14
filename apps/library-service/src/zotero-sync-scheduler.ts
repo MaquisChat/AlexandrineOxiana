@@ -14,11 +14,16 @@
  *   - automatic sync is on (settings read at this pass);
  *   - at least 2 minutes since the scheduler was started (the library activated);
  *   - at least `everyMinutes` since the link's last FINISHED record of any kind (manual or automatic, any outcome); a
- *     record dated in the future is taken as finished when first seen, for as long as it is the link's last (R276 b);
+ *     record dated in the future is taken as finished when first seen, for as long as it is the link's last (R276 b).
+ *     The link's last record is the one WRITTEN last (first in the history, which is newest first), not the one with
+ *     the greatest date (R278);
  *   - at least `everyMinutes` since the scheduler itself last started a run of the link in this process (whatever the
  *     history says: a record that never reached the history does not make the link due again at the next tick), and at
  *     least 5 minutes of STEADY time since then (R276 c);
- *   - at least `everyMinutes` since the researcher last stopped an automatic run, for every link (R276 a);
+ *   - at least `everyMinutes` since the NEWEST record in the history that ended because the researcher stopped it
+ *     (outcome stopped, reason stopped-by-you; any link, started by the button or by the scheduler), for every link
+ *     (R276 a, R278): the hold is read from the history, so it also holds after a restart; a future-dated stop record
+ *     counts from when it was first seen;
  *   - no back-off in force.
  * Each "since" is measured on two clocks, the wall clock and the steady one, and the LONGER counts: a clock set back
  * holds a link for one interval at most (the steady clock goes on; its records count as finished when first seen) and
@@ -87,8 +92,8 @@ export class ZoteroSyncScheduler {
    * long as it is that link's last record (R274 b, R276 b), even once the wall clock has passed its own time.
    */
   private readonly future = new Map<string, { at: number; seen: Mark }>();
-  /** R276 a: when the researcher last stopped an automatic run: no automatic run of any link for an interval from then. */
-  private stoppedByYou: Mark | undefined;
+  /** The newest stop record, when dated in the future: its id and when it was first seen (as `future`, for the hold). */
+  private stopPin: { id: string; seen: Mark } | undefined;
   /** R276 e: a pass could not read the files and said so; said again only after a pass that succeeded. */
   private failing = false;
   /** What the last pass read (for nextRunAt without fresh data). */
@@ -187,9 +192,10 @@ export class ZoteroSyncScheduler {
       const ended = await Promise.race([ran, new Promise<undefined>((r) => (this.wake = () => r(undefined)))]);
       this.wake = undefined;
       if (this.stopped) return;
+      // The run's own record is the newest in the history now (what nextRunAt sees before the next pass reads it).
+      if (ended && this.last) this.last = { ...this.last, history: [ended, ...this.last.history.filter((r) => r.id !== ended.id)] };
       if (ended?.outcome === "stopped") {
-        // R276 a: the researcher's Stop holds every link for an interval from now; any other stop ends this pass only.
-        if (ended.reason === "stopped-by-you") this.stoppedByYou = this.mark();
+        // Any stop ends this pass at once; the hold after the researcher's Stop is read from the history (R278).
         return;
       }
     }
@@ -206,12 +212,27 @@ export class ZoteroSyncScheduler {
     const own = this.started.get(key);
     // R276 c: and never sooner than the steady floor after the link's last automatic run, whatever the wall clock says.
     if (own) due = Math.max(due, after(own, every), now.wall + Math.max(0, ZOTERO_SYNC_STEADY_FLOOR_MS - (now.mono - own.mono)));
-    if (this.stoppedByYou) due = Math.max(due, after(this.stoppedByYou, every));
+    // R278: the hold after the researcher's Stop, from the NEWEST such record of any link and any trigger.
+    const stop = history.find((r) => r.outcome === "stopped" && r.reason === "stopped-by-you" && r.finishedAt !== undefined && Number.isFinite(Date.parse(r.finishedAt)));
+    if (stop) {
+      const t = Date.parse(stop.finishedAt!);
+      if (this.stopPin?.id === stop.id) due = Math.max(due, after(this.stopPin.seen, every));
+      else if (t > now.wall) {
+        this.stopPin = { id: stop.id, seen: now };
+        due = Math.max(due, after(now, every));
+      } else {
+        this.stopPin = undefined;
+        due = Math.max(due, t + every);
+      }
+    } else this.stopPin = undefined;
+    // The link's last record is the one written last: the first of its records in the history (newest first, R278).
     let finished = -Infinity;
     for (const r of history) {
       if (r.ref !== link.ref || r.projectId !== link.projectId || r.finishedAt === undefined) continue;
       const t = Date.parse(r.finishedAt);
-      if (Number.isFinite(t)) finished = Math.max(finished, t);
+      if (!Number.isFinite(t)) continue;
+      finished = t;
+      break;
     }
     const pinned = this.future.get(key);
     if (pinned && pinned.at === finished) {

@@ -424,6 +424,54 @@ describe("the scheduler alone (fake timers, the fake clock)", () => {
     expect(refs()).toEqual(["user:42", "group:9"]);
   });
 
+  it("R278 (I2, M7): a researcher's Stop of a MANUAL run holds every link for the interval, from the history; a new scheduler over the same history (a restart) still holds", async () => {
+    settings!.links = [link("user:42"), link("group:9", { projectId: "p2" })];
+    make().start();
+    await minutes(1);
+    // The record the holder writes when the researcher stops a manual run (the history is newest first).
+    const stoppedAt = Date.now();
+    records.unshift(record(link("user:42"), stoppedAt, { trigger: "manual", outcome: "stopped", reason: "stopped-by-you" }));
+    await minutes(1);
+    expect(sched!.nextRunAt()?.getTime()).toBe(stoppedAt + 60 * MIN);
+    await minutes(29);
+    expect(starts).toEqual([]);
+    // A restart of the service: a new scheduler over the same history.
+    await sched!.stop();
+    make().start();
+    await minutes(29);
+    expect(starts).toEqual([]);
+    expect(sched!.nextRunAt()?.getTime()).toBe(stoppedAt + 60 * MIN);
+    await minutes(1);
+    expect(refs()).toEqual(["user:42", "group:9"]);
+  });
+
+  it("R278 (I2): a stop record dated in the future (the clock was set back) holds for one interval from when it was first seen", async () => {
+    settings!.links = [link("group:9", { projectId: "p2" })];
+    records = [record(link("user:42"), T0.getTime() + HOUR, { outcome: "stopped", reason: "stopped-by-you" })];
+    make().start();
+    await minutes(1);
+    expect(sched!.nextRunAt()?.getTime()).toBe(T0.getTime() + 61 * MIN);
+    await minutes(59);
+    expect(starts).toEqual([]);
+    await minutes(1);
+    expect(refs()).toEqual(["group:9"]);
+  });
+
+  it("R278 (M6): a link's last record is the one written last, not the one with the greatest date: a run, the clock set back, a manual run 50 minutes later; the next automatic run comes a full interval after it", async () => {
+    make().start();
+    await minutes(2);
+    expect(starts).toHaveLength(1);
+    clockJump(-2 * HOUR);
+    await minutes(50);
+    expect(starts).toHaveLength(1);
+    // A manual run, written after the first and dated earlier.
+    records.unshift(record(link("user:42"), Date.now(), { trigger: "manual" }));
+    await minutes(59);
+    expect(starts).toHaveLength(1);
+    await minutes(1);
+    expect(starts).toHaveLength(2);
+  });
+
   it("R276 b (P4): a clock set back by less than the interval holds the link for ONE interval from when its record was first seen in the future; nextRunAt does not jump", async () => {
     make().start();
     await minutes(2);
