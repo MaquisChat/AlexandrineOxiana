@@ -27,7 +27,8 @@ import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "../..
 import { useMemorySecrets, useNoSecretStore } from "../../../../packages/library/src/secrets-testing.js";
 import { setSecret } from "../../../../packages/library/src/secrets.js";
 import { FakeZotero, guardNetwork } from "../../../../packages/library/tests/zotero/fake-zotero.js";
-import { run } from "../index.js";
+import { InvalidArgumentError, Option, type CommanderError } from "commander";
+import { buildProgram, run } from "../index.js";
 import { hasEnvPassphrase } from "../prompt.js";
 import { openSession } from "../session.js";
 
@@ -611,6 +612,40 @@ describe("R299 d: the program's own messages repeat nothing that was typed", () 
     expect(r.stderr).toContain("Usage: ao tools versions");
     await refused([KEY], /unknown command/u);
     await refused(["library", KEY], /unknown command/u);
+  });
+
+  it("R309 b: an invalid value for a known option or parameter names it by the program's own name, never the value", async () => {
+    /** The program as `ao` builds it, with one more command whose option and parameter refuse values (no command of ao has one yet). */
+    async function parse(args: string[]): Promise<{ stderr: string; code: string; exitCode: number }> {
+      const program = buildProgram();
+      let stderr = "";
+      program.configureOutput({ writeErr: (t) => void (stderr += t), writeOut: () => undefined });
+      program
+        .command("probe")
+        .addOption(new Option("--limit <n>", "how many").choices(["10", "20"]))
+        .argument("[count]", "a number", (v: string) => {
+          if (!/^\d+$/u.test(v)) throw new InvalidArgumentError(`"${v}" is not a number.`);
+          return v;
+        })
+        .action(() => undefined);
+      try {
+        await program.parseAsync(args, { from: "user" });
+      } catch (err) {
+        const e = err as CommanderError;
+        everything.push(stderr, e.message);
+        return { stderr, code: e.code, exitCode: e.exitCode };
+      }
+      throw new Error("not refused");
+    }
+    const opt = await parse(["probe", "--limit", KEY]);
+    expect([opt.code, opt.exitCode]).toEqual(["commander.invalidArgument", 1]);
+    expect(opt.stderr).toContain("error: the value given for --limit is not valid (what you typed is not shown, in case it was a key). Allowed choices are 10, 20.");
+    expect(opt.stderr).toContain("Usage: ao probe");
+    const optEq = await parse(["probe", `--limit=${KEY}`]);
+    expect(optEq.stderr).toContain("error: the value given for --limit is not valid (what you typed is not shown");
+    const arg = await parse(["probe", KEY]);
+    expect(arg.stderr).toContain("error: the value given for count is not valid (what you typed is not shown, in case it was a key)\n");
+    for (const r of [opt, optEq, arg]) expect(r.stderr).not.toContain(KEY);
   });
 
   it("a missing argument still names the argument it wanted (the program's own word, not something typed)", async () => {

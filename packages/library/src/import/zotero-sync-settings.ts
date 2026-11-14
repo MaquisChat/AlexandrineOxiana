@@ -29,8 +29,9 @@
  */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { AppSettingUnreadableError, ensurePrivateDir, setAppSettingAside, updateAppSettingStrict } from "../app-settings.js";
+import { AppSettingUnreadableError, ensurePrivateDir, readAppSettingStrict, setAppSettingAside } from "../app-settings.js";
 import { raiseDeviceNotice } from "../device-notices.js";
+import { writeFileAtomic } from "../fs/atomic.js";
 import { FileLockBusyError, FileLockUnavailableError, withFileLock } from "../fs/file-lock.js";
 import { InvalidInputError } from "../repo/errors.js";
 
@@ -329,7 +330,7 @@ function inTurn<T>(dir: string, name: string, step: () => Promise<T>): Promise<T
  * alone never takes it: the file is replaced atomically, so a reader sees the old file or the new one, whole. A lock
  * that stays taken ends as ZoteroSyncFileBusyError; one that cannot be made at all as ZoteroSyncFileUnreadableError.
  */
-async function underLock<T>(dir: string, name: string, step: () => Promise<T>): Promise<T> {
+async function underLock<T>(dir: string, name: string, step: (stillMine: () => Promise<boolean>) => Promise<T>): Promise<T> {
   try {
     ensurePrivateDir(dir);
   } catch {
@@ -394,17 +395,25 @@ function readFileStrict<T>(dir: string, name: string, check: (v: unknown) => v i
   });
 }
 
+/** R309 a: the holder's lock was taken over (or removed) before it wrote: nothing was written. */
+class LockLost extends Error {}
+
 /**
  * A read-modify-write of the file in its turn; damaged content is set aside first (then `edit` gets undefined). A file
  * written by a newer version is never changed: ZoteroSyncFileNewerError.
+ *
+ * R309 a: the last thing before the atomic write is to ask whether the lock is still this holder's. A holder that was
+ * stopped past the stale bound (its lock taken over meanwhile) writes NOTHING and makes the whole change again, from the
+ * read, under a new lock — once; lost a second time, it ends as a busy file does (ZoteroSyncFileBusyError). What remains
+ * is the instant between that check and the write.
  */
 function updateFile<T>(dir: string, name: string, check: (v: unknown) => v is T, edit: (cur: T | undefined) => T, o: ZoteroSyncFileOptions): Promise<T> {
   return inTurn(dir, name, async () => {
     // Told once the lock is released (R299 c: the lock is held for the read, the change and the write only).
     const asides: SetAside[] = [];
     let newer = false;
-    try {
-      return await underLock(dir, name, async () => {
+    const once = () =>
+      underLock(dir, name, async (stillMine) => {
         for (let attempt = 0; ; attempt++) {
           // A file there but unreadable (not damaged) is refused before anything is set aside or written.
           const got = await classify(dir, name, check);
@@ -416,13 +425,30 @@ function updateFile<T>(dir: string, name: string, check: (v: unknown) => v is T,
             const done = await setAside(dir, name, check, o);
             if (done) asides.push(done);
           }
+          let cur: T | undefined;
           try {
-            return await updateAppSettingStrict(dir, name, check, edit);
+            cur = await readAppSettingStrict(dir, name, check);
           } catch (err) {
             if (!(err instanceof AppSettingUnreadableError) || attempt >= 2) throw err instanceof AppSettingUnreadableError ? new ZoteroSyncFileUnreadableError(name) : err;
+            continue;
           }
+          const next = edit(cur);
+          if (!(await stillMine())) throw new LockLost();
+          await writeFileAtomic(join(dir, name), `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+          return next;
         }
       });
+    try {
+      try {
+        return await once();
+      } catch (err) {
+        if (!(err instanceof LockLost)) throw err;
+      }
+      try {
+        return await once();
+      } catch (err) {
+        throw err instanceof LockLost ? new ZoteroSyncFileBusyError(name) : err;
+      }
     } finally {
       if (newer) await newerNotice(dir, name, o);
       for (const done of asides) await toldSetAside(dir, name, done, o);

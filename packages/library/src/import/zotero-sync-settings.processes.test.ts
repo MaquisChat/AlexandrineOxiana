@@ -5,13 +5,15 @@
  * overlap of their changes is forced: each read of a guarded file waits, after reading, for a read by the other
  * instance (or 30 ms), so without the lock both would change the same old content.
  */
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /** While on, every read of a guarded file meets a read by the other instance before it returns (or gives up after 30 ms). */
 const gate = { on: false, waiting: undefined as (() => void) | undefined };
+/** R309 a: called after every read of a guarded file (its path), to stop a holder in the middle of its change. */
+const hook = { onRead: undefined as ((path: string) => Promise<void>) | undefined };
 async function meet(): Promise<void> {
   const other = gate.waiting;
   if (other) {
@@ -38,6 +40,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     readFile: async (...args: Parameters<typeof actual.readFile>) => {
       const got = await actual.readFile(...args);
       if (gate.on && typeof args[0] === "string" && /zotero-sync(?:-history)?\.json$/u.test(args[0])) await meet();
+      if (hook.onRead && typeof args[0] === "string" && /zotero-sync(?:-history)?\.json$/u.test(args[0])) await hook.onRead(args[0]);
       return got;
     },
   };
@@ -61,6 +64,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   gate.on = false;
+  hook.onRead = undefined;
   // After every case, nothing of the lock is left.
   expect((await readdir(dir)).filter((n) => n.includes(".lock"))).toEqual([]);
   await rm(dir, { recursive: true, force: true });
@@ -189,4 +193,70 @@ describe("R299 c: two processes change this computer's Zotero files at once", ()
     expect((await B.readZoteroSyncSettings(dir, "lib-a")).links).toEqual([]);
     expect((await readdir(dir)).some((n) => n.startsWith(`${A.ZOTERO_SYNC_FILE}.unreadable-`))).toBe(true);
   }, 20_000);
+
+  describe("R309 a: a holder stopped past the stale bound in the middle of its change", () => {
+    const kinds = ["settings", "history"] as const;
+    const change = (M: Module, d: string, kind: (typeof kinds)[number], lib: string, n: number) =>
+      kind === "settings" ? M.updateZoteroSyncSettings(d, lib, (cur) => ({ ...cur, links: [link(`user:${n}`)] })).then(() => undefined) : M.putZoteroSyncRun(d, lib, runRec(n));
+    const fileOf = (M: Module, kind: (typeof kinds)[number]) => (kind === "settings" ? M.ZOTERO_SYNC_FILE : M.ZOTERO_SYNC_HISTORY_FILE);
+    const libsIn = async (path: string) => Object.keys((JSON.parse(await readFile(path, "utf8")) as { libraries: object }).libraries).sort();
+
+    for (const kind of kinds) {
+      for (const first of ["A", "B"] as const) {
+        it(`${kind}, ${first} stopped: the other takes the lock over and writes; the stopped one writes nothing, then makes its change again on top: both kept`, async () => {
+          const [P, Q] = first === "A" ? [A, B] : [B, A];
+          const d = join(dir, `${kind}-${first}`);
+          await mkdir(d);
+          const file = join(d, fileOf(P, kind));
+          // The file is there already (another library's entry), so the stopped holder has read it.
+          await change(Q, d, kind, "lib-z", 3);
+          let reads = 0;
+          let between: string[] | undefined;
+          hook.onRead = async (path) => {
+            if (!path.startsWith(d) || ++reads !== 2) return; // its read for the change (the last before its write)
+            // P holds the lock and has read the file; it is stopped longer than the stale bound (its lock looks 31 s old).
+            const old = new Date(Date.now() - 31_000);
+            await utimes(`${file}.lock`, old, old);
+            // Meanwhile the other program takes the lock over and makes its own change.
+            await change(Q, d, kind, "lib-q", 2);
+            between = await libsIn(file);
+          };
+          await change(P, d, kind, "lib-p", 1);
+          hook.onRead = undefined;
+          // P's first attempt wrote nothing: between the two attempts the file held only Q's change.
+          expect(between).toEqual(["lib-q", "lib-z"]);
+          // P made its change again from the read under a new lock: both are kept.
+          expect(await libsIn(file)).toEqual(["lib-p", "lib-q", "lib-z"]);
+          if (kind === "settings") {
+            expect((await A.readZoteroSyncSettings(d, "lib-p")).links.map((l) => l.ref)).toEqual(["user:1"]);
+            expect((await A.readZoteroSyncSettings(d, "lib-q")).links.map((l) => l.ref)).toEqual(["user:2"]);
+          } else {
+            expect(await A.readZoteroSyncHistory(d, "lib-p")).toHaveLength(1);
+            expect(await A.readZoteroSyncHistory(d, "lib-q")).toHaveLength(1);
+          }
+          expect((await readdir(d)).filter((n) => n.includes(".lock"))).toEqual([]);
+        });
+      }
+
+      it(`${kind}: the lock lost twice in a row ends as a busy file does, with nothing written`, async () => {
+        const d = join(dir, `${kind}-twice`);
+        await mkdir(d);
+        await change(B, d, kind, "lib-q", 2);
+        const file = join(d, fileOf(A, kind));
+        const before = await readFile(file, "utf8");
+        let reads = 0;
+        hook.onRead = async (path) => {
+          if (!path.startsWith(d)) return;
+          // The read for the change, in each attempt: the lock is taken from under the holder (gone).
+          if (++reads === 2 || reads === 4) await rm(`${file}.lock`);
+        };
+        const err = await change(A, d, kind, "lib-p", 1).catch((e: unknown) => e);
+        hook.onRead = undefined;
+        expect(err).toBeInstanceOf(A.ZoteroSyncFileBusyError);
+        expect((err as Error).message).toBe("The Zotero sync settings are in use by another program. Try again.");
+        expect(reads).toBeGreaterThanOrEqual(3);
+        expect(await readFile(file, "utf8")).toBe(before);
+      });
+    }
+  });
 });

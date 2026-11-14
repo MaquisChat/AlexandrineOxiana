@@ -38,8 +38,13 @@ export function messageWithoutInput(message: string, code: string | undefined, c
       return `error: unknown command ${NOT_SHOWN}`;
     case "commander.excessArguments":
       return `error: too many arguments${command.parent ? ` for '${command.name()}'` : ""} ${NOT_SHOWN}`;
-    case "commander.invalidArgument":
-      return `error: a value given is not one this command accepts ${NOT_SHOWN}`;
+    case "commander.invalidArgument": {
+      // R309 b: the option or parameter is named by the program's own name for it, found in the command's definition
+      // (never taken from what was typed); the value is not shown. Choices, from the definition too.
+      const named = invalidTarget(message, command);
+      if (!named) return `error: a value given is not one this command accepts ${NOT_SHOWN}`;
+      return `error: the value given for ${named.name} is not valid ${NOT_SHOWN}${named.choices ? `. Allowed choices are ${named.choices.join(", ")}.` : ""}`;
+    }
     case "commander.missingArgument":
     case "commander.optionMissingArgument":
     case "commander.missingMandatoryOptionValue":
@@ -48,6 +53,25 @@ export function messageWithoutInput(message: string, code: string | undefined, c
     default:
       return `error: that was not understood ${NOT_SHOWN}`;
   }
+}
+
+/**
+ * The option or parameter a `commander.invalidArgument` message is about, as the command defines it: an option whose
+ * own flags open the message (`error: option '<flags>' argument …`), else a parameter whose own name the message
+ * says it is for. Undefined when neither is found (the message is then said without naming anything).
+ */
+function invalidTarget(message: string, command: Command): { name: string; choices?: readonly string[] } | undefined {
+  for (let c: Command | null = command; c; c = c.parent) {
+    for (const o of c.options) {
+      if (message.startsWith(`error: option '${o.flags}' argument '`)) return { name: o.long ?? o.short ?? o.flags, ...(o.argChoices ? { choices: o.argChoices } : {}) };
+    }
+  }
+  if (message.startsWith("error: command-argument value '")) {
+    for (const a of command.registeredArguments) {
+      if (message.includes(`' is invalid for argument '${a.name()}'.`)) return { name: a.name(), ...(a.argChoices ? { choices: a.argChoices } : {}) };
+    }
+  }
+  return undefined;
 }
 
 /** The program and every command made under it: Commander's own error messages go through messageWithoutInput (R299 d). */

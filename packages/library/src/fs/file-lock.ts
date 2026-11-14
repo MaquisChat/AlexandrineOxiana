@@ -30,8 +30,10 @@
  *  - A READ alone does not take it: the guarded file is replaced atomically (written to a temp file, then renamed), so a
  *    reader sees the old file or the new one, whole.
  *
- * The one case it does not cover is a holder that is alive but silent for more than FILE_LOCK_STALE_MS while it holds
- * the lock (a process stopped in a debugger, a computer put to sleep in those milliseconds): it is taken for dead.
+ * A holder that is alive but silent for more than FILE_LOCK_STALE_MS while it holds the lock (a process stopped in a
+ * debugger, a computer put to sleep in those milliseconds, a clock that jumps) is taken for dead and its lock taken
+ * over. So the step is given `stillMine` (R309 a): the caller asks it as the LAST thing before it writes, and writes
+ * nothing when the lock is gone or carries another token. What remains is the instant between that check and the write.
  */
 import { createHash, randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
@@ -131,11 +133,14 @@ async function look(path: string): Promise<{ id: string; stale: boolean } | unde
 /** Removes the lock at `path` only while it still carries `token` (only its holder removes a lock). Never throws. */
 async function release(path: string, token: string): Promise<void> {
   try {
-    if ((await tokenIn(path)) === token) await fsp.unlink(path);
+    if (await holds(path, token)) await fsp.unlink(path);
   } catch {
     // already gone; or it cannot be removed, and it goes stale in its time
   }
 }
+
+/** Whether the lock at `path` still carries `token` (the holder's own). Never throws: unreadable or gone is "no". */
+const holds = async (path: string, token: string): Promise<boolean> => (await tokenIn(path)) === token;
 
 /** One attempt to take the lock at `path` (no waiting); a stale lock is taken over first, by one waiter only. */
 async function attempt(path: string, depth: number, o: FileLockOptions): Promise<string | undefined> {
@@ -157,11 +162,12 @@ async function attempt(path: string, depth: number, o: FileLockOptions): Promise
 }
 
 /**
- * Runs `step` while holding the lock of `guarded` (see the top of this file). Throws FileLockBusyError when the lock
+ * Runs `step` while holding the lock of `guarded` (see the top of this file). `step` is given `stillMine`, which says
+ * whether the lock file still carries this holder's token (R309 a): ask it right before writing. Throws FileLockBusyError when the lock
  * stays taken for the whole wait, and FileLockUnavailableError when it cannot be made; `step` has not run in either
  * case. `step`'s own errors come out unchanged, after the lock is released.
  */
-export async function withFileLock<T>(guarded: string, step: () => Promise<T>, o: FileLockOptions = {}): Promise<T> {
+export async function withFileLock<T>(guarded: string, step: (stillMine: () => Promise<boolean>) => Promise<T>, o: FileLockOptions = {}): Promise<T> {
   const path = fileLockPath(guarded);
   const until = Date.now() + (o.waitMs ?? FILE_LOCK_WAIT_MS);
   const every = o.retryMs ?? FILE_LOCK_RETRY_MS;
@@ -174,7 +180,8 @@ export async function withFileLock<T>(guarded: string, step: () => Promise<T>, o
     await sleep(Math.min(every, left));
   }
   try {
-    return await step();
+    const mine = token;
+    return await step(() => holds(path, mine));
   } finally {
     await release(path, token);
   }

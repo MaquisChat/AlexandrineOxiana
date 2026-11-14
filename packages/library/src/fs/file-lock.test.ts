@@ -189,6 +189,23 @@ describe("withFileLock", () => {
     expect(await leftovers()).toEqual([]);
   });
 
+  it("R309 a: the step can ask whether the lock is still its own: yes while held; no once another holds it, or it is gone", async () => {
+    const lock = fileLockPath(guarded);
+    const seen: boolean[] = [];
+    await withFileLock(guarded, async (stillMine) => {
+      seen.push(await stillMine());
+      const mine = await readFile(lock, "utf8");
+      await writeFile(lock, JSON.stringify({ token: "b".repeat(32), at: new Date().toISOString() }));
+      seen.push(await stillMine());
+      await rm(lock);
+      seen.push(await stillMine());
+      await writeFile(lock, mine);
+      seen.push(await stillMine());
+    });
+    expect(seen).toEqual([true, false, false, true]);
+    expect(await leftovers()).toEqual([]);
+  });
+
   it("only the holder releases: a lock that is no longer this holder's (taken over meanwhile) is left as it is", async () => {
     const lock = fileLockPath(guarded);
     const other = JSON.stringify({ token: "b".repeat(32), at: new Date().toISOString() });
