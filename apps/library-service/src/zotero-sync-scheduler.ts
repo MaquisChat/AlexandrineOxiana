@@ -14,13 +14,16 @@
  *   - automatic sync is on (settings read at this pass);
  *   - at least 2 minutes since the scheduler was started (the library activated);
  *   - at least `everyMinutes` since the link's last FINISHED record of any kind (manual or automatic, any outcome); a
- *     record dated in the future counts as "now" from the moment it is first seen;
+ *     record dated in the future is taken as finished when first seen, for as long as it is the link's last (R276 b);
  *   - at least `everyMinutes` since the scheduler itself last started a run of the link in this process (whatever the
- *     history says: a record that never reached the history does not make the link due again at the next tick);
+ *     history says: a record that never reached the history does not make the link due again at the next tick), and at
+ *     least 5 minutes of STEADY time since then (R276 c);
+ *   - at least `everyMinutes` since the researcher last stopped an automatic run, for every link (R276 a);
  *   - no back-off in force.
- * Each "since" is measured on two clocks, the wall clock and the monotonic one, and the LONGER counts: a clock set back
- * cannot hold a link (the monotonic clock goes on) nor start a burst (its records count as now); a computer that slept
- * is due on waking (the wall clock went on while the monotonic one, on a Mac, stood).
+ * Each "since" is measured on two clocks, the wall clock and the steady one, and the LONGER counts: a clock set back
+ * holds a link for one interval at most (the steady clock goes on; its records count as finished when first seen) and
+ * never starts a burst; a computer that slept is due on waking (the wall clock went on while the steady one, on a Mac,
+ * stood), after the 5-minute steady floor at most; a wall clock that keeps leaping forward gets one run per 5 minutes.
  */
 import type { ZoteroSyncLink, ZoteroSyncRun, ZoteroSyncSettings } from "@ao/library";
 
@@ -28,6 +31,8 @@ import type { ZoteroSyncLink, ZoteroSyncRun, ZoteroSyncSettings } from "@ao/libr
 export const ZOTERO_SYNC_TICK_MS = 60_000;
 /** The first automatic run of a link after the library was activated comes no sooner than this. */
 export const ZOTERO_SYNC_FIRST_RUN_MS = 2 * 60_000;
+/** R276 c: at least this much STEADY time between two automatic runs of one link, whatever the wall clock does. */
+export const ZOTERO_SYNC_STEADY_FLOOR_MS = 5 * 60_000;
 
 /**
  * Why a link cannot start NOW (asked in the same synchronous step as `run`, so nothing can come between):
@@ -45,8 +50,11 @@ export interface ZoteroSyncSchedulerOptions {
   run(link: ZoteroSyncLink, trigger: "automatic"): Promise<ZoteroSyncRun>;
   /** This library's settings, read at each pass; undefined when none can be used (damaged, unreadable, newer). */
   settings(): Promise<ZoteroSyncSettings | undefined>;
-  /** This library's records, newest first (read at each pass that has automatic sync on). */
-  history?(): Promise<ZoteroSyncRun[]>;
+  /**
+   * This library's records, newest first (read at each pass that has automatic sync on); undefined when they cannot be
+   * used (a history file written by a newer version, R276 d): then nothing is scheduled.
+   */
+  history?(): Promise<ZoteroSyncRun[] | undefined>;
   /** Synchronous: why the link cannot start now, or undefined. */
   obstacle?(link: ZoteroSyncLink): ZoteroSyncObstacle | undefined;
   /** The back-off in force (ms since the epoch), given the records just read. */
@@ -74,8 +82,15 @@ export class ZoteroSyncScheduler {
   private wake: (() => void) | undefined;
   /** When this scheduler last started a run of each link, in this process (R274 b). */
   private readonly started = new Map<string, Mark>();
-  /** A record dated in the future, by link: its time and when it was first seen ("now", R274 b). */
+  /**
+   * A record dated in the future, by link: its time and when it was first seen. It is taken as finished then, for as
+   * long as it is that link's last record (R274 b, R276 b), even once the wall clock has passed its own time.
+   */
   private readonly future = new Map<string, { at: number; seen: Mark }>();
+  /** R276 a: when the researcher last stopped an automatic run: no automatic run of any link for an interval from then. */
+  private stoppedByYou: Mark | undefined;
+  /** R276 e: a pass could not read the files and said so; said again only after a pass that succeeded. */
+  private failing = false;
   /** What the last pass read (for nextRunAt without fresh data). */
   private last: { settings: ZoteroSyncSettings | undefined; history: readonly ZoteroSyncRun[] } | undefined;
   private readonly tickMs: number;
@@ -128,36 +143,55 @@ export class ZoteroSyncScheduler {
     this.timer = t;
   }
 
-  /** One pass: the due links, one after another, each looked at again after the one before has ended. */
+  /**
+   * One pass: the due links, one after another, each looked at again after the one before has ended. A run that ended
+   * `stopped` ends the pass (R276 a); stopped by the researcher, it also holds every link for an interval.
+   */
   private async pass(): Promise<void> {
     try {
-      for (;;) {
-        const settings = await this.o.settings();
-        if (this.stopped) return;
-        if (!settings?.automatic || !settings.links.length) {
-          this.last = { settings, history: [] };
-          return;
-        }
-        const history = (await this.o.history?.()) ?? [];
-        if (this.stopped) return;
-        this.last = { settings, history };
-        const now = this.mark();
-        // The first link that is due and can start now; the obstacle is asked in the same step as the start.
-        const link = settings.links.find((l) => this.dueAt(l, settings, history, now) <= now.wall && this.o.obstacle?.(l) === undefined);
-        if (!link || this.stopped) return;
-        this.started.set(keyOf(link), now);
-        const ran = this.o.run(link, "automatic").then(
-          () => undefined,
-          () => this.o.debug?.("zotero sync scheduler: an automatic run ended on an error"),
-        );
-        // Waits for the run to end, unless the scheduler is stopped meanwhile (the holder then stops the run).
-        await Promise.race([ran, new Promise<void>((r) => (this.wake = r))]);
-        this.wake = undefined;
-        if (this.stopped) return;
-      }
+      await this.passOnce();
+      this.failing = false;
     } catch {
-      // The settings or the records could not be read: nothing is scheduled at this pass.
-      this.o.debug?.("zotero sync scheduler: the settings or the records could not be read; nothing was started");
+      // The settings or the records could not be read: nothing is scheduled at this pass; said once (R276 e).
+      if (!this.failing) this.o.debug?.("zotero sync scheduler: the settings or the records could not be read; nothing was started");
+      this.failing = true;
+    }
+  }
+
+  private async passOnce(): Promise<void> {
+    for (;;) {
+      const settings = await this.o.settings();
+      if (this.stopped) return;
+      if (!settings?.automatic || !settings.links.length) {
+        this.last = { settings, history: [] };
+        return;
+      }
+      const history = this.o.history ? await this.o.history() : [];
+      if (this.stopped) return;
+      if (!history) {
+        // Records this build cannot use (written by a newer version): nothing is scheduled (R276 d).
+        this.last = { settings: undefined, history: [] };
+        return;
+      }
+      this.last = { settings, history };
+      const now = this.mark();
+      // The first link that is due and can start now; the obstacle is asked in the same step as the start.
+      const link = settings.links.find((l) => this.dueAt(l, settings, history, now) <= now.wall && this.o.obstacle?.(l) === undefined);
+      if (!link || this.stopped) return;
+      this.started.set(keyOf(link), now);
+      const ran = this.o.run(link, "automatic").then(
+        (r) => r,
+        () => void this.o.debug?.("zotero sync scheduler: an automatic run ended on an error"),
+      );
+      // Waits for the run to end, unless the scheduler is stopped meanwhile (the holder then stops the run).
+      const ended = await Promise.race([ran, new Promise<undefined>((r) => (this.wake = () => r(undefined)))]);
+      this.wake = undefined;
+      if (this.stopped) return;
+      if (ended?.outcome === "stopped") {
+        // R276 a: the researcher's Stop holds every link for an interval from now; any other stop ends this pass only.
+        if (ended.reason === "stopped-by-you") this.stoppedByYou = this.mark();
+        return;
+      }
     }
   }
 
@@ -170,19 +204,23 @@ export class ZoteroSyncScheduler {
     const key = keyOf(link);
     let due = after(this.activated, ZOTERO_SYNC_FIRST_RUN_MS);
     const own = this.started.get(key);
-    if (own) due = Math.max(due, after(own, every));
+    // R276 c: and never sooner than the steady floor after the link's last automatic run, whatever the wall clock says.
+    if (own) due = Math.max(due, after(own, every), now.wall + Math.max(0, ZOTERO_SYNC_STEADY_FLOOR_MS - (now.mono - own.mono)));
+    if (this.stoppedByYou) due = Math.max(due, after(this.stoppedByYou, every));
     let finished = -Infinity;
     for (const r of history) {
       if (r.ref !== link.ref || r.projectId !== link.projectId || r.finishedAt === undefined) continue;
       const t = Date.parse(r.finishedAt);
       if (Number.isFinite(t)) finished = Math.max(finished, t);
     }
-    if (finished > now.wall) {
-      // Dated in the future (the clock was set back): it counts as now from when it was first seen.
-      const seen = this.future.get(key);
-      const pin = seen && seen.at === finished ? seen : { at: finished, seen: now };
-      this.future.set(key, pin);
-      due = Math.max(due, after(pin.seen, every));
+    const pinned = this.future.get(key);
+    if (pinned && pinned.at === finished) {
+      // Still the link's last record: finished when first seen (R276 b), also once the wall clock has passed its time.
+      due = Math.max(due, after(pinned.seen, every));
+    } else if (finished > now.wall) {
+      // Dated in the future (the clock was set back): taken as finished now, when first seen.
+      this.future.set(key, { at: finished, seen: now });
+      due = Math.max(due, after(now, every));
     } else {
       this.future.delete(key);
       if (finished > -Infinity) due = Math.max(due, finished + every);

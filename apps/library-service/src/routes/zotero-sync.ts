@@ -314,7 +314,11 @@ export class ZoteroSyncHolder {
       },
       history: async () => {
         const o = state.session;
-        return o ? readZoteroSyncHistory(state.deps.appConfigDir, o.lib.id) : [];
+        if (!o) return undefined;
+        // R276 d: records written by a newer version (the module says so itself) stop scheduling, as newer settings do.
+        let newer = false;
+        const runs = await readZoteroSyncHistory(state.deps.appConfigDir, o.lib.id, { onNewer: () => (newer = true) });
+        return newer ? undefined : runs;
       },
       obstacle: (link) => this.obstacleTo(state, link),
       backoffUntil: (history) => this.backoffInForce(now(), historyBackoff(history)),
@@ -438,9 +442,9 @@ function inProgressId(runs: LibraryRun[], ref: string | undefined): string | und
   if (ref === undefined) return undefined;
   return runs.filter((r) => r.finishedAt === undefined && r.ref === ref).sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0]?.id;
 }
-async function readHistory(dir: string, libraryId: string): Promise<LibraryRun[]> {
+async function readHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<LibraryRun[]> {
   try {
-    return await readZoteroSyncHistory(dir, libraryId);
+    return await readZoteroSyncHistory(dir, libraryId, o);
   } catch (err) {
     throw fileError(err);
   }
@@ -501,7 +505,12 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
   async function stateOf(s: Session): Promise<ZoteroSyncStateResponse> {
     // R268 M4, R269 c: whether the settings were written by a newer version is said by the library module itself.
     let newer = false;
-    const [settings, history, stored] = await Promise.all([readSettings(dir(), s.lib.id, { onNewer: () => (newer = true) }), readHistory(dir(), s.lib.id), keyStored()]);
+    let historyNewer = false;
+    const [settings, history, stored] = await Promise.all([
+      readSettings(dir(), s.lib.id, { onNewer: () => (newer = true) }),
+      readHistory(dir(), s.lib.id, { onNewer: () => (historyNewer = true) }),
+      keyStored(),
+    ]);
     const running = holder.running;
     const current = inProgressId(history, running?.ref);
     const links: ZoteroSyncStateResponse["links"] = [];
@@ -524,7 +533,8 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     }
     const backoff = holder.backoffInForce(now().getTime(), historyBackoff(history));
     // R274 c: when the scheduler would next start a run, from these same settings and records ("not before").
-    const next = holder.scheduler?.nextRunAt({ settings: newer ? undefined : settings, history });
+    // Settings or records written by a newer version: nothing is scheduled (R269 c, R276 d).
+    const next = holder.scheduler?.nextRunAt({ settings: newer || historyNewer ? undefined : settings, history });
     return {
       readOnly: s.lib.mode === "read-only",
       settingsNewer: newer,

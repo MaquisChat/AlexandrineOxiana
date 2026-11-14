@@ -34,6 +34,9 @@ describe("the scheduler alone (fake timers, the fake clock)", () => {
   let held: Map<string, "busy" | "held">;
   let backoff: number | undefined;
   let outcome: ZoteroSyncRun["outcome"];
+  /** How the run of a ref ends, when not as `outcome` says (once: taken when that run ends). */
+  let endings: Map<string, Pick<ZoteroSyncRun, "outcome" | "reason">>;
+  let notes: string[];
   /** When set, runs end only when the test says so. */
   let gate: Map<string, () => void> | undefined;
   /** False: the run's record never reaches the history (a history that cannot be written). */
@@ -66,12 +69,15 @@ describe("the scheduler alone (fake timers, the fake clock)", () => {
       return records.slice();
     },
     obstacle: (l) => held.get(l.ref),
+    debug: (note) => void notes.push(note),
     backoffUntil: () => backoff,
     run: async (l, trigger) => {
       expect(trigger).toBe("automatic");
       starts.push({ ref: l.ref, at: Date.now() });
       if (gate) await new Promise<void>((r) => gate!.set(l.ref, r));
-      const rec = record(l, Date.now(), { trigger: "automatic", outcome, ...(outcome === "failed" ? { reason: "offline" as const } : {}) });
+      const end = endings.get(l.ref);
+      endings.delete(l.ref);
+      const rec = record(l, Date.now(), { trigger: "automatic", ...(end ?? { outcome, ...(outcome === "failed" ? { reason: "offline" as const } : {}) }) });
       if (recordSaved) records.unshift(rec);
       return rec;
     },
@@ -92,6 +98,8 @@ describe("the scheduler alone (fake timers, the fake clock)", () => {
     held = new Map();
     backoff = undefined;
     outcome = "finished";
+    endings = new Map();
+    notes = [];
     gate = undefined;
     recordSaved = true;
     settingsReads = 0;
@@ -156,6 +164,9 @@ describe("the scheduler alone (fake timers, the fake clock)", () => {
     expect(vi.getTimerCount()).toBe(1);
     // The lid is closed: five hours later the computer wakes. No tick was missed and queued: one timer, one pass.
     clockJump(5 * HOUR);
+    // The run comes once the 5-minute steady floor since the last one allows (R276 c): one, not one per missed tick.
+    await minutes(4);
+    expect(starts).toHaveLength(1);
     await minutes(1);
     expect(starts).toHaveLength(2);
     expect(vi.getTimerCount()).toBe(1);
@@ -185,6 +196,9 @@ describe("the scheduler alone (fake timers, the fake clock)", () => {
     expect(starts).toHaveLength(2);
     // Set forward ten hours: one run at the next tick, then none for the interval.
     clockJump(10 * HOUR);
+    // One run, once the 5-minute steady floor since the last one allows (R276 c).
+    await minutes(4);
+    expect(starts).toHaveLength(2);
     await minutes(1);
     expect(starts).toHaveLength(3);
     await minutes(59);
@@ -369,6 +383,116 @@ describe("the scheduler alone (fake timers, the fake clock)", () => {
     expect(sched!.nextRunAt({ settings: undefined, history: records })).toBeUndefined();
     held.set("user:42", "held");
     expect(sched!.nextRunAt()).toBeUndefined();
+  });
+
+  it("R276 a (P1): a researcher's Stop ends the pass and holds EVERY link for a full interval from the stop; nextRunAt says when", async () => {
+    settings!.links = [link("user:42"), link("group:9", { projectId: "p2" })];
+    gate = new Map();
+    endings.set("user:42", { outcome: "stopped", reason: "stopped-by-you" });
+    make().start();
+    await minutes(2);
+    expect(refs()).toEqual(["user:42"]);
+    await minutes(5);
+    const stoppedAt = Date.now();
+    gate.get("user:42")!();
+    await vi.advanceTimersByTimeAsync(0);
+    // Not at that instant (the pass ended there) ...
+    expect(refs()).toEqual(["user:42"]);
+    expect(sched!.nextRunAt()?.getTime()).toBe(stoppedAt + 60 * MIN);
+    // ... nor at any tick of the interval.
+    gate = undefined;
+    await minutes(59);
+    expect(refs()).toEqual(["user:42"]);
+    expect(sched!.nextRunAt()?.getTime()).toBe(stoppedAt + 60 * MIN);
+    await minutes(1);
+    // Both due when the hold ends (user:42 by its own stopped record too), in the settings' order.
+    expect(refs()).toEqual(["user:42", "user:42", "group:9"]);
+  });
+
+  it("R276 a (S9): a run stopped for another reason (its project locked) ends the pass; the other link runs at the next tick", async () => {
+    settings!.links = [link("user:42"), link("group:9", { projectId: "p2" })];
+    gate = new Map();
+    endings.set("user:42", { outcome: "stopped", reason: "project-locked" });
+    make().start();
+    await minutes(2);
+    gate.get("user:42")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(refs()).toEqual(["user:42"]);
+    held.set("user:42", "held");
+    gate = undefined;
+    await minutes(1);
+    expect(refs()).toEqual(["user:42", "group:9"]);
+  });
+
+  it("R276 b (P4): a clock set back by less than the interval holds the link for ONE interval from when its record was first seen in the future; nextRunAt does not jump", async () => {
+    make().start();
+    await minutes(2);
+    expect(starts).toHaveLength(1);
+    clockJump(-30 * MIN);
+    const seen: number[] = [];
+    for (let m = 1; m <= 60; m++) {
+      await minutes(1);
+      seen.push(sched!.nextRunAt()?.getTime() ?? NaN);
+      if (m < 60) expect(starts, `minute ${m}`).toHaveLength(1);
+    }
+    // First seen at the first tick after the jump; due one interval after that (61 steady minutes after the run).
+    expect(new Set(seen.slice(0, -1)).size).toBe(1);
+    await minutes(1);
+    expect(starts).toHaveLength(2);
+  });
+
+  it("R276 c (P5): a steady floor of 5 minutes between two automatic runs of one link, whatever the wall clock does; a real sleep still gets its one run", async () => {
+    make().start();
+    await minutes(2);
+    expect(starts).toHaveLength(1);
+    // The wall clock leaps 61 minutes every real minute, for an hour.
+    for (let m = 0; m < 60; m++) {
+      clockJump(61 * MIN);
+      await minutes(1);
+    }
+    // One run per 5 steady minutes at most: 12 in the hour (not 61), after the first.
+    expect(starts.length).toBe(1 + 12);
+  });
+
+  it("R276 c: a sleep a minute after a run gives its one run as soon as the 5-minute floor allows, not later", async () => {
+    make().start();
+    await minutes(2);
+    expect(starts).toHaveLength(1);
+    await minutes(1);
+    clockJump(5 * HOUR);
+    await minutes(1);
+    expect(starts).toHaveLength(1); // 2 steady minutes since the run
+    await minutes(2);
+    expect(starts).toHaveLength(1); // 4
+    await minutes(1);
+    expect(starts).toHaveLength(2); // 5: due
+    await minutes(10);
+    expect(starts).toHaveLength(2);
+  });
+
+  it("R276 d (M3): no usable history (a history file written by a newer version) → nothing scheduled, nextRunAt absent", async () => {
+    make({ history: async () => undefined }).start();
+    await minutes(3 * 60);
+    expect(starts).toEqual([]);
+    expect(sched!.nextRunAt()).toBeUndefined();
+  });
+
+  it("R276 e (M4): a file that cannot be read is logged once, not at every pass, until a pass succeeds again", async () => {
+    let failing = true;
+    make({
+      settings: async () => {
+        if (failing) throw new Error("EACCES");
+        return settings;
+      },
+    }).start();
+    await minutes(60);
+    expect(notes).toHaveLength(1);
+    failing = false;
+    await minutes(1);
+    failing = true;
+    await minutes(60);
+    expect(notes).toHaveLength(2);
+    expect(notes.every((n) => !n.includes("EACCES"))).toBe(true);
   });
 
   it("a pass with nothing due reads the settings and the records only, and starts nothing", async () => {
@@ -747,6 +871,83 @@ describe("the scheduler in the service", () => {
     await ticks(30);
     expect(finished().map((r) => r.trigger)).toEqual(["automatic", "automatic"]);
     expect(await sourceCount(pid)).toBe(4);
+  }, 180_000);
+
+  it("R276 a (S9): Stop on an automatic run holds every link for the interval; nextRunAt says when; Sync now works at once", async () => {
+    await openLibrary();
+    const p1 = await newProject(false, "One");
+    const p2 = await newProject(false, "Two");
+    z.addGroup(9, "G");
+    addItems(U, 12);
+    addItems("group:9", 2, "Group");
+    await saveSettings([linkOf(U, p1), linkOf("group:9", p2)]);
+    await ticks(1);
+    const holding = holdSync();
+    await vi.advanceTimersByTimeAsync(MIN);
+    await holding;
+    const stop = await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
+    expect(stop.json.run).toMatchObject({ ref: U, trigger: "automatic", outcome: "stopped", reason: "stopped-by-you" });
+    const stoppedAt = Date.now();
+    await svc.state.zoteroSync.scheduler!.idle();
+    expect(finished().map((r) => r.ref)).toEqual([U]);
+    const next = Date.parse((await state()).nextRunAt);
+    expect(next).toBeGreaterThanOrEqual(stoppedAt + HOUR - 1000);
+    expect(next).toBeLessThanOrEqual(Date.now() + HOUR);
+    await ticks(55);
+    expect(finished().map((r) => r.ref)).toEqual([U]);
+    // "Sync with Zotero now" is not held.
+    const manual = await call({ method: "POST", url: "/zotero/sync/run", body: { ref: U } });
+    expect(manual.status, manual.body).toBe(202);
+    await svc.state.zoteroSync.idle();
+    expect(finished().map((r) => [r.ref, r.trigger])).toEqual([
+      [U, "automatic"],
+      [U, "manual"],
+    ]);
+    await ticks(6);
+    expect(finished().slice(2).map((r) => [r.ref, r.trigger])).toEqual([["group:9", "automatic"]]);
+  }, 180_000);
+
+  it("R276 d (S7): a history file written by a newer version: nothing scheduled, nextRunAt absent, the file byte-identical", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    addItems(U, 2);
+    await saveSettings([linkOf(U, pid)]);
+    const path = join(deps.appConfigDir, "zotero-sync-history.json");
+    const newer = JSON.stringify({ v: 2, libraries: {} });
+    await writeFile(path, newer, { mode: 0o600 });
+    expect((await state()).nextRunAt).toBeUndefined();
+    await ticks(62);
+    expect(finished()).toEqual([]);
+    expect(z.requests).toEqual([]);
+    expect(await readFile(path, "utf8")).toBe(newer);
+    expect((await state()).nextRunAt).toBeUndefined();
+  }, 180_000);
+
+  it("R276 f (M2): after a refused move (work not paused in time, or an import not paused in time) the scheduler runs again (2-minute rule)", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    addItems(U, 3);
+    await saveSettings([linkOf(U, pid)], { everyMinutes: 30 });
+    const s = svc.state.session!;
+    // 1. Background work that could not be paused in time.
+    const drain = svc.state.drainWork.bind(svc.state);
+    svc.state.drainWork = async () => false;
+    await expect(svc.state.quiesce(s)).rejects.toMatchObject({ status: 409 });
+    svc.state.drainWork = drain;
+    await ticks(1);
+    expect(finished()).toEqual([]);
+    await ticks(1);
+    expect(finished().map((r) => r.trigger)).toEqual(["automatic"]);
+    // 2. An import that could not be paused in time.
+    const suspend = svc.state.suspendBatches.bind(svc.state);
+    svc.state.suspendBatches = async () => ({ paused: [], stuck: [{ projectId: pid, batchId: "b-stuck", handle: { resume() {} } as never, pending: Promise.resolve(undefined) }] });
+    await expect(svc.state.quiesce(s)).rejects.toMatchObject({ status: 409 });
+    svc.state.suspendBatches = suspend;
+    addItems(U, 1, "Later");
+    await ticks(29);
+    expect(finished()).toHaveLength(1);
+    await ticks(2);
+    expect(finished().map((r) => r.trigger)).toEqual(["automatic", "automatic"]);
   }, 180_000);
 
   it("a newer settings file: nothing scheduled, nextRunAt absent, and the state's flag comes from the module", async () => {
