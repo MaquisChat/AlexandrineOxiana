@@ -2,6 +2,12 @@
   "v": 1,
   "answers": {
     "https://api.crossref.org/works/10.5555/ao.fixture.2021.001": { "status": 200, "file": "crossref-work.json" },
-    "https://api.openalex.org/works/doi:10.5555/ao.fixture.2021.001": { "status": 200, "file": "openalex-work.json" }
+    "https://api.openalex.org/works/doi:10.5555/ao.fixture.2021.001": { "status": 200, "file": "openalex-work.json" },
+    "https://api.crossref.org/works?query.bibliographic=Lamont%20and%20Molnar%2C%20The%20Study%20of%20Boundaries%20in%20the%20Social%20Sciences%202002&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-lamont-boundaries.json" },
+    "https://api.openalex.org/works?search=Lamont%20and%20Molnar%2C%20The%20Study%20of%20Boundaries%20in%20the%20Social%20Sciences%202002&per-page=5": { "status": 200, "file": "openalex-find-lamont-boundaries-handbuilt.json" },
+    "https://api.crossref.org/works?query.bibliographic=Geertz%2C%20Deep%20Play%3A%20Notes%20on%20the%20Balinese%20Cockfight&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-geertz-deep-play.json" },
+    "https://api.openalex.org/works?search=Geertz%2C%20Deep%20Play%3A%20Notes%20on%20the%20Balinese%20Cockfight&per-page=5": { "status": 200, "file": "openalex-find-geertz-deep-play-handbuilt.json" },
+    "https://api.crossref.org/works?query.bibliographic=Vaisey%2C%20Motivation%20and%20Justification%3A%20A%20Dual-Process%20Model%20of%20Culture%20in%20Action%202009&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-vaisey-motivation.json" },
+    "https://api.openalex.org/works?search=Vaisey%2C%20Motivation%20and%20Justification%3A%20A%20Dual-Process%20Model%20of%20Culture%20in%20Action%202009&per-page=5": { "status": 200, "file": "openalex-find-vaisey-motivation-handbuilt.json" }
   }
 }
