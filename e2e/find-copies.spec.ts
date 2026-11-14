@@ -660,6 +660,23 @@ test("two found files are each decided by their own act (by keyboard)", async ({
 
 // ---------- point 7 ----------
 
+/**
+ * "Save changes" on the Governance screen, then what the screen shows once the save is answered: the button disabled
+ * (nothing left to save). "Saved." is shown too, but the screen's re-read of the rules after the save clears it, so on a
+ * loaded machine it can come and go between two looks (seen once in WebKit). What the service holds is then read.
+ */
+async function saveRules(page: Page, app: AppHarness, projectId: string, freeCopies: boolean): Promise<void> {
+  await page.getByRole("button", { name: "Save changes" }).click();
+  await expect(page.getByRole("button", { name: "Save changes" })).toBeDisabled({ timeout: STATE_TIMEOUT });
+  await expect(page.getByRole("alert").filter({ hasText: /could not be saved|changed elsewhere/ })).toHaveCount(0);
+  await expect
+    .poll(async () => {
+      const yaml = (await app.api<{ yaml: string }>("GET", `/projects/${projectId}/governance`)).body.yaml;
+      return /acquireMethods/.test(yaml) && /free_copy/.test(yaml);
+    }, { timeout: STATE_TIMEOUT })
+    .toBe(freeCopies);
+}
+
 test("the project's rules switch free copies off", async ({ page, app }) => {
   test.setTimeout(240_000);
   let projectId = "";
@@ -680,8 +697,7 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
     await box().click();
     await expect(page.getByRole("dialog", { name: "Record a reason" })).toHaveCount(0);
     await expect(box()).not.toBeChecked();
-    await page.getByRole("button", { name: "Save changes" }).click();
-    await expect(page.getByText(WORDS.saved, { exact: true })).toBeVisible({ timeout: STATE_TIMEOUT });
+    await saveRules(page, app, projectId, false);
   });
 
   await test.step("the next reference rests “Record complete” with the sentence that the rules do not allow it; nothing downloaded, nothing waits", async () => {
@@ -717,8 +733,7 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
     await dialog.getByRole("button", { name: "Record reason" }).click();
     await expect(dialog).toBeHidden();
     await expect(box()).toBeChecked();
-    await page.getByRole("button", { name: "Save changes" }).click();
-    await expect(page.getByText(WORDS.saved, { exact: true })).toBeVisible({ timeout: STATE_TIMEOUT });
+    await saveRules(page, app, projectId, true);
     // A save of the rules looks again at the entries the rules had stopped (R282 f): no "Try again" is needed.
     await openFind(page, projectId);
     await expectWaiting(page, PAIR_A, WORDS.looksRight);
@@ -747,7 +762,12 @@ test("a copy service switched off in Search sources is not asked", async ({ page
       await expect(b).toBeChecked({ checked: on.includes(name) });
     }
     await page.getByRole("button", { name: "Save", exact: true }).click();
-    await expect(page.getByText(WORDS.saved, { exact: true })).toBeAttached({ timeout: STATE_TIMEOUT });
+    // "Saved." is said in the screen's polite region, which the next message may replace at once: the save is known
+    // to be answered when "Save" is usable again; what the service holds is then read, and the screen read again below.
+    await expect(page.getByRole("button", { name: "Save", exact: true })).not.toHaveAttribute("aria-disabled", "true", { timeout: STATE_TIMEOUT });
+    await expect
+      .poll(async () => (await app.api<{ copies: Array<{ id: string; on: boolean }> }>("GET", "/settings/search-sources")).body.copies.filter((c) => c.on).length, { timeout: STATE_TIMEOUT })
+      .toBe(on.length);
     // Read again: the screen shows what the service now holds.
     await page.reload();
     for (const name of WORDS.copyServices) await expect(group().getByRole("checkbox", { name, exact: true })).toBeChecked({ checked: on.includes(name), timeout: STATE_TIMEOUT });
