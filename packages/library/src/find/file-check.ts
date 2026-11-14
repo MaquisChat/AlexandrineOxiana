@@ -1,6 +1,6 @@
 /**
  * What the answer is used for now (R296): advice shown to the researcher beside a held file; nothing is attached on
- * it unless the runner's option for attaching by itself is on, which nothing in the app sets.
+ * it by the app, which has no option to attach a file by itself (R301): only the researcher's "Use this file" does.
  *
  * The file check (Find and acquire, Task F11; Ruling R277 a, rebuilt by R282 a–c, stated in closed form by R292): is
  * a downloaded file the work of the record it was found for? The app attaches a file by itself ("match") only on
