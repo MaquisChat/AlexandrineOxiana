@@ -9,7 +9,8 @@
  * it to the service; the service decides what may be read. The page has no file-system access of
  * its own: the shell grants it only "open a picker", "listen for drag-and-drop events" and "choose a
  * folder to watch" (`pickWatchFolder`, R207), which gives the page a grant id and a folder name,
- * never a path.
+ * never a path; and the library sign-in window's six commands and its `library-window` event
+ * (Task F16, R325), which give the page yes or no and a state, never a cookie, a path or a file.
  *
  * Drops: the shell's web view reports drops for the whole window, with absolute paths and the
  * pointer position in physical pixels. The bridge finds the registered drop target under that
@@ -39,6 +40,108 @@ export interface DesktopShell {
    * outside text: it is shown only through `UserText`.
    */
   pickWatchFolder(title: string): Promise<{ grantId: string; name: string } | null>;
+  /**
+   * The library sign-in window (Task F16, R325): opens the ONE separate window at an https address
+   * for a ticket the service gave (32 lower-case hex); the shell, never the page, then fetches the PDF
+   * the window reaches and hands it to the service. Only the ticket and the address are passed. False
+   * when the shell refused (a ticket already open, a bad ticket or address) or is not there.
+   */
+  openLibraryWindow(ticket: string, url: string): Promise<boolean>;
+  /** "Add the PDF showing in the sign-in window": the shell fetches the window's current address. */
+  libraryWindowTakePdf(): Promise<boolean>;
+  /** Closes the sign-in window (its ticket ends). */
+  closeLibraryWindow(): Promise<void>;
+  /** "Sign out of my library": the window's cookies and storage are emptied now. */
+  signOutOfLibrary(): Promise<boolean>;
+  /** "Stay signed in to my library" (macOS only: false elsewhere). */
+  setStaySignedIn(on: boolean): Promise<boolean>;
+  /** Opens an https address in the researcher's own browser. */
+  openInBrowser(url: string): Promise<boolean>;
+  /** Hears the sign-in window's state. Returns the function that stops listening. */
+  onLibraryWindow(handler: (e: LibraryWindowEvent) => void): Promise<() => void>;
+}
+
+/** The sign-in window's states, as the shell sends them (event `library-window`, to the main window only). */
+export type LibraryWindowState = "opened" | "fetching" | "handed-over" | "not-a-pdf" | "failed" | "closed";
+/** Why the shell fetched nothing, when it refused before any request. */
+export type LibraryWindowReason = "no-ticket" | "busy" | "pause" | "sign-in-address" | "not-https" | "stopping";
+export interface LibraryWindowEvent {
+  /** The ticket the event is about; null when none was open. */
+  ticket: string | null;
+  state: LibraryWindowState;
+  reason?: LibraryWindowReason;
+}
+
+const LIBRARY_STATES: readonly string[] = ["opened", "fetching", "handed-over", "not-a-pdf", "failed", "closed"];
+const LIBRARY_REASONS: readonly string[] = ["no-ticket", "busy", "pause", "sign-in-address", "not-https", "stopping"];
+
+/** The event's payload when it is exactly what the shell sends; null otherwise. */
+function libraryWindowEvent(p: unknown): LibraryWindowEvent | null {
+  if (typeof p !== "object" || p === null || Array.isArray(p)) return null;
+  const { ticket, state, reason } = p as { ticket?: unknown; state?: unknown; reason?: unknown };
+  if (!(ticket === null || (typeof ticket === "string" && GRANT_ID.test(ticket)))) return null;
+  if (typeof state !== "string" || !LIBRARY_STATES.includes(state)) return null;
+  const e: LibraryWindowEvent = { ticket, state: state as LibraryWindowState };
+  if (typeof reason === "string" && LIBRARY_REASONS.includes(reason)) e.reason = reason as LibraryWindowReason;
+  return e;
+}
+
+/** Invokes a shell command whose answer is a yes or no: only `true` counts; a refusal or an error is false. */
+async function invokeYes(command: string, args: Record<string, unknown>): Promise<boolean> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return (await invoke(command, args)) === true;
+  } catch {
+    return false;
+  }
+}
+
+const libraryWindow = {
+  openLibraryWindow: (ticket: string, url: string) => invokeYes("open_library_window", { ticket, url }),
+  libraryWindowTakePdf: () => invokeYes("library_window_take_pdf", {}),
+  closeLibraryWindow: async () => {
+    await invokeYes("close_library_window", {});
+  },
+  signOutOfLibrary: () => invokeYes("sign_out_of_library", {}),
+  setStaySignedIn: (on: boolean) => invokeYes("set_stay_signed_in", { on }),
+  openInBrowser: (url: string) => invokeYes("open_in_browser", { url }),
+  onLibraryWindow: async (handler: (e: LibraryWindowEvent) => void): Promise<() => void> => {
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      const stop = await listen("library-window", (e) => {
+        const ev = libraryWindowEvent(e.payload);
+        if (ev) handler(ev);
+      });
+      return () => {
+        void stop();
+      };
+    } catch {
+      return () => {};
+    }
+  },
+};
+
+/** Outside the desktop shell (a plain browser, tests, the end-to-end harness) none of these is available: they answer false and load nothing. */
+export async function openLibraryWindow(ticket: string, url: string): Promise<boolean> {
+  return inDesktopShell() ? libraryWindow.openLibraryWindow(ticket, url) : false;
+}
+export async function libraryWindowTakePdf(): Promise<boolean> {
+  return inDesktopShell() ? libraryWindow.libraryWindowTakePdf() : false;
+}
+export async function closeLibraryWindow(): Promise<void> {
+  if (inDesktopShell()) await libraryWindow.closeLibraryWindow();
+}
+export async function signOutOfLibrary(): Promise<boolean> {
+  return inDesktopShell() ? libraryWindow.signOutOfLibrary() : false;
+}
+export async function setStaySignedIn(on: boolean): Promise<boolean> {
+  return inDesktopShell() ? libraryWindow.setStaySignedIn(on) : false;
+}
+export async function openInBrowser(url: string): Promise<boolean> {
+  return inDesktopShell() ? libraryWindow.openInBrowser(url) : false;
+}
+export async function onLibraryWindow(handler: (e: LibraryWindowEvent) => void): Promise<() => void> {
+  return inDesktopShell() ? libraryWindow.onLibraryWindow(handler) : () => {};
 }
 
 /** The longest title the page sends with a folder chooser, in characters (the shell bounds it too). */
@@ -152,6 +255,7 @@ function createShell(): DesktopShell {
       };
     },
     pickWatchFolder: invokePickWatchFolder,
+    ...libraryWindow,
   };
 }
 
