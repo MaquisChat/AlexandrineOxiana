@@ -9,9 +9,11 @@
  * Nothing happens without a press: the component makes ONE read (the origins) when the source is
  * shown, and no changing request fires by itself. A source from no watched folder shows nothing at
  * all. A failed read shows a quiet line and "Try again", never an error that hides the source.
- * The screen does not download a changed file (A9): when the origin's `local` hint is false it says
- * so and still offers the button, because the hint can be out of date; the service's own sentence
- * (409) is shown if the file really is not here. After an act the origins are read again and shown
+ * The screen does not download a changed file (A9) and says what is known of the new version (R251,
+ * the engine's `presence`): "local" offers the button; "not-downloaded" says so with its size (R235)
+ * and offers no button; "unknown" says the app cannot tell now and offers no button. The press is
+ * still guarded by the service (the hint can be out of date): its own sentence (409) is shown if the
+ * file is not here after all. After an act the origins are read again and shown
  * as the service now gives them (never a guess). Answers for another source, or after unmount, are
  * dropped. Folder labels and file names come from other people: UserText only.
  */
@@ -42,6 +44,7 @@ const KEPT = "Noted. The library's copy stays as it is.";
 const READ_ONLY_REASON = "This library is read-only, so nothing can be changed now.";
 const LOCKED_REASON = "This project is locked. Its passphrase is needed.";
 const NO_ANSWER = "The library service did not answer. Nothing was changed.";
+const CANNOT_TELL = "The app cannot tell at the moment whether the new version is downloaded to this Mac. Open Watched folders to see how this folder is doing.";
 
 /** The service's own sentence for a refusal, else a plain one. */
 const refusalText = (err: unknown): string => (err instanceof ApiClientError && err.status > 0 && err.message ? err.message : NO_ANSWER);
@@ -175,7 +178,7 @@ export function WatchOrigin({ api, projectId, sourceId, readOnly, onChanged }: W
       {read.origins.map((o) => {
         const working = busy.has(o.watchId);
         const off = readOnly || locked || working;
-        const bring = o.state === "changed" && !o.folderRemoved;
+        const bring = o.state === "changed" && !o.folderRemoved && o.presence === "local";
         const keep = o.state === "changed" || o.state === "gone";
         const refusal = refusals[o.watchId];
         return (
@@ -190,11 +193,12 @@ export function WatchOrigin({ api, projectId, sourceId, readOnly, onChanged }: W
               </p>
             )}
             {o.state === "changed" && <p>The file in the folder has changed since it was brought in. The library's copy is unchanged.</p>}
-            {o.state === "changed" && !o.local && !o.folderRemoved && (
+            {o.state === "changed" && o.presence === "not-downloaded" && !o.folderRemoved && (
               <p>
                 The new version is not downloaded to this Mac{typeof o.newBytes === "number" ? ` (${formatSize(o.newBytes)})` : ""}. Download it with your cloud drive's app, then bring it in here.
               </p>
             )}
+            {o.state === "changed" && o.presence !== "local" && o.presence !== "not-downloaded" && !o.folderRemoved && <p>{CANNOT_TELL}</p>}
             {o.state === "may-have-changed" && (
               <p>The file in the folder was replaced or edited, but it is not downloaded to this Mac, so the app cannot yet tell what changed. The library's copy is unchanged.</p>
             )}
