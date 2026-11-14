@@ -164,7 +164,10 @@ describe("pauses, and what clears each", () => {
 
   it("library-gone and undone pause only their link; fullDone is kept by a pause", async () => {
     await writeZoteroSyncSettings(dir, LIB, settings([link("user:42", "p1", { fullDone: true }), link("group:9", "p2")]));
-    await pauseLink(dir, LIB, "group:9", "library-gone");
+    expect(await pauseLink(dir, LIB, "group:9", "library-gone")).toBe(1);
+    // R250 d: how many links it paused; none for a Zotero library that is not linked (nothing written).
+    expect(await pauseLink(dir, LIB, "group:77", "undone")).toBe(0);
+    expect(await pauseLink(dir, "other-library", "group:9", "undone")).toBe(0);
     let s = await readZoteroSyncSettings(dir, LIB);
     expect(s.links.map((l) => l.paused)).toEqual([undefined, "library-gone"]);
     await pauseLink(dir, LIB, "user:42", "undone");

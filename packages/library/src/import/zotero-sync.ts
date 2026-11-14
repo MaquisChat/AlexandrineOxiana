@@ -89,6 +89,11 @@ export interface ZoteroSyncDeps extends BulkImportDeps {
   libraryId: string;
   /** The batch, as soon as there is one (started or resumed): for progress, and for suspending it on close. */
   onBatch?(projectId: string, h: BatchHandle): void;
+  /**
+   * R252: the caller's own synchronous check that this Zotero library is taken by another import or sync (its claim).
+   * True: refused with `import-running` exactly where the runner's own lock refuses (before any request).
+   */
+  taken?: () => boolean;
   /** Told when a device file's damaged content was set aside (the device notice belongs there). */
   onSetAside?: ZoteroSyncFileOptions["onSetAside"];
   /** Test seams: the dispatcher for every Zotero request, the waits, the clock (ms) for back-off and record times. */
@@ -99,7 +104,7 @@ export interface ZoteroSyncDeps extends BulkImportDeps {
 
 export interface ZoteroSyncOptions {
   trigger: "manual" | "automatic";
-  /** Aborting stops the run (a batch is suspended, resumable). Abort with "app-closed" or "project-locked" to say why. */
+  /** Aborting stops the run (a batch is suspended, resumable). Abort with "app-closed", "library-closed" (R248) or "project-locked" to say why. */
   signal: AbortSignal;
   /** The back-off time the caller keeps (ms since the epoch), from the last record that carried one. */
   backoffUntil?: number;
@@ -197,7 +202,7 @@ export function zoteroSyncBackoff(backoffUntil: number | undefined, now: number)
 const askedBackoff = (asked: number | undefined, now: number): number | undefined =>
   asked === undefined ? undefined : Math.min(Math.max(asked, now + ZOTERO_SYNC_MIN_BACKOFF_MS), now + ZOTERO_SYNC_MAX_BACKOFF_MS);
 
-const STOP_REASONS: readonly ZoteroSyncReason[] = ["stopped-by-you", "app-closed", "project-locked"];
+const STOP_REASONS: readonly ZoteroSyncReason[] = ["stopped-by-you", "app-closed", "library-closed", "project-locked"];
 const stopReason = (signal: AbortSignal): ZoteroSyncReason => (typeof signal.reason === "string" && STOP_REASONS.includes(signal.reason as ZoteroSyncReason) ? (signal.reason as ZoteroSyncReason) : "stopped-by-you");
 
 const ACCOUNT_REASON: Record<ZoteroAccountReason, ZoteroSyncReason> = {
@@ -362,7 +367,7 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     // M1: the stored link's pause, or its absence, is what counts; the caller's copy only when nothing is stored.
     const paused = current.paused;
     if (paused) throw new Ending("failed", paused === "undone" ? "sync-undone" : paused);
-    if (busy || (await zoteroImportRunning(deps.repo, link.projectId, link.ref))) throw new Ending("failed", "import-running");
+    if (busy || deps.taken?.() || (await zoteroImportRunning(deps.repo, link.projectId, link.ref))) throw new Ending("failed", "import-running");
     checkStop();
     const waitUntil = zoteroSyncBackoff(o.backoffUntil, now());
     if (waitUntil !== undefined) throw new Ending("failed", "backing-off", waitUntil);
@@ -584,7 +589,7 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     // Pauses (Accept 3): a refused key pauses every link of the library; a library gone, this link. Not for a refusal
     // that only read a pause already there.
     if (started && run.reason === "key-refused") await settingsChange("the pause", () => pauseAllZoteroSyncLinks(deps.appConfigDir, deps.libraryId, fileOpts));
-    if (started && run.reason === "library-gone") await settingsChange("the pause", () => pauseLink(deps.appConfigDir, deps.libraryId, link.ref, "library-gone", fileOpts));
+    if (started && run.reason === "library-gone") await settingsChange("the pause", async () => void (await pauseLink(deps.appConfigDir, deps.libraryId, link.ref, "library-gone", fileOpts)));
     const saved = await save(2);
     // M3: a record the history could not take says so; the started record on disk then reads stopped / app-closed
     // in every later read (this run no longer runs), which says less than happened, never more.

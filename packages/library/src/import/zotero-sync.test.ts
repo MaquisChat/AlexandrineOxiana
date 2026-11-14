@@ -26,6 +26,7 @@ import { useMemorySecrets, useNoSecretStore } from "../secrets-testing.js";
 import { setSecret } from "../secrets.js";
 import { FakeZotero, guardNetwork, type FakeRequest, type FakeResponse } from "../../tests/zotero/fake-zotero.js";
 import { findBatch, batchDirs } from "./bulk/batch.js";
+import { createBulkImport } from "./bulk/index.js";
 import type { BatchCounts, BatchHandle } from "./bulk/run.js";
 import { startZoteroWebImport, zoteroWebSince } from "./zotero-web.js";
 import {
@@ -379,6 +380,21 @@ describe("the plan's tests", () => {
     expect((await sync(await stored(), { backoffUntil: until })).outcome).toBe("finished");
   });
 
+  it("R252: a run whose library is taken by its caller is refused with its record, and no request is made", async () => {
+    const p = await project();
+    await articles(1);
+    let asked = 0;
+    const r = await sync(await linked(linkOf(p)), {}, { taken: () => (asked++, true) });
+    expect(r).toMatchObject({ outcome: "failed", reason: "import-running" });
+    expect(r.finishedAt).toBeDefined();
+    expect(asked).toBe(1);
+    expect(z.requests).toEqual([]);
+    expect((await history())[0]).toMatchObject({ id: r.id, outcome: "failed", reason: "import-running" });
+    expect(sourceCount(p)).toBe(0);
+    // Not taken: the run goes ahead.
+    expect((await sync(await stored(), {}, { taken: () => false })).outcome).toBe("finished");
+  });
+
   it("a locked project refuses before any request", async () => {
     const p = await project({ encrypted: true });
     await articles(1);
@@ -535,6 +551,20 @@ describe("every way a run ends leaves one honest record", () => {
     const r = await sync(await stored(), { signal: ctl.signal });
     expect(r).toMatchObject({ outcome: "stopped", reason: "app-closed" });
     expect(await libraryBytes()).toEqual(before);
+  });
+
+  it("R248: an abort because the library was closed or moved says so (library-closed), and the record is kept", async () => {
+    const p = await project();
+    await articles(24);
+    const ctl = new AbortController();
+    const onBatch = (_p: string, h: BatchHandle) => {
+      void (async () => {
+        for await (const pr of h.progress) if (pr.done >= 2) return ctl.abort("library-closed");
+      })();
+    };
+    const r = await sync(await linked(linkOf(p)), { signal: ctl.signal }, { onBatch });
+    expect(r).toMatchObject({ outcome: "stopped", reason: "library-closed" });
+    expect((await history())[0]).toMatchObject({ id: r.id, outcome: "stopped", reason: "library-closed" });
   });
 
   it("an abort during the key check is stopped, with no batch", async () => {
@@ -727,6 +757,23 @@ describe("R242: the sync's own batches carry their origin", () => {
     const manual = await startZoteroWebImport(bulkDeps(), p.id, { libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} });
     await manual.done;
     expect((await findBatch(repo, p.id, manual.batchId))!.origin).toBeUndefined();
+  });
+
+  it("R248: the batch list says which batch is the sync's, and of which Zotero library, from the batch's own record", async () => {
+    const p = await project();
+    await articles(1);
+    const manual = await startZoteroWebImport(bulkDeps(), p.id, { libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} });
+    await manual.done;
+    await articles(1);
+    const run = await sync(await linked(linkOf(p)));
+    expect(run.outcome).toBe("finished");
+    // The history plays no part: set aside, the list still says it.
+    await writeFile(join(config, ZOTERO_SYNC_HISTORY_FILE), "{ damaged");
+    const list = await createBulkImport(bulkDeps()).listBatches(p.id);
+    expect(list.find((b) => b.batchId === run.batchId)).toMatchObject({ kind: "zotero-web", origin: "zotero-sync", ref: U });
+    const m = list.find((b) => b.batchId === manual.batchId)!;
+    expect(m).toMatchObject({ kind: "zotero-web", ref: U });
+    expect(m).not.toHaveProperty("origin");
   });
 
   it("a history file set aside does not make the runner lose or duplicate its batch", async () => {

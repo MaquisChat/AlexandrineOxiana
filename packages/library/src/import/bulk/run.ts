@@ -343,6 +343,10 @@ export interface BatchSummary {
   counts: ImportBatch["counts"];
   /** The collections and tags this batch created, by id (R118; see ImportReport.created). */
   created: { collectionIds: string[]; tagIds: string[] };
+  /** R248: "zotero-sync" when the Zotero account sync started it (from the batch's own record). */
+  origin?: "zotero-sync";
+  /** R248: for a Zotero Web batch, its Zotero library (`user:<n>` / `group:<n>`, the record's source location). */
+  ref?: string;
 }
 
 const CAPTURE_METHOD: Record<ImportBatch["source"]["kind"], Provenance["captureMethod"]> = {
@@ -2347,6 +2351,8 @@ export async function listBatches(repo: Repo, projectId: string): Promise<BatchS
         ...(r.finishedAt ? { finishedAt: r.finishedAt } : {}),
         counts: r.counts,
         created: { collectionIds: [...r.createdCollectionIds], tagIds: [...r.createdTagIds] },
+        ...(r.origin === "zotero-sync" ? { origin: r.origin } : {}),
+        ...(r.source.kind === "zotero-web" && typeof r.source.location === "string" ? { ref: r.source.location } : {}),
       });
     } catch {
       // unreadable record: not listed
