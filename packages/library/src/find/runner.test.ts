@@ -42,7 +42,9 @@ import {
   FindUnknownOptionError,
   FindProjectStoppedError,
   FindRunnerClosedError,
+  FindLibraryRefusedError,
   createFindRunner,
+  libraryChancesOf,
   offerLeavesAChoice,
   runnerSeams,
   type FindRunner,
@@ -50,7 +52,8 @@ import {
 } from "./runner.js";
 import { DEFAULT_SEARCH_SETTINGS, FIND_QUEUE_MAX, type FindEntry, type FindState, type SearchSettings } from "./types.js";
 import { SEARCH_SOURCES_FILE, readSearchSettings, writeSearchSettings } from "./settings.js";
-import { FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT } from "@ao/shared";
+import { FIND_LIBRARY_TEXT, FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
+import type { LibraryAccess } from "./where.js";
 
 // ---------------------------------------------------------------------------------------------------------------
 // The world: a library with an index, made-up search services, a fake clock and fake timers.
@@ -4544,5 +4547,490 @@ describe("R297 c: a key added wakes the entries waiting for OpenAlex's daily all
     r.stop(q.id);
     await r.wakeAllowance(q.id);
     expect(await entryOf(q, w)).toEqual(stopped);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F15 (R324 a, b, c): "Get through my library" — who may start, the start, the five ways back, one ticket for the
+// whole service, the pause after a hand-over (through F17's seam). Nothing here reaches any network: the runner never
+// fetches from the library (the address and the ticket are only returned).
+
+describe("F15: a fetch through the researcher's library", () => {
+  const EZ: LibraryAccess = { kind: "ezproxy-login", base: "https://ezproxy.lib-f15.example.edu/login?url=" };
+  const OU: LibraryAccess = { kind: "openurl", base: "https://resolver.lib-f15.example.edu/openurl" };
+  const DOI = "10.5555/ao.f15.recognisable";
+  type Rest = { state: FindState; reason?: FindEntry["reason"] };
+  /** The resting states of the copy part a start is allowed from (R324 a). */
+  const RESTING: Rest[] = [
+    { state: "no-open-copy" },
+    { state: "no-open-copy", reason: { code: "copy-some-unreachable" } },
+    { state: "no-open-copy", reason: { code: "not-this-file" } },
+    { state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } },
+    { state: "record-complete", reason: { code: "switched-off", by: "settings" } },
+  ];
+  /** Rules under which a resting entry stays as it is at a resume (free copies not allowed: nothing is asked). */
+  const NO_FREE = GOV("acquireMethods: [reference_lookup, library_access]");
+  const draft = (o: { doi?: string | null; isbn?: string[]; type?: SourceDraft["type"] }): SourceDraft => ({
+    ...draftOf(ZORBLATT),
+    ...(o.type ? { type: o.type } : {}),
+    identifiers: { ...(o.doi === null ? {} : { doi: o.doi ?? DOI }), ...(o.isbn ? { isbn: o.isbn } : {}) },
+  });
+  async function record(p: Project, o: { doi?: string | null; isbn?: string[]; identifiable?: boolean; type?: SourceDraft["type"] } = {}): Promise<string> {
+    const sf = await repo.createSource(p.id, draft(o), [], {
+      provenance: { captureMethod: "reference_lookup", capturedAt: new Date(NOW).toISOString(), tool: { name: FIND_TOOL, version: "0" }, fileHashes: {}, legal: { status: "unknown" }, identifiable: o.identifiable === true },
+    });
+    return sf.source.id;
+  }
+  async function resting(p: Project, rest: Rest, sid?: string): Promise<FindEntry> {
+    const at = new Date(NOW).toISOString();
+    const e: FindEntry = { id: newId(), projectId: p.id, typed: "Zorblatt Grammar F15", state: rest.state, ...(rest.reason ? { reason: rest.reason } : {}), createdAt: at, updatedAt: at, attempts: 0, sourceId: sid ?? (await record(p)) };
+    await appendFindEntries(coreOf(), p.id, [e], "add");
+    return e;
+  }
+  const refusal = async (p: Promise<unknown>): Promise<FindLibraryRefusedError> => {
+    const err = await p.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(FindLibraryRefusedError);
+    return err as FindLibraryRefusedError;
+  };
+  async function fillHeld(p: Project, n: number): Promise<void> {
+    const sid = await record(p, { doi: "10.5555/ao.f15.other" });
+    const scratch = join(tmp, "f15-held.pdf");
+    await writeFile(scratch, await buildPdf({ title: "Another Paper", lines: ["Another Paper"] }));
+    const at = new Date(NOW).toISOString();
+    const waiting: FindEntry[] = Array.from({ length: n }, () => ({ id: newId(), projectId: p.id, typed: "x y", state: "fetching", createdAt: at, updatedAt: at, attempts: 0, sourceId: sid }));
+    await appendFindEntries(coreOf(), p.id, waiting, "add");
+    for (const w of waiting) {
+      await holdMismatchedFile(coreOf(), p.id, {
+        entry: { ...w, state: "needs-check", reason: { code: "file-title-absent" } },
+        sourceId: sid,
+        fromPath: scratch,
+        facts: { why: "title-absent", kind: "pdf", bytes: 1, acquired: { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at, tool: { name: FIND_TOOL, version: "0" }, access: "public" } },
+      });
+    }
+  }
+  const sameRest = (e: FindEntry | undefined, rest: Rest) => {
+    expect(e!.state).toBe(rest.state);
+    expect(e!.reason).toEqual(rest.reason);
+    expect(e!.returnTo).toBeUndefined();
+  };
+
+  it("R324 a: the table — every resting state and reason of the copy part: whether a start is offered, and whether links are given", async () => {
+    const p = await project();
+    const rows: Array<{ rest: Rest; start: boolean; links: boolean }> = [
+      ...RESTING.map((rest) => ({ rest, start: true, links: true })),
+      { rest: { state: "no-open-copy", reason: { code: "library-unfinished" } }, start: true, links: true },
+      { rest: { state: "no-open-copy", reason: { code: "record-removed" } }, start: false, links: false },
+      { rest: { state: "record-complete" }, start: false, links: false },
+      { rest: { state: "record-complete", reason: { code: "held-full" } }, start: false, links: false },
+      { rest: { state: "record-complete", reason: { code: "copy-store-not-allowed", by: "rules" } }, start: false, links: false },
+      { rest: { state: "record-complete", reason: { code: "copy-no-legal-basis", by: "rules" } }, start: false, links: false },
+      { rest: { state: "failed", reason: { code: "unreachable" } }, start: false, links: false },
+      { rest: { state: "failed", reason: { code: "held-full" } }, start: false, links: false },
+      { rest: { state: "looking-for-copy" }, start: false, links: false },
+      { rest: { state: "fetching" }, start: false, links: false },
+      { rest: { state: "in-library" }, start: false, links: false },
+      { rest: { state: "needs-check", reason: { code: "file-looks-right" } }, start: false, links: false },
+      { rest: { state: "needs-check", reason: { code: "file-other-doi" } }, start: false, links: false },
+      { rest: { state: "waiting-sign-in" }, start: false, links: false },
+    ];
+    const made = [];
+    for (const row of rows) made.push({ ...row, e: await resting(p, row.rest) });
+    const r = runner();
+    const view = await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: EZ, atWork: (id) => r.atWork(p.id, id) });
+    for (const m of made) {
+      const v = view.get(m.e.id);
+      expect(!!v, `links for ${JSON.stringify(m.rest)}`).toBe(m.links);
+      expect(v?.chance === "yes", `start for ${JSON.stringify(m.rest)}`).toBe(m.start);
+    }
+    // No library set: the same entries say why (the researcher's to mend), no other.
+    const unset = await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: null });
+    for (const m of made) expect(unset.get(m.e.id)?.chance, JSON.stringify(m.rest)).toBe(m.start ? "no-library" : undefined);
+  });
+
+  it("R324 a: not offered for an entry whose record has a file, has a file waiting for the check, is at work, has no DOI or ISBN, or whose rules forbid it", async () => {
+    const p = await project();
+    const r = runner();
+    const view = async (access: LibraryAccess | null = EZ, q: Project = p) => libraryChancesOf(repo, q.id, (await queue(q)).values(), { access, atWork: (id) => r.atWork(q.id, id) });
+    // A file already in the record.
+    const withFile = await resting(p, RESTING[0]!);
+    const mine = join(tmp, "f15-mine.pdf");
+    await writeFile(mine, await buildPdf({ title: "Mine", lines: ["Mine"] }));
+    await addCapturedOriginal(repo, p.id, withFile.sourceId!, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+    // A file waiting for the check: another entry of the same record holds one.
+    const sid = await record(p);
+    const waitingFor = await resting(p, RESTING[1]!, sid);
+    await resting(p, { state: "needs-check", reason: { code: "file-title-absent" } }, sid);
+    // At work: the runner has it queued (a resume puts a record-complete entry in the copy part's line).
+    const atWork = await resting(p, RESTING[3]!);
+    // Without a DOI or ISBN.
+    const bare = await resting(p, RESTING[0]!, await record(p, { doi: null }));
+    // An ISBN alone: an address through a resolver, none through EZproxy.
+    const isbnOnly = await resting(p, RESTING[0]!, await record(p, { doi: null, isbn: ["9780674212770"], type: "book" }));
+    const plain = await resting(p, RESTING[0]!);
+    settingsFn = () => new Promise(() => {}); // the copy part waits on the settings: the entry stays at work
+    r.resume(p.id);
+    await until(() => r.atWork(p.id, atWork.id), "the entry to be at work");
+    const v = await view();
+    expect(v.get(withFile.id)!.chance).toBeUndefined();
+    expect(v.get(waitingFor.id)!.chance).toBeUndefined();
+    expect(v.get(atWork.id)!.chance).toBeUndefined();
+    expect(v.get(bare.id)!.chance).toBeUndefined();
+    expect(v.get(isbnOnly.id)!.chance).toBeUndefined();
+    expect((await view(OU)).get(isbnOnly.id)!.chance).toBe("yes");
+    expect(v.get(plain.id)!.chance).toBe("yes");
+    // Links are given all the same (R324 d: "where to get it" does not depend on a start).
+    for (const e of [withFile, waitingFor, atWork, bare, isbnOnly]) expect(v.get(e.id)!.work.title).toBe(ZORBLATT.title);
+    // The rules forbid library_access.
+    const q = await project({ gov: GOV("acquireMethods: [reference_lookup, free_copy]") });
+    const forbidden = await resting(q, RESTING[0]!);
+    expect((await view(EZ, q)).get(forbidden.id)!.chance).toBeUndefined();
+    await expect(r.libraryStart(q.id, forbidden.id, EZ)).rejects.toMatchObject({ code: "not-offered" });
+  });
+
+  it("R328 g: with no library set, \"no-library\" is said only for an entry with a DOI; an ISBN alone carries no such promise", async () => {
+    const p = await project();
+    runner();
+    const withDoi = await resting(p, RESTING[0]!);
+    const isbnOnly = await resting(p, RESTING[0]!, await record(p, { doi: null, isbn: ["9780674212770"], type: "book" }));
+    const both = await resting(p, RESTING[0]!, await record(p, { isbn: ["9780674212770"], type: "book" }));
+    const unset = await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: null });
+    expect(unset.get(withDoi.id)!.chance).toBe("no-library");
+    expect(unset.get(both.id)!.chance).toBe("no-library");
+    expect(unset.get(isbnOnly.id)!.chance).toBeUndefined();
+    // Its links are given all the same.
+    expect(unset.get(isbnOnly.id)!.work.identifiers.isbn).toEqual(["9780674212770"]);
+    // Once a resolver is set, the ISBN alone may start (as before); through EZproxy it may not.
+    expect((await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: OU })).get(isbnOnly.id)!.chance).toBe("yes");
+    expect((await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: EZ })).get(isbnOnly.id)!.chance).toBeUndefined();
+  });
+
+  it("R324 a: not offered when the rules would not let the file be kept (a missing legal basis)", async () => {
+    const ident = (basis: boolean) => `identifiability:\n  containsIdentifiable: true\n  pseudonymizeFileNames: false\nencryption:\n  atRest: optional\nconsent:\n  requireLegalBasis: ${basis}\nprocessing:\n  metadata_lookup: [crossref, openalex]\n`;
+    const p = await project({ gov: ident(false) });
+    const e = await resting(p, RESTING[0]!, await record(p, { identifiable: true }));
+    const r = runner();
+    expect((await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: EZ })).get(e.id)!.chance).toBe("yes");
+    const { sha256 } = await repo.getGovernance(p.id);
+    await repo.setGovernance(p.id, ident(true), { baseSha256: sha256 });
+    expect((await libraryChancesOf(repo, p.id, (await queue(p)).values(), { access: EZ })).get(e.id)!.chance).toBeUndefined();
+    expect((await refusal(r.libraryStart(p.id, e.id, EZ))).code).toBe("not-offered");
+    expect((await entryOf(p, e.id))!.state).toBe("no-open-copy");
+  });
+
+  it("the start: the entry waits in the sign-in window, keeps what it returns to, and the address and a ticket are returned (only)", async () => {
+    const p = await project();
+    const e = await resting(p, RESTING[3]!);
+    const r = runner();
+    const n = changes.length;
+    const got = await r.libraryStart(p.id, e.id, EZ);
+    expect(got.url).toBe(`${EZ.base}https://doi.org/${DOI}`);
+    expect(got.ticket).toMatch(/^[0-9a-f]{32}$/u);
+    const w = (await entryOf(p, e.id))!;
+    expect(w.state).toBe("waiting-sign-in");
+    expect(w.reason).toBeUndefined();
+    expect(w.returnTo).toEqual({ state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } });
+    expect(got.entry).toEqual(w);
+    // The event: three fields, nothing of the address or the ticket.
+    expect(changes.slice(n)).toEqual([{ projectId: p.id, entryId: e.id, state: "waiting-sign-in" }]);
+    // The audit: a library fetch started for an entry of the project, with the method; nothing of the address.
+    const audit = await auditText(p);
+    expect(audit).toContain('"op":"project.find.library-start"');
+    expect(audit).toContain('"method":"library_access"');
+    expect(audit).toContain(e.id);
+    for (const secret of [got.ticket, "ezproxy", "lib-f15", DOI, "doi.org"]) expect(audit).not.toContain(secret);
+    // The queue file holds what it returns to, and nothing of the address or the ticket.
+    const qfile = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"), "utf8");
+    for (const secret of [got.ticket, "ezproxy", "lib-f15"]) expect(qfile).not.toContain(secret);
+    // The runner's notes hold nothing of it either.
+    for (const secret of [got.ticket, "lib-f15", DOI]) expect(notes.join("\n")).not.toContain(secret);
+    // A start is never made by the runner itself: a resume, a retry or a wake leaves it as it is.
+    await expect(r.retry(p.id, e.id)).rejects.toBeInstanceOf(FindEntryStateError);
+  });
+
+  it("R324 b: the five ways back — cancel, the ticket running out, start-up, a lock, a close — from each resting state: exactly what it was, and the ticket gone", async () => {
+    for (const rest of RESTING) {
+      // 1. Cancel.
+      {
+        const p = await project({ gov: NO_FREE });
+        const e = await resting(p, rest);
+        const r = runner();
+        const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+        const back = await r.libraryCancel(p.id, e.id);
+        sameRest(back, rest);
+        sameRest(await entryOf(p, e.id), rest);
+        expect(r.libraryHandedOver(ticket)).toBeNull();
+        await r.stopAll();
+      }
+      // 2. The ticket runs out (30 minutes).
+      {
+        const p = await project({ gov: NO_FREE });
+        const e = await resting(p, rest);
+        const r = runner();
+        const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+        timers.advance(LIBRARY_TICKET_MS - 1);
+        expect((await entryOf(p, e.id))!.state).toBe("waiting-sign-in");
+        timers.advance(1);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
+        sameRest(await entryOf(p, e.id), rest);
+        expect(r.libraryHandedOver(ticket)).toBeNull();
+        await r.stopAll();
+      }
+      // 3. Start-up: a new runner (the ticket was in memory only) returns it at resume.
+      {
+        const p = await project({ gov: NO_FREE });
+        const e = await resting(p, rest);
+        const r = runner();
+        const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+        // The process "died": nothing more of this runner (its ticket went with it).
+        const r2 = runner();
+        expect(r2.libraryHandedOver(ticket)).toBeNull();
+        r2.resume(p.id);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
+        sameRest(await entryOf(p, e.id), rest);
+        await r.stopAll();
+        await r2.stopAll();
+      }
+      // 4. The project locked (its key gone: nothing can be written), then unlocked.
+      {
+        const p = await project({ gov: NO_FREE, encrypted: true });
+        const e = await resting(p, rest);
+        const r = runner();
+        const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+        r.stop(p.id);
+        repo.lockProject(p.id);
+        expect(r.libraryHandedOver(ticket)).toBeNull();
+        await repo.unlockProject(p.id, "pw");
+        r.resume(p.id);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
+        sameRest(await entryOf(p, e.id), rest);
+        await r.stopAll();
+      }
+      // 5. The library closed (stopAll): the ticket ends at once; the entry comes back at the next open.
+      {
+        const p = await project({ gov: NO_FREE });
+        const e = await resting(p, rest);
+        const r = runner();
+        const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+        await r.stopAll();
+        expect(r.libraryHandedOver(ticket)).toBeNull();
+        const r2 = runner();
+        r2.resume(p.id);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
+        sameRest(await entryOf(p, e.id), rest);
+        await r2.stopAll();
+      }
+    }
+  });
+
+  it("R324 b: an entry found waiting at start-up with nothing kept to return to (an older build's line, or damaged) is no-open-copy, saying so honestly", async () => {
+    const p = await project({ gov: NO_FREE });
+    const e = await resting(p, { state: "waiting-sign-in" });
+    expect((await entryOf(p, e.id))!.returnTo).toBeUndefined();
+    const r = runner();
+    r.resume(p.id);
+    await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
+    expect(await entryOf(p, e.id)).toMatchObject({ state: "no-open-copy", reason: { code: "library-unfinished" } });
+    expect(FIND_REASON_TEXT["library-unfinished"]).toMatch(/^[A-Z].*\.$/u);
+  });
+
+  it("a resume while a ticket is open (the rules saved) leaves that entry waiting", async () => {
+    const p = await project({ gov: NO_FREE });
+    const e = await resting(p, RESTING[0]!);
+    const r = runner();
+    const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+    r.resume(p.id);
+    await new Promise((res) => setTimeout(res, 100));
+    expect((await entryOf(p, e.id))!.state).toBe("waiting-sign-in");
+    expect(r.libraryHandedOver(ticket)).toEqual({ projectId: p.id, entryId: e.id });
+  });
+
+  it("R324 c: one ticket at a time for the whole service — two starts at the same moment, in two projects, give exactly one", async () => {
+    const p1 = await project();
+    const p2 = await project();
+    const e1 = await resting(p1, RESTING[0]!);
+    const e2 = await resting(p2, RESTING[0]!);
+    const r = runner();
+    const both = await Promise.allSettled([r.libraryStart(p1.id, e1.id, EZ), r.libraryStart(p2.id, e2.id, EZ)]);
+    expect(both.filter((x) => x.status === "fulfilled")).toHaveLength(1);
+    const no = both.find((x) => x.status === "rejected") as PromiseRejectedResult;
+    expect(no.reason).toBeInstanceOf(FindLibraryRefusedError);
+    expect(no.reason.code).toBe("busy");
+    expect(no.reason.message).toBe(FIND_LIBRARY_TEXT.busy);
+    // The refused one was not changed.
+    const states = [(await entryOf(p1, e1.id))!.state, (await entryOf(p2, e2.id))!.state].sort();
+    expect(states).toEqual(["no-open-copy", "waiting-sign-in"]);
+  });
+
+  it("R324 c: the pause after a hand-over, through F17's seam — refused with the seconds left, then allowed; two quick presses cannot skip it", async () => {
+    const p = await project();
+    const [a, b, c] = [await resting(p, RESTING[0]!), await resting(p, RESTING[0]!), await resting(p, RESTING[0]!)];
+    const r = runner();
+    const { ticket } = await r.libraryStart(p.id, a.id, EZ);
+    // A wrong, a used and a malformed ticket are told apart from nothing: null.
+    expect(r.libraryHandedOver("0".repeat(32))).toBeNull();
+    expect(r.libraryHandedOver(ticket.toUpperCase())).toBeNull();
+    expect(r.libraryHandedOver(42)).toBeNull();
+    expect(r.libraryHandedOver(ticket)).toEqual({ projectId: p.id, entryId: a.id });
+    expect(r.libraryHandedOver(ticket)).toBeNull();
+    // The handed-over entry waits for the file's check (F17's): it is not returned by the seam.
+    expect((await entryOf(p, a.id))!.state).toBe("waiting-sign-in");
+    const first = await refusal(r.libraryStart(p.id, b.id, EZ));
+    expect(first.code).toBe("pause");
+    expect(first.message).toBe(libraryReadyIn(20));
+    expect(first.message).toBe("Ready in 20 seconds.");
+    timers.now += 19_001;
+    const later = await refusal(r.libraryStart(p.id, b.id, EZ));
+    expect(later.message).toBe("Ready in 1 second.");
+    expect((await entryOf(p, b.id))!.state).toBe("no-open-copy");
+    timers.now += 999;
+    // Two quick presses after the pause: one ticket, the other refused as busy.
+    const both = await Promise.allSettled([r.libraryStart(p.id, b.id, EZ), r.libraryStart(p.id, c.id, EZ)]);
+    expect(both.filter((x) => x.status === "fulfilled")).toHaveLength(1);
+    expect(((both.find((x) => x.status === "rejected") as PromiseRejectedResult).reason as FindLibraryRefusedError).code).toBe("busy");
+    expect(LIBRARY_PAUSE_MS).toBe(20_000);
+  });
+
+  it("R328 f: the time of the last hand-over is the caller's (a runner made anew sees it); a clock stepped back never shows more than the pause", async () => {
+    const p = await project();
+    const [a, b] = [await resting(p, RESTING[0]!), await resting(p, RESTING[0]!)];
+    let kept = Number.NEGATIVE_INFINITY;
+    const handOver = { get: () => kept, set: (at: number) => void (kept = at) };
+    const r1 = runner({ libraryHandOver: handOver });
+    const { ticket } = await r1.libraryStart(p.id, a.id, EZ);
+    expect(r1.libraryHandedOver(ticket)).toEqual({ projectId: p.id, entryId: a.id });
+    expect(kept).toBe(timers.now);
+    await r1.stopAll();
+    // The library closed and opened again: a new runner, the same pause.
+    const r2 = runner({ libraryHandOver: handOver });
+    timers.now += 5_000;
+    expect((await refusal(r2.libraryStart(p.id, b.id, EZ))).message).toBe("Ready in 15 seconds.");
+    // The clock stepped back an hour: at most the pause's own length, and the pause then really ends after it.
+    timers.now -= 3_600_000;
+    const back = await refusal(r2.libraryStart(p.id, b.id, EZ));
+    expect(back.code).toBe("pause");
+    expect(back.message).toBe("Ready in 20 seconds.");
+    timers.now += 19_000;
+    expect((await refusal(r2.libraryStart(p.id, b.id, EZ))).message).toBe("Ready in 1 second.");
+    timers.now += 1_000;
+    expect((await r2.libraryStart(p.id, b.id, EZ)).ticket).toMatch(/^[0-9a-f]{32}$/u);
+  });
+
+  describe("R328 e: the queue's view reads a record only when it changed", () => {
+    /** How many records of `projectId` were read since the last call. */
+    const reads = (projectId: string) => {
+      const spy = vi.spyOn(repo, "getSource");
+      return () => {
+        const n = spy.mock.calls.filter(([pid]) => pid === projectId).length;
+        spy.mockClear();
+        return n;
+      };
+    };
+
+    it("a second read with nothing changed reads no record; a changed DOI is read once and seen; a deleted record is gone", async () => {
+      const p = await project({ gov: NO_FREE });
+      const entries = [await resting(p, RESTING[0]!), await resting(p, RESTING[1]!), await resting(p, RESTING[3]!)];
+      const r = runner();
+      const count = reads(p.id);
+      const first = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(3);
+      for (const e of entries) expect(first.get(e.id)!.chance).toBe("yes");
+      const second = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(0);
+      expect([...second.entries()]).toEqual([...first.entries()]);
+      // The DOI edited: that record (only) is read again, and its new DOI is in the view.
+      await repo.updateSource(p.id, entries[0]!.sourceId!, { identifiers: { doi: "10.5555/ao.f15.changed" } });
+      const third = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(1);
+      expect(third.get(entries[0]!.id)!.work.identifiers.doi).toBe("10.5555/ao.f15.changed");
+      // The DOI removed: no start (the address needs it).
+      await repo.updateSource(p.id, entries[1]!.sourceId!, { identifiers: {} });
+      const fourth = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(1);
+      expect(fourth.get(entries[1]!.id)!.work.identifiers.doi).toBeUndefined();
+      expect(fourth.get(entries[1]!.id)!.chance).toBeUndefined();
+      // The record deleted: the entry has no view parts.
+      await repo.deleteSource(p.id, entries[2]!.sourceId!);
+      expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).has(entries[2]!.id)).toBe(false);
+      // A record changed outside the app (its file rewritten) is read again too.
+      const before = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      count();
+      const file = join(lib.root, (await repo.getSource(p.id, entries[0]!.sourceId!)).source.folder, "source.json");
+      count();
+      const text = await readFile(file, "utf8");
+      await writeFile(file, text.replace("10.5555/ao.f15.changed", "10.5555/ao.f15.outside"));
+      const after = await r.libraryChances(p.id, (await queue(p)).values(), EZ);
+      expect(count()).toBe(1);
+      expect(after.get(entries[0]!.id)!.work.identifiers.doi).toBe("10.5555/ao.f15.outside");
+      expect(before.get(entries[0]!.id)!.work.identifiers.doi).toBe("10.5555/ao.f15.changed");
+    });
+
+    it("what is kept is what the view needs; never another project's record; nothing after a lock or a close", async () => {
+      const p = await project({ gov: NO_FREE, encrypted: true });
+      const q = await project({ gov: NO_FREE });
+      const e = await resting(p, RESTING[0]!);
+      const f = await resting(q, RESTING[0]!, e.sourceId); // the same id asked for in another project: never served from p's
+      const r = runner();
+      const countP = reads(p.id);
+      const v = (await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!;
+      expect(Object.keys(v.work).sort()).toEqual(["creators", "id", "identifiers", "providers", "title", "type"]);
+      expect(v.work.providers).toEqual([]);
+      expect(v.work.creators).toEqual([{ role: "author", family: ZORBLATT.family }]);
+      expect(countP()).toBe(1);
+      expect((await r.libraryChances(q.id, (await queue(q)).values(), EZ)).has(f.id)).toBe(false);
+      // Locked: nothing is given, from the cache or otherwise; at the unlock the record is read anew (it was dropped).
+      r.stop(p.id);
+      repo.lockProject(p.id);
+      expect((await r.libraryChances(p.id, [e], EZ)).size).toBe(0);
+      await repo.unlockProject(p.id, "pw");
+      countP();
+      expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!.chance).toBe("yes");
+      expect(countP()).toBe(1);
+      // Closed: nothing at all.
+      await r.stopAll();
+      await expect(r.libraryChances(p.id, (await queue(p)).values(), EZ)).rejects.toBeInstanceOf(FindRunnerClosedError);
+      expect(countP()).toBe(0);
+    });
+  });
+
+  it("an expired ticket is not taken by the seam, and its entry comes back", async () => {
+    const p = await project({ gov: NO_FREE });
+    const e = await resting(p, RESTING[0]!);
+    const r = runner();
+    const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+    timers.now += LIBRARY_TICKET_MS; // the clock has passed the end, whether or not its timer has run yet
+    expect(r.libraryHandedOver(ticket)).toBeNull();
+    await until(async () => (await entryOf(p, e.id))!.state === "no-open-copy", "the entry to come back");
+  });
+
+  it(`R324 a: refused while ${FIND_HELD_MAX} files wait for the check, with the plan's sentence; refused without a library; refused on a read-only library`, async () => {
+    const p = await project();
+    const e = await resting(p, RESTING[0]!);
+    const r = runner();
+    const none = await refusal(r.libraryStart(p.id, e.id, null));
+    expect(none.code).toBe("no-library");
+    expect(none.message).toBe(FIND_LIBRARY_TEXT.noLibrary);
+    await fillHeld(p, FIND_HELD_MAX);
+    const full = await refusal(r.libraryStart(p.id, e.id, EZ));
+    expect(full.code).toBe("held-full");
+    expect(full.message).toBe("50 files are already waiting for your check. Decide on some of them, then try again.");
+    expect((await entryOf(p, e.id))!.state).toBe("no-open-copy");
+    // A read-only library refuses before anything.
+    const ro = await repoFor({ ...lib, mode: "read-only", readOnlyReason: "locked-by-other-device" });
+    const r2 = runner({ repo: ro });
+    await expect(r2.libraryStart(p.id, e.id, EZ)).rejects.toBeInstanceOf(ReadOnlyLibraryError);
+  });
+
+  it("removing a waiting entry ends its ticket; the queue's own rules are kept (one entry, waiting-sign-in)", async () => {
+    const p = await project();
+    const e = await resting(p, RESTING[0]!);
+    const r = runner();
+    const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+    await r.remove(p.id, e.id);
+    expect(r.libraryHandedOver(ticket)).toBeNull();
+    const other = await resting(p, RESTING[0]!);
+    await expect(appendFindEntries(coreOf(), p.id, [{ ...other, state: "no-open-copy" }], "library-start")).rejects.toBeInstanceOf(InvalidInputError);
   });
 });
