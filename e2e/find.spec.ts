@@ -23,7 +23,7 @@
  * lookups are paced by the product (Crossref one at a time) and the machine may be loaded.
  */
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR } from "./paths.js";
@@ -203,6 +203,67 @@ function plantWorks(app: AppHarness, o: { library: string; projectId: string; pa
   return JSON.parse(r.stdout) as string[];
 }
 
+/**
+ * After `app.restart()` the new service reopens the last library by itself (main.ts `reopenLast`): wait until it says
+ * the library is open before the screen is opened (R281 e). `GET /libraries` itself waits once for that attempt.
+ */
+async function libraryOpenAgain(app: AppHarness): Promise<void> {
+  await expect
+    .poll(async () => {
+      const r = await app.api<{ current?: { libraryId?: string } }>("GET", "/libraries");
+      return r.status === 200 && typeof r.body.current?.libraryId === "string";
+    }, { timeout: STATE_TIMEOUT })
+    .toBe(true);
+}
+
+// ---------- kept for a failing run (R281 e): the page's requests with their answers, and the service's log ----------
+
+interface RequestNote {
+  at: number;
+  line: string;
+}
+const requestNotes = new WeakMap<Page, { notes: RequestNote[]; pending: Map<object, string>; t0: number }>();
+
+test.beforeEach(async ({ page }) => {
+  const rec = { notes: [] as RequestNote[], pending: new Map<object, string>(), t0: Date.now() };
+  requestNotes.set(page, rec);
+  const at = () => Date.now() - rec.t0;
+  page.on("request", (r) => {
+    const line = `${r.method()} ${r.url()}`;
+    rec.pending.set(r, line);
+    rec.notes.push({ at: at(), line: `→ ${line}` });
+  });
+  page.on("requestfinished", (r) => {
+    rec.pending.delete(r);
+    void r.response().then(
+      async (res) => {
+        const status = res?.status() ?? 0;
+        // The body of an answer that is not a success (a refusal's sentence, an error code); never a success's body.
+        const body = res && status >= 400 ? (await res.text().catch(() => "")).slice(0, 400) : "";
+        rec.notes.push({ at: at(), line: `← ${status} ${r.method()} ${r.url()}${body ? ` ${body}` : ""}` });
+      },
+      () => rec.notes.push({ at: at(), line: `← (no answer read) ${r.method()} ${r.url()}` }),
+    );
+  });
+  page.on("requestfailed", (r) => {
+    rec.pending.delete(r);
+    rec.notes.push({ at: at(), line: `✗ ${r.method()} ${r.url()} ${r.failure()?.errorText ?? ""}` });
+  });
+});
+
+test.afterEach(async ({ page, app }, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) return;
+  const rec = requestNotes.get(page);
+  const lines = (rec?.notes ?? []).sort((a, b) => a.at - b.at).map((n) => `${String(n.at).padStart(7)} ms ${n.line}`);
+  for (const line of rec?.pending.values() ?? []) lines.push(`  (still waiting for an answer) ${line}`);
+  const requests = testInfo.outputPath("page-requests.txt");
+  writeFileSync(requests, lines.join("\n"));
+  await testInfo.attach("page-requests", { path: requests, contentType: "text/plain" });
+  const log = testInfo.outputPath("service-log.txt");
+  writeFileSync(log, app.log());
+  await testInfo.attach("service-log-file", { path: log, contentType: "text/plain" });
+});
+
 // ---------- the plan's first scenario ----------
 
 test("add, choose, complete, already, survives a restart", async ({ page, app }) => {
@@ -312,6 +373,7 @@ test("add, choose, complete, already, survives a restart", async ({ page, app })
     expect(before.map((r) => r.state)).toEqual([WORDS.recordComplete, WORDS.recordComplete, WORDS.already]);
     fileBefore = queueFile(libraryPath, projectFolder);
     await app.restart();
+    await libraryOpenAgain(app);
     await openFind(page, projectId);
     await expect(rows(page)).toHaveCount(3, { timeout: STATE_TIMEOUT });
     await expect(stateOf(page, 2)).toHaveText(WORDS.already, { timeout: STATE_TIMEOUT });
@@ -552,6 +614,7 @@ test("after a restart nothing is looked up twice", async ({ page, app }) => {
   await test.step("quit and reopen: the same entries in the same states, the same words; the queue file untouched", async () => {
     const shown = await shownQueue(page);
     await app.restart();
+    await libraryOpenAgain(app);
     await openFind(page, projectId);
     await expect(rows(page)).toHaveCount(2, { timeout: STATE_TIMEOUT });
     await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
@@ -575,5 +638,115 @@ test("after a restart nothing is looked up twice", async ({ page, app }) => {
     const a = (await queueOf(app, projectId)).entries.find((e) => e.typed === SURE_A)!;
     const a0 = before!.entries.find((e) => e.typed === SURE_A)!;
     expect([a.id, a.state, a.updatedAt]).toEqual([a0.id, "record-complete", a0.updatedAt]);
+  });
+});
+
+// ---------- an author alone (Task F9; R267, R270, R271) ----------
+
+/**
+ * An author's name typed alone. The recorded answers (packages/library/tests/fixtures/lookup/answers.json) for the
+ * addresses this line makes the app ask:
+ *  - the works search: Crossref's answer cut by hand (`crossref-find-stark-handbuilt.json`: the envelope recorded from
+ *    the service, its five entries about people of that name — reference works with dates of birth and posts —
+ *    replaced by Crossref's own records of five of the sociologist's articles; R281 d) and OpenAlex's built by hand from
+ *    five of his works (`openalex-find-stark-handbuilt.json`) — no title covers 0.6 of the line, it holds no digit and
+ *    two words, so the people search is asked (`peopleSearchWanted`);
+ *  - the people search: built by hand from OpenAlex's own records of two real people of that name (the sociologist,
+ *    A5055013655, and a historian of colonial Brazil, A5108208998; `openalex-find-stark-people-handbuilt.json`) — both
+ *    names cover both typed words, so the app asks which person is meant (`decidePerson`: "several");
+ *  - the sociologist's works, newest first: built by hand from OpenAlex's records of eighteen of his works, each read
+ *    by its DOI (`openalex-find-stark-works-handbuilt.json`, one page, its count 18);
+ *  - each work ticked: OpenAlex's single-work answer recorded from the service (`openalex-work-W….json`), whose DOI
+ *    and title are those kept for choosing, so each record is made without asking (R271 M4).
+ */
+const AUTHOR = "David Stark";
+/** What tells the sociologist from the other David Stark in the dialog: the first subject he works on. */
+const PERSON_SUBJECT = "Post-Communist Economic and Political Transition";
+const OTHER_SUBJECT = "Colonialism, slavery, and trade";
+/** His works listed (all 18), and those from 2015 on (the filter "From year" used once). */
+const STARK_LISTED = 18;
+const STARK_FROM_2015 = 6;
+/** The three works ticked, with the DOIs their records must carry. */
+const STARK_TICKED = [
+  { title: "Put to the test: For a new sociology of testing", doi: "10.1111/1468-4446.12746" },
+  { title: "For What It’s Worth", doi: "10.1108/s0733-558x20170000052011" },
+  { title: "Game Changer: The Topology of Creativity", doi: "10.1086/681213" },
+];
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+
+test("an author alone, the person, three works", async ({ page, app }) => {
+  let projectId = "";
+  const authorRow = () => rows(page).filter({ has: page.locator("[data-entry-text]", { hasText: `Author: ${AUTHOR}` }) });
+  const addedRows = () => rows(page).filter({ has: page.locator(".ao-find__origin", { hasText: `Added from “${AUTHOR}”` }) });
+
+  await test.step("set-up: a library and a project with the default lookups; the screen opened", async () => {
+    ({ projectId } = await libraryWithProject(app, page, { library: "Author library", project: "One person's works", governanceYaml: LOOKUP_RULES }));
+    await openFind(page, projectId);
+  });
+
+  await test.step("the name typed alone: the row reads “Author: David Stark” and “2 people match”", async () => {
+    await addLines(page, [AUTHOR]);
+    await expect(authorRow()).toHaveCount(1);
+    await expect(authorRow().locator(".ao-find__state")).toHaveText("2 people match", { timeout: STATE_TIMEOUT });
+    // Nothing was made by itself.
+    expect((await sources(app, projectId)).total).toBe(0);
+  });
+
+  await test.step("“Choose the person”: the two people, told apart by what they work on; the sociologist chosen", async () => {
+    await page.getByRole("button", { name: act("Choose the person", AUTHOR) }).click();
+    const dialog = page.getByRole("dialog", { name: `Choose the person for “${AUTHOR}”` });
+    await expect(dialog).toBeVisible();
+    const people = dialog.getByRole("radio", { name: AUTHOR, exact: true });
+    await expect(people).toHaveCount(2, { timeout: STATE_TIMEOUT });
+    await expect(people.nth(0)).toBeFocused();
+    await expect(people.nth(0)).toHaveAccessibleDescription(new RegExp(escapeRe(`Works on: ${PERSON_SUBJECT}`)));
+    await expect(people.nth(1)).toHaveAccessibleDescription(new RegExp(escapeRe(`Works on: ${OTHER_SUBJECT}`)));
+    await expect(dialog.getByText("To choose another person later, remove this entry and type the name again.")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "This is the person" })).toBeDisabled();
+    await people.nth(0).check();
+    await dialog.getByRole("button", { name: "This is the person" }).click();
+    await expect(dialog).toHaveCount(0);
+    // The works are fetched by the runner; the row says so when they have come.
+    await expect(authorRow().locator(".ao-find__state")).toHaveText("Choose works", { timeout: STATE_TIMEOUT });
+  });
+
+  await test.step("“Choose works”: his 18 works newest first; “From year” 2015 narrows them to 6; three ticked and added", async () => {
+    await page.getByRole("button", { name: act("Choose works", AUTHOR) }).click();
+    const dialog = page.getByRole("dialog", { name: `Choose works by ${AUTHOR}` });
+    await expect(dialog).toBeVisible();
+    const works = dialog.getByRole("checkbox");
+    await expect(works).toHaveCount(STARK_LISTED, { timeout: STATE_TIMEOUT });
+    await expect(dialog.getByRole("status")).toHaveText(`${STARK_LISTED} of ${STARK_LISTED} works shown`);
+    await expect(dialog.getByRole("textbox", { name: "From year" })).toBeFocused();
+    await dialog.getByRole("textbox", { name: "From year" }).fill("2015");
+    await expect(works).toHaveCount(STARK_FROM_2015);
+    await expect(dialog.getByRole("status")).toHaveText(`${STARK_FROM_2015} of ${STARK_LISTED} works shown`);
+    for (const w of STARK_TICKED) await dialog.getByRole("checkbox", { name: new RegExp(`^${escapeRe(w.title)}`) }).check();
+    await dialog.getByRole("button", { name: "Add the chosen works (3)" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByRole("button", { name: act("Choose works", AUTHOR) })).toBeFocused();
+  });
+
+  await test.step("three rows that say where they came from, each reaching “Record complete”", async () => {
+    await expect(addedRows()).toHaveCount(3, { timeout: STATE_TIMEOUT });
+    for (let i = 0; i < 3; i++) await expect(addedRows().nth(i).locator(".ao-find__state")).toHaveText(WORDS.recordComplete, { timeout: STATE_TIMEOUT });
+    const shown = (await addedRows().locator(".ao-find__match .ao-find__work").allTextContents()).sort();
+    expect(shown).toEqual(STARK_TICKED.map((w) => w.title).sort());
+    // Each is shown as a work the app added, not as a line typed (R281 a).
+    for (let i = 0; i < 3; i++) await expect(addedRows().nth(i).locator("[data-entry-text]")).toHaveText(/^Work: /);
+  });
+
+  await test.step("the three sources in the library, each with its work's DOI, made from the works chosen", async () => {
+    expect(await doisOf(app, projectId)).toEqual(STARK_TICKED.map((w) => w.doi).sort());
+    for (const item of (await sources(app, projectId)).items) {
+      expect((await stored(app, projectId, item.id)).source.provenance).toMatchObject({ captureMethod: "reference_lookup", identification: { method: "find-chosen" } });
+    }
+  });
+
+  await test.step("the author's row stays “Choose works”, with “3 added”, and can still be removed", async () => {
+    await expect(authorRow().locator(".ao-find__state")).toHaveText("Choose works · 3 added");
+    await expect(page.getByRole("button", { name: act("Remove from the queue", AUTHOR) })).toBeVisible();
+    const q = await queueOf(app, projectId);
+    expect(q.entries.find((e) => e.typed === AUTHOR)?.state).toBe("choose-works");
   });
 });
