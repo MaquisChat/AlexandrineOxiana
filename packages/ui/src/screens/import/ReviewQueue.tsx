@@ -53,6 +53,7 @@ import {
   PROJECT_REVIEW_PAGE_MAX,
   reviewGroup,
   type HeldFileDecision,
+  type HeldFileRefusalReason,
   type HeldFileDecisionRequest,
   type HeldFileDecisionResponse,
   type ReviewHeldFile,
@@ -507,7 +508,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   /**
    * "Use this file" / "Not this file" on a held file (F11): one request per decision, however often it is pressed.
    * Decided, the entry leaves the view (focus to the next entry, or the heading). A refusal is said in the service's
-   * own sentence and the entry stays; one already decided elsewhere leaves the view.
+   * own sentence and the entry stays; one the service says was already decided elsewhere leaves the view.
    */
   const [heldError, setHeldError] = useState<{ id: string; text: string } | null>(null);
   const decideHeld = async (item: ReviewItem, decision: HeldFileDecision) => {
@@ -527,7 +528,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         forget();
         return;
       }
-      if (e instanceof ApiClientError && e.code === "CONFLICT" && e.reason !== "source-gone") {
+      // R282 d: the entry leaves only when the service says it was already decided; any other refusal (paused, the
+      // record gone, …) is said in the service's sentence and the entry stays.
+      if (e instanceof ApiClientError && e.code === "CONFLICT" && e.reason === ("already-decided" satisfies HeldFileRefusalReason)) {
         leave([item.id], (n) => `This entry had already been decided, so it left the queue: ${titleFor(item, n)}`);
         return;
       }

@@ -115,6 +115,13 @@ export interface HeldFileDecisionRequest {
 export interface HeldFileDecisionResponse {
   decided: true;
 }
+/**
+ * R282 d: the `reason` of a 409 refusal of a held-file decision. Only "already-decided" means the entry is no longer
+ * waiting (the screen takes it away); "paused" (Find and acquire is stopped for the project now) and "source-gone"
+ * (the record is no longer in the library) leave it waiting, with the service's sentence.
+ */
+export const HELD_FILE_REFUSAL_REASONS = ["already-decided", "paused", "source-gone"] as const;
+export type HeldFileRefusalReason = (typeof HELD_FILE_REFUSAL_REASONS)[number];
 
 /** `GET /projects/:id/review?offset&limit&source`: one page of the queue, oldest first; `total` counts every entry the query matches. */
 export interface ProjectReviewPage {

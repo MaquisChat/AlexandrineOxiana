@@ -567,4 +567,25 @@ describe("a file found for a record that did not clearly match it (F11, R277 d)"
     expect(alert.textContent).toMatch(/no longer in the library, so the file cannot be added to it/u);
     expect(screen.getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
   });
+
+  it("R282 d: a 409 because Find and acquire is paused is NOT 'already decided': its sentence is shown and the entry stays", async () => {
+    const PAUSED = "Find and acquire is paused for this project. Try again in a moment. Nothing was changed.";
+    const o = project();
+    o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: PAUSED, reason: "paused" } }, { status: 409 }))];
+    const { user } = open(o);
+    await user.click(await screen.findByRole("button", { name: `Use this file for ${RECORD}` }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(PAUSED);
+    expect(screen.getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
+    expect(screen.queryByText(/had already been decided/u)).toBeNull();
+  });
+
+  it("R282 d: a 409 whose reason says already decided takes the entry away", async () => {
+    const o = project();
+    o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: "This entry has already been reviewed.", reason: "already-decided" } }, { status: 409 }))];
+    const { user } = open(o);
+    await user.click(await screen.findByRole("button", { name: `Use this file for ${RECORD}` }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: `Use this file for ${RECORD}` })).toBeNull());
+    expect(screen.getByRole("status").textContent).toMatch(/had already been decided, so it left the queue: Rivers and Memory/u);
+  });
 });

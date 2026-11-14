@@ -5,7 +5,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import { isId, type SourceDraft } from "@ao/core";
-import { FindProjectStoppedError, FindRunnerClosedError, HeldFileSourceGoneError, reviewCauseOf, type ListedReviewEntry, type ReviewDecision, type ReviewPatch } from "@ao/library";
+import { FindProjectStoppedError, FindRunnerClosedError, HeldFileSourceGoneError, ReviewEntryDecidedError, reviewCauseOf, type ListedReviewEntry, type ReviewDecision, type ReviewPatch } from "@ao/library";
 import {
   FIND_ROUTE_TEXT,
   HELD_FILE_DECISIONS,
@@ -27,6 +27,7 @@ import {
   type HeldFileDecision,
   type HeldFileDecisionRequest,
   type HeldFileDecisionResponse,
+  type HeldFileRefusalReason,
   type ReviewHeldFile,
   type WithdrawalReviewedRequest,
   type WithdrawalReviewedResponse,
@@ -154,8 +155,11 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
       await runner.resolveHeld(projectId, paramsOf(req).itemId ?? "", decision as HeldFileDecision);
     } catch (err) {
       if (err instanceof FindRunnerClosedError) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed);
-      if (err instanceof FindProjectStoppedError) throw new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.projectStopped);
-      if (err instanceof HeldFileSourceGoneError) throw new ApiError(409, "CONFLICT", err.message, "source-gone");
+      // R282 d: every 409 says why in its reason; only "already-decided" means the entry is no longer waiting.
+      const conflict = (message: string, reason: HeldFileRefusalReason) => new ApiError(409, "CONFLICT", message, reason);
+      if (err instanceof FindProjectStoppedError) throw conflict(FIND_ROUTE_TEXT.projectStopped, "paused");
+      if (err instanceof ReviewEntryDecidedError) throw conflict(err.message, "already-decided");
+      if (err instanceof HeldFileSourceGoneError) throw conflict(err.message, "source-gone");
       throw err;
     }
     state.publishState();

@@ -14,7 +14,7 @@ import { newId, type SourceDraft } from "@ao/core";
 import type { FindEntry } from "@ao/library";
 import { appendFindEntriesIn, holdMismatchedFileIn } from "../../../packages/library/src/repo/repo.js";
 import { deviceDeps, type Deps } from "@ao/library";
-import type { ProjectReviewEntry } from "@ao/shared";
+import { FIND_ROUTE_TEXT, type ProjectReviewEntry } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService } from "./server.js";
 
@@ -471,18 +471,35 @@ describe("F11: a file found for a record that did not clearly match it (R277)", 
     const again = await held(pid, e!.id, "discard");
     expect(again.status).toBe(409);
     expect(again.json.error.message).toBe("This entry has already been reviewed.");
+    // R282 d: the refusal says WHY in its reason, so the screen can tell "already decided" from any other conflict.
+    expect(again.json.error.reason).toBe("already-decided");
   });
 
-  it("Not this file destroys the held copy and the entry leaves the queue", async () => {
+  it("R282 d: while Find and acquire is paused for the project a decision is a 409 whose reason is paused (not already decided), and the entry stays", async () => {
     const pid = await newProject();
-    const { sid } = await heldFor(pid);
+    await heldFor(pid);
+    const [e] = (await queue(pid)).items;
+    svc.state.session!.find!.stop(pid);
+    const r = await held(pid, e!.id, "attach");
+    expect(r.status).toBe(409);
+    expect(r.json.error.code).toBe("CONFLICT");
+    expect(r.json.error.reason).toBe("paused");
+    expect(r.json.error.message).toBe(FIND_ROUTE_TEXT.projectStopped);
+    expect((await queue(pid)).total).toBe(1);
+  });
+
+  it("Not this file destroys the held copy and the entry leaves the queue; the held file is gone from the disk (M3)", async () => {
+    const pid = await newProject();
+    const { sid, eid } = await heldFor(pid);
+    const folder = ((await call({ url: "/projects" })).json.projects as Array<{ id: string; folder: string }>).find((p) => p.id === pid)!.folder;
+    const heldDir = join(tmp, "Lib", folder, "find", "held");
+    expect(await readdir(heldDir)).toEqual([`${eid}.pdf`]);
     const [e] = (await queue(pid)).items;
     const r = await held(pid, e!.id, "discard");
     expect(r.status, r.body).toBe(200);
     expect((await queue(pid)).total).toBe(0);
     expect((await svc.state.session!.repo.getSource(pid, sid)).assets).toEqual([]);
-    const folder = (await call({ url: `/projects/${pid}` })).json.folder as string | undefined;
-    if (folder) expect(await readdir(join(tmp, "Lib", folder, "find", "held"))).toEqual([]);
+    expect(await readdir(heldDir)).toEqual([]);
   });
 
   it("a decision that is not attach or discard is refused in words; a locked project is 423 before anything is read; another kind of entry is refused", async () => {
