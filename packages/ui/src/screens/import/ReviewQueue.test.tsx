@@ -1061,7 +1061,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(screen.queryByText(/had already been decided/u)).toBeNull();
   });
 
-  const NOT_TAKEN = "That press was not taken, because the list had just changed. Look at the file, then press again.";
+  const NOT_TAKEN = "Not taken: the list had just changed. Look at the file, then press again.";
   /** The service answers each decision after `ms` (a fake timer: it moves with the clock). */
   const slow = (ms: number) => [
     http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
@@ -1539,7 +1539,8 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
   // its "Not this file" at x 150 of the card's top line (100 × 30); the panel's "Accept" stands at y 500. A pointer
   // resting at a point presses whatever control's rectangle holds that point (a hidden stand-in is not hit).
   describe("R322: a press is taken only where the researcher pointed", () => {
-    const MOVED = "That press was not taken, because what is under the pointer had just moved. Look at the file, then press again.";
+    const MOVED = "Not taken. Look at the file, then move the pointer and press again.";
+    const MOVED_TOUCH = "Not taken: the page had just moved. Look at the file, then tap again.";
     const geo = { extra: 0 };
     const rectFor = (el: Element): DOMRect => {
       const top = 500 + (document.querySelector(".ao-review__layout") ? 300 : 0) + geo.extra;
@@ -1634,7 +1635,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
     });
 
-    const MOVED_SHOWN = "Not taken: the page had just moved. Move the pointer onto the button and press again.";
+    const MOVED_SHOWN = MOVED;
     const QUIET_SHOWN = "Not taken: the list had just changed. Look at the file, then press again.";
     /** The line under a card's two controls (R323 c). */
     const note = (title: string) => card(title).querySelector<HTMLElement>(".ao-review__file-note");
@@ -1800,7 +1801,7 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       pressBy(use("Right One"), "touch");
       await tick(10);
       expect(heldCalls).toHaveLength(0);
-      expect(h.said).toEqual([MOVED]);
+      expect(h.said).toEqual([MOVED_TOUCH]);
       await tick(300);
       pressBy(use("Right One"), "touch");
       await tick(10);
@@ -1898,6 +1899,179 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       },
       60_000,
     );
+
+    // R327: the press not taken for its place starts no quiet; a mouse press within SCROLL_SETTLE_MS of a scroll is not
+    // taken; one sentence per cause, said when it appears; the first movement of a pointer does not count.
+    describe("R327", () => {
+      const keyEnter = (b: HTMLElement) => {
+        b.focus();
+        fireEvent.keyDown(b, { key: "Enter", code: "Enter" });
+        fireEvent.click(b);
+        fireEvent.keyUp(b, { key: "Enter", code: "Enter" });
+      };
+      const later = (ms: number) => vi.setSystemTime(Date.now() + ms);
+
+      it("R327 a: after a press refused for its place, a real movement onto the control and a press at once is taken", async () => {
+        open(mixed());
+        await ready("Right Two");
+        const u = use("Right One");
+        pressBy(u);
+        await new Promise((r) => setTimeout(r, 30));
+        expect(heldCalls).toHaveLength(0);
+        moveOver(u);
+        pressBy(u);
+        await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+      });
+
+      it("R327 a: after a refusal on one card, pointing at another card's control and pressing at once is taken", async () => {
+        open(mixed());
+        await ready("Right Two");
+        pressBy(use("Right One"));
+        await new Promise((r) => setTimeout(r, 30));
+        expect(heldCalls).toHaveLength(0);
+        moveOver(use("Right Two"));
+        pressBy(use("Right Two"));
+        await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r10"]));
+      });
+
+      it("R327 b: scroll, a real movement onto the control, a press 100 ms after the scroll is not taken; 300 ms after it is taken", async () => {
+        for (const [gap, taken] of [[100, false], [300, true]] as const) {
+          heldCalls = [];
+          open(mixed());
+          await ready("Right Two");
+          const u = use("Right One");
+          fireEvent.scroll(window);
+          moveOver(u);
+          later(gap);
+          pressBy(u);
+          await new Promise((r) => setTimeout(r, 30));
+          expect({ gap, decided: heldCalls.map((c) => c.id) }).toEqual({ gap, decided: taken ? ["r8"] : [] });
+          cleanup();
+        }
+      });
+
+      it("R327 b: a scroll during the 250 ms renews it", async () => {
+        open(mixed());
+        await ready("Right Two");
+        const u = use("Right One");
+        fireEvent.scroll(window);
+        later(200);
+        fireEvent.scroll(window);
+        moveOver(u);
+        later(200); // 400 ms after the first scroll, 200 after the second
+        pressBy(u);
+        await new Promise((r) => setTimeout(r, 30));
+        expect(heldCalls).toHaveLength(0);
+        moveOver(u);
+        later(260);
+        pressBy(u);
+        await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+      });
+
+      it("R327 b: a keyboard press right after a scroll is taken", async () => {
+        open(mixed());
+        await ready("Right Two");
+        fireEvent.scroll(window);
+        keyEnter(use("Right One"));
+        await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+      });
+
+      describe("R327 c: one sentence for each cause, on the card and in the polite region", () => {
+        const cases: Array<[string, string, (u: HTMLElement) => void]> = [
+          ["a mouse press after the first movement of a pointer", MOVED, (u) => fireEvent.pointerMove(u, { pointerType: "mouse", pointerId: 1, clientX: 5, clientY: 5 })],
+          ["a mouse press with no movement since the screen opened", MOVED, () => undefined],
+          ["a mouse press after a scroll", MOVED, (u) => (moveOver(u), fireEvent.scroll(window))],
+          ["a mouse press on a control that moved", MOVED, (u) => (moveOver(u), (geo.extra = -300))],
+        ];
+        it.each(cases)("%s", async (_name, sentence, before) => {
+          open(mixed());
+          await ready("Right Two");
+          const h = listen();
+          const u = use("Right One");
+          before(u);
+          pressBy(u);
+          await waitFor(() => expect(note("Right One")?.textContent).toBe(sentence));
+          expect(h.said).toEqual([sentence]);
+          expect(heldCalls).toHaveLength(0);
+          h.stop();
+        });
+
+        it("a tap on a control that had just moved", async () => {
+          open(mixed());
+          await ready("Right Two");
+          const h = listen();
+          geo.extra = -300;
+          pressBy(use("Right One"), "touch");
+          await waitFor(() => expect(note("Right One")?.textContent).toBe(MOVED_TOUCH));
+          expect(h.said).toEqual([MOVED_TOUCH]);
+          h.stop();
+        });
+
+        it("a press inside the quiet (by key)", async () => {
+          open(mixed());
+          await waitFor(() => card("Right Two"));
+          const h = listen();
+          keyEnter(use("Right One"));
+          await waitFor(() => expect(note("Right One")?.textContent).toBe(QUIET_SHOWN));
+          expect(h.said).toEqual([QUIET_SHOWN]);
+          h.stop();
+        });
+
+        it("three refused presses in a row are said once; after the pointer really moves over the card, a further refusal is said again", async () => {
+          open(mixed());
+          await ready("Right Two");
+          const h = listen();
+          const u = use("Right One");
+          pressBy(u);
+          pressBy(u);
+          pressBy(u);
+          await waitFor(() => expect(note("Right One")?.textContent).toBe(MOVED));
+          expect(h.said).toEqual([MOVED]);
+          moveOver(card("Right One"));
+          await waitFor(() => expect(note("Right One")?.textContent).toBe(""));
+          pressBy(u);
+          await waitFor(() => expect(note("Right One")?.textContent).toBe(MOVED));
+          expect(h.said).toEqual([MOVED, MOVED]);
+          h.stop();
+        });
+
+        it("a line that changes to another sentence is said again", async () => {
+          open(mixed());
+          await waitFor(() => card("Right Two"));
+          const h = listen();
+          const u = use("Right One");
+          pressBy(u); // mouse, no movement: its place
+          await waitFor(() => expect(note("Right One")?.textContent).toBe(MOVED));
+          keyEnter(u); // inside the opening's quiet
+          await waitFor(() => expect(note("Right One")?.textContent).toBe(QUIET_SHOWN));
+          expect(h.said).toEqual([MOVED, QUIET_SHOWN]);
+          h.stop();
+        });
+      });
+
+      it("R327 d (i): ONE pointermove onto a control is the first pointer event the screen sees, then a press: not taken", async () => {
+        open(mixed());
+        await ready("Right Two");
+        const u = use("Right One");
+        fireEvent.pointerMove(u, { pointerType: "mouse", pointerId: 1, clientX: 40, clientY: 40 });
+        pressBy(u);
+        await new Promise((r) => setTimeout(r, 30));
+        expect(heldCalls).toHaveLength(0);
+      });
+
+      it("R327 d (ii): a scroll, then a pointermove at the same point as the first pointer events, then a press: not taken", async () => {
+        open(mixed());
+        await ready("Right Two");
+        const u = use("Right One");
+        fireEvent.pointerMove(document.body, { pointerType: "mouse", pointerId: 1, clientX: 40, clientY: 40 });
+        fireEvent.scroll(window);
+        fireEvent.pointerMove(u, { pointerType: "mouse", pointerId: 1, clientX: 40, clientY: 40 });
+        later(400);
+        pressBy(u);
+        await new Promise((r) => setTimeout(r, 30));
+        expect(heldCalls).toHaveLength(0);
+      });
+    });
   });
 
   // R319 b changes what this asserts: the entry leaves the queue, but its card stays in its place, without controls, saying so.
