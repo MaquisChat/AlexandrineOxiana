@@ -198,7 +198,7 @@ export function ChooseWorksDialog({ entry, works, person, loadError, onAdd, onCl
   };
   const total = items?.length ?? 0;
   const affiliationLine = [person?.affiliation].filter((x): x is string => typeof x === "string" && x.trim() !== "");
-  const subjects = (person?.subjects ?? []).filter((s): s is string => typeof s === "string" && s.trim() !== "");
+  const subjects = (person && Array.isArray(person.subjects) ? person.subjects : []).filter((s): s is string => typeof s === "string" && s.trim() !== "");
 
   return (
     <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={close} busy={busy} className="ao-find__dialog ao-find__works-dialog">
