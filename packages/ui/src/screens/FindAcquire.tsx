@@ -38,7 +38,7 @@ import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { isValidId } from "../api/import";
 import { isProjectLocked, libraryApi, type Collection, type LibraryApi, type LibraryState, type ProjectSummary } from "../api/library";
 import { ChooseWorkDialog } from "../components/ChooseWorkDialog";
-import { FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
+import { FindEntryRow, stateWords, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
 import { navigate, projectInQuery, type AppLocation } from "../navigation";
@@ -1012,6 +1012,3 @@ function ProjectQueue(props: {
     </div>
   );
 }
-
-// Plain text of an entry's state (for tests and the report).
-export const stateText = (e: FindEntryView, ctx?: Parameters<typeof stateWords>[1]) => wordsText(stateWords(e, ctx));
