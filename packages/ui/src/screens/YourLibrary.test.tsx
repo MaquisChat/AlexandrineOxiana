@@ -1192,6 +1192,31 @@ describe("Your library: sentences (R334 d) and keyboard", () => {
   });
 });
 
+describe("Your library: the researcher's own browser as the fallback (F20c; R348 h)", () => {
+  const SENTENCE =
+    "If the sign-in window cannot sign you in — some libraries ask for a passkey, a security key or Google — use your own browser: pair the browser extension, then use “Get through my library in my own browser” on a work.";
+  for (const where of ["the desktop app", "a browser"] as const) {
+    it(`one sentence in the sign-in window's part, in ${where}, word for word, with "pair the browser extension" an in-app link to the Browser extension page`, async () => {
+      if (where === "a browser") fake.shell = undefined;
+      const svc = useSvc(SET);
+      await show(svc);
+      const section = screen.getByRole("region", { name: "The sign-in window" });
+      const p = within(section).getByTestId("yl-browser-fallback");
+      expect(p.textContent).toBe(SENTENCE);
+      expect(screen.getAllByTestId("yl-browser-fallback")).toHaveLength(1);
+      const link = within(p).getByRole("link", { name: "pair the browser extension" });
+      expect(link.getAttribute("href")).toBe(PATHS.extension);
+      expect(link.getAttribute("target")).toBeNull();
+      const before = svc.sent.length;
+      await userEvent.setup().click(link);
+      expect(window.location.pathname).toBe(PATHS.extension);
+      // Following it asks the service nothing of this screen's.
+      expect(svc.sent.slice(before)).toEqual([]);
+      window.history.pushState(null, "", "/");
+    });
+  }
+});
+
 describe("Your library: the contract (each request exactly as the handler takes it)", () => {
   it("GET no body; PUT the four fields; derive { link } only; test no body; the switch's own save", async () => {
     const svc = useSvc(SET);
