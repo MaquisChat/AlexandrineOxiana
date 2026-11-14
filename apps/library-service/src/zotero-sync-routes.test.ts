@@ -337,6 +337,30 @@ describe("settings (Accept 3)", () => {
     expect(await readFile(path, "utf8")).toBe(newer);
   });
 
+  it("R268 M4: the state says when the settings were written by a newer version (settingsNewer), exactly then", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    const path = join(deps.appConfigDir, "zotero-sync.json");
+    // No file, and a file of this version: false.
+    expect((await state()).settingsNewer).toBe(false);
+    expect((await saveSettings([linkOf(U, pid)])).json.settingsNewer).toBe(false);
+    expect((await state()).settingsNewer).toBe(false);
+    // A newer version's file: true; the file stays as it was; the sentence is the shared one the screen shows.
+    const newer = JSON.stringify({ v: 3, libraries: {} });
+    await writeFile(path, newer, { mode: 0o600 });
+    const st = await state();
+    expect(st.settingsNewer).toBe(true);
+    expect(st.links).toEqual([]);
+    expect(await readFile(path, "utf8")).toBe(newer);
+    const refused = await saveSettings([linkOf(U, pid)]);
+    expect(refused.json.error.message).toBe(ZOTERO_SYNC_SENTENCES.settingsNewer);
+    // A damaged file is set aside by the library module: not "newer".
+    await writeFile(path, "{ not json", { mode: 0o600 });
+    expect((await state()).settingsNewer).toBe(false);
+    await writeFile(path, JSON.stringify({ v: 1.5, libraries: {} }), { mode: 0o600 });
+    expect((await state()).settingsNewer).toBe(false);
+  });
+
   it("nothing runs by itself after a settings write with automatic on, an unlock or a library open (the clock moved a day on each time)", async () => {
     // Every timer the service makes from here on is a fake one (the clock also moves on with real time, so the
     // service works): a start delayed by minutes or hours would fire when the clock is moved on.

@@ -15,7 +15,7 @@ import {
   type ZoteroSyncSettingsRequest,
   type ZoteroSyncStateResponse,
 } from "@ao/shared";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -64,6 +64,7 @@ function stateOf(o: StateIn = {}): ZoteroSyncStateResponse {
   const { links = [], ...rest } = o;
   return {
     readOnly: false,
+    settingsNewer: false,
     keyStored: true,
     automatic: false,
     everyMinutes: 60,
@@ -93,8 +94,10 @@ const ACCESS: ZoteroKeyCheckResponse = {
 function eventStream() {
   const enc = new TextEncoder();
   let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let connections = 0;
   return {
     handler: http.get(url("/events"), () => {
+      connections++;
       const body = new ReadableStream<Uint8Array>({
         start(c) {
           ctl = c;
@@ -103,6 +106,9 @@ function eventStream() {
       return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
     }),
     open: () => ctl !== undefined,
+    connections: () => connections,
+    /** The service ends the stream (the screen listens again shortly). */
+    close: () => ctl!.close(),
     push(type: string, data: unknown) {
       ctl!.enqueue(enc.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`));
     },
@@ -140,6 +146,8 @@ function useSvc(init: StateIn = {}, history: ZoteroSyncRun[] = []) {
     onRun: undefined as undefined | (() => Answer),
     onStop: undefined as undefined | (() => Answer),
     onCheck: undefined as undefined | (() => Answer),
+    /** What GET /projects/:id/review?limit=0 answers as `total`, per project (the library screen's count). */
+    waiting: {} as Record<string, number>,
     count: (method: string, path: string) => svc.calls.filter((c) => c.method === method && c.path === path).length,
     bodies: (method: string, path: string) => svc.calls.filter((c) => c.method === method && c.path === path).map((c) => c.body),
   };
@@ -188,6 +196,10 @@ function useSvc(init: StateIn = {}, history: ZoteroSyncRun[] = []) {
     http.post(url("/zotero/key-check"), async ({ request }) => {
       await rec(request);
       return svc.onCheck ? svc.onCheck() : HttpResponse.json(svc.access);
+    }),
+    http.get(url("/projects/:id/review"), async ({ request, params }) => {
+      await rec(request);
+      return HttpResponse.json({ items: [], total: svc.waiting[String(params.id)] ?? 0, offset: 0, limit: 0 });
     }),
     http.get(url("/projects"), async ({ request }) => {
       await rec(request);
@@ -743,14 +755,17 @@ describe("ZoteroSync", () => {
     await waitFor(() => expect(syncButton().textContent).toBe("Sync with Zotero now"));
   });
 
-  it("of two reads the later-started wins", async () => {
+  it("of two reads the later-started wins (and a save's answer wins over a read already out)", async () => {
     const svc = useSvc({ links: [{ ref: "user:42", projectId: P1 }] });
     await show(svc);
     const user = userEvent.setup();
     // A read started by an event is held; a save started after it answers first; the old read's answer is then dropped.
     const gate = held();
     const old = stateOf({ links: [{ ref: "user:42", projectId: P1 }], automatic: false, everyMinutes: 60 });
+    let first = true;
     svc.onState = async () => {
+      if (!first) return HttpResponse.json(svc.state);
+      first = false;
       await gate.p;
       return HttpResponse.json(old);
     };
@@ -906,13 +921,243 @@ describe("ZoteroSync", () => {
     expect((screen.getByRole("checkbox", { name: "Keep “Zotero library user:42” in step" }) as HTMLInputElement).checked).toBe(false);
   });
 
-  it("links out: the import report of the last run, and the review queue with the number waiting", async () => {
+  it("links out: the import report of the last run, and the project's review queue with its CURRENT number waiting (R268 M3)", async () => {
     const last = run({ batchId: B1, counts: { ...ZERO, new: 2, waiting: 3, conflicts: 1 } });
-    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1, lastRun: last }] });
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1, lastRun: last }, { ref: "group:7", projectId: P1 }, { ref: "group:8", projectId: P3 }] });
+    svc.waiting = { [P1]: 5, [P3]: 0 };
     await show(svc);
     const r = row("Zotero library user:42");
     expect(within(r).getByRole("link", { name: "Import report for “Zotero library user:42”" }).getAttribute("href")).toBe(`/import?project=${P1}&batch=${B1}`);
-    expect(within(r).getByRole("link", { name: "Review 3 waiting for “Zotero library user:42”" }).getAttribute("href")).toBe(`/import/review?project=${P1}&batch=${B1}`);
+    // N is what the project's queue holds now (not the run's 3), and it goes to that queue.
+    const review = await within(r).findByRole("link", { name: "Review 5 waiting for “Zotero library user:42”" });
+    expect(review.getAttribute("href")).toBe(`/import/review?project=${P1}`);
+    expect(within(row("Zotero group 7")).getByRole("link", { name: "Review 5 waiting for “Zotero group 7”" })).toBeTruthy();
+    // 0 waiting: no link. The status line stays the service's.
+    expect(within(row("Zotero group 8")).queryByRole("link", { name: /^Review/ })).toBeNull();
+    expect(within(r).getByText(svc.state.links[0]!.status)).toBeTruthy();
+    // One request per linked project per reading, never per event.
+    const counts = () => svc.calls.filter((c) => c.path.endsWith("/review")).map((c) => c.path);
+    expect(counts().sort()).toEqual([`/projects/${P1}/review`, `/projects/${P3}/review`]);
+    // The researcher decided some: after a run ends, the number is read again.
+    svc.waiting = { [P1]: 2, [P3]: 0 };
+    await push(svc, "zotero.sync", { ref: "user:42", projectId: P1, state: "checking" });
+    await push(svc, "zotero.sync", { ref: "user:42", projectId: P1, state: "running", done: 1, total: 2 });
+    expect(counts()).toHaveLength(2);
+    await push(svc, "zotero.sync", { ref: "user:42", projectId: P1, state: "finished", run: last });
+    expect(await within(row("Zotero library user:42")).findByRole("link", { name: "Review 2 waiting for “Zotero library user:42”" })).toBeTruthy();
+    expect(counts()).toHaveLength(4);
+  });
+
+  it("R268 I1: a save's answer wins over a read that started before it arrived; one fresh read follows; Saved. once; a second Save sends the saved values", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1 }] });
+    await show(svc);
+    const user = userEvent.setup();
+    const old = svc.state;
+    const gate = held();
+    svc.onSave = async (body) => {
+      await gate.p;
+      svc.state = { ...svc.state, automatic: body.automatic, everyMinutes: body.everyMinutes };
+      return HttpResponse.json(svc.state);
+    };
+    await user.click(screen.getByRole("checkbox", { name: "Sync automatically while the app is open" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "How often" }), "240");
+    const said: string[] = [];
+    const mo = new MutationObserver(() => {
+      const t = liveText();
+      if (t) said.push(t);
+    });
+    mo.observe(screen.getByTestId("zotero-live"), { childList: true, subtree: true, characterData: true });
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1));
+    // A read started now (by a "finished" event) answers with the settings from before the save.
+    let oldOnce = true;
+    svc.onState = () => {
+      if (oldOnce) {
+        oldOnce = false;
+        return HttpResponse.json(old);
+      }
+      return HttpResponse.json(svc.state);
+    };
+    const reads = svc.count("GET", "/zotero/sync");
+    await push(svc, "zotero.sync", { ref: "user:42", projectId: P1, state: "finished", run: run() });
+    await waitFor(() => expect(svc.count("GET", "/zotero/sync")).toBe(reads + 1));
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    await act(async () => {
+      gate.release();
+      await new Promise((r) => setTimeout(r, 100));
+    });
+    await waitFor(() => expect(liveText()).toBe("Saved."));
+    expect((screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement).value).toBe("240");
+    expect((screen.getByRole("checkbox", { name: "Sync automatically while the app is open" }) as HTMLInputElement).checked).toBe(true);
+    // Exactly one fresh read after the write's answer.
+    await waitFor(() => expect(svc.count("GET", "/zotero/sync")).toBe(reads + 2));
+    await act(async () => new Promise((r) => setTimeout(r, 100)));
+    expect(svc.count("GET", "/zotero/sync")).toBe(reads + 2);
+    expect((screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement).value).toBe("240");
+    mo.disconnect();
+    expect(said.filter((t) => t === "Saved.")).toHaveLength(1);
+    svc.onSave = undefined;
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(svc.count("PUT", "/zotero/sync/settings")).toBe(2));
+    expect(JSON.parse(svc.bodies("PUT", "/zotero/sync/settings")[1]!)).toMatchObject({ automatic: true, everyMinutes: 240 });
+  });
+
+  it("R268 M1: the form is inert while a save is out; focus stays on Save; nothing edited under it is lost", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1, paused: "undone" }] });
+    await show(svc);
+    const user = userEvent.setup();
+    const gate = held();
+    svc.onSave = async (body) => {
+      await gate.p;
+      svc.state = { ...svc.state, automatic: body.automatic, everyMinutes: body.everyMinutes };
+      return HttpResponse.json(svc.state);
+    };
+    await user.click(screen.getByRole("checkbox", { name: "Sync automatically while the app is open" }));
+    const save = screen.getByRole("button", { name: "Save" });
+    await user.click(save);
+    await waitFor(() => expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1));
+    const often = screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement;
+    const auto = screen.getByRole("checkbox", { name: "Sync automatically while the app is open" }) as HTMLInputElement;
+    const keep = screen.getByRole("checkbox", { name: "Keep “Zotero library user:42” in step" }) as HTMLInputElement;
+    const into = screen.getByRole("combobox", { name: "Into project for “Zotero library user:42”" }) as HTMLSelectElement;
+    for (const c of [often, auto, keep, into]) expect(c.disabled).toBe(true);
+    expect(save.getAttribute("aria-disabled")).toBe("true");
+    const resume = screen.getByRole("button", { name: "Turn syncing on again for “Zotero library user:42”" });
+    expect(resume.getAttribute("aria-disabled")).toBe("true");
+    expect(document.activeElement).toBe(save);
+    // Not operable: a change event and presses do nothing.
+    fireEvent.change(often, { target: { value: "240" } });
+    fireEvent.click(keep);
+    fireEvent.click(resume);
+    fireEvent.click(save);
+    expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1);
+    await act(async () => {
+      gate.release();
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    await waitFor(() => expect(liveText()).toBe("Saved."));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Save" }));
+    expect((screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement).value).toBe("60");
+    expect((screen.getByRole("checkbox", { name: "Keep “Zotero library user:42” in step" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement).disabled).toBe(false);
+  });
+
+  it("R268 M2: a failed key check takes the earlier check's success sentence off the screen; the names may stay", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1 }] });
+    await show(svc);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Check the key" }));
+    expect((await screen.findByTestId("zotero-key-result")).textContent).toContain(ACCESS.summary);
+    svc.onCheck = () => HttpResponse.json({ error: { code: "CONFLICT", message: ZOTERO_SYNC_REASON_TEXT["key-refused"], reason: "key-refused" } }, { status: 409 });
+    await user.click(screen.getByRole("button", { name: "Check the key" }));
+    await screen.findByTestId("zotero-key-error");
+    expect(screen.queryByTestId("zotero-key-result")).toBeNull();
+    expect(screen.queryByText(ACCESS.summary)).toBeNull();
+    expect(row("My library")).toBeTruthy();
+  });
+
+  it("R268 M4: a settings file written by a newer version: the service's sentence, no control that would be refused, never 'No Zotero library is linked'", async () => {
+    const svc = useSvc({ settingsNewer: true, links: [] }, [run()]);
+    render(<ZoteroSync client={testClient()} />);
+    expect((await screen.findByTestId("zotero-newer")).textContent).toBe(ZOTERO_SYNC_SENTENCES.settingsNewer);
+    await waitFor(() => expect(within(screen.getByRole("list", { name: "Sync history" })).getAllByRole("listitem")).toHaveLength(1));
+    void svc;
+    expect(screen.queryByText(/No Zotero library is linked/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^(Sync with Zotero now|Stop syncing)$/ })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Sync automatically while the app is open" })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "How often" })).toBeNull();
+    // The history stays readable.
+    expect(within(screen.getByRole("list", { name: "Sync history" })).getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it("R268 M5: a stored link moved to another project takes that project's defaults; one that stays keeps its options", async () => {
+    const svc = useSvc({
+      links: [
+        { ref: "user:42", projectId: P1, structure: "tags", duplicates: "skip" },
+        { ref: "group:7", projectId: P1, structure: "tags", duplicates: "keep-both" },
+        { ref: "group:8", projectId: P1, structure: "none", duplicates: "skip" },
+      ],
+    });
+    await show(svc);
+    const user = userEvent.setup();
+    // Into a project that pseudonymises names: "none"; into an open one: "collections"; both "merge" (the wizard's).
+    await user.selectOptions(screen.getByRole("combobox", { name: "Into project for “Zotero library user:42”" }), P4);
+    await user.selectOptions(screen.getByRole("combobox", { name: "Into project for “Zotero group 7”" }), P3);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1));
+    expect(JSON.parse(svc.bodies("PUT", "/zotero/sync/settings")[0]!).links).toEqual([
+      { ref: "user:42", projectId: P4, structure: "none", duplicates: "merge" },
+      { ref: "group:7", projectId: P3, structure: "collections", duplicates: "merge" },
+      { ref: "group:8", projectId: P1, structure: "none", duplicates: "skip" },
+    ]);
+    expect(svc.calls.filter((c) => c.path.endsWith("/governance")).map((c) => c.path).sort()).toEqual([`/projects/${P3}/governance`, `/projects/${P4}/governance`]);
+  });
+
+  it("R268 M5: a link whose project does not change keeps its options exactly", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P4, structure: "collections", duplicates: "keep-both" }] });
+    await show(svc);
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByRole("combobox", { name: "How often" }), "30");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1));
+    expect(JSON.parse(svc.bodies("PUT", "/zotero/sync/settings")[0]!).links).toEqual([{ ref: "user:42", projectId: P4, structure: "collections", duplicates: "keep-both" }]);
+    expect(svc.calls.filter((c) => c.path.endsWith("/governance"))).toEqual([]);
+  });
+
+  it("R268 M6: a pause this build does not know is said plainly, never shown as merely synced", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1, lastRun: run() }] });
+    svc.state = { ...svc.state, links: [{ ...svc.state.links[0]!, paused: "future-reason" as never, waitingFor: "paused" }] };
+    await show(svc);
+    const r = row("Zotero library user:42");
+    expect(within(r).getByText("Syncing of this library is paused.")).toBeTruthy();
+  });
+
+  it("R268 M7: another library opened while the screen is shown: the old one is forgotten and everything read again", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1 }] });
+    await show(svc);
+    const user = userEvent.setup();
+    await push(svc, "library.state", { open: true, libraryId: "lib-1", mode: "read-write" });
+    await user.click(screen.getByRole("button", { name: "Check the key" }));
+    await screen.findByRole("region", { name: "Lab group" });
+    await user.selectOptions(screen.getByRole("combobox", { name: "How often" }), "240");
+    const reads = svc.count("GET", "/zotero/sync");
+    const projects = svc.count("GET", "/projects");
+    svc.state = stateOf({ links: [{ ref: "group:55", projectId: P3 }], everyMinutes: 30 });
+    await push(svc, "library.state", { open: true, libraryId: "lib-2", mode: "read-write" });
+    await screen.findByRole("region", { name: "Zotero group 55" });
+    expect(svc.count("GET", "/zotero/sync")).toBeGreaterThan(reads);
+    expect(svc.count("GET", "/projects")).toBeGreaterThan(projects);
+    // The names, the draft and the key check's answer of the old library are gone.
+    expect(screen.queryByRole("region", { name: "Lab group" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "My library" })).toBeNull();
+    expect(screen.queryByTestId("zotero-key-result")).toBeNull();
+    expect((screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement).value).toBe("30");
+  });
+
+  it("R268 M7: after the event stream comes back, the state is read again", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1 }] });
+    await show(svc);
+    const reads = svc.count("GET", "/zotero/sync");
+    const fresh = run({ counts: { ...ZERO, new: 7 } });
+    svc.state = stateOf({ links: [{ ref: "user:42", projectId: P1, lastRun: fresh }] });
+    await act(async () => svc.events.close());
+    await waitFor(() => expect(svc.events.connections()).toBe(2), { timeout: 5000 });
+    await waitFor(() => expect(svc.count("GET", "/zotero/sync")).toBe(reads + 1));
+    expect(await within(row("Zotero library user:42")).findByText(zoteroSyncStatusLine(fresh, new Date()))).toBeTruthy();
+  });
+
+  it("R268 M7: the change from read-write to read-only: the controls go and the read-only sentence shows", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1, lastRun: run() }] });
+    await show(svc);
+    await push(svc, "library.state", { open: true, libraryId: "lib-1", mode: "read-write" });
+    expect(screen.getByRole("button", { name: "Save" })).toBeTruthy();
+    svc.state = { ...svc.state, readOnly: true };
+    await push(svc, "library.state", { open: true, libraryId: "lib-1", mode: "read-only" });
+    await screen.findByText(ZOTERO_SYNC_REASON_TEXT["library-read-only"]);
+    expect(screen.queryAllByRole("button")).toEqual([]);
+    expect(screen.queryAllByRole("checkbox")).toEqual([]);
+    expect(screen.queryAllByRole("combobox")).toEqual([]);
   });
 
   it("the undo's note is shown", async () => {

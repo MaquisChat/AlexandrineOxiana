@@ -11,11 +11,15 @@
  * whatever Zotero's servers said goes nowhere but a bounded debug note.
  */
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { FastifyInstance } from "fastify";
 import {
   SecretStoreUnavailableError,
   ZOTERO_SYNC_MAX_BACKOFF_MS,
+  ZOTERO_SYNC_FILE,
   ZOTERO_SYNC_MIN_BACKOFF_MS,
+  ZOTERO_SYNC_NEWER_SENTENCE,
   ZoteroAccountError,
   ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
@@ -66,6 +70,7 @@ import { bodyOf, type Ctx, type Obj, type Same } from "./util.js";
 true satisfies Same<LibraryReason, ZoteroSyncReason>;
 true satisfies Same<LibraryRun, ZoteroSyncRun>;
 true satisfies Same<Omit<LibraryKeyAccess, "backoffUntil">, ZoteroKeyAccess>;
+true satisfies Same<typeof ZOTERO_SYNC_NEWER_SENTENCE, (typeof ZOTERO_SYNC_SENTENCES)["settingsNewer"]>;
 
 const REF = /^(user|group):[1-9]\d{0,11}$/u;
 const STRUCTURES = ["collections", "tags", "none"] as const;
@@ -364,6 +369,20 @@ async function readHistory(dir: string, libraryId: string): Promise<LibraryRun[]
   }
 }
 
+/**
+ * Whether this computer's sync settings file was written by a newer version of the app (R268 M4): the library module's
+ * own rule for refusing it (an object whose `v` is a whole number above 1, R244 M7), read without changing anything.
+ * Missing, unreadable or damaged is not "newer" (the module reads those as nothing, or sets the damaged one aside).
+ */
+async function settingsNewer(dir: string): Promise<boolean> {
+  try {
+    const v = JSON.parse(await readFile(join(dir, ZOTERO_SYNC_FILE), "utf8")) as unknown;
+    return typeof v === "object" && v !== null && !Array.isArray(v) && Number.isSafeInteger((v as Obj).v) && ((v as Obj).v as number) > 1;
+  } catch {
+    return false;
+  }
+}
+
 /** Whether a key is saved (the value dropped at once); null when the password store cannot be asked. */
 async function keyStored(): Promise<boolean | null> {
   try {
@@ -417,7 +436,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
 
   /** The state, built from this computer's settings and history at request time (point 8). */
   async function stateOf(s: Session): Promise<ZoteroSyncStateResponse> {
-    const [settings, history, stored] = await Promise.all([readSettings(dir(), s.lib.id), readHistory(dir(), s.lib.id), keyStored()]);
+    const [settings, history, stored, newer] = await Promise.all([readSettings(dir(), s.lib.id), readHistory(dir(), s.lib.id), keyStored(), settingsNewer(dir())]);
     const running = holder.running;
     const current = inProgressId(history, running?.ref);
     const links: ZoteroSyncStateResponse["links"] = [];
@@ -441,6 +460,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     const backoff = holder.backoffInForce(now().getTime(), historyBackoff(history));
     return {
       readOnly: s.lib.mode === "read-only",
+      settingsNewer: newer,
       keyStored: stored,
       automatic: settings.automatic,
       everyMinutes: settings.everyMinutes,

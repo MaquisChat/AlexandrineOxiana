@@ -13,10 +13,11 @@
  * said with the shared reason sentences. Nothing is told by colour or symbol alone, and nothing reads as success for a
  * run that did not succeed.
  *
- * Order (R250): the state (and the history beside it) is read at load, after every "finished" event, after an act and
- * after a lost event stream came back; reads are coalesced (one at a time, and one more if asked meanwhile), and every
- * answer carries the number drawn when its request STARTED, so a later-started answer is never overwritten by an
- * earlier one (a settings save's answer is a reading too). The run in progress comes from the events and the state's
+ * Order (R250, R268 I1): the state (and the history beside it) is read at load, after every "finished" event, after an
+ * act and after a lost event stream came back; reads are coalesced (one at a time, and one more if asked meanwhile), and
+ * a read's answer carries the number drawn when its request STARTED, so of two reads the later-started wins. A WRITE's
+ * answer (a settings save) draws its number when it ARRIVES: it is applied then and wins over every read that started
+ * before; exactly one fresh read follows it, and "Saved." is said with its answer on screen. The run in progress comes from the events and the state's
  * `running` only (the history never holds it): an answer whose request started before the latest event does not
  * overrule what that event said about the run. Answers after the screen was left, the library was closed or another
  * library was opened are dropped. The form's draft is kept apart from the service's state until it is saved, so a
@@ -29,6 +30,7 @@
 import {
   ZOTERO_SYNC_EVERY_MINUTES,
   ZOTERO_SYNC_REASON_TEXT,
+  ZOTERO_SYNC_SENTENCES,
   zoteroSyncReasonText,
   zoteroSyncStatusLine,
   type ZoteroKeyCheckResponse,
@@ -40,13 +42,14 @@ import {
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type ReactNode } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { importApi, isValidId, type ProjectInfo } from "../api/import";
-import type { LibraryState } from "../api/library";
+import { libraryApi, type LibraryState } from "../api/library";
 import { zoteroSyncApi, zoteroSyncEventOf } from "../api/zoteroSync";
 import { UserText } from "../components/UserText";
 import { ZoteroKeyField } from "../components/ZoteroKeyField";
 import "../components/library.css";
-import { inAppLink, IMPORT_PATHS } from "../navigation";
+import { inAppLink } from "../navigation";
 import { reportHref } from "./import/shared";
+import { projectQueueHref } from "./import/ReviewQueue";
 import { defaultOptions } from "./import/StepOptions";
 import "./ZoteroSync.css";
 
@@ -62,6 +65,7 @@ export const ZOTERO_TEXT = {
   notListed: "The last key check did not list this library.",
   goneRemedy: "When the key can read this library again, “Check the key” turns syncing of it back on.",
   locked: "Unlock the project to sync.",
+  pausedUnknown: "Syncing of this library is paused.",
   noLinks: "No Zotero library is linked to a project yet.",
   noHistory: "No sync has been recorded on this computer yet.",
   chooseProject: "Choose a project",
@@ -128,6 +132,7 @@ function refusedField(message: string, links: ZoteroSyncSettingsRequest["links"]
 export function ZoteroSync({ client }: { client: ApiClient }) {
   const api = useMemo(() => zoteroSyncApi(client), [client]);
   const imp = useMemo(() => importApi(client), [client]);
+  const lib = useMemo(() => libraryApi(client), [client]);
   const ids = useId();
 
   const [state, setState] = useState<ZoteroSyncStateResponse | undefined>();
@@ -138,6 +143,11 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
   /** What the last key check of this visit said (names live only here, R78: no storage). */
   const [access, setAccess] = useState<ZoteroKeyCheckResponse | undefined>();
   const [checkError, setCheckError] = useState<string | undefined>();
+  /** The last check's summary is shown only while that check is the last word (R268 M2: a failed one takes it off). */
+  const [checkOk, setCheckOk] = useState(false);
+  /** How many entries wait in each linked project's review queue now (the library screen's count, R268 M3). */
+  const [reviewWaiting, setReviewWaiting] = useState<Record<string, number>>({});
+  const appliedWaiting = useRef(0);
   const [checking, setChecking] = useState(false);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [saving, setSaving] = useState(false);
@@ -236,6 +246,8 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     setState(undefined);
     setHistory(undefined);
     setAccess(undefined);
+    setCheckOk(false);
+    setReviewWaiting({});
     setDraft(null);
     setFieldErrors({});
     setSaveError(undefined);
@@ -243,6 +255,26 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     setCheckError(undefined);
     setRunning(null);
   }, [setRunning]);
+
+  /**
+   * The number waiting in each linked project's review queue, as the library screen reads it (GET /projects/:id/review,
+   * limit 0): one request per linked project per reading of the state (so at load, after a run ends, after a save),
+   * never per event; not for a locked project or a library that cannot be changed. Taken by the reading's number.
+   */
+  const readWaiting = useCallback(
+    (s: ZoteroSyncStateResponse, seq: number, g: number) => {
+      if (s.readOnly || s.settingsNewer) return;
+      const pids = [...new Set(s.links.filter((l) => l.waitingFor !== "project-locked").map((l) => l.projectId))].filter((p) => isValidId(p));
+      void Promise.all(pids.map((p) => lib.reviewQueue.count(p).then((n) => [p, n] as const, () => undefined))).then((got) => {
+        if (!alive.current || g !== gen.current || seq < appliedWaiting.current) return;
+        appliedWaiting.current = seq;
+        const next: Record<string, number> = {};
+        for (const e of got) if (e) next[e[0]] = e[1];
+        setReviewWaiting(next);
+      });
+    },
+    [lib],
+  );
 
   /** The state and the history, read again; one at a time, and one more when asked meanwhile. */
   const read = useCallback(async (): Promise<void> => {
@@ -260,8 +292,10 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
         const ev = eventSeq.current;
         const [s, h] = await Promise.allSettled([api.state(), api.history()]);
         if (!alive.current || g !== gen.current) return;
-        if (s.status === "fulfilled") applyState(s.value, seq, ev);
-        else if (!stateRef.current) {
+        if (s.status === "fulfilled") {
+          applyState(s.value, seq, ev);
+          readWaiting(s.value, seq, g);
+        } else if (!stateRef.current) {
           const e = s.reason;
           if (e instanceof ApiClientError && e.code === "LIBRARY_OFFLINE") setNoLibrary(true);
           setLoadError(sentenceOf(e, "The Zotero sync settings could not be read."));
@@ -274,7 +308,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     } finally {
       if (reading.current === mark) reading.current = null;
     }
-  }, [api, applyState, setNoLibrary]);
+  }, [api, applyState, setNoLibrary, readWaiting]);
 
   const readProjects = useCallback(() => {
     const g = gen.current;
@@ -406,9 +440,13 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
       if (!alive.current || g !== gen.current) return;
       accessRef.current = a;
       setAccess(a);
+      setCheckOk(true);
       say(<UserText>{a.summary}</UserText>);
     } catch (err) {
       if (!alive.current || g !== gen.current) return;
+      // The earlier check's sentence is no longer the last word (the names it gave stay on the rows).
+      setCheckOk(false);
+      setLive((s) => (s.text ? { text: "", n: s.n + 1 } : s));
       setCheckError(sentenceOf(err, "The key could not be checked. Try again in a moment."));
     } finally {
       checkBusy.current = false;
@@ -421,6 +459,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     // What the old key could read says nothing about the new one.
     accessRef.current = undefined;
     setAccess(undefined);
+    setCheckOk(false);
     setCheckError(undefined);
     void read();
   };
@@ -445,7 +484,11 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
   const valueOf = (ref: string): RowDraft => draft?.rows[ref] ?? stored(ref);
   const automatic = draft ? draft.automatic : (state?.automatic ?? false);
   const everyMinutes = draft ? draft.everyMinutes : (state?.everyMinutes ?? 60);
-  const edit = (fn: (d: Draft) => Draft) => setDraft((d) => fn(d ?? fromState()));
+  const edit = (fn: (d: Draft) => Draft) => {
+    // R268 M1: the form is inert while a save is out, so nothing edited under it can be lost.
+    if (saveBusy.current) return;
+    setDraft((d) => fn(d ?? fromState()));
+  };
   const editRow = (ref: string, patch: Partial<RowDraft>) => edit((d) => ({ ...d, rows: { ...d.rows, [ref]: { ...(d.rows[ref] ?? stored(ref)), ...patch } } }));
 
   /**
@@ -455,10 +498,13 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
    */
   const request = async (d: { automatic: boolean; everyMinutes: ZoteroSyncEveryMinutes; rows: Array<{ ref: string } & RowDraft> }): Promise<ZoteroSyncSettingsRequest> => {
     const out: ZoteroSyncSettingsRequest["links"] = [];
+    const confirmed = stateRef.current?.links ?? [];
     for (const r of d.rows) {
       if (!r.keep) continue;
-      const was = links.find((l) => l.ref === r.ref);
-      if (was) {
+      const was = confirmed.find((l) => l.ref === r.ref);
+      // A link that stays in its project keeps its options exactly; moved to another project, it takes that project's
+      // defaults, as a new link does (R268 M5).
+      if (was && was.projectId === r.projectId) {
         out.push({ ref: r.ref, projectId: r.projectId, structure: was.structure, duplicates: was.duplicates });
         continue;
       }
@@ -472,10 +518,12 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
   /**
    * A save: the answer is a reading of the state; a refusal that names a field is said there, with focus. "Save" sends
    * the draft with no `resume` anywhere, so an undone library stays paused (R265). "Turn syncing on again" sends the
-   * service's last confirmed settings (never the unsaved draft) with `resume: true` on that one link.
+   * service's last confirmed settings (never the unsaved draft) with `resume: true` on that one link. While it is out
+   * the form is inert (R268 M1).
    */
   const save = async (which: "draft" | { resume: string }) => {
-    if (saveBusy.current || !state || state.readOnly) return;
+    const confirmed = stateRef.current;
+    if (saveBusy.current || !confirmed || confirmed.readOnly || confirmed.settingsNewer) return;
     saveBusy.current = true;
     setSaving(true);
     setSaveError(undefined);
@@ -485,19 +533,21 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
       const body =
         which === "draft"
           ? await request({ automatic, everyMinutes, rows: rows.map((r) => ({ ref: r.ref, ...valueOf(r.ref) })) })
-          : await request({ automatic: state.automatic, everyMinutes: state.everyMinutes, rows: links.map((l) => ({ ref: l.ref, keep: true, projectId: l.projectId })) }).then((r) => ({
+          : await request({ automatic: confirmed.automatic, everyMinutes: confirmed.everyMinutes, rows: confirmed.links.map((l) => ({ ref: l.ref, keep: true, projectId: l.projectId })) }).then((r) => ({
               ...r,
               links: r.links.map((l) => (l.ref === which.resume ? { ...l, resume: true as const } : l)),
             }));
       if (!alive.current || g !== gen.current) return;
-      const seq = ++readSeq.current;
       const ev = eventSeq.current;
       try {
         const s = await api.saveSettings(body);
         if (!alive.current || g !== gen.current) return;
-        applyState(s, seq, ev);
+        // R268 I1: a write's answer is numbered when it arrives, so it wins over every read that started before it.
+        applyState(s, ++readSeq.current, ev);
         if (which === "draft") setDraft(null);
         say(ZOTERO_TEXT.saved);
+        // Exactly one fresh reading follows (one already out is overruled, and the coalesced read asks once more).
+        void read();
       } catch (err) {
         if (!alive.current || g !== gen.current) return;
         const msg = sentenceOf(err, "The settings could not be saved.");
@@ -544,6 +594,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
 
   // ---- the page ----
   const ro = state?.readOnly ?? false;
+  const newer = state?.settingsNewer ?? false;
   const titleId = `${ids}-h`;
 
   if (noLibrary && !state) {
@@ -594,6 +645,11 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
           <UserText>{ZOTERO_SYNC_REASON_TEXT["library-read-only"]}</UserText>
         </p>
       )}
+      {state && newer && (
+        <p className="ao-zotero__note" data-testid="zotero-newer">
+          <UserText>{ZOTERO_SYNC_SENTENCES.settingsNewer}</UserText>
+        </p>
+      )}
 
       {state && !ro && (
         <section aria-labelledby={`${ids}-key`}>
@@ -604,7 +660,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
               Check the key
             </button>
           </p>
-          {access && (
+          {access && checkOk && (
             <div data-testid="zotero-key-result">
               <p>
                 <UserText>{access.summary}</UserText>
@@ -622,7 +678,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
         </section>
       )}
 
-      {state && (
+      {state && !newer && (
         <section aria-labelledby={`${ids}-libs`} data-testid="zotero-libraries">
           <h2 id={`${ids}-libs`}>Libraries to keep in step</h2>
           {!access && links.length > 0 && !ro && <p className="ao-zotero__note">{ZOTERO_TEXT.beforeCheck}</p>}
@@ -640,6 +696,8 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
               projects={projects}
               errors={fieldErrors}
               busy={saving || checking}
+              saving={saving}
+              waitingNow={reviewWaiting[r.link?.projectId ?? ""] ?? 0}
               onKeep={(keep) => editRow(r.ref, { keep })}
               onProject={(projectId) => editRow(r.ref, { projectId })}
               onResume={() => void save({ resume: r.ref })}
@@ -649,7 +707,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
         </section>
       )}
 
-      {state && !ro && (
+      {state && !ro && !newer && (
         <section aria-labelledby={`${ids}-auto`}>
           <h2 id={`${ids}-auto`}>Automatic sync</h2>
           <p>
@@ -658,6 +716,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
                 type="checkbox"
                 data-field="automatic"
                 checked={automatic}
+                disabled={saving}
                 aria-describedby={[`${ids}-auto-hint`, fieldErrors.automatic ? `${ids}-auto-err` : ""].filter(Boolean).join(" ")}
                 onChange={(e) => edit((d) => ({ ...d, automatic: e.target.checked }))}
               />
@@ -678,6 +737,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
               <select
                 data-field="everyMinutes"
                 value={String(everyMinutes)}
+                disabled={saving}
                 aria-describedby={fieldErrors.everyMinutes ? `${ids}-every-err` : undefined}
                 onChange={(e) => edit((d) => ({ ...d, everyMinutes: Number(e.target.value) as ZoteroSyncEveryMinutes }))}
               >
@@ -707,7 +767,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
         </section>
       )}
 
-      {state && !ro && (
+      {state && !ro && !newer && (
         <div>
           <p>
             <button
@@ -777,6 +837,10 @@ interface RowProps {
   projects: ProjectInfo[];
   errors: Record<string, string>;
   busy: boolean;
+  /** A save is out: the row's settings are inert (R268 M1). */
+  saving: boolean;
+  /** How many entries wait in this link's project's review queue now (R268 M3). */
+  waitingNow: number;
   onKeep(keep: boolean): void;
   onProject(projectId: string): void;
   onResume(): void;
@@ -792,12 +856,15 @@ function ForName({ label }: { label: string }) {
   );
 }
 
-function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projects, errors, busy, onKeep, onProject, onResume, onCheck }: RowProps) {
+const KNOWN_PAUSES: readonly string[] = ["undone", "key-refused", "library-gone"];
+
+function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projects, errors, busy, saving, waitingNow, onKeep, onProject, onResume, onCheck }: RowProps) {
   const headingId = `${ids}-h`;
   const keepErr = errors[`keep:${refName}`];
   const projectErr = errors[`project:${refName}`];
   const last = link?.lastRun;
-  const waiting = last?.counts?.waiting ?? 0;
+  // R268 M6: a pause this build does not know is still a pause.
+  const unknownPause = !!link && ((!!link.paused && !KNOWN_PAUSES.includes(link.paused)) || (link.waitingFor === "paused" && !link.paused));
   const linkable = !!last?.batchId && isValidId(last.projectId) && isValidId(last.batchId);
   return (
     <section className="ao-zotero__lib" aria-labelledby={headingId} data-row-ref={refName}>
@@ -848,6 +915,7 @@ function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projec
           )}
         </p>
       )}
+      {unknownPause && <p className="ao-zotero__pause">{ZOTERO_TEXT.pausedUnknown}</p>}
       {link?.waitingFor === "project-locked" && <p className="ao-zotero__pause">{ZOTERO_TEXT.locked}</p>}
       {!readOnly && (
         <div className="ao-zotero__controls">
@@ -857,6 +925,7 @@ function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projec
               data-keep-ref={refName}
               data-field={`keep:${refName}`}
               checked={value.keep}
+              disabled={saving}
               aria-describedby={keepErr ? `${ids}-keep-err` : undefined}
               onChange={(e) => onKeep(e.target.checked)}
             />
@@ -873,7 +942,7 @@ function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projec
             <span>
               Into project <ForName label={label} />
             </span>
-            <select data-field={`project:${refName}`} value={value.projectId} aria-describedby={projectErr ? `${ids}-project-err` : undefined} onChange={(e) => onProject(e.target.value)}>
+            <select data-field={`project:${refName}`} value={value.projectId} disabled={saving} aria-describedby={projectErr ? `${ids}-project-err` : undefined} onChange={(e) => onProject(e.target.value)}>
               <option value="">{ZOTERO_TEXT.chooseProject}</option>
               {projects.map((p) => (
                 <option key={p.id} value={p.id} disabled={p.unlocked === false && p.id !== link?.projectId}>
@@ -890,19 +959,18 @@ function LibraryRow({ ids, refName, label, link, listed, readOnly, value, projec
           )}
         </div>
       )}
-      {!readOnly && linkable && (
+      {!readOnly && link && (linkable || waitingNow > 0) && (
         <p className="ao-zotero__links">
-          <a href={reportHref(last!.projectId, last!.batchId!)} onClick={inAppLink}>
-            Import report <ForName label={label} />
-          </a>
-          {waiting > 0 && (
-            <>
-              {" "}
-              <a href={`${IMPORT_PATHS.review}?project=${encodeURIComponent(last!.projectId)}&batch=${encodeURIComponent(last!.batchId!)}`} onClick={inAppLink}>
-                Review {num(waiting)} waiting{" "}
-                <ForName label={label} />
-              </a>
-            </>
+          {linkable && (
+            <a href={reportHref(last!.projectId, last!.batchId!)} onClick={inAppLink}>
+              Import report <ForName label={label} />
+            </a>
+          )}
+          {waitingNow > 0 && (
+            <a href={projectQueueHref(link.projectId)} onClick={inAppLink}>
+              Review {num(waitingNow)} waiting{" "}
+              <ForName label={label} />
+            </a>
           )}
         </p>
       )}
