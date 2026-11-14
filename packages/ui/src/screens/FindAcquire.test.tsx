@@ -7,6 +7,8 @@
 import {
   FIND_LIBRARY_FILE_TEXT,
   FIND_LIBRARY_TEXT,
+  FIND_LINK_FILE_TEXT,
+  FIND_LINK_TEXT,
   FIND_REASON_TEXT,
   FIND_ROUTE_TEXT,
   FIND_STOPPED_TEXT,
@@ -4063,6 +4065,211 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       await waitFor(() => expect(stateOf("twice at once")).toBe("Waiting for you in the sign-in window"));
       expect(posts("/library/start")).toHaveLength(1);
       expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // Task F18c (R345): "Open it here and fetch the PDF" — the same press as "Get through my library" with the link's
+  // start in place of the library's.
+
+  describe("Open it here and fetch the PDF (F18c; R345)", () => {
+    const OPEN_HERE = "Open it here and fetch the PDF";
+    const REPO = "https://repository.example.edu/bitstream/1/zq9here.pdf";
+    const PUB = "https://doi.org/10.5555/ao.here.zq9";
+    const OFFERS = [
+      { label: "A free copy may be at", url: REPO, host: "repository.example.edu" },
+      { label: "Publisher's page", url: PUB, host: "doi.org" },
+    ] as FindEntryView["offers"];
+    const REPO_PLACE = "A free copy may be at (repository.example.edu)";
+    const linkable = (o: Partial<FindEntryView> = {}) => noc({ offers: OFFERS, linkStart: true, ...o });
+    const here = (typed: string, place = REPO_PLACE) => within(row(typed)).getByRole("button", { name: `${OPEN_HERE}: ${place}: ${T(typed)}` });
+    const linkPosts = () => posts("/link/start");
+    /** The queue as `serve` gives it, and the link's start: `start` answers it (default: the link and TICKET). */
+    function serveLink(entries: FindEntryView[], o: { start?: (body: unknown) => Response | Promise<Response>; cancel?: (eid: string) => Response | Promise<Response> } = {}) {
+      serve(entries, o.cancel ? { cancel: o.cancel } : {});
+      server.use(http.post(url("/projects/:id/find/:eid/link/start"), async ({ request }) => (o.start ? o.start(await request.json()) : HttpResponse.json({ url: REPO, ticket: TICKET }))));
+    }
+    /** A row offered it, its start making the entry wait (as the service would). */
+    function waitsOnPress(typed: string, o: Partial<FindEntryView> = {}) {
+      const e = entry({ typed, ...linkable(o) });
+      serveLink([e], {
+        start: () => {
+          becomes(later(e, { state: "waiting-sign-in", offers: undefined, linkStart: undefined, library: undefined, windowStart: "link" }));
+          return HttpResponse.json({ url: REPO, ticket: TICKET });
+        },
+        cancel: () => {
+          if (current[0]!.state !== "waiting-sign-in") return refusal(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
+          becomes(later(e, {}, "2026-11-13T12:00:00.000Z"));
+          return HttpResponse.json(current[0]);
+        },
+      });
+      return e;
+    }
+
+    it("shown on each link exactly where the view offers it (`linkStart`), beside Open in my browser and Copy address; nowhere else; nothing asked by showing it", async () => {
+      serveLink([
+        entry({ typed: "offered", ...linkable() }),
+        entry({ typed: "offered rc", ...withSource({ state: "record-complete", reason: { code: "copy-not-allowed" }, offers: OFFERS, linkStart: true }) }),
+        entry({ typed: "not offered", ...noc({ offers: OFFERS }) }),
+        entry({ typed: "not exactly true", ...noc({ offers: OFFERS, linkStart: "yes" as never }) }),
+        entry({ typed: "no links", ...noc({ linkStart: true }) }),
+      ]);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(5));
+      const list = within(row("offered")).getByRole("list", { name: `Where to get it: ${T("offered")}` });
+      expect(within(list).getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual([
+        `Open in my browser: ${REPO_PLACE}: ${T("offered")}`,
+        `Copy address: ${REPO_PLACE}: ${T("offered")}`,
+        `${OPEN_HERE}: ${REPO_PLACE}: ${T("offered")}`,
+        `Open in my browser: Publisher's page (doi.org): ${T("offered")}`,
+        `Copy address: Publisher's page (doi.org): ${T("offered")}`,
+        `${OPEN_HERE}: Publisher's page (doi.org): ${T("offered")}`,
+      ]);
+      expect(here("offered rc", "Publisher's page (doi.org)")).toBeTruthy();
+      for (const t of ["not offered", "not exactly true", "no links"]) expect(within(row(t)).queryByRole("button", { name: new RegExp(`^${OPEN_HERE}`, "u") }), t).toBeNull();
+      // The row's own acts are as before (no "Get through my library" without `library.canStart`).
+      expect([...row("offered").querySelectorAll(".ao-find__actions button")].map((b) => b.getAttribute("aria-label"))).toEqual([`Open: ${T("offered")}`, `Remove from the queue: ${T("offered")}`]);
+      expect(linkPosts()).toHaveLength(0);
+      expect(fake.shell!.openLibraryWindow).not.toHaveBeenCalled();
+    });
+
+    it("R345 f: outside the desktop app the control is not shown — the links are plain links, nothing unavailable", async () => {
+      fake.shell = undefined;
+      serveLink([entry({ typed: "in a browser", ...linkable() })]);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      expect(row("in a browser").textContent).not.toMatch(/Open it here|Only in the desktop app/u);
+      expect(within(row("in a browser")).getAllByRole("link").map((a) => a.getAttribute("href"))).toEqual([REPO, PUB]);
+    });
+
+    it("a press: ONE start with exactly `{ url }` of that link; the shell opens the window with the answer's ticket and address; the row waits, focus on its words; nothing of the ticket or the address anywhere else", async () => {
+      const e = waitsOnPress("pressed here");
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      const spies = (["log", "info", "warn", "error", "debug", "trace"] as const).map((k) => vi.spyOn(console, k));
+      const user = userEvent.setup();
+      try {
+        show();
+        await waitFor(() => expect(rows()).toHaveLength(1));
+        const h = heard();
+        const seen: string[] = [];
+        const mo = new MutationObserver(() => seen.push(document.documentElement.outerHTML));
+        mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+        await user.dblClick(here("pressed here"));
+        await waitFor(() => expect(row("pressed here").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+        expect(linkPosts()).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/link/start`, body: { url: REPO } }]);
+        expect(posts("/library/start")).toHaveLength(0);
+        expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([[TICKET, REPO]]);
+        expect(document.activeElement).toBe(row("pressed here").querySelector("[data-entry-state]"));
+        // The waiting row is the library's: the shell's take, Cancel.
+        expect(btn("pressed here", "Add the PDF showing in the sign-in window")).toBeTruthy();
+        await user.click(btn("pressed here", "Cancel"));
+        await waitFor(() => expect(row("pressed here").querySelector(".ao-find__state")?.textContent).toBe("No open copy"));
+        expect(posts("/library/cancel")).toHaveLength(1);
+        expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
+        mo.disconnect();
+        h.stop();
+        seen.push(document.documentElement.outerHTML, ...h.said, window.location.href, JSON.stringify(window.history.state));
+        for (const store of [localStorage, sessionStorage]) for (let i = 0; i < store.length; i++) seen.push(store.key(i)!, store.getItem(store.key(i)!) ?? "");
+        for (const sp of spies) seen.push(JSON.stringify(sp.mock.calls.map((c) => c.map(String))));
+        expect(seen.join("\n").includes(TICKET)).toBe(false);
+        // No request but the start carries the address, and none carries the ticket.
+        expect(JSON.stringify(calls.filter((c) => !c.path.endsWith("/link/start")))).not.toMatch(/zq9here|0123456789abcdef0123456789abcdef/u);
+        for (const s of h.said) expect(s).not.toMatch(/\badd(s|ed)?\b|library/iu);
+      } finally {
+        for (const sp of spies) sp.mockRestore();
+      }
+    });
+
+    it("R342 b as for the library: a leftover window is closed and the shell asked once more; refused twice, ONE cancel and the row says the window could not be opened", async () => {
+      waitsOnPress("leftover");
+      fake.shell!.openLibraryWindow.mockResolvedValueOnce(false).mockResolvedValue(true);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await user.click(here("leftover", "Publisher's page (doi.org)"));
+      await waitFor(() => expect(row("leftover").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+      expect(linkPosts().map((c) => c.body)).toEqual([{ url: PUB }]);
+      expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([
+        [TICKET, REPO],
+        [TICKET, REPO],
+      ]);
+      expect(posts("/library/cancel")).toHaveLength(0);
+    });
+
+    it("the shell refuses twice: ONE cancel at the service; the row says the window could not be opened, and the control is offered again", async () => {
+      waitsOnPress("refused twice");
+      fake.shell!.openLibraryWindow.mockResolvedValue(false);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await user.click(here("refused twice"));
+      await waitFor(() => expect(note("refused twice")).toBe("The sign-in window could not be opened. Nothing was changed."));
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2);
+      await waitFor(() => expect(here("refused twice").getAttribute("aria-disabled")).toBeNull());
+    });
+
+    it("a refusal of the start: the service's sentence on the row, once; no window; the control busy only while it is out", async () => {
+      const e = entry({ typed: "refused", ...linkable() });
+      serveLink([e], { start: () => refusal(409, "CONFLICT", FIND_LINK_TEXT.notAPlace, "link-not-a-place") });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      server.use(
+        http.post(url("/projects/:id/find/:eid/link/start"), async () => {
+          await gate;
+          return refusal(409, "CONFLICT", FIND_LINK_TEXT.notAPlace, "link-not-a-place");
+        }),
+      );
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await user.click(here("refused"));
+      await waitFor(() => expect(within(row("refused")).getByRole("button", { name: `${OPEN_HERE}: ${REPO_PLACE}: ${T("refused")}` }).textContent).toBe("Opening the sign-in window…"));
+      for (const b of within(row("refused")).getAllByRole("button", { name: new RegExp(`^${OPEN_HERE}`, "u") })) expect(b.getAttribute("aria-disabled")).toBe("true");
+      await user.click(here("refused", "Publisher's page (doi.org)"));
+      release();
+      await waitFor(() => expect(within(row("refused")).getByRole("alert").textContent).toBe(FIND_LINK_TEXT.notAPlace));
+      expect(linkPosts()).toHaveLength(1);
+      expect(fake.shell!.openLibraryWindow).not.toHaveBeenCalled();
+      expect(here("refused").getAttribute("aria-disabled")).toBeNull();
+    });
+
+    it("R345 e: the shell's no-ticket for the one waiting row of a link's start: The sign-in window is not open for this work. Cancel, then use “Open it here and fetch the PDF” again.", async () => {
+      serve([entry({ typed: "link waits", ...waiting({ windowStart: "link" }) })]);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await say({ ticket: null, state: "failed", reason: "no-ticket" });
+      const SAID = "The sign-in window is not open for this work. Cancel, then use “Open it here and fetch the PDF” again.";
+      await waitFor(() => expect(note("link waits")).toBe(SAID));
+      await waitFor(() => expect(live().textContent).toBe(`“link waits”: ${SAID}`));
+    });
+
+    it("R345 e: a link's file not kept says so in words naming no library; a library's file as before", async () => {
+      serve([
+        entry({ typed: "link file", ...linkable({ library: { canStart: false, reason: "not-offered", lastFile: "not-pdf", lastFileFrom: "link" } }) }),
+        entry({ typed: "link rules", ...noc({ library: { canStart: false, reason: "not-offered", lastFile: "rules-method", lastFileFrom: "link" } }) }),
+        entry({ typed: "library file", ...startable({ library: { canStart: true, lastFile: "not-pdf" } }) }),
+        entry({ typed: "unknown from", ...noc({ library: { canStart: false, reason: "not-offered", lastFile: "not-pdf", lastFileFrom: "elsewhere" as never } }) }),
+      ]);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(4));
+      expect(libLine("link file")).toBe(FIND_LINK_FILE_TEXT["not-pdf"]);
+      expect(libLine("link rules")).toBe("The file fetched in the sign-in window was not kept: this project's rules do not allow fetching free copies of works.");
+      expect(libLine("library file")).toBe(FIND_LIBRARY_FILE_TEXT["not-pdf"]);
+      // A kind this build does not know: no sentence (it cannot say whose file it was truly).
+      expect(libLine("unknown from")).toBeUndefined();
+      expect(here("link file")).toBeTruthy();
+    });
+
+    it("in a read-only library the control is shown disabled and sends nothing", async () => {
+      useService({ mode: "read-only", queues: { [PID]: queue([entry({ typed: "read only", ...linkable() })], { readOnly: true, stopped: { code: "read-only", text: FIND_STOPPED_TEXT["read-only"] } }) } });
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const b = here("read only") as HTMLButtonElement;
+      expect(b.disabled).toBe(true);
+      fireEvent.click(b);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(linkPosts()).toHaveLength(0);
     });
   });
 });

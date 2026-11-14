@@ -47,6 +47,13 @@
  *     first and stays for ACT_SAID_MS; rows' changes arriving meanwhile are said after it — each row's latest as
  *     shown then, never the same change twice.
  *
+ * "Open it here and fetch the PDF" (Task F18c; R345): a press on that control of one of a row's links is the SAME press
+ * as "Get through my library" (`startWindow`, one function for both) with the link's start in place of the library's:
+ * ONE `POST …/link/start` with `{ url }` (that link, as the row's "Where to get it" parsed it), then the same open, the
+ * same retry, the same cancel when the window does not open, the same busy state; the waiting row, the shell's events,
+ * the closing and the hand-over do not know which start it was — only the words that would name the library untruly
+ * (the shell's "no ticket") are chosen by the view's `windowStart`.
+ *
  * Through the researcher's library (Task F18b; R340, R301; F15's start and cancel, F16's shell, F17's outcome):
  *   - Every library step is the researcher's press on that row: nothing is started on focus, on hover, on a timer, on
  *     an event or when the screen opens. "Get through my library" is ONE `POST …/library/start` (no body); with its
@@ -81,6 +88,7 @@ import {
   type FindChosenPerson,
   type FindEntryView,
   type FindLibraryStartResponse,
+  type FindLinkStartRequest,
   type FindPersonCandidate,
   type FindPersonWork,
   type FindQueueResponse,
@@ -161,6 +169,14 @@ export function findLibraryApi(client: ApiClient) {
   return {
     /** The library's address for the work and a one-time ticket: handed to the shell, and nowhere else. */
     start: (pid: string, eid: string) => client.request<FindLibraryStartResponse>("POST", path(pid, eid, "start")),
+    /**
+     * F18c (R345): "Open it here and fetch the PDF" — the start at one of the entry's links, the link alone in the body.
+     * The answer is the link as the service holds it and a one-time ticket: handed to the shell, and nowhere else.
+     */
+    linkStart: (pid: string, eid: string, url: string) => {
+      if (!isValidId(pid) || !isValidId(eid)) throw new Error("That is not a valid id.");
+      return client.request<FindLibraryStartResponse>("POST", `/projects/${encodeURIComponent(pid)}/find/${encodeURIComponent(eid)}/link/start`, { body: { url } satisfies FindLinkStartRequest });
+    },
     /** The entry back to what it was; 409 "entry-state" when it no longer waits. */
     cancel: (pid: string, eid: string) => client.request<FindEntryView>("POST", path(pid, eid, "cancel")),
   };
@@ -184,8 +200,11 @@ function shellWithin<V>(p: Promise<V>, ms = LIBRARY_SHELL_TIMEOUT_MS): Promise<V
   });
 }
 
-/** R340 b: what the shell reports for the row, in words (said once each). `opened` and `closed` have their own handling. */
-function windowSentence(e: LibraryWindowEvent): string | undefined {
+/**
+ * R340 b: what the shell reports for the row, in words (said once each). `opened` and `closed` have their own handling.
+ * F18c (R345 e): the one sentence that names the control to use again names the one the row was started by.
+ */
+function windowSentence(e: LibraryWindowEvent, v: FindEntryView): string | undefined {
   switch (e.state) {
     case "fetching":
       return FIND_TEXT.fetching;
@@ -193,7 +212,7 @@ function windowSentence(e: LibraryWindowEvent): string | undefined {
       return FIND_TEXT.notAPdf;
     case "failed":
       // R342 e: no ticket is open in the shell — no window for this work.
-      if (e.reason === "no-ticket") return FIND_TEXT.noWindow;
+      if (e.reason === "no-ticket") return v.windowStart === "link" ? FIND_TEXT.noWindowLink : FIND_TEXT.noWindow;
       return e.reason === "pause" ? FIND_TEXT.fetchPause : e.reason === "busy" ? FIND_TEXT.fetchBusy : FIND_TEXT.fetchFailed;
     case "handed-over":
       return FIND_TEXT.handedOver;
@@ -1571,18 +1590,20 @@ function ProjectQueue(props: {
   };
 
   /**
-   * "Get through my library": ONE start at the service; with its answer, the sign-in window opened by the shell. The
-   * ticket and the address live only in this press's variables and the one call to the shell (the ticket also in
-   * `libTicket` while the row waits). A window that did not open leaves nothing waiting: the start is cancelled.
+   * "Get through my library" — and, F18c (R345), "Open it here and fetch the PDF" on one of the row's links (`how`):
+   * ONE start at the service (the library's, or the link's with that link); with its answer, the sign-in window opened
+   * by the shell. The ticket and the address live only in this press's variables and the one call to the shell (the
+   * ticket also in `libTicket` while the row waits). A window that did not open leaves nothing waiting: the start is
+   * cancelled (the one cancel route serves both kinds).
    */
-  const startLibrary = async (e: FindEntryView) => {
+  const startWindow = async (e: FindEntryView, how: { kind: "library" } | { kind: "link"; url: string }) => {
     // R342 i: outside the desktop app a press says why, once, and asks nothing.
     if (!shell) {
       sayAct([FIND_TEXT.onlyDesktop]);
       return;
     }
     if (busyRef.current[e.id] || readOnly) return;
-    setBusyFor(e.id, "library");
+    setBusyFor(e.id, how.kind);
     acting.current.add(e.id);
     setErrorFor(e.id, undefined);
     setNoteFor(e.id, undefined);
@@ -1592,7 +1613,7 @@ function ProjectQueue(props: {
     try {
       let got: FindLibraryStartResponse;
       try {
-        got = await libApi.start(projectId, e.id);
+        got = how.kind === "link" ? await libApi.linkStart(projectId, e.id, how.url) : await libApi.start(projectId, e.id);
       } catch (err) {
         if (!live() || refused(err)) return;
         setErrorFor(e.id, sentenceOf(err, "That could not be done. Try again."));
@@ -1746,7 +1767,7 @@ function ProjectQueue(props: {
       if (!handed) void windowClosed(v);
       return;
     }
-    const text = windowSentence(ev);
+    const text = windowSentence(ev, v);
     if (!text) return;
     if (ev.state === "handed-over") {
       if (mine) libTicket.current = { ...mine, handedOver: true };
@@ -1813,7 +1834,11 @@ function ProjectQueue(props: {
         void remove(e);
         return;
       case "library":
-        void startLibrary(e);
+        void startWindow(e, { kind: "library" });
+        return;
+      case "link":
+        // F18c (R345): the link pressed, as the row's "Where to get it" parsed it from the view.
+        if (typeof a.url === "string" && a.url) void startWindow(e, { kind: "link", url: a.url });
         return;
       case "library-take":
         void takePdf(e);

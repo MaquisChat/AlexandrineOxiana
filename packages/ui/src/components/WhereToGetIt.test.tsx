@@ -5,7 +5,7 @@
  * "Copy address" (R311, the way that always works); if the opener does not take it, the place says so and the copy
  * remains.
  */
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
@@ -220,5 +220,79 @@ describe("WhereToGetIt in the desktop app (R340 d)", () => {
     await user.hover(within(list()).getAllByRole("button")[0]!);
     await new Promise((r) => setTimeout(r, 50));
     expect(fake.shell!.openInBrowser).not.toHaveBeenCalled();
+  });
+});
+
+describe("Open it here and fetch the PDF (F18c, R345 a, f)", () => {
+  const OPEN_HERE = "Open it here and fetch the PDF";
+  const openHereButtons = () => within(list()).getAllByRole("button", { name: new RegExp(`^(${OPEN_HERE}|${WHERE_TEXT.openingHere})`, "u") });
+
+  it("in the desktop app, when the row offers it: a third control beside Open in my browser and Copy address, named with the place and the row", () => {
+    fake.shell = fakeShell();
+    render(<WhereToGetIt offers={OFFERS} name={NAME} onOpenHere={() => {}} />);
+    const places = within(list()).getAllByRole("listitem");
+    expect(within(places[0]!).getAllByRole("button").map((b) => [b.textContent, b.getAttribute("aria-label")])).toEqual([
+      ["Open in my browser", `Open in my browser: Publisher's page (doi.org): ${NAME}`],
+      ["Copy address", `Copy address: Publisher's page (doi.org): ${NAME}`],
+      [OPEN_HERE, `${OPEN_HERE}: Publisher's page (doi.org): ${NAME}`],
+    ]);
+    expect(within(places[1]!).getByRole("button", { name: `${OPEN_HERE}: Your library's catalogue (catalogue.example.edu): ${NAME}` })).toBeTruthy();
+    expect(WHERE_TEXT.openHere).toBe(OPEN_HERE);
+  });
+
+  it("a press hands exactly that place's parsed address to the row, once — and to nothing else (no opener, no window)", async () => {
+    fake.shell = fakeShell();
+    const onOpenHere = vi.fn();
+    const user = userEvent.setup();
+    render(<WhereToGetIt offers={[{ label: "A free copy may be at", url: "https://repo.example.edu/bitstream/1/a.\tpdf", host: "x" }, ...OFFERS]} name={NAME} onOpenHere={onOpenHere} />);
+    await user.click(openHereButtons()[0]!);
+    expect(onOpenHere.mock.calls).toEqual([["https://repo.example.edu/bitstream/1/a.pdf"]]);
+    expect(fake.shell!.openInBrowser).not.toHaveBeenCalled();
+    expect(fake.shell!.openLibraryWindow).not.toHaveBeenCalled();
+  });
+
+  it("while a start is out (busy): every such control of the row is unavailable and a press sends nothing; the pressed one says so", async () => {
+    fake.shell = fakeShell();
+    const onOpenHere = vi.fn();
+    const user = userEvent.setup();
+    const { rerender } = render(<WhereToGetIt offers={OFFERS} name={NAME} onOpenHere={onOpenHere} />);
+    await user.click(openHereButtons()[1]!);
+    rerender(<WhereToGetIt offers={OFFERS} name={NAME} onOpenHere={onOpenHere} openHereBusy />);
+    const now = openHereButtons();
+    expect(now.map((b) => [b.textContent, b.getAttribute("aria-disabled"), b.getAttribute("aria-busy")])).toEqual([
+      [OPEN_HERE, "true", null],
+      [WHERE_TEXT.openingHere, "true", "true"],
+    ]);
+    expect(WHERE_TEXT.openingHere).toBe("Opening the sign-in window…");
+    await user.click(now[0]!);
+    await user.click(now[1]!);
+    expect(onOpenHere).toHaveBeenCalledTimes(1);
+    rerender(<WhereToGetIt offers={OFFERS} name={NAME} onOpenHere={onOpenHere} />);
+    expect(openHereButtons().map((b) => [b.textContent, b.getAttribute("aria-disabled")])).toEqual([
+      [OPEN_HERE, null],
+      [OPEN_HERE, null],
+    ]);
+  });
+
+  it("disabled (a read-only library): shown, disabled, and a press sends nothing", () => {
+    fake.shell = fakeShell();
+    const onOpenHere = vi.fn();
+    render(<WhereToGetIt offers={OFFERS} name={NAME} onOpenHere={onOpenHere} openHereDisabled />);
+    const b = openHereButtons()[0]! as HTMLButtonElement;
+    expect(b.disabled).toBe(true);
+    fireEvent.click(b);
+    expect(onOpenHere).not.toHaveBeenCalled();
+  });
+
+  it("not offered by the row: no such control; outside the desktop app: never (the links are plain links)", () => {
+    fake.shell = fakeShell();
+    const { unmount } = render(<WhereToGetIt offers={OFFERS} name={NAME} />);
+    expect(screen.queryByRole("button", { name: new RegExp(`^${OPEN_HERE}`, "u") })).toBeNull();
+    unmount();
+    fake.shell = undefined;
+    render(<WhereToGetIt offers={OFFERS} name={NAME} onOpenHere={() => {}} />);
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(within(list()).getAllByRole("link")).toHaveLength(2);
+    expect(document.body.textContent).not.toContain(OPEN_HERE);
   });
 });
