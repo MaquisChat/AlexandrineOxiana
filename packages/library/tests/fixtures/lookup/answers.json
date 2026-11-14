@@ -8,6 +8,13 @@
     "https://api.crossref.org/works?query.bibliographic=Geertz%2C%20Deep%20Play%3A%20Notes%20on%20the%20Balinese%20Cockfight&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-geertz-deep-play.json" },
     "https://api.openalex.org/works?search=Geertz%2C%20Deep%20Play%3A%20Notes%20on%20the%20Balinese%20Cockfight&per-page=5": { "status": 200, "file": "openalex-find-geertz-deep-play-handbuilt.json" },
     "https://api.crossref.org/works?query.bibliographic=Vaisey%2C%20Motivation%20and%20Justification%3A%20A%20Dual-Process%20Model%20of%20Culture%20in%20Action%202009&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-vaisey-motivation.json" },
-    "https://api.openalex.org/works?search=Vaisey%2C%20Motivation%20and%20Justification%3A%20A%20Dual-Process%20Model%20of%20Culture%20in%20Action%202009&per-page=5": { "status": 200, "file": "openalex-find-vaisey-motivation-handbuilt.json" }
+    "https://api.openalex.org/works?search=Vaisey%2C%20Motivation%20and%20Justification%3A%20A%20Dual-Process%20Model%20of%20Culture%20in%20Action%202009&per-page=5": { "status": 200, "file": "openalex-find-vaisey-motivation-handbuilt.json" },
+    "https://api.crossref.org/works?query.bibliographic=David%20Stark&rows=5&select=DOI,title,subtitle,author,editor,issued,type,container-title,publisher,ISBN": { "status": 200, "file": "crossref-find-stark.json" },
+    "https://api.openalex.org/works?search=David%20Stark&per-page=5": { "status": 200, "file": "openalex-find-stark-handbuilt.json" },
+    "https://api.openalex.org/authors?search=David%20Stark&per-page=20": { "status": 200, "file": "openalex-find-stark-people-handbuilt.json" },
+    "https://api.openalex.org/works?filter=authorships.author.id:A5055013655&sort=publication_date:desc&per-page=100&page=1": { "status": 200, "file": "openalex-find-stark-works-handbuilt.json" },
+    "https://api.openalex.org/works/W3015927993": { "status": 200, "file": "openalex-work-W3015927993.json" },
+    "https://api.openalex.org/works/W2621405455": { "status": 200, "file": "openalex-work-W2621405455.json" },
+    "https://api.openalex.org/works/W2038217319": { "status": 200, "file": "openalex-work-W2038217319.json" }
   }
 }

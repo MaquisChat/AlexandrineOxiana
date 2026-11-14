@@ -1,0 +1,305 @@
+{
+ "meta": {
+  "count": 5,
+  "db_response_time_ms": 0,
+  "page": 1,
+  "per_page": 5,
+  "groups_count": null
+ },
+ "results": [
+  {
+   "id": "https://openalex.org/W2038217319",
+   "doi": "https://doi.org/10.1086/681213",
+   "title": "Game Changer: The Topology of Creativity",
+   "display_name": "Game Changer: The Topology of Creativity",
+   "publication_year": 2015,
+   "publication_date": "2015-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2038217319",
+    "doi": "https://doi.org/10.1086/681213",
+    "mag": "2038217319",
+    "pmid": "https://pubmed.ncbi.nlm.nih.gov/26046227"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/681213",
+    "doi": "https://doi.org/10.1086/681213",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1086/681213",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5044125536",
+      "display_name": "Mathijs de Vaan",
+      "orcid": "https://orcid.org/0000-0003-1971-7290"
+     },
+     "raw_author_name": "Mathijs de Vaan"
+    },
+    {
+     "author_position": "middle",
+     "author": {
+      "id": "https://openalex.org/A5057226228",
+      "display_name": "Balázs Vedres",
+      "orcid": "https://orcid.org/0000-0002-9469-8774"
+     },
+     "raw_author_name": "Balazs Vedres"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "120",
+    "issue": "4",
+    "first_page": "1144",
+    "last_page": "1194"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2065401570",
+   "doi": "https://doi.org/10.1086/230786",
+   "title": "Recombinant Property in East European Capitalism",
+   "display_name": "Recombinant Property in East European Capitalism",
+   "publication_year": 1996,
+   "publication_date": "1996-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2065401570",
+    "doi": "https://doi.org/10.1086/230786",
+    "mag": "2065401570"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/230786",
+    "doi": "https://doi.org/10.1086/230786",
+    "is_oa": true,
+    "landing_page_url": "https://doi.org/10.1086/230786",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "101",
+    "issue": "4",
+    "first_page": "993",
+    "last_page": "1027"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W1902009078",
+   "doi": "https://doi.org/10.1086/649497",
+   "title": "Structural Folds: Generative Disruption in Overlapping Groups",
+   "display_name": "Structural Folds: Generative Disruption in Overlapping Groups",
+   "publication_year": 2010,
+   "publication_date": "2010-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W1902009078",
+    "doi": "https://doi.org/10.1086/649497",
+    "mag": "1902009078"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/649497",
+    "doi": "https://doi.org/10.1086/649497",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1086/649497",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5057226228",
+      "display_name": "Balázs Vedres",
+      "orcid": "https://orcid.org/0000-0002-9469-8774"
+     },
+     "raw_author_name": "Balázs Vedres"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "115",
+    "issue": "4",
+    "first_page": "1150",
+    "last_page": "1190"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2588831772",
+   "doi": "https://doi.org/10.1515/9781400831005",
+   "title": "The Sense of Dissonance: Accounts of Worth in Economic Life",
+   "display_name": "The Sense of Dissonance: Accounts of Worth in Economic Life",
+   "publication_year": 2009,
+   "publication_date": "2009-12-31",
+   "ids": {
+    "openalex": "https://openalex.org/W2588831772",
+    "doi": "https://doi.org/10.1515/9781400831005",
+    "mag": "2588831772"
+   },
+   "language": "en",
+   "type": "book",
+   "primary_location": {
+    "id": "doi:10.1515/9781400831005",
+    "doi": "https://doi.org/10.1515/9781400831005",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1515/9781400831005",
+    "source": {
+     "id": "https://openalex.org/S4306463805",
+     "display_name": "Princeton University Press eBooks",
+     "issn_l": null,
+     "issn": null,
+     "host_organization": "https://openalex.org/P4310316492",
+     "host_organization_name": "Princeton University Press",
+     "type": "ebook platform"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": null,
+    "issue": null,
+    "first_page": null,
+    "last_page": null
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2140588791",
+   "doi": "https://doi.org/10.1086/499507",
+   "title": "Social Times of Network Spaces: Network Sequences and Foreign Investment in Hungary",
+   "display_name": "Social Times of Network Spaces: Network Sequences and Foreign Investment in Hungary",
+   "publication_year": 2006,
+   "publication_date": "2006-03-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2140588791",
+    "doi": "https://doi.org/10.1086/499507",
+    "mag": "2140588791"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/499507",
+    "doi": "https://doi.org/10.1086/499507",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1086/499507",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5057226228",
+      "display_name": "Balázs Vedres",
+      "orcid": "https://orcid.org/0000-0002-9469-8774"
+     },
+     "raw_author_name": "Balázs Vedres"
+    }
+   ],
+   "biblio": {
+    "volume": "111",
+    "issue": "5",
+    "first_page": "1367",
+    "last_page": "1411"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  }
+ ]
+}
