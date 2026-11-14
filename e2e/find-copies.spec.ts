@@ -74,8 +74,8 @@
  * each named by the host parsed here from its address and opening that address, with the publisher's page at
  * `https://doi.org/` + the work's made-up DOI among them (the DOI is the only thing written into the spec). A row resting
  * "Record complete" — by the project's rules, or with every copy service off — is given the same offers by the service,
- * but the screen shows "Where to get it" only on "No open copy" (FindEntryRow), so there `expectOffersNotShown` checks
- * that the service gives them and that the row shows no "Where to get it" and no link.
+ * and (Task F18b, R340 d: a row shows links wherever its view carries them) shows them the same way:
+ * `expectWhereToGetIt(…, "record-complete")`.
  */
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -378,14 +378,15 @@ async function offersOf(app: AppHarness, projectId: string, w: Work, state: stri
 }
 
 /**
- * A row resting "No open copy" (R339 b): under "Where to get it" EXACTLY the links the service gives for its entry, in
- * the service's order, each shown as "<label> (<host>)" — the host parsed here from the address, not taken from the
+ * A row resting "No open copy", or "Record complete" by the rules or the settings (R339 b; R340 d: a row shows links
+ * wherever its view carries them): under "Where to get it" EXACTLY the links the service gives for its entry, in the
+ * service's order, each shown as "<label> (<host>)" — the host parsed here from the address, not taken from the
  * service — with that address as its `href`, and no other link there. Called once the screen shows the state.
  */
-async function expectWhereToGetIt(page: Page, app: AppHarness, projectId: string, w: Work): Promise<void> {
+async function expectWhereToGetIt(page: Page, app: AppHarness, projectId: string, w: Work, state: "no-open-copy" | "record-complete" = "no-open-copy"): Promise<void> {
   const row = rowOf(page, w);
-  await expect(row.locator(".ao-find__state")).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
-  const offers = await offersOf(app, projectId, w, "no-open-copy");
+  await expect(row.locator(".ao-find__state")).toHaveText(state === "no-open-copy" ? WORDS.noOpenCopy : WORDS.recordComplete, { timeout: STATE_TIMEOUT });
+  const offers = await offersOf(app, projectId, w, state);
   await expect(row.locator(".ao-find__where-title")).toHaveText(WORDS.whereToGetIt);
   const where = row.getByRole("list", { name: /^Where to get it/ });
   await expect(where).toBeVisible();
@@ -396,22 +397,7 @@ async function expectWhereToGetIt(page: Page, app: AppHarness, projectId: string
     await expect(links.nth(i)).toHaveText(`${o.label} (${new URL(o.url).host})`);
     await expect(links.nth(i)).toHaveAttribute("href", o.url);
   }
-  test.info().annotations.push({ type: "where-to-get-it", description: `${w.doi} (no open copy): ${offers.map((o) => `${o.label} (${new URL(o.url).host})`).join("; ")}` });
-}
-
-/**
- * A row resting "Record complete" by the rules or the settings: the service gives its entry the same kind of offers
- * (the publisher's page among them), but the screen shows "Where to get it" only on "No open copy", so the row shows no
- * "Where to get it" and no link at all.
- */
-async function expectOffersNotShown(page: Page, app: AppHarness, projectId: string, w: Work): Promise<void> {
-  const row = rowOf(page, w);
-  await expect(row.locator(".ao-find__state")).toHaveText(WORDS.recordComplete, { timeout: STATE_TIMEOUT });
-  const offers = await offersOf(app, projectId, w, "record-complete");
-  await expect(row.locator(".ao-find__where")).toHaveCount(0);
-  await expect(row.getByText(WORDS.whereToGetIt)).toHaveCount(0);
-  await expect(row.getByRole("link")).toHaveCount(0);
-  test.info().annotations.push({ type: "where-to-get-it", description: `${w.doi} (record complete, given but not shown): ${offers.map((o) => `${o.label} (${new URL(o.url).host})`).join("; ")}` });
+  test.info().annotations.push({ type: "where-to-get-it", description: `${w.doi} (${state}): ${offers.map((o) => `${o.label} (${new URL(o.url).host})`).join("; ")}` });
 }
 
 /** The live original files of the record made for `w`. */
@@ -835,7 +821,7 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
     await expect(reasonOfRow(page, PAIR_A)).toHaveText(WORDS.copyNotAllowed, { timeout: STATE_TIMEOUT });
     await expect(rowOf(page, PAIR_A).getByRole("button", { name: act(WORDS.tryAgain, PAIR_A.typed) })).toBeVisible();
     expect(await entryOf(app, projectId, PAIR_A)).toMatchObject({ state: "record-complete", reason: { code: "copy-not-allowed" } });
-    await expectOffersNotShown(page, app, projectId, PAIR_A);
+    await expectWhereToGetIt(page, app, projectId, PAIR_A, "record-complete");
     expect(placesOf(libraryPath, fileBytes("PAIR_A"))).toEqual([]);
     expect(filesUnder(join(projectRoot, "find", "held"))).toEqual([]);
     expect(filesUnder(join(libraryPath, ".tmp")).filter((f) => f.startsWith("find-"))).toEqual([]);
@@ -967,7 +953,7 @@ test("a copy service switched off in Search sources is not asked; switched on ag
     await expect(reasonOfRow(page, RIGHT)).toHaveText(WORDS.switchedOff, { timeout: STATE_TIMEOUT });
     await expect(retryOf(RIGHT)).toBeVisible();
     expect(await entryOf(app, projectId, RIGHT)).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
-    await expectOffersNotShown(page, app, projectId, RIGHT);
+    await expectWhereToGetIt(page, app, projectId, RIGHT, "record-complete");
     await nothingFetched();
   });
 
