@@ -1,7 +1,9 @@
 /**
- * Task F11 (R277 a, rebuilt by R282 a–c): the file check — a downloaded file against the record it was found for.
- * The app attaches a file by itself only on strong, positive evidence that the file IS the record's work; everything
- * else goes to the researcher. Every file here is made by the tests' own builders (no network).
+ * Task F11 (R277 a, rebuilt by R282 a–c, stated in closed form by R292): the file check — a downloaded file against
+ * the record it was found for. The app attaches a file by itself only on strong, positive evidence that the file IS
+ * the record's work; everything else goes to the researcher. Every file here is made by the tests' own builders (no
+ * network). R292 changed some rows' answers: each such row says so, naming the clause ("R292 n: …"); a match is
+ * always `by: "title"` now (R292 7: a DOI is never evidence). The reviewers' rows are in file-check.hostile.test.ts.
  */
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -72,30 +74,44 @@ const X = (why: "no-text" | "other-doi" | "other-kind" | "other-version" | "titl
 /** The reviewer's table and probes (task-F11-review.md, C1, C2, I4, I5): each must NOT match. */
 const MUST_NOT: Row[] = [
   // C1: another kind of document citing the record's DOI on its first page.
-  { name: "a reply citing the record's DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Journal of Upland Studies", "A reply to Okafor", "Carl Young", `In ${T} (doi:${D}), Amara Okafor argues that`, ...BODY] }) },
-  { name: "a comment citing the record's DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: [`Comment on ${T}`, "Carl Young", `doi:${D}`, `Amara Okafor argues that`, ...BODY] }) },
-  { name: "a correction citing the record's DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: [`Correction to: ${T}`, A, `The original article can be found online at https://doi.org/${D}`, ...BODY] }) },
+  // R292 2: the title only inside a sentence — no block (was other-kind).
+  { name: "a reply citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: ["Journal of Upland Studies", "A reply to Okafor", "Carl Young", `In ${T} (doi:${D}), Amara Okafor argues that`, ...BODY] }) },
+  // R292 2: "Comment on" on the title's line — no block (was other-kind).
+  { name: "a comment citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: [`Comment on ${T}`, "Carl Young", `doi:${D}`, `Amara Okafor argues that`, ...BODY] }) },
+  // R292 2: "Correction to" on the title's line — no block (was other-kind).
+  { name: "a correction citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: [`Correction to: ${T}`, A, `The original article can be found online at https://doi.org/${D}`, ...BODY] }) },
   { name: "an erratum (a header line) with the record's title, author and DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Erratum", T, A, `doi:${D}`, ...BODY] }) },
-  { name: "a retraction note citing the record's DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: [`Retraction Note: ${T}`, A, `doi:${D}`, ...BODY] }) },
+  // R292 2: "Retraction Note" on the title's line — no block (was other-kind).
+  { name: "a retraction note citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: [`Retraction Note: ${T}`, A, `doi:${D}`, ...BODY] }) },
   { name: "supplementary material citing the record's DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Supplementary material for", T, A, `https://doi.org/${D}`, ...BODY] }) },
-  { name: "a book review citing the record's DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Book Review", `Okafor, Amara. ${T}.`, `Upland Press. doi:${D}`, "Reviewed by Carl Young", ...BODY] }) },
+  // R292 2: the title only inside a citation — no block (was other-kind).
+  { name: "a book review citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: ["Book Review", `Okafor, Amara. ${T}.`, `Upland Press. doi:${D}`, "Reviewed by Carl Young", ...BODY] }) },
   // C2: "Capital" volume II.
-  { name: "'Capital' with 'Volume II' on the line after", rec: CAPITAL, want: X("other-version"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["CAPITAL", "Volume II", "Wendel Brakkenridge", ...BODY] }) },
-  { name: "'Capital' with 'Volume II' two lines after, below a subtitle", rec: CAPITAL, want: X("other-version"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["CAPITAL", "A Critique of Political Economy", "Volume II", "Wendel Brakkenridge", ...BODY] }) },
-  { name: "'Capital': the word first in a sentence, 'CAPITAL Volume II' later", rec: CAPITAL, want: X("other-version"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["capital accumulates in the hands of a few, as every reader of this book knows.", ...BODY, "CAPITAL Volume II"] }) },
+  // R292 3: "Volume II" directly below the block is not a line of names (was other-version).
+  { name: "'Capital' with 'Volume II' on the line after", rec: CAPITAL, want: X("title-absent"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["CAPITAL", "Volume II", "Wendel Brakkenridge", ...BODY] }) },
+  // R292 3: the subtitle directly below the block is not a line of names (was other-version).
+  { name: "'Capital' with 'Volume II' two lines after, below a subtitle", rec: CAPITAL, want: X("title-absent"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["CAPITAL", "A Critique of Political Economy", "Volume II", "Wendel Brakkenridge", ...BODY] }) },
+  // R292 2: no line holds the title's content words exactly — no block (was other-version).
+  { name: "'Capital': the word first in a sentence, 'CAPITAL Volume II' later", rec: CAPITAL, want: X("title-absent"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["capital accumulates in the hands of a few, as every reader of this book knows.", ...BODY, "CAPITAL Volume II"] }) },
   // C2: book reviews and comments by title.
   { name: "a book review whose embedded title is the reviewed book's ('BOOK REVIEWS' above the title)", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ title: T, author: A, lines: ["BOOK REVIEWS", T, "By Amara Okafor. Upland Press.", "Reviewed by Carl Young", ...BODY] }) },
   { name: "the same review without an embedded title", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ lines: ["BOOK REVIEWS", T, "By Amara Okafor. Upland Press.", "Carl Young", ...BODY] }) },
   { name: "'Reviewed Work:' then the title by the author", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ title: T, author: A, lines: ["Reviewed Work:", T, "by Amara Okafor", ...BODY] }) },
   { name: "'Erratum' as a header line above the title (no DOI)", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ lines: ["Erratum", T, A, ...BODY] }) },
-  { name: "a comment ('Comment' as a lone line) citing the record by title only", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Comment", "Carl Young", `In her ${T}, Amara Okafor argues that`, ...BODY] }) },
-  { name: "'Correction to: <title>' with the author, no DOI", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ lines: [`Correction to: ${T}`, A, ...BODY] }) },
+  // R292 2: the title only inside a sentence — no block (was other-kind).
+  { name: "a comment ('Comment' as a lone line) citing the record by title only", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: ["Comment", "Carl Young", `In her ${T}, Amara Okafor argues that`, ...BODY] }) },
+  // R292 2: "Correction to" on the title's line — no block (was other-kind).
+  { name: "'Correction to: <title>' with the author, no DOI", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [`Correction to: ${T}`, A, ...BODY] }) },
   { name: "another paper with the record in a page-1 reference list", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: ["Mountain Pastures and Seasonal Work", "Carl Young", ...BODY, "References", `Okafor, A. (2020) ${T}. Upland Press.`] }) },
-  { name: "another author's 'Notes on <title>' (the record's author's name read from 'Young people'; R284: 'notes on' before the title is a sign)", rec: { title: T, creators: [{ role: "author", given: "Ada", family: "Young" }] }, want: X("other-kind"), file: () => pdf({ lines: [`Notes on ${T}`, "Carl Other", "Young people in the hills tell it differently.", ...BODY] }) },
+  // R292 2: "Notes on" on the title's line — no block (was other-kind).
+  { name: "another author's 'Notes on <title>' (the record's author's name read from 'Young people'; R284: 'notes on' before the title is a sign)", rec: { title: T, creators: [{ role: "author", given: "Ada", family: "Young" }] }, want: X("title-absent"), file: () => pdf({ lines: [`Notes on ${T}`, "Carl Other", "Young people in the hills tell it differently.", ...BODY] }) },
   // Version marks beside the title.
-  { name: "'Part II' on the line after the title", rec: NO_DOI, want: X("other-version"), file: () => pdf({ lines: [T, "Part II", A, ...BODY] }) },
-  { name: "'2nd edition' on the line after the title", rec: NO_DOI, want: X("other-version"), file: () => pdf({ lines: [T, "2nd edition", A, ...BODY] }) },
-  { name: "'Volume 2' two lines below the title, under a subtitle", rec: NO_DOI, want: X("other-version"), file: () => pdf({ lines: [T, "Essays on the North", "Volume 2", A, ...BODY] }) },
+  // R292 3: "Part II" directly below the block is not a line of names holding the family name (was other-version).
+  { name: "'Part II' on the line after the title", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "Part II", A, ...BODY] }) },
+  // R292 3: "2nd edition" directly below the block is not a line of names (was other-version).
+  { name: "'2nd edition' on the line after the title", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "2nd edition", A, ...BODY] }) },
+  // R292 3: the subtitle directly below the block is not a line of names (was other-version).
+  { name: "'Volume 2' two lines below the title, under a subtitle", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "Essays on the North", "Volume 2", A, ...BODY] }) },
   // I4: no text.
   { name: "no text, with the right embedded title and author ('Capital')", rec: CAPITAL, want: X("no-text"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge" }) },
   { name: "no text, with the right embedded title and author (a record with a DOI)", rec: RIVERS, want: X("no-text"), file: () => pdf({ title: T, author: A }) },
@@ -122,9 +138,11 @@ const MUST_NOT: Row[] = [
   { name: "the title's words scattered over the page", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: ["Rivers are long.", "Many lines of other words come here to keep them apart from each other.", "Memory fails.", "More words, many of them, unrelated to anything.", "Upland walks.", "Yet more text that has nothing to do with it at all.", "Villages grow.", A, ...BODY] }) },
   { name: "the title as a block without the author's name", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "Someone Different", ...BODY] }) },
   // Rows of my own (what the rule made me doubt).
-  { name: "[own] the record's title as the subtitle of another title (the line before ends with a colon)", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: ["Mountain Pastures:", T, A, ...BODY] }) },
+  // R292 4: "Mountain Pastures:" is a two-word line directly above the block (was title-absent by the colon rule, gone).
+  { name: "[own] the record's title as the subtitle of another title (the line before ends with a colon)", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ lines: ["Mountain Pastures:", T, A, ...BODY] }) },
   { name: "[own] the title going on, in lower case, on the next line", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "of the North and the South", A, ...BODY] }) },
-  { name: "[own] 'Volume II' alone on the line above the title", rec: CAPITAL, want: X("other-version"), file: () => pdf({ lines: ["VOLUME II", "CAPITAL", "Wendel Brakkenridge", ...BODY] }) },
+  // R292 4 before 6: "VOLUME II" is a two-word line directly above the block; other-kind comes before other-version (was other-version).
+  { name: "[own] 'Volume II' alone on the line above the title", rec: CAPITAL, want: X("other-kind"), file: () => pdf({ lines: ["VOLUME II", "CAPITAL", "Wendel Brakkenridge", ...BODY] }) },
   { name: "[own] the author more than 600 characters after the title, no author metadata", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, ...filler(9), A, ...BODY] }) },
   { name: "[own] the title only beyond the first 2,000 characters", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [...filler(26), T, A] }) },
   { name: "[own] 'Retracted' in the embedded title", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ title: `RETRACTED: ${T}`, author: A, lines: [T, A, ...BODY] }) },
@@ -132,10 +150,12 @@ const MUST_NOT: Row[] = [
   // title begins within 800 characters; an embedded title of another document.
   { name: "R284: 'Review of <title>' on the line above the title", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Review of", T, "Amara Okafor, Upland Press", "Carl Young", `doi:${D}`, ...BODY] }) },
   { name: "R284: 'Reply to <family name>'", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Reply to Okafor", T, A, `doi:${D}`, ...BODY] }) },
-  { name: "R284: 'Notes on <title>' with the record's embedded title", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ title: T, author: A, lines: ["Notes on", T, "Carl Young", ...BODY] }) },
+  // R292 3: "Carl Young" below the block does not hold the family name (was other-kind).
+  { name: "R284: 'Notes on <title>' with the record's embedded title", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ title: T, author: A, lines: ["Notes on", T, "Carl Young", ...BODY] }) },
   { name: "R284: 'Capital' with 'Volume II' as a short line", rec: CAPITAL_DOI, want: X("other-version"), file: () => pdf({ lines: ["CAPITAL", "Wendel Brakkenridge", "Volume II", `doi:${CAPITAL_DOI.doi}`, ...BODY] }) },
   { name: "R284: 'Second edition' as a short line", rec: RIVERS, want: X("other-version"), file: () => pdf({ lines: [T, A, "Second edition", `doi:${D}`, ...BODY] }) },
-  { name: "R284: 'Revised edition' as a short line", rec: NO_DOI, want: X("other-version"), file: () => pdf({ lines: [T, "Revised edition", A, ...BODY] }) },
+  // R292 3: "Revised edition" directly below the block is not a line of names (was other-version).
+  { name: "R284: 'Revised edition' as a short line", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "Revised edition", A, ...BODY] }) },
   { name: "R284: 'Editorial' as a line of its own", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Editorial", T, A, `doi:${D}`, ...BODY] }) },
   { name: "R284: another paper citing the record, with its labelled DOI, at about character 1,500", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: ["Mountain Pastures and Seasonal Work", "Carl Young", ...BODY, ...filler(13), `As ${A} showed in ${T} (doi:${D}), memory follows water.`] }) },
   { name: "R284: a citing paper with its own embedded title, the record's DOI and title on page 1", rec: RIVERS, want: X("title-absent"), file: () => pdf({ title: "Mountain Pastures and Seasonal Work", author: "Carl Young", lines: ["Mountain Pastures and Seasonal Work", "Carl Young", `This paper extends ${T} by ${A} (doi:${D}) to the high pastures.`, ...BODY] }) },
@@ -144,46 +164,59 @@ const MUST_NOT: Row[] = [
 
 /** The cases that MUST match. */
 const MUST: Row[] = [
-  { name: "the work itself: its DOI labelled on the first page, its title and its author", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: ["Journal of Upland Studies", T, A, `https://doi.org/${D}`, ...BODY] }) },
-  { name: "no DOI in the file: the title as a block of one line, the author below", rec: RIVERS, want: M("title"), file: () => pdf({ lines: ["Journal of Upland Studies", T, A, ...BODY] }) },
+  // R292 4: "Journal of Upland Studies" directly above is a four-word line, and this record names no container (was a match by DOI). With the container: the next row.
+  { name: "the work itself: its DOI labelled on the first page, its title and its author", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Journal of Upland Studies", T, A, `https://doi.org/${D}`, ...BODY] }) },
+  // R292 4: as the row above (was a match).
+  { name: "no DOI in the file: the title as a block of one line, the author below", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Journal of Upland Studies", T, A, ...BODY] }) },
   { name: "the title as a block of two lines", rec: RIVERS, want: M("title"), file: () => pdf({ lines: ["Rivers and Memory", "in Upland Villages", A, ...BODY] }) },
   { name: "the title as a block of three lines", rec: RIVERS, want: M("title"), file: () => pdf({ lines: ["Rivers and", "Memory in Upland", "Villages", A, ...BODY] }) },
   { name: "the title hyphenated across a line", rec: NO_DOI, want: M("title"), file: () => pdf({ lines: ["Rivers and Memory in Up-", "land Villages", A, ...BODY] }) },
   { name: "a record with no DOI", rec: NO_DOI, want: M("title"), file: () => pdf({ title: T, author: A, lines: [T, A, ...BODY] }) },
   { name: "a record titled 'A Reply to My Critics' whose file says so", rec: { title: "A Reply to My Critics", creators: RIVERS.creators }, want: M("title"), file: () => pdf({ lines: ["A Reply to My Critics", A, ...BODY] }) },
-  { name: "a paper in 'American Sociological Review' (the journal's name is not a sign)", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: ["American Sociological Review", T, A, `doi:${D}`, ...BODY] }) },
-  { name: "a short title ('Capital') with its DOI, title and author", rec: CAPITAL_DOI, want: M("doi"), file: () => pdf({ lines: ["CAPITAL", "Wendel Brakkenridge", `doi:${CAPITAL_DOI.doi}`, ...BODY] }) },
+  // R292 4: the journal's name directly above, the record naming no container (was a match by DOI). With the container: below.
+  { name: "a paper in 'American Sociological Review' (the journal's name is not a sign)", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["American Sociological Review", T, A, `doi:${D}`, ...BODY] }) },
+  { name: "a short title ('Capital') with its DOI, title and author", rec: CAPITAL_DOI, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => pdf({ lines: ["CAPITAL", "Wendel Brakkenridge", `doi:${CAPITAL_DOI.doi}`, ...BODY] }) },
   { name: "a two-word title as a block with the author", rec: { title: "Upland Memory", creators: RIVERS.creators }, want: M("title"), file: () => pdf({ lines: ["Upland Memory", A, ...BODY] }) },
-  { name: "the record's DOI in another case, with its title and author", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: [T, A, "DOI 10.5555/AO.F11.RIVERS", ...BODY] }) },
-  { name: "the record's DOI with a trailing full stop", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: [T, A, `Cite as doi:${D}.`, ...BODY] }) },
+  { name: "the record's DOI in another case, with its title and author", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => pdf({ lines: [T, A, "DOI 10.5555/AO.F11.RIVERS", ...BODY] }) },
+  { name: "the record's DOI with a trailing full stop", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => pdf({ lines: [T, A, `Cite as doi:${D}.`, ...BODY] }) },
   { name: "a volume number the record's title holds", rec: { title: "Collected Letters, Volume 2", creators: RIVERS.creators }, want: M("title"), file: () => pdf({ title: "Collected Letters, Volume 2", author: A, lines: ["Collected Letters, Volume 2", A, ...BODY] }) },
   { name: "an EPUB whose title and creator are the record's, its text the title and author", rec: NO_DOI, want: M("title"), file: () => epub({ title: T, creator: A, body: `<h1>${T}</h1><p>${A}</p>${BODY.map((l) => `<p>${l}</p>`).join("")}` }) },
   // Rows of my own.
-  { name: "[own] the record's DOI broken across a line, with its title and author", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: [T, A, "doi:10.5555/ao.f11.", "rivers", ...BODY] }) },
-  { name: "[own] the record's DOI first, a reference's DOI after it", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: [T, A, `doi:${D}`, "See also doi:10.5555/ao.f11.someone-else", ...BODY] }) },
-  { name: "[own] a journal header with 'Vol. 12, No. 3' above the title (not a version of the work)", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: ["Journal of Upland Studies, Vol. 12, No. 3", T, A, `doi:${D}`, ...BODY] }) },
+  { name: "[own] the record's DOI broken across a line, with its title and author", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => pdf({ lines: [T, A, "doi:10.5555/ao.f11.", "rivers", ...BODY] }) },
+  { name: "[own] the record's DOI first, a reference's DOI after it", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => pdf({ lines: [T, A, `doi:${D}`, "See also doi:10.5555/ao.f11.someone-else", ...BODY] }) },
+  { name: "[own] a journal header with 'Vol. 12, No. 3' above the title (not a version of the work)", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => pdf({ lines: ["Journal of Upland Studies, Vol. 12, No. 3", T, A, `doi:${D}`, ...BODY] }) },
   { name: "[own] a title with its subtitle as a two-line block", rec: { title: "Rivers and Memory: Upland Villages", creators: RIVERS.creators }, want: M("title"), file: () => pdf({ lines: ["Rivers and Memory:", "Upland Villages", A, ...BODY] }) },
-  { name: "[own] the author only in the file's author metadata", rec: NO_DOI, want: M("title"), file: () => pdf({ author: A, lines: [T, ...BODY] }) },
-  { name: "[own] 9 of 10 title words in order, with the record's DOI and the author", rec: { title: "Rivers Memory Upland Villages Floods Droughts Parishes Registers Maps Families", creators: RIVERS.creators, doi: D }, want: M("doi"), file: () => pdf({ lines: ["Rivers Memory Upland Villages Floods Droughts Parishes Registers Families", A, `doi:${D}`, ...BODY] }) },
-  { name: "[own] an embedded title that is exactly the record's, the title in a sentence of the text, the author after it", rec: NO_DOI, want: M("title"), file: () => pdf({ title: T, lines: [`This is ${T} by Amara Okafor, a study.`, ...BODY] }) },
-  { name: "R284: a paper whose first page names the journal 'Review of Economic Studies'", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: ["The Review of Economic Studies", T, A, `doi:${D}`, ...BODY] }) },
-  { name: "R284: a first page with an 'Editorial Board' line", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: ["Editorial Board: see the journal's site", T, A, `doi:${D}`, ...BODY] }) },
-  { name: "R284: 'Vol. 12, No. 3, pp. 1–20' under the title", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: [T, "Vol. 12, No. 3, pp. 1–20", A, `doi:${D}`, ...BODY] }) },
-  { name: "R284: a long journal header before the title, the title still within 800 characters", rec: RIVERS, want: M("doi"), file: () => pdf({ lines: ["Journal of Upland Studies, published by the Society for Upland Studies, Upland Press", ...filler(5), T, A, `doi:${D}`, ...BODY] }) },
-  { name: "R284: the work with a junk embedded title 'Microsoft Word - final_v3.doc' (EPUB)", rec: RIVERS, want: M("doi"), file: () => epub({ title: "Microsoft Word - final_v3.doc", creator: A, body: `<h1>${T}</h1><p>${A}</p><p>doi:${D}</p>${BODY.map((l) => `<p>${l}</p>`).join("")}` }) },
-  { name: "R284: the work with a junk embedded title 'untitled' (PDF)", rec: RIVERS, want: M("doi"), file: () => pdf({ title: "untitled", lines: [T, A, `doi:${D}`, ...BODY] }) },
+  // R292 3: the author must stand on the line directly below the block; the metadata is not evidence (was a match).
+  { name: "[own] the author only in the file's author metadata", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ author: A, lines: [T, ...BODY] }) },
+  // R292 2: no missing word, with a DOI or without (was a match by DOI: the 90% rule is gone).
+  { name: "[own] 9 of 10 title words in order, with the record's DOI and the author", rec: { title: "Rivers Memory Upland Villages Floods Droughts Parishes Registers Maps Families", creators: RIVERS.creators, doi: D }, want: X("title-absent"), file: () => pdf({ lines: ["Rivers Memory Upland Villages Floods Droughts Parishes Registers Families", A, `doi:${D}`, ...BODY] }) },
+  // R292 2 and 8: no block; the embedded title is never evidence (was a match).
+  { name: "[own] an embedded title that is exactly the record's, the title in a sentence of the text, the author after it", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ title: T, lines: [`This is ${T} by Amara Okafor, a study.`, ...BODY] }) },
+  // R292 4: the journal's name directly above, the record naming no container (was a match by DOI). With the container: below.
+  { name: "R284: a paper whose first page names the journal 'Review of Economic Studies'", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["The Review of Economic Studies", T, A, `doi:${D}`, ...BODY] }) },
+  // R292 4: "Editorial Board: see the journal's site" is a six-word line directly above the block (was a match by DOI).
+  { name: "R284: a first page with an 'Editorial Board' line", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Editorial Board: see the journal's site", T, A, `doi:${D}`, ...BODY] }) },
+  // R292 3: the citation line directly below the block (numbers, "pp.") is not a line of names (was a match by DOI).
+  { name: "R284: 'Vol. 12, No. 3, pp. 1–20' under the title", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: [T, "Vol. 12, No. 3, pp. 1–20", A, `doi:${D}`, ...BODY] }) },
+  { name: "R284: a long journal header before the title, the title still within 800 characters", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => pdf({ lines: ["Journal of Upland Studies, published by the Society for Upland Studies, Upland Press", ...filler(5), T, A, `doi:${D}`, ...BODY] }) },
+  { name: "R284: the work with a junk embedded title 'Microsoft Word - final_v3.doc' (EPUB)", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => epub({ title: "Microsoft Word - final_v3.doc", creator: A, body: `<h1>${T}</h1><p>${A}</p><p>doi:${D}</p>${BODY.map((l) => `<p>${l}</p>`).join("")}` }) },
+  { name: "R284: the work with a junk embedded title 'untitled' (PDF)", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => pdf({ title: "untitled", lines: [T, A, `doi:${D}`, ...BODY] }) },
   { name: "R284: the work with an embedded title that is a file name ('… final draft.pdf', EPUB), no DOI", rec: NO_DOI, want: M("title"), file: () => epub({ title: "okafor chapter three final draft.pdf", creator: A, body: `<h1>${T}</h1><p>${A}</p>${BODY.map((l) => `<p>${l}</p>`).join("")}` }) },
   { name: "R284: an embedded title that is the record's title and a subtitle", rec: NO_DOI, want: M("title"), file: () => pdf({ title: `${T}: Water and Belonging`, author: A, lines: [T, A, ...BODY] }) },
   { name: "R284: an embedded title that is the record's main title (the record's title holds a subtitle)", rec: { title: `${T}: Water and Belonging`, creators: RIVERS.creators }, want: M("title"), file: () => pdf({ title: T, author: A, lines: [`${T}:`, "Water and Belonging", A, ...BODY] }) },
-  { name: "[own] the record's DOI in an EPUB's metadata, its title and author in the text", rec: RIVERS, want: M("doi"), file: () => epub({ title: T, creator: A, doi: D, body: `<h1>${T}</h1><p>${A}</p>${BODY.map((l) => `<p>${l}</p>`).join("")}` }) },
+  { name: "[own] the record's DOI in an EPUB's metadata, its title and author in the text", rec: RIVERS, want: M("title") /* R292 7: a DOI is never evidence (was by "doi") */, file: () => epub({ title: T, creator: A, doi: D, body: `<h1>${T}</h1><p>${A}</p>${BODY.map((l) => `<p>${l}</p>`).join("")}` }) },
+  // R292 4: the journal's name directly above the block is allowed when it is the record's container title.
+  { name: "R292: the work itself under the journal's name, the record naming that journal as its container", rec: { ...RIVERS, container: "Journal of Upland Studies" }, want: M("title"), file: () => pdf({ lines: ["Journal of Upland Studies", T, A, `https://doi.org/${D}`, ...BODY] }) },
+  { name: "R292: 'American Sociological Review' above, the record's container", rec: { ...RIVERS, container: "American Sociological Review" }, want: M("title"), file: () => pdf({ lines: ["American Sociological Review", T, A, `doi:${D}`, ...BODY] }) },
+  { name: "R292: 'The Review of Economic Studies' above, the record's container 'Review of Economic Studies'", rec: { ...RIVERS, container: "Review of Economic Studies" }, want: M("title"), file: () => pdf({ lines: ["The Review of Economic Studies", T, A, `doi:${D}`, ...BODY] }) },
 ];
 
-describe("the file check's table (R282, R284): what the file holds → match or the reason", () => {
+describe("the file check's table (R282, R284, R292): what the file holds → match or the reason", () => {
   it.each(MUST_NOT.map((r) => [r.name, r] as const))("must not match: %s", async (_name, row) => {
     const r = await checkFileAgainstRecord(await row.file(), row.rec);
     expect({ match: r.match, ...(r.match ? {} : { why: r.why }) }).toEqual(row.want);
   });
-  it.each(MUST.map((r) => [r.name, r] as const))("must match: %s", async (_name, row) => {
+  it.each(MUST.map((r) => [r.name, r] as const))("right files (a match unless R292 says otherwise in the row): %s", async (_name, row) => {
     const r = await checkFileAgainstRecord(await row.file(), row.rec);
     expect({ match: r.match, ...(r.match ? { by: r.by } : { why: r.why }) }).toEqual(row.want);
   });
