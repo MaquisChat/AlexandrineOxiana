@@ -1,36 +1,41 @@
 /**
- * "Your library" (`/settings/your-library`; Find and acquire Task F18a; R324, R334, R301): the researcher tells the app,
- * once, how their university library's links are built — by pasting any link that goes through the library, from which
- * the service works out the library's address — and may try the library's sign-in in the app's separate sign-in window
- * ("Test"), keep that window's sign-in between runs on a Mac ("Stay signed in to my library") or end it ("Sign out of my
- * library"). The settings are the app's, on this computer (F15's `your-library.json`).
+ * "Your library" (`/settings/your-library`; Find and acquire Task F18a; R324, R334, R335, R336, R301): the researcher
+ * tells the app, once, how their university library's links are built — by pasting any link that goes through the
+ * library, from which the service works out the library's address — and may try the library's sign-in in the app's
+ * separate sign-in window ("Test"), keep that window's sign-in between runs on a Mac ("Stay signed in to my library") or
+ * end it ("Sign out of my library"). The settings are the app's, on this computer (F15's `your-library.json`).
  *
  * The service is the authority (F15's routes and F18a's test route, apps/library-service/src/routes/your-library.ts):
- * the address is only ever one the service worked out (the PUT refuses any other), and every sentence it gives — the
- * worked-out address, a refusal, the file's problem — is shown as it is given, through UserText.
+ * the address is only ever one the service worked out (the PUT refuses any other), the stored address is named in the
+ * service's own sentence (`addressSentence`, R336 i), and every sentence it gives — the worked-out address, a refusal,
+ * the file's problem — is shown as it is given, through UserText.
  *
  * The pasted link is never kept (R324 e): it lives only in its field's own value (the field is uncontrolled, so it is
  * never in an attribute or a state), is sent once in the body of `POST …/derive` and nowhere else, and the field is
- * emptied when the answer arrives, worked out or refused. The field offers no history (`autocomplete="off"`, no `name`,
- * no form), so the browser keeps nothing of it either.
+ * emptied when the answer arrives (worked out or refused), when the service gives no answer in 60 seconds, and on
+ * "Discard changes". The field offers no history (`autocomplete="off"`, no `name`, no form).
  *
- * Order (as "Search sources"): the form's draft is kept apart from the service's answer until it is saved or
- * discarded, so a read arriving meanwhile never takes an unsaved change away. A read's answer carries the number drawn
- * when its request STARTED; a save's answer draws its number when it ARRIVES and wins over every read started before
- * it. "Save" sends the whole draft once; while it is out the form is inert; with no answer in 60 seconds it is given up,
- * the draft kept. Answers after the screen was left are dropped.
+ * Order (as "Search sources"): the form's draft (name, address, catalogue) is kept apart from the service's answer until
+ * it is saved or discarded. A read's answer carries the number drawn when its request STARTED; a save's answer draws its
+ * number when it ARRIVES and wins over every read started before it (a read follows a save refused as written by a
+ * newer version, R336 b). No request or call to the shell stays out for ever: each is given up after 60 seconds, said,
+ * and its late answer ignored (R336 a); while the address is worked out or "Stay signed in" is changed, "Save" says why
+ * it waits.
  *
- * The desktop shell (F16, through `desktopShell()`): "Stay signed in" asks the shell first and changes the draft only if
- * the shell took it (R334 c); "Test" asks the service for the address of one fixed work and opens the sign-in window
- * there with a ticket the page makes (32 hex from the browser's random source) — no ticket of the service, so whatever
- * the window might fetch is discarded and nothing is added (R334 b). The screen listens to the window's events only to
- * say that ITS window was closed. Outside the desktop app those three controls say "Only in the desktop app".
+ * "Stay signed in" is not part of the draft (R335 a): a press asks the shell; if the shell took it, that ONE setting is
+ * saved at once (with the settings as last saved); if the save fails, the shell is put back and that is checked. The
+ * sequence runs to its end even if the screen is left (R336 l). A save that replaces an unreadable file first switches
+ * the shell's side off (R336 n). Off a Mac, and outside the desktop app, the switch is shown unavailable with why.
+ *
+ * "Test" asks the service for the address of one fixed work and opens the sign-in window there with a ticket the page
+ * makes (32 hex from the browser's random source) — no ticket of the service, so whatever the window might fetch is
+ * discarded and nothing is added (R334 b). The screen listens to the window's events only for ITS window: reached a
+ * PDF, or closed (R336 d).
  */
 import {
-  LIBRARY_ACCESS_KIND_TEXT,
+  YOUR_LIBRARY_CATALOGUE_MAX,
   YOUR_LIBRARY_NAME_MAX,
   YOUR_LIBRARY_TEXT,
-  yourLibraryAddressSentence,
   type LibraryAccess,
   type YourLibraryDeriveRequest,
   type YourLibraryDeriveResponse,
@@ -40,7 +45,7 @@ import {
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { UserText } from "../components/UserText";
-import { desktopShell } from "../desktopShell";
+import { desktopShell, type DesktopShell } from "../desktopShell";
 import "./YourLibrary.css";
 
 /** This screen's own sentences (the service's are @ao/shared's). None says or implies that the app adds a file (R334 d). */
@@ -52,6 +57,7 @@ export const YOUR_LIBRARY_SCREEN_TEXT = {
   deriveButton: "Work out the address",
   pasteFirst: "Paste a link first.",
   deriveFailed: "The address could not be worked out.",
+  deriveSilent: "The service did not answer, so the link was not used. Paste it again.",
   noLibrary: "No library is set.",
   notSavedYet: "Not saved yet.",
   removeAddress: "Remove my library's address",
@@ -64,7 +70,11 @@ export const YOUR_LIBRARY_SCREEN_TEXT = {
   off: "off",
   onlyOnMac: "Only on a Mac",
   onlyDesktop: "Only in the desktop app",
-  stayOffFailed: "“Stay signed in” could not be switched off. Try again.",
+  stayNotChanged: "“Stay signed in” could not be changed. Try again.",
+  stayNotPutBack: "“Stay signed in” could not be put back, so the sign-in window may keep your sign-in. Use “Sign out of my library” to remove it.",
+  appSilent: "The app did not answer. Try again.",
+  waitDerive: "Wait until the address is worked out.",
+  waitStay: "Wait until “Stay signed in” is changed.",
   saved: "Saved.",
   saveTimedOut: "The service did not answer. Your changes are still here; save again in a moment.",
   saveFailed: "The settings could not be saved.",
@@ -77,7 +87,9 @@ export const YOUR_LIBRARY_SCREEN_TEXT = {
   testNoLibrary: "Set your library's address and save it first.",
   testFailed: "The test could not be started.",
   windowOpen: "The sign-in window is open.",
+  windowAlreadyOpen: "The sign-in window is already open.",
   windowRefused: "The sign-in window could not be opened. If it is in use for a work, finish or cancel that first.",
+  windowReachedPdf: "Signing in works: the window reached a PDF. Nothing was added to your library.",
   windowClosed: "The sign-in window was closed.",
   signOutButton: "Sign out of my library",
   signingOut: "Signing out…",
@@ -86,7 +98,7 @@ export const YOUR_LIBRARY_SCREEN_TEXT = {
 } as const;
 const T = YOUR_LIBRARY_SCREEN_TEXT;
 
-/** A save with no answer in this long is given up (as on "Search sources"). */
+/** A request or a call to the shell with no answer in this long is given up (as the save on "Search sources"). */
 export const SAVE_TIMEOUT_MS = 60_000;
 /** A press of "Save" this soon after the last save ended is the rest of a double click: one request per action. */
 const SECOND_PRESS_MS = 500;
@@ -113,32 +125,72 @@ export function yourLibraryApi(client: ApiClient) {
     test: () => client.request<YourLibraryTestResponse>("POST", "/settings/your-library/test"),
   };
 }
+type Api = ReturnType<typeof yourLibraryApi>;
+
+/** What came of a request given at most `ms`: its value, its error, or nothing in time (its late answer is ignored). */
+type Within<V> = { value: V } | { error: unknown } | "gave-up";
+function within<V>(p: Promise<V>, ms = SAVE_TIMEOUT_MS): Promise<Within<V>> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve("gave-up"), ms);
+    p.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve({ value });
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        resolve({ error });
+      },
+    );
+  });
+}
+const tookIt = (r: Within<boolean>) => r !== "gave-up" && "value" in r && r.value === true;
+
+/**
+ * Whether this is a Mac, by the browser's own platform (R336 e): `navigator.userAgentData.platform` ("macOS") where the
+ * browser has it, else `navigator.platform` — macOS's WebKit web view (the desktop app) has no `userAgentData` and
+ * reports "MacIntel" on Intel and Apple silicon alike.
+ */
+export function onAMac(): boolean {
+  const n = globalThis.navigator as (Navigator & { userAgentData?: { platform?: string } }) | undefined;
+  const p = n?.userAgentData?.platform || n?.platform || "";
+  return /^mac/i.test(p);
+}
+
+/** How a press of "Stay signed in" ended. */
+export type StayOutcome =
+  | { kind: "saved"; answer: YourLibraryResponse }
+  | { kind: "not-changed" }
+  | { kind: "app-silent" }
+  | { kind: "put-back"; error?: unknown }
+  | { kind: "not-put-back" };
+
+/**
+ * "Stay signed in" at once (R335 a, R336 l, m): the shell first; if it took the value, ONE save of the settings as last
+ * saved with the new value; if that save fails, the shell is asked to go back and its answer is checked. Not tied to the
+ * screen's life: it runs to its end even if the screen is left meanwhile.
+ */
+export async function switchStaySignedIn(shell: DesktopShell, api: Api, saved: YourLibraryResponse, on: boolean): Promise<StayOutcome> {
+  const asked = await within(shell.setStaySignedIn(on));
+  if (asked === "gave-up") return { kind: "app-silent" };
+  if (!tookIt(asked)) return { kind: "not-changed" };
+  const put = await within(api.save({ name: saved.name ?? "", access: saved.access ?? null, catalogueSearch: saved.catalogueSearch ?? null, staySignedIn: on }));
+  if (put !== "gave-up" && "value" in put) return { kind: "saved", answer: put.value };
+  const back = await within(shell.setStaySignedIn(!on));
+  if (!tookIt(back)) return { kind: "not-put-back" };
+  return put === "gave-up" ? { kind: "put-back" } : { kind: "put-back", error: put.error };
+}
 
 interface Draft {
   name: string;
   access: LibraryAccess | null;
   catalogueSearch: string;
-  staySignedIn: boolean;
 }
 type Field = "name" | "access" | "catalogueSearch" | "staySignedIn";
 
-const fromAnswer = (c: YourLibraryResponse): Draft => ({ name: c.name ?? "", access: c.access ?? null, catalogueSearch: c.catalogueSearch ?? "", staySignedIn: c.staySignedIn === true });
+const fromAnswer = (c: YourLibraryResponse): Draft => ({ name: c.name ?? "", access: c.access ?? null, catalogueSearch: c.catalogueSearch ?? "" });
 const sameAccess = (a: LibraryAccess | null, b: LibraryAccess | null) => (a === null || b === null ? a === b : a.kind === b.kind && a.base === b.base);
-const sameDraft = (a: Draft, b: Draft) => a.name === b.name && a.catalogueSearch === b.catalogueSearch && a.staySignedIn === b.staySignedIn && sameAccess(a.access, b.access);
-
-/**
- * The service's sentence for an address (`yourLibraryAddressSentence`, as the derive route says it): its host, and for a
- * link resolver its host and path (R328 b).
- */
-function addressSentence(a: LibraryAccess): string {
-  try {
-    const u = new URL(a.base);
-    const place = a.kind === "openurl" ? `${u.host}${u.pathname}` : u.host;
-    return LIBRARY_ACCESS_KIND_TEXT[a.kind] ? yourLibraryAddressSentence(place, a.kind) : place;
-  } catch {
-    return "";
-  }
-}
+const sameDraft = (a: Draft, b: Draft) => a.name === b.name && a.catalogueSearch === b.catalogueSearch && sameAccess(a.access, b.access);
 
 /** The service's own sentence for a refusal. */
 const sentenceOf = (err: unknown, fallback: string) => (err instanceof ApiClientError && err.message ? err.message : fallback);
@@ -163,6 +215,7 @@ function newTicket(): string {
 export function YourLibrary({ client }: { client: ApiClient }) {
   const api = useMemo(() => yourLibraryApi(client), [client]);
   const shell = useMemo(() => desktopShell(), []);
+  const mac = useMemo(() => onAMac(), []);
   const ids = useId();
 
   const [confirmed, setConfirmed] = useState<YourLibraryResponse | undefined>();
@@ -174,7 +227,9 @@ export function YourLibrary({ client }: { client: ApiClient }) {
   const [focusField, setFocusField] = useState<{ field: Field; n: number } | null>(null);
   const [deriving, setDeriving] = useState(false);
   const [derived, setDerived] = useState<string | undefined>();
-  const [stayBusy, setStayBusy] = useState(false);
+  /** The address last worked out, with the service's sentence for it (shown while it is the draft's, unsaved). */
+  const [workedOut, setWorkedOut] = useState<{ access: LibraryAccess; sentence: string } | undefined>();
+  const [stayPending, setStayPending] = useState<boolean | undefined>();
   const [stayNote, setStayNote] = useState<string | undefined>();
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | undefined>();
@@ -188,10 +243,12 @@ export function YourLibrary({ client }: { client: ApiClient }) {
   const saveBusy = useRef(false);
   const saveEndedAt = useRef(-Infinity);
   const deriveBusy = useRef(false);
-  const stayBusyRef = useRef(false);
+  /** Each derive's number; "Discard changes" and the give-up move on from it, so its late answer changes nothing. */
+  const deriveGen = useRef(0);
+  const stayBusy = useRef(false);
   const testBusy = useRef(false);
   const signOutBusy = useRef(false);
-  /** The ticket of the window "Test" opened, while it is open: only its "closed" is said. */
+  /** The ticket of the window "Test" opened, while it is open (R336 d). */
   const myTicket = useRef<string | null>(null);
   const confirmedRef = useRef<YourLibraryResponse | undefined>(undefined);
   const draftRef = useRef<Draft | null>(null);
@@ -223,31 +280,35 @@ export function YourLibrary({ client }: { client: ApiClient }) {
 
   const read = useCallback(async (): Promise<void> => {
     const seq = ++readSeq.current;
-    try {
-      const r = await api.read();
-      if (!alive.current) return;
-      apply(r, seq);
-    } catch (err) {
-      if (!alive.current) return;
-      if (!confirmedRef.current && seq >= applied.current) setLoadError(sentenceOf(err, T.loadFailed));
-    }
+    const r = await within(api.read());
+    if (r !== "gave-up" && "value" in r) apply(r.value, seq);
+    else if (!confirmedRef.current && seq >= applied.current) setLoadError(r === "gave-up" ? T.loadFailed : sentenceOf(r.error, T.loadFailed));
   }, [api, apply]);
 
   useEffect(() => {
     void read();
   }, [read]);
 
-  // The sign-in window's events: only "closed" for the window this screen opened is said; nothing else is done with them.
+  // The sign-in window's events: only those of the window this screen opened are said (R336 d); nothing else is done.
   useEffect(() => {
     if (!shell) return;
     let on = true;
     let stop: (() => void) | undefined;
     void shell
       .onLibraryWindow((e) => {
-        if (!on || e.state !== "closed" || e.ticket === null || e.ticket !== myTicket.current) return;
-        myTicket.current = null;
-        setTestResult(T.windowClosed);
-        say(T.windowClosed);
+        const mine = myTicket.current;
+        if (!on || mine === null) return;
+        if (e.state === "handed-over" && e.ticket === mine) {
+          myTicket.current = null;
+          setTestResult(T.windowReachedPdf);
+          say(T.windowReachedPdf);
+        } else if (e.state === "closed" && (e.ticket === mine || e.ticket === null)) {
+          myTicket.current = null;
+          // A sign-out closes the window: its own sentence says so.
+          if (signOutBusy.current) return;
+          setTestResult(T.windowClosed);
+          say(T.windowClosed);
+        }
       })
       .then((s) => {
         if (on) stop = s;
@@ -280,39 +341,38 @@ export function YourLibrary({ client }: { client: ApiClient }) {
     if (edit((d) => ({ ...d, [field]: v }))) setFieldErrors((f) => (f[field] ? { ...f, [field]: undefined } : f));
   };
 
-  /** The pasted link: read from the field once, sent once, and the field emptied when the answer arrives. */
+  /** The pasted link: read from the field once, sent once, and the field emptied when the answer (or none) comes. */
   const emptyLink = () => {
     if (linkRef.current) linkRef.current.value = "";
   };
   const derive = async () => {
-    if (deriveBusy.current || saveBusy.current || !confirmedRef.current || newer) return;
+    const c = confirmedRef.current;
+    if (deriveBusy.current || saveBusy.current || !c || c.problem?.code === "newer") return;
     const link = linkRef.current?.value ?? "";
     if (link.trim() === "") {
       setDerived(T.pasteFirst);
       say(T.pasteFirst);
       return;
     }
+    const gen = ++deriveGen.current;
     deriveBusy.current = true;
     setDeriving(true);
-    let sentence: string;
-    let access: LibraryAccess | null = null;
-    try {
-      const r = await api.derive(link);
-      sentence = String(r.sentence ?? "");
-      access = r.access ?? null;
-    } catch (err) {
-      // The service's sentence (a refusal names the field, never the link); the link is never part of what is shown.
-      sentence = sentenceOf(err, T.deriveFailed);
-    } finally {
-      deriveBusy.current = false;
-    }
-    if (!alive.current) return;
-    emptyLink();
+    const r = await within(api.derive(link));
+    // Discarded meanwhile (R336 c), or given up: this answer changes nothing.
+    if (gen !== deriveGen.current) return;
+    deriveBusy.current = false;
     setDeriving(false);
-    if (access) {
-      const a = access;
-      edit((d) => ({ ...d, access: a }));
-      setFieldErrors((f) => (f.access ? { ...f, access: undefined } : f));
+    emptyLink();
+    let sentence: string;
+    if (r === "gave-up") sentence = T.deriveSilent;
+    else if ("error" in r) sentence = sentenceOf(r.error, T.deriveFailed);
+    else {
+      sentence = String(r.value.sentence ?? "");
+      const a = r.value.access ?? null;
+      if (a && edit((d) => ({ ...d, access: a }))) {
+        setWorkedOut({ access: a, sentence });
+        setFieldErrors((f) => (f.access ? { ...f, access: undefined } : f));
+      }
     }
     setDerived(sentence);
     say(<UserText>{sentence}</UserText>);
@@ -322,99 +382,136 @@ export function YourLibrary({ client }: { client: ApiClient }) {
     if (edit((d) => ({ ...d, access: null }))) setFieldErrors((f) => (f.access ? { ...f, access: undefined } : f));
   };
 
-  const toggleStay = async (on: boolean) => {
-    const c = confirmedRef.current;
-    if (!shell || stayBusyRef.current || saveBusy.current || !c || c.problem?.code === "newer") return;
-    stayBusyRef.current = true;
-    setStayBusy(true);
-    let ok = false;
-    try {
-      ok = await shell.setStaySignedIn(on);
-    } catch {
-      ok = false;
-    } finally {
-      stayBusyRef.current = false;
-    }
-    if (!alive.current) return;
-    setStayBusy(false);
-    if (ok) {
-      // The shell took it: the draft changes, and Save makes the settings remember it.
-      if (!edit((d) => ({ ...d, staySignedIn: on }))) return;
-      setStayNote(undefined);
-      setFieldErrors((f) => (f.staySignedIn ? { ...f, staySignedIn: undefined } : f));
+  // ---- "Stay signed in": at once, never in the draft (R335 a) ----
+  const stayUnavailable: string | undefined = !shell ? T.onlyDesktop : !mac ? T.onlyOnMac : undefined;
+  const toggleStay = (on: boolean) => {
+    if (stayUnavailable) {
+      say(stayUnavailable);
       return;
     }
-    const note = on ? T.onlyOnMac : T.stayOffFailed;
-    setStayNote(note);
-    say(note);
+    const c = confirmedRef.current;
+    if (!shell || stayBusy.current || saveBusy.current || !c || c.problem?.code === "newer") return;
+    stayBusy.current = true;
+    setStayPending(on);
+    setStayNote(undefined);
+    setFieldErrors((f) => (f.staySignedIn ? { ...f, staySignedIn: undefined } : f));
+    // Not tied to the screen's life: the sequence finishes whether or not the screen is still open (R336 l).
+    void switchStaySignedIn(shell, api, c, on).then((o) => {
+      stayBusy.current = false;
+      setStayPending(undefined);
+      let note: string | undefined;
+      if (o.kind === "saved") {
+        apply(o.answer, ++readSeq.current);
+        say(T.saved);
+        return;
+      }
+      if (o.kind === "not-changed") note = T.stayNotChanged;
+      else if (o.kind === "app-silent") note = T.appSilent;
+      else if (o.kind === "not-put-back") note = T.stayNotPutBack;
+      else {
+        note = o.error === undefined ? T.saveFailed : sentenceOf(o.error, T.saveFailed);
+        if (o.error instanceof ApiClientError && o.error.status === 409) {
+          setDraft(null);
+          void read();
+        }
+      }
+      setStayNote(note);
+      say(<UserText>{note}</UserText>);
+    });
   };
 
   const discard = () => {
     const c = confirmedRef.current;
     if (saveBusy.current || !c) return;
-    const d = draftRef.current;
+    // An address still being worked out is discarded too (R336 c).
+    deriveGen.current++;
+    deriveBusy.current = false;
+    setDeriving(false);
     setDraft(null);
     setDerived(undefined);
+    setWorkedOut(undefined);
     setFieldErrors({});
-    setStayNote(undefined);
     emptyLink();
-    // The shell took a change of "Stay signed in" that is now discarded: it is put back as the settings hold it.
-    if (shell && d && d.staySignedIn !== (c.staySignedIn === true)) void shell.setStaySignedIn(c.staySignedIn === true).catch(() => false);
   };
 
+  /** Why "Save" waits, when it does (R336 a). */
+  const saveWaits: string | undefined = deriving ? T.waitDerive : stayPending !== undefined ? T.waitStay : undefined;
   const save = async () => {
+    if (saveWaits) {
+      say(saveWaits);
+      return;
+    }
     const c = confirmedRef.current;
-    if (saveBusy.current || deriveBusy.current || stayBusyRef.current || !c || c.problem?.code === "newer") return;
+    if (saveBusy.current || deriveBusy.current || stayBusy.current || !c || c.problem?.code === "newer") return;
     if (Date.now() - saveEndedAt.current < SECOND_PRESS_MS) return;
     const d = draftRef.current ?? fromAnswer(c);
-    const body: YourLibrarySaveRequest = { name: d.name, access: d.access, catalogueSearch: d.catalogueSearch.trim() || null, staySignedIn: d.staySignedIn };
+    // "Stay signed in" is sent as saved: a save never changes it (R335 a).
+    const body: YourLibrarySaveRequest = { name: d.name, access: d.access, catalogueSearch: d.catalogueSearch.trim() || null, staySignedIn: c.staySignedIn === true };
     saveBusy.current = true;
     setSaving(true);
     setSaveError(undefined);
     setFieldErrors({});
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      if (!alive.current) return;
-      timedOut = true;
+    const end = () => {
+      saveEndedAt.current = Date.now();
       saveBusy.current = false;
       setSaving(false);
-      setSaveError(T.saveTimedOut);
-      say(T.saveTimedOut);
-    }, SAVE_TIMEOUT_MS);
-    try {
-      const r = await api.save(body);
-      if (!alive.current || timedOut) return;
-      // A write's answer is numbered when it arrives: it wins over every read that started before it.
-      apply(r, ++readSeq.current);
-      setDraft(null);
-      say(T.saved);
-    } catch (err) {
-      if (!alive.current || timedOut) return;
-      const msg = sentenceOf(err, T.saveFailed);
-      const field = refusedField(err);
-      if (field) {
-        setFieldErrors({ [field]: msg });
-        setFocusField((f) => ({ field, n: (f?.n ?? 0) + 1 }));
-      } else setSaveError(msg);
-      // A newer file meanwhile: what the service holds now is read and shown.
-      if (err instanceof ApiClientError && err.status === 409) void read();
-    } finally {
-      clearTimeout(timer);
-      saveEndedAt.current = Date.now();
-      if (!timedOut) {
-        saveBusy.current = false;
-        if (alive.current) setSaving(false);
+    };
+    // R336 n: a save that replaces an unreadable file (read as "off") first switches the shell's side off.
+    if (c.problem?.code === "unreadable" && shell) {
+      const off = await within(shell.setStaySignedIn(false));
+      if (!tookIt(off)) {
+        setSaveError(off === "gave-up" ? T.appSilent : T.stayNotChanged);
+        end();
+        return;
       }
+      body.staySignedIn = false;
+    }
+    const r = await within(api.save(body));
+    end();
+    if (r === "gave-up") {
+      // Said once, by the alert (R336 h); the draft is kept.
+      setSaveError(T.saveTimedOut);
+      return;
+    }
+    if ("value" in r) {
+      // A write's answer is numbered when it arrives: it wins over every read that started before it.
+      apply(r.value, ++readSeq.current);
+      setDraft(null);
+      setWorkedOut(undefined);
+      say(T.saved);
+      return;
+    }
+    const err = r.error;
+    const msg = sentenceOf(err, T.saveFailed);
+    const field = refusedField(err);
+    if (field) {
+      setFieldErrors({ [field]: msg });
+      setFocusField((f) => ({ field, n: (f?.n ?? 0) + 1 }));
+    } else setSaveError(msg);
+    // A newer file meanwhile: the draft is dropped and what the service holds now is read and shown (R336 b).
+    if (err instanceof ApiClientError && err.status === 409) {
+      setDraft(null);
+      void read();
     }
   };
 
-  // "Test": why it cannot be pressed now, if it cannot.
+  // ---- "Test" (R334 b, R336 d) ----
   const testBlocked: string | undefined = !shell ? T.onlyDesktop : dirty || saving ? T.saveFirst : !confirmed?.access ? T.testNoLibrary : undefined;
   const runTest = async () => {
-    if (!shell || testBlocked || testBusy.current) return;
+    if (testBlocked) {
+      say(testBlocked);
+      return;
+    }
+    if (!shell || testBusy.current) return;
+    if (myTicket.current !== null) {
+      setTestResult(T.windowAlreadyOpen);
+      say(T.windowAlreadyOpen);
+      return;
+    }
     testBusy.current = true;
     setTesting(true);
-    const said = await (async (): Promise<string | null> => {
+    let gaveUp = false;
+    const attempt = async (): Promise<string | null> => {
       // The address is held only here, for the one call to the shell; it is never put in a state or on the page.
       let address: string;
       try {
@@ -422,8 +519,8 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       } catch (err) {
         return sentenceOf(err, T.testFailed);
       }
-      // The screen was left meanwhile: no window is opened.
-      if (!alive.current) return null;
+      // The screen was left, or the press given up, meanwhile: no window is opened.
+      if (!alive.current || gaveUp) return null;
       const ticket = newTicket();
       let opened = false;
       try {
@@ -431,33 +528,35 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       } catch {
         opened = false;
       }
+      if (gaveUp) return null;
       if (opened) myTicket.current = ticket;
       return opened ? T.windowOpen : T.windowRefused;
-    })();
+    };
+    const r = await within(attempt());
+    if (r === "gave-up") gaveUp = true;
     testBusy.current = false;
-    if (!alive.current || said === null) return;
     setTesting(false);
+    const said = r === "gave-up" ? T.appSilent : "value" in r ? r.value : T.testFailed;
+    if (said === null) return;
     setTestResult(said);
     say(<UserText>{said}</UserText>);
   };
 
   const signOut = async () => {
-    if (!shell || signOutBusy.current) return;
+    if (!shell) {
+      say(T.onlyDesktop);
+      return;
+    }
+    if (signOutBusy.current) return;
     signOutBusy.current = true;
     setSigningOut(true);
-    // The window closes with the sign-out; that is said by the sign-out's own sentence, not again as "closed".
-    myTicket.current = null;
-    let ok = false;
-    try {
-      ok = (await shell.signOutOfLibrary()) === true;
-    } catch {
-      ok = false;
-    } finally {
-      signOutBusy.current = false;
-    }
-    if (!alive.current) return;
+    const r = await within(shell.signOutOfLibrary());
+    signOutBusy.current = false;
     setSigningOut(false);
-    const t = ok ? T.signedOut : T.signOutFailed;
+    const ok = tookIt(r);
+    // Signed out, the window is gone; a failed sign-out keeps the screen's window in mind (R336 d).
+    if (ok) myTicket.current = null;
+    const t = r === "gave-up" ? T.appSilent : ok ? T.signedOut : T.signOutFailed;
     setSignOutResult(t);
     say(t);
   };
@@ -474,10 +573,18 @@ export function YourLibrary({ client }: { client: ApiClient }) {
   const by = (...xs: string[]) => xs.filter(Boolean).join(" ") || undefined;
   const invalid = (field: Field) => (fieldErrors[field] ? { "aria-invalid": true as const } : {});
 
+  // The address in the service's own words: the stored one's from its answer; one just worked out from the derive's.
   const addressChanged = !!(shown && confirmed && !sameAccess(shown.access, confirmed.access ?? null));
+  const addressText = !shown?.access
+    ? T.noLibrary
+    : !addressChanged
+      ? (confirmed?.addressSentence ?? "")
+      : workedOut && sameAccess(workedOut.access, shown.access)
+        ? workedOut.sentence
+        : "";
   const addressLine = shown && (
     <p className="ao-yl__address" data-testid="yl-address">
-      <UserText>{shown.access ? addressSentence(shown.access) : T.noLibrary}</UserText>
+      <UserText>{addressText}</UserText>
       {addressChanged && (
         <>
           {" "}
@@ -487,8 +594,10 @@ export function YourLibrary({ client }: { client: ApiClient }) {
     </p>
   );
 
+  const stayShown = stayPending ?? confirmed?.staySignedIn === true;
   const stayNoteId = `${ids}-stay-note`;
-  const stayNoteText = !shell ? T.onlyDesktop : stayNote;
+  const stayWhyId = `${ids}-stay-why`;
+  const saveWhyId = `${ids}-save-why`;
   const testReasonId = `${ids}-test-why`;
   const testNoteId = `${ids}-test-note`;
   const testResultId = `${ids}-test-result`;
@@ -524,7 +633,7 @@ export function YourLibrary({ client }: { client: ApiClient }) {
           <p>
             {T.catalogueLabel}: {shown.catalogueSearch ? <UserText>{shown.catalogueSearch}</UserText> : T.catalogueNone}
           </p>
-          <p>{`${T.stayLabel}: ${shown.staySignedIn ? T.on : T.off}`}</p>
+          <p>{`${T.stayLabel}: ${confirmed?.staySignedIn ? T.on : T.off}`}</p>
         </section>
       )}
       {shown && !newer && (
@@ -606,6 +715,7 @@ export function YourLibrary({ client }: { client: ApiClient }) {
               dir="ltr"
               autoComplete="off"
               spellCheck={false}
+              maxLength={YOUR_LIBRARY_CATALOGUE_MAX}
               data-field="catalogueSearch"
               value={shown.catalogueSearch}
               disabled={saving}
@@ -620,37 +730,49 @@ export function YourLibrary({ client }: { client: ApiClient }) {
           </div>
 
           <div className="ao-yl__field">
+            {/* Shown unavailable with aria-disabled, never removed from the tab order (R336 e). */}
             <label className="ao-yl__switch">
               <input
                 type="checkbox"
                 role="switch"
                 data-field="staySignedIn"
-                checked={shown.staySignedIn}
-                disabled={!shell || saving}
-                aria-busy={stayBusy || undefined}
-                aria-describedby={by(`${ids}-stay-hint`, stayNoteText ? stayNoteId : "", errId("staySignedIn"))}
-                onChange={(e) => void toggleStay(e.target.checked)}
+                checked={stayShown}
+                aria-disabled={!!stayUnavailable || stayPending !== undefined || saving || undefined}
+                aria-busy={stayPending !== undefined || undefined}
+                aria-describedby={by(stayUnavailable ? stayWhyId : `${ids}-stay-hint`, stayNote ? stayNoteId : "", errId("staySignedIn"))}
+                onChange={(e) => toggleStay(e.target.checked)}
               />
               {T.stayLabel}
             </label>
-            <p id={`${ids}-stay-hint`} className="ao-yl__note">
-              {T.stayHint}
-            </p>
-            {stayNoteText && (
-              <p id={stayNoteId} className="ao-yl__unavailable">
-                {stayNoteText}
+            {stayUnavailable ? (
+              <p id={stayWhyId} className="ao-yl__unavailable">
+                {stayUnavailable}
+              </p>
+            ) : (
+              <p id={`${ids}-stay-hint`} className="ao-yl__note">
+                {T.stayHint}
+              </p>
+            )}
+            {stayNote && (
+              <p id={stayNoteId} className="ao-yl__unavailable" data-testid="yl-stay-note">
+                <UserText>{stayNote}</UserText>
               </p>
             )}
             {fieldError("staySignedIn")}
           </div>
 
           <div className="ao-yl__actions">
-            <button type="button" aria-disabled={saving || undefined} onClick={() => void save()}>
+            <button type="button" aria-disabled={saving || !!saveWaits || undefined} aria-describedby={saveWaits ? saveWhyId : undefined} onClick={() => void save()}>
               Save
             </button>
             <button type="button" disabled={saving || !dirty} onClick={discard}>
               Discard changes
             </button>
+            {saveWaits && (
+              <p id={saveWhyId} className="ao-yl__unavailable" data-testid="yl-save-why">
+                {saveWaits}
+              </p>
+            )}
           </div>
           {saveError && (
             <p role="alert" className="ao-error" data-testid="yl-save-error">
