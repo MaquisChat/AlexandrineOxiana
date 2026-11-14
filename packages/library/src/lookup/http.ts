@@ -18,8 +18,18 @@
  *  - 429 / 5xx / network errors: 3 retries with exponential backoff (0.5 s, 1 s, 2 s), or the
  *    server's Retry-After, capped (default 60 s).
  *  - Redirects are followed (at most 3) only within the same origin.
- *  - User-Agent `AlexandrineOxiana/<version> (+https://github.com/maquiscatta-sys/AlexandrineOxiana)`;
- *    `; mailto:<email>` is added inside the parentheses only when the user set a contact email.
+ *  - User-Agent `AlexandrineOxiana/<version> (+https://github.com/maquiscatta-sys/AlexandrineOxiana)`; the default
+ *    carries no e-mail. `; mailto:<email>` is added inside the parentheses only on requests to a host for which
+ *    `contactEmailFor(host)` gives a well-formed address (F12, R290 e: Crossref's, to api.crossref.org only).
+ *  - Keys (F12, R290 a): a key travels in the `Authorization: Bearer` header only, never in an address, and only to
+ *    a host of KEYED_HOSTS reached over https on its default port: `keyFor(host)` (OpenAlex's) or a request's own key
+ *    bound to its host (`PostOptions.key`, Elicit's). ONE place decides it (the private `keyFor`). A request that
+ *    carries a key is never redirected (any 3xx is refused, the same site included); its answer is cached under the
+ *    caller's `cacheKey`, which holds no header, and is served from the cache whatever the key; an answer that holds
+ *    the key or the e-mail sent is not cached; no error's message or property carries the key (the library's own
+ *    words are not passed on for a keyed request). `keyTag(host)` gives a digest of the key in use (never the key) for
+ *    the pause of OpenAlex's daily allowance, which is kept per key (A2, R290 h).
+ *  - `postJson` (Elicit's search): one POST, never cached, never retried, never redirected, under its own time limit.
  *  - Under NODE_ENV=test only, AO_LOOKUP_FIXTURES replays recorded answers and fetches nothing
  *    (recorded.ts, R47/R130).
  *  - `GetOptions.query` (F10: the e-mail Unpaywall requires) is added to the address of the first request only. It is
@@ -51,13 +61,23 @@ export const DEFAULT_RATE_LIMITS: Readonly<Record<string, number>> = {
   "www.loc.gov": 1,
   "lccn.loc.gov": 1,
   "export.arxiv.org": 1 / 3,
+  // Elicit: one request every 2 s (docs.elicit.com; plan "Rates").
+  "elicit.com": 1 / 2,
 };
 const DEFAULT_RATE = 1;
 /** Requests open at once, per host; a host not listed is unlimited. */
 export const DEFAULT_CONCURRENCY: Readonly<Record<string, number>> = {
   "api.crossref.org": 1,
   "export.arxiv.org": 1,
+  "elicit.com": 1,
 };
+/**
+ * The only hosts a key is ever sent to (R290 a): OpenAlex's key to `api.openalex.org`, Elicit's to `elicit.com`; https
+ * on the default port only. A key function that answers for another host is never even asked.
+ */
+export const KEYED_HOSTS: ReadonlySet<string> = new Set(["api.openalex.org", "elicit.com"]);
+/** A key the client sends: visible ASCII without spaces, at most 4,096 characters (nothing that could change a header). */
+const KEY_SHAPE = /^[\x21-\x7e]{1,4096}$/u;
 /** The start of a 429's body shown to the caller's decision. */
 const RATE_LIMIT_BODY_BYTES = 4096;
 const DAY_MS = 86_400_000;
@@ -115,8 +135,16 @@ function wholeNumber(v: string | undefined): number | undefined {
 export interface HttpClientOptions {
   /** The library root; the cache lives in `<root>/.cache/lookups/`. */
   libraryRoot: string;
-  /** The researcher's contact email from settings (polite-pool etiquette); omitted when unset. */
-  contactEmail?: string;
+  /**
+   * The contact e-mail for a host's User-Agent (polite-pool etiquette; F12: Crossref's e-mail for api.crossref.org
+   * only), or undefined. Asked for every request's host; an address that is not well formed is never sent.
+   */
+  contactEmailFor?: (host: string) => string | undefined;
+  /**
+   * The key for a host (F12: OpenAlex's for api.openalex.org), or undefined. Asked only for a host of KEYED_HOSTS,
+   * at each request (a key added or changed is used by the next request). Never stored by the client.
+   */
+  keyFor?: (host: string) => string | undefined;
   /** undici dispatcher (tests pass a MockAgent). */
   dispatcher?: Dispatcher;
   /** Milliseconds since the epoch (rate limits and cache age). */
@@ -160,6 +188,20 @@ export interface GetOptions {
   query?: Readonly<Record<string, string>>;
 }
 
+/** One POST (F12: Elicit's search). */
+export interface PostOptions {
+  /** The request's own key, sent only when the address's host is `host` (and that host is keyed). */
+  key?: { host: string; value: string };
+  /** Limit of the whole call, the wait for a place included (default: the client's attempt deadline). */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /**
+   * Shown a refusal (a status other than 200) with the first 4 KiB of its body, for that one decision; the body is
+   * then dropped (never kept on the error, logged or cached).
+   */
+  onRefusal?: (status: number, bodyStart: string) => void;
+}
+
 interface CacheEntry {
   v: 1;
   storedAt: number;
@@ -172,7 +214,10 @@ interface MemoryEntry extends CacheEntry {
 }
 
 export class HttpClient {
-  readonly userAgent: string;
+  /** The default User-Agent: no e-mail (R290 e). */
+  readonly userAgent: string = USER_AGENT;
+  private readonly contactEmailFor?: (host: string) => string | undefined;
+  private readonly keyForHost?: (host: string) => string | undefined;
   private readonly cacheDir: string;
   /**
    * R247 (c): whether the library's root folder existed when the client was made. If it did, a cache write never
@@ -201,8 +246,8 @@ export class HttpClient {
   private readonly waiting = new Map<string, Array<() => void>>();
 
   constructor(opts: HttpClientOptions) {
-    const email = opts.contactEmail?.trim();
-    this.userAgent = email && EMAIL_RE.test(email) ? `AlexandrineOxiana/${VERSION} (+${PROJECT_URL}; mailto:${email})` : USER_AGENT;
+    this.contactEmailFor = opts.contactEmailFor;
+    this.keyForHost = opts.keyFor;
     this.cacheDir = join(opts.libraryRoot, ".cache", "lookups");
     this.rootExisted = existsSync(opts.libraryRoot);
     this.dispatcher = opts.dispatcher;
@@ -260,7 +305,8 @@ export class HttpClient {
     const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true);
     if (res.body !== null) validate?.(res.body); // throws: nothing is cached
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
-    if (res.body !== null && echoesQuery(res.body, opts.query)) return entry.body; // never cached (R257 h)
+    // Never cached (R257 h; R290 a, e): an answer that holds the private query, or the key or the e-mail sent with it.
+    if (res.body !== null && (echoesQuery(res.body, opts.query) || echoesQuery(res.body, res.sent))) return entry.body;
     this.remember(name, entry, sensitive);
     if (!sensitive) await this.writeCache(name, entry);
     return entry.body;
@@ -350,6 +396,133 @@ export class HttpClient {
     }
   }
 
+  /**
+   * THE one place that decides a key (R290 a): for an https address on its default port, with no user name, whose
+   * host is in KEYED_HOSTS, the request's own key when one is given and bound to that host (a key given for another
+   * host gives none), else `keyFor(host)`; a key that is not of KEY_SHAPE is never sent. Undefined for every other
+   * address.
+   */
+  private keyFor(u: URL, own?: { host: string; value: string }): string | undefined {
+    if (u.protocol !== "https:" || u.port !== "" || u.username !== "" || u.password !== "" || !KEYED_HOSTS.has(u.hostname)) return undefined;
+    let key: string | undefined;
+    if (own) key = own.host === u.hostname ? own.value : undefined;
+    else {
+      try {
+        key = this.keyForHost?.(u.hostname);
+      } catch {
+        key = undefined;
+      }
+    }
+    return typeof key === "string" && KEY_SHAPE.test(key) ? key : undefined;
+  }
+
+  /**
+   * A digest of the key the next request to `host` would carry ("" without one): it tells keys apart for the pause of
+   * OpenAlex's daily allowance (A2, R290 h) and is never the key. Held in memory only, by whoever asks.
+   */
+  keyTag(host: string): string {
+    let u: URL;
+    try {
+      u = new URL(`https://${host}/`);
+    } catch {
+      return "";
+    }
+    const key = this.keyFor(u);
+    return key ? createHash("sha256").update(`ao-key-tag\u0000${key}`).digest("hex").slice(0, 32) : "";
+  }
+
+  /** The User-Agent of a request to `host`: the default, or with `mailto:` when that host has a well-formed e-mail. */
+  private userAgentFor(host: string): { ua: string; email?: string } {
+    let email: string | undefined;
+    try {
+      email = this.contactEmailFor?.(host)?.trim();
+    } catch {
+      email = undefined;
+    }
+    return email && email.length <= 254 && EMAIL_RE.test(email) ? { ua: `AlexandrineOxiana/${VERSION} (+${PROJECT_URL}; mailto:${email})`, email } : { ua: USER_AGENT };
+  }
+
+  /**
+   * One POST of a JSON body (F12: Elicit's search), its answer parsed: `{ status: 200, json }`. Never cached, never
+   * retried, never redirected (any 3xx is refused), bounded as every answer (5 MB) and in time (`timeoutMs`, the wait
+   * for a place included). Any other status is a LookupHttpError with that status (a 429's allowance numbers on it as
+   * for a GET, `final`); `onRefusal` sees the start of its body first. In test mode with recorded answers nothing is
+   * fetched: the call fails (there are no recorded POST answers).
+   */
+  async postJson(url: string, body: unknown, opts: PostOptions = {}): Promise<{ status: 200; json: unknown }> {
+    if (this.recorded) throw new LookupHttpError("No recorded answer for this lookup (test mode: nothing is fetched)");
+    const u = new URL(url);
+    // A POST carries only its own key: `keyFor(host)` is never asked for it.
+    const key = this.keyFor(u, opts.key ?? { host: "", value: "" });
+    const limit = AbortSignal.timeout(opts.timeoutMs ?? this.attemptTimeoutMs);
+    const signal = opts.signal ? AbortSignal.any([opts.signal, limit]) : limit;
+    const payload = JSON.stringify(body);
+    let giveBack: (() => void) | undefined;
+    let given = false;
+    try {
+      const waited = (async () => {
+        const g = await this.hold(u.hostname);
+        if (given) g(); // the call was given up while it waited: the place goes straight back
+        else giveBack = g;
+        await this.throttle(u.hostname);
+      })();
+      await Promise.race([
+        waited,
+        new Promise<never>((_, reject) => {
+          if (signal.aborted) reject(new Error("aborted"));
+          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }),
+      ]);
+      const { ua } = this.userAgentFor(u.hostname);
+      const res = await request(u, {
+        method: "POST",
+        headers: {
+          "user-agent": ua,
+          accept: "application/json",
+          "content-type": "application/json",
+          ...(key ? { authorization: `Bearer ${key}` } : {}),
+        },
+        body: payload,
+        dispatcher: this.dispatcher,
+        signal,
+        headersTimeout: this.timeoutMs,
+        bodyTimeout: this.timeoutMs,
+      });
+      const header = (n: string) => {
+        const v = res.headers[n];
+        return Array.isArray(v) ? v[0] : v;
+      };
+      if (res.statusCode !== 200) {
+        const start = await readStart(res.body, RATE_LIMIT_BODY_BYTES);
+        try {
+          opts.onRefusal?.(res.statusCode, start);
+        } catch {
+          // the caller's decision never breaks the call
+        }
+        if (res.statusCode >= 300 && res.statusCode < 400) throw new LookupHttpError("The service redirected; a request to it is never redirected", res.statusCode);
+        if (res.statusCode === 429) {
+          const remaining = wholeNumber(header("x-ratelimit-remaining"));
+          const reset = wholeNumber(header("x-ratelimit-reset"));
+          throw new LookupHttpError("The service answered HTTP 429", 429, { ...(remaining !== undefined ? { remaining } : {}), ...(reset !== undefined ? { reset } : {}), final: true });
+        }
+        throw new LookupHttpError(`The service answered HTTP ${res.statusCode}`, res.statusCode);
+      }
+      const text = await readBounded(res.body);
+      try {
+        return { status: 200, json: JSON.parse(text) as unknown };
+      } catch {
+        throw new LookupHttpError("The service returned a response that is not JSON");
+      }
+    } catch (e) {
+      if (e instanceof LookupHttpError) throw e;
+      // Nothing of the library's own words: they could hold the address or the request.
+      throw new LookupHttpError(signal.aborted ? "The service did not answer in time" : "The service could not be reached");
+    } finally {
+      given = true;
+      giveBack?.();
+    }
+  }
+
   /** Waits for the host's next free slot; slots are handed out in call order. */
   private async throttle(host: string): Promise<void> {
     const prev = this.hostQueue.get(host) ?? Promise.resolve();
@@ -396,24 +569,30 @@ export class HttpClient {
     final429?: (a: RateLimitAnswer) => boolean,
     query?: Readonly<Record<string, string>>,
     final5xx = false,
-  ): Promise<{ status: 200 | 404; body: string | null }> {
+  ): Promise<{ status: 200 | 404; body: string | null; sent?: Record<string, string> }> {
     if (this.recorded) return this.recorded.answer(url);
+    const first = new URL(url);
+    const key = this.keyFor(first);
+    const { ua, email } = this.userAgentFor(first.hostname);
+    /** What was sent that an answer must not be cached with (an answer that echoes it is not kept). */
+    const sent: Record<string, string> = { ...(key ? { key } : {}), ...(email ? { email } : {}) };
     const params = query ? Object.entries(query) : [];
     const target = params.length ? `${url}${url.includes("?") ? "&" : "?"}${params.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&")}` : url;
     let lastError: LookupHttpError | undefined;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
-        res = await this.fetchFollowingRedirects(target);
+        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) });
       } catch (e) {
         if (e instanceof LookupHttpError) throw e; // refused redirect or oversized body: not retryable
-        // The library's own words can hold the address it was asked; with a query (an e-mail) they are not passed on.
-        const why = params.length ? "" : `: ${e instanceof Error ? e.message : String(e)}`;
+        // The library's own words can hold the address it was asked; with a query (an e-mail), a key or a contact
+        // e-mail they are not passed on.
+        const why = params.length || key || email ? "" : `: ${e instanceof Error ? e.message : String(e)}`;
         lastError = new LookupHttpError(`The metadata service could not be reached${why}`);
       }
       if (res) {
-        if (res.status === 200) return { status: 200, body: res.body };
-        if (res.status === 404 || res.status === 410) return { status: 404, body: null };
+        if (res.status === 200) return { status: 200, body: res.body, sent };
+        if (res.status === 404 || res.status === 410) return { status: 404, body: null, sent };
         if (res.status === 429 && res.rateLimit) {
           // The answer (body included) is shown to the caller's decision and then dropped: only
           // the parsed numbers and the decision stay on the error.
@@ -439,7 +618,10 @@ export class HttpClient {
    * One attempt; its deadline starts once the first rate-limit slot is granted (queueing is not
    * counted). Each hop holds one of its host's concurrency places until its body has been read.
    */
-  private async fetchFollowingRedirects(url: string): Promise<{ status: number; body: string | null; retryAfter?: string; rateLimit?: RateLimitAnswer }> {
+  private async fetchFollowingRedirects(
+    url: string,
+    send: { ua: string; key?: string },
+  ): Promise<{ status: number; body: string | null; retryAfter?: string; rateLimit?: RateLimitAnswer }> {
     let current = new URL(url);
     let signal: AbortSignal | undefined;
     for (let hop = 0; ; hop++) {
@@ -449,7 +631,11 @@ export class HttpClient {
         signal ??= AbortSignal.timeout(this.attemptTimeoutMs);
         const res = await request(current, {
           method: "GET",
-          headers: { "user-agent": this.userAgent, accept: "application/json, application/xml;q=0.9, */*;q=0.1" },
+          headers: {
+            "user-agent": send.ua,
+            accept: "application/json, application/xml;q=0.9, */*;q=0.1",
+            ...(send.key ? { authorization: `Bearer ${send.key}` } : {}),
+          },
           dispatcher: this.dispatcher,
           signal,
           headersTimeout: this.timeoutMs,
@@ -461,6 +647,8 @@ export class HttpClient {
         };
         if (res.statusCode >= 300 && res.statusCode < 400 && res.statusCode !== 304) {
           await res.body.dump();
+          // A request that carries a key is never redirected, the same site included (R290 a).
+          if (send.key) throw new LookupHttpError("The metadata service redirected a request that carries a key; not followed", res.statusCode);
           const loc = header("location");
           if (!loc || hop >= MAX_REDIRECTS) throw new LookupHttpError("The metadata service redirected too often", res.statusCode);
           const next = new URL(loc, current);

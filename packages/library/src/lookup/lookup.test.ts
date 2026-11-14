@@ -107,7 +107,7 @@ describe("lookupDoi", () => {
 
   it("serves the second call from the on-disk cache (one request), file named sha256(cacheKey), 0600 in a 0700 dir", async () => {
     crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
-    const http = client({ contactEmail: EMAIL });
+    const http = client({ contactEmailFor: () => EMAIL });
     const first = await lookupDoi(DOI, ctx(http));
     const second = await lookupDoi(DOI, ctx(http));
     expect(second).toEqual(first);
@@ -233,12 +233,12 @@ describe("lookupDoi", () => {
     crossref()
       .intercept({ path: "/works/10.5555/other", method: "GET", headers: { "user-agent": `AlexandrineOxiana/0.0.0 (+https://github.com/maquiscatta-sys/AlexandrineOxiana; mailto:${EMAIL})` } })
       .reply(200, fixture("crossref-work.json"), JSON_HEADERS);
-    await lookupDoi("10.5555/other", ctx(client({ contactEmail: EMAIL })));
+    await lookupDoi("10.5555/other", ctx(client({ contactEmailFor: () => EMAIL })));
     agent.assertNoPendingInterceptors();
   });
 
   it("ignores a contact email that could inject header text", () => {
-    expect(client({ contactEmail: "a@b.example\r\nX-Evil: 1" }).userAgent).toBe(UA);
+    expect(client({ contactEmailFor: () => "a@b.example\r\nX-Evil: 1" }).userAgent).toBe(UA);
   });
 });
 
