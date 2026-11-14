@@ -189,6 +189,8 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
     case "choose":
       // Nothing to choose from: no dialog (R258 M5).
       if (candidatesOf(e).length > 0 || authorOfferOf(e)) out.push("choose");
+      // R283 a, R287 c: the people of this name could not be looked up — "Try again" looks again.
+      if (e.reason?.code === "people-unavailable") out.push("retry");
       break;
     case "maybe-duplicate":
       out.push("same", "different");

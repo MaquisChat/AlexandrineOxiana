@@ -293,7 +293,7 @@ describe("ChooseWorksDialog", () => {
     expect(within(dialog).getByRole("alert").textContent).toBe("The queue holds 500 entries. Remove some finished ones first.");
   });
 
-  it("round 2 (R281 f): the dialog's name holds the person's affiliation; words match whole words of the title and where published, never the year; Article covers journal articles and preprints", async () => {
+  it("round 2 (R281 f, with R291 c): the dialog's name holds the person's affiliation; words match the beginnings of words of the title and where published, never the year; Article covers journal articles and preprints", async () => {
     const works = [
       ...WORKS,
       work({ id: "W9001", title: "Testing in pandemic times", issued: "2020-01-01", type: "preprint", container: "SocArXiv" }),
@@ -304,13 +304,14 @@ describe("ChooseWorksDialog", () => {
     expect(screen.getByRole("dialog", { name: "Choose works by David Stark (Columbia University)" })).toBe(dialog);
     // M5: whole words; a year typed as a word matches nothing by its year.
     const words = within(dialog).getByRole("textbox", { name: "Filter by words" });
+    // R291 c: where a word BEGINS with what was typed ("worth" finds "Worthiness"); never inside a word.
     await user.type(words, "worth");
-    expect(boxes(dialog).map(titleOf)).toEqual(["For What It’s Worth", "The Sense of Dissonance: Accounts of Worth in Economic Life"]);
+    expect(boxes(dialog).map(titleOf)).toEqual(["For What It’s Worth", "The Sense of Dissonance: Accounts of Worth in Economic Life", "Worthiness and its tests"]);
     await user.clear(words);
     await user.type(words, "2020");
     expect(boxes(dialog)).toHaveLength(0);
     await user.clear(words);
-    await user.type(words, "tes");
+    await user.type(words, "esting");
     expect(boxes(dialog)).toHaveLength(0);
     await user.clear(words);
     await user.type(words, "tests");
@@ -323,6 +324,64 @@ describe("ChooseWorksDialog", () => {
     await user.selectOptions(within(dialog).getByRole("combobox", { name: "Kind" }), "Article");
     expect(boxes(dialog).map(titleOf)).toContain("Testing in pandemic times");
     expect(boxes(dialog)).toHaveLength(6);
+  });
+
+  it("round 3 (R291 c): a typed word matches where a word of the title or of where it was published begins with it; in writing without spaces between words, anywhere in the title; every typed word must match; never the year", async () => {
+    const works = [
+      ...WORKS,
+      work({ id: "W9101", title: "社会学の方法と実践", issued: "1979-01-01", container: "Shakai Kenkyu" }),
+      work({ id: "W9102", title: "การศึกษาสังคมวิทยาเมือง", issued: "1978-01-01", container: "Thai Review" }),
+      work({ id: "W9103", title: "マーケットの社会学", issued: "1977-01-01", container: "Kenkyu" }),
+    ];
+    const { user, dialog } = await openIt({ works });
+    const words = within(dialog).getByRole("textbox", { name: "Filter by words" });
+    const titles = () => boxes(dialog).map(titleOf).sort();
+    const sociology = ["Put to the test: For a new sociology of testing", "For What It’s Worth", "Game Changer: The Topology of Creativity", "Structural Folds: Generative Disruption in Overlapping Groups", "Recombinant Property in East European Capitalism", "Redistributive Injustice"].sort();
+    // The beginning of a word of the title ("sociology") or of where it was published ("Sociology", "sociology").
+    await user.type(words, "soci");
+    expect(titles()).toEqual(sociology);
+    // Not the middle or the end of a word.
+    await user.clear(words);
+    await user.type(words, "ology");
+    expect(boxes(dialog)).toHaveLength(0);
+    // Where it was published alone: "Princeton University Press eBooks".
+    await user.clear(words);
+    await user.type(words, "princ");
+    expect(titles()).toEqual(["The Sense of Dissonance: Accounts of Worth in Economic Life"]);
+    // Han (with Hiragana), Katakana and Thai: anywhere in the title.
+    await user.clear(words);
+    await user.type(words, "方法");
+    expect(titles()).toEqual(["社会学の方法と実践"]);
+    await user.clear(words);
+    await user.type(words, "社会学");
+    expect(titles()).toEqual(["マーケットの社会学", "社会学の方法と実践"].sort());
+    await user.clear(words);
+    await user.type(words, "ケット");
+    expect(titles()).toEqual(["マーケットの社会学"]);
+    await user.clear(words);
+    await user.type(words, "สังคม");
+    expect(titles()).toEqual(["การศึกษาสังคมวิทยาเมือง"]);
+    // …in the title only, not where it was published ("Kenkyu" is written in Latin letters; a Han word is not looked for there).
+    await user.clear(words);
+    await user.type(words, "研究");
+    expect(boxes(dialog)).toHaveLength(0);
+    // Every typed word must match.
+    await user.clear(words);
+    await user.type(words, "soci americ");
+    expect(titles()).toEqual(["Game Changer: The Topology of Creativity", "Structural Folds: Generative Disruption in Overlapping Groups", "Recombinant Property in East European Capitalism"].sort());
+    await user.clear(words);
+    await user.type(words, "soci 方法");
+    expect(boxes(dialog)).toHaveLength(0);
+    await user.clear(words);
+    await user.type(words, "社会 方法");
+    expect(titles()).toEqual(["社会学の方法と実践"]);
+    // Never the year, not even its beginning.
+    await user.clear(words);
+    await user.type(words, "20");
+    expect(boxes(dialog)).toHaveLength(0);
+    await user.clear(words);
+    await user.type(words, "2015");
+    expect(boxes(dialog)).toHaveLength(0);
   });
 
   it("200 works stay usable: rendered once, a tick re-renders quickly (measured), and the list is still one stop", async () => {

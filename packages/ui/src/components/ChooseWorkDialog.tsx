@@ -14,10 +14,12 @@
  *
  * R279 d: when the typed words may also name an author (the entry's author offer; the parent passes `onShowAuthor`),
  * below the candidates: "“<typed>” may also be an author." and the button "Show this author's works", which sends the
- * act (the parent closes the dialog on its answer).
+ * act (the parent closes the dialog on its answer). R291 d: when the service refuses it ("This entry has no author to
+ * show."), the parent stops passing `onShowAuthor`: the offer goes, the works stay, and focus — if it was on the button
+ * that went — moves to the dialog's first remaining control (the candidates' group), never to the page.
  */
 import type { FindEntryView, FindWorkCandidate } from "@ao/shared";
-import { useId, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { creatorsText, identifierText, kindWords, usableCandidates, wherePublished, yearOf } from "../api/find";
 import { shortTyped } from "./FindEntryRow";
 import { DialogShell } from "./ReasonDialog";
@@ -79,6 +81,16 @@ export function ChooseWorkDialog({ entry, onChoose, onClose, busy = false, error
   /** undefined: nothing chosen yet; null: "None of these". */
   const [chosen, setChosen] = useState<string | null | undefined>(undefined);
   const name = `${id}-pick`;
+  const root = useRef<HTMLDivElement>(null);
+  const offered = !!onShowAuthor;
+  useEffect(() => {
+    if (offered) return;
+    const el = root.current;
+    const now = document.activeElement;
+    if (!el || (now && now !== document.body && now.isConnected)) return;
+    const radios = [...el.querySelectorAll<HTMLInputElement>('input[type="radio"]')];
+    (radios.find((r) => r.checked) ?? radios[0] ?? el.querySelector<HTMLElement>("button:not([disabled])"))?.focus();
+  }, [offered]);
 
   const close = () => {
     if (!busy) onClose();
@@ -104,7 +116,7 @@ export function ChooseWorkDialog({ entry, onChoose, onClose, busy = false, error
 
   return (
     <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={close} busy={busy} className="ao-find__dialog">
-      <div onKeyDown={onKeyDown}>
+      <div onKeyDown={onKeyDown} ref={root}>
         <h2 id={`${id}-t`}>
           Choose the work for “<UserText>{entry.typed}</UserText>”
         </h2>

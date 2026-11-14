@@ -37,6 +37,12 @@
  * chosen works" are acts like the others: their answers take their place in the order (R262, R263).
  *   - R272 a: while a change of "Check everything I have" is out, an add is not sent; it is sent as soon as the
  *     change is confirmed, or — if the change fails — not at all, the text kept and the failure said.
+ *   - R291 a: a change with no answer in SWITCH_TIMEOUT_MS may still have been stored (only its answer was lost): the
+ *     screen then reads the settings (`GET /find/screen`) before anything else, the switch and "Add" busy meanwhile;
+ *     the switch shows what the service holds, and a waiting add is sent only if that is the position asked for. If
+ *     that read fails too, the settings are unreadable (M3: the queue's answer says what is stored) and nothing is added.
+ *   - R291 b: an event about the library already held never resets the screen; it reads again only what has not been
+ *     read successfully. The full reset is for another library, or when nothing has been read yet.
  *   - R272 b: the result of the researcher's own act ("Added 2 references.", "Added 3 works.", "Removed …") is said
  *     first and stays for ACT_SAID_MS; rows' changes arriving meanwhile are said after it — each row's latest as
  *     shown then, never the same change twice.
@@ -79,11 +85,15 @@ export const FIND_SCREEN_TEXT = {
   /** R272 a: an add waits for a change of the switch; that change failed, so the add is not sent. */
   addSwitchFailed: "Nothing was added, because “Check everything I have” could not be changed. The text is kept: press “Add” to add it with the switch as it is now.",
   optionsUnreadable: "The list could not be read. Close this and try again.",
-  /** R281 c: a change of the switch with no answer in SWITCH_TIMEOUT_MS, while an add waited for it. */
-  switchTimedOut: "The service did not answer. The setting was not changed and nothing was added.",
-  /** The same, said on the switch (the add's sentence ends with the service's own words "The service did not answer."). */
-  switchNoAnswer: "The service did not answer.",
+  /**
+   * R291 a: an add waited for a change of the switch that got no answer, and the settings read afterwards shows another
+   * position than the one asked for, or cannot be read: the add is not sent.
+   */
+  addSwitchNoAnswer: "Nothing was added. The text is kept: press “Add” to add it with the switch as it is now.",
 } as const;
+
+/** R291 a: beside the switch after a change with no answer, once the settings were read again: what the service holds. */
+export const switchReadText = (on: boolean) => `The service did not answer in time. “Check everything I have” is ${on ? "on" : "off"}.`;
 
 /** The result of the researcher's own act stays in the status region at least this long before rows' changes are said (R272 b). */
 export const ACT_SAID_MS = 1000;
@@ -104,8 +114,17 @@ const ADD_TIMEOUT_MS = 60_000;
 /** A change of the switch with no answer for this long is given up (R281 c). */
 export const SWITCH_TIMEOUT_MS = 60_000;
 
-/** How a change of the switch ended, for an add that waited for it (R272 a, R281 c). */
-export type SwitchOutcome = "ok" | "failed" | "timeout";
+/**
+ * How a change of the switch ended, for an add that waited for it (R272 a, R281 c, R291 a): "ok" — the service holds the
+ * position asked for (confirmed, or read after a change with no answer); "failed" — refused; "not-stored" — no answer,
+ * and the settings read afterwards show the other position (`note`: the sentence beside the switch); "unknown" — no
+ * answer, and the settings could not be read either.
+ */
+export type SwitchOutcome = "ok" | "failed" | "not-stored" | "unknown";
+export interface SwitchResult {
+  outcome: SwitchOutcome;
+  note?: string;
+}
 
 /** -1, 0 or 1: which of two entries the service stamped later (`updatedAt`); 0 when equal or not comparable. */
 function stampOrder(a: FindEntryView, b: FindEntryView): number {
@@ -146,7 +165,7 @@ const isElsewhere = (e: FindEntryView) => !!e.elsewhere && (e.state === "already
 // The screen: project, collection, the switch; the queue of the chosen project below
 
 /** What the screen passes on to the queue from the one event stream it listens to. */
-type QueueSignal = { kind: "event"; ev: ServiceEvent } | { kind: "refresh" };
+type QueueSignal = { kind: "event"; ev: ServiceEvent } | { kind: "refresh" } | { kind: "say"; words: Words };
 interface QueueBus {
   subscribe(fn: (s: QueueSignal) => void): () => void;
 }
@@ -164,6 +183,8 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   /** The switch while its change is being sent. */
   const [checkSending, setCheckSending] = useState<boolean | undefined>();
   const [switchError, setSwitchError] = useState<string | undefined>();
+  /** R291 a: what the service holds, read after a change of the switch that got no answer (beside the switch). */
+  const [switchNote, setSwitchNote] = useState<string | undefined>();
   const [settingsError, setSettingsError] = useState<string | undefined>();
   /** The project the researcher chose on this screen (else the address's, else the remembered one). */
   const [chosen, setChosen] = useState<string | undefined>();
@@ -180,19 +201,26 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   const switchBusy = useRef(false);
   /** The last answer of the service about the remembered settings; every PUT is built from it plus its own change (R258 M2). */
   const confirmed = useRef<FindScreenSettings>({ checkEverything: false });
-  /** The time limits of PUTs still out (cleared on unmount). */
+  /** The time limits of PUTs and settings reads still out (cleared on unmount and when the library goes). */
   const putTimers = useRef(new Set<ReturnType<typeof setTimeout> | undefined>());
+  /** Their requests, aborted when the library goes. */
+  const putAborts = useRef(new Set<AbortController>());
   /** The PUTs, one at a time. */
   const putChain = useRef<Promise<void>>(Promise.resolve());
   /**
    * A change of the switch still out (R272 a): an add waits for it — true once the service confirmed it, false when it
    * failed or the library went.
    */
-  const switchWait = useRef<{ p: Promise<SwitchOutcome>; resolve: (o: SwitchOutcome) => void } | null>(null);
+  const switchWait = useRef<{ p: Promise<SwitchResult>; resolve: (r: SwitchResult) => void; taken: boolean } | null>(null);
   /** The first reads of this library (projects, remembered settings) have both answered (R281 e). */
   const projectsRead_ok = useRef(false);
   const screenRead_ok = useRef(false);
-  const waitForSwitch = useCallback(() => switchWait.current?.p, []);
+  const waitForSwitch = useCallback(() => {
+    const w = switchWait.current;
+    if (!w) return undefined;
+    w.taken = true;
+    return w.p;
+  }, []);
   /** GET /find/screen failed and nothing has been confirmed since: the queue's answer says what is stored (M3). */
   const screenUnread = useRef(false);
   /** Moves on with the library: an answer about the library that went is dropped. */
@@ -252,35 +280,79 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     })();
   }, [lib]);
 
-  // ---- at load, and afresh for each library ----
-  useEffect(() => {
-    const g = libGen.current;
-    readProjects();
-    api.screen().then(
-      (s) => {
-        if (!alive.current || g !== libGen.current) return;
+  /**
+   * One read of the remembered settings (`timeoutMs`: given up after that long, as a failure). Its answer is the new
+   * confirmed one; a failure is the state for settings that cannot be read (M3: the queue's answer says what is stored).
+   * "gone": the screen or the library went meanwhile, and nothing was changed.
+   */
+  const screenOnce = useCallback(
+    async (timeoutMs?: number): Promise<"ok" | "failed" | "gone"> => {
+      const g = libGen.current;
+      const ac = new AbortController();
+      const timer = timeoutMs === undefined ? undefined : setTimeout(() => ac.abort(), timeoutMs);
+      putTimers.current.add(timer);
+      putAborts.current.add(ac);
+      try {
+        const s = await api.screen({ signal: ac.signal });
+        if (!alive.current || g !== libGen.current) return "gone";
         confirmed.current = { ...s };
         screenUnread.current = false;
         screenRead_ok.current = true;
+        setScreenError(undefined);
         setRemembered(s);
-      },
-      (err: unknown) => {
-        if (!alive.current || g !== libGen.current) return;
-        confirmed.current = { checkEverything: false };
+        return "ok";
+      } catch (err) {
+        if (!alive.current || g !== libGen.current) return "gone";
         screenUnread.current = true;
         setScreenError(sentenceOf(err, FIND_SCREEN_TEXT.screenUnreadable));
-        setRemembered({ checkEverything: false });
-      },
-    );
-  }, [api, readProjects, epoch]);
+        setRemembered((cur) => cur ?? { ...confirmed.current });
+        return "failed";
+      } finally {
+        clearTimeout(timer);
+        putTimers.current.delete(timer);
+        putAborts.current.delete(ac);
+      }
+    },
+    [api],
+  );
+  /** A read of the settings in the order of the PUTs (an older answer never wins over a newer one); one at a time. */
+  const screenReading = useRef(false);
+  const readScreen = useCallback(
+    (timeoutMs?: number) => {
+      if (screenReading.current) return;
+      screenReading.current = true;
+      const g = libGen.current;
+      const run = async () => {
+        try {
+          if (alive.current && g === libGen.current) await screenOnce(timeoutMs);
+        } finally {
+          if (g === libGen.current) screenReading.current = false;
+        }
+      };
+      putChain.current = putChain.current.then(run, run);
+    },
+    [screenOnce],
+  );
+
+  // ---- at load, and afresh for each library ----
+  useEffect(() => {
+    readProjects();
+    readScreen();
+  }, [readScreen, readProjects, epoch]);
 
   /** Another library (or none): nothing of the old one is kept — lists, settings, answers still out (R258 I1). */
   const forgetLibrary = useCallback(() => {
     libGen.current++;
     projectsRead.current = null;
     putChain.current = Promise.resolve();
+    screenReading.current = false;
+    // What is still out about the old library is given up, and its time limits cleared.
+    for (const t of putTimers.current) clearTimeout(t);
+    putTimers.current.clear();
+    for (const ac of putAborts.current) ac.abort();
+    putAborts.current.clear();
     switchBusy.current = false;
-    switchWait.current?.resolve("failed");
+    switchWait.current?.resolve({ outcome: "failed" });
     switchWait.current = null;
     projectsRead_ok.current = false;
     screenRead_ok.current = false;
@@ -292,6 +364,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     setScreenError(undefined);
     setCheckSending(undefined);
     setSwitchError(undefined);
+    setSwitchNote(undefined);
     setSettingsError(undefined);
     setChosen(undefined);
     setCollections(undefined);
@@ -334,23 +407,30 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
               setNoLibrary(false);
               continue;
             }
-            // The library is open, and what the screen read of it failed or has not answered (it was loaded while the
-            // service was still reopening the library, say): everything is read again (R281 e).
-            const unknown = !projectsRead_ok.current || !screenRead_ok.current;
+            // The library is open, and nothing the screen read of it has succeeded (it was loaded while the service was
+            // still reopening the library, say): everything is read again (R281 e). When something was read, only what
+            // has not been read successfully is read again — the screen is not reset: dialogs, focus and what is typed
+            // stay (R291 b).
+            const nothingRead = !projectsRead_ok.current && !screenRead_ok.current;
+            const rereadMissing = () => {
+              if (!projectsRead_ok.current) readProjects();
+              if (!screenRead_ok.current) readScreen(SWITCH_TIMEOUT_MS);
+            };
             if (d.libraryId && known === undefined) {
               known = d.libraryId;
-              if (noLibraryRef.current || unknown) {
+              if (noLibraryRef.current || nothingRead) {
                 forgetLibrary();
                 setNoLibrary(false);
-              }
+              } else rereadMissing();
               continue;
             }
-            if (d.open === true && unknown) {
+            if (d.open === true && nothingRead) {
               forgetLibrary();
               setNoLibrary(false);
               continue;
             }
             // The same library: a project may have been locked, unlocked, created or removed, or the mode changed (M8).
+            if (!screenRead_ok.current) readScreen(SWITCH_TIMEOUT_MS);
             readProjects();
             emit({ kind: "refresh" });
             continue;
@@ -368,7 +448,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
       clearTimeout(retry);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, readProjects, forgetLibrary]);
+  }, [client, readProjects, readScreen, forgetLibrary]);
 
   const asked = projectInQuery(loc.search);
   // A project named in the address again (a link) takes over from the one chosen here.
@@ -421,7 +501,13 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
    */
   const put = (
     change: (base: FindScreenSettings) => FindScreenSettings,
-    h: { done?: (s: FindScreenSettings) => void; failed: (err: unknown, timedOut: boolean) => void; always?: () => void },
+    h: {
+      done?: (s: FindScreenSettings) => void;
+      failed: (err: unknown, timedOut: boolean) => void;
+      /** R291 a: no answer in `timeoutMs` — run in place of `failed`, still in the order of the PUTs, before `always`. */
+      noAnswer?: () => Promise<void>;
+      always?: () => void;
+    },
     timeoutMs?: number,
   ) => {
     const g = libGen.current;
@@ -435,6 +521,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
         ac.abort();
       }, timeoutMs);
       putTimers.current.add(timer);
+      putAborts.current.add(ac);
       try {
         const s = await api.putScreen(change(confirmed.current), { signal: ac.signal });
         if (!alive.current || g !== libGen.current) return;
@@ -444,11 +531,19 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
         h.done?.(s);
       } catch (err) {
         if (!alive.current || g !== libGen.current) return;
+        clearTimeout(timer);
+        putTimers.current.delete(timer);
+        putAborts.current.delete(ac);
+        if (timedOut && h.noAnswer) {
+          await h.noAnswer();
+          return;
+        }
         setRemembered({ ...confirmed.current });
         h.failed(err, timedOut);
       } finally {
         clearTimeout(timer);
         putTimers.current.delete(timer);
+        putAborts.current.delete(ac);
         if (alive.current && g === libGen.current) h.always?.();
       }
     };
@@ -501,22 +596,46 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     if (switchBusy.current || !remembered) return;
     switchBusy.current = true;
     const next = !shownCheck;
+    const g = libGen.current;
     setCheckSending(next);
     setSwitchError(undefined);
-    let resolve!: (o: SwitchOutcome) => void;
-    const wait = { p: new Promise<SwitchOutcome>((r) => (resolve = r)), resolve: (o: SwitchOutcome) => resolve(o) };
+    setSwitchNote(undefined);
+    let resolve!: (r: SwitchResult) => void;
+    const wait = { p: new Promise<SwitchResult>((r) => (resolve = r)), resolve: (r: SwitchResult) => resolve(r), taken: false };
     switchWait.current = wait;
     put(
       (b) => ({ ...b, checkEverything: next }),
       {
         done: () => {
           setSwitchVersion((v) => v + 1);
-          wait.resolve("ok");
+          wait.resolve({ outcome: "ok" });
         },
-        // Back to what the service stores, and why (no answer in time: given up, R281 c).
-        failed: (err, timedOut) => {
-          setSwitchError(`“Check everything I have” could not be changed. ${timedOut ? FIND_SCREEN_TEXT.switchNoAnswer : sentenceOf(err, "")}`.trim());
-          wait.resolve(timedOut ? "timeout" : "failed");
+        // Refused: back to what the service stores, and why.
+        failed: (err) => {
+          setSwitchError(`“Check everything I have” could not be changed. ${sentenceOf(err, "")}`.trim());
+          wait.resolve({ outcome: "failed" });
+        },
+        // R291 a: no answer in time — the change may have been stored. What the service holds is read before anything
+        // else; the switch and "Add" stay busy until it answers.
+        noAnswer: async () => {
+          const before = confirmed.current.checkEverything;
+          const r = await screenOnce(SWITCH_TIMEOUT_MS);
+          if (r === "gone" || !alive.current || g !== libGen.current) return;
+          if (r === "failed") {
+            // The state for settings that cannot be read: the queue is read, and its answer says what is stored (M3).
+            setSwitchVersion((v) => v + 1);
+            wait.resolve({ outcome: "unknown" });
+            return;
+          }
+          const on = confirmed.current.checkEverything;
+          const note = switchReadText(on);
+          setSwitchNote(note);
+          if (on !== before) setSwitchVersion((v) => v + 1);
+          const outcome: SwitchOutcome = on === next ? "ok" : "not-stored";
+          // Said once: by a waiting add, at the head of its own result (one message, so neither replaces the other
+          // unheard); else here.
+          if (!wait.taken) emit({ kind: "say", words: [note] });
+          wait.resolve({ outcome, note });
         },
         always: () => {
           switchBusy.current = false;
@@ -581,11 +700,17 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
             checked={shownCheck}
             aria-busy={checkSending !== undefined || undefined}
             aria-disabled={checkSending !== undefined || !remembered || undefined}
+            aria-describedby={switchNote ? `${ids}-swnote` : undefined}
             onChange={toggle}
           />
           Check everything I have
         </label>
       </div>
+      {switchNote && (
+        <p id={`${ids}-swnote`} className="ao-find__note">
+          {switchNote}
+        </p>
+      )}
       {screenError && (
         <p role="alert" className="ao-error">
           <UserText>{screenError}</UserText>
@@ -647,7 +772,7 @@ interface Meta {
 
 /** The dialog open on a row: "Choose", or an author's two (their lists read from `options` when it opened). */
 type DialogState =
-  | { kind: "choose"; entry: FindEntryView; busy: boolean; busyAuthor?: boolean; error?: string | undefined }
+  | { kind: "choose"; entry: FindEntryView; busy: boolean; busyAuthor?: boolean; error?: string | undefined; noAuthor?: boolean }
   | { kind: "person"; token: number; entry: FindEntryView; busy: boolean; busyAuthor?: boolean; error?: string | undefined; people?: FindPersonCandidate[]; loadError?: string }
   | { kind: "works"; token: number; entry: FindEntryView; busy: boolean; busyAuthor?: boolean; error?: string | undefined; works?: FindPersonWork[]; person?: FindChosenPerson; loadError?: string };
 
@@ -704,7 +829,7 @@ function ProjectQueue(props: {
   /** The project was unlocked here: the project list is read again. */
   onUnlocked: () => void;
   /** A change of "Check everything I have" still out: an add waits for it (R272 a). */
-  waitForSwitch: () => Promise<SwitchOutcome> | undefined;
+  waitForSwitch: () => Promise<SwitchResult> | undefined;
 }) {
   const { bus, api, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch } = props;
   const projectId = project.id;
@@ -1101,9 +1226,10 @@ function ProjectQueue(props: {
     () =>
       bus.subscribe((sig) => {
         if (!alive.current) return;
-        if (sig.kind === "refresh" || findProgressOf(sig.ev, projectId)) readSoon();
+        if (sig.kind === "say") sayAct(sig.words);
+        else if (sig.kind === "refresh" || findProgressOf(sig.ev, projectId)) readSoon();
       }),
-    [bus, projectId, readSoon],
+    [bus, projectId, readSoon, sayAct],
   );
   useEffect(() => {
     if (openSource) sourceRef.current?.focus();
@@ -1344,8 +1470,10 @@ function ProjectQueue(props: {
         lockedInDialog();
         return;
       }
-      // The service's sentence, in the dialog; nothing is changed here.
-      setDialog((cur) => (cur && cur.kind === kind ? { ...cur, busy: false, busyAuthor: false, error: sentenceOf(err, fallback) } : cur));
+      // The service's sentence, in the dialog; nothing is changed here — except that after "This entry has no author to
+      // show." the dialog no longer offers the author (R291 d).
+      const noAuthor = kind === "choose" && err instanceof ApiClientError && err.reason === "no-author";
+      setDialog((cur) => (cur && cur.kind === kind ? { ...cur, busy: false, busyAuthor: false, error: sentenceOf(err, fallback), ...(noAuthor ? { noAuthor: true } : {}) } : cur));
       // "Already added" (M6): the works' marks are read again, so the dialog shows what the queue now holds.
       const cur = dialogRef.current;
       if (cur?.kind === "works" && err instanceof ApiClientError && err.reason === "already-added") loadOptions("works", cur.token, cur.entry);
@@ -1428,17 +1556,22 @@ function ProjectQueue(props: {
     // R272 a: a change of "Check everything I have" still out — the add waits for it, and is not sent if it fails (the
     // service must hold the switch's new position before a reference is judged). The box stays read-only meanwhile.
     const pendingSwitch = waitForSwitch();
+    /** R291 a: what the service holds, read after a change with no answer: said at the head of this add's result. */
+    let switchLead: string | undefined;
+    const lead = (w: string): Words => [switchLead ? `${switchLead} ${w}` : w];
     if (pendingSwitch) {
-      const outcome = await pendingSwitch;
+      const { outcome, note } = await pendingSwitch;
+      if (outcome === "ok" && note) switchLead = note;
       if (!alive.current) return;
       if (g !== gen.current || outcome !== "ok") {
         addBusyRef.current = false;
         setAddBusyState(false);
         if (g === gen.current) {
-          // Not sent; the text kept; why, beside the box and once in the status region (R272 a, R281 c).
-          const why = outcome === "timeout" ? FIND_SCREEN_TEXT.switchTimedOut : FIND_SCREEN_TEXT.addSwitchFailed;
+          // Not sent; the text kept; why, beside the box and once in the status region (R272 a, R281 c, R291 a) — after
+          // a change with no answer, with what the service holds first.
+          const why = outcome === "failed" ? FIND_SCREEN_TEXT.addSwitchFailed : FIND_SCREEN_TEXT.addSwitchNoAnswer;
           setAddError(why);
-          sayAct([why]);
+          sayAct([outcome === "not-stored" && note ? `${note} ${why}` : why]);
           boxRef.current?.focus();
         }
         return;
@@ -1459,16 +1592,17 @@ function ProjectQueue(props: {
       // The box was read-only while the add was out, so it holds exactly what was sent (R258 I2).
       setText("");
       boxRef.current?.focus();
-      sayAct([addedText(r)]);
+      sayAct(lead(addedText(r)));
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current) return;
       if (timedOut) {
-        sayAct([FIND_SCREEN_TEXT.addTimedOut]);
+        sayAct(lead(FIND_SCREEN_TEXT.addTimedOut));
         setAddError(FIND_SCREEN_TEXT.addTimedOut);
         readNow();
         return;
       }
+      if (switchLead) sayAct([switchLead]);
       if (isProjectLocked(err)) {
         lockedNow = true;
         markLocked();
@@ -1623,7 +1757,7 @@ function ProjectQueue(props: {
           busy={dialog.busy}
           {...(dialog.error ? { error: dialog.error } : {})}
           onChoose={(id) => void choose(id)}
-          {...(authorOfferOf(dialog.entry) ? { onShowAuthor: () => void showAuthor(), busyAuthor: !!dialog.busyAuthor } : {})}
+          {...(authorOfferOf(dialog.entry) && !dialog.noAuthor ? { onShowAuthor: () => void showAuthor(), busyAuthor: !!dialog.busyAuthor } : {})}
           onClose={closeDialog}
         />
       )}

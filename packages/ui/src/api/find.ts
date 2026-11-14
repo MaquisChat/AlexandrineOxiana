@@ -70,7 +70,7 @@ export function findApi(client: ApiClient) {
      */
     author: (pid: string, eid: string) => r<FindEntryView>("POST", `${entryPath(pid, eid)}/author`),
     /** GET /find/screen: this computer's remembered switch, project and collection. */
-    screen: () => r<FindScreenSettings>("GET", "/find/screen"),
+    screen: (opts: { signal?: AbortSignal } = {}) => r<FindScreenSettings>("GET", "/find/screen", opts.signal ? { signal: opts.signal } : {}),
     /** PUT /find/screen: the whole settings (the handler refuses any other key). */
     putScreen: (s: FindScreenSettings, opts: { signal?: AbortSignal } = {}) =>
       r<FindScreenSettings>("PUT", "/find/screen", {

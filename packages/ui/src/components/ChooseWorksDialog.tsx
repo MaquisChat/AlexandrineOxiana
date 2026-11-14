@@ -51,8 +51,16 @@ const kindFilterOf = (type: string): Exclude<KindFilter, "Any"> => (ARTICLE_KIND
 
 /** Lower case, without accents: "Économie" and "economie" are the same words to the filter. */
 const fold = (s: string) => s.normalize("NFD").replace(/\p{M}+/gu, "").toLowerCase();
-/** The whole words of a text, folded (R281 f, M5: the filter matches whole words). */
+/** The words of a text, folded. */
 const wordsOf = (s: string): string[] => fold(s).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+/** A character of a script written without spaces between words (R291 c): such a typed word is looked for anywhere in the title. */
+const NO_SPACES = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+/**
+ * "Filter by words" (R291 c): every typed word must match. A word matches where a word of the title or of where it was
+ * published BEGINS with it ("soci" finds "Sociology", "ology" does not); a typed word holding a character of a script
+ * written without spaces between words matches anywhere in the title. Never the year (it has its own filters).
+ */
+const matchesWords = (it: Item, want: readonly string[]): boolean => want.every((x) => (NO_SPACES.test(x) ? it.title.includes(x) : it.hay.some((h) => h.startsWith(x))));
 
 const yearNumber = (s: string): number | undefined => (/^\s*\d{1,4}\s*$/.test(s) ? Number(s) : undefined);
 
@@ -78,8 +86,10 @@ interface Item {
   w: FindPersonWork;
   year: number | undefined;
   kind: Exclude<KindFilter, "Any">;
-  /** The whole words the words filter looks for: the title's and where it was published (not the year: it has its own filters). */
-  hay: ReadonlySet<string>;
+  /** The words the words filter looks at: the title's and where it was published (not the year: it has its own filters). */
+  hay: readonly string[];
+  /** The title, folded: where a word in a script written without spaces is looked for. */
+  title: string;
 }
 
 /** One work of the list. Memoised: a tick re-renders only the work ticked and the one that loses the tab stop. */
@@ -135,7 +145,7 @@ export function ChooseWorksDialog({ entry, works, person, loadError, onAdd, onCl
     () =>
       works?.filter(wellFormedCandidate).map((w) => {
         const y = yearOf(w.issued);
-        return { w, year: y === undefined ? undefined : Number(y), kind: kindFilterOf(w.type), hay: new Set(wordsOf(`${w.title} ${wherePublished(w) ?? ""}`)) };
+        return { w, year: y === undefined ? undefined : Number(y), kind: kindFilterOf(w.type), hay: wordsOf(`${w.title} ${wherePublished(w) ?? ""}`), title: fold(w.title) };
       }),
     [works],
   );
@@ -158,7 +168,7 @@ export function ChooseWorksDialog({ entry, works, person, loadError, onAdd, onCl
       if (lo !== undefined && (it.year === undefined || it.year < lo)) return false;
       if (hi !== undefined && (it.year === undefined || it.year > hi)) return false;
       if (kind !== "Any" && it.kind !== kind) return false;
-      return want.every((x) => it.hay.has(x));
+      return matchesWords(it, want);
     });
   }, [items, from, to, kind, words]);
 

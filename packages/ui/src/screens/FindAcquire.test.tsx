@@ -24,7 +24,7 @@ import { findApi } from "../api/find";
 import { routeFor } from "../App";
 import { PATHS } from "../navigation";
 import { SOURCE_FILE, server, testClient, url, useMockService } from "../test/service";
-import { ACT_SAID_MS, FindAcquire } from "./FindAcquire";
+import { ACT_SAID_MS, FindAcquire, SWITCH_TIMEOUT_MS } from "./FindAcquire";
 
 useMockService();
 
@@ -2145,7 +2145,7 @@ describe("FindAcquire: round 2 (R279, R281)", () => {
     }
   });
 
-  it("I3: a change of the switch with no answer in 60 seconds is given up: the switch goes back, a waiting add is not sent, the text is kept and the box editable, and it is said", async () => {
+  it("I3 / N1 (R281 c, R291 a): a change of the switch with no answer in 60 seconds, which the service did NOT store: the settings are read, the switch shows OFF, the waiting add is not sent, the text is kept and the box editable, and it is said", async () => {
     useService();
     let posts = 0;
     server.use(
@@ -2180,11 +2180,16 @@ describe("FindAcquire: round 2 (R279, R281)", () => {
     expect(box().readOnly).toBe(false);
     expect(box().value).toBe("Weber");
     expect(posts).toBe(0);
-    const SENT = "The service did not answer. The setting was not changed and nothing was added.";
-    // Visibly, beside the box (tied to it), and once in the status region.
+    const OFF = "The service did not answer in time. “Check everything I have” is off.";
+    const NOT_SENT = "Nothing was added. The text is kept: press “Add” to add it with the switch as it is now.";
+    // Visibly: beside the switch (tied to it) what the service holds, beside the box (tied to it) that nothing was added;
+    // and once in the status region.
+    const swIds = (sw.getAttribute("aria-describedby") ?? "").split(" ");
+    expect(swIds.map((i) => document.getElementById(i)?.textContent)).toContain(OFF);
     const ids = (box().getAttribute("aria-describedby") ?? "").split(" ");
-    expect(ids.map((i) => document.getElementById(i)?.textContent)).toContain(SENT);
-    await waitFor(() => expect(h.said.filter((x) => x === SENT)).toHaveLength(1));
+    expect(ids.map((i) => document.getElementById(i)?.textContent)).toContain(NOT_SENT);
+    await waitFor(() => expect(h.said.filter((x) => x.includes(OFF))).toEqual([`${OFF} ${NOT_SENT}`]));
+    expect(screen.queryByText(/could not be changed/)).toBeNull();
     h.stop();
   });
 
@@ -2412,5 +2417,300 @@ describe("FindAcquire: round 2 (R279, R281)", () => {
     );
     await findApi(testClient()).author(PID, E);
     expect(seen).toEqual([{ method: "POST", path: `/projects/${PID}/find/${E}/author`, body: "", query: "" }]);
+  });
+});
+
+describe("FindAcquire: round 3 (R291, R287 c)", () => {
+  const ON = "The service did not answer in time. “Check everything I have” is on.";
+  const NOT_SENT = "Nothing was added. The text is kept: press “Add” to add it with the switch as it is now.";
+  const screenGets = () => calls.filter((c) => c.method === "GET" && c.path === "/find/screen").length;
+  const sw = () => screen.getByRole("switch", { name: "Check everything I have" }) as HTMLInputElement;
+  const fake = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+
+  it("N1 (Q1): a change the service STORED but never answered: after the give-up the settings are read before anything else; the switch shows ON, it is said once, and the waiting reference is added once, after that read", async () => {
+    useService();
+    let posts = 0;
+    let gets = 0;
+    const reread = held<void>();
+    server.use(
+      http.put(url("/find/screen"), async ({ request }) => {
+        screenSettings = (await request.json()) as FindScreenSettings;
+        return new Promise<Response>(() => {});
+      }),
+      http.get(url("/find/screen"), async () => {
+        if (++gets > 1) await reread.p;
+        return HttpResponse.json(screenSettings);
+      }),
+      http.post(url(`/projects/${PID}/find`), () => {
+        posts++;
+        return HttpResponse.json({ added: [entry({ typed: "Weber" })], mergedLines: 0 });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(box().disabled).toBe(false));
+    await user.type(box(), "Weber");
+    const h = heard();
+    fake();
+    try {
+      fireEvent.click(sw());
+      await vi.advanceTimersByTimeAsync(10);
+      fireEvent.keyDown(box(), { key: "Enter", ctrlKey: true });
+      await vi.advanceTimersByTimeAsync(SWITCH_TIMEOUT_MS + 1_000);
+      // The read is out: the switch and Add are busy exactly as while the change was out, and nothing is sent.
+      expect(gets).toBe(2);
+      expect(sw().checked).toBe(true);
+      expect(sw().getAttribute("aria-busy")).toBe("true");
+      expect(box().readOnly).toBe(true);
+      expect(screen.getByRole("button", { name: "Adding…" }).getAttribute("aria-busy")).toBe("true");
+      expect(posts).toBe(0);
+      reread.release();
+      await vi.advanceTimersByTimeAsync(50);
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(posts).toBe(1));
+    expect(sw().checked).toBe(true);
+    expect(sw().getAttribute("aria-busy")).toBeNull();
+    const swIds = (sw().getAttribute("aria-describedby") ?? "").split(" ");
+    expect(swIds.map((i) => document.getElementById(i)?.textContent)).toContain(ON);
+    await waitFor(() => expect(box().value).toBe(""));
+    // Said once, at the head of the add's result (one message: neither can replace the other unheard).
+    await waitFor(() => expect(h.said.filter((x) => x.includes(ON))).toEqual([`${ON} Added 1 reference.`]));
+    expect(screen.queryByText(/could not be changed/)).toBeNull();
+    h.stop();
+  });
+
+  it("N1: with no add waiting, the sentence for what the service holds is said once by itself", async () => {
+    useService();
+    server.use(
+      http.put(url("/find/screen"), async ({ request }) => {
+        screenSettings = (await request.json()) as FindScreenSettings;
+        return new Promise<Response>(() => {});
+      }),
+    );
+    show();
+    await waitFor(() => expect(box().disabled).toBe(false));
+    const h = heard();
+    fake();
+    try {
+      fireEvent.click(sw());
+      await vi.advanceTimersByTimeAsync(SWITCH_TIMEOUT_MS + 1_000);
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(sw().getAttribute("aria-busy")).toBeNull());
+    expect(sw().checked).toBe(true);
+    await waitFor(() => expect(h.said.filter((x) => x.includes(ON))).toEqual([ON]));
+    h.stop();
+  });
+
+  it("N1: when the settings read after the give-up fails or gets no answer either, the screen is in its unreadable-settings state (the queue says what is stored) and nothing is added; the text is kept", async () => {
+    for (const how of ["fails", "no answer"] as const) {
+      useService();
+      let posts = 0;
+      let gets = 0;
+      server.use(
+        http.put(url("/find/screen"), async ({ request }) => {
+          screenSettings = (await request.json()) as FindScreenSettings;
+          return new Promise<Response>(() => {});
+        }),
+        http.get(url("/find/screen"), () => {
+          if (++gets === 1) return HttpResponse.json(screenSettings);
+          return how === "fails" ? refusal(503, "UNAVAILABLE", "This computer's Find and acquire settings could not be read.") : new Promise<Response>(() => {});
+        }),
+        http.get(url(`/projects/${PID}/find`), () => HttpResponse.json(queue([], { checkEverything: screenSettings.checkEverything }))),
+        http.post(url(`/projects/${PID}/find`), () => {
+          posts++;
+          return HttpResponse.json({ added: [], mergedLines: 0 });
+        }),
+      );
+      const user = userEvent.setup();
+      const view = show();
+      await waitFor(() => expect(box().disabled).toBe(false));
+      await user.type(box(), "Weber");
+      fake();
+      try {
+        fireEvent.click(sw());
+        await vi.advanceTimersByTimeAsync(10);
+        fireEvent.keyDown(box(), { key: "Enter", ctrlKey: true });
+        await vi.advanceTimersByTimeAsync(SWITCH_TIMEOUT_MS + 1_000);
+        if (how === "no answer") {
+          expect(sw().getAttribute("aria-busy"), how).toBe("true");
+          expect(box().readOnly, how).toBe(true);
+          await vi.advanceTimersByTimeAsync(SWITCH_TIMEOUT_MS + 1_000);
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(box().readOnly, how).toBe(false));
+      expect(gets, how).toBe(2);
+      // The state for settings that cannot be read (M3): its sentence, once, and the switch as the queue says.
+      await waitFor(() => expect(screen.getAllByText("This computer's Find and acquire settings could not be read."), how).toHaveLength(1));
+      await waitFor(() => expect(sw().checked, how).toBe(true));
+      expect(sw().getAttribute("aria-busy"), how).toBeNull();
+      expect(posts, how).toBe(0);
+      expect(box().value, how).toBe("Weber");
+      const ids = (box().getAttribute("aria-describedby") ?? "").split(" ");
+      expect(ids.map((i) => document.getElementById(i)?.textContent), how).toContain(NOT_SENT);
+      view.unmount();
+    }
+  });
+
+  it("N1: the settings read after the give-up leaves no timer and changes nothing late when the screen is unmounted or another library opens", async () => {
+    for (const how of ["unmount", "library"] as const) {
+      useService();
+      let posts = 0;
+      let gets = 0;
+      const reread = held<void>();
+      server.use(
+        http.put(url("/find/screen"), () => new Promise<Response>(() => {})),
+        http.get(url("/find/screen"), async () => {
+          if (++gets === 2) await reread.p;
+          return HttpResponse.json(screenSettings);
+        }),
+        http.post(url(`/projects/${PID}/find`), () => {
+          posts++;
+          return HttpResponse.json({ added: [], mergedLines: 0 });
+        }),
+      );
+      const user = userEvent.setup();
+      const view = show();
+      await waitFor(() => expect(box().disabled).toBe(false));
+      await waitFor(() => expect(events.open()).toBe(true));
+      if (how === "library") events.push({ type: "library.state", data: { open: true, libraryId: "lib-1", name: "L", mode: "read-write" } });
+      await user.type(box(), "Weber");
+      fake();
+      const set = vi.spyOn(globalThis, "setTimeout");
+      const cleared = vi.spyOn(globalThis, "clearTimeout");
+      try {
+        fireEvent.click(sw());
+        await vi.advanceTimersByTimeAsync(10);
+        fireEvent.keyDown(box(), { key: "Enter", ctrlKey: true });
+        await vi.advanceTimersByTimeAsync(SWITCH_TIMEOUT_MS + 1_000);
+        expect(gets, how).toBe(2);
+        const limits = set.mock.calls.map((c, i) => ({ ms: c[1], id: set.mock.results[i]!.value })).filter((x) => x.ms === SWITCH_TIMEOUT_MS);
+        expect(limits.length, how).toBe(2);
+        const readLimit = limits[1]!.id;
+        if (how === "unmount") view.unmount();
+        else events.push({ type: "library.state", data: { open: true, libraryId: "lib-2", name: "L2", mode: "read-write" } });
+        for (let i = 0; i < 20 && !cleared.mock.calls.some((c) => c[0] === readLimit); i++) await vi.advanceTimersByTimeAsync(5);
+        expect(cleared.mock.calls.some((c) => c[0] === readLimit), how).toBe(true);
+        const before = calls.length;
+        reread.release();
+        await vi.advanceTimersByTimeAsync(SWITCH_TIMEOUT_MS * 2);
+        expect(posts, how).toBe(0);
+        if (how === "unmount") expect(calls.length, how).toBe(before);
+      } finally {
+        set.mockRestore();
+        cleared.mockRestore();
+        vi.useRealTimers();
+      }
+      if (how === "library") {
+        // The new library's screen: nothing of the old change is shown or said.
+        await waitFor(() => expect(sw().getAttribute("aria-busy")).toBeNull());
+        expect(screen.queryByText(ON)).toBeNull();
+        expect(sw().checked).toBe(false);
+      }
+      view.unmount();
+    }
+  });
+
+  it("N2 (Q2): an event about the same library while the settings cannot be read keeps the dialog, focus and the draft, and asks for the settings once more; another library still resets everything", async () => {
+    const e = entry({ typed: "vague", state: "choose", candidates: [cand({ id: "c1" })] });
+    useService({ queues: { [PID]: queue([e]) } });
+    server.use(http.get(url("/find/screen"), () => refusal(500, "INTERNAL", "Something went wrong.")));
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(events.open()).toBe(true));
+    await waitFor(() => expect(screen.getAllByText("Something went wrong.")).toHaveLength(1));
+    await user.type(box(), "a draft");
+    await user.click(screen.getByRole("button", { name: "Choose: “vague”" }));
+    const d = await screen.findByRole("dialog");
+    const focused = document.activeElement;
+    expect(d.contains(focused)).toBe(true);
+    const before = screenGets();
+    for (let k = 1; k <= 2; k++) {
+      events.push({ type: "library.state", data: { open: true, libraryId: "lib-1", name: "L", mode: "read-write" } });
+      await waitFor(() => expect(screenGets()).toBe(before + k));
+      await new Promise((r) => setTimeout(r, 100));
+      expect(screen.getByRole("dialog")).toBe(d);
+      expect(document.activeElement).toBe(focused);
+      expect(box().value).toBe("a draft");
+    }
+    expect(screenGets()).toBe(before + 2);
+    // Another library: the full reset, as before.
+    events.push({ type: "library.state", data: { open: true, libraryId: "lib-2", name: "L2", mode: "read-write" } });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Find and acquire" })));
+    // The new library is read afresh (and the test ends only when those reads are done).
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(calls.filter((c) => c.path === `/projects/${PID}/collections`).length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("N3 b (R291 d): after “This entry has no author to show.” the dialog drops its offer of the author, keeps the works, and focus goes to its first remaining control", async () => {
+    const a = entry({ typed: "David Stark", state: "choose", candidates: [cand({ id: "c1", title: "Stark, (a reference entry)" }), cand({ id: "c2" })], authorOffer: { peopleCount: 2 } });
+    useService({ queues: { [PID]: queue([a]) } });
+    let chose: unknown;
+    server.use(
+      http.post(url(`/projects/${PID}/find/${a.id}/author`), () => refusal(409, "CONFLICT", FIND_ROUTE_TEXT.noAuthor, "no-author")),
+      http.post(url(`/projects/${PID}/find/${a.id}/choose`), async ({ request }) => {
+        chose = await request.json();
+        return HttpResponse.json({ ...a, state: "record-complete", chosen: "c2", sourceId: SID, updatedAt: "2026-11-13T11:00:00.000Z" });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await user.click(screen.getByRole("button", { name: "Choose: “David Stark”" }));
+    const d = await screen.findByRole("dialog");
+    await user.click(within(d).getByRole("button", { name: "Show this author's works: “David Stark”" }));
+    await waitFor(() => expect(within(d).queryByRole("button", { name: /Show this author's works/ })).toBeNull());
+    expect(d.textContent).not.toContain("may also be an author");
+    expect(within(d).getByRole("alert").textContent).toBe("This entry has no author to show.");
+    expect(document.activeElement).toBe(within(d).getAllByRole("radio")[0]);
+    // The works are still there and can be chosen.
+    expect(within(d).getAllByRole("radio")).toHaveLength(3);
+    await user.click(within(d).getAllByRole("radio")[1]!);
+    await user.click(within(d).getByRole("button", { name: "Use this one" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(chose).toEqual({ candidateId: "c2" });
+  });
+
+  it("R287 c: a “choose” entry whose people could not be looked up offers Try again after Choose and before Remove, with the service's sentence; the press sends the retry and the row follows it", async () => {
+    const p = entry({ typed: "Ann Swidler", state: "choose", candidates: [cand({ id: "c1" })], reason: { code: "people-unavailable" } });
+    const q = entry({ typed: "no reason", state: "choose", candidates: [cand({ id: "c1" })] });
+    const r = entry({ typed: "another reason", state: "choose", candidates: [cand({ id: "c1" })], reason: { code: "unexpected" } });
+    useService({ queues: { [PID]: queue([p, q, r]) } });
+    const answer = held<void>();
+    server.use(
+      http.post(url(`/projects/${PID}/find/${p.id}/retry`), async () => {
+        await answer.p;
+        const next: FindEntryView = { ...p, state: "looking-up", updatedAt: "2026-11-13T11:00:00.000Z" };
+        delete next.reason;
+        queues[PID] = queue([next, q, r]);
+        return HttpResponse.json(next);
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    const names = (t: string) => within(row(t)).getAllByRole("button").map((b) => b.getAttribute("aria-label"));
+    expect(names("Ann Swidler")).toEqual(["Choose: “Ann Swidler”", "Try again: “Ann Swidler”", "Remove from the queue: “Ann Swidler”"]);
+    expect(row("Ann Swidler").querySelector(".ao-find__reason")?.textContent).toBe(FIND_REASON_TEXT["people-unavailable"]);
+    expect(names("no reason")).toEqual(["Choose: “no reason”", "Remove from the queue: “no reason”"]);
+    expect(names("another reason")).toEqual(["Choose: “another reason”", "Remove from the queue: “another reason”"]);
+    const h = heard();
+    const before = calls.length;
+    await user.click(within(row("Ann Swidler")).getByRole("button", { name: "Try again: “Ann Swidler”" }));
+    const busy = within(row("Ann Swidler")).getByRole("button", { name: "Trying again…: “Ann Swidler”" });
+    expect(busy.getAttribute("aria-busy")).toBe("true");
+    answer.release();
+    await waitFor(() => expect(row("Ann Swidler").querySelector(".ao-find__state")?.textContent).toBe("Looking it up"));
+    expect(calls.slice(before).filter((c) => c.method === "POST")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${p.id}/retry`, body: undefined }]);
+    await waitFor(() => expect(document.activeElement).toBe(within(row("Ann Swidler")).getByRole("button", { name: "Remove from the queue: “Ann Swidler”" })));
+    await waitFor(() => expect(h.said.join(" | ")).toContain("“Ann Swidler”: Looking it up."));
+    h.stop();
   });
 });
