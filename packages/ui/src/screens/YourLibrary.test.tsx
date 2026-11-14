@@ -402,10 +402,10 @@ describe("Your library: the 60-second give-ups (R336 a, c)", () => {
     expect(svc.count("PUT", "/settings/your-library")).toBe(0);
     expect(liveText()).toBe(live);
     expect(screen.getByTestId("yl-test-result").textContent).toBe(T.appSilent);
-    // The window that opened late is not this screen's: its closing is not said.
+    // The window that opened late is this screen's own (R341 b): its closing is said.
     const t = fake.shell!.openLibraryWindow.mock.calls[0]![0];
     act(() => fake.shell!.libraryWindow({ ticket: t, state: "closed" }));
-    expect(screen.getByTestId("yl-test-result").textContent).toBe(T.appSilent);
+    expect(screen.getByTestId("yl-test-result").textContent).toBe(T.windowClosed);
   });
 });
 
@@ -476,6 +476,27 @@ describe("Your library: Stay signed in, at once (R335 a, R336 e, l, m, n)", () =
     await user.click(btn("Save"));
     await waitFor(() => expect(svc.count("PUT", "/settings/your-library")).toBe(2));
     expect(putBodies(svc)[1].staySignedIn).toBe(true);
+  });
+
+  it("R341 a (N1): pressed while a Save is out, the switch sends nothing and says why, by the switch and in the status region", async () => {
+    const svc = useSvc(SET);
+    await show(svc);
+    const gate = held<void>();
+    svc.onPut = async () => {
+      await gate.p;
+      return undefined;
+    };
+    const user = userEvent.setup();
+    await user.click(btn("Save"));
+    await waitFor(() => expect(svc.count("PUT", "/settings/your-library")).toBe(1));
+    await user.click(stay());
+    expect(fake.shell!.setStaySignedIn).not.toHaveBeenCalled();
+    expect(liveText()).toBe("Wait until your changes are saved.");
+    expect(described(stay())).toContain("Wait until your changes are saved.");
+    expect(svc.count("PUT", "/settings/your-library")).toBe(1);
+    gate.release();
+    await waitFor(() => expect(liveText()).toBe(T.saved));
+    expect(described(stay())).not.toContain("Wait until your changes are saved.");
   });
 
   it("on a Mac, a false or failing answer of the shell: “Stay signed in” could not be changed. Try again. — never Only on a Mac; nothing saved", async () => {
@@ -887,7 +908,7 @@ describe("Your library: Test (R334 b, R336 d)", () => {
     expect(screen.getByTestId("yl-test-result").textContent).toBe(T.windowClosed);
   });
 
-  it("while its own window is open, a press says it is already open and opens nothing; reaching a PDF is said, and forgets the window", async () => {
+  it("while its own window is open, a press says it is already open and opens nothing; reaching a PDF is said, and the window is still remembered until it closes", async () => {
     const svc = useSvc(SET);
     await show(svc);
     const win = realWindow(fake.shell!);
@@ -902,7 +923,12 @@ describe("Your library: Test (R334 b, R336 d)", () => {
     win.handOver();
     await waitFor(() => expect(liveText()).toBe(T.windowReachedPdf));
     expect(T.windowReachedPdf).toBe("Signing in works: the window reached a PDF. Nothing was added to your library.");
-    // The ticket ended with the hand-over: a new press opens the window again.
+    // The ticket ended with the hand-over but the window is still there (R341 b): a press says so; after its closing a press opens again.
+    await user.click(btn("Test"));
+    expect(liveText()).toBe(T.windowAlreadyOpen);
+    expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+    act(() => fake.shell!.libraryWindow({ ticket: null, state: "closed" }));
+    await waitFor(() => expect(liveText()).toBe(T.windowClosed));
     await user.click(btn("Test"));
     await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2));
     expect(liveText()).toBe(T.windowOpen);
@@ -938,6 +964,90 @@ describe("Your library: Test (R334 b, R336 d)", () => {
     h.stop();
     await user.click(btn("Test"));
     await waitFor(() => expect(liveText()).toBe(T.windowOpen));
+  });
+
+  it("R341 b (N2): a Test given up, the shell opens the window late — the next Test says it is already open, opens nothing, and the closing is said once", async () => {
+    fakeTime();
+    const svc = useSvc(SET);
+    await show(svc);
+    const gate = held<void>();
+    const win = realWindow(fake.shell!);
+    const real = fake.shell!.openLibraryWindow.getMockImplementation()!;
+    fake.shell!.openLibraryWindow.mockImplementationOnce(async (ticket, address) => {
+      await gate.p;
+      return real(ticket, address);
+    });
+    await act(async () => btn("Test").click());
+    await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+    await pass(MINUTE_AND_A_BIT);
+    await waitFor(() => expect(screen.getByTestId("yl-test-result").textContent).toBe(T.appSilent));
+    // The shell opens the window after all.
+    await act(async () => {
+      gate.release();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(win.w.open).not.toBeNull();
+    const posts = svc.count("POST", "/settings/your-library/test");
+    await act(async () => btn("Test").click());
+    expect(liveText()).toBe(T.windowAlreadyOpen);
+    expect(screen.getByTestId("yl-test-result").textContent).toBe(T.windowAlreadyOpen);
+    expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+    expect(svc.count("POST", "/settings/your-library/test")).toBe(posts);
+    const h = heard();
+    win.close();
+    await waitFor(() => expect(liveText()).toBe(T.windowClosed));
+    act(() => fake.shell!.libraryWindow({ ticket: null, state: "closed" }));
+    await pass(30);
+    expect(h.said).toEqual([T.windowClosed]);
+    h.stop();
+    // After the closing a Test works again.
+    await act(async () => btn("Test").click());
+    await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(liveText()).toBe(T.windowOpen));
+  });
+
+  it("R341 b (N3): the window reached a PDF (its ticket ended), then closed with no ticket — said once; a second Test works after", async () => {
+    const svc = useSvc(SET);
+    await show(svc);
+    const win = realWindow(fake.shell!);
+    const user = userEvent.setup();
+    await user.click(btn("Test"));
+    await waitFor(() => expect(liveText()).toBe(T.windowOpen));
+    win.handOver();
+    await waitFor(() => expect(liveText()).toBe(T.windowReachedPdf));
+    // The shell ended the ticket, but the window is still there: Test says so and opens nothing.
+    await user.click(btn("Test"));
+    expect(liveText()).toBe(T.windowAlreadyOpen);
+    expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+    const h = heard();
+    act(() => fake.shell!.libraryWindow({ ticket: null, state: "closed" }));
+    await waitFor(() => expect(liveText()).toBe(T.windowClosed));
+    act(() => fake.shell!.libraryWindow({ ticket: null, state: "closed" }));
+    await act(async () => new Promise((r) => setTimeout(r, 30)));
+    expect(h.said).toEqual([T.windowClosed]);
+    h.stop();
+    expect(screen.getByTestId("yl-test-result").textContent).toBe(T.windowClosed);
+    await user.click(btn("Test"));
+    await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2));
+  });
+
+  it("R341 b: a closed with no ticket while no test of this screen is open says nothing; nor does a closed for another ticket", async () => {
+    const svc = useSvc(SET);
+    await show(svc);
+    const win = realWindow(fake.shell!);
+    const h = heard();
+    act(() => fake.shell!.libraryWindow({ ticket: null, state: "closed" }));
+    act(() => fake.shell!.libraryWindow({ ticket: "a".repeat(32), state: "closed" }));
+    const user = userEvent.setup();
+    await user.click(btn("Test"));
+    await waitFor(() => expect(liveText()).toBe(T.windowOpen));
+    act(() => fake.shell!.libraryWindow({ ticket: "a".repeat(32), state: "closed" }));
+    win.close();
+    await waitFor(() => expect(liveText()).toBe(T.windowClosed));
+    act(() => fake.shell!.libraryWindow({ ticket: null, state: "closed" }));
+    await act(async () => new Promise((r) => setTimeout(r, 30)));
+    expect(h.said).toEqual([T.windowOpen, T.windowClosed]);
+    h.stop();
   });
 
   it("unavailable while a draft is unsaved (Save your changes first.) and when no library is set; a press says why", async () => {

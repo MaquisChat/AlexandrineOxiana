@@ -30,7 +30,9 @@
  * "Test" asks the service for the address of one fixed work and opens the sign-in window there with a ticket the page
  * makes (32 hex from the browser's random source) — no ticket of the service, so whatever the window might fetch is
  * discarded and nothing is added (R334 b). The screen listens to the window's events only for ITS window: reached a
- * PDF, or closed (R336 d).
+ * PDF, or closed (R336 d). The screen remembers that its window MAY be open from the moment "Test" asks the shell to open
+ * it (even if that call is given up, and after the window's ticket ended at a hand-over) until it hears the window close,
+ * the shell says it did not open, a sign-out closes it, or the screen is left (R341 b).
  */
 import {
   YOUR_LIBRARY_CATALOGUE_MAX,
@@ -75,6 +77,7 @@ export const YOUR_LIBRARY_SCREEN_TEXT = {
   appSilent: "The app did not answer. Try again.",
   waitDerive: "Wait until the address is worked out.",
   waitStay: "Wait until “Stay signed in” is changed.",
+  waitSave: "Wait until your changes are saved.",
   saved: "Saved.",
   saveTimedOut: "The service did not answer. Your changes are still here; save again in a moment.",
   saveFailed: "The settings could not be saved.",
@@ -248,8 +251,9 @@ export function YourLibrary({ client }: { client: ApiClient }) {
   const stayBusy = useRef(false);
   const testBusy = useRef(false);
   const signOutBusy = useRef(false);
-  /** The ticket of the window "Test" opened, while it is open (R336 d). */
+  /** The ticket of the last "Test" asked of the shell, and whether its window MAY be open (R341 b). */
   const myTicket = useRef<string | null>(null);
+  const windowMayBeOpen = useRef(false);
   const confirmedRef = useRef<YourLibraryResponse | undefined>(undefined);
   const draftRef = useRef<Draft | null>(null);
   const mainRef = useRef<HTMLElement>(null);
@@ -297,13 +301,13 @@ export function YourLibrary({ client }: { client: ApiClient }) {
     void shell
       .onLibraryWindow((e) => {
         const mine = myTicket.current;
-        if (!on || mine === null) return;
+        if (!on || !windowMayBeOpen.current) return;
         if (e.state === "handed-over" && e.ticket === mine) {
-          myTicket.current = null;
+          // The shell ended the ticket, but the window is still there until it closes.
           setTestResult(T.windowReachedPdf);
           say(T.windowReachedPdf);
         } else if (e.state === "closed" && (e.ticket === mine || e.ticket === null)) {
-          myTicket.current = null;
+          windowMayBeOpen.current = false;
           // A sign-out closes the window: its own sentence says so.
           if (signOutBusy.current) return;
           setTestResult(T.windowClosed);
@@ -390,7 +394,11 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       return;
     }
     const c = confirmedRef.current;
-    if (!shell || stayBusy.current || saveBusy.current || !c || c.problem?.code === "newer") return;
+    if (saveBusy.current) {
+      say(T.waitSave);
+      return;
+    }
+    if (!shell || stayBusy.current || !c || c.problem?.code === "newer") return;
     stayBusy.current = true;
     setStayPending(on);
     setStayNote(undefined);
@@ -503,7 +511,7 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       return;
     }
     if (!shell || testBusy.current) return;
-    if (myTicket.current !== null) {
+    if (windowMayBeOpen.current) {
       setTestResult(T.windowAlreadyOpen);
       say(T.windowAlreadyOpen);
       return;
@@ -522,14 +530,18 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       // The screen was left, or the press given up, meanwhile: no window is opened.
       if (!alive.current || gaveUp) return null;
       const ticket = newTicket();
+      // From here the window may open, even if this press is given up: it is remembered until it is heard closed.
+      myTicket.current = ticket;
+      windowMayBeOpen.current = true;
       let opened = false;
       try {
         opened = (await shell.openLibraryWindow(ticket, address)) === true;
       } catch {
         opened = false;
       }
+      // The shell said it did not open (also late): nothing is open, unless a later test has begun.
+      if (!opened && myTicket.current === ticket) windowMayBeOpen.current = false;
       if (gaveUp) return null;
-      if (opened) myTicket.current = ticket;
       return opened ? T.windowOpen : T.windowRefused;
     };
     const r = await within(attempt());
@@ -555,7 +567,7 @@ export function YourLibrary({ client }: { client: ApiClient }) {
     setSigningOut(false);
     const ok = tookIt(r);
     // Signed out, the window is gone; a failed sign-out keeps the screen's window in mind (R336 d).
-    if (ok) myTicket.current = null;
+    if (ok) windowMayBeOpen.current = false;
     const t = r === "gave-up" ? T.appSilent : ok ? T.signedOut : T.signOutFailed;
     setSignOutResult(t);
     say(t);
@@ -597,6 +609,7 @@ export function YourLibrary({ client }: { client: ApiClient }) {
   const stayShown = stayPending ?? confirmed?.staySignedIn === true;
   const stayNoteId = `${ids}-stay-note`;
   const stayWhyId = `${ids}-stay-why`;
+  const staySavingId = `${ids}-stay-saving`;
   const saveWhyId = `${ids}-save-why`;
   const testReasonId = `${ids}-test-why`;
   const testNoteId = `${ids}-test-note`;
@@ -739,7 +752,7 @@ export function YourLibrary({ client }: { client: ApiClient }) {
                 checked={stayShown}
                 aria-disabled={!!stayUnavailable || stayPending !== undefined || saving || undefined}
                 aria-busy={stayPending !== undefined || undefined}
-                aria-describedby={by(stayUnavailable ? stayWhyId : `${ids}-stay-hint`, stayNote ? stayNoteId : "", errId("staySignedIn"))}
+                aria-describedby={by(stayUnavailable ? stayWhyId : `${ids}-stay-hint`, saving ? staySavingId : "", stayNote ? stayNoteId : "", errId("staySignedIn"))}
                 onChange={(e) => toggleStay(e.target.checked)}
               />
               {T.stayLabel}
@@ -751,6 +764,11 @@ export function YourLibrary({ client }: { client: ApiClient }) {
             ) : (
               <p id={`${ids}-stay-hint`} className="ao-yl__note">
                 {T.stayHint}
+              </p>
+            )}
+            {saving && (
+              <p id={staySavingId} className="ao-yl__unavailable">
+                {T.waitSave}
               </p>
             )}
             {stayNote && (
