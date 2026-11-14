@@ -357,6 +357,75 @@ const PAIRS: Row[] = [
   { id: "P.coverOnly", what: "the cover sheet's place alone", record: ND, file: pdf(["Upland Repository", T, A, ...fill(2)]), want: "other-kind", clause: "4" },
 ];
 
+// ---- R296 e: the third review's rows (task-F11-review3.md: A1, A2 and the right files), with the answer the rule requires ----
+const RCD: FileCheckRecord = { title: T, creators: [...OK, { role: "author", given: "Ben", family: "Smith" }], doi: D, container: JOURNAL };
+const ep = (paras: string[], meta: { title?: string; creator?: string } = {}): FileSpec => ({ kind: "epub", ...meta, body: paras.map((l) => `<p>${l}</p>`).join("") });
+const R3: Row[] = [
+  // A1: no cap that hides words — a block line, a line of names or a title zone longer than 4,000 characters does not
+  // satisfy its clause (R296 e: fail closed). With no place, the reason is read in the first 1,000 characters (R293 e).
+  { id: "r3.2k", what: "EPUB: the title + 4,100 dots + 'Online Appendix and Supplementary Tables' on one line", record: ND, file: ep([`${T} ${".".repeat(4100)} Online Appendix and Supplementary Tables`, A]), before: "MATCH title", want: "title-absent", clause: "R296 e A1: a block line beyond the bound is no block; no sign in the first 1,000 characters" },
+  { id: "r3.2kC", what: "control: the title + 10 dots + 'Online Appendix…'", record: ND, file: ep([`${T} ${".".repeat(10)} Online Appendix and Supplementary Tables`, A]), want: "title-absent", clause: "2: extra words" },
+  { id: "r3.2l", what: "EPUB: the title + '. '×2100 + 'ERRATUM' on one line", record: ND, file: ep([`${T} ${". ".repeat(2100)} ERRATUM`, A]), before: "MATCH title", want: "title-absent", clause: "R296 e A1: a block line beyond the bound is no block; no sign in the first 1,000 characters" },
+  { id: "r3.2lC", what: "control: the title + '. '×10 + 'ERRATUM'", record: ND, file: ep([`${T} ${". ".repeat(10)} ERRATUM`, A]), want: "other-kind", clause: "R293 e: 'erratum' in the first 1,000 characters" },
+  { id: "r3.5l", what: "EPUB: 1,900-character cover / T / A / 2,500-character abstract / 'This article has been retracted…'", record: ND, file: ep(["Cover " + "word ".repeat(380), T, A, "Abstract " + "valley ".repeat(360), "This article has been retracted at the request of the editors."]), before: "MATCH title", want: "other-kind", clause: "R296 e A1: a title zone beyond the bound fails clause 5" },
+  { id: "r3.5lC", what: "control: as 5l with a short abstract", record: ND, file: ep(["Cover " + "word ".repeat(380), T, A, "Abstract " + "valley ".repeat(20), "This article has been retracted at the request of the editors."]), want: "other-kind", clause: "5: 'retracted'" },
+  { id: "r3.5lD", what: "EPUB: T / A / 4,200-character abstract / the retraction line", record: ND, file: ep([T, A, "Abstract " + "valley ".repeat(600), "This article has been retracted at the request of the editors."]), before: "MATCH title", want: "other-kind", clause: "R296 e A1: a title zone beyond the bound fails clause 5" },
+  { id: "r3.5lE", what: "EPUB: T / A / 4,200-character abstract / 'Book Review'", record: ND, file: ep([T, A, "Abstract " + "valley ".repeat(600), "Book Review"]), before: "MATCH title", want: "other-kind", clause: "R296 e A1: a title zone beyond the bound fails clause 5" },
+  { id: "r3.zoneUnder", what: "EPUB: T / A / a 3,800-character abstract (zone under the bound)", record: ND, file: ep([T, A, "Abstract " + "valley ".repeat(540)]), want: "MATCH title", clause: "5: within the bound" },
+  { id: "r3.zoneOver", what: "EPUB: T / A / a 4,200-character abstract (zone over the bound, no sign)", record: ND, file: ep([T, A, "Abstract " + "valley ".repeat(600)]), want: "other-kind", clause: "R296 e A1: a title zone beyond the bound fails clause 5" },
+  { id: "r3.namesLong", what: "EPUB: the line of names 'Amara Okafor' + '. '×2100 + 'Volume 2'", record: ND, file: ep([T, `Amara Okafor ${". ".repeat(2100)}Volume 2`]), want: "title-absent", clause: "R296 e A1: a line of names beyond the bound is not a line of names" },
+  { id: "r3.namesLongC", what: "control: 'Amara Okafor' + '. '×10 + 'Ben Smith'", record: ND, file: ep([T, `Amara Okafor ${". ".repeat(10)}Ben Smith`]), want: "MATCH title", clause: "3" },
+  // A2: a decimal number, a currency code or word, a year with a letter or in roman numerals are not marks.
+  { id: "r3.3e", what: "below: 'By Amara Okafor. Upland Press. EUR 24.95'", record: ND, file: pdf([T, "By Amara Okafor. Upland Press. EUR 24.95"]), before: "MATCH title", want: "title-absent", clause: "R296 e A2: a currency code and a decimal number (a price)" },
+  { id: "r3.3r", what: "below: 'Amara Okafor USD 30'", record: ND, file: pdf([T, "Amara Okafor USD 30"]), before: "MATCH title", want: "title-absent", clause: "R296 e A2: a currency code next to a number" },
+  { id: "r3.3m", what: "below: 'Amara Okafor MMXX'", record: ND, file: pdf([T, "Amara Okafor MMXX"]), before: "MATCH title", want: "title-absent", clause: "R296 e A2: a year in roman numerals" },
+  { id: "r3.3n", what: "below: 'Amara Okafor 2020a'", record: ND, file: pdf([T, "Amara Okafor 2020a"]), before: "MATCH title", want: "title-absent", clause: "R296 e A2: a year with a letter suffix" },
+  { id: "r3.decimal", what: "below: 'Amara Okafor 24.95'", record: ND, file: pdf([T, "Amara Okafor 24.95"]), want: "title-absent", clause: "R296 e A2: a decimal number is a number" },
+  { id: "r3.dollars", what: "below: 'Amara Okafor 30 dollars'", record: ND, file: pdf([T, "Amara Okafor 30 dollars"]), want: "title-absent", clause: "R296 e A2: a currency word next to a number" },
+  { id: "r3.mcmxc", what: "below: 'Amara Okafor MCMXC'", record: ND, file: pdf([T, "Amara Okafor MCMXC"]), want: "title-absent", clause: "R296 e A2: a year in roman numerals" },
+  { id: "r3.poundName", what: "below: 'Amara Okafor and Ezra Pound' (a currency word not next to a number)", record: ND, file: pdf([T, "Amara Okafor and Ezra Pound"]), want: "MATCH title", clause: "3" },
+  { id: "r3.romanShort", what: "below: 'Amara Okafor XIV' (a roman numeral of three letters)", record: ND, file: pdf([T, "Amara Okafor XIV"]), want: "MATCH title", clause: "3: a capitalised word" },
+  // Separators and joined marks on the line of names.
+  { id: "r3.Y03", what: "'ORIGINAL ARTICLE' / T / 'Amara Okafor | Ben Smith'", record: RCD, file: pdf(["ORIGINAL ARTICLE", T, "Amara Okafor | Ben Smith"]), before: "title-absent", want: "MATCH title", clause: "R296 e: '|' separates names" },
+  { id: "r3.Y03b", what: "Wiley: 'RESEARCH ARTICLE' / T / 'Amara Okafor1 | Ben Smith2'", record: RCD, file: pdf(["RESEARCH ARTICLE", T, "Amara Okafor1 | Ben Smith2"]), before: "title-absent", want: "MATCH title", clause: "R296 e: '|' separates names" },
+  { id: "r3.Y05", what: "Springer: 'ORIGINAL PAPER' / T / 'Amara Okafor¹ · Ben Smith²'", record: RCD, file: pdf(["ORIGINAL PAPER", T, "Amara Okafor¹ · Ben Smith²", "Received: 3 March 2020 / Accepted: 5 May 2020"]), before: "title-absent", want: "MATCH title", clause: "R296 e: '·' separates names" },
+  { id: "r3.Y07", what: "MDPI: 'Article' / T / 'Amara Okafor 1,* and Ben Smith 2'", record: RCD, file: pdf(["Article", T, "Amara Okafor 1,* and Ben Smith 2", "1 University of Upland"]), before: "title-absent", want: "MATCH title", clause: "R296 e: marks joined by commas and symbols" },
+  { id: "r3.bullet", what: "below: 'Amara Okafor • Ben Smith'", record: ND, file: pdf([T, "Amara Okafor • Ben Smith"]), want: "MATCH title", clause: "R296 e: '•' separates names" },
+  { id: "r3.endash", what: "below: 'Amara Okafor – Ben Smith'", record: ND, file: pdf([T, "Amara Okafor – Ben Smith"]), want: "MATCH title", clause: "R296 e: '–' separates names" },
+  { id: "r3.marksDagger", what: "below: 'Amara Okafor 1,2,† and Ben Smith 2'", record: ND, file: pdf([T, "Amara Okafor 1,2,† and Ben Smith 2"]), want: "MATCH title", clause: "R296 e: marks joined by commas and symbols" },
+  { id: "r3.letterMarks", what: "below: 'Amara Okafor a,*, Ben Smith b'", record: ND, file: pdf([T, "Amara Okafor a,*, Ben Smith b"]), want: "MATCH title", clause: "3" },
+  { id: "r3.pipeYear", what: "below: 'Amara Okafor | Upland Press | 2020'", record: ND, file: pdf([T, "Amara Okafor | Upland Press | 2020"]), want: "title-absent", clause: "3: a year" },
+  { id: "r3.onlySeparators", what: "below: a line of only separators, then 'Upland Press'", record: ND, file: pdf([T, "| · •", "Upland Press"]), want: "title-absent", clause: "3: not a line of names (R293 d: an empty line; the next line lacks the family name)" },
+  { id: "r3.onlySeparatorsThenNames", what: "below: a line of only separators, then the line of names", record: ND, file: pdf([T, "| · •", A]), want: "MATCH title", clause: "R293 d: a line with no letter and no digit is empty" },
+  // The fifteen ordinary pages of the third review (record RCD unless said), with the answer the rule gives.
+  { id: "r3.Y01", what: "society journal: citation line above", record: RCD, file: pdf(["Journal of Upland Studies 12(3): 45-67, 2020", T, "Amara Okafor and Ben Smith", "University of Upland", "Abstract"]), want: "MATCH title", clause: "2–8 hold" },
+  { id: "r3.Y02", what: "Elsevier: ScienceDirect header, journal, homepage, T, 'Amara Okafor a,*, Ben Smith b'", record: RCD, file: pdf(["Contents lists available at ScienceDirect", "Journal of Upland Studies", "journal homepage: www.elsevier.com/locate/jus", T, "Amara Okafor a,*, Ben Smith b", "a University of Upland, UK"]), want: "MATCH title", clause: "2–8 hold" },
+  { id: "r3.Y03c", what: "'ORIGINAL ARTICLE' / T / 'Amara Okafor and Ben Smith'", record: RCD, file: pdf(["ORIGINAL ARTICLE", T, "Amara Okafor and Ben Smith"]), want: "MATCH title", clause: "2–8 hold" },
+  { id: "r3.Y04", what: "'OPEN ACCESS' / 'Check for updates' / T / names", record: RCD, file: pdf(["OPEN ACCESS", "Check for updates", T, "Amara Okafor and Ben Smith"]), want: "other-kind", clause: "4: 'Check for updates' (held layout: final review's list)" },
+  { id: "r3.Y06", what: "ORCID address after the name", record: RCD, file: pdf(["Article", T, "Amara Okafor https://orcid.org/0000-0002-1825-0097"]), want: "title-absent", clause: "3: a web address (held layout: final review's list)" },
+  { id: "r3.Y08", what: "subtitle on its own line, the record holds it", record: { title: "Rivers and Memory: Upland Villages since 1800", creators: OK }, file: pdf(["Rivers and Memory", "Upland Villages since 1800", A]), want: "MATCH title", clause: "2–8 hold" },
+  { id: "r3.Y08b", what: "subtitle on its own line, the record lacks it", record: ND, file: pdf([T, "A Study of Seasonal Labour", A]), want: "title-absent", clause: "3 (accepted cost)" },
+  { id: "r3.Y09", what: "book title page: T / A / press / place", record: ND, file: pdf([T, "Amara Okafor", "Upland Press", "Oxford and New York"]), want: "MATCH title", clause: "2–8 hold" },
+  { id: "r3.Y10", what: "EPUB title page", record: ND, file: ep([T, "Amara Okafor", "Upland Press"], { title: T, creator: "Amara Okafor" }), want: "MATCH title", clause: "2–8 hold" },
+  { id: "r3.Y11", what: "'NBER WORKING PAPER SERIES' / T / A", record: ND, file: pdf(["NBER WORKING PAPER SERIES", T, "Amara Okafor", "Working Paper 12345", "http://www.nber.org/papers/w12345"]), want: "other-kind", clause: "4 (held layout: final review's list)" },
+  { id: "r3.Y12", what: "arXiv margin identifier first", record: RCD, file: pdf(["arXiv:2001.01234v1 [physics.soc-ph] 5 Jan 2020", T, "Amara Okafor1, Ben Smith2", "1Department of History, University of Upland"]), want: "MATCH title", clause: "2–8 hold" },
+  { id: "r3.Y13", what: "thesis: T / 'by' / A", record: ND, file: pdf([T, "by", "Amara Okafor", "A thesis submitted in partial fulfilment of the requirements for the degree of Doctor of Philosophy"]), want: "MATCH title", clause: "2: the joining-word line 'by' joins the block" },
+  { id: "r3.Y15", what: "Nature: 'Article' / T / DOI line / names", record: RCD, file: pdf(["Article", T, "https://doi.org/10.5555/ao.f11.rivers", "Received: 3 March 2020", "Amara Okafor1, Ben Smith2 & Carl Other3"]), want: "title-absent", clause: "3: the DOI line below the title (held layout: final review's list)" },
+];
+/** Review3's fifteen ordinary pages: Y01, Y02, Y03c, Y04, Y05, Y06, Y07, Y08, Y08b, Y09, Y10, Y11, Y12, Y13, Y15. */
+const FIFTEEN = ["r3.Y01", "r3.Y02", "r3.Y03c", "r3.Y04", "r3.Y05", "r3.Y06", "r3.Y07", "r3.Y08", "r3.Y08b", "r3.Y09", "r3.Y10", "r3.Y11", "r3.Y12", "r3.Y13", "r3.Y15"];
+
+describe("R296 e: the third review's rows", () => {
+  for (const row of R3) {
+    it(`${row.id}: ${row.what} → ${row.want} (clause ${row.clause})`, async () => {
+      expect(await run(row)).toBe(row.want);
+    });
+  }
+  it("the fifteen ordinary pages: ten match (Y04, Y06, Y08b, Y11, Y15 held)", () => {
+    expect(R3.filter((r) => FIFTEEN.includes(r.id) && r.want === "MATCH title")).toHaveLength(10);
+  });
+});
+
 describe("R292: the reviewers' rows — what the file holds → R292's answer", () => {
   for (const row of ROWS) {
     it(`${row.id}: ${row.what} → ${row.want} (clause ${row.clause})`, async () => {
