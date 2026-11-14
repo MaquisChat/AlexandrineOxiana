@@ -639,7 +639,7 @@ async function entryLine(core: RepoCore, projectId: string, entryId: string, pat
 /**
  * The researcher's decision on a held file (R277; review queue "Use this file" / "Not this file"), ONE governed change
  * each, audited with ids and counts only:
- *  - "attach": the held file becomes an original of the source, exactly as a file that matched (method `free_copy`,
+ *  - "attach" (R301: the ONLY way a found file becomes a source's file): the held file becomes an original (method `free_copy`,
  *    its `acquired` record), with the check's answer (`checkOf`: "match" for a file that looked right, R296 b, else
  *    `{ result: "accepted-after-mismatch", why }` — the researcher accepted it after the check failed); the held copy goes; the review entry is resolved ("file-attached"); the queue
  *    entry is "in-library". Capture `free_copy` and `store` are evaluated as for any added original. A source that is

@@ -12,8 +12,8 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 // The service has no undici of its own: the library's (the one its lookup client uses) sets the global dispatcher.
 import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FindRunnerClosedError, deviceDeps, rebuildIndexIfNeeded, type Deps, type FindEntry, type FindRunnerDeps } from "@ao/library";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { FindRunnerClosedError, deviceDeps, rebuildIndexIfNeeded, type Deps, type FindEntry } from "@ao/library";
 import { FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STOPPED_TEXT, findAlreadyAddedRefusal, findWorkIdRefusal, type FindEntryView, type FindQueueResponse } from "@ao/shared";
 import { serialStore } from "../../../packages/library/src/import/project-queue.js";
 import { runnerSeams } from "../../../packages/library/src/find/runner.js";
@@ -23,19 +23,6 @@ import { newId } from "@ao/core";
 import { existsSync } from "node:fs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 import type { ServiceEvent } from "./events.js";
-
-// R296 c: what the service gives its runner, seen as the runner is made (the runner itself is the library's own).
-const runnerDeps = vi.hoisted(() => [] as Array<Record<string, unknown>>);
-vi.mock("@ao/library", async (importOriginal) => {
-  const lib = await importOriginal<typeof import("@ao/library")>();
-  return {
-    ...lib,
-    createFindRunner: (d: FindRunnerDeps) => {
-      runnerDeps.push(d as unknown as Record<string, unknown>);
-      return lib.createFindRunner(d);
-    },
-  };
-});
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const PASS = "correct horse battery staple";
@@ -624,17 +611,6 @@ describe("refusals", () => {
     expect(put.status, put.body).toBe(200);
     expect((await until(async () => ((x) => (x?.state === "no-open-copy" ? x : undefined))(await entry(pid, e!.id)), "the entry to go on")).state).toBe("no-open-copy");
     expect(doiAsked()).toBeGreaterThan(before);
-  });
-
-  it("R296 c: the service's runner has the option that attaches a found file by itself off", async () => {
-    runnerDeps.length = 0;
-    await start();
-    await openNewLibrary();
-    expect(runnerDeps.length).toBeGreaterThan(0);
-    for (const d of runnerDeps) {
-      expect(d.attachBySelf).toBeUndefined();
-      expect(d.attachBySelf === true).toBe(false);
-    }
   });
 
   it("R296 d: a decision on a waiting file, through the review route, wakes the project's entries waiting for the limit", async () => {

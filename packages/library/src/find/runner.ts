@@ -73,10 +73,8 @@ import { libraryVersion } from "../resources.js";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AcquiredFrom, SourceFile } from "@ao/core";
-import { kindFor, mimeFor } from "../repo/io.js";
-import { addCapturedOriginal, heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
+import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
 import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, type HeldFileFacts } from "../repo/review.js";
-import { SourceHasFileError } from "../repo/assets.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
 import { checkFileAgainstRecord, type FileCheckResult } from "./file-check.js";
@@ -141,8 +139,6 @@ export const FIND_CHECK_TIMEOUT_MS = 60_000;
  * this often (an in-memory read); a record removed meanwhile aborts the download.
  */
 export const FIND_SOURCE_WATCH_MS = 2_000;
-/** Task F11: the label of a free copy's file name in the source's `original/` folder (with the date). */
-const FREE_COPY_LABEL = "free copy";
 
 /**
  * Task F11: a free copy's address as `Asset.acquired` keeps it: user name, password, query and fragment removed
@@ -267,13 +263,6 @@ export interface FindRunnerDeps {
    * entry and creates nothing; it asks again every FIND_INDEX_WAIT_MS and goes on by itself.
    */
   indexReady?: () => boolean;
-  /**
-   * R296 c: whether a found file the check matches is attached by the runner itself (as built in F11). Default OFF:
-   * every found file waits for the researcher (R296 a), the check's answer recorded as advice. Nothing in the app sets
-   * it (no setting, environment variable, route or screen); only the tests of attaching by itself turn it on. Whether
-   * the app should ever attach by itself is the owner's decision.
-   */
-  attachBySelf?: boolean;
 }
 
 /** Why the runner does nothing for a project now. */
@@ -529,8 +518,6 @@ const errName = (err: unknown) => (err instanceof Error ? err.name : "error");
 
 export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const { repo, http } = deps;
-  /** R296 c: the one reader of the option (off unless a caller sets it to true). */
-  const attachBySelf = deps.attachBySelf === true;
   const now = () => deps.now?.() ?? new Date();
   const debug = (n: string) => {
     try {
@@ -1410,7 +1397,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   // ------------------------------------------------------------------------------------------------------------
-  // Task F11: the free copy — looked for, downloaded, checked against the record, and only then attached.
+  // Task F11: the free copy — looked for, downloaded, checked against the record, and held for the researcher, who
+  // alone attaches it ("Use this file"; R301: the app never attaches a found file by itself).
 
   /** Whether the project's rules allow the acquiring method `free_copy` (asked before ANY free-copy service). */
   function copyAllowed(ctx: LookupContext): boolean {
@@ -1434,7 +1422,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const RECORD_REMOVED: FindReason = { code: "record-removed" };
   /** R296 d: FIND_HELD_MAX files already wait for the researcher: the entry waits, "record-complete", asking nothing. */
   const HELD_FULL: FindReason = { code: "held-full" };
-  /** Why the rules refused a free copy's file at attach or hold (M8): the capture of `free_copy`, or its store. */
+  /**
+   * Why the rules refused a free copy's file at its hold (M8): the capture of `free_copy`, or its store. (At "Use this
+   * file" the same rules are evaluated again by `resolveHeldFile`, and a refusal is the service's usual sentence.)
+   */
   async function copyRefusal(pid: string, err: PolicyDeniedError, prov: Provenance): Promise<FindReason> {
     if (err.action !== "store") return COPY_RULES;
     return (await refusalOf(pid, err, { identifiable: prov.identifiable, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) })) === NO_LEGAL_BASIS ? COPY_NO_BASIS : COPY_STORE;
@@ -1518,14 +1509,13 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   /**
-   * The free-copy part of an entry's life (R277): its record made, its source without a readable file.
+   * The free-copy part of an entry's life (R277): its record made, its source without a readable file. R301: no path
+   * of it attaches a file to the source; only the researcher's "Use this file" on the held file does (`resolveHeld`).
    *
    *   record-complete ──► looking-for-copy ──► no-open-copy   (no offer: the "elsewhere" links are kept)
    *                                       ──► fetching ──► needs-check   (R296 a: the first file the check matches is held,
    *                                                                       "file-looks-right"; no offer matches: the FIRST
    *                                                                       file that did not is held, "file-<why>")
-   *                                                    ──► in-library    (only with the option `attachBySelf`, off: the
-   *                                                                       first file that passes is attached)
    *                                                    ──► record-complete / held-full (the hold found FIND_HELD_MAX
    *                                                                       files waiting meanwhile: the file is dropped)
    *                                                    ──► no-open-copy  (no offer could be downloaded: its links kept)
@@ -1560,7 +1550,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     if (!live()) return;
     if (hasFile(sf)) {
-      // Its source has a readable file already (attached here before a crash, or by the researcher).
+      // Its source has a readable file already (the researcher's own: added by hand, or a held file used).
       await finish({ state: "in-library" }, ["nextTryAt", "reason"]);
       return;
     }
@@ -1690,13 +1680,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           if (live() && gone) await removedRecord();
           return;
         }
-        if (check.match && attachBySelf) {
-          await attach(pid, eid, r, live, version, sid, sf.source.provenance, got, offer, check.by);
-          return;
-        }
         if (check.match) {
-          // R296 a: the file the check matched waits for the researcher like any other, with the advice that it looks
-          // right; a file kept before it that did not match is dropped (one held file per entry).
+          // R296 a, R301: the app never attaches a found file by itself. The file the check matched waits for the
+          // researcher like any other, with the advice that it looks right; a file kept before it that did not match is
+          // dropped (one held file per entry).
           if (held) await fsp.rm(held.path, { force: true });
           await holdOne(pid, eid, r, live, version, sid, sf.source.provenance, { path: got.path, offer, check });
           return;
@@ -1724,53 +1711,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
   }
 
-  /** The file that passed the check, attached in the project's store turn: ONE governed change, then the entry's line. */
-  async function attach(
-    pid: string,
-    eid: string,
-    r: Run,
-    live: () => boolean,
-    version: { get(): FindEntry; set(e: FindEntry): void },
-    sid: string,
-    prov: Provenance,
-    got: Awaited<ReturnType<typeof fetchFile>>,
-    offer: CopyOffer,
-    by: "doi" | "title",
-  ): Promise<void> {
-    await inTurn(r, pid, live, async () => {
-      const cur = await current(pid, eid);
-      // Removed, retried or otherwise changed meanwhile: nothing is attached for it.
-      if (!cur || !sameVersion(cur, version.get())) return;
-      try {
-        await addCapturedOriginal(
-          repo,
-          pid,
-          sid,
-          { fromPath: got.path, kind: kindFor(offer.kind), ext: offer.kind, mime: mimeFor(offer.kind), label: `${FREE_COPY_LABEL} ${stamp().slice(0, 10)}`, acquired: { ...acquiredFor(offer), check: { result: "match", by } } },
-          "free_copy",
-          // R282 g (M5): never a second file by itself — a source that gained one meanwhile is refused inside the change.
-          { onlyWithoutFile: true },
-        );
-      } catch (err) {
-        const said = await copyEnded(pid, err, prov);
-        if (!said) throw err;
-        const [w] = await write(pid, [evolve(cur, said, ["nextTryAt", "reason", "offers"], stamp())], "update");
-        if (w) version.set(w);
-        return;
-      }
-      // A crash or a lock here leaves the entry "fetching" beside a source with its file: resumed, it is "in-library".
-      const [w] = await write(pid, [evolve(cur, { state: "in-library" }, ["nextTryAt", "reason", "offers"], stamp())], "update");
-      if (w) version.set(w);
-    });
-  }
-
   /**
-   * What the entry says when a file could not be attached or held (R282 g), or null for an error not foreseen: the
-   * record removed meanwhile (M1); a readable file gained meanwhile ("in-library", M5); the rules (M8).
+   * What the entry says when a file could not be held (R282 g), or null for an error not foreseen: the record removed
+   * meanwhile (M1); the rules (M8).
    */
   async function copyEnded(pid: string, err: unknown, prov: Provenance): Promise<Partial<FindEntry> | null> {
     if (err instanceof NotFoundError) return { state: "no-open-copy", reason: RECORD_REMOVED };
-    if (err instanceof SourceHasFileError) return { state: "in-library" };
     if (err instanceof PolicyDeniedError) return { state: "record-complete", reason: await copyRefusal(pid, err, prov) };
     return null;
   }
