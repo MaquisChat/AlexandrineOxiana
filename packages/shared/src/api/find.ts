@@ -57,7 +57,7 @@ export const FIND_STATES = [
 export type FindState = (typeof FIND_STATES)[number];
 
 /** Why an entry could not go on (the library's FindReasonCode). */
-export const FIND_REASON_CODES = ["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected"] as const;
+export const FIND_REASON_CODES = ["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected", "people-unavailable"] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 
@@ -71,6 +71,8 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "queue-full": "The queue holds 500 entries. Remove some finished ones first.",
   budget: "OpenAlex's free daily allowance is used up; searching Crossref only until tomorrow.",
   unexpected: "Something went wrong while looking this up. Try again.",
+  /** F8b (R283 a): on a "choose" entry whose people search could not be had; "Try again" is offered on it. */
+  "people-unavailable": "People of this name could not be looked up just now. “Try again” looks again.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */
@@ -144,6 +146,8 @@ export const FIND_ROUTE_TEXT = {
   tooManyWorks: "At most 50 works can be added at once. Nothing was added.",
   /** Task F8b (R279): `POST …/:eid/author` on an entry that is not "choose" with an author offer (409); nothing changed. */
   noAuthor: "This entry has no author to show.",
+  /** Task F8b (R285 b): a body sent to a route that takes none (400); the field is never repeated. */
+  noBody: "This request takes no body. Nothing was changed.",
 } as const;
 
 /** Work `n` (counting from 1, in the request) was already added from this entry: the whole tick is refused (409). Never its title. */

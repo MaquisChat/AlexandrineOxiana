@@ -71,7 +71,7 @@ import {
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
 import type { WorkCandidate } from "./candidates.js";
-import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, authorOfferProbe, childTyped, fetchWork, fitAuthorEntry, fitPeople, hasInitial, isPersonId, isWorkId, peopleSearchWanted, sameWork, searchPeople, titleCovered, worksOf } from "./people.js";
+import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, authorOfferProbe, childTyped, fetchWork, fitAuthorEntry, fitPeople, hasInitial, isPersonId, isWorkId, peopleSearchWanted, sameWork, searchPeople, titleCovered, worksOf, type PersonDecision } from "./people.js";
 import { FindQueueUnreadableError, sanitizeEntry } from "./queue-store.js";
 import { parseReference, type Reference } from "./reference.js";
 import { decideMatch, openAlexSearchPausedUntil, scoreCandidate, searchWorks, type SearchSource } from "./search.js";
@@ -362,6 +362,15 @@ function fit(given: FindEntry): FindEntry {
   if (size(candidates) > FIND_LINE_MAX_BYTES) candidates = candidates.map((c) => ({ ...c, creators: c.creators.slice(0, 10) }));
   const out = offer ? fitAuthorEntry({ ...e, candidates }) : { ...e, candidates };
   return sanitizeEntry(out) ? out : evolve(out, {}, ["candidates"], e.updatedAt);
+}
+
+/**
+ * R285 b: whether an entry in "choose" carrying an author offer keeps at least one work candidate once fitted for the
+ * store. When it would not, the offer is never made: the entry goes to the author's flow instead (never "choose" with
+ * an offer and nothing to choose).
+ */
+export function offerLeavesAChoice(e: FindEntry): boolean {
+  return (fit(e).candidates?.length ?? 0) > 0;
 }
 
 /** The duplicate keys of a work candidate. */
@@ -1209,25 +1218,42 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // wait, never a guess.
     /** R279 c: people that fit while a work's title is covered too — offered beside the works' "choose". */
     let offer: Partial<FindEntry> = {};
+    /** R283 a: the people search could not be had, but the works rule offers a choice: "choose" at once, saying so. */
+    let note: Partial<FindEntry> = {};
+    const worksChoice = (): WorkCandidate[] => {
+      const d = decideMatch(ref, res.candidates);
+      const byId = new Map(res.candidates.map((c) => [c.id, c]));
+      return d.kind === "choose" ? d.ids.map((id) => byId.get(id)!).filter(Boolean) : [];
+    };
     if (sources.includes("openalex") && peopleSearchWanted(ref, res.candidates)) {
-      let found: Awaited<ReturnType<typeof searchPeople>>;
+      let found: Awaited<ReturnType<typeof searchPeople>> | undefined;
       try {
         found = await guard(r, searchPeople(ref, ctx), FIND_LOOKUP_TIMEOUT_MS);
       } catch (err) {
-        if (await notHad(err)) return;
-        throw err;
+        // R283 a: refused by the spent allowance, failed or timed out — an entry with work candidates the works rule
+        // offers is not held back; only one with none waits or retries, as F8 ruled (the name may be a person's).
+        if ((err instanceof FindPeopleError || err instanceof TimedOut) && worksChoice().length > 0) note = { reason: { code: "people-unavailable" } };
+        else if (await notHad(err)) return;
+        else throw err;
       }
       if (!live()) return;
-      const fits = fitPeople(ref, found.people);
+      const fits = found ? fitPeople(ref, found.people) : ({ kind: "none" } as const);
       // R279 b, c: a person fits and no work's title is covered: the author's flow as built (below). A person fits AND a
       // work's title is covered: the works' outcome as built, carrying the people as an offer (never a guess either way).
-      const who = titleCovered(ref, res.candidates) ? { kind: "none" as const } : fits;
-      if (fits.kind !== "none" && who.kind === "none") offer = { people: fits.kind === "one" ? [fits.person] : fits.people, ...(found.more ? { morePeople: true as const } : {}) };
-      const more = found.more ? { morePeople: true as const } : {};
+      let who = titleCovered(ref, res.candidates) ? ({ kind: "none" } as PersonDecision) : fits;
+      if (fits.kind !== "none" && who.kind === "none") {
+        offer = { people: fits.kind === "one" ? [fits.person] : fits.people, ...(found?.more ? { morePeople: true as const } : {}) };
+        // R285 b: an offer whose stored line would keep no work candidate is never made: the author's flow instead.
+        if (!offerLeavesAChoice(evolve(entry, { state: "choose", candidates: worksChoice(), ...offer }, ["nextTryAt", "reason"], stamp()))) {
+          offer = {};
+          who = fits;
+        }
+      }
+      const more = found?.more ? { morePeople: true as const } : {};
       const drop: Array<keyof FindEntry> = ["nextTryAt", "reason", "candidates", "chosen", "works", "morePeople", "moreWorks", "match"];
       // More people than the 20 read may fit as well: the one that fitted is offered, never chosen in silence.
       // Nor when the one that fitted did so only through a typed initial (R270 d).
-      if (who.kind === "several" || (who.kind === "one" && (found.more || who.byInitial))) {
+      if (who.kind === "several" || (who.kind === "one" && (found?.more || who.byInitial))) {
         await finish({ state: "choose-person", people: who.kind === "one" ? [who.person] : who.people, ...more }, drop);
         return;
       }
@@ -1273,8 +1299,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const byId = new Map(res.candidates.map((c) => [c.id, c]));
       const ids = decision.kind === "choose" ? decision.ids : res.candidates.map((c) => c.id);
       const candidates = ids.map((id) => byId.get(id)!).filter(Boolean);
-      // F8b: with the author offer, if any (the people found; R279 c).
-      await finish({ state: "choose", candidates, ...offer }, ["nextTryAt", "reason", "people", "morePeople"]);
+      // F8b: with the author offer, if any (the people found; R279 c), or the note that people could not be looked up (R283 a).
+      await finish({ state: "choose", candidates, ...offer, ...note }, ["nextTryAt", "reason", "people", "morePeople"]);
       return;
     }
     const cand = res.candidates.find((c) => c.id === decision.id)!;
@@ -1414,7 +1440,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       const waiting = cur.state === "looking-up" && !!cur.nextTryAt;
-      if (cur.state !== "failed" && cur.state !== "not-found" && !waiting) throw new FindEntryStateError();
+      // R283 a: a "choose" made while people of the name could not be looked up: Try again looks again (afresh).
+      const peopleUnseen = cur.state === "choose" && cur.reason?.code === "people-unavailable";
+      if (cur.state !== "failed" && cur.state !== "not-found" && !waiting && !peopleUnseen) throw new FindEntryStateError();
       cancelLater(projectId, entryId);
       // F8: a work added from a person's list keeps its work (it is asked again by its id, never searched by text),
       // and an author's entry keeps the person whose works did not come.

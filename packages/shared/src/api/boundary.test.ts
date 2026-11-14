@@ -66,7 +66,7 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
 
   it("find and acquire: states, every reason code and every stop code has its one sentence, and the bounds", () => {
     expect(FIND_STATES).toHaveLength(15);
-    expect([...FIND_REASON_CODES]).toEqual(["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected"]);
+    expect([...FIND_REASON_CODES]).toEqual(["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected", "people-unavailable"]);
     // Exhaustive by type (Record<FindReasonCode, string>) and checked here at run time: one plain sentence each.
     expect(Object.keys(FIND_REASON_TEXT).sort()).toEqual([...FIND_REASON_CODES].sort());
     for (const c of FIND_REASON_CODES) expect(FIND_REASON_TEXT[c]).toMatch(/^[A-Z].*\.$/);
@@ -99,6 +99,11 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
   it("find and acquire, a name that is also a title (F8b, R279): the author offer is counts only, and its refusal has its sentence", () => {
     expect(FIND_REFUSAL_REASONS).toContain("no-author");
     expect(FIND_ROUTE_TEXT.noAuthor).toBe("This entry has no author to show.");
+    // R285 b: the sentence for a request that carries a body is a shared route sentence.
+    expect(FIND_ROUTE_TEXT.noBody).toBe("This request takes no body. Nothing was changed.");
+    // R283 a: people of the name could not be looked up; "Try again" looks again.
+    expect(FIND_REASON_CODES).toContain("people-unavailable");
+    expect(FIND_REASON_TEXT["people-unavailable"]).toBe("People of this name could not be looked up just now. “Try again” looks again.");
     const offer: FindAuthorOffer = { peopleCount: 2 };
     const view: Pick<FindEntryView, "authorOffer"> = { authorOffer: { ...offer, morePeople: true } };
     expect(view.authorOffer).toEqual({ peopleCount: 2, morePeople: true });

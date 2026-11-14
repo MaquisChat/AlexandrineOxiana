@@ -426,7 +426,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const { s, projectId, entryId } = addressed(req, true);
     const runner = runnerOf(s);
     // The request names nothing: a body field is refused, never repeated.
-    if (Object.keys(bodyOf(req)).length > 0) throw badRequest("This request takes no body. Nothing was changed.");
+    if (Object.keys(bodyOf(req)).length > 0) throw badRequest(FIND_ROUTE_TEXT.noBody);
     const cur = await entryOf(s, projectId, entryId);
     if (cur.state !== "choose" || !cur.people?.length) throw new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.noAuthor, "no-author");
     return entryView(await pressed(s, projectId, () => runner.asAuthor(projectId, entryId)));

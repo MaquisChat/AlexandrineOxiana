@@ -37,6 +37,7 @@ import {
   FindProjectStoppedError,
   FindRunnerClosedError,
   createFindRunner,
+  offerLeavesAChoice,
   runnerSeams,
   type FindRunner,
   type FindRunnerDeps,
@@ -2252,8 +2253,8 @@ describe("F8: an author alone — the person, then their works", () => {
     expect((await entryOf(p, id))!.works).toHaveLength(150);
   });
 
-  it("the people search meeting the spent allowance: the entry waits with budget (never a guess among the works found)", async () => {
-    know(NAME, cr({ title: "Lanterns of the Estuary", family: "Brackwater", year: 2001, doi: "10.5555/ao.f8.lantern" }), OA_EMPTY);
+  it("the people search meeting the spent allowance with NO work candidate: the entry waits with budget (R283 a: as F8 ruled)", async () => {
+    know(NAME, cr(), OA_EMPTY);
     peopleAnswers.set(NAME, "budget");
     const p = await project();
     const r = runner();
@@ -2566,6 +2567,82 @@ describe("F8: an author alone — the person, then their works", () => {
       await stateIs(p, added[0]!.id, "choose");
       return { p, r, id: added[0]!.id };
     }
+
+    // R283 a: a people search that cannot be made or fails does not hold back an entry that has work candidates.
+    for (const trouble of ["budget", "fail"] as const) {
+      it(`R283 a: the people search ${trouble === "budget" ? "refused by the spent allowance" : "failing"} and a short title with work candidates: choose at once with people-unavailable, no wait`, async () => {
+        know(SHORT, cr(LANTERN), OA_EMPTY);
+        peopleAnswers.set(SHORT, trouble);
+        const p = await project();
+        const r = runner();
+        const { added } = await r.add(p.id, [SHORT]);
+        await stateIs(p, added[0]!.id, "choose");
+        const e = (await entryOf(p, added[0]!.id))!;
+        expect(e).toMatchObject({ state: "choose", reason: { code: "people-unavailable" }, attempts: 0 });
+        expect(e.nextTryAt).toBeUndefined();
+        expect(e.people).toBeUndefined();
+        expect(e.candidates!.map((c) => c.identifiers.doi)).toEqual([LANTERN.doi]);
+        expect(askedPeople).toEqual([SHORT]);
+        expect(timers.pending.size).toBe(0);
+      });
+    }
+
+    it("R283 a: Try again on such an entry asks the works and the people again; a person now fits beside a covered title: choose with the author offer", async () => {
+      titled(TWO());
+      peopleAnswers.set(NAME, "fail");
+      const p = await project();
+      const r = runner();
+      const { added } = await r.add(p.id, [NAME]);
+      const id = added[0]!.id;
+      await stateIs(p, id, "choose");
+      expect((await entryOf(p, id))!).toMatchObject({ reason: { code: "people-unavailable" } });
+      expect((await entryOf(p, id))!.people).toBeUndefined();
+      // A refusal of other acts is unchanged: the offer is not there.
+      await expect(r.asAuthor(p.id, id)).rejects.toBeInstanceOf(FindNoAuthorError);
+      peopleAnswers.set(NAME, peopleOf(TWO()));
+      // The lookup cache (on disk and in the client's memory) is cleared so that each request made is seen.
+      await rm(join(lib.root, ".cache"), { recursive: true, force: true });
+      (http as unknown as { memory: Map<string, unknown> }).memory.clear();
+      const worksBefore = asked.filter((a) => a.text === NAME).length;
+      const again = await r.retry(p.id, id);
+      expect(again).toMatchObject({ state: "looking-up", attempts: 0 });
+      expect(again.reason).toBeUndefined();
+      expect(again.candidates).toBeUndefined();
+      await until(async () => changes.filter((c) => c.entryId === id && c.state === "choose").length === 2, "the entry to ask again");
+      const e = (await entryOf(p, id))!;
+      expect(e.reason).toBeUndefined();
+      expect(e.people!.map((x) => x.id)).toEqual(["A5001", "A5003"]);
+      expect(askedPeople).toEqual([NAME, NAME]);
+      // One works search again (Crossref and OpenAlex, one request each).
+      expect(asked.filter((a) => a.text === NAME).length - worksBefore).toBe(2);
+    });
+
+    it("R283 a: Try again is refused on a choose entry without that reason, as before", async () => {
+      const { p, r, id } = await offered();
+      await expect(r.retry(p.id, id)).rejects.toBeInstanceOf(FindEntryStateError);
+    });
+
+    it("R283 b: a line the works rule is sure of is unchanged by a people search that would fail", async () => {
+      const SURE = "Quillfeather, Zorblatt Grammar of Habitus";
+      know(SURE, cr(ZORBLATT), OA_EMPTY);
+      peopleAnswers.set(SURE, "budget");
+      const p = await project();
+      const r = runner();
+      const { added } = await r.add(p.id, [SURE]);
+      await settled(p, added[0]!.id);
+      expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
+      expect(askedPeople).toEqual([]);
+    });
+
+    it("R285 b: an offer that would leave no work candidate on the stored line is not made: offerLeavesAChoice", () => {
+      const base: FindEntry = { id: newId(), projectId: newId(), typed: NAME, state: "choose", createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), attempts: 0, people: [{ id: "A5001", name: NAME, worksCount: 3, subjects: [] }] };
+      const good = { id: "c1", title: NAME, creators: [{ family: "Editors", role: "author" as const }], type: "book" as const, identifiers: {}, providers: ["crossref"] };
+      expect(offerLeavesAChoice({ ...base, candidates: [good] })).toBe(true);
+      // A candidate the store would refuse (a creator's role it does not know): the fitted line keeps no candidate.
+      const refused = { ...good, creators: [{ family: "Editors", role: "ghost-writer" as unknown as "author" }] };
+      expect(offerLeavesAChoice({ ...base, candidates: [refused] })).toBe(false);
+      expect(offerLeavesAChoice({ ...base, candidates: [] })).toBe(false);
+    });
 
     it("an author's name whose works search returns an entry titled with the name: the people search is asked, and the entry is choose with an author offer", async () => {
       const { p, id } = await offered();
