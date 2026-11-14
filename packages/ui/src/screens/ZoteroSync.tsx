@@ -31,6 +31,7 @@ import {
   ZOTERO_SYNC_EVERY_MINUTES,
   ZOTERO_SYNC_REASON_TEXT,
   ZOTERO_SYNC_SENTENCES,
+  zoteroNextSyncLine,
   zoteroSyncReasonText,
   zoteroSyncStatusLine,
   type ZoteroKeyCheckResponse,
@@ -749,6 +750,8 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
           <p id={`${ids}-auto-hint`} className="ao-zotero__note">
             {ZOTERO_TEXT.automaticHint}
           </p>
+          {/* Z10 (R274 c): when the service's scheduler would next start a run, in the shared words; only when given. */}
+          {state.nextRunAt && <UserText as="p">{zoteroNextSyncLine(state.nextRunAt, new Date())}</UserText>}
           {fieldErrors.automatic && (
             <p id={`${ids}-auto-err`} className="ao-error">
               <UserText>{fieldErrors.automatic}</UserText>

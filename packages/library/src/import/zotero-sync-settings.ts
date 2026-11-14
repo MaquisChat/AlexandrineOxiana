@@ -252,6 +252,12 @@ const isHistoryFile = fileOf<ZoteroSyncRun[]>((e) => Array.isArray(e) && e.lengt
 export interface ZoteroSyncFileOptions {
   /** Told when damaged content was set aside (the file's own name and the name it is kept under; no path). */
   onSetAside?(fileName: string, keptAs: string): void;
+  /**
+   * R269 c: told, on every read or refused write, that the file was written by a newer version of the app and so was
+   * not read (it is left exactly as it is; the device notice is raised once per process). Only for that: a missing,
+   * unreadable or damaged file is never "newer".
+   */
+  onNewer?(fileName: string): void;
   /** Test seam: the clock for the set-aside name. */
   now?: () => Date;
 }
@@ -297,6 +303,7 @@ function inTurn<T>(dir: string, name: string, step: () => Promise<T>): Promise<T
 const newerTold = new Set<string>();
 /** Said once per process for the file (never on every read or refused write) when the settings were written by a newer version; never throws. */
 function newerNotice(dir: string, name: string, o: ZoteroSyncFileOptions): Promise<void> {
+  o.onNewer?.(name);
   if (name !== ZOTERO_SYNC_FILE || newerTold.has(join(dir, name))) return Promise.resolve();
   newerTold.add(join(dir, name));
   return raiseDeviceNotice(dir, "zotero-sync-settings-newer", (o.now ?? (() => new Date()))());
