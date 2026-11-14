@@ -344,6 +344,15 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   });
   app.delete("/extension/pairings/:pid", async (req): Promise<PairingRemovedResponse> => {
     if (!(await pairing.unpair(paramsOf(req).pid ?? ""))) throw notFound("That pairing");
+    // R353 d: the LAST extension unpaired — a work waiting in the browser returns as by "Cancel" (its ticket ends at
+    // once, inside the call; the entry's write follows, not awaited). A window's wait is never touched. If the entry
+    // cannot be written now (its project locked, the library closing) it comes back by the existing ways; the removal
+    // answers as before, and the failure is a warning that names nothing of the work.
+    if (pairing.list().length === 0) {
+      state.session?.find?.endBrowserWait().catch(() => {
+        req.log.warn("A work waiting in the browser could not be put back now; it comes back when its project is next unlocked or the library next opened.");
+      });
+    }
     return { removed: true };
   });
 

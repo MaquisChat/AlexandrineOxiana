@@ -11,6 +11,7 @@ import {
   FIND_BROWSER_PAGE_MAX,
   FIND_BROWSER_REFUSALS,
   FIND_BROWSER_STALL_MS,
+  FIND_BROWSER_TAKE_MS,
   FIND_BROWSER_TEXT,
   FIND_FILE_NOT_KEPT_CAUSE,
   FIND_WAITING_PLACES,
@@ -291,8 +292,12 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       cutOff: "The PDF did not arrive whole. The work is still waiting. Try again.",
       held: "Sent. The file waits for your check in the app's review queue.",
       gone: "The file was not kept: the work is no longer waiting for it.",
+      // R353 g: the browser's inbox cannot be used.
+      inbox: "The app's folder for files from your browser cannot be used right now. Nothing was kept. The work is still waiting.",
     });
-    expect([...FIND_BROWSER_REFUSALS]).toEqual(["browser-not-waiting", "browser-page", "browser-busy", "browser-too-large", "browser-not-pdf", "browser-cut-off"]);
+    expect([...FIND_BROWSER_REFUSALS]).toEqual(["browser-not-waiting", "browser-page", "browser-busy", "browser-inbox", "browser-too-large", "browser-not-pdf", "browser-cut-off"]);
+    // R353 a: the body's overall end beside the stall's.
+    expect(FIND_BROWSER_TAKE_MS).toBe(300_000);
     expect([...FIND_BROWSER_FILE_ENDS]).toEqual(["held", "not-kept", "gone"]);
     expect([...FIND_WAITING_PLACES]).toEqual(["window", "browser"]);
     expect([FIND_BROWSER_LABEL_MAX, FIND_BROWSER_NO_TITLE, FIND_BROWSER_PAGE_MAX, FIND_BROWSER_PAGE_HEADER, FIND_BROWSER_STALL_MS]).toEqual([200, "(no title)", 2048, "x-ao-page", 120_000]);

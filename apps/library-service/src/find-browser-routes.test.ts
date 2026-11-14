@@ -128,7 +128,7 @@ async function everything(dir: string): Promise<{ audit: string; queue: string }
   return out;
 }
 
-async function start(o: { stallMs?: number } = {}): Promise<LibraryService> {
+async function start(o: { stallMs?: number; takeMs?: number } = {}): Promise<LibraryService> {
   logs = "";
   const logStream = new Writable({
     write(chunk, _enc, cb) {
@@ -136,7 +136,7 @@ async function start(o: { stallMs?: number } = {}): Promise<LibraryService> {
       cb();
     },
   });
-  svc = await createService({ token: TOKEN, deps, logStream, logLevel: "trace", worker: null, ...(o.stallMs !== undefined ? { browserStallMs: o.stallMs } : {}) });
+  svc = await createService({ token: TOKEN, deps, logStream, logLevel: "trace", worker: null, ...(o.stallMs !== undefined ? { browserStallMs: o.stallMs } : {}), ...(o.takeMs !== undefined ? { browserTakeMs: o.takeMs } : {}) });
   svc.state.events.subscribe((e) => events.push(e));
   return svc;
 }
@@ -281,8 +281,8 @@ const inboxFiles = async () => readdir(inboxOfService()).catch(() => [] as strin
 const reviewItems = async (pid: string) => ((await call({ url: `/projects/${pid}/review` })).json.items ?? []) as Array<Record<string, any>>;
 
 /** A library open, "Your library" set, an extension paired, a project with a resting entry; optionally the browser wait started. */
-async function ready(o: { gov?: string; started?: boolean; stallMs?: number; rest?: Rest } = {}): Promise<{ pid: string; e: FindEntry; url?: string; ticket?: string }> {
-  await start(o.stallMs !== undefined ? { stallMs: o.stallMs } : {});
+async function ready(o: { gov?: string; started?: boolean; stallMs?: number; takeMs?: number; rest?: Rest } = {}): Promise<{ pid: string; e: FindEntry; url?: string; ticket?: string }> {
+  await start({ ...(o.stallMs !== undefined ? { stallMs: o.stallMs } : {}), ...(o.takeMs !== undefined ? { takeMs: o.takeMs } : {}) });
   await openNewLibrary();
   const pid = await newProject(o.gov ? { gov: o.gov } : {});
   await setLibrary();
@@ -1026,4 +1026,223 @@ describe("R348 j: the whole way at the service", () => {
     expect(await inboxFiles()).toEqual([]);
     // A request to the network was never made (afterEach), and nothing leaked.
   });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** One request written on a real socket; resolves with what came back (the head and whatever followed) once the server answers. */
+async function rawRequest(port: number, head: string, body: Buffer): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    let got = "";
+    const sock = connect(port, "127.0.0.1", () => {
+      sock.write(head);
+      sock.write(body);
+    });
+    sock.on("data", (d) => {
+      got += d.toString("latin1");
+      if (/\r\n\r\n[\s\S]*\}/u.test(got)) {
+        sock.destroy();
+        resolve(got);
+      }
+    });
+    sock.on("error", reject);
+    sock.on("close", () => resolve(got));
+  });
+}
+const pairingIds = async () => ((await call({ url: "/extension/pairings" })).json.extensions as Array<{ id: string; origin: string }>);
+const unpair = (id: string) => call({ method: "DELETE", url: `/extension/pairings/${id}` });
+
+describe("R353: F20a's round 2", () => {
+  it("(a) M1: a body trickled one byte inside every stall window is ended at the overall limit, counted from the ticket's check — cut off, the connection closed, the flag released, the ticket open, the inbox emptied", async () => {
+    const { pid, e, ticket } = await ready({ started: true, stallMs: 400, takeMs: 1500 });
+    const pdf = await goodPdf();
+    const slow = new PassThrough();
+    const t0 = Date.now();
+    const p = sendFile(ticket!, slow);
+    slow.write(pdf.subarray(0, 100));
+    let i = 100;
+    const drip = setInterval(() => {
+      if (i < pdf.length - 1) slow.write(pdf.subarray(i, ++i));
+    }, 150);
+    try {
+      const r = await p;
+      const took = Date.now() - t0;
+      expect([r.status, r.json.error.code, r.json.error.reason, r.json.error.message]).toEqual([400, "VALIDATION", "browser-cut-off", FIND_BROWSER_TEXT.cutOff]);
+      expect(r.headers.connection).toBe("close");
+      expect(took).toBeGreaterThanOrEqual(1400);
+      expect(took).toBeLessThan(10_000);
+    } finally {
+      clearInterval(drip);
+      slow.destroy();
+    }
+    expect(await inboxFiles()).toEqual([]);
+    await stillServes(pid, e, ticket!);
+  });
+
+  it("(b) M2: logUrl writes [redacted] for every path segment of exactly 32 hexadecimal digits, wherever it stands and in either case; an ordinary path with a project's id is logged as before", () => {
+    const t = "0123456789abcdef0123456789abcdef";
+    const T = t.toUpperCase();
+    for (const [url, want] of [
+      [`/find/browser/./file/${t}`, "/find/browser/./file/[redacted]"],
+      // `file;` is a segment of its own, not a ticket; the ticket's own segment after it goes.
+      [`/find/browser/file;/${t}`, "/find/browser/file;/[redacted]"],
+      [`/x/find/browser/file/${t}`, "/x/find/browser/file/[redacted]"],
+      [`/find/browser/files/${t}`, "/find/browser/files/[redacted]"],
+      [`/find/browser/waiting/${t}`, "/find/browser/waiting/[redacted]"],
+      [`/find/browser/waiting/${T}`, "/find/browser/waiting/[redacted]"],
+      [`/${t}`, "/[redacted]"],
+      [`/a/${t}/b?x=${t}`, "/a/[redacted]/b"],
+      [`/find/browser/files/${t}/`, "/find/browser/files/[redacted]/"],
+      // Decoded as for the media path: an encoded separator still bounds the segment.
+      [`/x%2F${t}`, "/x/[redacted]"],
+      [`/x%252F${t}%252Fy`, "/x/[redacted]/y"],
+      // A ticket with other characters in the same segment (not exactly 32 hex digits, but bounded by them): it goes too.
+      [`/find/browser/files/${t};x`, "/find/browser/files/[redacted];x"],
+      [`/find/browser/files/x;${t}`, "/find/browser/files/x;[redacted]"],
+    ] as const) {
+      const logged = logUrl(url);
+      expect(logged, url).toBe(want);
+      expect(logged).not.toContain(t.slice(0, 8));
+      expect(logged).not.toContain(T.slice(0, 8));
+    }
+    // Not a ticket: 31 or 33 hex digits within a longer run of ticket characters is left (the 40-run rule as before).
+    expect(logUrl(`/x/${t.slice(1)}`)).toBe(`/x/${t.slice(1)}`);
+    // Ordinary paths, as before.
+    const pid = "019a4f2e-7c1d-7b3a-8e2f-0123456789ab";
+    const eid = "019a4f2e-7c1d-7b3a-8e2f-ba9876543210";
+    for (const url of [`/projects/${pid}/find/${eid}/browser/start`, `/projects/${pid}/sources`, "/find/browser/waiting", `/projects/${pid.replace(/-/gu, "")}x`]) expect(logUrl(url)).toBe(url.split("?")[0]);
+  });
+
+  it("(c) M3: the preflight of the file route from the paired Origin allows x-ao-page; nothing else of it changes", async () => {
+    await ready({ started: true });
+    const t = "0".repeat(32);
+    const pre = await svc!.app.inject({ method: "OPTIONS", url: `/find/browser/file/${t}`, headers: { ...host, origin: EXT, "access-control-request-method": "POST", "access-control-request-headers": "authorization, content-type, x-ao-page" } });
+    expect(pre.statusCode).toBe(204);
+    expect(String(pre.headers["access-control-allow-headers"]).split(/,\s*/u).sort()).toEqual(["authorization", "content-type", "x-ao-page"]);
+    expect([pre.headers["access-control-allow-origin"], pre.headers["access-control-allow-methods"], pre.headers["access-control-max-age"]]).toEqual([EXT, "GET, POST, PUT, PATCH, DELETE", "600"]);
+    // Another Origin: refused as before.
+    expect((await svc!.app.inject({ method: "OPTIONS", url: `/find/browser/file/${t}`, headers: { ...host, origin: OTHER_EXT, "access-control-request-method": "POST" } })).statusCode).toBe(403);
+    // The paired extension's preflight of another route: as before (the shell's are documents-route.test.ts's).
+    const list = await svc!.app.inject({ method: "OPTIONS", url: "/find/browser/waiting", headers: { ...host, origin: EXT, "access-control-request-method": "POST" } });
+    expect([list.statusCode, list.headers["access-control-allow-headers"]]).toEqual([204, "authorization, content-type"]);
+  });
+
+  it("(d) M4: unpairing the LAST extension ends a browser wait — the entry back at its rest as by Cancel, nothing listed to a newly paired extension, the old ticket refused; the removal answers as before", async () => {
+    const { pid, e, ticket } = await ready({ started: true, rest: { state: "no-open-copy" } });
+    const [paired] = await pairingIds();
+    const n = events.length;
+    const r = await unpair(paired!.id);
+    expect([r.status, r.json]).toEqual([200, { removed: true }]);
+    await until(async () => (await view(pid, e.id)).state === "no-open-copy", "the entry to come back");
+    const v = await view(pid, e.id);
+    expect(v).not.toHaveProperty("waitingIn");
+    expect(v).not.toHaveProperty("browserStart");
+    expect(events.slice(n).filter((x) => x.type === "find.progress").map((x) => x.data)).toEqual([{ projectId: pid, entryId: e.id, state: "no-open-copy" }]);
+    // The audit: as a cancel's (an update of the entry), nothing of the ticket, the title or the address (afterEach).
+    extToken = await pairExtension(OTHER_EXT);
+    expect((await waitingList({ origin: OTHER_EXT })).json).toEqual({ waiting: [] });
+    const old = await sendFile(ticket!, await goodPdf(), { origin: OTHER_EXT });
+    expect([old.status, old.json.error.reason]).toEqual([404, "browser-not-waiting"]);
+    expect(await inboxFiles()).toEqual([]);
+    expect(logs).not.toMatch(/could not be put back/u);
+  });
+
+  it("(d) M4: with another extension still paired, unpairing one changes nothing; a work waiting in the WINDOW is never touched", async () => {
+    const { pid, e, ticket } = await ready({ started: true });
+    const first = extToken;
+    const second = await pairExtension(OTHER_EXT);
+    const ids = await pairingIds();
+    expect(ids).toHaveLength(2);
+    expect((await unpair(ids.find((x) => x.origin === EXT)!.id)).status).toBe(200);
+    await sleep(100);
+    expect((await view(pid, e.id)).waitingIn).toBe("browser");
+    extToken = second;
+    expect((await waitingList({ origin: OTHER_EXT })).json.waiting).toEqual([{ ticket, label: TITLE }]);
+    expect(first).not.toBe(second);
+    // The window's wait: the last extension unpaired, the window still waits with its ticket.
+    await cancel(pid, e.id);
+    const w = await windowStart(pid, e.id);
+    expect(w.status).toBe(200);
+    expect((await unpair(ids.find((x) => x.origin === OTHER_EXT)!.id)).status).toBe(200);
+    expect(await pairingIds()).toEqual([]);
+    await sleep(100);
+    expect((await view(pid, e.id)).state).toBe("waiting-sign-in");
+    expect(svc!.state.session!.find!.waitingIn(pid, e.id)).toBe("window");
+    expect(svc!.state.session!.find!.libraryHandedOver(w.json.ticket, "window")).toEqual({ projectId: pid, entryId: e.id });
+  });
+
+  it("(e) M5: a window's ticket given to the file route with a slowly sent body — the 404 of a wrong ticket, and the body is NOT taken: the inbox stays empty throughout", async () => {
+    const { pid, e } = await ready();
+    const w = await windowStart(pid, e.id);
+    expect(w.status, w.body).toBe(200);
+    const pdf = await goodPdf();
+    const slow = new PassThrough();
+    const p = sendFile(w.json.ticket, slow);
+    slow.write(pdf.subarray(0, 100));
+    let answered: Answer | null = null;
+    void p.then((a) => (answered = a));
+    for (let k = 0; k < 15; k++) {
+      await sleep(100);
+      expect(await inboxFiles(), `after ${(k + 1) * 100} ms`).toEqual([]);
+      if (k < 10) slow.write(pdf.subarray(100 + k, 101 + k));
+    }
+    expect(answered, "answered before the body ended").not.toBeNull();
+    expect([answered!.status, answered!.json.error.reason]).toEqual([404, "browser-not-waiting"]);
+    slow.end();
+    await p;
+    expect(await inboxFiles()).toEqual([]);
+    expect(svc!.state.session!.find!.waitingIn(pid, e.id)).toBe("window");
+  });
+
+  it("(f) M6: x-ao-page given twice, or one value holding a comma and a space — 400 browser-page; the ticket stays open", async () => {
+    const { pid, e, ticket } = await ready({ started: true });
+    const pdf = await goodPdf();
+    const joined = await sendFile(ticket!, pdf, { page: `${TAB}, https://other.example/y` });
+    expect([joined.status, joined.json.error.code, joined.json.error.reason, joined.json.error.message]).toEqual([400, "VALIDATION", "browser-page", FIND_BROWSER_TEXT.page]);
+    // Sent twice on a real connection (Node joins the two values).
+    const port = await svc!.listen(0);
+    host = { host: `127.0.0.1:${port}` };
+    for (const second of [TAB, "https://other.example/y"]) {
+      const got = await rawRequest(
+        port,
+        `POST /find/browser/file/${ticket} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${extToken}\r\nOrigin: ${EXT}\r\nContent-Type: application/pdf\r\nx-ao-page: ${TAB}\r\nx-ao-page: ${second}\r\nContent-Length: ${pdf.length}\r\nConnection: close\r\n\r\n`,
+        pdf,
+      );
+      expect(got.split("\r\n")[0]).toBe("HTTP/1.1 400 Bad Request");
+      expect(got).toContain('"reason":"browser-page"');
+      errorBodies.push(got);
+    }
+    expect(await inboxFiles()).toEqual([]);
+    await stillServes(pid, e, ticket!);
+  });
+
+  for (const how of ["open to others (0755)", "a link to another folder"] as const) {
+    it(`(g) M7: an inbox ${how} is not written into — 503 browser-inbox, a warning without the path, the flag released, the ticket open; put right, the same ticket succeeds`, async () => {
+      const { pid, e, ticket } = await ready({ started: true });
+      const inbox = inboxOfService();
+      const elsewhere = join(tmp, "elsewhere-inbox");
+      await mkdir(inbox, { recursive: true, mode: 0o700 });
+      if (how === "open to others (0755)") await chmod(inbox, 0o755);
+      else {
+        await rm(inbox, { recursive: true, force: true });
+        await mkdir(elsewhere, { recursive: true, mode: 0o700 });
+        await symlink(elsewhere, inbox);
+      }
+      for (let k = 0; k < 2; k++) {
+        const r = await sendFile(ticket!, await goodPdf());
+        expect([r.status, r.json.error.code, r.json.error.reason, r.json.error.message]).toEqual([503, "UNAVAILABLE", "browser-inbox", FIND_BROWSER_TEXT.inbox]);
+        expect(r.headers.connection).not.toBe("close");
+      }
+      expect(await readdir(how === "a link to another folder" ? elsewhere : inbox)).toEqual([]);
+      expect(logs).toContain("The folder for files from the browser cannot be used");
+      expect(logs).not.toContain(tmp);
+      expect((await view(pid, e.id)).state).toBe("waiting-sign-in");
+      expect((await waitingList()).json.waiting).toHaveLength(1);
+      // Put right: the same ticket succeeds.
+      if (how === "open to others (0755)") await chmod(inbox, 0o700);
+      else await rm(inbox);
+      await stillServes(pid, e, ticket!);
+    });
+  }
 });
