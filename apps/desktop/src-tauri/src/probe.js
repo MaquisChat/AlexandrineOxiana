@@ -166,6 +166,19 @@
         });
       }
     }
+    // Task F19: when the check asks for the sign-in window's own probe, open that window once, as
+    // the app's page does (a ticket of 32 hex digits and an https address); its probe reports to the check.
+    if (cfg.libraryOpen && window.__TAURI_INTERNALS__) {
+      await step("libraryWindowOpened", async function () {
+        var bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        var ticket = Array.from(bytes, function (b) {
+          return (b < 16 ? "0" : "") + b.toString(16);
+        }).join("");
+        var opened = await window.__TAURI_INTERNALS__.invoke("open_library_window", { ticket: ticket, url: cfg.libraryOpen });
+        return opened === true ? "ok" : "answered " + JSON.stringify(opened);
+      });
+    }
   };
 
   window.addEventListener("load", function () {

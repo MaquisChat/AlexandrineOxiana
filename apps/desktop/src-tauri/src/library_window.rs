@@ -1756,6 +1756,12 @@ impl Host for TauriHost {
                 }
             })
             .devtools(cfg!(debug_assertions));
+        // The launch check's probe (debug builds, test mode, its switch set; R343 b).
+        #[cfg(debug_assertions)]
+        let builder = match library_probe::from_env(self.test_mode()) {
+            Some(report) => builder.initialization_script(library_probe::script(&report)),
+            None => builder,
+        };
         let Ok(w) = window_store(builder, store).build() else { return false };
         let closed = self.clone();
         w.on_window_event(move |e| {
@@ -1827,6 +1833,62 @@ impl Host for TauriHost {
             return false;
         }
         remove_data_stores(&self.app)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The launch check's probe of this window (Task F19, R343 b): debug builds only.
+
+/// The sign-in window's probe (`library_probe.js`): compiled into debug builds only, and given to the
+/// window only in test mode (`lib.rs` `test_mode()`: a debug build with NODE_ENV=test) with
+/// `AO_SHELL_LIBRARY_PROBE` set to the launch check's report address, exactly
+/// `http://127.0.0.1:<port>/report`. A release build has neither the script nor the switch (pinned
+/// by `a_release_build_has_neither_the_sign_in_windows_probe_nor_its_switch`). The probe tries every
+/// command from inside the window and reports what happened by navigating to that address.
+#[cfg(debug_assertions)]
+pub mod library_probe {
+    use tauri::Url;
+
+    const SCRIPT: &str = include_str!("library_probe.js");
+    /// The switch (test mode only): the check's report address.
+    pub const SWITCH: &str = "AO_SHELL_LIBRARY_PROBE";
+
+    /// The report address, only in its one accepted form: `http://127.0.0.1:<port>/report`.
+    pub fn report_address(v: &str) -> Option<Url> {
+        let u = Url::parse(v).ok()?;
+        let ok = u.scheme() == "http"
+            && u.host_str() == Some("127.0.0.1")
+            && u.port().is_some_and(|p| p != 0)
+            && u.path() == "/report"
+            && u.query().is_none()
+            && u.fragment().is_none()
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.as_str() == v;
+        ok.then_some(u)
+    }
+
+    /// The report address when the probe is asked for: test mode and the switch in its accepted form.
+    pub fn from_env(test_mode: bool) -> Option<Url> {
+        if !test_mode {
+            return None;
+        }
+        report_address(&std::env::var(SWITCH).ok()?)
+    }
+
+    /// The probe with its configuration: the report address and the check's own page beside it.
+    pub fn script(report: &Url) -> String {
+        let mut page = report.clone();
+        page.set_path("/page");
+        let cfg = serde_json::json!({ "report": report.as_str(), "page": page.as_str() });
+        SCRIPT.replace("__LIBRARY_PROBE_CONFIG__", &cfg.to_string())
+    }
+
+    /// Where the main window's probe opens the sign-in window: an https address on the check's port,
+    /// which the check does not serve over TLS — the window shows its error page, and the probe goes
+    /// on from there to the check's own page (a page outside the app, as any library's is).
+    pub fn open_address(report: &Url) -> String {
+        format!("https://127.0.0.1:{}/sign-in", report.port().unwrap_or(0))
     }
 }
 
@@ -3659,5 +3721,136 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         let mut want: Vec<String> = six.iter().chain(["pick_watch_folder"].iter()).flat_map(|c| [format!("allow-{}", c.replace('_', "-")), format!("deny-{}", c.replace('_', "-"))]).collect();
         want.sort();
         assert_eq!(app_perms, want.iter().collect::<Vec<_>>());
+    }
+
+    // ----- the launch check's probe of this window (Task F19, R343 b) -----
+
+    /// `src` as a release build compiles it: every item under `#[cfg(debug_assertions)]` or
+    /// `#[cfg(test)]` (with the attributes and doc comments after that attribute) removed — a block
+    /// to its matching brace, anything else to its `;`. (`cfg!(…)` expressions are compiled in
+    /// every build, so they are kept.)
+    fn as_released(src: &str) -> String {
+        let mut out = String::new();
+        let mut rest = src;
+        loop {
+            let at = [rest.find("#[cfg(debug_assertions)]"), rest.find("#[cfg(test)]")].into_iter().flatten().min();
+            let Some(at) = at else {
+                out.push_str(rest);
+                return out;
+            };
+            out.push_str(&rest[..at]);
+            let mut i = at + rest[at..].find(']').unwrap() + 1;
+            let b = rest.as_bytes();
+            // Further attributes and doc comments belong to the same item.
+            loop {
+                while i < b.len() && (b[i] as char).is_whitespace() {
+                    i += 1;
+                }
+                if rest[i..].starts_with("#[") {
+                    i += rest[i..].find(']').unwrap() + 1;
+                } else if rest[i..].starts_with("//") {
+                    i += rest[i..].find('\n').unwrap_or(rest.len() - i);
+                } else {
+                    break;
+                }
+            }
+            let semi = rest[i..].find(';').map(|k| i + k);
+            let brace = rest[i..].find('{').map(|k| i + k);
+            let end = match (brace, semi) {
+                (Some(o), s) if s.is_none_or(|s| o < s) => block_end(rest, o),
+                (_, Some(s)) => s + 1,
+                _ => rest.len(),
+            };
+            rest = &rest[end..];
+        }
+    }
+
+    /// The end (just past the matching `}`) of the block opening at `open`, with the braces inside
+    /// string literals (plain, byte and raw), character literals and comments not counted.
+    fn block_end(src: &str, open: usize) -> usize {
+        let b = src.as_bytes();
+        let mut depth = 0usize;
+        let mut k = open;
+        while k < b.len() {
+            match b[k] {
+                b'/' if b.get(k + 1) == Some(&b'/') => k += src[k..].find('\n').unwrap_or(src.len() - k),
+                b'/' if b.get(k + 1) == Some(&b'*') => k += src[k..].find("*/").map_or(src.len() - k, |e| e + 1),
+                b'r' if matches!(b.get(k + 1), Some(b'"') | Some(b'#')) && (!b[k - 1].is_ascii_alphanumeric() || (b[k - 1] == b'b' && !b[k - 2].is_ascii_alphanumeric())) => {
+                    let hashes = b[k + 1..].iter().take_while(|&&c| c == b'#').count();
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let body = k + 2 + hashes;
+                    k = body + src[body..].find(&close).unwrap() + close.len() - 1;
+                }
+                b'"' => {
+                    k += 1;
+                    while b[k] != b'"' {
+                        k += if b[k] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                // A character literal ('x', '\n', '\''), not a lifetime ('a).
+                b'\'' if b.get(k + 1) == Some(&b'\\') => k += 3 + src[k + 3..].find('\'').unwrap(),
+                b'\'' if b.get(k + 2) == Some(&b'\'') => k += 2,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return k + 1;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        src.len()
+    }
+
+    #[test]
+    fn a_release_build_has_neither_the_sign_in_windows_probe_nor_its_switch() {
+        let files = [("library_window.rs", include_str!("library_window.rs")), ("lib.rs", include_str!("lib.rs"))];
+        let mut seen_in_debug = (false, false);
+        for (name, src) in files {
+            seen_in_debug.0 |= src.contains("library_probe.js");
+            seen_in_debug.1 |= src.contains("AO_SHELL_LIBRARY_PROBE");
+            // Comment lines compile to nothing (a doc comment goes with its item).
+            let released: String = as_released(src).lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+            assert!(!released.contains("library_probe"), "{name}: a release build would hold the sign-in window's probe");
+            assert!(!released.contains("AO_SHELL_LIBRARY_PROBE"), "{name}: a release build would read the probe's switch");
+            // The main window's probe module is debug-only as well (it reads the same switch).
+            assert!(!released.contains("probe::"), "{name}: a release build would call a probe");
+        }
+        // The control: the debug build has both (so the stripping above is what removed them).
+        assert_eq!(seen_in_debug, (true, true));
+        // And the stripping itself: a gated block, a gated statement and a gated item with its doc go; the rest stays.
+        let s = "a();\n#[cfg(debug_assertions)]\n{ b({}); }\nc();\n#[cfg(debug_assertions)]\nlet x = 1;\n#[cfg(test)]\n/// doc\n#[allow(x)]\nmod t { fn y() {} }\nd();\n#[cfg(test)]\nmod u { const S: &str = \"}{\\\"}\"; const C: char = '}'; const R: &str = r#\"}\"#; // }\n }\ne();";
+        assert_eq!(as_released(s).split_whitespace().collect::<String>(), "a();c();d();e();");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_probe_reports_only_to_the_checks_own_loopback_address() {
+        use super::library_probe::{open_address, report_address, script};
+        let r = report_address("http://127.0.0.1:40125/report").unwrap();
+        assert_eq!(r.as_str(), "http://127.0.0.1:40125/report");
+        let s = script(&r);
+        assert!(!s.contains("__LIBRARY_PROBE_CONFIG__"));
+        assert!(s.contains(r#"{"page":"http://127.0.0.1:40125/page","report":"http://127.0.0.1:40125/report"}"#), "{s}");
+        // The main window's probe opens the sign-in window at an https address of the same port.
+        assert_eq!(open_address(&r), "https://127.0.0.1:40125/sign-in");
+        assert!(window_address(&open_address(&r)).is_some());
+        for bad in [
+            "",
+            "https://127.0.0.1:40125/report",
+            "http://127.0.0.2:40125/report",
+            "http://localhost:40125/report",
+            "http://127.0.0.1/report",
+            "http://127.0.0.1:0/report",
+            "http://127.0.0.1:40125/report?x=1",
+            "http://127.0.0.1:40125/other",
+            "http://u:p@127.0.0.1:40125/report",
+            "http://127.0.0.1:40125/report#x",
+            "http://example.org:40125/report",
+        ] {
+            assert!(report_address(bad).is_none(), "{bad}");
+        }
     }
 }
