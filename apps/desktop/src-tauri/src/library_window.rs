@@ -1582,6 +1582,10 @@ impl Host for TauriHost {
             .user_agent(USER_AGENT)
             .initialization_script(SCRIPT)
             .on_navigation(navigation_allowed)
+            // The web view itself never saves a file: a download it would start is refused (the
+            // shell's own fetch is the only way a file is kept; WebKitGTK shows no PDF and would
+            // otherwise save it to the Downloads folder).
+            .on_download(|_webview, _event| false)
             .on_new_window(move |u, _features| {
                 if let Some(target) = new_window_target(&u) {
                     // Off the web view's own callback: the navigation is posted to the main thread.
