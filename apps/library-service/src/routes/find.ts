@@ -21,6 +21,10 @@
  * Task F15 (R324 a, d): the queue's answer gives each entry resting as R324 a names its "Where to get it" (`offers`,
  * joined) and `library` (whether "Get through my library" may start); `returnTo` is never sent. The start and cancel
  * routes are in routes/your-library.ts.
+ *
+ * Task F18c (R345): such an entry's view also says whether "Open it here and fetch the PDF" may start at its links
+ * (`linkStart: true`, only when it carries links), a file of a link's start not kept says so (`library.lastFileFrom`),
+ * and an entry waiting in the sign-in window opened at one of its links says so (`windowStart: "link"`).
  */
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { isId } from "@ao/core";
@@ -117,7 +121,7 @@ true satisfies Same<FindStoppedFor["code"] | "index-needs-rebuild", FindStoppedC
 true satisfies Same<WorkCandidate, FindWorkCandidate>;
 true satisfies Same<OfferLink, FindOfferLink>;
 true satisfies Same<LibraryMatch, FindMatch>;
-true satisfies Same<Omit<FindEntry, "people" | "works" | "removed" | "returnTo"> & { peopleCount?: number; worksCount?: number; addedCount?: number; authorOffer?: FindAuthorOffer; library?: FindLibraryChance }, FindEntryView>;
+true satisfies Same<Omit<FindEntry, "people" | "works" | "removed" | "returnTo"> & { peopleCount?: number; worksCount?: number; addedCount?: number; authorOffer?: FindAuthorOffer; library?: FindLibraryChance; linkStart?: true; windowStart?: "link" }, FindEntryView>;
 true satisfies Same<PersonCandidate, FindPersonCandidate>;
 true satisfies Same<typeof LIBRARY_PEOPLE_MAX, typeof FIND_PEOPLE_MAX>;
 true satisfies Same<typeof LIBRARY_PERSON_WORKS_MAX, typeof FIND_PERSON_WORKS_MAX>;
@@ -137,7 +141,7 @@ export function entryView(e: FindEntry, added?: ReadonlySet<string>, library?: L
   const { people, works, removed: _removed, candidates, morePeople, returnTo: _returnTo, offers: stored, ...rest } = e;
   // F15: on an entry with library parts, its offers are the joined list (none: no offers); on an entry waiting in the
   // sign-in window none (its stored links are kept for its return); otherwise as stored.
-  const offers = library ? library.offers : e.state === "waiting-sign-in" ? undefined : stored;
+  const offers = e.state === "waiting-sign-in" ? undefined : library ? library.offers : stored;
   const n = works && added ? works.filter((w) => added.has(w.id)).length : 0;
   // F8b (R279 c): an entry asking among works with people stored beside them carries an author offer — counts only.
   const offer = e.state === "choose" && people?.length ? { peopleCount: people.length, ...(morePeople ? { morePeople } : {}) } : undefined;
@@ -153,11 +157,18 @@ export function entryView(e: FindEntry, added?: ReadonlySet<string>, library?: L
     // the plan's) and whether a start through the library is offered.
     ...(offers !== undefined && (!library || offers.length > 0) ? { offers } : {}),
     ...(library?.library ? { library: library.library } : {}),
+    // F18c (R345 b): "Open it here and fetch the PDF" — only where links are shown.
+    ...(library?.linkStart && offers?.length ? { linkStart: true as const } : {}),
+    // F18c (R345 e): a wait in the sign-in window opened at one of the entry's links.
+    ...(e.state === "waiting-sign-in" && library?.windowStart === "link" ? { windowStart: "link" as const } : {}),
   };
 }
 
-/** Task F15: the parts of an entry's view about the library (only for an entry resting as R324 a names). */
-export type LibraryParts = { offers: OfferLink[]; library?: FindLibraryChance };
+/**
+ * Task F15: the parts of an entry's view about the library (only for an entry resting as R324 a names). F18c: whether
+ * a link start may be made (`linkStart`); for an entry waiting in the sign-in window, only `windowStart` (no offers).
+ */
+export type LibraryParts = { offers: OfferLink[]; library?: FindLibraryChance; linkStart?: true; windowStart?: "link" };
 
 /**
  * Task F15 (R324 a, d): for the entries of a project's queue, the library parts of their views: "Where to get it" (the
@@ -170,6 +181,8 @@ export type LibraryParts = { offers: OfferLink[]; library?: FindLibraryChance };
 export async function libraryPartsOf(appConfigDir: string, s: Session, projectId: string, entries: Iterable<FindEntry>): Promise<Map<string, LibraryParts>> {
   const out = new Map<string, LibraryParts>();
   const list = [...entries];
+  // F18c (R345 e): an entry waiting in the sign-in window opened at one of its links (the runner's memory only).
+  for (const e of list) if (e.state === "waiting-sign-in" && s.find?.windowStartOf(projectId, e.id) === "link") out.set(e.id, { offers: [], windowStart: "link" });
   if (!list.some(restsForLibrary)) return out;
   const { settings } = await readYourLibrary(appConfigDir);
   const runner = s.find;
@@ -186,8 +199,8 @@ export async function libraryPartsOf(appConfigDir: string, s: Session, projectId
     const offers = whereToGetIt(c.work, settings, byId.get(id)?.offers ?? []);
     const chance: FindLibraryChance | undefined = c.chance === "yes" ? { canStart: true } : c.chance === "no-library" ? { canStart: false, reason: "no-library" } : undefined;
     // Task F17 (R329 g): what became of the last file handed over that could not be held (the runner's memory only).
-    const library: FindLibraryChance | undefined = c.lastFile ? { ...(chance ?? { canStart: false, reason: "not-offered" }), lastFile: c.lastFile } : chance;
-    out.set(id, { offers, ...(library ? { library } : {}) });
+    const library: FindLibraryChance | undefined = c.lastFile ? { ...(chance ?? { canStart: false, reason: "not-offered" }), lastFile: c.lastFile, ...(c.lastFileFrom === "link" ? { lastFileFrom: "link" as const } : {}) } : chance;
+    out.set(id, { offers, ...(library ? { library } : {}), ...(c.link ? { linkStart: true as const } : {}) });
   }
   return out;
 }
