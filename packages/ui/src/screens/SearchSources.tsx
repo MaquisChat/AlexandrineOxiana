@@ -87,7 +87,7 @@ export const SEARCH_SOURCES_TEXT = {
 
 /** The services' names (the product's own words). */
 const RECORD_NAME: Record<SearchRecordSource, string> = { crossref: "Crossref", openalex: "OpenAlex", elicit: "Elicit" };
-const COPY_NAME: Record<SearchCopySource, string> = {
+export const COPY_NAME: Record<SearchCopySource, string> = {
   openalex: "OpenAlex",
   unpaywall: "Unpaywall",
   arxiv: "arXiv",

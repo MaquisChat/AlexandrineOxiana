@@ -12,7 +12,14 @@
  * from the record's field checks: a cleared review item does not make them say "confirmed by you"
  * (R137). Every answer is dropped when the source changed, the screen closed or the project locked
  * in the meantime.
+ *
+ * Task F18b (R340 e, R330 b): a file got by Find and acquire says, under its line, how it was got — where from (a free
+ * copy and the service that found it, as the Search sources screen names it; or through the researcher's library), when,
+ * and what the app's check had said when the researcher used it — from the file's own `acquired` record. The host is
+ * parsed from the recorded address (never taken as given); every part from the record is shown through UserText. A
+ * file without such a record shows nothing new.
  */
+import { HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { errorText, isProjectLocked, type Asset, type Creator, type LibraryApi, type SourcePatch } from "../api/library";
 import { isShowablePicture, type FieldReview, type PendingJob, type VerifiedSource } from "../api/verification";
@@ -28,6 +35,7 @@ import { FieldCheck } from "../components/VerificationBadge";
 import { valueText } from "../components/FieldEvidencePopover";
 import "../components/library.css";
 import "../components/verification.css";
+import { COPY_NAME } from "./SearchSources";
 
 export interface SourceDetailProps {
   api: Pick<LibraryApi, "sources" | "citations" | "verification" | "watchedFolders">;
@@ -77,6 +85,58 @@ export const FIELD_LABELS: Record<string, string> = {
   "/identifiers/isbn": "ISBN",
 };
 const fieldLabel = (pointer: string) => FIELD_LABELS[pointer] ?? pointer.replace(/^\//, "").replace(/\//g, " ");
+
+/** The date form this screen already uses (the availability mark's): "Nov 14, 2026". */
+const ACQUIRED_DATE = new Intl.DateTimeFormat("en", { dateStyle: "medium" });
+/** The check's doubts a record may name (`AcquiredFrom.check.why`): each in the review queue's own words. */
+const DOUBTS: ReadonlySet<string> = new Set(["other-doi", "title-absent", "no-text", "other-version", "other-kind"]);
+
+/** Words with the parts that come from the record marked: those are shown through UserText. */
+type AcquiredWords = Array<string | { user: string }>;
+
+/**
+ * How a file was got, in words (R340 e), from its `acquired` record read defensively; undefined for a file without one.
+ * `<host>` is parsed from the recorded address, never taken from anything else in the record.
+ */
+export function acquiredWords(a: Asset): AcquiredWords | undefined {
+  const r: unknown = a.acquired;
+  if (!r || typeof r !== "object" || Array.isArray(r)) return undefined;
+  const { method, service, address, at, check } = r as Record<string, unknown>;
+  let host: string | undefined;
+  try {
+    const u = new URL(typeof address === "string" ? address : "");
+    if ((u.protocol === "https:" || u.protocol === "http:") && u.host) host = u.host;
+  } catch {
+    host = undefined;
+  }
+  const out: AcquiredWords = [];
+  if (method === "free_copy") {
+    const svc = typeof service === "string" && Object.hasOwn(COPY_NAME, service) ? COPY_NAME[service as keyof typeof COPY_NAME] : undefined;
+    out.push("A free copy");
+    if (host) out.push(" from ", { user: host });
+    if (svc) out.push(", found through ", svc);
+    out.push(".");
+  } else if (method === "library_access") {
+    out.push(...(host ? ["Fetched through your library (", { user: host }, ")."] : ["Fetched through your library."]));
+  } else out.push("Added by Find and acquire.");
+  const when = typeof at === "string" ? new Date(at) : undefined;
+  if (when && !Number.isNaN(when.getTime())) out.push(" Added on ", { user: ACQUIRED_DATE.format(when) }, ".");
+  const c = check && typeof check === "object" ? (check as Record<string, unknown>) : undefined;
+  if (c?.result === "match") out.push(" The app's check had said it looked like the right file.");
+  else if (c?.result === "accepted-after-mismatch" && typeof c.why === "string" && DOUBTS.has(c.why))
+    out.push(` You used it although the app's check had a doubt: ${HELD_FILE_WHY_TEXT[c.why as keyof typeof HELD_FILE_WHY_TEXT]}`);
+  return out;
+}
+
+function AcquiredLine({ asset }: { asset: Asset }) {
+  const words = acquiredWords(asset);
+  if (!words) return null;
+  return (
+    <p className="ao-muted ao-source__acquired">
+      {words.map((w, i) => (typeof w === "string" ? <span key={i}>{w}</span> : <UserText key={i}>{w.user}</UserText>))}
+    </p>
+  );
+}
 
 function formatBytes(n: number | undefined): string {
   if (n === undefined) return "";
@@ -605,6 +665,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
               {file.assets.map((a) => (
                 <li key={a.id}>
                   <UserText>{baseName(a.path)}</UserText> <span className="ao-muted">{[a.kind, formatBytes(a.bytes), a.encrypted ? "encrypted" : ""].filter(Boolean).join(" · ")}</span>
+                  <AcquiredLine asset={a} />
                 </li>
               ))}
             </ul>
