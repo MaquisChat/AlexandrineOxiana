@@ -42,10 +42,19 @@
  * before pressing again (the product's 600 ms quiet, which the screen does not show ending: `decide`). What the service holds (a source's files, the queue) and what is on disk is read only AFTER the screen
  * has shown the state it follows.
  *
- * **Pressing a found file's control by mouse (R322, R323).** The screen takes a mouse press only where the pointer
+ * **Pressing a found file's control by mouse (R322, R323, R327).** The screen takes a mouse press only where the pointer
  * really moved over that control and the control still stands there (the first movement the page sees does not count,
- * nor one reporting the same place, and a scroll forgets it): `pressByMouse` scrolls first, then moves beside the
- * control and onto it, then presses. A press not taken would show "Not taken: …" on the card.
+ * nor one reporting the same place, and a scroll forgets it), and (R327 b) not when it begins within 250 ms
+ * (SCROLL_SETTLE_MS) after a scroll of the page: `pressByMouse` scrolls first, waits until the page is at rest — the
+ * control at the same place on two looks in a row and the page's own last scroll event more than that behind (read from
+ * the page, not a fixed time) — then moves beside the control and onto it, then presses. A press not taken for its place
+ * would show "Not taken. Look at the file, then move the pointer and press again." on the card; `decide` accepts only
+ * the quiet's sentence as a reason to press again, so that one fails the scenario.
+ *
+ * **Search sources (R326, R330 c).** A save of "Search sources" wakes the entries those settings had stopped, and
+ * "Try again" is offered on them. Scenario 7 proves it end to end: with every copy service off the row rests "Record
+ * complete" with "Switched off in Search sources." and "Try again"; "Try again" while they are still off leaves it so,
+ * with nothing asked; Europe PMC switched on and saved, the entry goes on with no further press and its file waits.
  */
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -213,13 +222,39 @@ async function openReviewQueue(page: Page, projectId: string): Promise<void> {
   await expect(page.getByRole("heading", { level: 2, name: WORDS.section })).toBeVisible({ timeout: STATE_TIMEOUT });
 }
 
+/** ReviewQueue.tsx SCROLL_SETTLE_MS (R327 b): a mouse press that begins this soon after a scroll of the page is not taken. */
+const SCROLL_SETTLE_MS = 250;
+
 /**
- * A press by mouse as a researcher makes it (R322, R323): the control brought into view first (a scroll forgets where
- * controls stood), then the pointer moved beside it and onto it — two movements at different places — then pressed.
+ * A press by mouse as a researcher makes it (R322, R323, R327 b): the control brought into view first (a scroll forgets
+ * where controls stood), then — once the page has come to rest: the control stands at the same place on two looks in a
+ * row and the page's own last scroll event is more than SCROLL_SETTLE_MS behind (both read from the page, not a fixed
+ * time) — the pointer moved beside it and onto it (two movements at different places), then pressed.
  */
 async function pressByMouse(page: Page, control: ReturnType<Page["getByRole"]>): Promise<{ x: number; y: number }> {
+  // The page's last scroll event, as the screen sees it (window, capture phase); installed once per page.
+  await page.evaluate(() => {
+    const w = window as unknown as { __aoLastScroll?: number };
+    if (w.__aoLastScroll !== undefined) return;
+    w.__aoLastScroll = Number.NEGATIVE_INFINITY;
+    window.addEventListener("scroll", () => void (w.__aoLastScroll = performance.now()), true);
+  });
   await control.scrollIntoViewIfNeeded();
   await expect(control).toBeVisible();
+  let last = "";
+  await expect
+    .poll(
+      async () => {
+        const b = await control.boundingBox();
+        const at = JSON.stringify(b && [Math.round(b.x), Math.round(b.y)]);
+        const sinceScroll = await page.evaluate(() => performance.now() - (window as unknown as { __aoLastScroll: number }).__aoLastScroll);
+        const settled = b !== null && at === last && sinceScroll > SCROLL_SETTLE_MS + 50;
+        last = at;
+        return settled;
+      },
+      { timeout: STATE_TIMEOUT, intervals: [100] },
+    )
+    .toBe(true);
   const box = (await control.boundingBox())!;
   const x = box.x + box.width / 2;
   const y = box.y + box.height / 2;
@@ -288,7 +323,7 @@ interface StoredSource {
   assets: StoredAsset[];
 }
 interface QueueView {
-  entries: Array<{ id: string; typed: string; state: string; sourceId?: string; reason?: { code: string } }>;
+  entries: Array<{ id: string; typed: string; state: string; updatedAt: string; sourceId?: string; reason?: { code: string; by?: string } }>;
 }
 
 async function queueOf(app: AppHarness, projectId: string): Promise<QueueView> {
@@ -743,11 +778,12 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
   });
 });
 
-// ---------- point 8 ----------
+// ---------- point 8 (R326, R330 c) ----------
 
-test("a copy service switched off in Search sources is not asked", async ({ page, app }) => {
+test("a copy service switched off in Search sources is not asked; switched on again, the entry it stopped goes on by itself", async ({ page, app }) => {
   test.setTimeout(240_000);
   let projectId = "";
+  let projectRoot = "";
   let libraryPath = "";
   const group = () => page.getByRole("region", { name: WORDS.copiesGroup });
 
@@ -772,11 +808,22 @@ test("a copy service switched off in Search sources is not asked", async ({ page
     await page.reload();
     for (const name of WORDS.copyServices) await expect(group().getByRole("checkbox", { name, exact: true })).toBeChecked({ checked: on.includes(name), timeout: STATE_TIMEOUT });
   }
+  /**
+   * Nothing of RIGHT's file anywhere in the library, no other file waiting than PAIR_B's (found before), no download's
+   * part file: no copy service was asked for it.
+   */
+  async function nothingFetched(): Promise<void> {
+    expect(placesOf(libraryPath, fileBytes("RIGHT"))).toEqual([]);
+    expect(filesUnder(join(projectRoot, "find", "held"))).toEqual([`${(await entryOf(app, projectId, PAIR_B)).id}.pdf`]);
+    expect(filesUnder(join(libraryPath, ".tmp")).filter((f) => f.startsWith("find-"))).toEqual([]);
+  }
+  const retryOf = (w: Work) => rowOf(page, w).getByRole("button", { name: act(WORDS.tryAgain, w.typed) });
 
   await test.step("set-up; in Search sources every copy service off but Europe PMC, which has no copy of the next work", async () => {
     const made = await libraryWithProject(app, page, { library: "Switch library", project: "Switched", governanceYaml: LOOKUP_RULES });
     projectId = made.projectId;
     libraryPath = made.libraryPath;
+    projectRoot = join(made.libraryPath, made.projectFolder);
     await copiesOn(["Europe PMC"]);
   });
 
@@ -785,27 +832,61 @@ test("a copy service switched off in Search sources is not asked", async ({ page
     await addLines(page, [WRONG.typed]);
     await expect(stateOfRow(page, WRONG)).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
     await expect(reasonOfRow(page, WRONG)).toHaveCount(0);
+    // "Try again" is not offered on "No open copy" when every service asked answered (FindEntryRow, F11).
+    await expect(retryOf(WRONG)).toHaveCount(0);
     expect(placesOf(libraryPath, fileBytes("WRONG"))).toEqual([]);
   });
 
   await test.step("Semantic Scholar switched on and saved; a new reference whose copy is there: the file is found and waits", async () => {
-    // "Try again" is not offered on "No open copy" when every service asked answered (FindEntryRow, F11): a new reference.
-    await expect(rowOf(page, WRONG).getByRole("button", { name: act(WORDS.tryAgain, WRONG.typed) })).toHaveCount(0);
     await copiesOn(["Europe PMC", "Semantic Scholar"]);
     await openFind(page, projectId);
     await addLines(page, [PAIR_B.typed]);
     await expectWaiting(page, PAIR_B, WORDS.looksRight);
+    // The save woke nothing that did not rest for the settings: the first entry still has no open copy.
     await expect(stateOfRow(page, WRONG)).toHaveText(WORDS.noOpenCopy);
   });
 
-  await test.step("with EVERY copy service off, the next reference says it is switched off in Search sources", async () => {
+  await test.step("with EVERY copy service off, the next reference rests “Record complete”, switched off in Search sources, and “Try again” is offered", async () => {
     await copiesOn([]);
     await openFind(page, projectId);
     await addLines(page, [RIGHT.typed]);
     await expect(stateOfRow(page, RIGHT)).toHaveText(WORDS.recordComplete, { timeout: STATE_TIMEOUT });
     await expect(reasonOfRow(page, RIGHT)).toHaveText(WORDS.switchedOff, { timeout: STATE_TIMEOUT });
-    expect(await entryOf(app, projectId, RIGHT)).toMatchObject({ state: "record-complete", reason: { code: "switched-off" } });
-    expect(placesOf(libraryPath, fileBytes("RIGHT"))).toEqual([]);
+    await expect(retryOf(RIGHT)).toBeVisible();
+    expect(await entryOf(app, projectId, RIGHT)).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+    await nothingFetched();
+  });
+
+  await test.step("“Try again” while they are still off: the settings are looked at again and the entry rests as it was; nothing asked, nothing downloaded", async () => {
+    const before = (await entryOf(app, projectId, RIGHT)).updatedAt;
+    await retryOf(RIGHT).click();
+    // The act answered: the button no longer says "Trying again…".
+    await expect(retryOf(RIGHT)).toHaveText(WORDS.tryAgain, { timeout: STATE_TIMEOUT });
+    // Through the service: the entry was taken up again (written anew) and has come back to rest for the same reason.
+    await expect
+      .poll(async () => {
+        const e = await entryOf(app, projectId, RIGHT);
+        return e.updatedAt !== before && e.state === "record-complete" ? e.reason : null;
+      }, { timeout: STATE_TIMEOUT })
+      .toEqual({ code: "switched-off", by: "settings" });
+    await expect(stateOfRow(page, RIGHT)).toHaveText(WORDS.recordComplete, { timeout: STATE_TIMEOUT });
+    await expect(reasonOfRow(page, RIGHT)).toHaveText(WORDS.switchedOff, { timeout: STATE_TIMEOUT });
+    await expect(retryOf(RIGHT)).toBeVisible();
+    await nothingFetched();
+  });
+
+  await test.step("Europe PMC — the one service with its copy — switched on and saved: with no further press the entry goes on, and its file waits", async () => {
+    await copiesOn(["Europe PMC"]);
+    await openFind(page, projectId);
+    // No press on the row: the save of Search sources woke the entry it had stopped (R326 a).
+    await expectWaiting(page, RIGHT, WORDS.looksRight);
+    const e = await entryOf(app, projectId, RIGHT);
+    expect(e).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    expect(placesOf(projectRoot, fileBytes("RIGHT"))).toEqual([`find/held/${e.id}.pdf`]);
+    expect(await filesOfRecord(app, projectId, RIGHT)).toEqual([]);
+    // The others are as they were: the first still has no open copy, PAIR_B's file still waits.
+    await expect(stateOfRow(page, WRONG)).toHaveText(WORDS.noOpenCopy);
+    await expect(stateOfRow(page, PAIR_B)).toHaveText(WORDS.needsCheck);
   });
 });
 
