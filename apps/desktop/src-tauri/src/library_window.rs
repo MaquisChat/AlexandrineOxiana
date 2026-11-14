@@ -277,21 +277,30 @@ pub fn looks_like_pdf_address(url: &Url) -> bool {
 
 /// Whether the address is part of a sign-in, which a replayed GET could spoil (a single-use SAML or
 /// CAS step): its path holds `/login`, `/saml`, `/sso`, `/Shibboleth.sso`, `/idp/`, `/oauth`,
-/// `/authorize` or `/cas/` (and, stricter than the plan, `/logon`, `/signin`, `/sign-in`, `/wayf`),
-/// in any case and percent-encoded or not; its query carries a SAML message; or its host is the
-/// library's own sign-in host (`proxy_host`, the host the window was opened at). Such an address is
-/// never fetched by the shell.
+/// `/authorize` or `/cas/` (and, stricter than the plan, `/logon`, `/signin`, `/sign-in`, `/wayf`,
+/// and ADFS's `/adfs/`, OpenID Connect's `/openid-connect/` and simpleSAMLphp's `/simplesaml`, R331 e),
+/// in any case and percent-encoded or not; its query carries a SAML message or artifact (`SAMLart`),
+/// a CAS service ticket (`ticket=ST-…`) or an OAuth answer (both `code` and `state`); or its host is
+/// the library's own sign-in host (`proxy_host`, the host the window was opened at), compared without
+/// one trailing dot. Such an address is never fetched by the shell.
 pub fn sign_in_address(url: &Url, proxy_host: Option<&str>) -> bool {
     let path = plain_path(url);
-    const PARTS: [&str; 12] = ["/login", "/saml", "/sso", "/shibboleth.sso", "/idp/", "/oauth", "/authorize", "/cas/", "/logon", "/signin", "/sign-in", "/wayf"];
+    const PARTS: [&str; 15] = [
+        "/login", "/saml", "/sso", "/shibboleth.sso", "/idp/", "/oauth", "/authorize", "/cas/", "/logon", "/signin", "/sign-in", "/wayf", "/adfs/", "/openid-connect/", "/simplesaml",
+    ];
     if PARTS.iter().any(|p| path.contains(p)) {
         return true;
     }
-    if url.query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("SAMLRequest") || k.eq_ignore_ascii_case("SAMLResponse")) {
+    let key = |k: &str| url.query_pairs().any(|(n, _)| n.eq_ignore_ascii_case(k));
+    if key("SAMLRequest") || key("SAMLResponse") || key("SAMLart") || (key("code") && key("state")) {
         return true;
     }
+    if url.query_pairs().any(|(n, v)| n.eq_ignore_ascii_case("ticket") && v.starts_with("ST-")) {
+        return true;
+    }
+    let bare = |h: &str| h.strip_suffix('.').unwrap_or(h).to_ascii_lowercase();
     match (proxy_host, url.host_str()) {
-        (Some(p), Some(h)) => h.eq_ignore_ascii_case(p),
+        (Some(p), Some(h)) => bare(h) == bare(p),
         _ => false,
     }
 }
@@ -1974,6 +1983,49 @@ mod tests {
             assert!(!sign_in_address(&u(not), Some("ezproxy.lib.edu")), "{not}");
         }
         assert!(!sign_in_address(&u("https://ezproxy.lib.edu/x.pdf"), None));
+    }
+
+    #[test]
+    fn more_sign_in_forms_are_never_fetched() {
+        let proxy = Some("ezproxy.lib.edu");
+        for sign_in in [
+            // The proxy's own host written with a trailing dot.
+            "https://ezproxy.lib.edu./x.pdf",
+            "https://EZPROXY.lib.edu./x.pdf",
+            // SAML artifact, CAS service ticket, OAuth/OpenID answer.
+            "https://p.test/acs?SAMLart=AAQAA",
+            "https://p.test/acs?samlart=AAQAA",
+            "https://p.test/x.pdf?ticket=ST-1-abcdef-cas",
+            "https://p.test/x.pdf?TICKET=ST-9",
+            "https://p.test/cb.pdf?code=abc&state=xyz",
+            "https://p.test/cb.pdf?state=xyz&Code=abc",
+            // ADFS, Keycloak (and other OpenID Connect servers), simpleSAMLphp.
+            "https://sts.lib.edu/adfs/ls/?wa=wsignin1.0",
+            "https://sts.lib.edu/ADFS/ls/x.pdf",
+            "https://kc.lib.edu/realms/u/protocol/openid-connect/auth",
+            "https://kc.lib.edu/realms/u/protocol/openid%2Dconnect/x.pdf",
+            "https://idp.lib.edu/simplesaml/module.php/saml/x.pdf",
+            "https://idp.lib.edu/simpleSAMLphp/x.pdf",
+            "https://idp.lib.edu/%61dfs/x.pdf",
+        ] {
+            assert!(sign_in_address(&u(sign_in), proxy), "{sign_in}");
+        }
+        // A proxy host given with a trailing dot matches the host written without one.
+        assert!(sign_in_address(&u("https://ezproxy.lib.edu/x.pdf"), Some("ezproxy.lib.edu.")));
+        for not in [
+            "https://p.test/x.pdf?code=abc",
+            "https://p.test/x.pdf?state=xyz",
+            "https://p.test/codes/state.pdf",
+            "https://p.test/x.pdf?ticket=12345",
+            "https://p.test/x.pdf?ticket=st-1",
+            "https://p.test/x.pdf?t=ST-1",
+            "https://p.test/adfsx/x.pdf",
+            "https://p.test/openid-connected.pdf",
+            "https://ezproxy.lib.edu.evil.example/x.pdf",
+            "https://www-jstor-org.ezproxy.lib.edu./stable/pdf/1.pdf",
+        ] {
+            assert!(!sign_in_address(&u(not), proxy), "{not}");
+        }
     }
 
     #[test]
