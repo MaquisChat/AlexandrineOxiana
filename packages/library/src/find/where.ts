@@ -11,7 +11,10 @@
  *   3. `go.openathens.net/redirector/<domain>?url=` (UNVERIFIED against a real institution) → that redirector;
  *   4. a query with `url_ver=Z39.88-2004`, `ctx_ver=`, `rft_id=` or an `rft.` key (an OpenURL resolver) → its origin
  *      and path, every path parameter (`;…` in any segment, as `;jsessionid=…`) dropped (R328 b); a path one of whose
- *      segments looks like a session's key (16 or more characters of hex or base64url alone, or `(S(…))`) is refused.
+ *      segments looks like a session's key (16 or more hexadecimal digits alone; or 20 or more characters of letters,
+ *      digits, `-` and `_` holding a lower-case letter, an upper-case letter and a digit; or ASP.NET's cookieless form,
+ *      a segment wholly one parenthesised group of parts `<upper-case letter>(<characters but parentheses and slashes>)`,
+ *      as `(S(…))` or `(A(…)S(…))`) is refused (R333 b).
  * A link is refused, with a code the service says in words (`YOUR_LIBRARY_DERIVE_TEXT`), when it is over
  * LIBRARY_LINK_MAX characters, holds a control character or a space (outside the spaces and line ends around it, which
  * a paste brings), cannot be read as an address, is not https, holds a user name or password, or names its host by a
@@ -91,11 +94,11 @@ const authorityOf = (u: URL): string => u.host;
 /**
  * R328 b, narrowed by R333 b: a path segment that looks like a session's key — 16 or more hexadecimal digits alone, or
  * 20 or more characters of letters, digits, `-` and `_` holding a lower-case letter, an upper-case letter and a digit,
- * or ASP.NET's `(S(…))`. A long plain word is not one.
+ * or ASP.NET's cookieless form (`(S(…))`, `(A(…)S(…))`, …). A long plain word is not one.
  */
 const HEX_KEY = /^[0-9A-Fa-f]{16,}$/u;
 const MIXED_KEY = /^[A-Za-z0-9_-]{20,}$/u;
-const ASPNET_KEY = /^\(S\(.*\)\)$/u;
+const ASPNET_KEY = /^\((?:[A-Z]\([^()/]+\))+\)$/u;
 const sessionLike = (seg: string): boolean =>
   HEX_KEY.test(seg) || (MIXED_KEY.test(seg) && /[a-z]/u.test(seg) && /[A-Z]/u.test(seg) && /\d/u.test(seg)) || ASPNET_KEY.test(seg);
 const holdsSessionKey = (path: string): boolean => path.split("/").some(sessionLike);

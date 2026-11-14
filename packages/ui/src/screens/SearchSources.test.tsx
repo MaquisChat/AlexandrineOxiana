@@ -306,6 +306,10 @@ describe("Search sources: draft and save", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
     await waitFor(() => expect(screen.getByTestId("search-save-error").textContent).toBe(SEARCH_SOURCES_TEXT.saveTimedOut));
+    // Said once: the alert holds the sentence; the polite status region does not.
+    expect(screen.getByTestId("search-save-error").getAttribute("role")).toBe("alert");
+    expect(liveText()).not.toContain(SEARCH_SOURCES_TEXT.saveTimedOut);
+    expect(screen.getAllByText(SEARCH_SOURCES_TEXT.saveTimedOut)).toHaveLength(1);
     expect(box(record_(), "Elicit").disabled).toBe(false);
     expect(box(record_(), "Elicit").checked).toBe(true);
     await act(async () => {
