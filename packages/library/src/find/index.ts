@@ -34,3 +34,17 @@ export type {
   WorkCandidate,
 } from "./types.js";
 export { REFERENCE_MAX_CHARS, REFERENCE_MIN_CHARS } from "./reference.js";
+// Task F10: where a free copy is, and its bounded download (used by the runner in F11).
+export {
+  FREE_COPY_ELSEWHERE_MAX,
+  FREE_COPY_FILE_HOSTS,
+  FREE_COPY_MAX_BYTES,
+  FREE_COPY_OFFERS_MAX,
+  FREE_COPY_OFFERS_PER_SOURCE,
+  FREE_COPY_SOURCES,
+  fileHostAllowed,
+  findFreeCopies,
+} from "./free-copy.js";
+export type { CopyOffer, ElsewhereLink, FreeCopySource } from "./free-copy.js";
+export { FETCH_FILE_CONCURRENCY, FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FETCH_FILE_MAX_REDIRECTS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
+export type { FetchFileErrorCode } from "./fetch-file.js";
