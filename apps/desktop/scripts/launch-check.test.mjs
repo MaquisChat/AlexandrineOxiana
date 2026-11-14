@@ -74,7 +74,9 @@ describe("what the page may ask of the shell (capabilities/main-window.json; Tas
     assert.deepEqual(NOT_PROBED_IPC, { "watch.pick": "allow-pick-watch-folder" });
     const { files, capability, conf } = read();
     assert.deepEqual(capabilityProblems({ files, capability, conf }), []);
-    assert.deepEqual(capability.permissions, ["core:event:allow-listen", "core:event:allow-unlisten", "dialog:allow-open", "allow-pick-watch-folder"]);
+    assert.deepEqual(capability.permissions.slice(0, 4), ["core:event:allow-listen", "core:event:allow-unlisten", "dialog:allow-open", "allow-pick-watch-folder"]);
+    // Task F16: the library sign-in window's six commands, and nothing else.
+    assert.deepEqual(capability.permissions.slice(4), ["allow-open-library-window", "allow-library-window-take-pdf", "allow-close-library-window", "allow-sign-out-of-library", "allow-set-stay-signed-in", "allow-open-in-browser"]);
 
     const { "watch.pick": _w, ...probed } = EXPECTED_IPC;
     assert.deepEqual(probeProblems({ ...GOOD, ipc: probed }, { media: true }), []);

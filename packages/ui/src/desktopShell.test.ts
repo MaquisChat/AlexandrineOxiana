@@ -15,6 +15,8 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: (...a: unknown[]) => open(..
 vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ onDragDropEvent }) }));
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
+const listen = vi.fn();
+vi.mock("@tauri-apps/api/event", () => ({ listen: (...a: unknown[]) => listen(...a) }));
 
 async function load() {
   vi.resetModules();
@@ -26,6 +28,7 @@ const g = globalThis as { isTauri?: unknown };
 beforeEach(() => {
   open.mockReset();
   invoke.mockReset();
+  listen.mockReset();
   onDragDropEvent.mockClear();
   dragHandler = undefined;
 });
@@ -201,5 +204,107 @@ describe("pickWatchFolder (Task W6, R207): the shell's chooser hands the service
     expect(sent).toBe("📁".repeat(200));
     // No lone surrogate (which serde_json would refuse).
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(sent)).toBe(false);
+  });
+});
+
+describe("the library sign-in window (Task F16): six commands and one event, through the shell only", () => {
+  const TICKET = "0123456789abcdef0123456789abcdef";
+  const URL_ = "https://ezproxy.lib.example/login?url=https://doi.org/10.1038/171737a0";
+
+  it("openLibraryWindow passes ticket and url only", async () => {
+    g.isTauri = true;
+    const m = await load();
+    invoke.mockResolvedValueOnce(true);
+    expect(await m.openLibraryWindow(TICKET, URL_)).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenLastCalledWith("open_library_window", { ticket: TICKET, url: URL_ });
+    expect(Object.keys(invoke.mock.calls[0]![1] as object)).toEqual(["ticket", "url"]);
+    // The same through the shell object.
+    invoke.mockResolvedValueOnce(true);
+    expect(await m.desktopShell()!.openLibraryWindow(TICKET, URL_)).toBe(true);
+    expect(invoke).toHaveBeenLastCalledWith("open_library_window", { ticket: TICKET, url: URL_ });
+  });
+
+  it("each command is invoked by its own name with only its own arguments, and only `true` counts as done", async () => {
+    g.isTauri = true;
+    const m = await load();
+    const calls: Array<[() => Promise<unknown>, string, Record<string, unknown>]> = [
+      [() => m.libraryWindowTakePdf(), "library_window_take_pdf", {}],
+      [() => m.signOutOfLibrary(), "sign_out_of_library", {}],
+      [() => m.setStaySignedIn(true), "set_stay_signed_in", { on: true }],
+      [() => m.setStaySignedIn(false), "set_stay_signed_in", { on: false }],
+      [() => m.openInBrowser("https://doi.org/10.1038/171737a0"), "open_in_browser", { url: "https://doi.org/10.1038/171737a0" }],
+    ];
+    for (const [call, name, args] of calls) {
+      invoke.mockResolvedValueOnce(true);
+      expect(await call(), name).toBe(true);
+      expect(invoke).toHaveBeenLastCalledWith(name, args);
+      for (const answer of [false, null, undefined, "true", 1, {}]) {
+        invoke.mockResolvedValueOnce(answer);
+        expect(await call(), `${name} ${JSON.stringify(answer)}`).toBe(false);
+      }
+      invoke.mockRejectedValueOnce(new Error(`${name} not allowed`));
+      expect(await call()).toBe(false);
+    }
+    invoke.mockResolvedValueOnce(null);
+    await m.closeLibraryWindow();
+    expect(invoke).toHaveBeenLastCalledWith("close_library_window", {});
+    invoke.mockRejectedValueOnce(new Error("x"));
+    await expect(m.closeLibraryWindow()).resolves.toBeUndefined();
+    invoke.mockResolvedValueOnce(false);
+    expect(await m.openLibraryWindow(TICKET, URL_)).toBe(false);
+  });
+
+  it("outside the desktop shell nothing is available: false, nothing invoked, no Tauri module loaded", async () => {
+    const m = await load();
+    expect(await m.openLibraryWindow(TICKET, URL_)).toBe(false);
+    expect(await m.libraryWindowTakePdf()).toBe(false);
+    expect(await m.closeLibraryWindow()).toBeUndefined();
+    expect(await m.signOutOfLibrary()).toBe(false);
+    expect(await m.setStaySignedIn(true)).toBe(false);
+    expect(await m.openInBrowser("https://doi.org/x")).toBe(false);
+    const handler = vi.fn();
+    const stop = await m.onLibraryWindow(handler);
+    stop();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(listen).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("onLibraryWindow hears the window's state, typed, and drops anything else", async () => {
+    g.isTauri = true;
+    const m = await load();
+    const handler = vi.fn();
+    const unlisten = vi.fn();
+    let deliver: ((e: { payload: unknown }) => void) | undefined;
+    listen.mockImplementationOnce(async (name: string, h: (e: { payload: unknown }) => void) => {
+      expect(name).toBe("library-window");
+      deliver = h;
+      return unlisten;
+    });
+    const stop = await m.onLibraryWindow(handler);
+    const states = ["opened", "fetching", "handed-over", "not-a-pdf", "failed", "closed"];
+    for (const state of states) deliver!({ payload: { ticket: TICKET, state } });
+    deliver!({ payload: { ticket: null, state: "failed", reason: "no-ticket" } });
+    deliver!({ payload: { ticket: TICKET, state: "failed", reason: "pause" } });
+    expect(handler.mock.calls.map((c) => c[0])).toEqual([
+      ...states.map((state) => ({ ticket: TICKET, state })),
+      { ticket: null, state: "failed", reason: "no-ticket" },
+      { ticket: TICKET, state: "failed", reason: "pause" },
+    ]);
+    handler.mockClear();
+    for (const payload of [null, "opened", { state: "opened" }, { ticket: "x", state: "opened" }, { ticket: TICKET.toUpperCase(), state: "opened" }, { ticket: TICKET, state: "added" }, [TICKET, "opened"]]) {
+      deliver!({ payload });
+    }
+    expect(handler).not.toHaveBeenCalled();
+    // An unknown reason is left out; the rest is kept.
+    deliver!({ payload: { ticket: TICKET, state: "failed", reason: "because", extra: "x" } });
+    expect(handler.mock.calls.map((c) => c[0])).toEqual([{ ticket: TICKET, state: "failed" }]);
+    stop();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    // A listener that cannot be registered gives a stop that does nothing.
+    listen.mockRejectedValueOnce(new Error("event.listen not allowed"));
+    const none = await m.onLibraryWindow(handler);
+    expect(() => none()).not.toThrow();
   });
 });
