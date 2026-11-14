@@ -202,8 +202,17 @@ export interface FindRunnerDeps {
   repo: Repo;
   index: IndexDb;
   http: HttpClient;
-  /** The "Search sources" settings (F12); until F12 exists, a function returning DEFAULT_SEARCH_SETTINGS. */
+  /**
+   * The "Search sources" settings (F12: `search-sources.json`, read by the service), asked when each entry's work
+   * starts: a save takes effect for the next entry, and an entry already at work finishes under what it started with.
+   */
   settings: () => Promise<SearchSettings>;
+  /**
+   * F12 (R290 c): Elicit's key from the password store, or undefined when none is stored. Asked only when Elicit is
+   * on in the settings AND the project's rules allow it (never for a source that is off); without it Elicit is not
+   * asked. Absent: Elicit is never asked.
+   */
+  elicitKey?: () => Promise<string | undefined>;
   /** "Check everything I have": a match in another unlocked project counts. */
   checkEverything: () => boolean;
   now?: () => Date;
@@ -846,6 +855,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return without.result === "deny" && withBasis.result !== "deny" ? NO_LEGAL_BASIS : RULES;
   }
   const SETTINGS: FindReason = { code: "switched-off", by: "settings" };
+  /** R297 a: the only record source switched on and allowed needs a key that is not saved (Elicit). */
+  const NEEDS_KEY: FindReason = { code: "needs-key", by: "settings" };
 
   // ------------------------------------------------------------------------------------------------------------
   // Completing an entry with a candidate: the duplicate check and the creation in one store turn.
@@ -1121,14 +1132,37 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       throw err;
     }
     if (!live()) return;
-    const on = s.record.filter((x) => x.on && (x.id === "crossref" || x.id === "openalex")).map((x) => x.id as SearchSource);
+    // F12 (R290 b, c): the sources Find and acquire asks by the typed words, in the settings' order — Crossref,
+    // OpenAlex and Elicit (Open Library and the Library of Congress are never asked by it). Settings narrow, the rules
+    // decide: a source is asked only when it is on AND the rules allow it; the reason says which of the two refused.
+    const on = s.record.filter((x) => x.on && (x.id === "crossref" || x.id === "openalex" || x.id === "elicit")).map((x) => x.id as SearchSource);
     if (!on.length) {
       await finish({ state: "failed", reason: SETTINGS }, ["nextTryAt"]);
       return;
     }
-    const sources = on.filter((x) => providerAllowed(ctx, x));
-    if (!sources.length) {
+    const allowed = on.filter((x) => providerAllowed(ctx, x));
+    if (!allowed.length) {
       await finish({ state: "failed", reason: RULES }, ["nextTryAt"]);
+      return;
+    }
+    // Elicit only with a stored key, read only now that it is on and allowed (never for a source that is off).
+    let elicitKey: string | undefined;
+    if (allowed.includes("elicit") && deps.elicitKey) {
+      try {
+        elicitKey = (await guard(r, deps.elicitKey(), FIND_SETTINGS_TIMEOUT_MS)) || undefined;
+      } catch (err) {
+        if (err instanceof Abandoned) throw err;
+        // No password store, or one that did not answer in time: Elicit is not asked (it is an extra; the others decide).
+        debug(err instanceof TimedOut ? "find: the Elicit key could not be read in time" : "find: the Elicit key could not be read");
+      }
+      if (!live()) return;
+      if (!elicitKey) debug("find: Elicit is on but no key is stored; it is not asked");
+    }
+    const sources = allowed.filter((x) => x !== "elicit" || elicitKey !== undefined);
+    if (!sources.length) {
+      // Only Elicit was on and allowed, and it has no key (R297 a): said so, and ends as "switched off" ends ("Try again"
+      // goes on once the key is saved).
+      await finish({ state: "failed", reason: NEEDS_KEY }, ["nextTryAt"]);
       return;
     }
 
@@ -1200,7 +1234,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     let res: Awaited<ReturnType<typeof searchWorks>>;
     try {
-      res = await guard(r, searchWorks(ref, ctx, { sources }), FIND_LOOKUP_TIMEOUT_MS);
+      res = await guard(r, searchWorks(ref, ctx, { sources, ...(elicitKey ? { elicitKey } : {}) }), FIND_LOOKUP_TIMEOUT_MS);
     } catch (err) {
       if (err instanceof TimedOut) {
         debug("find: a search did not answer in time");
@@ -1274,7 +1308,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // Nobody of that name: the entry stays whatever the works search makes it.
     }
 
-    const failed = sources.filter((x) => res.notes.includes(`${x}-failed`));
+    // F12 (R290 c): Elicit is an extra, not one of the sources a complete answer needs — its failure counts only when
+    // it was the one source asked (then nothing answered: the ordinary retries).
+    const needed = sources.length > 1 ? sources.filter((x) => x !== "elicit") : sources;
+    const failed = needed.filter((x) => res.notes.includes(`${x}-failed`));
     const budget = sources.includes("openalex") && res.notes.includes("openalex-budget");
     /** Every source asked answered: the list is complete (one source left by the rules or the settings counts). */
     const complete = failed.length === 0 && !budget;

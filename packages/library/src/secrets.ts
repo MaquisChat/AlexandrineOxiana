@@ -17,7 +17,7 @@ import { createRequire } from "node:module";
 export const SECRET_SERVICE = "AlexandrineOxiana";
 
 /** Names of the secrets the app keeps (anything else is refused, so a typo never creates a stray entry). */
-export const SECRET_NAMES = ["zotero-api-key"] as const;
+export const SECRET_NAMES = ["zotero-api-key", "elicit-api-key", "openalex-api-key"] as const;
 export type SecretName = (typeof SECRET_NAMES)[number];
 
 export const SECRET_STORE_UNAVAILABLE =
