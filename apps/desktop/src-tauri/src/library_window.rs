@@ -443,13 +443,23 @@ fn v4_allowed(ip: Ipv4Addr, allow_loopback: bool) -> bool {
         || ip.is_broadcast()
         || o[0] == 0
         || (o[0] == 100 && (o[1] & 0xc0) == 64)
-        || o[0] >= 240)
+        || o[0] >= 240
+        // IETF protocol assignments (192.0.0.0/24), benchmarking (198.18.0.0/15) and the three
+        // documentation ranges (R331 b).
+        || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113))
 }
 
 /// Whether the shell may connect to `ip`: never a loopback (except in test mode), private (RFC 1918),
-/// carrier-grade NAT (100.64/10), link-local, unspecified, multicast, broadcast or reserved IPv4
-/// address; never a unique-local (RFC 4193), link-local, site-local, unspecified or multicast IPv6
-/// address; and an IPv6 address that carries an IPv4 one (mapped, compatible, NAT64) by the IPv4 rule.
+/// carrier-grade NAT (100.64/10), link-local, unspecified, multicast, broadcast, reserved,
+/// benchmarking, IETF-assigned (192.0.0.0/24) or documentation IPv4 address; never a unique-local
+/// (RFC 4193), link-local, site-local, unspecified, multicast or documentation (2001:db8::/32) IPv6
+/// address, nor one of the transition forms that can lead to any IPv4 host — 6to4 (2002::/16),
+/// Teredo (2001::/32), the local NAT64 prefix (64:ff9b:1::/48) and SIIT (::ffff:0:0:0/96), refused
+/// whole (R331 b); and an IPv6 address that carries an IPv4 one (mapped, compatible, the well-known
+/// NAT64 prefix) by the IPv4 rule.
 pub fn address_allowed(ip: IpAddr, allow_loopback: bool) -> bool {
     match ip {
         IpAddr::V4(v4) => v4_allowed(v4, allow_loopback),
@@ -462,6 +472,13 @@ pub fn address_allowed(ip: IpAddr, allow_loopback: bool) -> bool {
             }
             let s = v6.segments();
             if v6.is_unspecified() || v6.is_multicast() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 || (s[0] & 0xffc0) == 0xfec0 {
+                return false;
+            }
+            let transition = s[0] == 0x2002
+                || (s[0] == 0x2001 && (s[1] == 0 || s[1] == 0x0db8))
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
+                || s[..6] == [0, 0, 0, 0, 0xffff, 0];
+            if transition {
                 return false;
             }
             let embedded = || Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
@@ -2012,6 +2029,37 @@ mod tests {
         }
         for a in ["10.0.0.1", "192.168.1.1", "fd00::1", "169.254.1.1", "0.0.0.0"] {
             assert!(!address_allowed(a.parse().unwrap(), true), "{a}");
+        }
+    }
+
+    #[test]
+    fn transition_reserved_and_documentation_ranges_are_refused() {
+        // (range, an address inside, an address just outside)
+        let table = [
+            ("2002::/16 (6to4)", "2002:a00:1::1", "2003::1"),
+            ("2002::/16 (6to4 of loopback)", "2002:7f00:1::", "2001:ffff:ffff:ffff::1"),
+            ("2001::/32 (Teredo)", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:1::1"),
+            ("64:ff9b:1::/48 (local NAT64)", "64:ff9b:1::a00:1", "64:ff9b:2::1"),
+            ("64:ff9b:1::/48 (public inside)", "64:ff9b:1:ffff::5db8:d822", "64:ff9b:0:1::5db8:d822"),
+            ("::ffff:0:0:0/96 (SIIT)", "::ffff:0:7f00:1", "::ffff:1:7f00:1"),
+            ("::ffff:0:0:0/96 (SIIT, public inside)", "::ffff:0:5db8:d822", "::fffe:0:5db8:d822"),
+            ("192.0.0.0/24", "192.0.0.9", "192.0.1.1"),
+            ("192.0.0.0/24 (low edge)", "192.0.0.0", "191.255.255.255"),
+            ("198.18.0.0/15", "198.19.255.255", "198.20.0.1"),
+            ("198.18.0.0/15 (low edge)", "198.18.0.1", "198.17.255.255"),
+            ("192.0.2.0/24", "192.0.2.1", "192.0.3.1"),
+            ("198.51.100.0/24", "198.51.100.7", "198.51.101.1"),
+            ("203.0.113.0/24", "203.0.113.9", "203.0.114.1"),
+            ("2001:db8::/32", "2001:db8::1", "2001:db9::1"),
+            ("2001:db8::/32 (high edge)", "2001:db8:ffff:ffff::1", "2001:db7:ffff::1"),
+        ];
+        for (range, inside, outside) in table {
+            assert!(!address_allowed(inside.parse().unwrap(), false), "{range}: {inside}");
+            assert!(address_allowed(outside.parse().unwrap(), false), "{range}: {outside}");
+        }
+        // The IPv4 ranges hold in their IPv6 forms too.
+        for a in ["::ffff:192.0.2.1", "::ffff:198.18.0.1", "64:ff9b::c000:201", "::ffff:203.0.113.9"] {
+            assert!(!address_allowed(a.parse().unwrap(), false), "{a}");
         }
     }
 
