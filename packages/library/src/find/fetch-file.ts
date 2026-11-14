@@ -212,6 +212,21 @@ function unmarkInUse(name: string): void {
   if (!u.external) activeTemp.delete(name);
 }
 
+/**
+ * For other callers (F11) (R261): takes a counted hold on a `find-<id>` folder's name, through the same counter the
+ * downloads use. The folder counts as in use while any hold or download remains. Returns the function that gives the
+ * hold up; giving it up a second time does nothing.
+ */
+export function holdFindTemp(name: string): () => void {
+  markInUse(name);
+  let held = true;
+  return () => {
+    if (!held) return;
+    held = false;
+    unmarkInUse(name);
+  };
+}
+
 const header = (h: Record<string, string | string[] | undefined>, n: string): string | undefined => {
   const v = h[n];
   return Array.isArray(v) ? v[0] : v;

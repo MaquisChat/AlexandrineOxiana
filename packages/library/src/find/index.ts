@@ -46,5 +46,5 @@ export {
   findFreeCopies,
 } from "./free-copy.js";
 export type { CopyOffer, ElsewhereLink, FreeCopySource } from "./free-copy.js";
-export { FETCH_FILE_CONCURRENCY, FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FETCH_FILE_MAX_REDIRECTS, FetchFileError, fetchFile } from "./fetch-file.js";
+export { FETCH_FILE_CONCURRENCY, FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FETCH_FILE_MAX_REDIRECTS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
 export type { FetchFileErrorCode } from "./fetch-file.js";

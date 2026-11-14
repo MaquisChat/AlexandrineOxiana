@@ -734,6 +734,42 @@ describe("round 2 (R256, R257)", () => {
     expect((await findFreeCopies({ ...BOOK }, ctx(), ["internetarchive"])).offers.map((o) => o.url)).toEqual(["https://archive.org/download/first/first.pdf"]);
   });
 
+  it("a title search offers only the same words in the same order (R261 a)", async () => {
+    const capital: WorkCandidate = { ...ARTICLE, id: "w-cap", title: "Capital and Labour", identifiers: {} };
+    arxiv(
+      `au:quill AND ti:"capital and labour"`,
+      atom([
+        { id: "1901.10001", title: "Labour and Capital", authors: ["Ada Quill"] },
+        { id: "1901.10002", title: "CAPITAL, and  Labour.", authors: ["Ada Quill"] },
+      ]),
+    );
+    expect((await findFreeCopies(capital, ctx(), ["arxiv"])).offers.map((o) => o.url)).toEqual(["https://arxiv.org/pdf/1901.10002"]);
+    const ny: WorkCandidate = { ...ARTICLE, id: "w-ny", title: "New York New York", identifiers: {} };
+    arxiv(`au:quill AND ti:"new york new york"`, atom([{ id: "1901.10003", title: "New York", authors: ["Ada Quill"] }]));
+    expect((await findFreeCopies(ny, ctx(), ["arxiv"])).offers).toEqual([]);
+  });
+
+  it("an arXiv entry naming another DOI is not offered; the same DOI, or none, is judged as before (R261 c)", async () => {
+    arxiv(
+      ARTICLE_TITLE_Q,
+      atom([
+        { id: "1901.20001", title: "Rivers and Memory in Upland Villages", authors: ["Ada Quill"], doi: "10.9999/other.version" },
+        { id: "1901.20002", title: "Rivers and Memory in Upland Villages", authors: ["Ada Quill"], doi: ` ${DOI.toUpperCase()} ` },
+        { id: "1901.20003", title: "Rivers and Memory in Upland Villages", authors: ["Ada Quill"] },
+      ]),
+    );
+    expect((await findFreeCopies(ARTICLE, ctx(), ["arxiv"])).offers.map((o) => o.url)).toEqual(["https://arxiv.org/pdf/1901.20002", "https://arxiv.org/pdf/1901.20003"]);
+  });
+
+  it("an answer that echoes the e-mail with a JSON escape or in upper case is not cached either (R261 d)", async () => {
+    for (const note of ["asked by test-only\\u0040example.invalid", `asked by ${EMAIL.toUpperCase()}`]) {
+      agent.get("https://api.unpaywall.org").intercept({ path: `/v2/${DOI}`, query: { email: EMAIL }, method: "GET" }).reply(200, `{"doi":"${DOI}","note":"${note}"}`, JSON_H);
+      await findFreeCopies(ARTICLE, ctx(client()), ["unpaywall"], EMAIL);
+      for (const f of await filesUnder(join(tmp, "Lib"))) expect(f).not.toMatch(/test-only|example\.invalid/iu);
+      expect(await filesUnder(join(tmp, "Lib"))).toEqual([]); // no cache file at all
+    }
+  });
+
   it("an arXiv answer that is not well-formed gives nothing and throws nothing", async () => {
     arxiv(ARTICLE_TITLE_Q, "<feed><entry><id>http://arxiv.org/abs/2101.00009</id>");
     expect(await findFreeCopies(ARTICLE, ctx(), ["arxiv"])).toEqual({ offers: [], elsewhere: [] });

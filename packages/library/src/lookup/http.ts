@@ -493,11 +493,20 @@ export class HttpClient {
   }
 }
 
-/** True when `body` holds a value of the private query, as sent or percent-encoded (case ignored). */
+/**
+ * True when `body` holds a value of the private query, as sent or percent-encoded, in any letter case, in the body as
+ * received or with its `\uXXXX` escapes decoded (R261).
+ */
 function echoesQuery(body: string, query: Readonly<Record<string, string>> | undefined): boolean {
   if (!query) return false;
   const lower = body.toLowerCase();
-  return Object.values(query).some((v) => v.length > 0 && (lower.includes(v.toLowerCase()) || lower.includes(encodeURIComponent(v).toLowerCase())));
+  const decoded = body.replace(/\\u([0-9a-fA-F]{4})/gu, (_m, h: string) => String.fromCharCode(parseInt(h, 16))).toLowerCase();
+  return Object.values(query).some((v) => {
+    if (v.length === 0) return false;
+    const want = v.toLowerCase();
+    const enc = encodeURIComponent(v).toLowerCase();
+    return lower.includes(want) || lower.includes(enc) || decoded.includes(want) || decoded.includes(enc);
+  });
 }
 
 /** A Retry-After (or Backoff) header — seconds or an HTTP date — in milliseconds from `now`; undefined when absent or unreadable. */

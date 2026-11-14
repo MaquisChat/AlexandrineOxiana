@@ -19,7 +19,7 @@
  *    `oa_locations[].url_for_pdf` (at most 20 read).
  *  - arXiv: by the first author's family name and the title only (R256 a: arXiv has no DOI search field), spelled as
  *    its manual spells it: `au:<family>+AND+ti:%22<title words>%22`. An entry whose `arxiv:doi` is the record's DOI
- *    needs no title check. The Atom answer is checked by `prescanXml` (no declarations, well-formed) and parsed with
+ *    needs no title check; one naming another DOI is not offered (R261). The Atom answer is checked by `prescanXml` (no declarations, well-formed) and parsed with
  *    @xmldom/xmldom; at most 5 entries are read. The offer's address is built from the entry's id, checked
  *    (`ARXIV_ID_NEW`/`ARXIV_ID_OLD`).
  *  - Europe PMC, by DOI: a result with the same DOI, `isOpenAccess` "Y" and a `pmcid` matching `^PMC\d{1,9}$`
@@ -35,9 +35,9 @@
  *    "PDF", "EPUB"), else the first plain `.pdf`/`.epub`; never one whose name or format says encrypted (R256 d).
  *    Identifiers start with a letter or digit (R257 d). Anything unknown or malformed means "no".
  *  - A copy found by title (an arXiv entry without the record's DOI; DOAB; the Internet Archive) is taken only when
- *    its title is the record's title (R257 a): the two titles' content words — F2's tokens (`tokensOf`, reference.ts)
+ *    its title is the record's title (R257 a): the two titles' content words — F2's tokens (`segmentsOf`/`segmentTokens`, reference.ts)
  *    without the plan's small joining words (F2's `STOP_WORDS` in search.ts: and, et, al, by, the, of, in) — are the
- *    same set, nothing extra on either side; AND one of its creators' names holds a family name of the record. A
+ *    same sequence (same words, same order), nothing extra on either side (R261); AND one of its creators' names holds a family name of the record. A
  *    near match is neither offered nor linked. A copy found by DOI needs no such check.
  *  - Every address loses its fragment when it is parsed (R257 e); only offers that are kept count as already offered.
  *
@@ -56,7 +56,8 @@ import { encodeDoi } from "../lookup/crossref.js";
 import { EMAIL_RE, LookupHttpError, type GetOptions } from "../lookup/http.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FIND_DOI_MAX } from "./types.js";
-import { tokensOf } from "./reference.js";
+import { segmentTokens, segmentsOf } from "./reference.js";
+import { STOP_WORDS } from "./search.js";
 
 /** The largest free copy the app downloads (100 MiB). */
 export const FREE_COPY_MAX_BYTES = 104_857_600;
@@ -191,15 +192,14 @@ function firstFamily(w: WorkCandidate): string | undefined {
   return f ? f.slice(0, 200) : undefined;
 }
 
-/** The plan's small joining words, as F2's `STOP_WORDS` (search.ts, not exported there): left out of a title's content words. */
-const TITLE_STOP_WORDS: ReadonlySet<string> = new Set(["and", "et", "al", "by", "the", "of", "in"]);
-const contentWords = (t: string): Set<string> => new Set(tokensOf(t.slice(0, 4000)).filter((x) => !TITLE_STOP_WORDS.has(x)));
+/** A title's content words in order: F2's joining words (`STOP_WORDS`) left out; case, accents and punctuation are ignored as F2's `tokensOf` does, but repeats are kept. */
+const contentWords = (t: string): string[] => segmentsOf(t.slice(0, 4000)).flatMap(segmentTokens).filter((x) => !STOP_WORDS.has(x));
 
-/** True when two titles have the same content words: the same set, nothing extra on either side (R257 a). */
+/** True when two titles have the same content words in the same order, nothing extra on either side (R257 a, R261). */
 function sameTitle(a: string, b: string): boolean {
   const A = contentWords(a);
   const B = contentWords(b);
-  return A.size > 0 && A.size === B.size && [...A].every((x) => B.has(x));
+  return A.length > 0 && A.length === B.length && A.every((x, i) => x === B[i]);
 }
 
 /** True when the found item is the record's work: the same title (`sameTitle`) and a creator holding a family name of the record. */
@@ -351,6 +351,7 @@ async function fromArxiv(w: WorkCandidate, ctx: LookupContext): Promise<Raw[]> {
     const id = arxivId(e.id);
     if (!id) return [];
     const byDoi = !!doi && !!e.doi && sameDoi(e.doi, doi); // the entry itself names the record's DOI
+    if (doi && e.doi && !byDoi) return []; // it names another DOI: most likely another version of the work (R261)
     if (!byDoi && !sameWork(w, e.title, e.authors)) return [];
     return [{ url: `https://arxiv.org/pdf/${id}`, kind: "pdf" as const, built: true as const }];
   });

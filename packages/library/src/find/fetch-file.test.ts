@@ -19,7 +19,7 @@ import { createLibrary } from "../library.js";
 import { USER_AGENT } from "../lookup/http.js";
 import { openTestRepo } from "../repo/testing.js";
 import { activeTemp, isStaleWorkDir } from "../tmp-registry.js";
-import { FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FetchFileError, fetchFile } from "./fetch-file.js";
+import { FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
 import { FREE_COPY_MAX_BYTES } from "./free-copy.js";
 
 const PDF = Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
@@ -520,6 +520,44 @@ describe("round 2 (R257)", () => {
     } finally {
       activeTemp.delete("find-e1");
     }
+  });
+
+  it("a hold taken while a download runs survives the download's end and keeps the folder in use until released (R261)", async () => {
+    holdKeys.add("https://arxiv.org/a");
+    const a = get("https://arxiv.org/a");
+    await settle(() => held.length === 1);
+    const release = holdFindTemp("find-e1");
+    held[0]!.respond(200, {}, [PDF], true);
+    await a;
+    expect(activeTemp.has("find-e1")).toBe(true);
+    expect(isStaleWorkDir("find-e1")).toBe(false);
+    release();
+    expect(activeTemp.has("find-e1")).toBe(false);
+    expect(isStaleWorkDir("find-e1")).toBe(true);
+  });
+
+  it("a hold taken before and released during a download does not make the folder stale while it still writes (R261)", async () => {
+    const release = holdFindTemp("find-e1");
+    holdKeys.add("https://arxiv.org/a");
+    const a = get("https://arxiv.org/a");
+    await settle(() => held.length === 1);
+    release();
+    expect(isStaleWorkDir("find-e1")).toBe(false);
+    held[0]!.respond(200, {}, [PDF], true);
+    await a;
+    expect(isStaleWorkDir("find-e1")).toBe(true);
+  });
+
+  it("giving up a hold twice does nothing the second time (R261)", () => {
+    const one = holdFindTemp("find-e1");
+    const two = holdFindTemp("find-e1");
+    one();
+    one();
+    expect(activeTemp.has("find-e1")).toBe(true); // the other hold stands
+    two();
+    expect(activeTemp.has("find-e1")).toBe(false);
+    two();
+    expect(activeTemp.has("find-e1")).toBe(false);
   });
 
   it("an abort while a download waits for its place ends the call with the abort's reason and leaves nothing on disk", async () => {
