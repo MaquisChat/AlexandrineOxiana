@@ -17,6 +17,8 @@ import { FindRunnerClosedError, deviceDeps, rebuildIndexIfNeeded, type Deps } fr
 import { FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STOPPED_TEXT, findAlreadyAddedRefusal, findWorkIdRefusal, type FindEntryView, type FindQueueResponse } from "@ao/shared";
 import { serialStore } from "../../../packages/library/src/import/project-queue.js";
 import { runnerSeams } from "../../../packages/library/src/find/runner.js";
+import { appendFindEntriesIn } from "../../../packages/library/src/repo/repo.js";
+import { newId } from "@ao/core";
 import { existsSync } from "node:fs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 import type { ServiceEvent } from "./events.js";
@@ -155,6 +157,19 @@ function mockServices(): void {
     .intercept({ path: (p: string) => p.startsWith("/works?") && !p.includes("filter="), method: "GET" })
     .reply(() => ({ statusCode: 200, data: JSON.stringify(OA_EMPTY), responseOptions: { headers: { "content-type": "application/json" } } }))
     .persist();
+  // Task F11: a record made goes on to look for a free copy; in this made-up world no service has one.
+  agent
+    .get("https://api.openalex.org")
+    .intercept({ path: (p: string) => p.startsWith("/works/doi:"), method: "GET" })
+    .reply(() => ({ statusCode: 404, data: "{}" }))
+    .persist();
+  for (const origin of ["https://export.arxiv.org", "https://www.ebi.ac.uk", "https://api.semanticscholar.org", "https://directory.doabooks.org", "https://archive.org"]) {
+    agent
+      .get(origin)
+      .intercept({ path: () => true, method: "GET" })
+      .reply(() => ({ statusCode: 404, data: "{}" }))
+      .persist();
+  }
   gated = new Gated(agent);
   previous = getGlobalDispatcher();
   setGlobalDispatcher(gated);
@@ -262,7 +277,12 @@ async function until<T>(fn: () => Promise<T | undefined | false>, what = "the co
     await new Promise((r) => setTimeout(r, 20));
   }
 }
-const FINAL = ["choose", "already", "maybe-duplicate", "record-complete", "not-found", "failed"];
+const FINAL = ["choose", "already", "maybe-duplicate", "record-complete", "not-found", "failed", "no-open-copy", "in-library", "needs-check"];
+/**
+ * F11: a record the queue made goes on by itself to look for a free copy ("record-complete" → "looking-for-copy" →
+ * …); this service's made-up services offer none, so such an entry ends "no-open-copy". Each of these says the record is made.
+ */
+const MADE = ["record-complete", "looking-for-copy", "fetching", "no-open-copy"];
 const settled = (pid: string, eid: string) => until(async () => ((e) => (e && FINAL.includes(e.state) ? e : undefined))(await entry(pid, eid)), "the entry to settle");
 const asked = (text: string) => gated.sent.filter((s) => s.service === "crossref" && s.text === text).length;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -390,7 +410,7 @@ describe("adding lines", () => {
     const [e] = r.json.added as FindEntryView[];
     expect(e!.typed).toBe(LINE);
     const done = await settled(pid, e!.id);
-    expect(done.state).toBe("record-complete");
+    expect(MADE).toContain(done.state);
     expect(done.sourceId).toBeTruthy();
     const progress = () => events.filter((x) => x.type === "find.progress");
     await until(async () => progress().some((x) => x.data.state === "record-complete"), "the event");
@@ -556,6 +576,25 @@ describe("refusals", () => {
     expect(r.json.error).toMatchObject({ message: FIND_STOPPED_TEXT["queue-unreadable"], reason: "queue-unreadable" });
   });
 
+  it("F11: the queue's answer carries what the copy states need: the 'elsewhere' links of no-open-copy, the reason of needs-check, each with its sentence", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc!.state.session!.repo;
+    const at = new Date().toISOString();
+    const base = { projectId: pid, typed: "Quillfeather, Zorblatt", createdAt: at, updatedAt: at, attempts: 0 };
+    const none = { ...base, id: newId(), state: "no-open-copy" as const, offers: [{ label: "A free copy may be at" as const, url: "https://repository.example.edu/z.pdf", host: "repository.example.edu" }] };
+    const check = { ...base, id: newId(), state: "needs-check" as const, reason: { code: "file-other-doi" as const } };
+    const rules = { ...base, id: newId(), state: "record-complete" as const, reason: { code: "copy-not-allowed" as const, by: "rules" as const } };
+    await appendFindEntriesIn(repo, pid, [none, check, rules], "add");
+    const q = await queue(pid);
+    expect(q.entries.find((e) => e.id === none.id)).toMatchObject({ state: "no-open-copy", offers: none.offers });
+    expect(q.entries.find((e) => e.id === check.id)).toMatchObject({ state: "needs-check", reason: { code: "file-other-doi" } });
+    expect(q.entries.find((e) => e.id === rules.id)).toMatchObject({ state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } });
+    for (const c of ["copy-not-allowed", "held-full", "not-this-file", "file-other-doi", "file-title-absent", "file-no-text", "file-other-version"] as const) expect(FIND_REASON_TEXT[c]).toBeTruthy();
+    expect(FIND_REASON_TEXT["copy-not-allowed"]).not.toContain("free_copy");
+  });
+
   it("a typed line never appears in the log", async () => {
     await start();
     await openNewLibrary();
@@ -620,7 +659,7 @@ describe("the runner's life in the service", () => {
     // Unlocked: nothing was half-done, and the held line is looked up again and completes once.
     expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
     expect((await entry(pid, c!.id))!.state).toBe("choose");
-    expect((await settled(pid, e!.id)).state).toBe("record-complete");
+    expect(MADE).toContain((await settled(pid, e!.id)).state);
     expect((await call({ url: `/projects/${pid}/sources?limit=10` })).json.total).toBe(1);
   });
 
@@ -651,7 +690,7 @@ describe("the runner's life in the service", () => {
     expect(q.stopped).toEqual({ code: "index-not-ready", text: FIND_STOPPED_TEXT["index-not-ready"] });
     open();
     // (The released answer was kept in the lookup cache, so the resumed run may not ask again.)
-    expect((await settled(pid, e!.id)).state).toBe("record-complete");
+    expect(MADE).toContain((await settled(pid, e!.id)).state);
   });
 
   it("close during a held choose: the press answers 503 in words, and the library's files are unchanged after the lock is released (R245)", async () => {
@@ -738,7 +777,7 @@ describe("the runner's life in the service", () => {
     expect(oldRunnerClosed).toBe(true);
     expect(svc!.state.session!.find).not.toBe(oldRunner);
     release();
-    expect((await settled(pid, e!.id)).state).toBe("record-complete");
+    expect(MADE).toContain((await settled(pid, e!.id)).state);
     await sleep(200);
     expect((await readFile(oldFile)).equals(oldBytes!)).toBe(true);
   }, 60_000);
@@ -753,7 +792,7 @@ describe("other projects and the screen's settings", () => {
     expect((await call({ method: "PUT", url: "/find/screen", body: { checkEverything: true, projectId: b } })).status).toBe(200);
     const [ea] = await add(a, [LINE]);
     const madeA = await settled(a, ea!.id);
-    expect(madeA.state).toBe("record-complete");
+    expect(MADE).toContain(madeA.state);
     const [eb] = await add(b, [LINE]);
     const there = await settled(b, eb!.id);
     expect(there).toMatchObject({ state: "already", elsewhere: true });
@@ -839,7 +878,7 @@ describe("R247: the index, the cache, and work under way at a close or a move", 
     open();
     expect((await rebuilding).status).toBe(200);
     // The runner goes on by itself.
-    expect((await settled(pid, e1)).state).toBe("record-complete");
+    expect(MADE).toContain((await settled(pid, e1)).state);
     // An index error and no rebuild: "needs a rebuild", naming the control.
     (svc!.state.session!.repo.indexErrors as Array<{ op: string; error: unknown }>).push({ op: "source.create", error: new Error("index write failed") });
     const r2 = await call({ method: "POST", url: `/projects/${pid}/find`, body: { lines: [NOTHING] } });
@@ -909,7 +948,7 @@ describe("R247: the index, the cache, and work under way at a close or a move", 
     expect(await snapshot(path)).toEqual(after);
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
     const done = (await entry(pid, e!.id))!;
-    expect(done.state).toBe("record-complete");
+    expect(MADE).toContain(done.state);
     const sources = (await call({ url: `/projects/${pid}/sources?limit=10` })).json;
     expect(sources.total).toBe(1);
   }, 30_000);
@@ -965,8 +1004,8 @@ describe("R247: the index, the cache, and work under way at a close or a move", 
     await sleep(300);
     release();
     expect((await moving).status).toBe(200);
-    expect(atCopy.state).toBe("record-complete");
-    expect((await entry(pid, e!.id))!.state).toBe("record-complete");
+    expect(MADE).toContain(atCopy.state);
+    expect(MADE).toContain((await entry(pid, e!.id))!.state);
   }, 30_000);
 
   it("(M6) a quiesce that is rolled back resumes the queue", async () => {
@@ -984,7 +1023,7 @@ describe("R247: the index, the cache, and work under way at a close or a move", 
     svc!.state.stopWatches = stopWatches;
     expect(moved.status).not.toBe(200);
     release();
-    expect((await settled(pid, e!.id)).state).toBe("record-complete");
+    expect(MADE).toContain((await settled(pid, e!.id)).state);
   });
 });
 
@@ -1082,7 +1121,7 @@ describe("F8: an author alone", () => {
     expect(o2.json.works.filter((w: { added?: true }) => w.added).map((w: { id: string }) => w.id)).toEqual(["W1000", "W1002"]);
     expect(o2.json.works[0]).toMatchObject({ id: "W1000", title: "Vexmoor Ledger 0", issued: "2024-01-01", type: "article-journal", container: "Vexmoor Review of Invented Studies", identifiers: { doi: "10.5555/ao.f8.r1000" } });
     // Each work ticked goes on to a record of its own.
-    for (const k of t.json.added as FindEntryView[]) expect((await settled(pid, k.id)).state).toBe("record-complete");
+    for (const k of t.json.added as FindEntryView[]) expect(MADE).toContain((await settled(pid, k.id)).state);
     // Nothing typed, no name, title or OpenAlex id in a log line (the events are checked after every test).
     for (const w of ["A5001", "W1000", "Ledger", "Made-up"]) expect(logs.includes(w), w).toBe(false);
     for (const ev of events) if (ev.type === "find.progress") expect(Object.keys(ev.data as object).sort()).toEqual(["entryId", "projectId", "state"]);

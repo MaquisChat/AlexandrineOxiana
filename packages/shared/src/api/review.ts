@@ -17,7 +17,7 @@ export type ReviewCause =
   | { kind: "capture-conflict"; foundBy?: "later-check" }
   | { kind: "consent-withdrawal"; consentIds: string[] }
   /** Find and acquire (F11, R277): a file found for the source's record did not clearly match it; it is held for the researcher. */
-  | { kind: "acquired-file-mismatch"; findEntryId: string; held: string };
+  | { kind: "acquired-file-mismatch"; findEntryId: string };
 
 /**
  * Where an entry came from, so a person can tell entries apart:

@@ -100,7 +100,7 @@ describe("font names a researcher's own file cannot take (Task 57 M5): one list"
     expect(reviewGroup({ kind: "verification", cause: { kind: "capture-conflict" } })).toBe("capture");
     expect(reviewGroup({ kind: "verification", cause: { kind: "consent-withdrawal", consentIds: ["c1"] } })).toBe("withdrawal");
     // F11 (R277): a file found for a record that did not clearly match it.
-    expect(reviewGroup({ kind: "verification", cause: { kind: "acquired-file-mismatch", findEntryId: "e1", held: "find/held/e1.pdf" } })).toBe("found-file");
+    expect(reviewGroup({ kind: "verification", cause: { kind: "acquired-file-mismatch", findEntryId: "e1" } })).toBe("found-file");
   });
 
   it("a held file's reasons each have one plain sentence (F11, R277 d)", () => {
