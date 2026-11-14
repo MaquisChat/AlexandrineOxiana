@@ -63,8 +63,14 @@ export function displayEnv(root: string, p: { path: string; display?: string }):
   return runEnv(root, { PATH: p.path, ...(p.display ? { DISPLAY: p.display } : {}) });
 }
 
-/** The environment tauri-driver (and so WebKitWebDriver and the app) gets: only this, nothing inherited. */
-export function desktopEnv(root: string, p: EnvParts): Record<string, string> {
+/**
+ * The environment tauri-driver (and so WebKitWebDriver and the app) gets: only this, nothing inherited.
+ * `testMode` (the library scenarios, Task F19): the shell's own test mode, NODE_ENV=test, which a
+ * debug build alone honours and which lets the shell's request reach the loopback address where the
+ * stand-in library answers (R343 a: the one product switch those scenarios use). The shell does not
+ * pass it on: the service runs as a person's does.
+ */
+export function desktopEnv(root: string, p: EnvParts, opts: { testMode?: boolean } = {}): Record<string, string> {
   return {
     ...runEnv(root, { PATH: p.path }),
     DISPLAY: p.display,
@@ -73,6 +79,7 @@ export function desktopEnv(root: string, p: EnvParts): Record<string, string> {
     AO_DESKTOP_NODE: p.nodeBin,
     AO_DESKTOP_SERVICE_DIR: p.serviceDir,
     AO_DESKTOP_WORKER_BIN: p.workerBin,
+    ...(opts.testMode ? { NODE_ENV: "test" } : {}),
   };
 }
 
@@ -311,6 +318,27 @@ export interface Desktop {
   pickInFileDialog(title: string, path: string): Promise<void>;
   /** Closes the main window as its close button does: the window manager's WM_DELETE_WINDOW (x11.ts). */
   closeWithCloseButton(): Promise<void>;
+  /** The id of the visible window titled exactly `title` on the run's display, or undefined. */
+  windowId(title: string): string | undefined;
+  /**
+   * Key presses into the window titled `title`, as a person types them (xdotool, the keyboard focus
+   * confirmed on that window before each part): text to type, or `{ key: "Tab" | "Return" | … }`.
+   */
+  typeInto(title: string, parts: Array<string | { key: string }>): Promise<void>;
+  /** Closes the window titled `title` as its close button does (WM_DELETE_WINDOW). */
+  closeWindowTitled(title: string): Promise<void>;
+  /**
+   * Starts the app again through the same drivers, after it has exited (a quit and a new start with
+   * the same home, settings and data): a new WebDriver session (`session`) and new pids (`shell`).
+   */
+  relaunch(): Promise<void>;
+}
+
+export interface StartOptions {
+  /** The shell's test mode (NODE_ENV=test; see desktopEnv). */
+  testMode?: boolean;
+  /** Called with the app's data folder before the app starts (the app's own settings files of the run). */
+  prepare?: (appDataDir: string) => void;
 }
 
 export type Role = "button" | "link" | "textbox" | "heading" | "dialog" | "navigation" | "region" | "list" | "listitem" | "table" | "checkbox" | "alert";
@@ -382,7 +410,7 @@ function firstLine(child: ReturnType<RunLifetime["spawn"]>, what: string, ms: nu
  * Starts the app under WebDriver on a private display and bus, inside `run` (see the file comment).
  * Every process is started through `run`, so the `run` fixture stops all of them whatever happens.
  */
-export async function startDesktop(run: RunLifetime): Promise<Desktop> {
+export async function startDesktop(run: RunLifetime, opts: StartOptions = {}): Promise<Desktop> {
   const missing = checkPrerequisites();
   if (missing.length) throw new Error(`The desktop end-to-end test cannot run here:\n- ${missing.join("\n- ")}`);
   // What an earlier test runner killed outright left behind (nothing in-process can clean that up):
@@ -412,39 +440,48 @@ export async function startDesktop(run: RunLifetime): Promise<Desktop> {
     writeFileSync(workerBin, `#!/bin/sh\nexec env -u PWD '${w.dev.replaceAll("'", "'\\''")}' -m ao_worker\n`);
     chmodSync(workerBin, 0o755);
   }
-  const env = desktopEnv(root, { display, bus, workerBin, nodeBin: process.execPath, serviceDir: SERVICE_DIR, path });
+  const env = desktopEnv(root, { display, bus, workerBin, nodeBin: process.execPath, serviceDir: SERVICE_DIR, path }, { testMode: opts.testMode });
+  opts.prepare?.(join(root, "data", APP_IDENTIFIER));
   const port = await freePort();
   const nativePort = await freePort();
   const driver = run.spawn(findTauriDriver()!, ["--port", String(port), "--native-port", String(nativePort)], env);
   const base = `http://127.0.0.1:${port}`;
   // tauri-driver listens shortly after it starts. Only "not listening yet" is waited out; any other
   // answer (a refused session, a driver that exited) fails at once with its cause.
-  const session = await until("tauri-driver to start a session", 90_000, async () => {
-    if (driver.exitCode !== null || driver.signalCode !== null) throw new Fatal(`tauri-driver exited (${driver.exitCode ?? driver.signalCode})`);
-    try {
-      return await newSession(base, { "tauri:options": { application: SHELL } }, { commandTimeoutMs: 120_000 });
-    } catch (err) {
-      if (err instanceof Error && !(err instanceof WebDriverError) && /ECONNREFUSED|fetch failed/.test(err.message)) return undefined;
-      throw new Fatal(`the app could not be started through WebDriver: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  });
+  const startSession = () =>
+    until("tauri-driver to start a session", 90_000, async () => {
+      if (driver.exitCode !== null || driver.signalCode !== null) throw new Fatal(`tauri-driver exited (${driver.exitCode ?? driver.signalCode})`);
+      try {
+        return await newSession(base, { "tauri:options": { application: SHELL } }, { commandTimeoutMs: 120_000 });
+      } catch (err) {
+        if (err instanceof Error && !(err instanceof WebDriverError) && /ECONNREFUSED|fetch failed/.test(err.message)) return undefined;
+        throw new Fatal(`the app could not be started through WebDriver: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+  let session = await startSession();
   // On every way out of the run: end the WebDriver session, so that WebKitWebDriver ends cleanly
   // before its process group is stopped (an error here is expected once the app has closed).
   run.defer(() => session.delete());
+  /** The log's length when the app was (last) started: a relaunch reads only what came after. */
+  let logFrom = 0;
+  const appLog = () => readShellLog(run.log().slice(logFrom));
   const failedStart = () => {
-    const f = readShellLog(run.log()).startFailure;
+    const f = appLog().startFailure;
     if (f) throw new Fatal(`the app could not start: ${f}`);
   };
-  const shellPid = await until("the app's process under the drivers", 60_000, () => {
-    failedStart();
-    return descendants(driver.pid!).find((p) => running(p) && cmdline(p).startsWith(SHELL));
-  });
-  const servicePid = await until("the library service under the app", 120_000, () => {
-    failedStart();
-    if (!running(shellPid)) throw new Fatal("the app exited before its service started");
-    return readShellLog(run.log()).port !== undefined ? descendants(shellPid).find((p) => running(p) && /service\.mjs/.test(cmdline(p))) : undefined;
-  });
-  const shell = { shellPid, servicePid };
+  const findPids = async (except: number[] = []) => {
+    const shellPid = await until("the app's process under the drivers", 60_000, () => {
+      failedStart();
+      return descendants(driver.pid!).find((p) => running(p) && !except.includes(p) && cmdline(p).startsWith(SHELL));
+    });
+    const servicePid = await until("the library service under the app", 120_000, () => {
+      failedStart();
+      if (!running(shellPid)) throw new Fatal("the app exited before its service started");
+      return appLog().port !== undefined ? descendants(shellPid).find((p) => running(p) && /service\.mjs/.test(cmdline(p))) : undefined;
+    });
+    return { shellPid, servicePid };
+  };
+  const shell = await findPids();
   const isUnder = (p: number, ancestor: number) => {
     for (let q = p, i = 0; q > 1 && i < 64; i++) {
       if (q === ancestor) return true;
@@ -482,10 +519,12 @@ export async function startDesktop(run: RunLifetime): Promise<Desktop> {
     librariesDir: join(root, "libraries"),
     filesDir: join(root, "files"),
     appDataDir: join(root, "data", APP_IDENTIFIER),
-    session,
+    get session() {
+      return session;
+    },
     shell,
     log: () => run.log(),
-    shellLog: () => readShellLog(run.log()),
+    shellLog: () => appLog(),
     helpers: () => [shell.servicePid, ...descendants(shell.servicePid)].filter(running),
     appProcesses: () => processesMarkedBy(root, infrastructure()).filter((p) => !startedByBus(p)),
     runProcesses: () => [...new Set([...[xvfb.pid!, dbus.pid!, driver.pid!].flatMap((p) => [p, ...descendants(p)]), ...processesMarkedBy(root, [])])].filter(running),
@@ -524,6 +563,31 @@ export async function startDesktop(run: RunLifetime): Promise<Desktop> {
       const win = windowTitled(windows(), WINDOW_TITLE);
       if (!win) throw new Error(`no visible window titled "${WINDOW_TITLE}" on the display`);
       await requestWindowClose(socketPathFor(display), Number(win));
+    },
+    windowId(title) {
+      return windowTitled(windows(), title);
+    },
+    async typeInto(title, parts) {
+      const win = await until(`the window "${title}"`, 30_000, () => windowTitled(windows(), title));
+      for (const part of parts) {
+        await focused(win, title);
+        if (typeof part === "string") xdo(["type", "--delay", "25", part]);
+        else xdo(["key", "--clearmodifiers", part.key]);
+      }
+    },
+    async closeWindowTitled(title) {
+      const win = windowTitled(windows(), title);
+      if (!win) throw new Error(`no visible window titled "${title}" on the display`);
+      await requestWindowClose(socketPathFor(display), Number(win));
+    },
+    async relaunch() {
+      if (running(shell.shellPid)) throw new Error("the app is still running: it is started again only after it has exited");
+      const old = shell.shellPid;
+      // The old session ended with its app; a new one starts the app again (WebKitWebDriver).
+      await session.delete().catch(() => undefined);
+      logFrom = run.log().length;
+      session = await startSession();
+      Object.assign(shell, await findPids([old]));
     },
   };
 }

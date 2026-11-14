@@ -1,0 +1,222 @@
+/**
+ * The stand-in for a library and a publisher (Task F19, R343 a): ONE https server on the loopback
+ * address that answers by host name, as an EZproxy library and the publishers behind it do. Every name
+ * is made up, under `ao-library-standin.test` (`.test` never resolves on the internet; the machine's
+ * set-up maps these names to 127.0.0.1 and makes it trust the throw-away authority that signed the
+ * certificate: system-setup.ts). Nothing here reaches any other server.
+ *
+ *  - `login.proxy.ao-library-standin.test` — the library's proxy, where the sign-in window is opened
+ *    (`/login?url=<target>`). Without its session cookie: a sign-in form (made-up reader, made-up
+ *    password). The form posts to a SAML-like path (`/saml/SSO`) carrying a one-time assertion; that
+ *    path sets the session cookie FOR THE PROXY'S PARENT DOMAIN (`Domain=proxy.ao-library-standin.test`,
+ *    so that it also reaches the hyphenated hosts) and sends the window back to `/login`, which then
+ *    sends it on to the target through the proxy. The SAML-like path accepts each assertion once: a
+ *    second request with it is a REPLAY and fails the scenario, and so does any request the shell
+ *    itself makes to this host (the shell must never fetch a sign-in address).
+ *  - `doi-org.proxy.ao-library-standin.test` — doi.org through the proxy: `/<doi>` → the work's page
+ *    at the publisher, through the proxy.
+ *  - `www-invented-journals-example.proxy.ao-library-standin.test` — the publisher through the proxy's
+ *    hyphenated host. Pages (each needs the session cookie, else back to the sign-in):
+ *      `/article/marked`      a page WITH `meta name="citation_pdf_url"` → `/pdf/marked.pdf` (inline PDF);
+ *      `/article/unmarked`    a page WITHOUT it, showing a link to the PDF at an address that does not
+ *                             look like one (`/content/unmarked/fulltext`, inline);
+ *      `/article/attachment`    a page WITH the mark → `/files/attachment`, a PDF sent with
+ *                             `Content-Disposition: attachment` at an address that does not look like one;
+ *      `/article/redirect`    a page WITH the mark → `/pdf/redirect.pdf`, which redirects to the third host.
+ *  - `cdn.ao-library-standin.test` — a third host, NOT under the proxy's domain: `/<slug>.pdf` (inline);
+ *    records which cookies it is sent.
+ *
+ * Every request is recorded (`requests()`): when, host, method, path, who made it, and the NAMES of the
+ * cookies it carried — never their values, and nothing of it is printed. Who: the shell's own request
+ * asks `Accept: application/pdf` and nothing else (library_window.rs `fetch_pdf`); the web view's
+ * navigations ask for HTML first. The pages' only script is a beacon (`/ready?…`) that says the page
+ * is shown with its first control focused, so that the scenario types only once a person could.
+ * `violations()` lists what fails a scenario whatever it checks: a replayed assertion, the shell at
+ * the sign-in host or the SAML-like path, a wrong sign-in.
+ */
+import { randomBytes } from "node:crypto";
+import { createServer, type Server } from "node:https";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import { STANDIN_DOMAIN } from "./system-setup.js";
+
+export const PROXY_DOMAIN = `proxy.${STANDIN_DOMAIN}`;
+export const HOSTS = {
+  proxy: `login.${PROXY_DOMAIN}`,
+  doi: `doi-org.${PROXY_DOMAIN}`,
+  publisher: `www-invented-journals-example.${PROXY_DOMAIN}`,
+  third: `cdn.${STANDIN_DOMAIN}`,
+} as const;
+export const STANDIN_NAMES: string[] = Object.values(HOSTS);
+/** The proxy's session cookie (its name; its value is random per sign-in and never recorded). */
+export const SESSION_COOKIE = "ezproxy";
+/** The made-up reader's sign-in (a stand-in's; no real account). */
+export const READER = { user: "test-only-reader", password: "not-a-real-password" };
+export const SAML_PATH = "/saml/SSO";
+
+/** The publisher's pages by kind; a work's DOI ends with its kind (10.5555/ao.f19.<kind>). */
+export type PageKind = "marked" | "unmarked" | "attachment" | "redirect";
+
+export interface StandinRequest {
+  at: number;
+  host: string;
+  method: string;
+  path: string;
+  /** "shell": the shell's own request (Accept: application/pdf alone); "window": the sign-in window. */
+  by: "shell" | "window";
+  /** The names of the cookies the request carried (never their values). */
+  cookies: string[];
+}
+
+export interface Standin {
+  port: number;
+  /** `https://<host>:<port>`. */
+  origin(host: string): string;
+  requests(): StandinRequest[];
+  violations(): string[];
+  /** The bytes the stand-in serves as the work's PDF for `kind`. */
+  pdf(kind: PageKind): Buffer;
+  close(): Promise<void>;
+}
+
+const html = (title: string, body: string, head = "") =>
+  `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${title}</title>${head}</head><body>${body}</body></html>`;
+/** The page says it is shown and its first control focused (a beacon to the stand-in). */
+const ready = (what: string, focus?: string) =>
+  `<script>window.addEventListener("load",function(){${focus ? `var f=document.getElementById(${JSON.stringify(focus)});if(f)f.focus();` : ""}setTimeout(function(){var i=new Image();i.src="/ready?page=${what}&focused="+(document.activeElement&&document.activeElement.id||"");},0);});</script>`;
+
+/** Starts the stand-in on 127.0.0.1 with the certificate for its names; `pdfs` gives each kind's file. */
+export async function startStandin(tls: { certPem: string; keyPem: string }, pdfs: Record<PageKind, Buffer>): Promise<Standin> {
+  const log: StandinRequest[] = [];
+  const violations: string[] = [];
+  /** One-time assertions issued with a form, and those already used. */
+  const issued = new Set<string>();
+  const used = new Set<string>();
+  /** Session values handed out (the cookie's value is checked, never recorded). */
+  const sessions = new Set<string>();
+  let port = 0;
+  const origin = (host: string) => `https://${host}:${port}`;
+
+  const cookiesOf = (req: IncomingMessage): Map<string, string> => {
+    const out = new Map<string, string>();
+    for (const part of String(req.headers.cookie ?? "").split(";")) {
+      const i = part.indexOf("=");
+      if (i > 0) out.set(part.slice(0, i).trim(), part.slice(i + 1).trim());
+    }
+    return out;
+  };
+  const signedIn = (req: IncomingMessage) => sessions.has(cookiesOf(req).get(SESSION_COOKIE) ?? "");
+  const send = (res: ServerResponse, status: number, body: string | Buffer, headers: Record<string, string> = {}) => {
+    const b = typeof body === "string" ? Buffer.from(body) : body;
+    res.writeHead(status, { "content-length": String(b.length), "cache-control": "no-store", ...(typeof body === "string" && !headers["content-type"] ? { "content-type": "text/html; charset=utf-8" } : {}), ...headers });
+    res.end(b);
+  };
+  const redirect = (res: ServerResponse, to: string, status = 302) => send(res, status, "", { location: to });
+  const pdf = (res: ServerResponse, kind: PageKind, attachment = false) =>
+    send(res, 200, pdfs[kind], { "content-type": "application/pdf", ...(attachment ? { "content-disposition": `attachment; filename="${kind}.pdf"` } : {}) });
+  const toSignIn = (res: ServerResponse, target: string) => redirect(res, `${origin(HOSTS.proxy)}/login?url=${encodeURIComponent(target)}`);
+  const kindOf = (s: string): PageKind | undefined => (["marked", "unmarked", "attachment", "redirect"] as const).find((k) => k === s);
+
+  const handle = async (req: IncomingMessage, res: ServerResponse) => {
+    const host = String(req.headers.host ?? "").replace(/:\d+$/, "").toLowerCase();
+    const url = new URL(req.url ?? "/", "https://x");
+    const accept = String(req.headers.accept ?? "");
+    const by: StandinRequest["by"] = accept === "application/pdf" ? "shell" : "window";
+    log.push({ at: Date.now(), host, method: req.method ?? "", path: url.pathname, by, cookies: [...cookiesOf(req).keys()] });
+    let body = "";
+    for await (const chunk of req) body += chunk;
+
+    if (url.pathname === "/ready") return send(res, 204, "");
+    if (host === HOSTS.proxy) {
+      if (by === "shell") violations.push(`the shell asked the sign-in host (${req.method} ${url.pathname})`);
+      if (url.pathname === SAML_PATH) {
+        if (by === "shell") return send(res, 400, "");
+        const form = new URLSearchParams(body);
+        const assertion = form.get("assertion") ?? "";
+        if (req.method !== "POST" || !issued.has(assertion)) return send(res, 400, html("Refused", "<p>Not a sign-in.</p>"));
+        if (used.has(assertion)) {
+          violations.push("the SAML-like path was asked twice with one assertion (a replay)");
+          return send(res, 400, html("Refused", "<p>This sign-in was already used.</p>"));
+        }
+        used.add(assertion);
+        if (form.get("user") !== READER.user || form.get("password") !== READER.password) {
+          violations.push("the sign-in form arrived with another user name or password than was typed");
+          return send(res, 403, html("Refused", "<p>Wrong user name or password.</p>"));
+        }
+        const value = randomBytes(16).toString("hex");
+        sessions.add(value);
+        res.setHeader("set-cookie", `${SESSION_COOKIE}=${value}; Domain=${PROXY_DOMAIN}; Path=/; Secure; HttpOnly; SameSite=Lax`);
+        return redirect(res, `/login?url=${encodeURIComponent(form.get("relay") ?? "")}`, 303);
+      }
+      if (url.pathname === "/login") {
+        const target = url.searchParams.get("url") ?? "";
+        if (signedIn(req)) {
+          const m = /^https:\/\/doi\.org\/(10\.5555\/ao\.f19\.[a-z-]+)$/.exec(target);
+          return m ? redirect(res, `${origin(HOSTS.doi)}/${m[1]}`) : send(res, 404, html("Not here", "<p>The stand-in proxies only its own works.</p>"));
+        }
+        const assertion = randomBytes(16).toString("hex");
+        issued.add(assertion);
+        return send(
+          res,
+          200,
+          html(
+            "Sign in — Invented University Library",
+            `<h1>Invented University Library</h1><form method="post" action="${SAML_PATH}"><p><label for="user">User name</label> <input id="user" name="user" autocomplete="off"></p><p><label for="password">Password</label> <input id="password" name="password" type="password"></p><input type="hidden" name="relay" value="${target.replace(/"/g, "&quot;")}"><input type="hidden" name="assertion" value="${assertion}"><p><button type="submit">Sign in</button></p></form>${ready("sign-in", "user")}`,
+          ),
+        );
+      }
+      return send(res, 404, "");
+    }
+    if (host === HOSTS.doi) {
+      const doi = url.pathname.slice(1);
+      const kind = kindOf(/^10\.5555\/ao\.f19\.([a-z-]+)$/.exec(doi)?.[1]?.replace(/^restart$/, "unmarked").replace(/^close$/, "marked") ?? "");
+      if (!signedIn(req)) return toSignIn(res, `https://doi.org/${doi}`);
+      return kind ? redirect(res, `${origin(HOSTS.publisher)}/article/${kind}`) : send(res, 404, "");
+    }
+    if (host === HOSTS.publisher) {
+      if (!signedIn(req)) return toSignIn(res, "https://doi.org/");
+      const page = /^\/article\/([a-z]+)$/.exec(url.pathname);
+      if (page) {
+        const kind = kindOf(page[1]!);
+        if (!kind) return send(res, 404, "");
+        const mark = (to: string) => `<meta name="citation_pdf_url" content="${origin(HOSTS.publisher)}${to}">`;
+        const title = `An invented article (${kind})`;
+        if (kind === "unmarked") return send(res, 200, html(title, `<h1>${title}</h1><p><a id="pdf" href="/content/unmarked/fulltext">Full text (PDF)</a></p>${ready("unmarked", "pdf")}`));
+        const to = kind === "attachment" ? "/files/attachment" : `/pdf/${kind}.pdf`;
+        return send(res, 200, html(title, `<h1>${title}</h1><p><a href="${to}">PDF</a></p>${ready(kind)}`, mark(to)));
+      }
+      if (url.pathname === "/content/unmarked/fulltext") return pdf(res, "unmarked");
+      if (url.pathname === "/files/attachment") return pdf(res, "attachment", true);
+      if (url.pathname === "/pdf/redirect.pdf") return redirect(res, `${origin(HOSTS.third)}/redirect.pdf`);
+      const p = /^\/pdf\/([a-z]+)\.pdf$/.exec(url.pathname);
+      const k = p ? kindOf(p[1]!) : undefined;
+      return k ? pdf(res, k) : send(res, 404, "");
+    }
+    if (host === HOSTS.third) {
+      if (url.pathname === "/redirect.pdf") return pdf(res, "redirect");
+      return send(res, 404, "");
+    }
+    return send(res, 421, "");
+  };
+
+  const server: Server = createServer({ cert: tls.certPem, key: tls.keyPem }, (req, res) => {
+    handle(req, res).catch(() => {
+      if (!res.headersSent) send(res, 500, "");
+      else res.destroy();
+    });
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  port = (server.address() as AddressInfo).port;
+  return {
+    port,
+    origin,
+    requests: () => log.slice(),
+    violations: () => violations.slice(),
+    pdf: (k) => pdfs[k],
+    close: () =>
+      new Promise((done) => {
+        server.close(() => done());
+        server.closeAllConnections();
+      }),
+  };
+}
