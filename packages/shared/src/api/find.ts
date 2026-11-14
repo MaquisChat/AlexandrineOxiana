@@ -183,6 +183,8 @@ export const FIND_REFUSAL_REASONS = [
   // Task F18c (R345): "Open it here and fetch the PDF" refused — the sentences are FIND_LINK_TEXT.
   "link-not-offered",
   "link-not-a-place",
+  // Task F20a (R348 d): "Get through my library in my own browser" with no browser extension paired.
+  "browser-not-paired",
 ] as const;
 export type FindRefusalReason = (typeof FIND_REFUSAL_REASONS)[number];
 
@@ -371,6 +373,18 @@ export interface FindEntryView {
    * longer knows (tickets are in memory only; after a restart the entry returns at once).
    */
   windowStart?: "link";
+  /**
+   * Task F20a (R348 e): `true` when "Get through my library in my own browser" may start for this entry — the entry is
+   * offered a library start (`library.canStart` is `true`) AND at least one browser extension is paired with the app.
+   * Worked out by the service, never by the screen; absent otherwise.
+   */
+  browserStart?: true;
+  /**
+   * Task F20a (R348 e): on an entry "waiting-sign-in" whose open ticket (or file being taken) is the browser's,
+   * "browser" — the work waits in the researcher's own browser, not in the sign-in window. Memory only, as
+   * `windowStart`; absent for the window (a browser start is a library start: `windowStart` is absent too).
+   */
+  waitingIn?: "browser";
 }
 
 /** Task F8b (R279 c): an author of the typed name offered beside the works ("Show this author's works"). Counts only. */
@@ -560,7 +574,7 @@ export type FindLibraryChance = (
    * Task F18c (R345 e): with `lastFile`, "link" when that file was fetched at one of the entry's links (its sentence is
    * then FIND_LINK_FILE_TEXT, which names no library). Absent for a file through the library.
    */
-  lastFileFrom?: "link";
+  lastFileFrom?: "link" | "browser";
 };
 
 /** The longest link "derive" reads (a longer one is refused in words). */
@@ -623,8 +637,8 @@ export const FIND_LIBRARY_TEXT = {
   notOffered: "This entry cannot be fetched through your library now. Nothing was changed.",
   /** "no-library": no library is set — the researcher's to mend. */
   noLibrary: "Your library is not set. Set it in Your library, then try again.",
-  /** "library-busy": another ticket is open (one sign-in window, one entry at a time). */
-  busy: "Another work is waiting in the sign-in window. Finish or cancel it first.",
+  /** "library-busy": another ticket is open (one work waits at a time, in the sign-in window or in the browser; R348 b). */
+  busy: "Another work is waiting for its file, in the sign-in window or in your browser. Finish or cancel it first.",
   /** "library-held-full" (R324 a): FIND_HELD_MAX files already wait for the researcher's check. */
   heldFull: `${FIND_HELD_MAX} files are already waiting for your check. Decide on some of them, then try again.`,
 } as const;
@@ -641,14 +655,38 @@ export const LIBRARY_FILE_MAX_BYTES = 200 * 1024 * 1024;
 /** Why a file handed over through the library was not held. */
 export const FIND_LIBRARY_FILE_OUTCOMES = ["not-pdf", "too-large", "unreadable", "rules-method", "rules-store", "rules-legal-basis"] as const;
 export type FindLibraryFileOutcome = (typeof FIND_LIBRARY_FILE_OUTCOMES)[number];
-export const FIND_LIBRARY_FILE_TEXT: Record<FindLibraryFileOutcome, string> = {
-  "not-pdf": "The file from your library was not kept: it is not a PDF or EPUB.",
-  "too-large": "The file from your library was not kept: it is larger than 200 MB.",
-  unreadable: "The file from your library could not be read, so it was not kept. Try again through your library.",
-  "rules-method": "The file from your library was not kept: this project's rules do not allow fetching works through your library.",
-  "rules-store": "The file from your library was not kept: this project's rules do not allow storing the file for this record.",
-  "rules-legal-basis": "The file from your library was not kept: this project's rules need a legal basis to store the file for this record, and the record has none.",
-};
+/**
+ * Task F20a (R348 g): why a handed-over file was not kept, in the words every not-kept sentence ends with — ONE source
+ * for the library's, the link's and the browser's sentences, so that their causes cannot drift apart. The method's
+ * cause depends on the method the start asked for (`library_access` for the library and the browser, `free_copy` for
+ * a link); "unreadable" has a sentence of its own for each.
+ */
+export const FIND_FILE_NOT_KEPT_CAUSE = {
+  "not-pdf": "it is not a PDF or EPUB.",
+  "too-large": "it is larger than 200 MB.",
+  "rules-store": "this project's rules do not allow storing the file for this record.",
+  "rules-legal-basis": "this project's rules need a legal basis to store the file for this record, and the record has none.",
+  /** The method `library_access` (the library's start, in the window or in the browser). */
+  "rules-method-library": "this project's rules do not allow fetching works through your library.",
+  /** The method `free_copy` (a link's start). */
+  "rules-method-link": "this project's rules do not allow fetching free copies of works.",
+} as const;
+
+/** The not-kept sentences of one kind of start: `<prefix><cause>` for each cause, `unreadable` its own. */
+const notKeptText = (prefix: string, method: "rules-method-library" | "rules-method-link", unreadable: string): Record<FindLibraryFileOutcome, string> => ({
+  "not-pdf": `${prefix}${FIND_FILE_NOT_KEPT_CAUSE["not-pdf"]}`,
+  "too-large": `${prefix}${FIND_FILE_NOT_KEPT_CAUSE["too-large"]}`,
+  unreadable,
+  "rules-method": `${prefix}${FIND_FILE_NOT_KEPT_CAUSE[method]}`,
+  "rules-store": `${prefix}${FIND_FILE_NOT_KEPT_CAUSE["rules-store"]}`,
+  "rules-legal-basis": `${prefix}${FIND_FILE_NOT_KEPT_CAUSE["rules-legal-basis"]}`,
+});
+
+export const FIND_LIBRARY_FILE_TEXT: Record<FindLibraryFileOutcome, string> = notKeptText(
+  "The file from your library was not kept: ",
+  "rules-method-library",
+  "The file from your library could not be read, so it was not kept. Try again through your library.",
+);
 
 // ---------------------------------------------------------------------------------------------------------------
 // Task F18c (R345): "Open it here and fetch the PDF" — one of an entry's own links opened in the sign-in window, on the
@@ -678,11 +716,94 @@ export const FIND_LINK_TEXT = {
 } as const;
 
 /** Why a file fetched at one of the entry's links was not held (the library's outcomes), in words that name no library. */
-export const FIND_LINK_FILE_TEXT: Record<FindLibraryFileOutcome, string> = {
-  "not-pdf": "The file fetched in the sign-in window was not kept: it is not a PDF or EPUB.",
-  "too-large": "The file fetched in the sign-in window was not kept: it is larger than 200 MB.",
-  unreadable: "The file fetched in the sign-in window could not be read, so it was not kept. Try again with “Open it here and fetch the PDF”.",
-  "rules-method": "The file fetched in the sign-in window was not kept: this project's rules do not allow fetching free copies of works.",
-  "rules-store": "The file fetched in the sign-in window was not kept: this project's rules do not allow storing the file for this record.",
-  "rules-legal-basis": "The file fetched in the sign-in window was not kept: this project's rules need a legal basis to store the file for this record, and the record has none.",
-};
+export const FIND_LINK_FILE_TEXT: Record<FindLibraryFileOutcome, string> = notKeptText(
+  "The file fetched in the sign-in window was not kept: ",
+  "rules-method-link",
+  "The file fetched in the sign-in window could not be read, so it was not kept. Try again with “Open it here and fetch the PDF”.",
+);
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F20a (R348): "Get through my library in my own browser" — the fallback for a library whose sign-in the app's
+// window cannot do (a passkey, a security key, Google's sign-in). A third entry point into the one start: the same
+// ticket (one work waits at a time, in the window OR in the browser), pause, limit, waiting state, cancel and ways
+// back; what differs is kept with the ticket in memory: where the work waits. The paired browser extension sends the
+// PDF of the researcher's tab; the file WAITS in the review queue for the researcher's check (R301), never added.
+//
+//   POST /projects/:id/find/:eid/browser/start   (the desktop app's token; no body) → FindBrowserStartResponse
+//                                                (the library's address for the work, no ticket); cancelled by
+//                                                `…/library/cancel`. Refusals: the library start's, and 409
+//                                                "browser-not-paired" (FIND_BROWSER_TEXT.notPaired).
+//   POST /find/browser/waiting                   (the extension's token and its paired Origin) FindBrowserWaitingRequest
+//                                                → FindBrowserWaitingResponse
+//   POST /find/browser/file/:ticket              (the extension's token and its paired Origin) the PDF's bytes,
+//                                                `Content-Type: application/pdf`, header FIND_BROWSER_PAGE_HEADER (the
+//                                                tab's address) → FindBrowserFileResponse; refusals FIND_BROWSER_REFUSALS.
+
+/** Where a work waits for its file: in the app's sign-in window, or in the researcher's own browser. */
+export const FIND_WAITING_PLACES = ["window", "browser"] as const;
+export type FindWaitingIn = (typeof FIND_WAITING_PLACES)[number];
+
+/** The app's start in the browser: the library's address for the work, and nothing else (never the ticket). */
+export interface FindBrowserStartResponse {
+  url: string;
+}
+/** The extension's list asked for: exactly `{}`. */
+export type FindBrowserWaitingRequest = Record<string, never>;
+/** A work waiting for a PDF from the browser, as the extension gets it: its ticket and its title cut, nothing else. */
+export interface FindBrowserWaiting {
+  ticket: string;
+  /** The record's title, at most FIND_BROWSER_LABEL_MAX characters (code points); FIND_BROWSER_NO_TITLE without one. Text, never markup. */
+  label: string;
+}
+/** Today none or one (one ticket for the whole service). */
+export interface FindBrowserWaitingResponse {
+  waiting: FindBrowserWaiting[];
+}
+/** How the hand-over of a file sent from the browser ended. */
+export const FIND_BROWSER_FILE_ENDS = ["held", "not-kept", "gone"] as const;
+export type FindBrowserFileEnd = (typeof FIND_BROWSER_FILE_ENDS)[number];
+/** The answer once the file's path has ended (always 200): "held", "not-kept" (FIND_BROWSER_FILE_TEXT) or "gone". */
+export interface FindBrowserFileResponse {
+  outcome: FindBrowserFileEnd;
+  sentence: string;
+}
+/** The longest label the list gives, in characters (code points). */
+export const FIND_BROWSER_LABEL_MAX = 200;
+/** The label of a record without a title. */
+export const FIND_BROWSER_NO_TITLE = "(no title)";
+/** The header that carries the tab's address, and its longest form. */
+export const FIND_BROWSER_PAGE_HEADER = "x-ao-page";
+export const FIND_BROWSER_PAGE_MAX = 2048;
+/** No byte of the PDF for this long: cut off. */
+export const FIND_BROWSER_STALL_MS = 120_000;
+/** The file route's refusals, in the order they are checked (each with its sentence in FIND_BROWSER_TEXT). */
+export const FIND_BROWSER_REFUSALS = ["browser-not-waiting", "browser-page", "browser-busy", "browser-too-large", "browser-not-pdf", "browser-cut-off"] as const;
+export type FindBrowserRefusal = (typeof FIND_BROWSER_REFUSALS)[number];
+export const FIND_BROWSER_TEXT = {
+  /** 409 "browser-not-paired" (the app's start). */
+  notPaired: "No browser is paired with this app. Pair the browser extension first (Browser extension, in the settings). Nothing was changed.",
+  /** 400: the list asked with anything but `{}`. */
+  listBody: "This request takes an empty object ({}) and nothing else.",
+  /** 404 "browser-not-waiting": the same answer for every wrong ticket. */
+  notWaiting: "That work is no longer waiting for a PDF from your browser. Nothing was kept.",
+  /** 400 "browser-page". */
+  page: "This tab's address is not an https address, so the app does not take a file from it. The work is still waiting.",
+  /** 409 "browser-busy". */
+  busy: "A PDF from your browser is being taken in. Try again in a moment.",
+  /** 413 "browser-too-large". */
+  tooLarge: "That PDF is larger than 200 MB, so the app does not take it. The work is still waiting.",
+  /** 400 "browser-not-pdf". */
+  notPdf: "That tab's file is not a PDF. The work is still waiting.",
+  /** 400 "browser-cut-off". */
+  cutOff: "The PDF did not arrive whole. The work is still waiting. Try again.",
+  /** 200 "held". */
+  held: "Sent. The file waits for your check in the app's review queue.",
+  /** 200 "gone": the entry or its record removed, the project locked, the record already has a file. */
+  gone: "The file was not kept: the work is no longer waiting for it.",
+} as const;
+/** 200 "not-kept": the sentence the entry's row shows (by `library.lastFileFrom: "browser"`). */
+export const FIND_BROWSER_FILE_TEXT: Record<FindLibraryFileOutcome, string> = notKeptText(
+  "The file sent from your browser was not kept: ",
+  "rules-method-library",
+  "The file sent from your browser could not be read, so it was not kept. Try again with “Get through my library in my own browser”.",
+);

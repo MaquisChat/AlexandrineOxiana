@@ -2,6 +2,23 @@
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
 import { YOUR_LIBRARY_TEST_DOI, type YourLibraryResponse, type YourLibraryTestResponse } from "../index.js";
+import {
+  FIND_BROWSER_FILE_ENDS,
+  FIND_BROWSER_FILE_TEXT,
+  FIND_BROWSER_LABEL_MAX,
+  FIND_BROWSER_NO_TITLE,
+  FIND_BROWSER_PAGE_HEADER,
+  FIND_BROWSER_PAGE_MAX,
+  FIND_BROWSER_REFUSALS,
+  FIND_BROWSER_STALL_MS,
+  FIND_BROWSER_TEXT,
+  FIND_FILE_NOT_KEPT_CAUSE,
+  FIND_WAITING_PLACES,
+  type FindBrowserFileResponse,
+  type FindBrowserStartResponse,
+  type FindBrowserWaitingRequest,
+  type FindBrowserWaitingResponse,
+} from "../index.js";
 import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, FIND_LIBRARY_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, WHERE_TO_GET_IT_MAX, WHERE_TO_GET_IT_URL_MAX, YOUR_LIBRARY_DERIVE_REFUSALS, YOUR_LIBRARY_DERIVE_TEXT, YOUR_LIBRARY_LINK_MAX, YOUR_LIBRARY_NAME_MAX, YOUR_LIBRARY_TEXT, libraryReadyIn, yourLibraryAddressSentence, FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, LIBRARY_FILE_MAX_BYTES, FIND_LINK_TEXT, FIND_LINK_FILE_TEXT, FIND_WINDOW_STARTS, type FindLinkStartRequest, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin, SEARCH_RECORD_SOURCES, SEARCH_COPY_SOURCES, SEARCH_SOURCE_GROUPS, SEARCH_SOURCE_INFO, SEARCH_KEY_SECRETS, SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI, SEARCH_TEST_TEXT, SEARCH_SETTINGS_TEXT, searchEmailRefusal, isSearchApiKeyShape, type SearchSourcesResponse, type SearchRecordRow } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
@@ -256,5 +273,54 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect(answer.addressSentence).toBe("Your library's address: ezproxy.lib.example.edu (EZproxy)");
     const r: YourLibraryTestResponse = { url: "https://ezproxy.lib.example.edu/login?url=https://doi.org/10.1038/171737a0" };
     expect(Object.keys(r)).toEqual(["url"]);
+  });
+
+  it("Get through my library in my own browser (F20a, R348): the busy sentence true of both places, the refusals, the answers, and the not-kept causes from one source", () => {
+    // R348 b: one work waits at a time, in the window or in the browser.
+    expect(FIND_LIBRARY_TEXT.busy).toBe("Another work is waiting for its file, in the sign-in window or in your browser. Finish or cancel it first.");
+    expect(FIND_REFUSAL_REASONS).toContain("browser-not-paired");
+    expect(FIND_BROWSER_TEXT).toEqual({
+      notPaired: "No browser is paired with this app. Pair the browser extension first (Browser extension, in the settings). Nothing was changed.",
+      listBody: "This request takes an empty object ({}) and nothing else.",
+      notWaiting: "That work is no longer waiting for a PDF from your browser. Nothing was kept.",
+      page: "This tab's address is not an https address, so the app does not take a file from it. The work is still waiting.",
+      busy: "A PDF from your browser is being taken in. Try again in a moment.",
+      tooLarge: "That PDF is larger than 200 MB, so the app does not take it. The work is still waiting.",
+      notPdf: "That tab's file is not a PDF. The work is still waiting.",
+      cutOff: "The PDF did not arrive whole. The work is still waiting. Try again.",
+      held: "Sent. The file waits for your check in the app's review queue.",
+      gone: "The file was not kept: the work is no longer waiting for it.",
+    });
+    expect([...FIND_BROWSER_REFUSALS]).toEqual(["browser-not-waiting", "browser-page", "browser-busy", "browser-too-large", "browser-not-pdf", "browser-cut-off"]);
+    expect([...FIND_BROWSER_FILE_ENDS]).toEqual(["held", "not-kept", "gone"]);
+    expect([...FIND_WAITING_PLACES]).toEqual(["window", "browser"]);
+    expect([FIND_BROWSER_LABEL_MAX, FIND_BROWSER_NO_TITLE, FIND_BROWSER_PAGE_MAX, FIND_BROWSER_PAGE_HEADER, FIND_BROWSER_STALL_MS]).toEqual([200, "(no title)", 2048, "x-ao-page", 120_000]);
+    // R348 g: each "The file sent from your browser was not kept: " and the cause as the library's and the link's say it.
+    expect(Object.keys(FIND_BROWSER_FILE_TEXT).sort()).toEqual([...FIND_LIBRARY_FILE_OUTCOMES].sort());
+    expect(FIND_BROWSER_FILE_TEXT.unreadable).toBe("The file sent from your browser could not be read, so it was not kept. Try again with “Get through my library in my own browser”.");
+    expect(FIND_BROWSER_FILE_TEXT["rules-method"]).toBe("The file sent from your browser was not kept: this project's rules do not allow fetching works through your library.");
+    expect(FIND_BROWSER_FILE_TEXT["not-pdf"]).toBe("The file sent from your browser was not kept: it is not a PDF or EPUB.");
+    for (const k of ["not-pdf", "too-large", "rules-store", "rules-legal-basis"] as const) {
+      const cause = FIND_FILE_NOT_KEPT_CAUSE[k];
+      expect(FIND_BROWSER_FILE_TEXT[k]).toBe(`The file sent from your browser was not kept: ${cause}`);
+      expect(FIND_LIBRARY_FILE_TEXT[k]).toBe(`The file from your library was not kept: ${cause}`);
+      expect(FIND_LINK_FILE_TEXT[k]).toBe(`The file fetched in the sign-in window was not kept: ${cause}`);
+    }
+    // The browser's rules-method cause is the library's (a browser start is a library start: library_access).
+    expect(FIND_BROWSER_FILE_TEXT["rules-method"].split(": ")[1]).toBe(FIND_LIBRARY_FILE_TEXT["rules-method"].split(": ")[1]);
+    // R348 f vi: no sentence says a file was "added".
+    for (const t of [...Object.values(FIND_BROWSER_TEXT), ...Object.values(FIND_BROWSER_FILE_TEXT), FIND_LIBRARY_TEXT.busy]) {
+      expect(t).not.toMatch(/\badd(s|ed)?\b/iu);
+      expect(t).toMatch(/^[A-Z0-9“].*\.$/u);
+    }
+    // The shapes: the app's start answers the address only; the list and the file's answer.
+    const start: FindBrowserStartResponse = { url: "https://ezproxy.lib.example.edu/login?url=https://doi.org/10.1/x" };
+    expect(Object.keys(start)).toEqual(["url"]);
+    const req: FindBrowserWaitingRequest = {};
+    const list: FindBrowserWaitingResponse = { waiting: [{ ticket: "0".repeat(32), label: "A title" }] };
+    const sent: FindBrowserFileResponse = { outcome: "held", sentence: FIND_BROWSER_TEXT.held };
+    expect([Object.keys(req), Object.keys(list.waiting[0]!), sent.outcome]).toEqual([[], ["ticket", "label"], "held"]);
+    const v: Pick<FindEntryView, "browserStart" | "waitingIn" | "library"> = { browserStart: true, waitingIn: "browser", library: { canStart: true, lastFile: "not-pdf", lastFileFrom: "browser" } };
+    expect([v.browserStart, v.waitingIn, v.library?.lastFileFrom]).toEqual([true, "browser", "browser"]);
   });
 });
