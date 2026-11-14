@@ -361,7 +361,8 @@ describe("settings (Accept 3)", () => {
     expect((await state()).settingsNewer).toBe(false);
   });
 
-  it("nothing runs by itself after a settings write with automatic on, an unlock or a library open (the clock moved a day on each time)", async () => {
+  // Z10: since the scheduler, automatic ON runs by itself (zotero-sync-scheduler.test.ts); with it OFF nothing does.
+  it("nothing runs by itself after a settings write with automatic off, an unlock or a library open (the clock moved a day on each time)", async () => {
     // Every timer the service makes from here on is a fake one (the clock also moves on with real time, so the
     // service works): a start delayed by minutes or hours would fire when the clock is moved on.
     vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
@@ -375,8 +376,8 @@ describe("settings (Accept 3)", () => {
       const libPath = await openLibrary();
       const pid = await newProject(true);
       addItems(U, 2);
-      expect((await saveSettings([linkOf(U, pid)], { automatic: true, everyMinutes: 30 })).status).toBe(200);
-      expect((await state()).automatic).toBe(true);
+      expect((await saveSettings([linkOf(U, pid)], { automatic: false, everyMinutes: 30 })).status).toBe(200);
+      expect((await state()).automatic).toBe(false);
       expect((await state()).nextRunAt).toBeUndefined();
       await aDayOn();
       expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
