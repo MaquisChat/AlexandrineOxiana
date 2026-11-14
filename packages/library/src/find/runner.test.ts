@@ -4,7 +4,10 @@ import { bibtexAdapter } from "../import/refman.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_GOVERNANCE, findDuplicate, newId, type Project, type SourceDraft } from "@ao/core";
-import { Dispatcher, MockAgent } from "undici";
+import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
+import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
+import { activeTemp } from "../tmp-registry.js";
+import { FIND_HELD_MAX, holdMismatchedFile, readReviewEntries } from "../repo/review.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
@@ -29,6 +32,8 @@ import {
   FIND_STOP_SETTLE_MS,
   FIND_TOOL,
   FIND_INDEX_WAIT_MS,
+  FIND_DOWNLOAD_TIMEOUT_MS,
+  cleanAcquiredAddress,
   FindAlreadyAddedError,
   FindEntryStateError,
   FindIndexNotReadyError,
@@ -264,7 +269,8 @@ beforeEach(async () => {
   askedWorks = [];
   askedSingle = [];
   sentF8 = [];
-  settings = DEFAULT_SEARCH_SETTINGS;
+  // The record part (F4, F8) is tested with every free-copy service off (F11 tests the copy part with its own settings).
+  settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: false })) };
   settingsFn = async () => settings;
   everythingFn = () => everything;
   everything = false;
@@ -2529,5 +2535,431 @@ describe("F8: an author alone — the person, then their works", () => {
     expect(pressed.morePeople).toBeUndefined();
     await stateIs(p, added[0]!.id, "choose-works");
     expect((await entryOf(p, added[0]!.id))!.morePeople).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F11: the free copy — looked for, downloaded, checked against its record, attached or held for the researcher.
+
+describe("F11: the free copy of a record the queue completed", () => {
+  /** The free-copy answers of OpenAlex (`works/doi:<doi>`): the addresses of its locations, in order. */
+  let oaCopies: Map<string, string[]>;
+  /** What each file address answers: a PDF's bytes; absent: 404. */
+  let files: Map<string, Buffer>;
+  /** File addresses held until released (a download in flight). */
+  let holdFiles: Set<string>;
+  type Held = { key: string; aborted: boolean; respond(status: number, body: Buffer | null): void };
+  let heldFiles: Held[];
+  let fileRequests: string[];
+  let copyRequests: string[];
+  let fileAgent: MockAgent;
+  let saved: Dispatcher;
+
+  const COPY_ONLY_OPENALEX = (): SearchSettings => ({ ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" })) });
+  const GOOD_LINES = ["Journal of Invented Studies 4 (1999)", ZORBLATT.title, "Mirabel Quillfeather", `doi:${ZORBLATT.doi}`, "Abstract. A grammar of habitus, invented for these tests, with enough words."];
+  const good = () => buildPdf({ title: ZORBLATT.title, author: "Mirabel Quillfeather", lines: GOOD_LINES });
+  const other = (n: number) => buildPdf({ title: `Another Paper ${n}`, lines: [`doi:10.5555/ao.f11.other${n}`, `Another Paper ${n}`, "Someone Else", "Abstract. Nothing to do with the record at all, but long enough."] });
+
+  const interceptor: Dispatcher.DispatcherComposeInterceptor = (dispatch) => (opts, handler) => {
+    const key = `${new URL(String(opts.origin)).origin}${opts.path}`;
+    fileRequests.push(key);
+    if (!holdFiles.has(key)) return dispatch(opts, handler);
+    const h: Held = { key, aborted: false, respond: () => {} };
+    const controller = {
+      paused: false,
+      aborted: false,
+      reason: null,
+      rawHeaders: null,
+      rawTrailers: null,
+      pause() {},
+      resume() {},
+      abort(reason: Error) {
+        if (h.aborted) return;
+        h.aborted = true;
+        handler.onResponseError?.(controller as never, reason);
+      },
+    };
+    handler.onRequestStart?.(controller as never, {});
+    h.respond = (status, body) => {
+      if (h.aborted) return;
+      handler.onResponseStart?.(controller as never, status, {}, "OK");
+      if (body) handler.onResponseData?.(controller as never, body);
+      handler.onResponseEnd?.(controller as never, {});
+    };
+    heldFiles.push(h);
+    return true;
+  };
+
+  function mockCopies(): void {
+    agent
+      .get("https://api.openalex.org")
+      .intercept({ path: (p: string) => p.startsWith("/works/doi:"), method: "GET" })
+      .reply((o) => {
+        const doi = decodeURIComponent(String(o.path).slice("/works/doi:".length));
+        copyRequests.push(String(o.path));
+        const urls = oaCopies.get(doi) ?? [];
+        const [best, ...rest] = urls;
+        return {
+          statusCode: 200,
+          data: JSON.stringify({ id: "https://openalex.org/W1", ...(best ? { best_oa_location: { is_oa: true, pdf_url: best } } : {}), locations: rest.map((u) => ({ is_oa: true, pdf_url: u })) }),
+          responseOptions: { headers: { "content-type": "application/json" } },
+        };
+      })
+      .persist();
+    fileAgent = new MockAgent();
+    fileAgent.disableNetConnect();
+    for (const origin of ["https://arxiv.org", "https://europepmc.org", "https://library.oapen.org"]) {
+      fileAgent
+        .get(origin)
+        .intercept({ path: () => true, method: "GET" })
+        .reply((o) => {
+          const body = files.get(`${origin}${String(o.path)}`);
+          return body ? { statusCode: 200, data: body } : { statusCode: 404, data: "" };
+        })
+        .persist();
+    }
+    saved = getGlobalDispatcher();
+    setGlobalDispatcher(fileAgent.compose(interceptor));
+  }
+
+  beforeEach(() => {
+    oaCopies = new Map();
+    files = new Map();
+    holdFiles = new Set();
+    heldFiles = [];
+    fileRequests = [];
+    copyRequests = [];
+    settings = COPY_ONLY_OPENALEX();
+    mockCopies();
+  });
+  afterEach(async () => {
+    for (const h of heldFiles) h.respond(500, null);
+    setGlobalDispatcher(saved);
+    await fileAgent.close();
+  });
+
+  const DONE: FindState[] = ["in-library", "no-open-copy", "needs-check", "failed"];
+  /** The copy part is over: its last state written and said, its folder removed and given up. */
+  const copyDone = async (p: Project, id: string, r: Repo = repo) => {
+    await until(async () => DONE.includes((await entryOf(p, id, r))?.state ?? "looking-up"), "the free copy to be done");
+    const state = (await entryOf(p, id, r))!.state;
+    await until(() => changes.some((c) => c.entryId === id && c.state === state), "its event");
+    await until(async () => !activeTemp.has(`find-${id}`) && !(await exists(folderOf(id))), "its folder to go");
+  };
+  /** A typed line made into a record (copies off), then the copy part started with `copies` on. */
+  async function recordMade(o: { encrypted?: boolean; gov?: string } = {}): Promise<{ p: Project; r: FindRunner; eid: string; sid: string }> {
+    know(LINE, cr(ZORBLATT));
+    const p = await project(o);
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await until(async () => !!(await entryOf(p, added[0]!.id))?.sourceId, "the record");
+    return { p, r, eid: added[0]!.id, sid: (await entryOf(p, added[0]!.id))!.sourceId! };
+  }
+  const pendingReviews = async (p: Project) => (await readReviewEntries(coreOf(), coreOf().state(p.id))).filter((e) => e.status === "pending");
+  const heldDirOf = (p: Project) => join(lib.root, p.folder, "find", "held");
+  const folderOf = (eid: string) => join(lib.root, ".tmp", `find-${eid}`);
+  const exists = (path: string) => readdir(path).then(
+    () => true,
+    () => false,
+  );
+
+  it("cleanAcquiredAddress removes the user name, password, query and fragment", () => {
+    expect(cleanAcquiredAddress("https://user:secret@europepmc.org/articles/PMC1?pdf=render&token=abc#page=2")).toBe("https://europepmc.org/articles/PMC1");
+    expect(cleanAcquiredAddress("https://arxiv.org/pdf/2101.00001")).toBe("https://arxiv.org/pdf/2101.00001");
+    expect(cleanAcquiredAddress("not an address")).toBe("");
+  });
+
+  it("nothing is asked and nothing downloaded when the rules do not allow free_copy, and the entry says so in words", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    const { p, eid } = await recordMade({ gov: GOV("acquireMethods: [reference_lookup]") });
+    await until(async () => (await entryOf(p, eid))?.reason?.code === "copy-not-allowed", "the refusal");
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } });
+    expect(copyRequests).toEqual([]);
+    expect(fileRequests).toEqual([]);
+    // Not tried again by itself: only the next open or unlock looks again.
+    await new Promise((res) => setTimeout(res, 50));
+    expect(copyRequests).toEqual([]);
+  });
+
+  it("an entry already in the library is never fetched for", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    await importLikeAttach(p, ZORBLATT);
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    await settled(p, added[0]!.id);
+    await new Promise((res) => setTimeout(res, 50));
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("already");
+    expect(copyRequests).toEqual([]);
+    expect(fileRequests).toEqual([]);
+  });
+
+  it("the first passing offer is attached and nothing is held; the provenance of the file says free_copy, the service and a clean address", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001", "https://europepmc.org/articles/PMC77?pdf=render", "https://arxiv.org/pdf/2101.00003"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await other(1));
+    files.set("https://europepmc.org/articles/PMC77?pdf=render", await good());
+    files.set("https://arxiv.org/pdf/2101.00003", await good());
+    const { p, eid, sid } = await recordMade();
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+    const sf = await repo.getSource(p.id, sid);
+    expect(sf.assets).toHaveLength(1);
+    expect(sf.assets[0]).toMatchObject({
+      role: "original",
+      kind: "pdf",
+      mime: "application/pdf",
+      acquired: { method: "free_copy", via: "service", service: "openalex", address: "https://europepmc.org/articles/PMC77", access: "public", tool: { name: FIND_TOOL }, check: { result: "match", by: "doi" } },
+    });
+    // The third offer was never asked for; nothing is held; the folder is gone.
+    expect(fileRequests.filter((k) => k.includes("2101.00003"))).toEqual([]);
+    expect(await pendingReviews(p)).toEqual([]);
+    expect(await exists(heldDirOf(p))).toBe(false);
+    expect(await exists(folderOf(eid))).toBe(false);
+    expect(activeTemp.has(`find-${eid}`)).toBe(false);
+    expect(changes.filter((c) => c.entryId === eid).map((c) => c.state)).toEqual(["looking-up", "record-complete", "looking-for-copy", "fetching", "in-library"]);
+  });
+
+  it("no offer passes: the first failing file is held, one per entry, and the entry needs a check", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001", "https://arxiv.org/pdf/2101.00002"]);
+    const first = await other(1);
+    files.set("https://arxiv.org/pdf/2101.00001", first);
+    files.set("https://arxiv.org/pdf/2101.00002", await other(2));
+    const { p, eid, sid } = await recordMade();
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-other-doi" } });
+    expect((await repo.getSource(p.id, sid)).assets).toEqual([]);
+    expect(await readdir(heldDirOf(p))).toEqual([`${eid}.pdf`]);
+    expect((await readFile(join(heldDirOf(p), `${eid}.pdf`))).equals(first)).toBe(true);
+    const [rev, ...more] = await pendingReviews(p);
+    expect(more).toEqual([]);
+    expect(rev).toMatchObject({ sourceId: sid, cause: { kind: "acquired-file-mismatch", findEntryId: eid }, heldFile: { why: "other-doi", kind: "pdf", fileDoi: "10.5555/ao.f11.other1", acquired: { service: "openalex", address: "https://arxiv.org/pdf/2101.00001" } } });
+    expect(await exists(folderOf(eid))).toBe(false);
+  });
+
+  it("Use this file attaches the held file and the entry is in the library; Not this file destroys the held copy", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await other(1));
+    know(LINE_2, cr(ZORBLATT));
+    const { p, r, eid, sid } = await recordMade();
+    await copyDone(p, eid);
+    const [rev] = await pendingReviews(p);
+    const done = await r.resolveHeld(p.id, rev!.id, "attach");
+    expect(done?.state).toBe("in-library");
+    expect((await repo.getSource(p.id, sid)).assets[0]!.acquired).toMatchObject({ method: "free_copy", service: "openalex", check: { result: "accepted-after-mismatch", why: "other-doi" } });
+    expect(await readdir(heldDirOf(p))).toEqual([]);
+    expect(changes.at(-1)).toEqual({ projectId: p.id, entryId: eid, state: "in-library" });
+  });
+
+  it("Not this file: the held copy is destroyed and the entry has no open copy, saying why", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await other(1));
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    const [rev] = await pendingReviews(p);
+    const done = await r.resolveHeld(p.id, rev!.id, "discard");
+    expect(done).toMatchObject({ state: "no-open-copy", reason: { code: "not-this-file" } });
+    expect(await readdir(heldDirOf(p))).toEqual([]);
+    expect(await pendingReviews(p)).toEqual([]);
+  });
+
+  it("removing the entry discards its held file and closes its review entry", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await other(1));
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    await r.remove(p.id, eid);
+    expect(await readdir(heldDirOf(p))).toEqual([]);
+    expect(await pendingReviews(p)).toEqual([]);
+    expect(await entryOf(p, eid)).toBeUndefined();
+  });
+
+  it(`${FIND_HELD_MAX} held: the next mismatched file is not kept and the entry says so, with Try again`, async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await other(1));
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    // Twenty files already wait in this project.
+    const scratch = join(tmp, "x.pdf");
+    await writeFile(scratch, await other(9));
+    await importLikeAttach(p, { ...ZORBLATT, doi: "10.5555/ao.f11.someother", title: "Some Other Work Entirely" });
+    const otherSid = repo.listSourceIds(p.id)[0]!;
+    const waiting: FindEntry[] = Array.from({ length: FIND_HELD_MAX }, () => ({ id: newId(), projectId: p.id, typed: "x y", state: "fetching", createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), attempts: 0, sourceId: otherSid }));
+    await appendFindEntries(coreOf(), p.id, waiting, "add");
+    for (const w of waiting) {
+      await holdMismatchedFile(coreOf(), p.id, {
+        entry: { ...w, state: "needs-check" },
+        sourceId: otherSid,
+        fromPath: scratch,
+        facts: { why: "title-absent", kind: "pdf", bytes: 1, acquired: { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at: new Date(NOW).toISOString(), tool: { name: FIND_TOOL, version: "0" }, access: "public" } },
+      });
+    }
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    const eid = added[0]!.id;
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "failed", reason: { code: "held-full" } });
+    expect(await readdir(heldDirOf(p))).toHaveLength(FIND_HELD_MAX);
+    expect((await readdir(heldDirOf(p))).some((n) => n.startsWith(eid))).toBe(false);
+    expect(await exists(folderOf(eid))).toBe(false);
+    // Try again looks for a copy again (never for the record).
+    const again = await r.retry(p.id, eid);
+    expect(again.state).toBe("looking-for-copy");
+    await copyDone(p, eid);
+    expect((await sourcesOf(p)).length).toBe(2);
+  });
+
+  it("no offer: no open copy, with the 'elsewhere' links for Where to get it", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://repository.example.edu/bitstream/zorblatt.pdf"]);
+    const { p, eid } = await recordMade();
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", offers: [{ label: "A free copy may be at", host: "repository.example.edu", url: "https://repository.example.edu/bitstream/zorblatt.pdf" }] });
+    expect(fileRequests).toEqual([]);
+  });
+
+  it("the folder is held in use from before the first download until the file is stored, and removed when the entry is done", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    holdFiles.add("https://arxiv.org/pdf/2101.00001");
+    const { p, eid, sid } = await recordMade();
+    await until(() => heldFiles.length === 1, "the download to start");
+    expect(activeTemp.has(`find-${eid}`)).toBe(true);
+    heldFiles[0]!.respond(200, await good());
+    // Still held while the file is checked and stored; given up and removed once it is.
+    await until(async () => (await repo.getSource(p.id, sid)).assets.length === 1 || !activeTemp.has(`find-${eid}`), "the file to be stored");
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(1);
+    await copyDone(p, eid);
+    expect(activeTemp.has(`find-${eid}`)).toBe(false);
+    expect(await exists(folderOf(eid))).toBe(false);
+  });
+
+  for (const how of ["lock", "close"] as const) {
+    it(`a ${how} during a download: aborted, nothing left, nothing written after it`, async () => {
+      oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+      holdFiles.add("https://arxiv.org/pdf/2101.00001");
+      const { p, r, eid } = await recordMade({ encrypted: true });
+      await until(() => heldFiles.length === 1, "the download to start");
+      const queueBytes = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"));
+      const auditBefore = await auditText(p);
+      if (how === "lock") {
+        r.stop(p.id);
+        repo.lockProject(p.id);
+      } else await r.stopAll();
+      await until(() => heldFiles[0]!.aborted, "the download to be aborted");
+      await until(async () => !(await exists(folderOf(eid))), "the folder to go");
+      expect(activeTemp.has(`find-${eid}`)).toBe(false);
+      await new Promise((res) => setTimeout(res, 50));
+      expect(await readFile(join(lib.root, p.folder, "find", "queue.jsonl"))).toEqual(queueBytes);
+      expect(await auditText(p)).toBe(auditBefore);
+      if (how === "lock") {
+        // Unlocked, it resumes as looking for a copy, and goes on.
+        await repo.unlockProject(p.id, "pw");
+        holdFiles.clear();
+        files.set("https://arxiv.org/pdf/2101.00001", await good());
+        r.resume(p.id);
+        await copyDone(p, eid);
+        expect(changes.filter((c) => c.entryId === eid).map((c) => c.state).slice(-3)).toEqual(["looking-for-copy", "fetching", "in-library"]);
+      }
+    });
+  }
+
+  it("a crash during fetching resumes as looking for a copy; nothing is half-attached", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    know(LINE, cr(ZORBLATT));
+    holdFiles.add("https://arxiv.org/pdf/2101.00001");
+    const p = await project();
+    // The crash comes in the change that attaches the file: the marker is left, as if the process died there.
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    const eid = added[0]!.id;
+    await until(() => heldFiles.length === 1, "the download to start");
+    seams.crashAt = "before-audit";
+    heldFiles[0]!.respond(200, await good());
+    await until(() => notes.some((n) => n.includes("SimulatedCrash")), "the crash");
+    expect((await entryOf(p, eid))!.state).toBe("fetching");
+    // A new process: the marker rolls the half change back; the entry resumes as looking for a copy.
+    for (const x of runners) await x.stopAll();
+    runners = [];
+    handle.close();
+    await lib.close();
+    lib = await openLibrary(lib.root, mkDeps());
+    handle = new IndexHandle(lib.root);
+    repo = await repoFor();
+    const sid = (await entryOf(p, eid))!.sourceId!;
+    expect((await repo.getSource(p.id, sid)).assets).toEqual([]);
+    holdFiles.clear();
+    changes = [];
+    runner().resume(p.id);
+    await copyDone(p, eid);
+    expect(changes.filter((c) => c.entryId === eid).map((c) => c.state)).toEqual(["looking-for-copy", "fetching", "in-library"]);
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(1);
+  });
+
+  it("a crash after the file is attached and before the entry's line: resumed, the entry is in the library, the file attached once", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    const { p, eid, sid } = await recordMade();
+    await until(async () => (await repo.getSource(p.id, sid)).assets.length === 1, "the file");
+    await copyDone(p, eid);
+    // As if the line had not been written: the entry back at "fetching" beside a source with its file.
+    const cur = (await entryOf(p, eid))!;
+    await appendFindEntries(coreOf(), p.id, [{ ...cur, state: "fetching", updatedAt: new Date(NOW + 1).toISOString() }], "update");
+    const n = fileRequests.length;
+    runner().resume(p.id);
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(1);
+    expect(fileRequests.length).toBe(n);
+  });
+
+  it("no title, address or file name in any audit entry, log line or event", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001", "https://arxiv.org/pdf/2101.00002"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await other(1));
+    files.set("https://arxiv.org/pdf/2101.00002", await other(2));
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    const [rev] = await pendingReviews(p);
+    await r.resolveHeld(p.id, rev!.id, "attach");
+    const audit = await auditText(p);
+    const logs = notes.join("\n");
+    for (const s of ["Zorblatt", "Habitus", "Quillfeather", "arxiv.org", "2101.0000", "Another Paper", "10.5555/ao.f11", ".pdf", "find/held"]) {
+      expect(audit, s).not.toContain(s);
+      expect(logs, s).not.toContain(s);
+    }
+    for (const c of changes) expect(Object.keys(c).sort()).toEqual(["entryId", "projectId", "state"]);
+  });
+
+  it("Unpaywall is not asked without an e-mail", async () => {
+    settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "unpaywall" || c.id === "openalex" })) };
+    const unpaywall: string[] = [];
+    agent
+      .get("https://api.unpaywall.org")
+      .intercept({ path: () => true, method: "GET" })
+      .reply((o) => {
+        unpaywall.push(String(o.path));
+        return { statusCode: 200, data: "{}" };
+      })
+      .persist();
+    const { p, eid } = await recordMade();
+    await copyDone(p, eid);
+    expect(unpaywall).toEqual([]);
+    expect(copyRequests.length).toBe(1);
+  });
+
+  it("a download is bounded as a whole: past FIND_DOWNLOAD_TIMEOUT_MS (its wait for a place included) it is aborted and leaves nothing", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    holdFiles.add("https://arxiv.org/pdf/2101.00001");
+    const { p, eid } = await recordMade();
+    await until(() => heldFiles.length === 1, "the download to start");
+    expect(FIND_DOWNLOAD_TIMEOUT_MS).toBe(240_000);
+    timers.advance(FIND_DOWNLOAD_TIMEOUT_MS);
+    await until(() => heldFiles[0]!.aborted, "the download to be aborted");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", offers: [{ host: "arxiv.org" }] });
+    expect(await exists(folderOf(eid))).toBe(false);
   });
 });

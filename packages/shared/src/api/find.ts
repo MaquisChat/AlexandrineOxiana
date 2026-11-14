@@ -55,7 +55,26 @@ export const FIND_STATES = [
 export type FindState = (typeof FIND_STATES)[number];
 
 /** Why an entry could not go on (the library's FindReasonCode). */
-export const FIND_REASON_CODES = ["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected"] as const;
+export const FIND_REASON_CODES = [
+  "not-allowed",
+  "no-legal-basis",
+  "switched-off",
+  "unreachable",
+  "locked",
+  "queue-full",
+  "budget",
+  "unexpected",
+  // Task F11: the free copy. "copy-not-allowed" (the entry stays "record-complete"; looked at again when the rules
+  // change, at the next open or unlock); "held-full" ("failed", with "Try again"); "not-this-file" ("no-open-copy");
+  // on "needs-check", why the file did not clearly match its record.
+  "copy-not-allowed",
+  "held-full",
+  "not-this-file",
+  "file-other-doi",
+  "file-title-absent",
+  "file-no-text",
+  "file-other-version",
+] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 
@@ -69,6 +88,13 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "queue-full": "The queue holds 500 entries. Remove some finished ones first.",
   budget: "OpenAlex's free daily allowance is used up; searching Crossref only until tomorrow.",
   unexpected: "Something went wrong while looking this up. Try again.",
+  "copy-not-allowed": "This project's rules do not allow fetching free copies of works.",
+  "held-full": "20 files are already waiting for your check. Decide on some of them, then try again.",
+  "not-this-file": "You said the file found was not this work.",
+  "file-other-doi": "The file names another DOI as its own.",
+  "file-title-absent": "The file does not show this record's title with its author.",
+  "file-no-text": "The file has no text that could be read (a scan, or a damaged file).",
+  "file-other-version": "The file seems to be another volume, edition, a review or a correction of this work.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */

@@ -66,10 +66,28 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
 
   it("find and acquire: states, every reason code and every stop code has its one sentence, and the bounds", () => {
     expect(FIND_STATES).toHaveLength(15);
-    expect([...FIND_REASON_CODES]).toEqual(["not-allowed", "no-legal-basis", "switched-off", "unreachable", "locked", "queue-full", "budget", "unexpected"]);
+    expect([...FIND_REASON_CODES]).toEqual([
+      "not-allowed",
+      "no-legal-basis",
+      "switched-off",
+      "unreachable",
+      "locked",
+      "queue-full",
+      "budget",
+      "unexpected",
+      // Task F11: the free copy.
+      "copy-not-allowed",
+      "held-full",
+      "not-this-file",
+      "file-other-doi",
+      "file-title-absent",
+      "file-no-text",
+      "file-other-version",
+    ]);
     // Exhaustive by type (Record<FindReasonCode, string>) and checked here at run time: one plain sentence each.
     expect(Object.keys(FIND_REASON_TEXT).sort()).toEqual([...FIND_REASON_CODES].sort());
-    for (const c of FIND_REASON_CODES) expect(FIND_REASON_TEXT[c]).toMatch(/^[A-Z].*\.$/);
+    // One plain sentence each (the plan's sentence for held files starts with its number).
+    for (const c of FIND_REASON_CODES) expect(FIND_REASON_TEXT[c]).toMatch(/^[A-Z0-9].*\.$/);
     expect(FIND_REASON_TEXT["not-allowed"]).toBe("This project's rules do not allow this.");
     expect(FIND_REASON_TEXT["switched-off"]).toBe("Switched off in Search sources.");
     expect(FIND_REASON_TEXT.unreachable).toBe("The search services could not be reached. Try again later.");
@@ -77,6 +95,11 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect(FIND_REASON_TEXT["queue-full"]).toBe("The queue holds 500 entries. Remove some finished ones first.");
     expect(FIND_REASON_TEXT.budget).toBe("OpenAlex's free daily allowance is used up; searching Crossref only until tomorrow.");
     expect(FIND_REASON_TEXT.unexpected).toBe("Something went wrong while looking this up. Try again.");
+    // F11: the rules' refusal in words (never the raw method name); the plan's sentence for 20 held files.
+    expect(FIND_REASON_TEXT["copy-not-allowed"]).toBe("This project's rules do not allow fetching free copies of works.");
+    expect(FIND_REASON_TEXT["copy-not-allowed"]).not.toContain("free_copy");
+    expect(FIND_REASON_TEXT["held-full"]).toBe("20 files are already waiting for your check. Decide on some of them, then try again.");
+    expect(FIND_REASON_TEXT["not-this-file"]).toBe("You said the file found was not this work.");
     expect(FIND_REASON_TEXT["no-legal-basis"]).toBe("This project's rules need a legal basis for records made from typed references. Record one in the project's Governance settings.");
     expect(Object.keys(FIND_STOPPED_TEXT).sort()).toEqual([...FIND_STOPPED_CODES].sort());
     for (const c of FIND_STOPPED_CODES) expect(FIND_STOPPED_TEXT[c]).toMatch(/^[A-Z].*\.$/);

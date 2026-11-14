@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup, DEVICE_NOTICE_KINDS, isDeviceNoticeKind } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup, HELD_FILE_WHY_TEXT, HELD_FILE_REVIEW_TEXT, HELD_FILE_DECISIONS, DEVICE_NOTICE_KINDS, isDeviceNoticeKind } from "./index.js";
 
 describe("@ao/shared", () => {
   it("credential query keys (R96/R98), any case", () => {
@@ -99,6 +99,15 @@ describe("font names a researcher's own file cannot take (Task 57 M5): one list"
     // Verification entries by their cause (R176 3: recorded, or read by the library's reviewCauseOf), never by their fields.
     expect(reviewGroup({ kind: "verification", cause: { kind: "capture-conflict" } })).toBe("capture");
     expect(reviewGroup({ kind: "verification", cause: { kind: "consent-withdrawal", consentIds: ["c1"] } })).toBe("withdrawal");
+    // F11 (R277): a file found for a record that did not clearly match it.
+    expect(reviewGroup({ kind: "verification", cause: { kind: "acquired-file-mismatch", findEntryId: "e1", held: "find/held/e1.pdf" } })).toBe("found-file");
+  });
+
+  it("a held file's reasons each have one plain sentence (F11, R277 d)", () => {
+    expect(Object.keys(HELD_FILE_WHY_TEXT).sort()).toEqual(["no-text", "other-doi", "other-version", "title-absent"]);
+    for (const t of Object.values(HELD_FILE_WHY_TEXT)) expect(t).toMatch(/^[A-Z].*\.$/);
+    expect(HELD_FILE_REVIEW_TEXT).toBe("A file was found for this record, but it did not clearly match.");
+    expect(HELD_FILE_DECISIONS).toEqual(["attach", "discard"]);
   });
 });
 
