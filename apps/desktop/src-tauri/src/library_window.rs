@@ -2155,6 +2155,12 @@ mod tests {
     /// `meta` contents, and reports what it did: the addresses it went to, what it stored, whether
     /// it touched anything that makes a request or reaches the shell, and the globals it added.
     fn run_script(href: &str, metas: &[&str], stored: &[&str], framed: bool) -> serde_json::Value {
+        run_script_on_page(href, metas, stored, framed, "")
+    }
+
+    /// As `run_script`, with the page's own code `page` run after the script's start and before the
+    /// document is loaded (where a page's scripts run).
+    fn run_script_on_page(href: &str, metas: &[&str], stored: &[&str], framed: bool, page: &str) -> serde_json::Value {
         let harness = format!(
             r#"
 const touched = [];
@@ -2181,6 +2187,7 @@ const keysBefore = Object.keys(w).sort().join(",");
 const window = w;
 const gBefore = Object.keys(globalThis).sort().join(",");
 (new Function("window", "document", "location", "sessionStorage", {script}))(w, document, location, sessionStorage);
+{page}
 if (ready) ready();
 process.stdout.write(JSON.stringify({{
   assigned, touched, stored: [...sessionStorage.m.keys()],
@@ -2193,6 +2200,7 @@ process.stdout.write(JSON.stringify({{
             stored = serde_json::to_string(stored).unwrap(),
             framed = framed,
             script = serde_json::Value::from(SCRIPT),
+            page = page,
         );
         let out = std::process::Command::new("node").args(["--input-type=module", "-e", &harness]).output().expect("node on PATH");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -2248,6 +2256,25 @@ process.stdout.write(JSON.stringify({{
         let framed = run_script(page, &["https://p.test/x.pdf"], &[], true);
         quiet(&framed);
         assert_eq!(framed["listened"], false);
+    }
+
+    #[test]
+    fn a_page_that_redefines_url_cannot_bend_the_same_origin_rule() {
+        let page = "https://p.test/article/1";
+        let evil = "https://evil.example/x.pdf";
+        // The reviewer's page: `origin` made to answer the page's own origin.
+        let origin = "Object.defineProperty(URL.prototype, 'origin', { get() { return location.origin; } });";
+        // Every getter the script reads, made to say \"same origin, https, no user\".
+        let all = "for (const [k, v] of [['origin', location.origin], ['protocol', 'https:'], ['username', ''], ['password', '']]) Object.defineProperty(URL.prototype, k, { get() { return v; } }); Object.defineProperty(URL.prototype, 'href', { get() { return 'https://p.test/y.pdf'; } });";
+        for code in [origin, all] {
+            let r = run_script_on_page(page, &[evil], &[], false, code);
+            quiet(&r);
+            assert_eq!(r["stored"], serde_json::json!([]), "{r}");
+        }
+        // The script's own rule still holds on such a page for the page's own PDF.
+        let own = "https://p.test/x.pdf";
+        let r = run_script_on_page(page, &[own], &[], false, origin);
+        assert_eq!(r["assigned"], serde_json::json!([own]), "{r}");
     }
 
     // ----- the inbox -----
