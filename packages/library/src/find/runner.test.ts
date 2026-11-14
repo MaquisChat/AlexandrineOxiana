@@ -31,6 +31,8 @@ import {
   FIND_INDEX_WAIT_MS,
   FindEntryStateError,
   FindIndexNotReadyError,
+  FindProjectStoppedError,
+  FindRunnerClosedError,
   createFindRunner,
   runnerSeams,
   type FindRunner,
@@ -211,6 +213,8 @@ afterEach(async () => {
   seams.failUndo = undefined;
   runnerSeams.beforeCreate = undefined;
   runnerSeams.afterCreate = undefined;
+  runnerSeams.inAct = undefined;
+  runnerSeams.inCreate = undefined;
   await agent.close();
   handle.close();
   await lib.close();
@@ -1344,16 +1348,17 @@ describe("R237 (d): when nothing can be written for a project, the runner says s
 });
 
 describe("R237 (g): minors", () => {
-  it("M1: after stop, add writes the entry but starts no run until resume", async () => {
+  it("M1 (as changed by R245): after stop, an add is refused and writes nothing; after resume it writes and runs", async () => {
     know(LINE, cr(ZORBLATT));
     const p = await project();
     const r = runner();
     r.stop(p.id);
-    const { added } = await r.add(p.id, [LINE]);
+    await expect(r.add(p.id, [LINE])).rejects.toBeInstanceOf(FindProjectStoppedError);
     await new Promise((res) => setTimeout(res, 100));
     expect(gated.sent).toEqual([]);
-    expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
+    expect((await queue(p)).size).toBe(0);
     r.resume(p.id);
+    const { added } = await r.add(p.id, [LINE]);
     await settled(p, added[0]!.id);
     expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
   });
@@ -1600,5 +1605,273 @@ describe("last round", () => {
     await until(async () => [...(await queue(p)).values()][0]!.state === "failed", "the entry to be worked on");
     expect(read.mock.calls.map((c) => c[1])).not.toContain(older!.source.id);
     read.mockRestore();
+  });
+});
+
+describe("last round (m1): the healing scan at resume reads only what it must", () => {
+  it("old Not found, Failed and Already (not elsewhere) entries do not make resume read older source records", async () => {
+    const p = await project();
+    const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+    const stale = (state: FindState, extra: Partial<FindEntry> = {}): FindEntry => ({ id: newId(), projectId: p.id, typed: LINE, state, createdAt: hoursAgo(5), updatedAt: hoursAgo(4), attempts: 0, ...extra });
+    await appendFindEntries(coreOf(), p.id, [stale("not-found"), stale("failed", { reason: { code: "unreachable" } }), stale("already", { duplicateOf: newId() })], "add");
+    // A source made now, before the one waiting entry (made an hour from now): it cannot have been made for it.
+    await repo.createSource(p.id, draftOf({ ...ZORBLATT, doi: undefined }), [], { provenance: plainProvenance() });
+    const [older] = await sourcesOf(p);
+    const later = new Date(Date.now() + 3_600_000).toISOString();
+    await appendFindEntries(coreOf(), p.id, [{ id: newId(), projectId: p.id, typed: LINE, state: "looking-up", createdAt: later, updatedAt: later, attempts: 0 }], "add");
+    const read = vi.spyOn(repo, "getSourceRecord");
+    settings = { record: DEFAULT_SEARCH_SETTINGS.record.map((x) => ({ ...x, on: false })) };
+    const r = runner();
+    r.resume(p.id);
+    await until(async () => [...(await queue(p)).values()].some((e) => e.state === "failed" && e.createdAt === later), "the waiting entry to be worked on");
+    expect(read.mock.calls.map((c) => c[1])).not.toContain(older!.source.id);
+    read.mockRestore();
+  });
+});
+
+describe("R245: nothing of the runner writes after the library's lock is released", () => {
+  const fileOf = (p: Project) => join(lib.root, p.folder, "find", "queue.jsonl");
+  const bytesOf = (p: Project) => readFile(fileOf(p)).catch(() => Buffer.alloc(0));
+  /** Holds the project's store turn (as an import would) until the returned function is called. */
+  async function holdTurn(p: Project): Promise<{ free: () => void; done: Promise<void> }> {
+    let free!: () => void;
+    let inTurn = false;
+    const done = serialStore(repo, p.id, async () => {
+      inTurn = true;
+      await new Promise<void>((res) => (free = res));
+    });
+    await until(() => inTurn, "the turn to be held");
+    return { free, done };
+  }
+  /** An entry in "not-found" and one in "choose". */
+  async function twoEntries(r: FindRunner, p: Project): Promise<{ none: FindEntry; choose: FindEntry }> {
+    know("Zorblatt Variants of Habitus", cr({ ...ZORBLATT, doi: "10.5555/ao.f4.v1" }, { ...ZORBLATT, doi: "10.5555/ao.f4.v2", year: 2003 }));
+    const { added } = await r.add(p.id, ["Nothing Matches Vorpalwick", "Zorblatt Variants of Habitus"]);
+    await settled(p, added[0]!.id);
+    await settled(p, added[1]!.id);
+    const none = (await entryOf(p, added[0]!.id))!;
+    const choose = (await entryOf(p, added[1]!.id))!;
+    expect([none.state, choose.state]).toEqual(["not-found", "choose"]);
+    return { none, choose };
+  }
+
+  it("acts held before their turn, stopAll called, released: nothing is written and every act is refused", async () => {
+    const p = await project();
+    const r = runner();
+    const { none, choose } = await twoEntries(r, p);
+    const before = await bytesOf(p);
+    const turn = await holdTurn(p);
+    const acts = [
+      r.choose(p.id, choose.id, choose.candidates![0]!.id),
+      r.retry(p.id, none.id),
+      r.remove(p.id, none.id),
+    ].map((a) => a.then(() => "done", (err: unknown) => err));
+    await new Promise((res) => setTimeout(res, 30));
+    const stopping = r.stopAll();
+    turn.free();
+    await turn.done;
+    await stopping;
+    for (const a of await Promise.all(acts)) expect(a).toBeInstanceOf(FindRunnerClosedError);
+    // (R247 M4: an add takes no turn; after stopAll it is refused at once.)
+    await expect(r.add(p.id, ["Another Line Entirely"])).rejects.toBeInstanceOf(FindRunnerClosedError);
+    await new Promise((res) => setTimeout(res, 50));
+    expect((await bytesOf(p)).equals(before)).toBe(true);
+    expect(await sourcesOf(p)).toEqual([]);
+  });
+
+  it("acts held before their turn, stop(projectId) called, released: nothing is written and every act is refused", async () => {
+    const p = await project();
+    const r = runner();
+    const { none, choose } = await twoEntries(r, p);
+    const before = await bytesOf(p);
+    const turn = await holdTurn(p);
+    const acts = [
+      r.choose(p.id, choose.id, null),
+      r.confirmDuplicate(p.id, choose.id, true),
+      r.addHereAsWell(p.id, choose.id),
+      r.retry(p.id, none.id),
+      r.remove(p.id, none.id),
+    ].map((a) => a.then(() => "done", (err: unknown) => err));
+    await new Promise((res) => setTimeout(res, 30));
+    r.stop(p.id);
+    turn.free();
+    await turn.done;
+    for (const a of await Promise.all(acts)) expect(a).toBeInstanceOf(FindProjectStoppedError);
+    await expect(r.add(p.id, ["Another Line Entirely"])).rejects.toBeInstanceOf(FindProjectStoppedError);
+    expect((await bytesOf(p)).equals(before)).toBe(true);
+    // After resume the researcher can act again.
+    r.resume(p.id);
+    await r.retry(p.id, none.id);
+  });
+
+  it("an act inside its turn when stopAll is called: stopAll settles after it, within its bound", async () => {
+    const p = await project();
+    const order: string[] = [];
+    let watched = "";
+    // The act's own line, written inside its turn, is told by onChange (m3: the order is asserted).
+    const r = runner({
+      onChange: (e) => {
+        changes.push(e);
+        if (e.entryId === watched && e.state === "record-complete") order.push("act's line written");
+      },
+    });
+    const { choose } = await twoEntries(r, p);
+    watched = choose.id;
+    let release!: () => void;
+    let entered = false;
+    runnerSeams.inAct = async () => {
+      entered = true;
+      await new Promise<void>((res) => (release = res));
+    };
+    const act = r.choose(p.id, choose.id, choose.candidates![0]!.id).then(
+      () => order.push("act done"),
+      () => order.push("act refused"),
+    );
+    await until(() => entered, "the act to be inside its turn");
+    const t0 = Date.now();
+    const stopping = r.stopAll().then(() => order.push("stopAll settled"));
+    await new Promise((res) => setTimeout(res, 50));
+    expect(order).toEqual([]);
+    release();
+    await Promise.all([act, stopping]);
+    expect(Date.now() - t0).toBeLessThan(FIND_STOP_SETTLE_MS);
+    // The act finished (its line written) before stopAll settled.
+    expect(order.indexOf("act's line written")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("act's line written")).toBeLessThan(order.indexOf("stopAll settled"));
+    expect(order).toContain("act done");
+    // Whatever the act did, it did before stopAll settled: nothing changes afterwards.
+    const after = await bytesOf(p);
+    await new Promise((res) => setTimeout(res, 50));
+    expect((await bytesOf(p)).equals(after)).toBe(true);
+  });
+});
+
+describe("R247: a creation under way finishes before the lock goes; a half-made record is healed; adds never wait behind an import", () => {
+  const held = () => {
+    let release!: () => void;
+    let entered = false;
+    const gate = new Promise<void>((res) => (release = res));
+    return {
+      seam: async () => {
+        entered = true;
+        await gate;
+      },
+      entered: () => entered,
+      release: () => release(),
+    };
+  };
+
+  it(`(d) a creation held inside its turn when stopAll is called: stopAll waits past its bound (${FIND_STOP_SETTLE_MS} ms); the record and the entry's line are both there`, async () => {
+    know(LINE, cr(ZORBLATT));
+    const p = await project();
+    const r = runner();
+    const h = held();
+    runnerSeams.inCreate = h.seam;
+    const { added } = await r.add(p.id, [LINE]);
+    await until(h.entered, "the creation to be under way");
+    let settledAt = 0;
+    const t0 = Date.now();
+    const stopping = r.stopAll().then(() => (settledAt = Date.now()));
+    await new Promise((res) => setTimeout(res, FIND_STOP_SETTLE_MS + 300));
+    expect(settledAt).toBe(0);
+    h.release();
+    await stopping;
+    expect(settledAt - t0).toBeGreaterThan(FIND_STOP_SETTLE_MS);
+    const e = (await entryOf(p, added[0]!.id))!;
+    const sources = await sourcesOf(p);
+    expect(sources).toHaveLength(1);
+    expect(e).toMatchObject({ state: "record-complete", sourceId: sources[0]!.source.id });
+  }, 20_000);
+
+  it("(d) an act held inside its turn when stopAll is called: stopAll waits past its bound; the act finishes", async () => {
+    const p = await project();
+    const r = runner();
+    know("Zorblatt Variants of Habitus", cr({ ...ZORBLATT, doi: "10.5555/ao.f4.v1" }, { ...ZORBLATT, doi: "10.5555/ao.f4.v2", year: 2003 }));
+    const { added } = await r.add(p.id, ["Zorblatt Variants of Habitus"]);
+    await settled(p, added[0]!.id);
+    const c = (await entryOf(p, added[0]!.id))!;
+    expect(c.state).toBe("choose");
+    const h = held();
+    runnerSeams.inAct = h.seam;
+    const act = r.choose(p.id, c.id, c.candidates![0]!.id);
+    await until(h.entered, "the act to be inside its turn");
+    let settledAt = 0;
+    const stopping = r.stopAll().then(() => (settledAt = Date.now()));
+    await new Promise((res) => setTimeout(res, FIND_STOP_SETTLE_MS + 300));
+    expect(settledAt).toBe(0);
+    h.release();
+    expect((await act).state).toBe("record-complete");
+    await stopping;
+    expect(await sourcesOf(p)).toHaveLength(1);
+  }, 20_000);
+
+  for (const how of ["choose", "a duplicate answer"] as const) {
+    it(`(e) M1: a lock between the record's creation and the entry's line, after ${how}, is healed at resume by a new runner`, async () => {
+      const p = await project({ encrypted: true });
+      let r = runner();
+      let e: FindEntry;
+      if (how === "choose") {
+        know("Zorblatt Variants of Habitus", cr({ ...ZORBLATT, doi: "10.5555/ao.f4.v1" }, { ...ZORBLATT, doi: "10.5555/ao.f4.v2", year: 2003 }));
+        const { added } = await r.add(p.id, ["Zorblatt Variants of Habitus"]);
+        await settled(p, added[0]!.id);
+        e = (await entryOf(p, added[0]!.id))!;
+        expect(e.state).toBe("choose");
+      } else {
+        await repo.createSource(p.id, draftOf({ ...ZORBLATT, doi: undefined }), [], { provenance: plainProvenance() });
+        know(LINE, cr(ZORBLATT));
+        const { added } = await r.add(p.id, [LINE]);
+        await settled(p, added[0]!.id);
+        e = (await entryOf(p, added[0]!.id))!;
+        expect(e.state).toBe("maybe-duplicate");
+      }
+      runnerSeams.afterCreate = () => {
+        r.stop(p.id);
+        repo.lockProject(p.id);
+      };
+      const press = how === "choose" ? r.choose(p.id, e.id, e.candidates![0]!.id) : r.confirmDuplicate(p.id, e.id, false);
+      await expect(press).rejects.toBeTruthy();
+      runnerSeams.afterCreate = undefined;
+      await r.stopAll();
+      await repo.unlockProject(p.id, "pw");
+      const before = await sourcesOf(p);
+      const made = before.filter((x) => x.source.provenance.captureMethod === "reference_lookup");
+      expect(made).toHaveLength(1);
+      expect((await entryOf(p, e.id))!.state).toBe(e.state);
+      // A new runner (as after a close and reopen) heals it at resume.
+      r = runner();
+      r.resume(p.id);
+      await until(async () => (await entryOf(p, e.id))!.state === "record-complete", "the entry to be healed");
+      expect((await entryOf(p, e.id))!.sourceId).toBe(made[0]!.source.id);
+      expect(await sourcesOf(p)).toHaveLength(before.length);
+    });
+  }
+
+  it("(e) M2: a line the parser refuses is named by its number and its true cause, never by its text", async () => {
+    const p = await project();
+    const r = runner();
+    const err = await r.add(p.id, ["Zorblatt Grammar of Habitus", "\u0000\u0007\u202e"]).catch((x: unknown) => x);
+    expect(err).toBeInstanceOf(InvalidInputError);
+    expect((err as Error).message).toContain("Line 2");
+    expect((err as Error).message).toMatch(/cannot be shown/);
+    expect((err as Error).message).not.toContain("Zorblatt");
+    expect((await queue(p)).size).toBe(0);
+  });
+
+  it("(e) M4: an add while an import holds the project's store turn is written at once; stopAll waits for an add already writing", async () => {
+    const p = await project();
+    let releaseImport!: () => void;
+    const importHeld = new Promise<void>((res) => (releaseImport = res));
+    let inTurn = false;
+    const imported = importLikeAttach(p, { ...ZORBLATT, doi: "10.5555/ao.f4.other" }, async () => {
+      inTurn = true;
+      await importHeld;
+    });
+    await until(() => inTurn, "the import to hold the turn");
+    const r = runner();
+    gated.hold(parseReference(LINE)!.text);
+    const { added } = await r.add(p.id, [LINE]);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
+    releaseImport();
+    await imported;
   });
 });

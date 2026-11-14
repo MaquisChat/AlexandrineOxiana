@@ -1,0 +1,307 @@
+/**
+ * Find and acquire, slice 1 (Task F5; R225, R226, R237; plan Amendments A2, A3). The shapes are @ao/shared's
+ * (api/find.ts); the work is the library's runner (`Session.find`, made in `ServiceState.activate`; its life is in
+ * state.ts). Every route is for the desktop app's token only: none is in server.ts's EXTENSION_ROUTES, so the
+ * extension's token is refused (403) before any of them runs, and each route checks the caller again.
+ *
+ * What was typed is the researcher's text and reaches nothing but the library: no refusal repeats a line (a line
+ * outside the bounds is named by its number), and nothing here logs a body. Ids are checked with `isId` before
+ * anything is looked up. An entry is looked for only in the project addressed: an entry of another project is 404
+ * and is never acted on. The queue is read anew for every request (a read may show an entry whose change is then
+ * rolled back, A2: the next read is right); nothing here caches a queue or where a match elsewhere is.
+ */
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import { isId } from "@ao/core";
+import {
+  FIND_ADD_MAX_LINES,
+  FIND_QUEUE_MAX as LIBRARY_QUEUE_MAX,
+  FIND_TYPED_MAX,
+  FindEntryStateError,
+  FindEntryTooLargeError,
+  FindIndexNotReadyError,
+  FindProjectStoppedError,
+  FindQueueFullError,
+  FindQueueUnreadableError,
+  FindQueueUnwritableError,
+  FindRunnerClosedError,
+  InvalidInputError,
+  KeyNotAvailableError,
+  NotFoundError,
+  ProjectLockedError,
+  REFERENCE_MIN_CHARS,
+  ReadOnlyLibraryError,
+  readFindQueueOf,
+  type FindEntry,
+  type FindMatch as LibraryMatch,
+  type FindReasonCode as LibraryReasonCode,
+  type FindRunner,
+  type FindState as LibraryState,
+  type FindStoppedFor,
+  type OfferLink,
+  type WorkCandidate,
+} from "@ao/library";
+import {
+  FIND_ADD_LINES_MAX,
+  FIND_BODY_MAX_BYTES,
+  FIND_CANDIDATES_SENT,
+  FIND_LINE_MAX_CHARS,
+  FIND_LINE_MIN_CHARS,
+  FIND_QUEUE_MAX,
+  FIND_ROUTE_TEXT,
+  FIND_STOPPED_TEXT,
+  findLineRefusal,
+  type FindAddRequest,
+  type FindAddResponse,
+  type FindChooseRequest,
+  type FindDuplicateRequest,
+  type FindElsewhereResponse,
+  type FindEntryView,
+  type FindMatch,
+  type FindOfferLink,
+  type FindQueueResponse,
+  type FindReasonCode,
+  type FindRemoveResponse,
+  type FindScreenSettings,
+  type FindState,
+  type FindStoppedCode,
+  type FindWorkCandidate,
+} from "@ao/shared";
+import { ApiError, badRequest } from "../errors.js";
+import { FIND_SCREEN_KEYS, findScreenOf, readFindScreen, writeFindScreen } from "../find-screen.js";
+import type { Session } from "../state.js";
+import { bodyAs, bodyOf, paramsOf, type Ctx, type Same } from "./util.js";
+
+// The library's types and @ao/shared's declarations are one and the same (Task 47).
+true satisfies Same<LibraryState, FindState>;
+true satisfies Same<LibraryReasonCode, FindReasonCode>;
+true satisfies Same<FindStoppedFor["code"] | "index-needs-rebuild", FindStoppedCode>; // the service tells "needs a rebuild" from "being rebuilt" (R247 b)
+true satisfies Same<WorkCandidate, FindWorkCandidate>;
+true satisfies Same<OfferLink, FindOfferLink>;
+true satisfies Same<LibraryMatch, FindMatch>;
+true satisfies Same<Omit<FindEntry, "people" | "works" | "removed">, FindEntryView>;
+true satisfies Same<typeof LIBRARY_QUEUE_MAX, typeof FIND_QUEUE_MAX>;
+true satisfies Same<typeof FIND_ADD_MAX_LINES, typeof FIND_ADD_LINES_MAX>;
+true satisfies Same<typeof FIND_TYPED_MAX, typeof FIND_LINE_MAX_CHARS>;
+true satisfies Same<typeof REFERENCE_MIN_CHARS, typeof FIND_LINE_MIN_CHARS>;
+
+/** An entry as the screen gets it: no `people` and `works`, at most FIND_CANDIDATES_SENT candidates. */
+export function entryView(e: FindEntry): FindEntryView {
+  const { people: _people, works: _works, removed: _removed, candidates, ...rest } = e;
+  return { ...rest, ...(candidates ? { candidates: candidates.slice(0, FIND_CANDIDATES_SENT) } : {}) };
+}
+
+/** A library refusal said in words, with the `reason` the screen may act on; anything else is passed on as it is. */
+function said(err: unknown): unknown {
+  if (err instanceof ApiError) return err;
+  if (err instanceof ProjectLockedError || err instanceof KeyNotAvailableError) return new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
+  if (err instanceof ReadOnlyLibraryError) return new ApiError(409, "READ_ONLY", FIND_ROUTE_TEXT.readOnly, "read-only");
+  if (err instanceof FindQueueFullError) return new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.queueFull, "queue-full");
+  // The store's own sentence (A2).
+  if (err instanceof FindQueueUnreadableError) return new ApiError(409, "CONFLICT", err.message, "queue-unreadable");
+  if (err instanceof FindEntryStateError) return new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
+  if (err instanceof FindIndexNotReadyError) return new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.indexNotReady, "index-not-ready");
+  if (err instanceof FindRunnerClosedError) return new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
+  if (err instanceof NotFoundError) return new ApiError(404, "NOT_FOUND", FIND_ROUTE_TEXT.entryNotFound);
+  // The library's sentences never repeat what was typed.
+  if (err instanceof InvalidInputError || err instanceof FindEntryTooLargeError) return new ApiError(400, "VALIDATION", err.message, "line");
+  if (err instanceof FindQueueUnwritableError) return new ApiError(503, "UNAVAILABLE", err.message);
+  return err;
+}
+
+async function inWords<T>(p: () => Promise<T>): Promise<T> {
+  try {
+    return await p();
+  } catch (err) {
+    throw said(err);
+  }
+}
+
+export function registerFind(app: FastifyInstance, ctx: Ctx): void {
+  const { state } = ctx;
+  const limit = { bodyLimit: FIND_BODY_MAX_BYTES };
+
+  const uiOnly = (req: FastifyRequest) => {
+    if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Find and acquire is used from the desktop app.");
+  };
+
+  /** The project (and entry) addressed: ids checked first, then the project looked up in the open library. */
+  const addressed = (req: FastifyRequest, withEntry: boolean): { s: Session; projectId: string; entryId: string } => {
+    uiOnly(req);
+    const p = paramsOf(req);
+    const projectId = p.id ?? "";
+    const entryId = p.eid ?? "";
+    if (!isId(projectId)) throw badRequest("That is not a project's id.");
+    if (withEntry && !isId(entryId)) throw badRequest("That is not a queue entry's id.");
+    const s = state.requireSession();
+    if (!s.repo.listProjects().some((x) => x.id === projectId)) throw new ApiError(404, "NOT_FOUND", "That project was not found.");
+    return { s, projectId, entryId };
+  };
+
+  /** A changing request: refused for a read-only library, and while Find and acquire is stopped for the library. */
+  const runnerOf = (s: Session): FindRunner => {
+    state.assertNotMoving();
+    if (s.lib.mode === "read-only" || !s.index) throw new ApiError(409, "READ_ONLY", FIND_ROUTE_TEXT.readOnly, "read-only");
+    if (!s.find || state.session !== s) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
+    return s.find;
+  };
+
+  /**
+   * A press on the runner. The runner itself refuses a press that reaches its store turn after `stopAll()` or
+   * `stop(projectId)` and writes nothing, and `stopAll()` waits for presses already in their turn (R245): the service
+   * no longer counts presses. A press refused because Find and acquire stopped for the library meanwhile is a 503 in
+   * words; one refused because the project was stopped is 423 when the project is locked now, else a 409 in words
+   * that say nothing was added (or changed) (R247 M3). A press that fails while the project has been locked meanwhile
+   * is 423.
+   */
+  const pressed = async <T>(s: Session, projectId: string, fn: () => Promise<T>, nothing = "Nothing was changed."): Promise<T> => {
+    try {
+      return await fn();
+    } catch (err) {
+      if (state.session !== s || !s.find || err instanceof FindRunnerClosedError) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
+      if (err instanceof FindProjectStoppedError) {
+        if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
+        const why = stoppedOf(s, projectId);
+        throw new ApiError(409, "CONFLICT", why ? `${FIND_STOPPED_TEXT[why]} ${nothing}` : FIND_ROUTE_TEXT.projectStopped, "stopped");
+      }
+      if (!(err instanceof ApiError) && !s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
+      throw said(err);
+    }
+  };
+
+  /**
+   * Why nothing is done for the project's queue now: the runner's own code, with the index's state said truly
+   * (R247 b): "index-not-ready" only while a rebuild runs, "index-needs-rebuild" when it cannot be trusted and none runs.
+   */
+  const stoppedOf = (s: Session, projectId: string): FindStoppedCode | undefined => {
+    const code = s.find?.stoppedFor(projectId)?.code;
+    if (code && code !== "index-not-ready") return code;
+    const index = state.findIndexState(s);
+    if (index === "ready") return code === "index-not-ready" ? "index-not-ready" : undefined;
+    return index === "rebuilding" ? "index-not-ready" : "index-needs-rebuild";
+  };
+
+  /** The entry of THIS project: 404 when its queue does not hold it (never there, another project's, or removed by anyone; R245). */
+  const entryOf = async (s: Session, projectId: string, entryId: string): Promise<FindEntry> => {
+    const q = await inWords(() => readFindQueueOf(s.repo, projectId));
+    const e = q.entries.get(entryId);
+    if (e) return e;
+    throw new ApiError(404, "NOT_FOUND", FIND_ROUTE_TEXT.entryNotFound);
+  };
+
+  app.get("/projects/:id/find", async (req, reply): Promise<FindQueueResponse> => {
+    const { s, projectId } = addressed(req, false);
+    const q = await inWords(() => readFindQueueOf(s.repo, projectId));
+    const readOnly = s.lib.mode === "read-only" || !s.index;
+    const runner = state.session === s ? s.find : undefined;
+    const stopped: FindStoppedCode | undefined = readOnly ? "read-only" : runner ? stoppedOf(s, projectId) : undefined;
+    // Read from the file every time (R247 M10): right after an open, the answer never lags behind it.
+    const screen = await readFindScreen(state.deps.appConfigDir);
+    reply.header("Cache-Control", "no-store");
+    return {
+      entries: [...q.entries.values()].map(entryView),
+      checkEverything: screen.checkEverything,
+      lockedProjectsNotChecked: runner && !readOnly ? runner.lockedNotChecked() : 0,
+      readOnly,
+      unreadableLines: q.unreadableLines,
+      ...(stopped ? { stopped: { code: stopped, text: FIND_STOPPED_TEXT[stopped] } } : {}),
+    };
+  });
+
+  app.post("/projects/:id/find", limit, async (req): Promise<FindAddResponse> => {
+    const { s, projectId } = addressed(req, false);
+    const runner = runnerOf(s);
+    const b = bodyAs<FindAddRequest>(req);
+    if (!Array.isArray(b.lines)) throw badRequest('"lines" must be a list of references, one per line.');
+    const given = b.lines as unknown[];
+    if (given.length === 0) throw badRequest(FIND_ROUTE_TEXT.noLines);
+    if (given.length > FIND_ADD_LINES_MAX) throw badRequest(FIND_ROUTE_TEXT.tooManyLines);
+    const lines = given.map((l, i) => {
+      const t = typeof l === "string" ? l.trim() : "";
+      // At least 2 characters, and at most 500 UTF-16 units (the library's own bound).
+      if (Array.from(t).length < FIND_LINE_MIN_CHARS || t.length > FIND_LINE_MAX_CHARS) throw new ApiError(400, "VALIDATION", findLineRefusal(i + 1), "line");
+      return t;
+    });
+    const collectionId = b.collectionId;
+    if (collectionId !== undefined && (typeof collectionId !== "string" || !isId(collectionId))) throw badRequest("The collection is not one of this project's.");
+    const r = await pressed(s, projectId, () => runner.add(projectId, lines, collectionId), "Nothing was added.");
+    return { added: r.added.map(entryView), mergedLines: r.mergedLines };
+  });
+
+  app.post("/projects/:id/find/:eid/choose", limit, async (req): Promise<FindEntryView> => {
+    const { s, projectId, entryId } = addressed(req, true);
+    const runner = runnerOf(s);
+    const b = bodyAs<FindChooseRequest>(req);
+    const candidateId = b.candidateId;
+    if (candidateId !== null && (typeof candidateId !== "string" || candidateId.length === 0 || candidateId.length > 512)) throw badRequest('"candidateId" must be a candidate\'s id, or null for "None of these".');
+    const cur = await entryOf(s, projectId, entryId);
+    // Only an entry waiting for a choice: a second press, or a press on any other state, is a 409 in words.
+    if (cur.state !== "choose") throw new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
+    if (candidateId !== null && !cur.candidates?.some((c) => c.id === candidateId)) throw new ApiError(400, "VALIDATION", FIND_ROUTE_TEXT.unknownCandidate, "unknown-candidate");
+    return entryView(await pressed(s, projectId, () => runner.choose(projectId, entryId, candidateId)));
+  });
+
+  app.post("/projects/:id/find/:eid/duplicate", limit, async (req): Promise<FindEntryView> => {
+    const { s, projectId, entryId } = addressed(req, true);
+    const runner = runnerOf(s);
+    const same = bodyAs<FindDuplicateRequest>(req).same;
+    if (typeof same !== "boolean") throw badRequest('"same" must be true or false.');
+    await entryOf(s, projectId, entryId);
+    return entryView(await pressed(s, projectId, () => runner.confirmDuplicate(projectId, entryId, same)));
+  });
+
+  app.post("/projects/:id/find/:eid/add-here", limit, async (req): Promise<FindEntryView> => {
+    const { s, projectId, entryId } = addressed(req, true);
+    const runner = runnerOf(s);
+    bodyOf(req);
+    await entryOf(s, projectId, entryId);
+    return entryView(await pressed(s, projectId, () => runner.addHereAsWell(projectId, entryId)));
+  });
+
+  app.post("/projects/:id/find/:eid/retry", limit, async (req): Promise<FindEntryView> => {
+    const { s, projectId, entryId } = addressed(req, true);
+    const runner = runnerOf(s);
+    bodyOf(req);
+    await entryOf(s, projectId, entryId);
+    return entryView(await pressed(s, projectId, () => runner.retry(projectId, entryId)));
+  });
+
+  app.delete("/projects/:id/find/:eid", limit, async (req): Promise<FindRemoveResponse> => {
+    const { s, projectId, entryId } = addressed(req, true);
+    const runner = runnerOf(s);
+    await entryOf(s, projectId, entryId);
+    await pressed(s, projectId, () => runner.remove(projectId, entryId));
+    return { removed: true };
+  });
+
+  // Where the match in another project is: worked out now, never stored, never cached (A3).
+  app.get("/projects/:id/find/:eid/elsewhere", async (req, reply): Promise<FindElsewhereResponse> => {
+    const { s, projectId, entryId } = addressed(req, true);
+    reply.header("Cache-Control", "no-store");
+    await entryOf(s, projectId, entryId);
+    const runner = state.session === s ? s.find : undefined;
+    if (!runner) return null;
+    const m = await inWords(() => runner.elsewhere(projectId, entryId));
+    if (!m) return null;
+    // Locked or removed meanwhile: null ("Already in another project that is locked now.").
+    const other = s.repo.listProjects().find((p) => p.id === m.projectId);
+    if (!other || !s.repo.isUnlocked(other.id)) return null;
+    return { projectId: other.id, projectName: other.name, sourceId: m.sourceId };
+  });
+
+  app.get("/find/screen", async (req): Promise<FindScreenSettings> => {
+    uiOnly(req);
+    return readFindScreen(state.deps.appConfigDir);
+  });
+
+  app.put("/find/screen", limit, async (req): Promise<FindScreenSettings> => {
+    uiOnly(req);
+    const b = bodyOf(req);
+    for (const k of Object.keys(b)) if (!FIND_SCREEN_KEYS.includes(k)) throw badRequest(`"${k}" is not part of this request.`);
+    if (typeof b.checkEverything !== "boolean") throw badRequest('"checkEverything" must be true or false.');
+    for (const k of ["projectId", "collectionId"]) if (b[k] !== undefined && (typeof b[k] !== "string" || !isId(b[k]))) throw badRequest(`"${k}" must be an id.`);
+    const next = findScreenOf(b as unknown as FindScreenSettings);
+    await writeFindScreen(state.deps.appConfigDir, next, state.opts.now());
+    state.findCheckEverything = next.checkEverything;
+    return next;
+  });
+}

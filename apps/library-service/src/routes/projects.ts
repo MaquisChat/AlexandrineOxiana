@@ -153,6 +153,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     await limit.guard(id, () => s.repo.unlockProject(id, secret));
     // Work that waited for the key: viewing proxies, OCR and worker jobs of this project (R142), and its daily backup (R99 I7).
     state.resumeProject(s, id, { workerJobs: true });
+    state.resumeFind(s, id); // Find and acquire (Task F5): its queue goes on (the runner waits for the index itself)
     state.startWork("backup", async () => {
       await state.runScheduledBackups(id);
     });
@@ -163,6 +164,8 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
   app.post("/projects/:id/lock", async (req) => {
     const s = state.requireSession();
     const id = projectParam(ctx, req);
+    // Find and acquire (Task F5) stops for an encrypted project BEFORE its key is dropped: nothing more is written.
+    if (s.repo.getProject(id).encryption.enabled) state.stopFind(s, id);
     s.repo.lockProject(id);
     // Its recordings stop playing: media tickets end with the key (R135 2).
     state.media.revokeProject(id);
