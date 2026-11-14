@@ -734,6 +734,32 @@ describe("Search sources: round 2 (R314)", () => {
   });
 });
 
+describe("Search sources: moving past a source the screen does not know (R316 d)", () => {
+  const withUnknown = (order: string[]) => ({ ...DEFAULT, record: order.map((id) => ({ id: id as never, on: true })) });
+  const order = () => Array.from(record_().querySelectorAll<HTMLElement>("li[data-source]")).map((li) => li.dataset.source);
+
+  it("an unknown source between Crossref and OpenAlex: Move OpenAlex up goes above Crossref, announced once, and the PUT sends the order after the move", async () => {
+    const svc = useSvc({ settings: withUnknown(["crossref", "scopus", "openalex", "elicit"]) });
+    await show(svc);
+    const user = userEvent.setup();
+    await user.click(within(record_()).getByRole("button", { name: "Move OpenAlex up" }));
+    expect(order()).toEqual(["openalex", "crossref", "scopus", "elicit"]);
+    expect(liveText()).toBe("OpenAlex moved to position 1 of 2.");
+    await waitFor(() => expect(document.activeElement).toBe(within(record_()).getByRole("button", { name: "Move OpenAlex down" })));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(svc.count("PUT", "/settings/search-sources")).toBe(1));
+    const body = JSON.parse(svc.sent.find((s) => s.method === "PUT")!.body);
+    expect(body.record.map((r: { id: string }) => r.id)).toEqual(["openalex", "crossref", "scopus", "elicit"]);
+  });
+
+  it("an unknown source first: the first movable row has no Move up", async () => {
+    const svc = useSvc({ settings: withUnknown(["scopus", "crossref", "openalex", "elicit"]) });
+    await show(svc);
+    expect(within(record_()).queryByRole("button", { name: "Move Crossref up" })).toBeNull();
+    expect(within(record_()).getByRole("button", { name: "Move Crossref down" })).toBeTruthy();
+  });
+});
+
 describe("Search sources: reachable", () => {
   it("the screen is linked from the library's settings links and from Find and acquire with the project", async () => {
     const state = { opened: true };

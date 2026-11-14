@@ -317,10 +317,15 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
     if (saveBusy.current || !c || c.problem?.code === "newer") return;
     const d = draftRef.current ?? fromAnswer(c);
     const i = d.record.findIndex((r) => r.id === id);
-    const j = dir === "up" ? i - 1 : i + 1;
-    if (i < 0 || !movable(id) || !d.record[j] || !movable(d.record[j]!.id)) return;
+    if (i < 0 || !movable(id)) return;
+    // R316 d: the neighbour is the nearest row that can be moved; a row the screen does not know is passed over.
+    let j = dir === "up" ? i - 1 : i + 1;
+    while (d.record[j] && !movable(d.record[j]!.id)) j += dir === "up" ? -1 : 1;
+    if (!d.record[j]) return;
+    // The row goes above (up) or below (down) that neighbour; the rows passed over keep their order.
     const record = [...d.record];
-    [record[i], record[j]] = [record[j]!, record[i]!];
+    const [row] = record.splice(i, 1);
+    record.splice(j, 0, row!);
     setDraft({ ...d, record });
     const order = record.filter((r) => movable(r.id));
     say(`${nameOf("record", id)} moved to position ${order.findIndex((r) => r.id === id) + 1} of ${order.length}.`);

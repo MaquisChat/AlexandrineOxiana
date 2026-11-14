@@ -617,6 +617,14 @@ function editYaml(text: string, fn: (doc: Document) => void): string {
  * declared unless one is already (an existing declaration, with its agreements, is kept as it is). Taken out, nothing
  * else changes: the vendors stay byte for byte (a declared vendor that no operation names allows nothing).
  */
+/** Exactly the entry the Elicit box writes: `- id: elicit`, no other key, no comment anywhere on it. */
+function isBoxEntry(v: unknown): boolean {
+  if (!isMap(v) || v.items.length !== 1 || v.get("id") !== ELICIT) return false;
+  const pair = v.items[0]!;
+  const nodes = [v, pair.key, pair.value] as { comment?: string | null; commentBefore?: string | null }[];
+  return nodes.every((n) => !n || (!n.comment && !n.commentBefore));
+}
+
 function writeElicit(text: string, on: boolean, current: string[], savedVendors: unknown): string {
   return editYaml(text, (doc) => {
     const path = ["processing", "metadata_lookup"];
@@ -633,7 +641,8 @@ function writeElicit(text: string, on: boolean, current: string[], savedVendors:
     if (!on) {
       // R314 e: a vendor entry for Elicit that this draft added (the saved file had none) goes with the tick.
       if (vendorDeclared(savedVendors) || !isSeq(vendors)) return;
-      vendors.items = vendors.items.filter((v) => !(isMap(v) && v.get("id") === ELICIT));
+      // R316 c: only an entry that is exactly what the box writes (the id alone, no comment) goes; anything typed stays.
+      vendors.items = vendors.items.filter((v) => !isBoxEntry(v));
       if (vendors.items.length === 0 && savedVendors === undefined) doc.deleteIn(["vendors"]);
       return;
     }
@@ -662,7 +671,7 @@ const ELICIT_DROPPED_BY: Partial<Record<Profile, string>> = {
 function elicitRefusals(violations: Violation[]): string[] {
   return violations
     .filter((v) => v.control === "processing.metadata_lookup" && Array.isArray(v.actual) && v.actual.includes(ELICIT) && Array.isArray(v.required) && !v.required.includes(ELICIT))
-    .map((v) => ELICIT_DROPPED_BY[v.profile] ?? `the ${PROFILE_LABEL[v.profile] ?? v.profile} profile does not allow it.`);
+    .map((v) => ELICIT_DROPPED_BY[v.profile] ?? "");
 }
 
 /**
@@ -718,12 +727,21 @@ function FindAcquireWays({
   // The general note on GDPR and HIPAA is said only while the box is unticked: once ticked, the verdict below says it.
   const profileNotes = elicitOn ? [] : (cfg?.profiles ?? []).flatMap((p) => (ELICIT_PROFILE_NOTE[p] ? [ELICIT_PROFILE_NOTE[p]!] : []));
   const refusals = elicitRefusals(violations);
+  const reasons = refusals.filter(Boolean).join(" ");
   const verdict: ReactNode = !elicitOn ? null : unsaved ? (
     "What this project's rules allow for Elicit is said here once the changes are saved."
   ) : refusals.length ? (
-    <>
-      <strong>Named, but NOT allowed:</strong> {refusals.join(" ")}
-    </>
+    reasons ? (
+      <>
+        <strong>Named, but NOT allowed:</strong> {reasons}
+      </>
+    ) : (
+      // R316 a: no words for the profile (or none given): no reason is invented.
+      <strong>Named, but NOT allowed by the rules in force.</strong>
+    )
+  ) : !on.has("reference_lookup") ? (
+    // R316 b: Find and acquire does not ask Elicit where it may not look references up (the card's first box, above).
+    "Named, but Find and acquire may not look references up in this project, so Elicit is not asked."
   ) : (
     "Allowed by this project's rules."
   );

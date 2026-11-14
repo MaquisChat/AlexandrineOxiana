@@ -849,6 +849,103 @@ describe("The Elicit box says what the rules in force say (R314 a, e, f)", () =>
     expect(saved.processing.metadata_lookup).not.toContain("elicit");
   });
 
+  it("R316 a: a violation with no profile, or one the screen has no words for, says only that the rules in force do not allow it; the GDPR and HIPAA reasons are as built", async () => {
+    const bare = { control: "processing.metadata_lookup", required: DEFAULT_LOOKUPS, actual: [...DEFAULT_LOOKUPS, "elicit"] };
+    serve({ yaml: file("", ""), violations: [bare] });
+    const view = render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(described(elicitBox())).toContain("Named, but NOT allowed by the rules in force.");
+    expect(described(elicitBox())).not.toMatch(/undefined|profile/);
+    expect(described(elicitBox())).not.toContain(ALLOWED);
+    view.unmount();
+    serve({ yaml: file("", ""), violations: [{ ...bare, profile: "ferpa" }] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(described(elicitBox())).toContain("Named, but NOT allowed by the rules in force.");
+    expect(described(elicitBox())).not.toMatch(/ferpa|profile does not allow/);
+  });
+
+  it("R316 b: ticked while the project may not look references up: says Elicit is not asked, tied to the box; with looking up allowed: Allowed", async () => {
+    const NOT_ASKED = "Named, but Find and acquire may not look references up in this project, so Elicit is not asked.";
+    serve({ yaml: `acquireMethods: [free_copy, library_access]\nprocessing:\n  metadata_lookup: [crossref, elicit]\nvendors:\n  - id: elicit\n`, violations: [] });
+    const view = render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(elicitBox().checked).toBe(true);
+    expect(described(elicitBox())).toContain(NOT_ASKED);
+    expect(described(elicitBox())).not.toContain(ALLOWED);
+    view.unmount();
+    serve({ yaml: `acquireMethods: [reference_lookup]\nprocessing:\n  metadata_lookup: [crossref, elicit]\nvendors:\n  - id: elicit\n`, violations: [] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(described(elicitBox())).toContain(ALLOWED);
+    expect(described(elicitBox())).not.toContain(NOT_ASKED);
+  });
+
+  it("R316 b: a violation still comes first when lookups are not allowed either", async () => {
+    serve({ yaml: `profiles: [gdpr]\nacquireMethods: [free_copy]\nprocessing:\n  metadata_lookup: [crossref, openalex, openlibrary, loc, elicit]\nvendors:\n  - id: elicit\n`, violations: [dropped("gdpr")] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(described(elicitBox())).toContain("Named, but NOT allowed: under GDPR");
+    expect(described(elicitBox())).not.toContain(ALLOWED);
+  });
+
+  it("R316 b: ticked but not yet saved, the sentence says it will be said once the changes are saved", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.click(elicitBox());
+    const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Reason" }), "Trying");
+    await user.type(within(dialog).getByRole("textbox", { name: "Approved by" }), "Dr Ana Souza");
+    await user.click(within(dialog).getByRole("button", { name: "Record reason" }));
+    expect(elicitBox().checked).toBe(true);
+    expect(described(elicitBox())).toContain("What this project's rules allow for Elicit is said here once the changes are saved.");
+    expect(described(elicitBox())).not.toContain(ALLOWED);
+  });
+
+  it("R316 c: an entry the researcher typed for Elicit in the same draft (an agreement, a comment) stays when the box is unticked; nothing typed: nothing left of the box's entry", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.click(elicitBox());
+    const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Reason" }), "Trying");
+    await user.type(within(dialog).getByRole("textbox", { name: "Approved by" }), "Dr Ana Souza");
+    await user.click(within(dialog).getByRole("button", { name: "Record reason" }));
+    await user.click(screen.getByRole("button", { name: "View governance.yaml" }));
+    const raw = screen.getByRole("textbox", { name: "governance.yaml" }) as HTMLTextAreaElement;
+    expect(raw.value).toContain("- id: elicit\n");
+    fireEvent.change(raw, { target: { value: raw.value.replace("- id: elicit\n", "- id: elicit # DPA signed 2026-10\n    dpa: true\n") } });
+    await user.click(elicitBox());
+    expect(elicitBox().checked).toBe(false);
+    const text = (screen.getByRole("textbox", { name: "governance.yaml" }) as HTMLTextAreaElement).value;
+    expect(text).toContain("vendors:");
+    expect(text).toContain("- id: elicit # DPA signed 2026-10\n    dpa: true\n");
+    expect(parse(text).vendors).toEqual([{ id: "elicit", dpa: true }]);
+    expect(parse(text).processing.metadata_lookup).not.toContain("elicit");
+  });
+
+  it("R316 c: a comment alone on the box's entry also keeps it", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.click(elicitBox());
+    const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Reason" }), "Trying");
+    await user.type(within(dialog).getByRole("textbox", { name: "Approved by" }), "Dr Ana Souza");
+    await user.click(within(dialog).getByRole("button", { name: "Record reason" }));
+    await user.click(screen.getByRole("button", { name: "View governance.yaml" }));
+    const raw = screen.getByRole("textbox", { name: "governance.yaml" }) as HTMLTextAreaElement;
+    fireEvent.change(raw, { target: { value: raw.value.replace("- id: elicit\n", "- id: elicit # to be agreed\n") } });
+    await user.click(elicitBox());
+    const text = (screen.getByRole("textbox", { name: "governance.yaml" }) as HTMLTextAreaElement).value;
+    expect(text).toContain("# to be agreed");
+    expect(parse(text).vendors).toEqual([{ id: "elicit" }]);
+  });
+
   it("R314 f: ways the rules file names that this version does not know are kept as written when a box is ticked or unticked", async () => {
     const cap = serve({ yaml: "acquireMethods: [reference_lookup, a_later_way]\n" });
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);
