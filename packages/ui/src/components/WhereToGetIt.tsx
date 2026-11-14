@@ -31,7 +31,7 @@ export const WHERE_TEXT = {
 /** A call to the shell with no answer in this long is given up (the house's limit, as on the Your library screen). */
 export const OPEN_TIMEOUT_MS = 60_000;
 
-/** The offers that may be shown: well-formed, an https: address with no name or password, each with the host its address really leads to. */
+/** The offers that may be shown: well-formed, an https: address with no name or password, each with its address as parsed (`href`, R342 h) and the host it really leads to. */
 export function whereOffers(list: unknown): FindOfferLink[] {
   if (!Array.isArray(list)) return [];
   const out: FindOfferLink[] = [];
@@ -46,7 +46,8 @@ export function whereOffers(list: unknown): FindOfferLink[] {
       continue;
     }
     if (u.protocol !== "https:" || u.username || u.password || !u.host) continue;
-    out.push({ label: label as FindOfferLink["label"], url, host: u.host });
+    // R342 h: the address as parsed is what is handed on — to the link, the shell's opener and the copy.
+    out.push({ label: label as FindOfferLink["label"], url: u.href, host: u.host });
   }
   return out;
 }

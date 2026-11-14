@@ -70,6 +70,13 @@ describe("WhereToGetIt in a browser", () => {
     expect(a.textContent).toBe("A free copy may be at (xn--80ak6aa92e.example)");
   });
 
+  it("R342 h: an address with a tab and a newline inside is shown and linked as parsed, never the raw string", () => {
+    render(<WhereToGetIt offers={[{ label: "Publisher's page", url: "https://doi.org/10.5555/ao.\tta\nb?q=1", host: "doi.org" }]} name={NAME} />);
+    const a = within(list()).getByRole("link");
+    expect(a.getAttribute("href")).toBe("https://doi.org/10.5555/ao.tab?q=1");
+    expect(a.textContent).toBe("Publisher's page (doi.org)");
+  });
+
   it("nothing to show: nothing at all", () => {
     const { container } = render(<WhereToGetIt offers={[{ label: "WorldCat", url: "ftp://worldcat.org/x", host: "worldcat.org" }]} name={NAME} />);
     expect(container.textContent).toBe("");
@@ -180,6 +187,29 @@ describe("WhereToGetIt in the desktop app (R340 d)", () => {
     expect(address.closest("[dir=auto]")).toBeTruthy();
     expect(address.closest("a")).toBeNull();
     expect(within(second!).queryByText(/catalogue\.example\.edu\/search/u)).toBeNull();
+  });
+
+  it("R342 h: an address with a tab and a newline inside is handed on as parsed — to the opener and to the copy — never the raw string", async () => {
+    const RAW = "https://doi.org/10.5555/ao.\tta\nb?q=1";
+    const PARSED = "https://doi.org/10.5555/ao.tab?q=1";
+    fake.shell!.openInBrowser.mockResolvedValue(true);
+    const user = userEvent.setup();
+    const writeText = stubClipboard();
+    render(<WhereToGetIt offers={[{ label: "Publisher's page", url: RAW, host: "doi.org" }]} name={NAME} />);
+    await user.click(within(list()).getByRole("button", { name: /^Open in my browser/ }));
+    await waitFor(() => expect(fake.shell!.openInBrowser).toHaveBeenCalledTimes(1));
+    expect(fake.shell!.openInBrowser.mock.calls).toEqual([[PARSED]]);
+    await user.click(within(list()).getByRole("button", { name: /^Copy address/ }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(writeText.mock.calls).toEqual([[PARSED]]);
+  });
+
+  it("R342 h: a copy that fails shows the parsed address to select", async () => {
+    const user = userEvent.setup();
+    stubClipboard(true);
+    render(<WhereToGetIt offers={[{ label: "Publisher's page", url: "https://doi.org/10.5555/ao.\tta\nb", host: "doi.org" }]} name={NAME} />);
+    await user.click(within(list()).getByRole("button", { name: /^Copy address/ }));
+    expect(await within(list()).findByText("https://doi.org/10.5555/ao.tab")).toBeTruthy();
   });
 
   it("nothing is opened on focus, on hover or by itself", async () => {
