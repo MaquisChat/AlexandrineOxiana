@@ -40,6 +40,8 @@ import { join } from "node:path";
 import { elicitAsk } from "./elicit.js";
 import type { FreeCopySource } from "./free-copy.js";
 import { crossrefSearchUrl, openAlexSearchUrl } from "./search.js";
+import { InvalidInputError } from "../repo/errors.js";
+import { catalogueTemplateOk, isLibraryAccess, type LibraryAccess } from "./where.js";
 import { DEFAULT_SEARCH_SETTINGS, type RecordSearchSource, type SearchSettings } from "./types.js";
 
 
@@ -154,10 +156,10 @@ class Unusable extends Error {}
  * SEARCH_SOURCES_MAX_BYTES (decided by its size, then by the bytes read: never more than the bound plus one is read),
  * not a regular file, or not JSON. Opened without waiting on a pipe.
  */
-async function readBounded(dir: string): Promise<unknown> {
+async function readBounded(dir: string, name: string = SEARCH_SOURCES_FILE): Promise<unknown> {
   let fh: fsp.FileHandle;
   try {
-    fh = await fsp.open(join(dir, SEARCH_SOURCES_FILE), fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+    fh = await fsp.open(join(dir, name), fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new Unusable();
@@ -206,30 +208,122 @@ export async function readSearchSettings(dir: string): Promise<SearchSettingsRea
  */
 export async function writeSearchSettings(dir: string, next: SearchSettings, now: Date): Promise<SearchSettings> {
   const file = fileOf(next);
-  const accept = (v: unknown): v is StoredFile | Record<string, unknown> => isStored(v) || isNewer(v);
+  await writeBounded(dir, SEARCH_SOURCES_FILE, file, isStored, () => new SearchSettingsNewerError(), now);
+  return settingsOf(file);
+}
+
+/**
+ * The one way an app-wide settings file of Find and acquire is saved (`search-sources.json`, F15's `your-library.json`):
+ * atomically and 0600 (`updateAppSettingStrict`); a file written by a newer version is left as it is (`newer()` thrown,
+ * nothing written); a file this build cannot use — over the bound, not JSON, not of its shape — is set aside (kept
+ * beside it, never deleted) and the new content written.
+ */
+async function writeBounded<F>(dir: string, name: string, file: F, stored: (v: unknown) => v is F, newer: () => Error, now: Date): Promise<void> {
+  const accept = (v: unknown): v is F | Record<string, unknown> => stored(v) || isNewer(v);
   const write = () =>
-    updateAppSettingStrict(dir, SEARCH_SOURCES_FILE, accept, (cur) => {
-      if (cur !== undefined && isNewer(cur)) throw new SearchSettingsNewerError();
+    updateAppSettingStrict(dir, name, accept, (cur) => {
+      if (cur !== undefined && isNewer(cur)) throw newer();
       return file;
     });
   // R298 f: a file this read cannot use (over the bound included: never "newer") is set aside, then written. (Setting
   // it aside goes through the general reader, which reads it once, at this save only.)
   let unusable = false;
   try {
-    await readBounded(dir);
+    await readBounded(dir, name);
   } catch {
     unusable = true;
   }
-  if (unusable) await setAppSettingAside(dir, SEARCH_SOURCES_FILE, refuseAll, now).catch(() => undefined);
+  if (unusable) await setAppSettingAside(dir, name, refuseAll, now).catch(() => undefined);
   try {
     await write();
   } catch (err) {
     if (!(err instanceof AppSettingUnreadableError)) throw err;
     // Damaged (or a shape this version cannot use): kept aside, never deleted; then the new settings are written.
-    await setAppSettingAside(dir, SEARCH_SOURCES_FILE, accept, now).catch(() => undefined);
+    await setAppSettingAside(dir, name, accept, now).catch(() => undefined);
     await write();
   }
-  return settingsOf(file);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F15 (R324 f): "Your library" — `<appConfigDir>/your-library.json`, beside `search-sources.json`, read and
+// written by the same code (`readBounded`, `writeBounded`): 0600, atomic, read up to SEARCH_SOURCES_MAX_BYTES.
+//
+//   { "v": 1, "name": "<at most 200, no control characters>", "access": LibraryAccess | null,
+//     "catalogueSearch"?: "<https, {query} once after the host>", "staySignedIn": bool }
+//
+// Missing: not set (`access` null, nothing said). Unreadable, too large or not of this shape (an access this build's
+// `isLibraryAccess` would not give, a catalogue address `catalogueTemplateOk` refuses, a name with a control
+// character): not set AND `problem: "unreadable"` (the read never rewrites it; the next save sets it aside). Written by a
+// newer version: not set AND `problem: "newer"`, and a save is refused (YourLibraryNewerError). The pasted link is never
+// a field of the file: only the address worked out from it.
+
+export const YOUR_LIBRARY_FILE = "your-library.json";
+export const YOUR_LIBRARY_NAME_MAX = 200;
+
+/** The researcher's library (the plan's `YourLibrary`). Not set: `access` null. */
+export type YourLibrary = { name: string; access: LibraryAccess | null; catalogueSearch?: string; staySignedIn: boolean };
+export interface YourLibraryRead {
+  settings: YourLibrary;
+  problem?: SearchSettingsProblem;
+}
+
+/** These settings were written by a newer version of the app: not read, not changed. */
+export class YourLibraryNewerError extends Error {
+  constructor() {
+    super("These Your library settings were written by a newer version of the app. Update the app to change them.");
+    this.name = "YourLibraryNewerError";
+  }
+}
+
+/** An institution's name the settings keep: at most 200 characters, no control character ("" when not given). */
+export const yourLibraryNameOk = (v: unknown): v is string => typeof v === "string" && v.length <= YOUR_LIBRARY_NAME_MAX && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(v);
+
+type YourLibraryFile = YourLibrary & { v: 1 };
+const YOUR_LIBRARY_KEYS: readonly string[] = ["v", "name", "access", "catalogueSearch", "staySignedIn"];
+function isYourLibraryFile(v: unknown): v is YourLibraryFile {
+  if (!isObj(v) || v.v !== 1 || Object.keys(v).some((k) => !YOUR_LIBRARY_KEYS.includes(k))) return false;
+  return yourLibraryNameOk(v.name) && (v.access === null || isLibraryAccess(v.access)) && (v.catalogueSearch === undefined || catalogueTemplateOk(v.catalogueSearch)) && typeof v.staySignedIn === "boolean";
+}
+const notSet = (): YourLibrary => ({ name: "", access: null, staySignedIn: false });
+const yourLibraryOf = (f: YourLibraryFile): YourLibrary => ({
+  name: f.name,
+  access: f.access === null ? null : { kind: f.access.kind, base: f.access.base },
+  ...(f.catalogueSearch !== undefined ? { catalogueSearch: f.catalogueSearch } : {}),
+  staySignedIn: f.staySignedIn,
+});
+
+/** "Your library" on this computer, read anew. Never throws. */
+export async function readYourLibrary(dir: string): Promise<YourLibraryRead> {
+  let raw: unknown;
+  try {
+    raw = await readBounded(dir, YOUR_LIBRARY_FILE);
+  } catch {
+    return { settings: notSet(), problem: "unreadable" };
+  }
+  if (raw === undefined) return { settings: notSet() };
+  if (isNewer(raw)) return { settings: notSet(), problem: "newer" };
+  if (!isYourLibraryFile(raw)) return { settings: notSet(), problem: "unreadable" };
+  return { settings: yourLibraryOf(raw) };
+}
+
+/**
+ * Saves "Your library": only the type's fields, each checked again here (an address `isLibraryAccess` refuses, a
+ * catalogue address `catalogueTemplateOk` refuses, a name with a control character: InvalidInputError naming the field,
+ * nothing written); `staySignedIn` false unless given true. Returns what was saved, as a read gives it.
+ */
+export async function writeYourLibrary(dir: string, next: YourLibrary, now: Date): Promise<YourLibrary> {
+  if (!yourLibraryNameOk(next.name)) throw new InvalidInputError("The institution's name must be at most 200 characters, with no control characters.");
+  if (next.access !== null && !isLibraryAccess(next.access)) throw new InvalidInputError("The library's address is not one the app worked out.");
+  if (next.catalogueSearch !== undefined && !catalogueTemplateOk(next.catalogueSearch)) throw new InvalidInputError("The catalogue search address is not one the app accepts.");
+  const file: YourLibraryFile = {
+    v: 1,
+    name: next.name,
+    access: next.access === null ? null : { kind: next.access.kind, base: next.access.base },
+    ...(next.catalogueSearch !== undefined ? { catalogueSearch: next.catalogueSearch } : {}),
+    staySignedIn: next.staySignedIn === true,
+  };
+  await writeBounded(dir, YOUR_LIBRARY_FILE, file, isYourLibraryFile, () => new YourLibraryNewerError(), now);
+  return yourLibraryOf(file);
 }
 
 /** The e-mail the lookup client may put in the User-Agent of a request to `host`: Crossref's, to api.crossref.org only. */

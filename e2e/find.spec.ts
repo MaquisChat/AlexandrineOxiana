@@ -30,6 +30,14 @@
  * answer would show as "Some services could not be reached…" (or, with none answered, as the engine's waits). The harness
  * cannot serve a file: a file found, "Needs your check", "Use this file" and "In your library" are a later task's (F14).
  *
+ * Such a row still says where the work can be got (Task F15; R324 a, R339 a): the service's answer for the queue gives
+ * each resting entry its `offers` ("Where to get it": any free-copy service's link — none here —, then for a work with a
+ * DOI the publisher's page at `https://doi.org/<doi>`, the library's catalogue when one is set — none here —, and for a
+ * book or a work with an ISBN, Open Library and WorldCat), and the row shows them as links "<label> (<host>)". The spec
+ * reads each entry's offers from the service's own answer and checks that the row shows exactly those, in order, each
+ * named by the host parsed here from its address and opening that address; the only thing written into the spec is the
+ * work's DOI, for the publisher's page that must be among them.
+ *
  * Every wait is for something the screen shows (a state in words, a count, a row) with a generous limit (R173):
  * lookups are paced by the product (Crossref one at a time) and the machine may be loaded.
  */
@@ -99,7 +107,7 @@ interface StoredSource {
   };
 }
 interface QueueView {
-  entries: Array<{ id: string; typed: string; state: string; updatedAt: string; sourceId?: string; duplicateOf?: string; elsewhere?: true; chosen?: string }>;
+  entries: Array<{ id: string; typed: string; state: string; updatedAt: string; sourceId?: string; duplicateOf?: string; elsewhere?: true; chosen?: string; offers?: Array<{ label: string; url: string; host: string }> }>;
 }
 
 const queue = (page: Page) => page.getByRole("list", { name: "Queue" });
@@ -111,13 +119,36 @@ type Row = ReturnType<Page["locator"]>;
 
 /**
  * A completed record whose copy part ended with every service answering that it has no copy (F11): "No open copy", no
- * reason (none of the services failed, so no "Try again"), and no "Where to get it" (no service gave a link).
+ * reason (none of the services failed, so no "Try again") — and "Where to get it" (F15; R339 a) with EXACTLY the links
+ * the service gives for that entry in its own answer for the queue: at least one, the publisher's page at
+ * `https://doi.org/<doi>` (the work's DOI, as the scenario knows it) among them, and the screen showing each in the
+ * service's order as "<label> (<host>)" — the host parsed here from the address, not taken from the service — with that
+ * address as its `href`, and no other link under "Where to get it".
  */
-async function expectNoOpenCopy(row: Row): Promise<void> {
+async function expectNoOpenCopy(app: AppHarness, projectId: string, row: Row, doi: string): Promise<void> {
   await expect(row.locator(".ao-find__state")).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
   await expect(row.locator(".ao-find__reason")).toHaveCount(0);
   await expect(row.getByRole("button", { name: /^Try again/ })).toHaveCount(0);
-  await expect(row.getByText("Where to get it")).toHaveCount(0);
+  // What the service gives for this entry (the row carries the entry's id).
+  const entryId = await row.getAttribute("data-entry-id");
+  expect(entryId, "the row names its entry").toBeTruthy();
+  const entry = (await queueOf(app, projectId)).entries.find((e) => e.id === entryId);
+  expect(entry?.state, `the service's answer holds the entry ${entryId} with no open copy`).toBe("no-open-copy");
+  const offers = entry?.offers ?? [];
+  expect(offers.length, "the service gives at least one place to get the work").toBeGreaterThan(0);
+  expect(offers.filter((o) => o.label === "Publisher's page").map((o) => o.url)).toEqual([`https://doi.org/${doi}`]);
+  // What the screen shows: the heading, then exactly those links, in that order.
+  await expect(row.locator(".ao-find__where-title")).toHaveText("Where to get it");
+  const where = row.getByRole("list", { name: /^Where to get it/ });
+  await expect(where).toBeVisible();
+  const links = where.getByRole("link");
+  await expect(links).toHaveCount(offers.length);
+  await expect(row.locator(".ao-find__where a")).toHaveCount(offers.length);
+  for (const [i, o] of offers.entries()) {
+    await expect(links.nth(i)).toHaveText(`${o.label} (${new URL(o.url).host})`);
+    await expect(links.nth(i)).toHaveAttribute("href", o.url);
+  }
+  test.info().annotations.push({ type: "where-to-get-it", description: `${doi}: ${offers.map((o) => `${o.label} (${new URL(o.url).host})`).join("; ")}` });
 }
 
 /** The Find and acquire screen for a project (by its address, as the Library screen's link leads there). */
@@ -316,7 +347,7 @@ test("add, choose, complete, already, survives a restart", async ({ page, app })
   await test.step("two references typed: one becomes a complete record by itself (no open copy of it), the other asks to choose", async () => {
     await addLines(page, [SURE_A, CHOOSE_B]);
     await expect(rows(page)).toHaveCount(2);
-    await expectNoOpenCopy(rows(page).nth(0));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
     await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
     await expect(rows(page).nth(0).locator("[data-entry-text]")).toHaveText(SURE_A);
     await expect(rows(page).nth(1).locator("[data-entry-text]")).toHaveText(CHOOSE_B);
@@ -354,7 +385,7 @@ test("add, choose, complete, already, survives a restart", async ({ page, app })
     await radios.nth(B_DOIS.indexOf(B_CHOSEN.doi)).check();
     await dialog.getByRole("button", { name: "Use this one" }).click();
     await expect(dialog).toHaveCount(0);
-    await expectNoOpenCopy(rows(page).nth(1));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(1), B_CHOSEN.doi);
   });
 
   await test.step("after the choice: exactly one source for the chosen work and none for the others", async () => {
@@ -447,7 +478,7 @@ test("Check everything I have finds the other project", async ({ page, app }) =>
     const sw = page.getByRole("switch", { name: "Check everything I have" });
     await expect(sw).not.toBeChecked();
     await addLines(page, [SURE_A]);
-    await expectNoOpenCopy(rows(page).nth(0));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
     expect(await doisOf(app, projectId)).toEqual([WORK_A.doi]);
   });
 
@@ -474,7 +505,7 @@ test("Check everything I have finds the other project", async ({ page, app }) =>
     await expect(stateOf(page, 1)).toHaveText(WORDS.elsewhereLocked, { timeout: STATE_TIMEOUT });
     await expect(page.getByText(WORDS.lockedCount(1), { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: act("Open it there", SURE_C) })).toHaveCount(0);
-    await expectNoOpenCopy(rows(page).nth(0));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
   });
 
   await test.step("nothing of the second project is written into the first project's queue", async () => {
@@ -519,7 +550,7 @@ test("by keyboard only: add, choose, use this one", async ({ page, app }) => {
     await expect(box).toHaveValue("", { timeout: STATE_TIMEOUT });
     await expect(rows(page)).toHaveCount(2, { timeout: STATE_TIMEOUT });
     await expect(box).toBeFocused();
-    await expectNoOpenCopy(rows(page).nth(0));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
     await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
   });
 
@@ -544,7 +575,7 @@ test("by keyboard only: add, choose, use this one", async ({ page, app }) => {
     await expect(dialog.getByRole("button", { name: "Use this one" })).toBeFocused();
     await page.keyboard.press("Enter");
     await expect(dialog).toHaveCount(0);
-    await expectNoOpenCopy(rows(page).nth(1));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(1), B_DOIS[0]!);
   });
 
   await test.step("after the dialog closes, focus is on the row's next control (its “Open”), never the page", async () => {
@@ -578,13 +609,13 @@ test("what was typed is in no address, header or log line", async ({ page, app }
     ({ projectId } = await libraryWithProject(app, page, { library: "Quiet library", project: "Nothing said", governanceYaml: LOOKUP_RULES }));
     await openFind(page, projectId);
     await addLines(page, [SURE_A, CHOOSE_B]);
-    await expectNoOpenCopy(rows(page).nth(0));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
     await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
     await page.getByRole("button", { name: act("Choose", CHOOSE_B) }).click();
     const dialog = page.getByRole("dialog", { name: `Choose the work for “${CHOOSE_B}”` });
     await dialog.getByRole("radio").nth(0).check();
     await dialog.getByRole("button", { name: "Use this one" }).click();
-    await expectNoOpenCopy(rows(page).nth(1));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(1), B_DOIS[0]!);
     await page.getByRole("button", { name: act("Open", SURE_A) }).click();
     await expectRecordShown(page, WORK_A);
   });
@@ -629,7 +660,7 @@ test("after a restart nothing is looked up twice", async ({ page, app }) => {
     ({ projectId, libraryPath, projectFolder } = await libraryWithProject(app, page, { library: "Restart library", project: "Twice told", governanceYaml: LOOKUP_RULES }));
     await openFind(page, projectId);
     await addLines(page, [SURE_A, CHOOSE_B]);
-    await expectNoOpenCopy(rows(page).nth(0));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
     await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
     before = await queueOf(app, projectId);
     fileBefore = queueFile(libraryPath, projectFolder);
@@ -657,7 +688,7 @@ test("after a restart nothing is looked up twice", async ({ page, app }) => {
     await dialog.getByRole("radio").nth(B_DOIS.indexOf(B_CHOSEN.doi)).check();
     await dialog.getByRole("button", { name: "Use this one" }).click();
     await expect(dialog).toHaveCount(0);
-    await expectNoOpenCopy(rows(page).nth(1));
+    await expectNoOpenCopy(app, projectId, rows(page).nth(1), B_CHOSEN.doi);
     expect(await doisOf(app, projectId)).toEqual([WORK_A.doi, B_CHOSEN.doi].sort());
     // The first entry was not touched again.
     const a = (await queueOf(app, projectId)).entries.find((e) => e.typed === SURE_A)!;
@@ -754,9 +785,16 @@ test("an author alone, the person, three works", async ({ page, app }) => {
 
   await test.step("three rows that say where they came from, each a complete record with no open copy", async () => {
     await expect(addedRows()).toHaveCount(3, { timeout: STATE_TIMEOUT });
-    for (let i = 0; i < 3; i++) await expectNoOpenCopy(addedRows().nth(i));
+    for (let i = 0; i < 3; i++) await expect(addedRows().nth(i).locator(".ao-find__state")).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
     const shown = (await addedRows().locator(".ao-find__match .ao-find__work").allTextContents()).sort();
     expect(shown).toEqual(STARK_TICKED.map((w) => w.title).sort());
+    // Each row's work is known by the title it shows, and so its DOI.
+    for (let i = 0; i < 3; i++) {
+      const title = await addedRows().nth(i).locator(".ao-find__match .ao-find__work").textContent();
+      const work = STARK_TICKED.find((w) => w.title === title);
+      expect(work, `the row's work “${title}” is one of those ticked`).toBeTruthy();
+      await expectNoOpenCopy(app, projectId, addedRows().nth(i), work!.doi);
+    }
     // Each is shown as a work the app added, not as a line typed (R281 a).
     for (let i = 0; i < 3; i++) await expect(addedRows().nth(i).locator("[data-entry-text]")).toHaveText(/^Work: /);
   });

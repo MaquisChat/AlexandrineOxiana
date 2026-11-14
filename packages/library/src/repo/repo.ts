@@ -69,6 +69,7 @@ import {
   getSourceRecordWithAssets,
   listSourceIds,
   relinkLinkedAsset as relinkLinkedAssetIn,
+  sourceRecordStamp,
   updateSource,
   type CreateInTx,
   type CreateSourceOptions,
@@ -1280,6 +1281,11 @@ export async function lookupPolicyInfo(
   return { policy, actor: core.actor, tz: core.zoneOf(st.project), clock: core.clock, sensitive: core.encrypted(st) };
 }
 
+/** Package-internal (Task F15, R328 e): a stamp of a source's record file (one `stat`, nothing read), or null when it is gone. */
+export function sourceRecordStampIn(repo: Repo, projectId: string, id: string): string | null {
+  return sourceRecordStamp(cores.get(repo)!, projectId, id);
+}
+
 /** Package-internal (Zotero Web import): records the library version a finished import saw (governed, audited). */
 export function recordZoteroWebLibraryVersion(repo: Repo, projectId: string, ref: string, version: number): Promise<void> {
   return recordZoteroWebVersion(cores.get(repo)!, projectId, ref, version);
@@ -1322,7 +1328,7 @@ export function readFindQueueDetailedIn(repo: Repo, projectId: string): Promise<
  * Package-internal (Find and acquire): one governed change of the queue (`project.find.add|update|remove`); with an
  * add, `alongside` are new lines of live entries written in the same change (F8: the author's entry whose works are added).
  */
-export function appendFindEntriesIn(repo: Repo, projectId: string, entries: FindEntry[], op: "add" | "update" | "remove", alongside: FindEntry[] = []): Promise<void> {
+export function appendFindEntriesIn(repo: Repo, projectId: string, entries: FindEntry[], op: "add" | "update" | "remove" | "library-start", alongside: FindEntry[] = []): Promise<void> {
   return appendFindEntries(cores.get(repo)!, projectId, entries, op, alongside);
 }
 
