@@ -177,6 +177,9 @@ function rig(tabs: Record<number, FakeTab>, o: { post?: FinderDeps["post"]; wait
           o.tabStall !== undefined ? { askMs: o.tabStall } : {},
         ),
       );
+      // As in Chrome: the injection's answer reaches the background AFTER the script's port and its first messages
+      // (the script connects and speaks while it is being run).
+      await new Promise((res) => setTimeout(res, 15));
     },
     post:
       o.post ??

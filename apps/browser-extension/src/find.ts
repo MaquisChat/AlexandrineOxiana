@@ -227,9 +227,15 @@ interface Current {
   tabId: number;
   ticket: string;
   /** Set while the injected script's port is expected: the one connection this sending accepts. */
-  expect?: (port: PortLike) => void;
+  expect?: (got: Connected) => void;
   port?: PortLike;
 }
+
+interface TabReader {
+  next(ms: number, sentence: string): Promise<TabMessage>;
+  close(): void;
+}
+type Connected = { port: PortLike; r: TabReader };
 
 export function createFinder(deps: FinderDeps) {
   const waits = { ...FIND_WAITS, ...deps.waits };
@@ -250,11 +256,13 @@ export function createFinder(deps: FinderDeps) {
     const take = current!.expect!;
     current!.expect = undefined;
     current!.port = port;
-    take(port);
+    // Listening at once: the script speaks as soon as it has connected, before the injection's answer reaches the
+    // background, and a port does not keep messages for a listener added later.
+    take({ port, r: readerOf(port) });
   }
 
   /** The port's messages as a queue; `next` waits at most `ms` for one; a disconnect or a wrong shape ends it. */
-  function reader(port: PortLike) {
+  function readerOf(port: PortLike): TabReader {
     const queue: TabMessage[] = [];
     let ended = false;
     let wake: (() => void) | undefined;
@@ -316,10 +324,9 @@ export function createFinder(deps: FinderDeps) {
     if (refused) return refused;
 
     // 2. The script, and its port (expected before the injection: the script may connect before it resolves).
-    const connected = new Promise<PortLike>((resolve) => (c.expect = resolve));
+    const connected = new Promise<Connected>((resolve) => (c.expect = resolve));
     await within(deps.inject(c.tabId), waits.inject, FIND_TEXT.notAllowed);
-    const port = await within(connected, waits.connect, FIND_TEXT.notAllowed);
-    const r = reader(port);
+    const { port, r } = await within(connected, waits.connect, FIND_TEXT.notAllowed);
     try {
       // 3. Its first word: the tab's own address and whether it shows a PDF.
       const head = await r.next(waits.connect, FIND_TEXT.notAllowed);
