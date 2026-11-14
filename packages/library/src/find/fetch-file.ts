@@ -33,6 +33,13 @@
  * in a `pipeline` into `createWriteStream(…, { flags: "wx", mode: 0o600 })` with the abort signal, the file removed
  * on any failure. Refusals are `FetchFileError`s whose message is a plain sentence and never holds an address, a
  * host or a server's words; an abort through `signal` rejects with the signal's reason, as there.
+ *
+ * **Recorded answers (test mode only; Task F14, Ruling R317):** `recorded` is the lookup client's recorded FILE
+ * answers (`HttpClient.recordedFiles`, made only under NODE_ENV=test with `AO_LOOKUP_FIXTURES` set; the switch is
+ * read there, once, never here). When given, its dispatcher answers each request in place of the process's — and
+ * that is the ONLY difference: every rule above runs as for a real download, and an address it has no answer for
+ * is a 404 ("The service did not send the file."), so nothing reaches the network. Anything but the loader's own
+ * object is refused (TypeError) before anything is sent. Absent (always, outside test mode), nothing changes.
  */
 import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
@@ -44,6 +51,7 @@ import { fileTypeFromFile } from "file-type";
 import { request } from "undici";
 import { openZip } from "../extract/zip.js";
 import { USER_AGENT } from "../lookup/http.js";
+import { RecordedFiles } from "../lookup/recorded.js";
 import { activeTemp } from "../tmp-registry.js";
 import { FREE_COPY_MAX_BYTES, fileHostAllowed, parseFreeCopyAddress } from "./free-copy.js";
 
@@ -264,9 +272,12 @@ async function typeOf(path: string): Promise<"application/pdf" | "application/ep
  */
 export async function fetchFile(
   url: string,
-  opts: { maxBytes: number; deadlineMs: 180_000; into: string; signal?: AbortSignal },
+  opts: { maxBytes: number; deadlineMs: 180_000; into: string; signal?: AbortSignal; recorded?: RecordedFiles },
 ): Promise<{ path: string; sha256: string; bytes: number; mime: "application/pdf" | "application/epub+zip" }> {
   checkTarget(opts.into);
+  if (opts.recorded !== undefined && !(opts.recorded instanceof RecordedFiles)) throw new TypeError("fetchFile: `recorded` must be the lookup client's recorded file answers");
+  // Test mode only (R317): the recorded answers' dispatcher in place of the process's; nothing else differs.
+  const via = opts.recorded ? { dispatcher: opts.recorded.dispatcher } : {};
   opts.signal?.throwIfAborted();
   const max = Math.min(Number.isFinite(opts.maxBytes) && opts.maxBytes > 0 ? Math.floor(opts.maxBytes) : 0, FREE_COPY_MAX_BYTES);
   const deadlineMs = Math.min(Number.isFinite(opts.deadlineMs) && opts.deadlineMs > 0 ? opts.deadlineMs : FETCH_FILE_DEADLINE_MS, FETCH_FILE_DEADLINE_MS);
@@ -305,6 +316,7 @@ export async function fetchFile(
       let res: Awaited<ReturnType<typeof request>>;
       try {
         res = await request(current.href, {
+          ...via,
           method: "GET",
           headers: { "user-agent": USER_AGENT, accept: "application/pdf, application/epub+zip;q=0.9, */*;q=0.1", "accept-encoding": "identity" },
           signal: ac.signal,

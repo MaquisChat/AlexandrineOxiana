@@ -18,8 +18,10 @@
 //! What the shell fetches, and when (R325 b, c). Only while a ticket is open (the page passes it with
 //! `open_library_window`; it is the service's, F15), one fetch at a time, at most ONE file per ticket,
 //! and not within PAUSE of the last hand-over. A fetch starts when a page finishes loading at an
-//! address that `looks_like_pdf_address` and is not a `sign_in_address`, or when the researcher
-//! presses "Add the PDF showing in the sign-in window" (`library_window_take_pdf`). The one request
+//! address that `looks_like_pdf_address` and is not a `sign_in_address`, when the window asks to
+//! start a download (its own download is refused; the download's address is fetched instead, R331 g),
+//! or when the researcher presses "Add the PDF showing in the sign-in window"
+//! (`library_window_take_pdf`). The one request
 //! path is `fetch_pdf` (plan A1, point 8: it can later be replaced by the web view's own download):
 //! https on every hop, at most MAX_REDIRECTS redirects followed by hand, each hop's host resolved by
 //! the shell, checked (`address_allowed`) and connected TO THAT ADDRESS (reqwest's resolve override,
@@ -721,6 +723,16 @@ fn hop_client(url: &Url, addr: SocketAddr, rules: &FetchRules, user_agent: &str,
     b.build().map_err(|_| FetchError::Network)
 }
 
+/// Sends a hop's request and takes the answer only from `addr`, the address that was checked: an
+/// answer that came from any other address is refused.
+async fn send_to(req: reqwest::RequestBuilder, addr: SocketAddr) -> Result<reqwest::Response, FetchError> {
+    let resp = req.send().await.map_err(net)?;
+    if resp.remote_addr() != Some(addr) {
+        return Err(FetchError::Refused);
+    }
+    Ok(resp)
+}
+
 /// `Referer`: the previous page reduced to its origin and path (never its query, which may hold a
 /// session's ticket), and to its origin alone for another origin; none from a page that was not https.
 fn referer_for(previous: Option<&Url>, target: &Url) -> Option<String> {
@@ -811,10 +823,7 @@ pub async fn fetch_pdf(
         if let Some(c) = cookie_header(&jar, &url, SystemTime::now()) {
             req = req.header(COOKIE, c);
         }
-        let mut resp = req.send().await.map_err(net)?;
-        if resp.remote_addr() != Some(addr) {
-            return Err(FetchError::Refused);
-        }
+        let mut resp = send_to(req, addr).await?;
         let status = resp.status().as_u16();
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if redirects >= rules.max_redirects {
@@ -1022,6 +1031,8 @@ pub enum HandOverError {
     NoService,
     /// The file could not be completed, or its line could not be made or written.
     Write,
+    /// The fetch's ticket ended (the window closed) before the file was named: it is not kept.
+    Ended,
 }
 
 impl fmt::Display for HandOverError {
@@ -1029,13 +1040,17 @@ impl fmt::Display for HandOverError {
         f.write_str(match self {
             HandOverError::NoService => "The library service is not running, so the file was not kept.",
             HandOverError::Write => "The file could not be handed to the library service.",
+            HandOverError::Ended => "The sign-in window was closed, so the file was not kept.",
         })
     }
 }
 
 /// Completes the part file and names it to the service, by the same writer and under the same lock
-/// as the folder grants (grant.rs). The file is removed when it cannot be handed over.
-pub fn hand_over(target: &dyn GrantTarget, ticket: &str, part: PartFile) -> Result<(), HandOverError> {
+/// as the folder grants (grant.rs). The line is written through `gate` (in the app,
+/// `Library::send_if_current`), which runs it only while the fetch's ticket is still the open one
+/// and answers None, writing nothing, when it has ended (R331 c). The file is removed when it is not
+/// handed over.
+pub fn hand_over(target: &dyn GrantTarget, ticket: &str, part: PartFile, gate: &dyn Fn(&mut dyn FnMut() -> bool) -> Option<bool>) -> Result<(), HandOverError> {
     if target.stopping() {
         return Err(HandOverError::NoService);
     }
@@ -1043,13 +1058,18 @@ pub fn hand_over(target: &dyn GrantTarget, ticket: &str, part: PartFile) -> Resu
     let grant = part.grant().to_string();
     let path = part.commit().map_err(|_| HandOverError::Write)?;
     let line = file_grant_line(&grant, ticket, &path);
-    let sent = match line {
-        Some(l) if !target.stopping() => input.send_line(&l),
+    let mut send = || match &line {
+        Some(l) if !target.stopping() => input.send_line(l),
         _ => false,
     };
-    if !sent {
+    let sent = gate(&mut send);
+    if sent != Some(true) {
         let _ = fs::remove_file(&path);
-        return Err(if target.stopping() { HandOverError::NoService } else { HandOverError::Write });
+        return Err(match sent {
+            None => HandOverError::Ended,
+            Some(_) if target.stopping() => HandOverError::NoService,
+            Some(_) => HandOverError::Write,
+        });
     }
     Ok(())
 }
@@ -1108,8 +1128,17 @@ pub fn parse_device(text: &str) -> Option<DeviceState> {
     Some(DeviceState { stay_signed_in: stay, store })
 }
 
+/// The device file read; None as well when it is a symbolic link (R331 h): it is then treated as
+/// unreadable (not kept, a new store id written over the link).
 pub fn read_device(path: &Path) -> Option<DeviceState> {
-    let f = File::open(path).ok()?;
+    let mut o = OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    let f = o.open(path).ok()?;
     let mut text = String::new();
     f.take(4097).read_to_string(&mut text).ok()?;
     if text.len() > 4096 {
@@ -1118,7 +1147,9 @@ pub fn read_device(path: &Path) -> Option<DeviceState> {
     parse_device(&text)
 }
 
-/// Writes the device file atomically (a new 0600 file beside it, flushed, then renamed over it).
+/// Writes the device file atomically (a new 0600 file beside it, flushed, then renamed over it, and
+/// the folder flushed so that the new name survives a power loss — best effort, as the library's
+/// own atomic writes do, packages/library/src/fs/atomic.ts `fsyncDir`; R331 h).
 pub fn write_device(path: &Path, s: &DeviceState) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no folder"))?;
     fs::create_dir_all(dir)?;
@@ -1139,6 +1170,10 @@ pub fn write_device(path: &Path, s: &DeviceState) -> io::Result<()> {
     let renamed = written.and_then(|_| fs::rename(&tmp, path));
     if renamed.is_err() {
         let _ = fs::remove_file(&tmp);
+        return renamed;
+    }
+    if let Ok(folder) = File::open(dir) {
+        let _ = folder.sync_all();
     }
     renamed
 }
@@ -1151,6 +1186,48 @@ pub struct Job {
     pub generation: u64,
     pub ticket: String,
     pub input: FetchInput,
+    /// Where the host puts the way to cancel this fetch once it has started it.
+    pub abort: AbortSlot,
+}
+
+/// The way to cancel one fetch (R331 c). The controller keeps it from the moment it marks the fetch
+/// as running, under the same lock, so that the window's closing at any moment finds it; the host
+/// puts the cancelling in it once it has started the fetch, and when the window has closed before
+/// that, the fetch is cancelled at once.
+#[derive(Clone, Default)]
+pub struct AbortSlot(Arc<Mutex<Abort>>);
+
+#[derive(Default)]
+enum Abort {
+    #[default]
+    Empty,
+    Set(Box<dyn FnOnce() + Send>),
+    Fired,
+}
+
+impl AbortSlot {
+    fn state(&self) -> MutexGuard<'_, Abort> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Keeps the way to cancel the fetch; cancels it at once if the window has already closed.
+    pub fn set(&self, abort: Box<dyn FnOnce() + Send>) {
+        let mut g = self.state();
+        if matches!(*g, Abort::Fired) {
+            drop(g);
+            abort();
+        } else {
+            *g = Abort::Set(abort);
+        }
+    }
+
+    /// Cancels the fetch now, or as soon as the way to cancel it is kept.
+    fn fire(&self) {
+        let was = std::mem::replace(&mut *self.state(), Abort::Fired);
+        if let Abort::Set(abort) = was {
+            abort();
+        }
+    }
 }
 
 impl fmt::Debug for Job {
@@ -1211,7 +1288,7 @@ struct Inner {
     fetching: Option<u64>,
     generation: u64,
     last_handover: Option<Instant>,
-    abort: Option<Box<dyn FnOnce() + Send>>,
+    abort: Option<AbortSlot>,
     device: Option<DeviceState>,
 }
 
@@ -1303,10 +1380,14 @@ impl Library {
         }
         g.generation += 1;
         g.fetching = Some(g.generation);
+        // The way to cancel it is kept under this same lock (R331 c).
+        let abort = AbortSlot::default();
+        g.abort = Some(abort.clone());
         Ok(Job {
             generation: g.generation,
             ticket,
             input: FetchInput { url: url.clone(), previous, user_agent: USER_AGENT.to_string(), proxy_host: g.proxy_host.clone() },
+            abort,
         })
     }
 
@@ -1329,11 +1410,36 @@ impl Library {
             let previous = g.previous.clone();
             Self::begin(&mut g, url, previous, now)
         };
+        self.run_automatic(host, job);
+    }
+
+    /// A fetch the window itself started (a page load or a download): run, or said only when it waits
+    /// for the pause.
+    fn run_automatic(&self, host: &dyn Host, job: Result<Job, (Option<String>, State, Reason)>) {
         match job {
             Ok(job) => self.run(host, job),
             Err((ticket, state, Reason::Pause)) => host.emit(&LibraryEvent::refused(ticket.as_deref(), state, Reason::Pause)),
             Err(_) => {}
         }
+    }
+
+    /// The window asked to start a download (R331 g; on the main thread: nothing here blocks). The
+    /// window's own download is refused (`TauriHost::create_window`); its address is taken as the
+    /// PDF's address and goes the same way as a page that reached a PDF's address (`page_loaded`):
+    /// only while a ticket is open, nothing is being fetched and the pause is over, https only, never
+    /// a sign-in address, at most one file per ticket, and through the one request path (`fetch_pdf`)
+    /// with all its rules, the window's current page as its `Referer`. The window has not moved, so
+    /// its current page stays as it was. Nothing is said when nothing is fetched, except the pause.
+    pub fn download_requested(&self, host: &dyn Host, url: &Url, now: Instant) {
+        let job = {
+            let mut g = self.lock();
+            if g.ticket.is_none() || g.fetching.is_some() || host.stopping() {
+                return;
+            }
+            let previous = g.current.clone();
+            Self::begin(&mut g, url, previous, now)
+        };
+        self.run_automatic(host, job);
     }
 
     /// `library_window_take_pdf()`: from the main window only; fetches the window's current address
@@ -1372,38 +1478,48 @@ impl Library {
         }
     }
 
-    /// Keeps the way to cancel the running fetch (the window's closing calls it).
-    pub fn set_abort(&self, generation: u64, abort: Box<dyn FnOnce() + Send>) {
+    /// The hand-over's last step (R331 c): `send` (the line to the service) runs only while fetch
+    /// `generation` is still the running fetch of the open `ticket`, and under the controller's lock,
+    /// so that the window's closing cannot come between the check and the line. When the line is
+    /// written the fetch ends there as handed over: the ticket ends in the shell too, the pause
+    /// starts and the main window hears it. None, with nothing written or said, when the ticket has
+    /// ended (the window closed, or another ticket is open).
+    pub fn send_if_current(&self, host: &dyn Host, generation: u64, ticket: &str, now: Instant, send: &mut dyn FnMut() -> bool) -> Option<bool> {
         let mut g = self.lock();
-        if g.fetching == Some(generation) {
-            g.abort = Some(abort);
+        if g.fetching != Some(generation) || g.ticket.as_deref() != Some(ticket) {
+            return None;
         }
+        let sent = send();
+        if sent {
+            g.fetching = None;
+            g.abort = None;
+            g.last_handover = Some(now);
+            g.ticket = None;
+            host.emit(&LibraryEvent::new(Some(ticket), State::HandedOver));
+        }
+        Some(sent)
     }
 
     /// The fetch `generation` for `ticket` ended. A hand-over ends the ticket in the shell too and
-    /// starts the pause; any other end leaves the ticket open (the researcher may try again). The
-    /// end of a fetch the window's closing cancelled is not said again.
+    /// starts the pause; any other end leaves the ticket open (the researcher may try again). An
+    /// outcome for a fetch that is no longer the running fetch of its open ticket is dropped (R331 c):
+    /// the window's closing cancelled it and has said so, or its hand-over was already settled by
+    /// `send_if_current`.
     pub fn finish(&self, host: &dyn Host, generation: u64, ticket: &str, outcome: Outcome, now: Instant) {
         let event = {
             let mut g = self.lock();
-            let current = g.fetching == Some(generation);
-            if current {
-                g.fetching = None;
-                g.abort = None;
+            if g.fetching != Some(generation) || g.ticket.as_deref() != Some(ticket) {
+                return;
             }
+            g.fetching = None;
+            g.abort = None;
             if outcome == Outcome::HandedOver {
                 g.last_handover = Some(now);
-                if g.ticket.as_deref() == Some(ticket) {
-                    g.ticket = None;
-                }
-                Some(LibraryEvent::new(Some(ticket), State::HandedOver))
-            } else {
-                current.then(|| LibraryEvent::new(Some(ticket), outcome.state()))
+                g.ticket = None;
             }
+            LibraryEvent::new(Some(ticket), outcome.state())
         };
-        if let Some(e) = event {
-            host.emit(&e);
-        }
+        host.emit(&event);
     }
 
     /// `close_library_window()`: from the main window only.
@@ -1430,7 +1546,7 @@ impl Library {
             (g.ticket.take(), g.abort.take())
         };
         if let Some(abort) = abort {
-            abort();
+            abort.fire();
         }
         host.emit(&LibraryEvent::new(ticket.as_deref(), State::Closed));
     }
@@ -1572,6 +1688,7 @@ impl TauriHost {
 
     /// The job itself: the window's cookies read once, the fetch into a part file, the hand-over.
     async fn fetch(&self, job: Job) -> Outcome {
+        let (generation, ticket) = (job.generation, job.ticket.clone());
         let Some(config) = self.library.config().cloned() else { return Outcome::HandOver(HandOverError::NoService) };
         let Ok(inbox) = prepare_inbox(&config.config_dir) else { return Outcome::Fetch(FetchError::Write) };
         let Some(grant) = crate::grant::new_grant_id() else { return Outcome::Fetch(FetchError::Write) };
@@ -1585,7 +1702,8 @@ impl TauriHost {
         if let Err(e) = fetch_pdf(job.input, cookies, &rules, Arc::new(SystemResolver), &mut part).await {
             return Outcome::Fetch(e);
         }
-        match hand_over(&*self.target, &job.ticket, part) {
+        let gate = |send: &mut dyn FnMut() -> bool| self.library.send_if_current(self, generation, &ticket, Instant::now(), send);
+        match hand_over(&*self.target, &job.ticket, part, &gate) {
             Ok(()) => Outcome::HandedOver,
             Err(e) => Outcome::HandOver(e),
         }
@@ -1598,8 +1716,9 @@ impl Host for TauriHost {
     }
 
     fn create_window(&self, url: &Url, store: [u8; 16]) -> bool {
-        use tauri::webview::{NewWindowResponse, PageLoadEvent};
+        use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
         let loaded = self.clone();
+        let downloads = self.clone();
         let opened = self.app.clone();
         let builder = tauri::WebviewWindowBuilder::new(&self.app, LABEL, tauri::WebviewUrl::External(url.clone()))
             .title(TITLE)
@@ -1610,8 +1729,14 @@ impl Host for TauriHost {
             .on_navigation(navigation_allowed)
             // The web view itself never saves a file: a download it would start is refused (the
             // shell's own fetch is the only way a file is kept; WebKitGTK shows no PDF and would
-            // otherwise save it to the Downloads folder).
-            .on_download(|_webview, _event| false)
+            // otherwise save it to the Downloads folder). Its address is taken as the PDF's address
+            // and fetched by the shell under every rule of its one request path (R331 g).
+            .on_download(move |_webview, event| {
+                if let DownloadEvent::Requested { url, .. } = event {
+                    downloads.library.download_requested(&downloads, &url, Instant::now());
+                }
+                false
+            })
             .on_new_window(move |u, _features| {
                 if let Some(target) = new_window_target(&u) {
                     // Off the web view's own callback: the navigation is posted to the main thread.
@@ -1676,12 +1801,12 @@ impl Host for TauriHost {
 
     fn start_fetch(&self, job: Job) {
         let host = self.clone();
-        let (generation, ticket) = (job.generation, job.ticket.clone());
+        let (generation, ticket, slot) = (job.generation, job.ticket.clone(), job.abort.clone());
         let handle = tauri::async_runtime::spawn(async move {
             let outcome = host.fetch(job).await;
             host.library.finish(&host, generation, &ticket, outcome, Instant::now());
         });
-        self.library.set_abort(generation, Box::new(move || handle.abort()));
+        slot.set(Box::new(move || handle.abort()));
     }
 
     fn stopping(&self) -> bool {
@@ -1775,11 +1900,34 @@ mod tests {
         Url::parse(s).unwrap()
     }
 
-    fn tmp(name: &str) -> PathBuf {
+    /// A folder under the temporary folder, removed with all it holds when the test ends, whether it
+    /// passes or fails (R331 h).
+    struct TmpDir(PathBuf);
+
+    impl std::ops::Deref for TmpDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TmpDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(name: &str) -> TmpDir {
         let d = std::env::temp_dir().join(format!("ao-library-window-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
-        d
+        TmpDir(d)
     }
 
     // ----- cookies -----
@@ -1924,7 +2072,7 @@ mod tests {
         let shown = format!("{:?}", store_cookie(&c).unwrap());
         assert!(!shown.contains("SECRETVALUE") && !shown.contains("SESSIONNAME"), "{shown}");
         let input = FetchInput { url: u("https://h.test/SECRETPATH?t=SECRETQUERY"), previous: Some(u("https://h.test/PREV")), user_agent: "ua".into(), proxy_host: Some("SECRETHOST".into()) };
-        let job = Job { generation: 1, ticket: TICKET.into(), input: input.clone() };
+        let job = Job { generation: 1, ticket: TICKET.into(), input: input.clone(), abort: AbortSlot::default() };
         let event = LibraryEvent::new(Some(TICKET), State::Opened);
         let part = PartFile::new(PathBuf::from("/SECRETDIR"), GRANT.into());
         let device = DeviceState { stay_signed_in: true, store: [0xab; 16] };
@@ -2415,6 +2563,9 @@ process.stdout.write(JSON.stringify({{
         }
     }
 
+    /// A gate whose ticket is open: the line is written.
+    const OPEN: fn(&mut dyn FnMut() -> bool) -> Option<bool> = |send| Some(send());
+
     fn written_part(inbox: &Path) -> PartFile {
         let mut p = PartFile::new(inbox.to_path_buf(), GRANT.into());
         p.write(b"%PDF-1.7 x").unwrap();
@@ -2427,19 +2578,19 @@ process.stdout.write(JSON.stringify({{
         let inbox = prepare_inbox(&d).unwrap();
         let w = Written::default();
         let target = FakeTarget { stopping: AtomicBool::new(false), input: Some(ServiceInput::for_test(w.clone())) };
-        hand_over(&target, TICKET, written_part(&inbox)).unwrap();
+        hand_over(&target, TICKET, written_part(&inbox), &OPEN).unwrap();
         let file = inbox.join(format!("{GRANT}.pdf"));
         assert_eq!(w.text(), file_grant_line(GRANT, TICKET, &file).unwrap());
         assert!(file.is_file());
         fs::remove_file(&file).unwrap();
         // The app is closing, the service is gone, or its pipe is closed: no line, and no file left.
         let stopping = FakeTarget { stopping: AtomicBool::new(true), input: Some(ServiceInput::for_test(w.clone())) };
-        assert_eq!(hand_over(&stopping, TICKET, written_part(&inbox)), Err(HandOverError::NoService));
+        assert_eq!(hand_over(&stopping, TICKET, written_part(&inbox), &OPEN), Err(HandOverError::NoService));
         let gone = FakeTarget { stopping: AtomicBool::new(false), input: None };
-        assert_eq!(hand_over(&gone, TICKET, written_part(&inbox)), Err(HandOverError::NoService));
+        assert_eq!(hand_over(&gone, TICKET, written_part(&inbox), &OPEN), Err(HandOverError::NoService));
         let closed = FakeTarget { stopping: AtomicBool::new(false), input: Some(ServiceInput::for_test(w.clone())) };
         closed.input.as_ref().unwrap().close_for_test();
-        assert_eq!(hand_over(&closed, TICKET, written_part(&inbox)), Err(HandOverError::Write));
+        assert_eq!(hand_over(&closed, TICKET, written_part(&inbox), &OPEN), Err(HandOverError::Write));
         assert_eq!(fs::read_dir(&inbox).unwrap().count(), 0);
         assert_eq!(w.text().matches('\n').count(), 1);
         fs::remove_dir_all(&d).unwrap();
@@ -2478,6 +2629,29 @@ process.stdout.write(JSON.stringify({{
         assert_ne!(a, new_store_id().unwrap());
         assert_eq!(a[6] >> 4, 4);
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_device_file_that_is_a_link_is_not_read() {
+        let d = tmp("device-link");
+        let elsewhere = d.join("elsewhere.json");
+        let kept = DeviceState { stay_signed_in: true, store: [7; 16] };
+        write_device(&elsewhere, &kept).unwrap();
+        let p = d.join(DEVICE_FILE);
+        std::os::unix::fs::symlink(&elsewhere, &p).unwrap();
+        assert_eq!(read_device(&p), None);
+        // At the start it counts as unreadable: not kept, a new store id; what it pointed to is left.
+        let host = FakeHost::new(Some(p.clone()), true);
+        let lib = Library::default();
+        assert!(lib.at_start(&host));
+        assert!(!lib.stay_signed_in());
+        assert!(!fs::symlink_metadata(&p).unwrap().file_type().is_symlink());
+        let now = read_device(&p).unwrap();
+        assert!(!now.stay_signed_in);
+        assert_ne!(now.store, kept.store);
+        assert_eq!(read_device(&elsewhere), Some(kept));
+        fs::remove_dir_all(d).unwrap();
     }
 
     // ----- the controller -----
@@ -2575,7 +2749,7 @@ process.stdout.write(JSON.stringify({{
     const START: &str = "https://ezproxy.lib.edu/login?url=https://doi.org/10.1/x";
     const PDF: &str = "https://www-jstor-org.ezproxy.lib.edu/stable/pdf/1.pdf";
 
-    fn started(name: &str) -> (Library, FakeHost, PathBuf) {
+    fn started(name: &str) -> (Library, FakeHost, TmpDir) {
         let d = tmp(name);
         let host = FakeHost::new(Some(d.join(DEVICE_FILE)), false);
         let lib = Library::default();
@@ -2759,7 +2933,7 @@ process.stdout.write(JSON.stringify({{
         let job = host.jobs.lock().unwrap().remove(0);
         let aborted = Arc::new(AtomicBool::new(false));
         let a = aborted.clone();
-        lib.set_abort(job.generation, Box::new(move || a.store(true, Ordering::SeqCst)));
+        job.abort.set(Box::new(move || a.store(true, Ordering::SeqCst)));
         lib.window_closed(&host);
         assert!(aborted.load(Ordering::SeqCst));
         assert_eq!(host.last(), LibraryEvent::new(Some(TICKET), State::Closed));
@@ -2781,6 +2955,128 @@ process.stdout.write(JSON.stringify({{
         lib.close(&host, "main");
         assert_eq!(host.last(), LibraryEvent::new(Some(TICKET2), State::Closed));
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_window_closing_between_a_fetch_s_start_and_its_abort_still_cancels_it() {
+        let (lib, host, d) = started("race");
+        let t0 = Instant::now();
+        lib.open(&host, "main", TICKET, START);
+        lib.page_loaded(&host, &u(PDF), t0);
+        let job = host.jobs.lock().unwrap().remove(0);
+        // The reviewer's interleaving: the fetch is started, the window closes, and only then is the
+        // way to cancel the fetch kept.
+        lib.window_closed(&host);
+        assert_eq!(host.last(), LibraryEvent::new(Some(TICKET), State::Closed));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let a = aborted.clone();
+        job.abort.set(Box::new(move || a.store(true, Ordering::SeqCst)));
+        assert!(aborted.load(Ordering::SeqCst), "the fetch was not cancelled");
+        // Its outcome, should one still arrive, is dropped: nothing said, no pause started.
+        let n = host.events().len();
+        lib.finish(&host, job.generation, TICKET, Outcome::HandedOver, t0);
+        assert_eq!(host.events().len(), n);
+        // A new ticket's fetch starts at once, the old one cancelled before it.
+        assert!(lib.open(&host, "main", TICKET2, START));
+        lib.page_loaded(&host, &u(PDF), t0 + Duration::from_secs(1));
+        assert_eq!(host.jobs(), 1);
+        assert_eq!(host.last(), LibraryEvent::new(Some(TICKET2), State::Fetching));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn an_outcome_that_arrives_after_its_ticket_ended_hands_nothing_over() {
+        let (lib, host, d) = started("late");
+        let t0 = Instant::now();
+        lib.open(&host, "main", TICKET, START);
+        lib.page_loaded(&host, &u(PDF), t0);
+        let old = host.jobs.lock().unwrap().remove(0);
+        lib.window_closed(&host);
+        // A new ticket's fetch is running when the old fetch's file is complete.
+        lib.open(&host, "main", TICKET2, START);
+        lib.page_loaded(&host, &u("https://www-jstor-org.ezproxy.lib.edu/stable/pdf/2.pdf"), t0);
+        let new = host.jobs.lock().unwrap().remove(0);
+        let inbox = prepare_inbox(&d).unwrap();
+        let w = Written::default();
+        let target = FakeTarget { stopping: AtomicBool::new(false), input: Some(ServiceInput::for_test(w.clone())) };
+        let n = host.events().len();
+        for ticket in [TICKET, TICKET2] {
+            let gate = |send: &mut dyn FnMut() -> bool| lib.send_if_current(&host, old.generation, ticket, t0, send);
+            assert_eq!(hand_over(&target, ticket, written_part(&inbox), &gate), Err(HandOverError::Ended), "{ticket}");
+        }
+        assert_eq!(w.text(), "", "a line was written for an ended ticket");
+        assert!(inbox_is_empty(&d), "a file was left");
+        assert_eq!(host.events().len(), n, "{:?}", host.events());
+        lib.finish(&host, old.generation, TICKET, Outcome::HandOver(HandOverError::Ended), t0);
+        assert_eq!(host.events().len(), n);
+        // The new ticket's file is handed over as before: one line, the ticket ended, said once.
+        let gate = |send: &mut dyn FnMut() -> bool| lib.send_if_current(&host, new.generation, TICKET2, t0, send);
+        hand_over(&target, TICKET2, written_part(&inbox), &gate).unwrap();
+        let file = inbox.join(format!("{GRANT}.pdf"));
+        assert_eq!(w.text(), file_grant_line(GRANT, TICKET2, &file).unwrap());
+        assert_eq!(host.last(), LibraryEvent::new(Some(TICKET2), State::HandedOver));
+        lib.finish(&host, new.generation, TICKET2, Outcome::HandedOver, t0);
+        assert_eq!(host.events().iter().filter(|e| e.state == State::HandedOver).count(), 1);
+        host.at(PDF);
+        assert!(!lib.take_pdf(&host, "main", t0 + Duration::from_secs(60)));
+        assert_eq!(host.last(), LibraryEvent::refused(None, State::Failed, Reason::NoTicket));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_download_the_window_would_start_is_fetched_by_the_shell_under_every_rule() {
+        let (lib, host, d) = started("download");
+        let t0 = Instant::now();
+        let page = "https://www-jstor-org.ezproxy.lib.edu/stable/1";
+        // An address that does not look like a PDF's: a download is taken as the PDF all the same.
+        let dl = "https://www-jstor-org.ezproxy.lib.edu/stable/get/1?attachment=1";
+        // Without a ticket: nothing, and nothing said.
+        lib.download_requested(&host, &u(dl), t0);
+        assert_eq!(host.jobs(), 0);
+        assert!(host.events().is_empty());
+        lib.open(&host, "main", TICKET, START);
+        lib.page_loaded(&host, &u(page), t0);
+        // Not https, a sign-in address, not a web address: nothing, and nothing said.
+        let n = host.events().len();
+        for no in ["http://p.test/a.pdf", "https://ezproxy.lib.edu/x.pdf", "https://p.test/login/file.pdf", "https://p.test/x.pdf?SAMLart=1", "data:application/pdf;base64,JVBERi0=", "blob:https://p.test/1"] {
+            lib.download_requested(&host, &u(no), t0);
+        }
+        assert_eq!(host.jobs(), 0);
+        assert_eq!(host.events().len(), n);
+        // With an open ticket: ONE fetch of that address, the window's current page as its Referer.
+        lib.download_requested(&host, &u(dl), t0);
+        assert_eq!(host.jobs(), 1);
+        assert_eq!(host.last(), LibraryEvent::new(Some(TICKET), State::Fetching));
+        // A second download while it runs: nothing.
+        lib.download_requested(&host, &u("https://www-jstor-org.ezproxy.lib.edu/stable/get/2"), t0);
+        lib.page_loaded(&host, &u(PDF), t0);
+        assert_eq!(host.jobs(), 1);
+        let job = host.jobs.lock().unwrap().remove(0);
+        assert_eq!(job.ticket, TICKET);
+        assert_eq!(job.input.url, u(dl));
+        assert_eq!(job.input.previous, Some(u(page)));
+        assert_eq!(job.input.user_agent, USER_AGENT);
+        assert_eq!(job.input.proxy_host.as_deref(), Some("ezproxy.lib.edu"));
+        // After the ticket's file was handed over: nothing more for it.
+        lib.finish(&host, job.generation, TICKET, Outcome::HandedOver, t0);
+        lib.download_requested(&host, &u(dl), t0 + Duration::from_secs(30));
+        assert_eq!(host.jobs(), 0);
+        // The next ticket waits for the pause, which is said.
+        lib.open(&host, "main", TICKET2, START);
+        lib.download_requested(&host, &u(dl), t0 + Duration::from_secs(10));
+        assert_eq!(host.jobs(), 0);
+        assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET2), State::Failed, Reason::Pause));
+        lib.download_requested(&host, &u(dl), t0 + Duration::from_secs(21));
+        assert_eq!(host.jobs(), 1);
+        // Nothing starts while the app closes.
+        let (lib2, host2, d2) = started("download-stopping");
+        lib2.open(&host2, "main", TICKET, START);
+        host2.stopping.store(true, Ordering::SeqCst);
+        lib2.download_requested(&host2, &u(dl), t0);
+        assert_eq!(host2.jobs(), 0);
+        for x in [d, d2] {
+            fs::remove_dir_all(x).unwrap();
+        }
     }
 
     #[test]
@@ -2885,9 +3181,10 @@ process.stdout.write(JSON.stringify({{
 
     // ----- the fetch, against a local https test server -----
 
+    /// The test server's certificate and key, kept in memory: the folder they are made in is removed
+    /// at once, and each server writes them into its own folder, removed when it stops (R331 h).
     struct TestCert {
-        key: PathBuf,
-        cert: PathBuf,
+        key: Vec<u8>,
         pem: Vec<u8>,
     }
 
@@ -2897,7 +3194,7 @@ process.stdout.write(JSON.stringify({{
             let d = tmp("cert");
             let (key, cert) = (d.join("key.pem"), d.join("cert.pem"));
             let out = std::process::Command::new("openssl")
-                .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=a.test", "-addext", "subjectAltName=DNS:a.test,DNS:b.test,DNS:c.test"])
+                .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=a.test", "-addext", "subjectAltName=DNS:a.test,DNS:b.test,DNS:c.test,DNS:localhost"])
                 .arg("-keyout")
                 .arg(&key)
                 .arg("-out")
@@ -2905,8 +3202,7 @@ process.stdout.write(JSON.stringify({{
                 .output()
                 .expect("openssl");
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-            let pem = fs::read(&cert).unwrap();
-            TestCert { key, cert, pem }
+            TestCert { key: fs::read(&key).unwrap(), pem: fs::read(&cert).unwrap() }
         })
     }
 
@@ -2939,7 +3235,7 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         child: std::process::Child,
         port: u16,
         log: PathBuf,
-        dir: PathBuf,
+        dir: TmpDir,
     }
 
     impl Server {
@@ -2949,10 +3245,13 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
             let dir = tmp(&format!("server-{name}"));
             let log = dir.join("log");
             fs::write(&log, b"").unwrap();
+            let (key, cert) = (dir.join("key.pem"), dir.join("cert.pem"));
+            fs::write(&key, &c.key).unwrap();
+            fs::write(&cert, &c.pem).unwrap();
             let mut child = std::process::Command::new("node")
                 .args(["--input-type=module", "-e", SERVER])
-                .arg(&c.key)
-                .arg(&c.cert)
+                .arg(&key)
+                .arg(&cert)
                 .arg(&log)
                 .stdout(std::process::Stdio::piped())
                 .spawn()
@@ -2980,7 +3279,7 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
-            let _ = fs::remove_dir_all(&self.dir);
+            let _ = fs::remove_dir_all(&*self.dir);
         }
     }
 
@@ -3138,11 +3437,76 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         assert_eq!(s.paths(), vec!["a.test/redirect"]);
     }
 
+    /// The client uses no proxy even where the environment names one. Run in a child process of
+    /// this test program whose environment alone names the proxy (a local listener that must see no
+    /// connection): the variables never reach this process or any other test, and reqwest reads them
+    /// once per process, so no other test can be affected or affect this one.
+    #[test]
+    fn the_client_uses_no_proxy_even_when_one_is_set() {
+        const CHILD: &str = "AO_LIBRARY_WINDOW_PROXY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let s = Server::start("proxy-child");
+            let mut r = rules();
+            r.idle = Duration::from_secs(3);
+            r.total = Duration::from_secs(6);
+            let mut sink = Vec::new();
+            assert_eq!(fetch(input(s.url("a.test", "/small.pdf"), None), &r, &mut sink), Ok(13));
+            assert_eq!(s.paths(), vec!["a.test/small.pdf"]);
+            return;
+        }
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let at = format!("http://127.0.0.1:{}", proxy.local_addr().unwrap().port());
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "library_window::tests::the_client_uses_no_proxy_even_when_one_is_set", "--nocapture", "--test-threads=1"]).env(CHILD, "1");
+        for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            child.env(k, &at);
+        }
+        child.env_remove("NO_PROXY").env_remove("no_proxy");
+        let out = child.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("test result: ok. 1 passed"), "{text}");
+        assert_eq!(proxy.accept().map(|_| ()).map_err(|e| e.kind()), Err(io::ErrorKind::WouldBlock), "the proxy was connected to");
+    }
+
+    #[test]
+    fn a_host_with_no_checked_address_is_never_looked_up() {
+        let s = Server::start("nolookup");
+        let checked = SocketAddr::new("127.0.0.1".parse().unwrap(), s.port);
+        let client = hop_client(&s.url("a.test", "/"), checked, &rules(), USER_AGENT, Duration::from_secs(10)).unwrap();
+        tauri::async_runtime::block_on(async {
+            // The checked host is reached at its checked address.
+            let ok = client.get(s.url("a.test", "/small.pdf")).send().await.unwrap();
+            assert_eq!(ok.status().as_u16(), 200);
+            // A name the client was not given an address for is not looked up: the request fails
+            // before any connection. (`localhost` is in the system's hosts file and in the test
+            // certificate, so a client that looked it up would reach the test server; nothing outside
+            // is asked.)
+            assert!(client.get(s.url("localhost", "/small.pdf")).send().await.is_err());
+        });
+        assert_eq!(s.paths(), vec!["a.test/small.pdf"]);
+    }
+
+    #[test]
+    fn an_answer_from_another_address_than_the_checked_one_is_refused() {
+        let s = Server::start("remote");
+        let url = s.url("a.test", "/small.pdf");
+        let real = SocketAddr::new("127.0.0.1".parse().unwrap(), s.port);
+        let client = hop_client(&url, real, &rules(), USER_AGENT, Duration::from_secs(10)).unwrap();
+        // The connection went to `real`; the address that was checked is another one.
+        for checked in [SocketAddr::new("127.0.0.2".parse().unwrap(), s.port), SocketAddr::new("::ffff:127.0.0.1".parse().unwrap(), s.port), SocketAddr::new(real.ip(), s.port + 1)] {
+            let got = tauri::async_runtime::block_on(send_to(client.get(url.clone()), checked));
+            assert_eq!(got.err(), Some(FetchError::Refused), "{checked}");
+        }
+        // The answer from the checked address is taken.
+        assert!(tauri::async_runtime::block_on(send_to(client.get(url), real)).is_ok());
+    }
+
     fn urlencode(s: &str) -> String {
         s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
     }
 
-    fn part_in(name: &str) -> (PathBuf, PartFile) {
+    fn part_in(name: &str) -> (TmpDir, PartFile) {
         let d = tmp(name);
         let inbox = prepare_inbox(&d).unwrap();
         let p = PartFile::new(inbox, GRANT.into());
@@ -3228,7 +3592,7 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         ];
         let mut texts: Vec<String> = all.iter().flat_map(|e| [e.to_string(), format!("{e:?}")]).collect();
         texts.extend([InboxError::NotAFolder, InboxError::NotYours, InboxError::Io].iter().flat_map(|e| [e.to_string(), format!("{e:?}")]));
-        texts.extend([HandOverError::NoService, HandOverError::Write].iter().flat_map(|e| [e.to_string(), format!("{e:?}")]));
+        texts.extend([HandOverError::NoService, HandOverError::Write, HandOverError::Ended].iter().flat_map(|e| [e.to_string(), format!("{e:?}")]));
         for t in texts {
             // No address (no `/`, no scheme's `:`), no query or cookie (`=`).
             assert!(!t.contains('/') && !t.contains(':') && !t.contains('='), "{t}");

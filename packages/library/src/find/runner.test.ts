@@ -15,6 +15,7 @@ import { KeyRing } from "../crypto/keys.js";
 import { IndexHandle, createIndexSink } from "../index/index.js";
 import { findSourceBy } from "../index/db.js";
 import { HttpClient } from "../lookup/http.js";
+import { LOOKUP_FIXTURES_ENV, recordedLookupsFromEnv } from "../lookup/recorded.js";
 import { serialStore } from "../import/project-queue.js";
 import { InvalidInputError, ReadOnlyLibraryError } from "../repo/errors.js";
 import { addCapturedOriginal, recoveryPendingProjects, type Repo } from "../repo/repo.js";
@@ -3306,6 +3307,30 @@ describe("F11: the free copy of a record the queue completed", () => {
     // Not tried again by itself: only the next open or unlock looks again.
     await new Promise((res) => setTimeout(res, 50));
     expect(copyRequests).toEqual([]);
+  });
+
+  // Task F14 (R317): the runner hands the lookup client's recorded file answers down to the download; with them, the
+  // process's dispatcher (the "network" here) is never asked for a file — recorded or not.
+  it("with the lookup client's recorded file answers, the runner downloads through them and never through the network", async () => {
+    const fixtures = join(tmp, "recorded");
+    await mkdir(fixtures);
+    await writeFile(join(fixtures, "good-handbuilt.pdf"), await good());
+    await writeFile(
+      join(fixtures, "answers.json"),
+      JSON.stringify({ v: 1, answers: {}, files: { "https://europepmc.org/articles/PMC77?pdf=render": { status: 302, location: "https://arxiv.org/pdf/2101.00009" }, "https://arxiv.org/pdf/2101.00009": { status: 200, file: "good-handbuilt.pdf" } } }),
+    );
+    const rec = recordedLookupsFromEnv({ NODE_ENV: "test", [LOOKUP_FIXTURES_ENV]: fixtures })!.files;
+    vi.spyOn(http, "recordedFiles", "get").mockReturnValue(rec);
+    // The "network" would answer both addresses with a file: only the recorded answers may be used.
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001", "https://europepmc.org/articles/PMC77?pdf=render"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    files.set("https://europepmc.org/articles/PMC77?pdf=render", await good());
+    const { p, eid, sid } = await recordMade();
+    await copyDone(p, eid);
+    // The first offer has no recorded answer (404, the next is tried); the second is a recorded redirect to a file.
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    expect((await repo.getSource(p.id, sid)).assets).toEqual([]);
+    expect(fileRequests).toEqual([]);
   });
 
   it("an entry already in the library is never fetched for", async () => {

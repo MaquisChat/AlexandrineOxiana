@@ -49,7 +49,7 @@ import { libraryVersion } from "../resources.js";
 import { join } from "node:path";
 import { request, type Dispatcher } from "undici";
 import { writeFileAtomic } from "../fs/atomic.js";
-import { recordedLookupsFromEnv, type RecordedLookups } from "./recorded.js";
+import { recordedLookupsFromEnv, type RecordedFiles, type RecordedLookups } from "./recorded.js";
 
 const VERSION: string = libraryVersion();
 const PROJECT_URL = "https://github.com/maquiscatta-sys/AlexandrineOxiana";
@@ -273,6 +273,14 @@ export class HttpClient {
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.attemptTimeoutMs = opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
     this.recorded = recordedLookupsFromEnv(opts.env ?? process.env);
+  }
+
+  /**
+   * Task F14 (R317): the recorded FILE answers when the switch above is on (test mode only), else undefined. Read
+   * with the switch, once, here; the find runner hands it to `fetchFile`, which then never reaches the network.
+   */
+  get recordedFiles(): RecordedFiles | undefined {
+    return this.recorded?.files;
   }
 
   /** Parsed JSON, or null when the resource does not exist (404). A 200 that is not JSON is never cached. */
