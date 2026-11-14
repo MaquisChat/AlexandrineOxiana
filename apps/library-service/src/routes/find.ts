@@ -17,6 +17,10 @@
  *
  * Task F8b (R279): an entry in "choose" with people stored beside its candidates carries `authorOffer` (counts only);
  * `POST …/:eid/author` (no body) turns it into the author's flow with the people stored.
+ *
+ * Task F15 (R324 a, d): the queue's answer gives each entry resting as R324 a names its "Where to get it" (`offers`,
+ * joined) and `library` (whether "Get through my library" may start); `returnTo` is never sent. The start and cancel
+ * routes are in routes/your-library.ts.
  */
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { isId } from "@ao/core";
@@ -57,6 +61,10 @@ import {
   type FindStoppedFor,
   type OfferLink,
   type WorkCandidate,
+  libraryChancesOf,
+  readYourLibrary,
+  restsForLibrary,
+  whereToGetIt,
 } from "@ao/library";
 import {
   FIND_ADD_LINES_MAX,
@@ -95,6 +103,7 @@ import {
   type FindState,
   type FindStoppedCode,
   type FindWorkCandidate,
+  type FindLibraryChance,
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
 import { FIND_SCREEN_KEYS, findScreenOf, readFindScreen, writeFindScreen } from "../find-screen.js";
@@ -108,7 +117,7 @@ true satisfies Same<FindStoppedFor["code"] | "index-needs-rebuild", FindStoppedC
 true satisfies Same<WorkCandidate, FindWorkCandidate>;
 true satisfies Same<OfferLink, FindOfferLink>;
 true satisfies Same<LibraryMatch, FindMatch>;
-true satisfies Same<Omit<FindEntry, "people" | "works" | "removed"> & { peopleCount?: number; worksCount?: number; addedCount?: number; authorOffer?: FindAuthorOffer }, FindEntryView>;
+true satisfies Same<Omit<FindEntry, "people" | "works" | "removed" | "returnTo"> & { peopleCount?: number; worksCount?: number; addedCount?: number; authorOffer?: FindAuthorOffer; library?: FindLibraryChance }, FindEntryView>;
 true satisfies Same<PersonCandidate, FindPersonCandidate>;
 true satisfies Same<typeof LIBRARY_PEOPLE_MAX, typeof FIND_PEOPLE_MAX>;
 true satisfies Same<typeof LIBRARY_PERSON_WORKS_MAX, typeof FIND_PERSON_WORKS_MAX>;
@@ -123,8 +132,12 @@ true satisfies Same<typeof REFERENCE_MIN_CHARS, typeof FIND_LINE_MIN_CHARS>;
  * COUNTS (R267 b: a queue of 500 entries must not carry 200 works each) — the lists come from `GET …/:eid/options`.
  * `added` is the set of works added from it, worked out from the queue's live entries (R271 M5; `addedOf`).
  */
-export function entryView(e: FindEntry, added?: ReadonlySet<string>): FindEntryView {
-  const { people, works, removed: _removed, candidates, morePeople, ...rest } = e;
+export function entryView(e: FindEntry, added?: ReadonlySet<string>, library?: LibraryParts): FindEntryView {
+  // F15: what a waiting entry returns to stays in the library (`returnTo` is never sent).
+  const { people, works, removed: _removed, candidates, morePeople, returnTo: _returnTo, offers: stored, ...rest } = e;
+  // F15: on an entry with library parts, its offers are the joined list (none: no offers); on an entry waiting in the
+  // sign-in window none (its stored links are kept for its return); otherwise as stored.
+  const offers = library ? library.offers : e.state === "waiting-sign-in" ? undefined : stored;
   const n = works && added ? works.filter((w) => added.has(w.id)).length : 0;
   // F8b (R279 c): an entry asking among works with people stored beside them carries an author offer — counts only.
   const offer = e.state === "choose" && people?.length ? { peopleCount: people.length, ...(morePeople ? { morePeople } : {}) } : undefined;
@@ -136,7 +149,45 @@ export function entryView(e: FindEntry, added?: ReadonlySet<string>): FindEntryV
     ...(morePeople && !offer ? { morePeople } : {}),
     ...(works ? { worksCount: works.length } : {}),
     ...(n > 0 ? { addedCount: n } : {}),
+    // F15 (R324 a, d): an entry resting as R324 a names carries "Where to get it" (the copy services' links joined with
+    // the plan's) and whether a start through the library is offered.
+    ...(offers !== undefined && (!library || offers.length > 0) ? { offers } : {}),
+    ...(library?.library ? { library: library.library } : {}),
   };
+}
+
+/** Task F15: the parts of an entry's view about the library (only for an entry resting as R324 a names). */
+export type LibraryParts = { offers: OfferLink[]; library?: FindLibraryChance };
+
+/**
+ * Task F15 (R324 a, d): for the entries of a project's queue, the library parts of their views: "Where to get it" (the
+ * copy services' links first, then the publisher's page, the catalogue, Open Library and WorldCat; the hosts parsed
+ * from the addresses) and `library` (whether "Get through my library" may start, or "no-library"). "Your library" is
+ * read anew; the rules, each resting entry's record and the runner's work are asked by the library's
+ * `libraryChancesOf` — through the runner's `libraryChances`, which reads a record only when its file changed (R328 e).
+ * A project that cannot be read now gives nothing (the view is then as before).
+ */
+export async function libraryPartsOf(appConfigDir: string, s: Session, projectId: string, entries: Iterable<FindEntry>): Promise<Map<string, LibraryParts>> {
+  const out = new Map<string, LibraryParts>();
+  const list = [...entries];
+  if (!list.some(restsForLibrary)) return out;
+  const { settings } = await readYourLibrary(appConfigDir);
+  const runner = s.find;
+  let chances: Awaited<ReturnType<typeof libraryChancesOf>>;
+  try {
+    // R328 e: through the open library's runner, a record is read only when its file changed since it was last read
+    // (a read-only library has no runner: its records are read each time).
+    chances = runner ? await runner.libraryChances(projectId, list, settings.access) : await libraryChancesOf(s.repo, projectId, list, { access: settings.access });
+  } catch {
+    return out;
+  }
+  const byId = new Map(list.map((e) => [e.id, e]));
+  for (const [id, c] of chances) {
+    const offers = whereToGetIt(c.work, settings, byId.get(id)?.offers ?? []);
+    const library: FindLibraryChance | undefined = c.chance === "yes" ? { canStart: true } : c.chance === "no-library" ? { canStart: false, reason: "no-library" } : undefined;
+    out.set(id, { offers, ...(library ? { library } : {}) });
+  }
+  return out;
 }
 
 /** R271 M5: per author's entry, the works added from it — those of the live entries made from it. */
@@ -276,8 +327,10 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const screen = await readFindScreen(state.deps.appConfigDir);
     reply.header("Cache-Control", "no-store");
     const added = addedOf(q.entries.values());
+    // F15 (R324 a, d): "Where to get it" and whether a start through the library is offered, for the resting entries.
+    const library = await libraryPartsOf(state.deps.appConfigDir, s, projectId, q.entries.values());
     return {
-      entries: [...q.entries.values()].map((e) => entryView(e, added.get(e.id))),
+      entries: [...q.entries.values()].map((e) => entryView(e, added.get(e.id), library.get(e.id))),
       checkEverything: screen.checkEverything,
       lockedProjectsNotChecked: runner && !readOnly ? runner.lockedNotChecked() : 0,
       readOnly,

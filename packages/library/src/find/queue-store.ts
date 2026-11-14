@@ -189,6 +189,27 @@ function offerOf(x: unknown): OfferLink {
   return { label: label as OfferLink["label"], url: str(o.url, 2000), host: str(o.host, 253) };
 }
 
+function reasonOf(v: unknown): { code: string; by?: "rules" | "settings" } {
+  const r = obj(v);
+  const by = r.by;
+  if (by !== undefined && by !== "rules" && by !== "settings") throw new Bad();
+  return { code: str(r.code, 40, 1), ...(by !== undefined ? { by } : {}) };
+}
+
+/** Task F15: a `returnTo` of its shape (one of the two resting states, a reason), else undefined (not kept). */
+function returnToOf(v: unknown): { state: "no-open-copy" | "record-complete"; reason?: { code: string; by?: "rules" | "settings" } } | undefined {
+  if (v === undefined) return undefined;
+  try {
+    const t = obj(v);
+    if (Object.keys(t).some((k) => k !== "state" && k !== "reason")) return undefined;
+    if (t.state !== "no-open-copy" && t.state !== "record-complete") return undefined;
+    return { state: t.state, ...(t.reason !== undefined ? { reason: reasonOf(t.reason) } : {}) };
+  } catch (err) {
+    if (err instanceof Bad) return undefined;
+    throw err;
+  }
+}
+
 /**
  * The entry as the queue keeps it, or null when `x` is not an entry of the type or is beyond what the queue keeps.
  * The result is a NEW object, deep: nothing is shared with `x`, and nothing `x` holds beyond the type's fields is in it.
@@ -217,16 +238,7 @@ export function sanitizeEntry(x: unknown): FindEntry | null {
     out = put(out, "sourceId", opt(e.sourceId, id));
     out = put(out, "duplicateOf", opt(e.duplicateOf, id));
     out = put(out, "elsewhere", e.elsewhere);
-    out = put(
-      out,
-      "reason",
-      opt(e.reason, (v) => {
-        const r = obj(v);
-        const by = r.by;
-        if (by !== undefined && by !== "rules" && by !== "settings") throw new Bad();
-        return { code: str(r.code, 40, 1), ...(by !== undefined ? { by } : {}) };
-      }),
-    );
+    out = put(out, "reason", opt(e.reason, reasonOf));
     out = put(
       out,
       "match",
@@ -249,6 +261,10 @@ export function sanitizeEntry(x: unknown): FindEntry | null {
     out = put(out, "morePeople", e.morePeople);
     out = put(out, "moreWorks", e.moreWorks);
     out = put(out, "work", opt(e.work, (v) => str(v, 40, 1)));
+    // Task F15 (R324 b): what a "waiting-sign-in" entry returns to — on that state only (elsewhere it is not kept). One
+    // that is not of its shape is not kept either (the entry stays readable; the runner then says honestly that what it
+    // was could not be read back, "library-unfinished").
+    if (state === "waiting-sign-in") out = put(out, "returnTo", returnToOf(e.returnTo));
     out = put(out, "removed", e.removed);
     return out as unknown as FindEntry;
   } catch (err) {
@@ -506,7 +522,12 @@ async function endsTorn(abs: string): Promise<boolean> {
   }
 }
 
-type Op = "add" | "update" | "remove";
+/**
+ * Task F15: "library-start" is an update (one entry, written "waiting-sign-in") governed with the capture of
+ * `library_access` too — the rules are asked again inside the change, fail closed — and audited with that method.
+ */
+type Op = "add" | "update" | "remove" | "library-start";
+const LIBRARY_START_REQ = { action: "capture" as const, capture: { method: "library_access" as const } };
 
 /**
  * Appends changes of entries to the queue: ONE governed change (R26: policy, transaction marker, audit
@@ -534,7 +555,8 @@ type Op = "add" | "update" | "remove";
  */
 export async function appendFindEntries(core: RepoCore, projectId: string, entries: FindEntry[], op: Op, alongside: FindEntry[] = []): Promise<void> {
   core.assertWritable();
-  if (op !== "add" && op !== "update" && op !== "remove") throw new InvalidInputError("This is not a change the queue knows.");
+  if (op !== "add" && op !== "update" && op !== "remove" && op !== "library-start") throw new InvalidInputError("This is not a change the queue knows.");
+  if (op === "library-start" && (!Array.isArray(entries) || entries.length !== 1 || entries[0]?.state !== "waiting-sign-in")) throw new InvalidInputError("This is not a change the queue knows.");
   const st0 = core.state(projectId);
   core.assertUnlocked(st0);
   if (!Array.isArray(entries)) throw new InvalidInputError("The queue entries are not a list.");
@@ -577,14 +599,19 @@ export async function appendFindEntries(core: RepoCore, projectId: string, entri
 
 function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[], alongside: FindEntry[] = []): Promise<void> {
   let written: FindEntry[] = [];
+  const library = op === "library-start";
   return runMutation(
     core,
     projectId,
-    REQ,
+    library ? [LIBRARY_START_REQ, REQ] : REQ,
     async (tx) => {
       written = await linesInTx(core, tx, op, given, alongside);
     },
-    { op: FIND_QUEUE_OPS[op], entity: { type: "project", id: projectId }, auditDetails: () => ({ entries: written.map((e) => e.id), count: written.length, states: countStates(written) }) },
+    {
+      op: FIND_QUEUE_OPS[op],
+      entity: { type: "project", id: projectId },
+      auditDetails: () => ({ entries: written.map((e) => e.id), count: written.length, states: countStates(written), ...(library ? { method: "library_access" } : {}) }),
+    },
   );
 }
 
@@ -601,7 +628,7 @@ async function linesInTx(core: RepoCore, tx: Tx, op: Op, given: FindEntry[], alo
       const { removed: _r, ...rest } = c;
       byId.set(c.id, rest);
     } else if (cur && cur.removed !== true) {
-      if (op === "update") {
+      if (op === "update" || op === "library-start") {
         const { removed: _r, ...rest } = c;
         byId.set(c.id, rest);
       } else byId.set(c.id, removalOf(cur, c.updatedAt));

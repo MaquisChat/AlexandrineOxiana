@@ -67,9 +67,13 @@ import {
   readFindQueueDetailedIn,
   readFindQueueIn,
   repoLibrary,
+  sourceRecordStampIn,
   type Repo,
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { FIND_LIBRARY_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
+import { idsOf, libraryAddressFor, type LibraryAccess } from "./where.js";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AcquiredFrom, SourceFile } from "@ao/core";
@@ -86,11 +90,13 @@ import { decideMatch, openAlexSearchPausedUntil, scoreCandidate, searchWorks, ty
 import {
   FIND_DOI_MAX,
   FIND_LINE_MAX_BYTES,
+  FIND_QUEUE_MAX,
   FIND_TYPED_MAX,
   type FindEntry,
   type FindMatch,
   type FindReason,
   type FindReasonCode,
+  type FindReturnTo,
   type FindState,
   type SearchSettings,
 } from "./types.js";
@@ -244,6 +250,239 @@ export class FindAlreadyAddedError extends Error {
 }
 
 /**
+ * Task F15 (R324): a start "through my library" refused, and why — nothing was changed. The message is the shared
+ * sentence (FIND_LIBRARY_TEXT; the pause's is `libraryReadyIn`); nothing of the entry, the address or a ticket is in it.
+ */
+export class FindLibraryRefusedError extends Error {
+  override name = "FindLibraryRefusedError";
+  constructor(
+    readonly code: "not-offered" | "no-library" | "busy" | "pause" | "held-full",
+    /** "pause": the whole seconds left, rounded up. */
+    readonly seconds?: number,
+  ) {
+    super(
+      code === "pause"
+        ? libraryReadyIn(seconds ?? 1)
+        : code === "no-library"
+          ? FIND_LIBRARY_TEXT.noLibrary
+          : code === "busy"
+            ? FIND_LIBRARY_TEXT.busy
+            : code === "held-full"
+              ? FIND_LIBRARY_TEXT.heldFull
+              : FIND_LIBRARY_TEXT.notOffered,
+    );
+  }
+}
+
+/** Task F15: the record as a work (for the free-copy lookups, the file check, a library address and "Where to get it"). */
+function workOfSourceFile(sf: SourceFile): WorkCandidate {
+  const s = sf.source;
+  return {
+    id: s.id,
+    title: primary(s.title) ?? "",
+    creators: s.creators.slice(0, 100),
+    type: s.type,
+    identifiers: { ...(s.identifiers.doi ? { doi: s.identifiers.doi } : {}), ...(s.identifiers.isbn?.length ? { isbn: s.identifiers.isbn.slice(0, 20) } : {}) },
+    ...(s.issued ? { issued: s.issued } : {}),
+    providers: [],
+  };
+}
+
+/**
+ * R324 a: the copy part's resting states a fetch through the library may start from, and whose view gives "Where to get
+ * it": "no-open-copy" (any reason but the record's removal), or "record-complete" because free copies are not allowed by
+ * the rules or every copy service is switched off — always with the entry's record (`sourceId`).
+ */
+export function restsForLibrary(e: FindEntry): boolean {
+  if (!e.sourceId) return false;
+  if (e.state === "no-open-copy") return e.reason?.code !== "record-removed";
+  return e.state === "record-complete" && (e.reason?.code === "copy-not-allowed" || e.reason?.code === "switched-off");
+}
+
+type PolicyInfo = Awaited<ReturnType<typeof lookupPolicyInfo>>;
+/** What the store of a record's file is asked with: its provenance's identifiable flag and legal basis. */
+type StoreFacts = { identifiable: boolean; legalBasis?: string };
+/**
+ * Whether the rules allow a fetch through the library for this record AND would let its file be kept: the capture of
+ * `library_access` and the store of the file as the copy part asks them before a download (identifiable data, the legal
+ * basis). Fails closed (no rules, or a rule that cannot be evaluated).
+ */
+function libraryAllowedBy(info: PolicyInfo, projectId: string, facts: StoreFacts): boolean {
+  if (!info.policy) return false;
+  const base = { projectId, actor: info.actor, now: info.clock().toISOString(), ...(info.tz ? { tz: info.tz } : {}) };
+  try {
+    if (evaluate(info.policy, { ...base, action: "capture", capture: { method: "library_access" } }).result === "deny") return false;
+    const store = { identifiable: facts.identifiable, hasLocation: false, ...(facts.legalBasis ? { legalBasis: facts.legalBasis } : {}) };
+    return evaluate(info.policy, { ...base, action: "store", store }).result !== "deny";
+  } catch {
+    return false;
+  }
+}
+
+/** Task F15: what the entry's view says of the library (R324 a, d). `chance` absent: no start offered. */
+export type FindLibraryChanceOf = { work: WorkCandidate; chance?: "yes" | "no-library" };
+
+/**
+ * R328 e: what the queue's view needs of a record, and nothing more — the work as "Where to get it" and a library
+ * address use it (its id, title, type, DOI and ISBNs, and the one creator's name the catalogue's query takes), whether
+ * the record has a file, and the two facts the store of a file is asked with.
+ */
+type RecordFacts = { work: WorkCandidate; hasFile: boolean; store: StoreFacts };
+
+function factsOf(sf: SourceFile): RecordFacts {
+  const w = workOfSourceFile(sf);
+  // The name the catalogue's query takes (whereToGetIt): the first family name, else the first creator's literal one.
+  const named = w.creators.find((c) => c.family);
+  const creator = named ? { role: named.role, family: named.family } : w.creators[0]?.literal ? { role: w.creators[0].role, literal: w.creators[0].literal } : undefined;
+  const prov = sf.source.provenance;
+  return {
+    work: { id: w.id, title: w.title, creators: creator ? [creator] : [], type: w.type, identifiers: w.identifiers, providers: [] },
+    hasFile: sourceHasFile(sf),
+    store: { identifiable: prov.identifiable, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) },
+  };
+}
+
+/** At most this many records' facts are kept (four full queues); the one used longest ago goes first. */
+export const RECORD_FACTS_MAX = 4 * FIND_QUEUE_MAX;
+
+/**
+ * R328 e: the records' facts the queue's view read last, each with the stamp of its file when it was read (a `stat`:
+ * inode, size, modification and change times). Kept by the runner — one per open library, in memory only — per
+ * project; a project's are dropped at its lock (`stop`) and all at the close (`stopAll`). Never shared between
+ * projects: a record is looked up under the project it was read in.
+ */
+interface RecordFactsCache {
+  get(projectId: string, sourceId: string, stamp: string): RecordFacts | undefined;
+  set(projectId: string, sourceId: string, stamp: string, facts: RecordFacts): void;
+  dropProject(projectId: string): void;
+  clear(): void;
+}
+
+function createRecordFactsCache(max = RECORD_FACTS_MAX): RecordFactsCache {
+  const byProject = new Map<string, Map<string, { stamp: string; facts: RecordFacts }>>();
+  /** Every key kept, in the order of its last use (`projectId \0 sourceId`): the bound. */
+  const order = new Map<string, [string, string]>();
+  const key = (p: string, id: string) => `${p}\u0000${id}`;
+  const forget = (p: string, id: string) => {
+    byProject.get(p)?.delete(id);
+    if (byProject.get(p)?.size === 0) byProject.delete(p);
+    order.delete(key(p, id));
+  };
+  return {
+    get(p, id, stamp) {
+      const hit = byProject.get(p)?.get(id);
+      if (!hit) return undefined;
+      if (hit.stamp !== stamp) {
+        forget(p, id);
+        return undefined;
+      }
+      order.delete(key(p, id));
+      order.set(key(p, id), [p, id]);
+      return hit.facts;
+    },
+    set(p, id, stamp, facts) {
+      forget(p, id);
+      let m = byProject.get(p);
+      if (!m) byProject.set(p, (m = new Map()));
+      m.set(id, { stamp, facts });
+      order.set(key(p, id), [p, id]);
+      while (order.size > max) {
+        const [oldest] = order.values();
+        forget(oldest![0], oldest![1]);
+      }
+    },
+    dropProject(p) {
+      for (const id of [...(byProject.get(p)?.keys() ?? [])]) forget(p, id);
+    },
+    clear() {
+      byProject.clear();
+      order.clear();
+    },
+  };
+}
+
+/**
+ * Task F15 (R324 a, d): for each entry of `entries` that rests as R324 a names and whose record is still in the library,
+ * the record as a work (for "Where to get it", given whether or not a library is set) and whether "Get through my library"
+ * may start: "yes" when its record has no file, no file of it waits for the researcher's check (no entry of the queue
+ * for the same record is "needs-check"), it is not at work (`atWork`), it has a DOI or ISBN that gives an address
+ * through `access`, and the rules allow `library_access` and would keep the file; "no-library" when all of that holds
+ * but no library is set (`access` null; then a DOI is needed, R328 g: an ISBN alone gives no address through EZproxy
+ * or OpenAthens, so it carries no such promise). One read of the rules, one read of each
+ * resting entry's record. A locked project gives nothing.
+ */
+export async function libraryChancesOf(
+  repo: Repo,
+  projectId: string,
+  entries: Iterable<FindEntry>,
+  o: { access: LibraryAccess | null; atWork?: (entryId: string) => boolean; only?: string; records?: RecordFactsCache },
+): Promise<Map<string, FindLibraryChanceOf>> {
+  const out = new Map<string, FindLibraryChanceOf>();
+  const all = [...entries];
+  const resting = all.filter((e) => restsForLibrary(e) && (o.only === undefined || e.id === o.only));
+  if (!resting.length) return out;
+  let info: PolicyInfo;
+  try {
+    info = await lookupPolicyInfo(repo, projectId);
+  } catch (err) {
+    if (err instanceof ProjectLockedError) return out;
+    throw err;
+  }
+  const waitingFor = new Set(all.filter((e) => e.state === "needs-check" && e.sourceId).map((e) => e.sourceId!));
+  // The rules' answer depends only on the two facts the store is asked with: asked once per kind in this read (R328 e).
+  const asked = new Map<string, boolean>();
+  const allowed = (f: StoreFacts): boolean => {
+    const k = JSON.stringify([f.identifiable, f.legalBasis ?? null]);
+    let v = asked.get(k);
+    if (v === undefined) asked.set(k, (v = libraryAllowedBy(info, projectId, f)));
+    return v;
+  };
+  // R328 e: with the runner's cache, each record's file is stat'ed (first, all of them) and read only when its stamp
+  // changed.
+  const cache = o.records;
+  let stamps: Array<string | null> = [];
+  try {
+    if (cache) stamps = resting.map((e) => sourceRecordStampIn(repo, projectId, e.sourceId!));
+  } catch (err) {
+    if (err instanceof ProjectLockedError) return new Map();
+    throw err;
+  }
+  for (const [i, e] of resting.entries()) {
+    let facts: RecordFacts | undefined;
+    const stamp = cache ? stamps[i] : undefined;
+    if (cache && stamp === null) continue; // the record is not there (deleted)
+    if (cache && stamp) facts = cache.get(projectId, e.sourceId!, stamp);
+    if (!facts) {
+      let sf: SourceFile;
+      try {
+        sf = await repo.getSource(projectId, e.sourceId!);
+      } catch (err) {
+        if (err instanceof NotFoundError) continue;
+        throw err;
+      }
+      facts = factsOf(sf);
+      if (cache && stamp) cache.set(projectId, e.sourceId!, stamp, facts);
+    }
+    const work = facts.work;
+    const ids = idsOf(work);
+    const free = !facts.hasFile && !waitingFor.has(e.sourceId!) && !(o.atWork?.(e.id) ?? false);
+    // R328 g: with no library set, a DOI is needed for the promise "set your library" (every kind of library gives an
+    // address for a DOI; an ISBN alone gives one only through a link resolver).
+    const target = o.access ? libraryAddressFor(o.access, work) !== null : !!ids.doi;
+    const may = free && target && allowed(facts.store);
+    out.set(e.id, { work, ...(may ? { chance: o.access ? ("yes" as const) : ("no-library" as const) } : {}) });
+  }
+  return out;
+}
+
+/** Task F15 (R324 b): the entry as it rested before the start, or (nothing kept) "no-open-copy" saying so honestly. */
+function returnedFrom(cur: FindEntry, at: string): FindEntry {
+  const t: FindReturnTo | undefined = cur.returnTo;
+  const back: Partial<FindEntry> = t ? { state: t.state, ...(t.reason ? { reason: t.reason } : {}) } : { state: "no-open-copy", reason: { code: "library-unfinished" } };
+  return evolve(cur, back, ["returnTo", "reason", "nextTryAt"], at);
+}
+
+/**
  * Test seams (R47: honoured only under NODE_ENV=test): run just before and just after a record's creation; `inAct`,
  * awaited inside a researcher's act, in its store turn, right after its check (R245); and `inCreate`, awaited inside
  * the store turn just before a record is made (R247 d).
@@ -286,6 +525,12 @@ export interface FindRunnerDeps {
    * entry and creates nothing; it asks again every FIND_INDEX_WAIT_MS and goes on by itself.
    */
   indexReady?: () => boolean;
+  /**
+   * Task F15 (R328 f): where the time of the last hand-over (ms since the epoch; -Infinity: none) is kept — by the
+   * caller (the service), so that it outlives this runner: a runner made for a library closed and opened again sees
+   * it. Absent: kept in this runner only.
+   */
+  libraryHandOver?: { get(): number; set(at: number): void };
 }
 
 /** Why the runner does nothing for a project now. */
@@ -379,6 +624,42 @@ export interface FindRunner {
   lockedNotChecked(): number;
   /** Why nothing is being done for the project now, or null. */
   stoppedFor(projectId: string): FindStoppedFor | null;
+  /**
+   * Task F15 (R324 a, c): the researcher's press "Get through my library" on an entry — never called by the runner
+   * itself (no timer, no resume, no "Try again" starts one). Refused with FindLibraryRefusedError, nothing changed:
+   * another ticket open anywhere in this runner ("busy" — checked synchronously at the call, so two calls at the same
+   * moment give one ticket), within LIBRARY_PAUSE_MS of the last hand-over ("pause", with the whole seconds left), the
+   * entry not offered a start by `libraryChancesOf` ("not-offered"), no library set ("no-library"), FIND_HELD_MAX files
+   * waiting in the project ("held-full"); a read-only library (ReadOnlyLibraryError), a locked project
+   * (ProjectLockedError), a stopped project or runner (as every act). Otherwise, in one governed change (op
+   * `project.find.library-start`, the capture of `library_access` asked again inside it), the entry becomes
+   * "waiting-sign-in" keeping what it returns to (`returnTo`), and the call returns the library's address for the work
+   * and a ticket (32 hex from the system's random source, single use, LIBRARY_TICKET_MS, held in this runner's memory
+   * only). Neither is written, logged, audited or sent in an event.
+   */
+  libraryStart(projectId: string, entryId: string, access: LibraryAccess | null): Promise<{ url: string; ticket: string; entry: FindEntry }>;
+  /**
+   * Task F15 (R324 b): "Cancel" on an entry "waiting-sign-in": it returns to exactly the state and reason it had (or,
+   * nothing kept, "no-open-copy" / "library-unfinished"), and its ticket, if open, ends. Any other state:
+   * FindEntryStateError, nothing changed.
+   */
+  libraryCancel(projectId: string, entryId: string): Promise<FindEntry>;
+  /**
+   * Task F15's seam for Task F17 (the file handed over): ends the open ticket as handed over and starts the pause
+   * (LIBRARY_PAUSE_MS from now), returning the project and entry it was for. The entry is left "waiting-sign-in" for F17
+   * to write its outcome (R324 h: the file waits for the researcher's check). For anything else — a wrong, used, expired
+   * or malformed ticket, or a closed runner — null, the same null whatever the cause (compared in constant time). Synchronous.
+   */
+  libraryHandedOver(ticket: unknown): { projectId: string; entryId: string } | null;
+  /** Task F15: whether the runner is working on the entry, or has it queued or waiting for a retry (no start is offered then). */
+  atWork(projectId: string, entryId: string): boolean;
+  /**
+   * Task F15 (R328 e): `libraryChancesOf` for the queue's view, with this runner's `atWork` and its cache of the
+   * records' facts: a record's file is read only when its stamp (one `stat`) changed since it was last read; the cache
+   * holds only what the view needs, per project, dropped at the project's `stop` (a lock) and at `stopAll` (a close).
+   * A locked project gives nothing; after `stopAll`, FindRunnerClosedError.
+   */
+  libraryChances(projectId: string, entries: Iterable<FindEntry>, access: LibraryAccess | null): Promise<Map<string, FindLibraryChanceOf>>;
 }
 
 /**
@@ -756,7 +1037,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   // Writing an entry: one governed change, then the event.
 
   /** `alongside` (with an add only, F8): new lines of live entries written in the same governed change; returned after `next`. */
-  async function write(pid: string, next: FindEntry[], op: "add" | "update" | "remove", alongside: FindEntry[] = []): Promise<FindEntry[]> {
+  async function write(pid: string, next: FindEntry[], op: "add" | "update" | "remove" | "library-start", alongside: FindEntry[] = []): Promise<FindEntry[]> {
     const fitted = [...next.map(fit), ...alongside.map(fit)];
     await appendFindEntriesIn(repo, pid, fitted.slice(0, next.length), op, fitted.slice(next.length));
     if (op !== "remove") {
@@ -1528,18 +1809,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   /** The record as the free-copy lookups and the file check take it (from the source as stored now). */
-  function workOfSource(sf: SourceFile): WorkCandidate {
-    const s = sf.source;
-    return {
-      id: s.id,
-      title: primary(s.title) ?? "",
-      creators: s.creators.slice(0, 100),
-      type: s.type,
-      identifiers: { ...(s.identifiers.doi ? { doi: s.identifiers.doi } : {}), ...(s.identifiers.isbn?.length ? { isbn: s.identifiers.isbn.slice(0, 20) } : {}) },
-      ...(s.issued ? { issued: s.issued } : {}),
-      providers: [],
-    };
-  }
+  const workOfSource = workOfSourceFile;
 
   /** "Where to get it": the free copies on other hosts (and, when nothing could be downloaded, the offers), at most FREE_COPY_ELSEWHERE_MAX. */
   function linksOf(elsewhere: Array<{ host: string; url: string }>, offers: CopyOffer[] = []): FindEntry["offers"] {
@@ -2032,6 +2302,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     });
     // R282 g (M2): its download in flight is aborted (its folder removed and given up as the work ends).
     downloads.get(keyOfRun(projectId, entryId))?.abort(new Abandoned());
+    // F15: an entry waiting in the sign-in window that is removed ends its ticket.
+    if (ticketFor(projectId, entryId)) dropTicket();
     // R310 a: its waiting file went with it, so a place is free: the entries waiting for one go on (the same light
     // wake as after a decision; nothing in flight is touched). An entry that had no waiting file wakes nothing.
     if (freed) await wakeHeldFull(projectId);
@@ -2147,6 +2419,20 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       }
       const q = await readFindQueueIn(repo, projectId);
       if (!alive(projectId, gen)) return;
+      // F15 (R324 b): an entry waiting in the sign-in window whose ticket is not open here (start-up, after a lock or a
+      // close: tickets are in memory only) returns to what it was — never resumed as a fetch. One with an open ticket
+      // (a resume after the rules were saved) is left waiting. Back in the copy part, it goes on as at any resume.
+      for (const e of q.values()) {
+        if (e.state !== "waiting-sign-in" || ticketFor(projectId, e.id)) continue;
+        const back = await inTurn(r, projectId, () => alive(projectId, gen), async () => {
+          const cur = await current(projectId, e.id);
+          if (!cur || cur.state !== "waiting-sign-in" || ticketFor(projectId, e.id)) return null;
+          const [w] = await write(projectId, [returnedFrom(cur, stamp())], "update");
+          return w ?? null;
+        });
+        if (!alive(projectId, gen)) return;
+        if (back && inCopyPart(back)) enqueue(projectId, back.id);
+      }
       const waiting = [...q.values()].filter((e) => e.state === "looking-up");
       // R247 (e): a record can be made for an entry in other states too (a choose, a duplicate answer, "add it here as
       // well"); a lock or a crash between its creation and the entry's line leaves the entry as it was, without a
@@ -2215,10 +2501,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   function stop(projectId: string): void {
     stopRun(projectId);
+    // F15 (R328 e): nothing read from a locked project's records is kept.
+    records.dropProject(projectId);
+    // F15 (R324 b): a lock ends the project's open ticket; its entry comes back at the next resume (nothing can be
+    // written for a locked project now).
+    if (libTicket?.projectId === projectId) dropTicket();
   }
 
   async function stopAll(): Promise<void> {
     closed = true;
+    // F15 (R324 b, c): a close ends the open ticket at once (in memory only); its entry comes back at the next open.
+    dropTicket();
+    // F15 (R328 e): nothing read from the records outlives the close.
+    records.clear();
     for (const pid of runs.keys()) stopRun(pid);
     if (indexWait !== undefined) {
       timers.clearTimeout(indexWait);
@@ -2361,5 +2656,151 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return w;
   }
 
-  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resolveHeld, wakeHeldFull, wakeAllowance, wakeSettings, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks, asAuthor };
+  // ------------------------------------------------------------------------------------------------------------
+  // Task F15 (R324 a–c): a fetch through the researcher's library — only the "waiting-sign-in" state: entered on the
+  // researcher's press, left by cancel, the ticket's end, start-up (`resume`), a lock or a close. The runner never
+  // fetches anything from the library: it hands back an address and a ticket. ONE ticket at a time, in memory only.
+
+  /** The open ticket (at most one). */
+  let libTicket: { ticket: string; projectId: string; entryId: string; expires: number; timer: unknown } | undefined;
+  /** A start between its synchronous check and its ticket: another start meanwhile is "busy". */
+  let libClaimed = false;
+  /** When the last hand-over was (the pause): the caller's (R328 f), else this runner's own. */
+  let ownHandOver = Number.NEGATIVE_INFINITY;
+  const handOver = deps.libraryHandOver ?? { get: () => ownHandOver, set: (at: number) => void (ownHandOver = at) };
+
+  function dropTicket(): void {
+    if (libTicket) timers.clearTimeout(libTicket.timer);
+    libTicket = undefined;
+  }
+  const ticketFor = (pid: string, eid: string) => libTicket !== undefined && libTicket.projectId === pid && libTicket.entryId === eid;
+
+  /** R328 e: the records' facts the queue's view read last (see `libraryChances`). */
+  const records = createRecordFactsCache();
+
+  async function libraryChances(projectId: string, entries: Iterable<FindEntry>, access: LibraryAccess | null): Promise<Map<string, FindLibraryChanceOf>> {
+    assertOpen();
+    const out = await libraryChancesOf(repo, projectId, entries, { access, atWork: (id) => atWork(projectId, id), records });
+    // Closed or the project locked while it was read: what was read is not kept.
+    if (closed) records.clear();
+    else if (!repo.isUnlocked(projectId)) records.dropProject(projectId);
+    return out;
+  }
+
+  function atWork(projectId: string, entryId: string): boolean {
+    const r = runs.get(projectId);
+    return running.has(keyOfRun(projectId, entryId)) || !!r?.pending.includes(entryId) || !!r?.timers.has(entryId);
+  }
+
+  async function libraryStart(projectId: string, entryId: string, access: LibraryAccess | null): Promise<{ url: string; ticket: string; entry: FindEntry }> {
+    assertOpen();
+    assertId(entryId);
+    if (readOnly()) throw new ReadOnlyLibraryError();
+    // Checked and claimed without awaiting anything: two presses at the same moment, in any projects, give one ticket.
+    if (libTicket || libClaimed) throw new FindLibraryRefusedError("busy");
+    const at = now().getTime();
+    // R328 f: a clock stepped backwards (the last hand-over now in the future) counts the pause from now: never more
+    // than the pause's own length is said, and it ends after it.
+    if (handOver.get() > at) handOver.set(at);
+    const since = at - handOver.get();
+    if (since < LIBRARY_PAUSE_MS) throw new FindLibraryRefusedError("pause", Math.min(LIBRARY_PAUSE_MS / 1000, Math.max(1, Math.ceil((LIBRARY_PAUSE_MS - since) / 1000))));
+    libClaimed = true;
+    try {
+      return await act(projectId, async () => {
+        const q = await readFindQueueIn(repo, projectId);
+        const cur = q.get(entryId);
+        if (!cur) throw new NotFoundError("Queue entry", entryId);
+        const ch = (await libraryChancesOf(repo, projectId, q.values(), { access, atWork: (id) => atWork(projectId, id), only: entryId })).get(entryId);
+        if (!ch?.chance) throw new FindLibraryRefusedError("not-offered");
+        if (ch.chance === "no-library" || !access) throw new FindLibraryRefusedError("no-library");
+        // R324 a: the file the library gives will wait for the researcher's check too.
+        if ((await heldWaitingCountIn(repo, projectId)) >= FIND_HELD_MAX) throw new FindLibraryRefusedError("held-full");
+        const url = libraryAddressFor(access, ch.work);
+        if (!url) throw new FindLibraryRefusedError("not-offered");
+        const returnTo: FindReturnTo = { state: cur.state as FindReturnTo["state"], ...(cur.reason ? { reason: cur.reason } : {}) };
+        const [entry] = await write(projectId, [evolve(cur, { state: "waiting-sign-in", returnTo }, ["reason", "nextTryAt"], stamp())], "library-start");
+        // Stopped (a lock) or closed while it was written: no ticket; the entry comes back at the next resume.
+        if (closed || runs.get(projectId)?.stopped) throw new FindProjectStoppedError();
+        const ticket = randomBytes(16).toString("hex");
+        const timer = timers.setTimeout(() => void ticketEnded(ticket), LIBRARY_TICKET_MS);
+        libTicket = { ticket, projectId, entryId, expires: now().getTime() + LIBRARY_TICKET_MS, timer };
+        return { url, ticket, entry: entry! };
+      });
+    } finally {
+      libClaimed = false;
+    }
+  }
+
+  /** The entry back to what it was, in an act's turn, if it is still waiting (and, from `resume`, has no open ticket). */
+  async function bringBack(projectId: string, entryId: string): Promise<FindEntry | null> {
+    return act(projectId, async () => {
+      const cur = await current(projectId, entryId);
+      if (!cur || cur.state !== "waiting-sign-in" || ticketFor(projectId, entryId)) return null;
+      const [w] = await write(projectId, [returnedFrom(cur, stamp())], "update");
+      return w ?? null;
+    });
+  }
+
+  /** The ticket ran out (its timer, or the seam found it past its end): it ends, and its entry comes back. */
+  async function ticketEnded(ticket: string): Promise<void> {
+    const t = libTicket;
+    if (!t || t.ticket !== ticket) return;
+    dropTicket();
+    // A stopped project (locked) or a closed runner writes nothing: the entry comes back at the next resume.
+    await bringBack(t.projectId, t.entryId).catch(() => undefined);
+  }
+
+  async function libraryCancel(projectId: string, entryId: string): Promise<FindEntry> {
+    assertOpen();
+    assertId(entryId);
+    return act(projectId, async () => {
+      const cur = await current(projectId, entryId);
+      if (!cur) throw new NotFoundError("Queue entry", entryId);
+      if (cur.state !== "waiting-sign-in") throw new FindEntryStateError();
+      if (ticketFor(projectId, entryId)) dropTicket();
+      const [w] = await write(projectId, [returnedFrom(cur, stamp())], "update");
+      return w!;
+    });
+  }
+
+  function libraryHandedOver(ticket: unknown): { projectId: string; entryId: string } | null {
+    const t = libTicket;
+    if (closed || !t || typeof ticket !== "string" || !/^[0-9a-f]{32}$/u.test(ticket)) return null;
+    if (!timingSafeEqual(Buffer.from(ticket, "utf8"), Buffer.from(t.ticket, "utf8"))) return null;
+    const at = now().getTime();
+    if (at >= t.expires) {
+      void ticketEnded(t.ticket);
+      return null;
+    }
+    dropTicket();
+    handOver.set(at);
+    return { projectId: t.projectId, entryId: t.entryId };
+  }
+
+  return {
+    add,
+    choose,
+    confirmDuplicate,
+    addHereAsWell,
+    retry,
+    remove,
+    resolveHeld,
+    wakeHeldFull,
+    wakeAllowance,
+    wakeSettings,
+    resume,
+    stop,
+    stopAll,
+    elsewhere,
+    lockedNotChecked,
+    stoppedFor,
+    choosePerson,
+    chooseWorks,
+    asAuthor,
+    libraryStart,
+    libraryCancel,
+    libraryHandedOver,
+    atWork,
+    libraryChances,
+  };
 }
