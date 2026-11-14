@@ -187,8 +187,8 @@ const strictEncode = (s: string): string => encodeURIComponent(s).replace(/[!'()
 /** A DOI as one path of doi.org: every character encoded but its slashes. */
 const doiPath = (doi: string): string => strictEncode(doi).replace(/%2F/gu, "/");
 
-/** The work's DOI of the accepted shape, and its first ISBN that is one (as ISBN-13). */
-function idsOf(w: WorkCandidate): { doi?: string; isbn?: string } {
+/** The work's DOI of the accepted shape, and its first ISBN that is one (as ISBN-13): what a library address is built from. */
+export function idsOf(w: WorkCandidate): { doi?: string; isbn?: string } {
   const doi = canonDoi(w.identifiers?.doi);
   let isbn: string | undefined;
   for (const i of w.identifiers?.isbn ?? []) {
