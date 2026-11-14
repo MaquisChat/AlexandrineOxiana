@@ -339,10 +339,18 @@ export function registerSearchSettings(app: FastifyInstance, ctx: Ctx): void {
     const slot = `${group}/${id}`;
     if (running.has(slot)) throw new ApiError(409, "CONFLICT", SEARCH_SETTINGS_TEXT.testRunning);
     running.add(slot);
-    try {
+    // R304 a: the place is given up on every way out, at the Test's time limit at the latest, whatever it waits on.
+    let limit: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<SearchSourceTestResponse>((r) => (limit = setTimeout(() => r(TEST_ANSWER.unreachable), FIND_SOURCE_TEST_TIMEOUT_MS)));
+    const run = (async (): Promise<SearchSourceTestResponse> => {
       const { settings } = await state.readSearchSources();
+      // A keyed source's key, read within the one bound (R304 a): a store that fails or does not answer in time is
+      // said (the key routes' sentence for a store that is not available), and nothing is asked.
+      const keyName = group === "record" && id === "elicit" ? "elicit-api-key" : id === "openalex" ? "openalex-api-key" : undefined;
+      const read = keyName ? await state.searchKeyWithin(keyName) : undefined;
+      if (read?.unreadable) return { ok: false, sentence: SEARCH_SETTINGS_TEXT.noStoreForStatus };
       // A key or an e-mail that is needed and missing: said, and nothing asked (testSearchSource asks nothing then).
-      const key = group === "record" && id === "elicit" ? await state.searchKey("elicit-api-key") : undefined;
+      const key = keyName === "elicit-api-key" ? read?.key : undefined;
       const http = new HttpClient({
         // A fresh client: nothing cached answers in the service's place. Its requests are made "sensitive" by the
         // library (memory only), so nothing it gets is written under this folder, which is never created.
@@ -360,7 +368,12 @@ export function registerSearchSettings(app: FastifyInstance, ctx: Ctx): void {
         ...(settings.unpaywallEmail ? { email: settings.unpaywallEmail } : {}),
       });
       return TEST_ANSWER[result];
+    })();
+    try {
+      return await Promise.race([run, late]);
     } finally {
+      clearTimeout(limit);
+      run.catch(() => undefined);
       running.delete(slot);
     }
   });

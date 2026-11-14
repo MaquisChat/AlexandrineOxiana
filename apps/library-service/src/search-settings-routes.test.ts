@@ -14,7 +14,7 @@ import { Writable } from "node:stream";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SECRET_STORE_UNAVAILABLE, deviceDeps, lookupContextFor, lookupDoi, type Deps } from "@ao/library";
-import { SEARCH_SETTINGS_TEXT, SEARCH_TEST_TEXT, searchEmailRefusal, type SearchSourcesResponse } from "@ao/shared";
+import { SEARCH_SETTINGS_TEXT, SEARCH_SOURCE_TEST_TIMEOUT_MS as FIND_SOURCE_TEST_TIMEOUT_MS, SEARCH_TEST_TEXT, searchEmailRefusal, type SearchSourcesResponse } from "@ao/shared";
 import { useMemorySecrets, useNoSecretStore } from "../../../packages/library/src/secrets-testing.js";
 import { _resetElicitForTests } from "../../../packages/library/src/find/elicit.js";
 import { _setSecretBackend } from "../../../packages/library/src/secrets.js";
@@ -418,6 +418,135 @@ describe("R297 b, R298 g: the OpenAlex key belongs to OpenAlex, is read lazily a
       expect(store.reads).toBe(2);
     } finally {
       Date.now = real;
+    }
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+describe("R304: no read of a key waits for the password store beyond the bound (a Test, Elicit's key, a key saved during a read)", () => {
+  type Name = "elicit-api-key" | "openalex-api-key";
+  /** A password store whose reads of `name` are counted and answer after `delay` ms (Infinity: never) with what is saved then, or `answer`. */
+  function slowStore(name: Name, delay: number, answer?: string | null) {
+    const seen = { reads: 0 };
+    _setSecretBackend({
+      get: async (n) => {
+        if (n !== name) return secrets.values.get(n) ?? null;
+        seen.reads++;
+        if (delay === Infinity) return new Promise<never>(() => undefined);
+        await new Promise((r) => setTimeout(r, delay));
+        return answer !== undefined ? answer : (secrets.values.get(n) ?? null);
+      },
+      set: async (n, v) => void secrets.values.set(n, v),
+      delete: async (n) => secrets.values.delete(n),
+    });
+    return seen;
+  }
+  const UNREADABLE = { ok: false, sentence: SEARCH_SETTINGS_TEXT.noStoreForStatus };
+  const test = (g: string, id: string) => call({ method: "POST", url: `/settings/search-sources/${g}/${id}/test` });
+
+  it("a store that never answers: a Test of Elicit or of OpenAlex ends within the bound, says the key could not be read, asks nothing, and a second press is accepted", async () => {
+    for (const [name, g, id, origin] of [
+      ["elicit-api-key", "record", "elicit", "https://elicit.com"],
+      ["openalex-api-key", "copies", "openalex", "https://api.openalex.org"],
+    ] as const) {
+      await start();
+      secrets.values.set(name, name === "elicit-api-key" ? ELICIT_KEY : OA_KEY);
+      const store = slowStore(name, Infinity);
+      requests = [];
+      const t0 = Date.now();
+      expect((await test(g, id)).json, id).toEqual(UNREADABLE);
+      expect(Date.now() - t0).toBeLessThan(SEARCH_KEY_WAIT_MS + 1_000);
+      const again = await test(g, id);
+      expect(again.status, id).toBe(200);
+      expect(again.json).toEqual(UNREADABLE);
+      expect(requests.filter((r) => r.origin === origin)).toEqual([]);
+      expect(store.reads).toBe(1);
+      await svc!.close();
+      svc = undefined;
+      secrets = useMemorySecrets();
+    }
+  });
+
+  it("a store that answers after the bound: the Test says so; once the key has come, the next press asks with it", async () => {
+    await start();
+    secrets.values.set("elicit-api-key", ELICIT_KEY);
+    slowStore("elicit-api-key", SEARCH_KEY_WAIT_MS + 500);
+    expect((await test("record", "elicit")).json).toEqual(UNREADABLE);
+    expect(requests).toEqual([]);
+    await new Promise((r) => setTimeout(r, 800));
+    expect((await test("record", "elicit")).json).toEqual({ ok: true, sentence: SEARCH_TEST_TEXT.answered });
+    expect(requests.map((r) => r.headers.authorization)).toEqual([`Bearer ${ELICIT_KEY}`]);
+  });
+
+  it("a key saved while a Test waits on the store: the next press asks with the saved key", async () => {
+    await start();
+    slowStore("elicit-api-key", Infinity);
+    const first = test("record", "elicit");
+    await new Promise((r) => setTimeout(r, 100));
+    expect((await call({ method: "PUT", url: "/secrets/elicit-api-key", body: { apiKey: ELICIT_KEY } })).status).toBe(200);
+    expect((await first).status).toBe(200);
+    const second = await test("record", "elicit");
+    expect(second.json).toEqual({ ok: true, sentence: SEARCH_TEST_TEXT.answered });
+    const toElicit = requests.filter((r) => r.origin === "https://elicit.com");
+    expect(toElicit.at(-1)!.headers.authorization).toBe(`Bearer ${ELICIT_KEY}`);
+  });
+
+  it("a Test whose request hangs ends at its 30-second limit and gives its place up: a second press is accepted", async () => {
+    await start();
+    crossrefDelay = 45_000;
+    const t0 = Date.now();
+    const r = await test("record", "crossref");
+    expect(r.json).toEqual({ ok: false, sentence: SEARCH_TEST_TEXT.unreachable });
+    expect(Date.now() - t0).toBeLessThan(FIND_SOURCE_TEST_TIMEOUT_MS + 3_000);
+    crossrefDelay = 0;
+    expect((await test("record", "crossref")).status).toBe(200);
+  }, 60_000);
+
+  it("Elicit's key is read once for every entry, bounded from the read's start: with a store that hangs, the first entry waits at most the bound, the next two do not wait; a PUT then reaches the next entry", async () => {
+    await start();
+    secrets.values.set("elicit-api-key", ELICIT_KEY);
+    const store = slowStore("elicit-api-key", Infinity);
+    expect((await call({ method: "PUT", url: "/settings/search-sources", body: { ...ALL_ON, record: ALL_ON.record.map((x) => ({ ...x, on: true })) } })).status).toBe(200);
+    const pid = await openLibraryWithProject(ELICIT_GOV);
+    const times: number[] = [];
+    for (const line of [LINE, "Zorblatt Grammar of Habitus by Quillfeather 1999", "Quillfeather 1999 Zorblatt Grammar of Habitus"]) {
+      const t = Date.now();
+      const e = await addAndSettle(pid, line);
+      times.push(Date.now() - t);
+      expect(e.reason).toBeUndefined();
+    }
+    expect(times[0]!).toBeLessThan(SEARCH_KEY_WAIT_MS + 3_000);
+    expect(times[1]!, "the second entry waited").toBeLessThan(SEARCH_KEY_WAIT_MS);
+    expect(times[2]!, "the third entry waited").toBeLessThan(SEARCH_KEY_WAIT_MS);
+    expect(store.reads).toBe(1);
+    expect(requests.filter((r) => r.origin === "https://elicit.com")).toEqual([]);
+    expect((await call({ method: "PUT", url: "/secrets/elicit-api-key", body: { apiKey: ELICIT_KEY } })).status).toBe(200);
+    await addAndSettle(pid, "Grammar of Habitus, Quillfeather");
+    const toElicit = requests.filter((r) => r.origin === "https://elicit.com");
+    expect(toElicit).toHaveLength(1);
+    expect(toElicit[0]!.headers.authorization).toBe(`Bearer ${ELICIT_KEY}`);
+  });
+
+  it("R304 c: a key saved (PUT) or removed (DELETE) while a read is in flight wins over the read's late answer, for both keys", async () => {
+    for (const name of ["openalex-api-key", "elicit-api-key"] as const) {
+      await start();
+      // The store answers an old key 500 ms after it is asked.
+      slowStore(name, 500, "old-key-RECOGNISABLE-0000");
+      const late = svc!.state.searchKey(name);
+      expect((await call({ method: "PUT", url: `/secrets/${name}`, body: { apiKey: OA_KEY } })).status).toBe(200);
+      await late;
+      expect(await svc!.state.searchKey(name), `${name} after PUT`).toBe(OA_KEY);
+      if (name === "openalex-api-key") expect(svc!.state.searchKeyForHost("api.openalex.org")).toBe(OA_KEY);
+      await svc!.close();
+      await start();
+      slowStore(name, 500, "old-key-RECOGNISABLE-0000");
+      const late2 = svc!.state.searchKey(name);
+      expect((await call({ method: "DELETE", url: `/secrets/${name}` })).status).toBe(200);
+      await late2;
+      expect(await svc!.state.searchKey(name), `${name} after DELETE`).toBeUndefined();
+      await svc!.close();
+      svc = undefined;
+      secrets = useMemorySecrets();
     }
   });
 });

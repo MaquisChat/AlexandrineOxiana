@@ -1228,24 +1228,42 @@ export class ServiceState {
   }
 
   /**
-   * The lookup client's wait before a request to `host` (R297 b, R298 g): for api.openalex.org, while its key is not
-   * held yet, starts (or joins) the one read and waits for it at most until SEARCH_KEY_WAIT_MS after that read began.
-   * Never rejects; nothing for any other host.
+   * A key within the bound (R298 g, R304 a, b): what is held, or else the one shared read (started or joined), waited
+   * for at most until SEARCH_KEY_WAIT_MS after that read began — the same bound for both keys, so a hung store delays
+   * only the first caller of its minute. `unreadable` when the store failed or did not answer in that time (nothing is
+   * held then); `key` undefined and `unreadable` false: none is saved. Never rejects.
    */
-  async searchKeyReady(host: string): Promise<void> {
-    const name = "openalex-api-key";
-    if (host !== "api.openalex.org" || this.searchKeys.has(name)) return;
+  async searchKeyWithin(name: "elicit-api-key" | "openalex-api-key"): Promise<{ key?: string; unreadable: boolean }> {
+    const held = (): { key?: string; unreadable: boolean } => {
+      const v = this.searchKeys.get(name);
+      return { ...(v ? { key: v } : {}), unreadable: false };
+    };
+    if (this.searchKeys.has(name)) return held();
     const read = this.searchKey(name);
     const inFlight = this.searchKeyReads.get(name);
-    if (!inFlight) return;
-    const left = inFlight.startedAt + SEARCH_KEY_WAIT_MS - Date.now();
-    if (left <= 0) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([read.then(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, left)))]);
-    } finally {
-      clearTimeout(timer);
+    if (inFlight) {
+      const left = inFlight.startedAt + SEARCH_KEY_WAIT_MS - Date.now();
+      if (left > 0) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([read.then(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, left)))]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    } else {
+      await read;
     }
+    return this.searchKeys.has(name) ? held() : { unreadable: true };
+  }
+
+  /**
+   * The lookup client's wait before a request to `host` (R297 b, R298 g): for api.openalex.org, `searchKeyWithin` its
+   * key (a request then goes with what is held, or without). Nothing for any other host.
+   */
+  async searchKeyReady(host: string): Promise<void> {
+    if (host !== "api.openalex.org") return;
+    await this.searchKeyWithin("openalex-api-key");
   }
 
   /** A key saved (`value`) or removed (null) through the secrets routes: used by the next request. */
@@ -1322,7 +1340,8 @@ export class ServiceState {
       // No key is read here (R298 g): OpenAlex's is read lazily by its first request, within its own short bound.
       settings: async () => (await this.readSearchSources()).settings,
       // Asked by the runner only when Elicit is on and the project's rules allow it.
-      elicitKey: () => this.searchKey("elicit-api-key"),
+      // Read as OpenAlex's is (R304 b): one shared read, bounded from its start; unreadable → the entry goes on without Elicit.
+      elicitKey: async () => (await this.searchKeyWithin("elicit-api-key")).key,
       checkEverything: () => this.findCheckEverything,
       onChange: (e) => {
         if (this.session === s) this.events.publish("find.progress", { projectId: e.projectId, entryId: e.entryId, state: e.state } satisfies FindProgressEvent);
