@@ -2813,7 +2813,8 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     const links = within(list).getAllByRole("link");
     expect(links.map((a) => [a.getAttribute("href"), a.getAttribute("aria-label")])).toEqual([
       ["https://doi.org/10.5555/ao.where", "Publisher's page (doi.org): “with offers”"],
-      ["https://catalogue.example.edu/search?q=Distinction", "Your library's catalogue (<b>catalogue.example.edu</b>): “with offers”"],
+      // R313 h: the host named is the address's own, never the one the service sent.
+      ["https://catalogue.example.edu/search?q=Distinction", "Your library's catalogue (catalogue.example.edu): “with offers”"],
     ]);
     for (const a of links) {
       expect(a.getAttribute("target")).toBe("_blank");
@@ -2870,7 +2871,7 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
       const hint = within(r).getByText("Paste an address into your browser.");
       expect(hint.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       const copies = within(list).getAllByRole("button", { name: /^Copy address: / });
-      expect(copies.map((b) => b.getAttribute("aria-label"))).toEqual(["Copy address: Publisher's page (doi.org)", "Copy address: Your library's catalogue (<b>catalogue.example.edu</b>)"]);
+      expect(copies.map((b) => b.getAttribute("aria-label"))).toEqual(["Copy address: Publisher's page (doi.org)", "Copy address: Your library's catalogue (catalogue.example.edu)"]);
       for (const b of copies) expect(b.textContent).toBe("Copy address");
       // Label and host shown as outside text (UserText): markup stays text.
       expect(list.querySelector("b")).toBeNull();
@@ -2884,18 +2885,37 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
       expect(document.activeElement).toBe(copies[1]);
     });
 
-    it("a copy that fails says the app's words for it, once", async () => {
+    it("R315 c: a copy that fails shows that place's address as text to select, with the sentence, once; focus kept", async () => {
       useService({ queues: { [PID]: queue([entry({ typed: "with offers", ...noc(), offers })]) } });
       const user = userEvent.setup();
       stubClipboard(true);
       show();
       await waitFor(() => expect(rows()).toHaveLength(1));
       const r = row("with offers");
-      const [first] = within(r).getAllByRole("button", { name: /^Copy address: / });
+      const [first, second] = within(r).getAllByRole("button", { name: /^Copy address: / });
       await user.click(first!);
-      await waitFor(() => expect(within(r).getAllByText("Copying is not available here.")).toHaveLength(1));
+      const SAID = "Copying did not work here. Select the address and copy it.";
+      await waitFor(() => expect(within(r).getAllByText(SAID)).toHaveLength(1));
+      // Under that place, not another: the address itself, as outside text, never a link.
+      const place = first!.closest("li")!;
+      expect(within(place).getByText(SAID)).toBeTruthy();
+      const address = within(place).getByText("https://doi.org/10.5555/ao.where");
+      expect(address.closest("[dir=auto]")).toBeTruthy();
+      expect(address.closest("a")).toBeNull();
+      expect(within(second!.closest("li")!).queryByText(/catalogue\.example\.edu\/search/u)).toBeNull();
       expect(within(r).queryByText("Address copied.")).toBeNull();
       expect(document.activeElement).toBe(first);
+    });
+
+    it("R313 h: an offer whose host says one site and whose address leads to another is named by the address's host", async () => {
+      const lying = [{ label: "Publisher's page", url: "https://evil.example.net/a.pdf", host: "doi.org" }] as FindEntryView["offers"];
+      useService({ queues: { [PID]: queue([entry({ typed: "lying offer", ...noc(), offers: lying })]) } });
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("lying offer");
+      expect(within(r).getByRole("button", { name: "Copy address: Publisher's page (evil.example.net)" })).toBeTruthy();
+      expect(within(r).getByText("evil.example.net")).toBeTruthy();
+      expect(r.textContent).not.toContain("doi.org");
     });
 
     it("in a browser the links stay (no Copy address, no hint)", async () => {
@@ -2907,6 +2927,18 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
       expect(within(r).queryAllByRole("button", { name: /^Copy address/ })).toHaveLength(0);
       expect(r.textContent).not.toContain("Paste an address into your browser.");
       expect(within(within(r).getByRole("list", { name: "Where to get it: “with offers”" })).getAllByRole("link")).toHaveLength(2);
+    });
+
+    it("R313 h: in a browser too, the link is named by the host its address leads to", async () => {
+      delete g.isTauri;
+      const lying = [{ label: "Publisher's page", url: "https://evil.example.net/a.pdf", host: "doi.org" }] as FindEntryView["offers"];
+      useService({ queues: { [PID]: queue([entry({ typed: "lying offer", ...noc(), offers: lying })]) } });
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const r = row("lying offer");
+      const link = within(r).getByRole("link", { name: "Publisher's page (evil.example.net): “lying offer”" });
+      expect(link.getAttribute("href")).toBe("https://evil.example.net/a.pdf");
+      expect(r.textContent).not.toContain("doi.org");
     });
   });
 

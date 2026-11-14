@@ -178,3 +178,10 @@
 .ao-find__where-title {
   font-weight: 700;
 }
+
+/* R315 c: an address that could not be copied, shown to select and copy by hand. */
+.ao-find__address {
+  user-select: text;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+}

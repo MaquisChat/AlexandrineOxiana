@@ -80,8 +80,8 @@ export const FIND_TEXT = {
   pasteHint: "Paste an address into your browser.",
   copyAddress: "Copy address",
   addressCopied: "Address copied.",
-  /** The app's words for a copy that did not work (as the Cite panel says them). */
-  copyFailed: "Copying is not available here.",
+  /** R315 c: a copy that did not work; the address is then shown under its place, to select. */
+  copyFailed: "Copying did not work here. Select the address and copy it.",
 } as const;
 
 /** Reasons on "record-complete" that "Try again" takes (F11: the rules, the store part, the waiting files' limit). */
@@ -93,23 +93,27 @@ export const reviewEntryHref = (e: FindEntryView): string =>
 
 /**
  * The entry's offers that may be shown as links: well-formed, an https: address with no name or password in it. The
- * service promises https: only; this screen does not rely on it — anything else is left out.
+ * service promises https: only; this screen does not rely on it — anything else is left out. R313 h: each is named by
+ * the host its address really leads to (parsed here), never by the `host` the service sent.
  */
 export function safeOffers(e: FindEntryView): FindOfferLink[] {
   const list: unknown = e.offers;
   if (!Array.isArray(list)) return [];
-  return list.filter((o): o is FindOfferLink => {
-    if (!o || typeof o !== "object") return false;
-    const { label, url, host } = o as Record<string, unknown>;
-    if (typeof label !== "string" || typeof url !== "string" || typeof host !== "string" || !label || !host) return false;
+  const out: FindOfferLink[] = [];
+  for (const o of list) {
+    if (!o || typeof o !== "object") continue;
+    const { label, url } = o as Record<string, unknown>;
+    if (typeof label !== "string" || typeof url !== "string" || !label) continue;
     let u: URL;
     try {
       u = new URL(url);
     } catch {
-      return false;
+      continue;
     }
-    return u.protocol === "https:" && !u.username && !u.password;
-  });
+    if (u.protocol !== "https:" || u.username || u.password || !u.host) continue;
+    out.push({ ...(o as FindOfferLink), host: u.host });
+  }
+  return out;
 }
 
 /** A record removed from the library: its entry offers only its removal (R282 g). */
@@ -368,14 +372,17 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
   // R311 a: in the desktop app a link there would do nothing; each address is copied instead (said once below).
   const copyOnly = offers.length > 0 && inDesktopShell();
   const [copySaid, setCopySaid] = useState<string | undefined>();
-  const copyAddress = async (address: string) => {
+  /** R315 c: the place whose address could not be copied: it shows the address itself, to select and copy. */
+  const [copyFailedAt, setCopyFailedAt] = useState<number | undefined>();
+  const copyAddress = async (address: string, at: number) => {
     setCopySaid(undefined);
+    setCopyFailedAt(undefined);
     try {
       if (!navigator.clipboard) throw new Error("no clipboard");
       await navigator.clipboard.writeText(address);
       setCopySaid(FIND_TEXT.addressCopied);
     } catch {
-      setCopySaid(FIND_TEXT.copyFailed);
+      setCopyFailedAt(at);
     }
   };
   const button = (kind: FindActKind) => {
@@ -448,9 +455,19 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
               copyOnly ? (
                 <li key={`${i}:${o.url}`}>
                   <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>){" "}
-                  <button type="button" data-act="copy-address" aria-label={`${FIND_TEXT.copyAddress}: ${o.label} (${o.host})`} onClick={() => void copyAddress(o.url)}>
+                  <button type="button" data-act="copy-address" aria-label={`${FIND_TEXT.copyAddress}: ${o.label} (${o.host})`} onClick={() => void copyAddress(o.url, i)}>
                     {FIND_TEXT.copyAddress}
                   </button>
+                  <div aria-live="polite">
+                    {copyFailedAt === i && (
+                      <>
+                        <p className="ao-error">{FIND_TEXT.copyFailed}</p>
+                        <UserText as="p" className="ao-find__address">
+                          {o.url}
+                        </UserText>
+                      </>
+                    )}
+                  </div>
                 </li>
               ) : (
                 <li key={`${i}:${o.url}`}>
@@ -463,7 +480,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
           </ul>
           {copyOnly && (
             <div aria-live="polite">
-              {copySaid && <p className={copySaid === FIND_TEXT.addressCopied ? "ao-ok" : "ao-error"}>{copySaid}</p>}
+              {copySaid && <p className="ao-ok">{copySaid}</p>}
             </div>
           )}
         </div>
