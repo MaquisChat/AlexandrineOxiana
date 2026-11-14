@@ -1175,6 +1175,8 @@ describe("FindAcquire: round 4 (R262)", () => {
     // it first, so it sees the old entry) and is held; the act's answer arrives; then the older read's answer arrives.
     const e = entry({ typed: "Merton", state: "not-found", updatedAt: "2026-11-13T10:00:00.000Z" });
     let hold: ReturnType<typeof held<void>> | undefined;
+    /** What the service stores: as the real retry does, the entry is written "looking-up" before the act is answered. */
+    let stored: FindEntryView = e;
     useService({
       queues: {
         [PID]: async () => {
@@ -1184,7 +1186,7 @@ describe("FindAcquire: round 4 (R262)", () => {
             await h.p;
             return HttpResponse.json(queue([e])); // read the queue before the retry was applied
           }
-          return HttpResponse.json(queue([e]));
+          return HttpResponse.json(queue([stored]));
         },
       },
     });
@@ -1192,7 +1194,8 @@ describe("FindAcquire: round 4 (R262)", () => {
     server.use(
       http.post(url(`/projects/${PID}/find/${e.id}/retry`), async () => {
         await answer.p;
-        return HttpResponse.json({ ...e, state: "looking-up", updatedAt: "2026-11-13T10:05:00.000Z" });
+        stored = { ...e, state: "looking-up", updatedAt: "2026-11-13T10:05:00.000Z" };
+        return HttpResponse.json(stored);
       }),
     );
     const user = userEvent.setup();
