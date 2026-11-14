@@ -72,7 +72,7 @@ import {
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { FIND_LIBRARY_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
+import { FIND_LIBRARY_TEXT, LIBRARY_FILE_MAX_BYTES, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn, type FindLibraryFileOutcome } from "@ao/shared";
 import { idsOf, libraryAddressFor, type LibraryAccess } from "./where.js";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
@@ -80,7 +80,7 @@ import type { AcquiredFrom, SourceFile } from "@ao/core";
 import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
 import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, sourceHasFile, type HeldFileFacts } from "../repo/review.js";
 import type { WorkCandidate } from "./candidates.js";
-import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
+import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, fileTypeByBytes, holdFindTemp } from "./fetch-file.js";
 import { checkFileAgainstRecord, type FileCheckResult } from "./file-check.js";
 import { FREE_COPY_ELSEWHERE_MAX, FREE_COPY_MAX_BYTES, FREE_COPY_SOURCES, findFreeCopies, type CopyOffer, type FreeCopySource } from "./free-copy.js";
 import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, authorOfferProbe, childTyped, fetchWork, fitAuthorEntry, fitPeople, hasInitial, isPersonId, isWorkId, peopleSearchWanted, sameWork, searchPeople, titleCovered, worksOf, type PersonDecision } from "./people.js";
@@ -320,7 +320,19 @@ function libraryAllowedBy(info: PolicyInfo, projectId: string, facts: StoreFacts
 }
 
 /** Task F15: what the entry's view says of the library (R324 a, d). `chance` absent: no start offered. */
-export type FindLibraryChanceOf = { work: WorkCandidate; chance?: "yes" | "no-library" };
+export type FindLibraryChanceOf = { work: WorkCandidate; chance?: "yes" | "no-library"; lastFile?: FindLibraryFileOutcome };
+
+/**
+ * Task F17 (R329): a file handed over for an entry, as the runner is given it. The runner never touches the place the
+ * file was handed over in (the shell's inbox): the caller's `take` copies it, read from a handle it opened and checked,
+ * into `to` — a new file (created exclusively, 0600) in the runner's own temporary folder for the entry — at most
+ * `maxBytes`, and removes it from where it was; `discard` removes it without reading it. Both are the caller's, and
+ * the runner calls exactly one of them, once. Neither throws: a file that cannot be taken is `{ ok: false, why }`.
+ */
+export interface HandedFile {
+  take(path: string, to: string, maxBytes: number): Promise<{ ok: true; bytes: number } | { ok: false; why: "too-large" | "unreadable" }>;
+  discard(path: string): Promise<void>;
+}
 
 /**
  * R328 e: what the queue's view needs of a record, and nothing more — the work as "Where to get it" and a library
@@ -651,6 +663,31 @@ export interface FindRunner {
    * or malformed ticket, or a closed runner — null, the same null whatever the cause (compared in constant time). Synchronous.
    */
   libraryHandedOver(ticket: unknown): { projectId: string; entryId: string } | null;
+  /**
+   * Task F17 (R329 d): the library's starting address this runner built at the entry's start and kept with its ticket
+   * (in memory only), without user name, password, query or fragment — for an entry handed over through the seam and
+   * not yet taken; otherwise null. It is the address a held file's record keeps: never one the shell or a page gave.
+   */
+  libraryAddressOf(projectId: string, entryId: string): string | null;
+  /**
+   * Task F17 (R329 c–g): the file handed over for an entry the seam (`libraryHandedOver`) has just answered for. From
+   * the seam's answer until this ends the entry is at work: "Cancel" is refused (FindEntryStateError), and a resume (a
+   * save of the rules, an unlock) leaves it waiting. The file is taken (`file.take`) into the runner's temporary folder
+   * for the entry, its type decided by its complete bytes (a PDF or EPUB, as for a downloaded copy), checked against the
+   * record as advice, and HELD as a found copy is — one governed change: the review entry, the held file, the entry's
+   * "needs-check" — with the record of how it was got (`library_access`, `via`, `signed-in-session`, `address`). R301:
+   * nothing is attached. FIND_HELD_MAX does not refuse it (R329 f). Written only if the entry is still the one that
+   * waited (its version as first read after the seam). Otherwise:
+   *  - the entry removed, or its record deleted, meanwhile: nothing is held; nothing is written about the file;
+   *  - the project locked or the runner closed: nothing is written; the entry comes back at the unlock or the next open;
+   *  - not a PDF or EPUB, too large, unreadable, the rules refuse (`library_access`, the store, the legal basis): the
+   *    file is destroyed and the entry returns to exactly what it was (`returnTo`); the view says why (`lastFile`, in
+   *    memory only, dropped at the entry's next start);
+   *  - the record gained a file meanwhile: nothing is held, "in-library".
+   * Called without a hand-over for the entry, or with an address other than the one kept (`libraryAddressOf`), the
+   * file is discarded and nothing is taken. Never rejects; nothing of the path or the address is logged or audited.
+   */
+  acceptLibraryFile(projectId: string, entryId: string, path: string, via: "sign-in-window" | "browser-extension", address: string, file: HandedFile): Promise<void>;
   /** Task F15: whether the runner is working on the entry, or has it queued or waiting for a retry (no start is offered then). */
   atWork(projectId: string, entryId: string): boolean;
   /**
@@ -911,6 +948,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }, FIND_INDEX_WAIT_MS);
   }
   const keyOfRun = (pid: string, eid: string) => `${pid}\u0000${eid}`;
+  /** F17 (R338 i): the view's last outcome of the entry's handed-over file goes (see `fileOutcomes`). */
+  function dropFileOutcome(pid: string, eid: string): void {
+    fileOutcomes.delete(keyOfRun(pid, eid));
+  }
 
   function freshRun(): Run {
     let signalStop!: () => void;
@@ -1040,6 +1081,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function write(pid: string, next: FindEntry[], op: "add" | "update" | "remove" | "library-start", alongside: FindEntry[] = []): Promise<FindEntry[]> {
     const fitted = [...next.map(fit), ...alongside.map(fit)];
     await appendFindEntriesIn(repo, pid, fitted.slice(0, next.length), op, fitted.slice(next.length));
+    // F17 (R338 i): the view's last outcome of a handed-over file is dropped at any later write of the entry's line.
+    for (const e of fitted) dropFileOutcome(pid, e.id);
     if (op !== "remove") {
       for (const e of fitted) {
         if (e.state !== "looking-up") madeHere.delete(e.id);
@@ -2422,10 +2465,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // close: tickets are in memory only) returns to what it was — never resumed as a fetch. One with an open ticket
       // (a resume after the rules were saved) is left waiting. Back in the copy part, it goes on as at any resume.
       for (const e of q.values()) {
-        if (e.state !== "waiting-sign-in" || ticketFor(projectId, e.id)) continue;
+        if (e.state !== "waiting-sign-in" || ticketFor(projectId, e.id) || handed.has(keyOfRun(projectId, e.id))) continue;
         const back = await inTurn(r, projectId, () => alive(projectId, gen), async () => {
           const cur = await current(projectId, e.id);
-          if (!cur || cur.state !== "waiting-sign-in" || ticketFor(projectId, e.id)) return null;
+          if (!cur || cur.state !== "waiting-sign-in" || ticketFor(projectId, e.id) || handed.has(keyOfRun(projectId, e.id))) return null;
           const [w] = await write(projectId, [returnedFrom(cur, stamp())], "update");
           return w ?? null;
         });
@@ -2661,7 +2704,20 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   // fetches anything from the library: it hands back an address and a ticket. ONE ticket at a time, in memory only.
 
   /** The open ticket (at most one). */
-  let libTicket: { ticket: string; projectId: string; entryId: string; expires: number; timer: unknown } | undefined;
+  let libTicket: { ticket: string; projectId: string; entryId: string; expires: number; timer: unknown; address: string } | undefined;
+  /**
+   * F17 (R329 c, d): the entries handed over through the seam whose file is not yet taken or refused (`keyOfRun`), each
+   * with the starting address kept from its ticket. At work while here. In memory only.
+   */
+  const handed = new Map<string, { address: string; taking?: true }>();
+  /**
+   * F17 (R329 g): what became of the last file of an entry that could not be held. In memory only; set only with the
+   * entry's own return (`bringBack`, which writes the entry back: never for an entry that is gone), dropped at any later
+   * write of the entry's line, its removal included (`write`, R338 i). An entry with an outcome rests; every write of a
+   * resting entry goes through `write` (the other writers of the queue — a hold, a decision, a removal with its waiting
+   * file, a record's removal — touch only an entry that is fetching or holds a waiting file).
+   */
+  const fileOutcomes = new Map<string, FindLibraryFileOutcome>();
   /** A start between its synchronous check and its ticket: another start meanwhile is "busy". */
   let libClaimed = false;
   /** When the last hand-over was (the pause): the caller's (R328 f), else this runner's own. */
@@ -2680,6 +2736,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function libraryChances(projectId: string, entries: Iterable<FindEntry>, access: LibraryAccess | null): Promise<Map<string, FindLibraryChanceOf>> {
     assertOpen();
     const out = await libraryChancesOf(repo, projectId, entries, { access, atWork: (id) => atWork(projectId, id), records });
+    // F17 (R329 g): what became of the last file of an entry that could not be held.
+    for (const [id, c] of out) {
+      const last = fileOutcomes.get(keyOfRun(projectId, id));
+      if (last) c.lastFile = last;
+    }
     // Closed or the project locked while it was read: what was read is not kept.
     if (closed) records.clear();
     else if (!repo.isUnlocked(projectId)) records.dropProject(projectId);
@@ -2688,7 +2749,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   function atWork(projectId: string, entryId: string): boolean {
     const r = runs.get(projectId);
-    return running.has(keyOfRun(projectId, entryId)) || !!r?.pending.includes(entryId) || !!r?.timers.has(entryId);
+    const k = keyOfRun(projectId, entryId);
+    return running.has(k) || handed.has(k) || !!r?.pending.includes(entryId) || !!r?.timers.has(entryId);
   }
 
   async function libraryStart(projectId: string, entryId: string, access: LibraryAccess | null): Promise<{ url: string; ticket: string; entry: FindEntry }> {
@@ -2722,7 +2784,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         if (closed || runs.get(projectId)?.stopped) throw new FindProjectStoppedError();
         const ticket = randomBytes(16).toString("hex");
         const timer = timers.setTimeout(() => void ticketEnded(ticket), LIBRARY_TICKET_MS);
-        libTicket = { ticket, projectId, entryId, expires: now().getTime() + LIBRARY_TICKET_MS, timer };
+        // F17 (R329 d): the address a file got this way records — this start's own, without its query (so without
+        // the work's DOI) or any user name, password or fragment; in memory only, with the ticket.
+        libTicket = { ticket, projectId, entryId, expires: now().getTime() + LIBRARY_TICKET_MS, timer, address: cleanAcquiredAddress(url) };
         return { url, ticket, entry: entry! };
       });
     } finally {
@@ -2730,12 +2794,18 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
   }
 
-  /** The entry back to what it was, in an act's turn, if it is still waiting (and, from `resume`, has no open ticket). */
-  async function bringBack(projectId: string, entryId: string): Promise<FindEntry | null> {
+  /**
+   * The entry back to what it was, in an act's turn, if it is still waiting and has no open ticket. With `outcome` (the
+   * hand-over's own return, R329 g): what became of its file, kept for the view only when the entry was written back.
+   * (Never called for an entry handed over and not yet done: the ticket's end cannot meet one, and the hand-over clears
+   * its mark first — R338 e.)
+   */
+  async function bringBack(projectId: string, entryId: string, outcome?: FindLibraryFileOutcome): Promise<FindEntry | null> {
     return act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur || cur.state !== "waiting-sign-in" || ticketFor(projectId, entryId)) return null;
       const [w] = await write(projectId, [returnedFrom(cur, stamp())], "update");
+      if (w && outcome) fileOutcomes.set(keyOfRun(projectId, entryId), outcome);
       return w ?? null;
     });
   }
@@ -2756,6 +2826,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       if (cur.state !== "waiting-sign-in") throw new FindEntryStateError();
+      // F17 (R329 c): its file is being taken: the hand-over's outcome is written first.
+      if (handed.has(keyOfRun(projectId, entryId))) throw new FindEntryStateError();
       if (ticketFor(projectId, entryId)) dropTicket();
       const [w] = await write(projectId, [returnedFrom(cur, stamp())], "update");
       return w!;
@@ -2773,7 +2845,165 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     dropTicket();
     handOver.set(at);
+    // F17 (R329 c): from this answer until its outcome is written, the entry is at work.
+    handed.set(keyOfRun(t.projectId, t.entryId), { address: t.address });
     return { projectId: t.projectId, entryId: t.entryId };
+  }
+
+  function libraryAddressOf(projectId: string, entryId: string): string | null {
+    return handed.get(keyOfRun(projectId, entryId))?.address ?? null;
+  }
+
+  /** F17 (R329 g): why the rules refused the file at its hold, as the view says it. */
+  async function heldRefusal(pid: string, err: PolicyDeniedError, prov: Provenance): Promise<FindLibraryFileOutcome> {
+    if (err.action !== "store") return "rules-method";
+    return (await refusalOf(pid, err, { identifiable: prov.identifiable, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) })) === NO_LEGAL_BASIS ? "rules-legal-basis" : "rules-store";
+  }
+
+  function acceptLibraryFile(projectId: string, entryId: string, path: string, via: "sign-in-window" | "browser-extension", address: string, file: HandedFile): Promise<void> {
+    const k = keyOfRun(projectId, entryId);
+    const mine = handed.get(k);
+    const drop = () => file.discard(path).catch(() => undefined);
+    if (!mine || mine.taking || closed) {
+      // Not handed over through the seam (or already being taken): nothing is read; the file goes. A closed runner
+      // clears the mark of the hand-over it will never take (R338 f).
+      if (mine && !mine.taking) handed.delete(k);
+      return drop();
+    }
+    // Taken once: a second call for the same hand-over is refused like one without a hand-over.
+    mine.taking = true;
+    const p = takeLibraryFile(projectId, entryId, path, via, address, mine.address, file, k).catch((err: unknown) => {
+      debug(`find: a file from the library could not be kept (${errName(err)})`);
+    });
+    inflight.add(p);
+    void p.finally(() => inflight.delete(p));
+    return p;
+  }
+
+  async function takeLibraryFile(
+    projectId: string,
+    entryId: string,
+    path: string,
+    via: "sign-in-window" | "browser-extension",
+    address: string,
+    kept: string,
+    file: HandedFile,
+    k: string,
+  ): Promise<void> {
+    // At work until the end (R329 c): the entry stays in `handed` (`atWork`, Cancel and a resume see it there).
+    let taken = false;
+    let written = false;
+    let outcome: FindLibraryFileOutcome | undefined;
+    let folder: string | undefined;
+    let release: (() => void) | undefined;
+    const folderName = `find-${entryId}`;
+    // R338 h: the check stops when the project is locked or the library closed, as the copy part's does.
+    const r = runOf(projectId);
+    // R338 f: every statement after the seam's mark is inside this `try`; the outer `finally` clears the mark and
+    // discards the handed file whatever was thrown.
+    try {
+      folder = join(repoLibrary(repo).root, ".tmp", folderName);
+      release = holdFindTemp(folderName);
+      // The address is the one this runner built at the start, never one the caller was told by anyone else.
+      if (address !== kept) {
+        outcome = "unreadable";
+        return;
+      }
+      // The entry as it is now (the version the outcome is written against) and its record.
+      const first = await act(projectId, () => current(projectId, entryId));
+      if (!first || first.state !== "waiting-sign-in" || !first.sourceId) return;
+      let sf: SourceFile;
+      try {
+        sf = await repo.getSource(projectId, first.sourceId);
+      } catch (err) {
+        if (err instanceof NotFoundError) return; // the record was deleted: nothing is held
+        throw err;
+      }
+      await fsp.mkdir(folder, { recursive: true, mode: 0o700 });
+      const st = await fsp.lstat(folder);
+      if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("not a folder");
+      const into = join(folder, "handed-over");
+      taken = true;
+      const got = await file.take(path, into, LIBRARY_FILE_MAX_BYTES);
+      if (!got.ok) {
+        outcome = got.why;
+        return;
+      }
+      // The type by the complete file's bytes, as for a downloaded copy: a file the shell called a PDF may be refused.
+      const mime = await fileTypeByBytes(into).catch(() => undefined);
+      if (!mime) {
+        outcome = "not-pdf";
+        return;
+      }
+      const kind = mime === "application/pdf" ? "pdf" : "epub";
+      const fromPath = join(folder, `handed-over.${kind}`);
+      await fsp.rename(into, fromPath);
+      const record = { title: primary(sf.source.title) ?? "", creators: sf.source.creators, ...(sf.source.identifiers.doi ? { doi: sf.source.identifiers.doi } : {}), ...(sf.source.container && primary(sf.source.container) ? { container: primary(sf.source.container)! } : {}) };
+      let check: FileCheckResult;
+      try {
+        check = await guard(r, checkFileAgainstRecord(fromPath, record), FIND_CHECK_TIMEOUT_MS);
+      } catch (err) {
+        if (!(err instanceof TimedOut)) throw err;
+        debug("find: the file check did not end in time");
+        check = { match: false, why: "no-text", evidence: { kind, bytes: got.bytes } };
+      }
+      const ev = check.evidence;
+      await act(projectId, async () => {
+        const cur = await current(projectId, entryId);
+        // R329 c: only if the entry is still the one that waited.
+        if (!cur || cur.state !== "waiting-sign-in" || !sameVersion(cur, first)) return;
+        const facts: HeldFileFacts = {
+          ...(check.match ? { why: "looks-right", by: check.by } : { why: check.why }),
+          kind: ev.kind,
+          bytes: ev.bytes,
+          ...(ev.fileDoi ? { fileDoi: ev.fileDoi } : {}),
+          ...(ev.embeddedTitle ? { embeddedTitle: ev.embeddedTitle } : {}),
+          ...(ev.textStart ? { textStart: ev.textStart } : {}),
+          acquired: { method: "library_access", via, address: kept, at: stamp(), tool: { name: FIND_TOOL, version: VERSION }, access: "signed-in-session" },
+        };
+        const next = fit(evolve(cur, { state: "needs-check", reason: { code: `file-${facts.why}` } }, ["returnTo", "nextTryAt", "offers"], stamp()));
+        try {
+          await holdMismatchedFileIn(repo, projectId, { entry: next, sourceId: cur.sourceId!, fromPath, facts, handedOver: true });
+        } catch (err) {
+          if (err instanceof HeldFileEntryGoneError || err instanceof NotFoundError) return;
+          if (err instanceof HeldFileSourceHasFileError) {
+            await write(projectId, [evolve(cur, { state: "in-library" }, ["returnTo", "reason", "nextTryAt", "offers"], stamp())], "update");
+            written = true;
+            return;
+          }
+          if (err instanceof PolicyDeniedError) {
+            outcome = await heldRefusal(projectId, err, sf.source.provenance);
+            return;
+          }
+          throw err;
+        }
+        written = true;
+        notify(projectId, entryId, "needs-check");
+      });
+    } catch (err) {
+      // R338 g: a file taken and not kept is always said — any failure not foreseen above gives "could not be read"
+      // (shown only if the entry is written back: not after a lock or a close, which write nothing).
+      if (!(err instanceof Abandoned || err instanceof FindProjectStoppedError || err instanceof FindRunnerClosedError)) {
+        debug(`find: a file from the library could not be kept (${errName(err)})`);
+      }
+      outcome = "unreadable";
+    } finally {
+      // R338 f: whatever was thrown, the handed file is discarded (if it was never taken) and the mark goes.
+      try {
+        if (!taken) await file.discard(path).catch(() => undefined);
+        if (folder !== undefined && !released) await fsp.rm(folder, { recursive: true, force: true }).catch(() => {});
+        release?.();
+      } finally {
+        handed.delete(k);
+      }
+      // Not held: the entry returns to exactly what it was (R324 b, R329 g), saying what became of its file — now,
+      // unless the project is stopped or the runner closed (then at the unlock's or the next open's resume, as F15
+      // built it).
+      if (!written && !closed && !runs.get(projectId)?.stopped) {
+        const back = await bringBack(projectId, entryId, outcome).catch(() => null);
+        if (back && inCopyPart(back)) enqueue(projectId, back.id);
+      }
+    }
   }
 
   return {
@@ -2801,5 +3031,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     libraryHandedOver,
     atWork,
     libraryChances,
+    libraryAddressOf,
+    acceptLibraryFile,
   };
 }
