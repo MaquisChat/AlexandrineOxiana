@@ -32,11 +32,12 @@
  * check says (HELD_FILE_WHY_TEXT) and the file's facts, all outside text through UserText — with its own "Use this
  * file" and "Not this file": one request per press, one file per request; nothing decides several files at once
  * (R303 a). The files that look right are gathered first ("Files that look right (N)"), the others after them ("Other
- * files found (N)"); a group with no file is not shown. One file's decision under way leaves the others usable. After
- * a decision focus goes to the next waiting file's "Use this file" (in the same group, else the first of the other
- * group), else to the queue's heading, or to the message that nothing is waiting.
+ * files found (N)"); a group with no file is not shown. One file's decision under way leaves the others usable.
+ * R319: nothing moves under the pointer — a decided file keeps its card in its place, saying what was decided, without
+ * controls; files that arrive are counted on a line and come in only by "Show them". After a decision focus goes to
+ * the next waiting card's heading (R313 a), else to the section's heading, or to the message that nothing is waiting.
  */
-import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type KeyboardEvent, type ReactNode, type Ref } from "react";
 import { ApiClientError, type ApiClient } from "../../api/client";
 import {
   importApi,
@@ -143,16 +144,17 @@ export interface ReviewQueueProps {
 export const SOURCE_POOL = 6;
 
 /**
- * R313 c, R318 b: the quiet. While it is in force no "Use this file" or "Not this file" acts — by key or by pointer. It
- * lasts this long from the LATEST of these moments:
- *  - a waiting file leaving the list (decided, or already decided);
- *  - the list being read again while it holds waiting files (its cards move; the first read only shows them);
+ * R313 c, R318 b, R319 d: the quiet. While it is in force no "Use this file" or "Not this file" acts — by key or by
+ * pointer. Since R319 a decided file's card stays in its place and no card takes it (nothing moves under the pointer);
+ * the quiet is kept for the moments the section's cards DO appear where they were not. It lasts this long from the
+ * LATEST of these moments:
+ *  - the section laid out: at the screen's opening, and afresh by "Show them" (R319 c);
+ *  - the section shown again after the queue was read again during the visit (it is gone while the queue is read);
  *  - a press on a deciding control that is not taken: on a card whose own decision is out (that card is still
- *    working, or is about to leave), or a press swallowed by the quiet itself.
- * A press that is taken (a card at rest, no quiet in force) starts no quiet: one file's wait does not hold back a
- * deliberate decision on another. So steady pressing at one spot never reaches the card that takes a decided file's
- * place: only a press after this long without any press on a deciding control (and without a file leaving or the list
- * moving) acts. Long enough for a double click or a quick second key press; short enough not to slow deliberate work.
+ *    working), or a press swallowed by the quiet itself.
+ * A decision answered starts none (its card stays where it was, without controls). A press that is taken (a card at
+ * rest, no quiet in force) starts none either: one file's wait does not hold back a deliberate decision on another.
+ * Long enough for a double click or a quick second key press; short enough not to slow deliberate work.
  */
 export const DECIDE_SETTLE_MS = 600;
 
@@ -167,6 +169,14 @@ export const HELD_DECIDE_WORDS: Readonly<Record<HeldFileDecision, { idle: string
   attach: { idle: "Use this file", working: "Using this file…" },
   discard: { idle: "Not this file", working: "Removing this file…" },
 };
+
+/** What became of a file decided in this visit (R319 a, b): attached, discarded, or found already decided. */
+type FileEnd = HeldFileDecision | "already";
+/** R319: the found files' section as laid out — its cards in their places — and what became of those decided here. */
+interface FileLayout {
+  items: HeldItem[];
+  ended: Readonly<Record<string, FileEnd>>;
+}
 
 /** Entries per page when the project's whole queue is read. */
 export const PROJECT_PAGE = 500;
@@ -251,15 +261,46 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  /** The polite region's words; a new `n` is a new node, so the same words twice are said twice (R313 g). */
-  const [said, setSaid] = useState({ text: "", n: 0 });
-  const setStatus = useCallback((text: string) => setSaid((cur) => ({ text, n: cur.n + 1 })), []);
+  /**
+   * The polite region's messages; each is its own node, so the same words twice are said twice (R313 g). R319 e: a new
+   * message never takes the place of one not yet shown — those already shown give way, those not yet shown stay before
+   * it (a decision's result set in the same moment as the notice of a press not taken is said, then the notice).
+   */
+  const [said, setSaid] = useState<{ msgs: ReadonlyArray<{ text: string; n: number }>; n: number }>({ msgs: [], n: 0 });
+  /** The `n` of the last message shown. */
+  const saidShown = useRef(0);
+  useEffect(() => {
+    saidShown.current = said.n;
+  }, [said]);
+  const setStatus = useCallback(
+    (text: string) =>
+      setSaid((cur) => {
+        const n = cur.n + 1;
+        return { n, msgs: text ? [...cur.msgs.filter((m) => m.n > saidShown.current), { text, n }] : [] };
+      }),
+    [],
+  );
   const [focusId, setFocusId] = useState<{ id: string | null } | null>(null);
   /** Waiting files (F11, R303): the decision under way on each, the service's sentence for a refused one, where focus goes after one. */
   const [heldBusy, setHeldBusy] = useState<Readonly<Record<string, HeldFileDecision>>>({});
   const heldBusyRef = useRef(new Set<string>());
   const [heldErrors, setHeldErrors] = useState<Readonly<Record<string, string>>>({});
   const [fileFocus, setFileFocus] = useState<{ to: string } | null>(null);
+  /**
+   * R319: the found files' section as laid out (null until the queue is first read; again after a lock or for another
+   * project). Its cards stay in their places for the whole visit: a decided file keeps its card, a file the service no
+   * longer lists keeps its card, and files that arrive are not slid in — only "Show them" lays it out afresh.
+   */
+  const [laid, setLaid] = useState<FileLayout | null>(null);
+  const laidRef = useRef(laid);
+  /** The project (and source) the section was laid out for. */
+  const laidFor = useRef<string | null>(null);
+  const putLayout = useCallback((l: FileLayout | null) => {
+    laidRef.current = l;
+    setLaid(l);
+  }, []);
+  /** The found files' section's heading: focus goes there after "Show them", and after the last waiting file. */
+  const foundHead = useRef<HTMLHeadingElement>(null);
 
   /** The project's queue is locked (PROJECT_LOCKED): nothing of it is shown until it is unlocked here. */
   const [locked, setLocked] = useState(false);
@@ -352,6 +393,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     setError(null);
     setHeldBusy({});
     setHeldErrors({});
+    // Nothing of the found files' section outlives a lock: unlocked, it is laid out afresh.
+    putLayout(null);
     setStore(recordStore());
     setLocked(true);
   }, []);
@@ -363,8 +406,12 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     pool.current = p;
     let live = true;
     const ok = () => live && g === gen.current;
-    // R313 c: a list read again moves its cards; the first read only shows them.
-    const reread = !!itemsRef.current?.some(isFound);
+    // R319: the section's layout belongs to one project (and source); another one is laid out afresh.
+    const layoutKey = `${projectId}\n${sourceId ?? ""}\n${batchId ?? ""}`;
+    if (laidFor.current !== layoutKey) {
+      laidFor.current = layoutKey;
+      putLayout(null);
+    }
     setError(null);
     setItems(null);
     /** Every page of the project's queue, oldest first; a page for an older generation stops the read. */
@@ -381,11 +428,23 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     (batchId ? api.review(batchId) : readAll()).then(
       (list) => {
         if (!ok()) return;
-        if (reread && list.some(isFound)) holdQuiet(Date.now());
+        const shown = laidRef.current;
+        if (!shown) {
+          // R319 d: the screen's opening lays the section out; its cards appear, so the quiet holds.
+          const files = list.filter(isFound) as HeldItem[];
+          putLayout({ items: files, ended: {} });
+          if (files.length) holdQuiet(Date.now());
+        } else if (shown.items.length) {
+          // Read again during the visit: the cards stay as laid out (a file no longer listed keeps its card, R319 b; one
+          // that arrived is only counted, R319 c). The section was gone while the queue was read and is shown again,
+          // in the same order, so the quiet holds (R313 c).
+          holdQuiet(Date.now());
+        }
         setItems(list);
         const back = refocusAfterRead.current;
         refocusAfterRead.current = null;
-        if (back) setFileFocus({ to: list.some((i) => i.id === back) ? back : ":title" });
+        // R313 e: back to that file's heading; its card is still in its place (R319 b), whether or not it still waits.
+        if (back) setFileFocus({ to: laidRef.current?.items.some((i) => i.id === back) ? back : ":title" });
         // A waiting file is shown in full in its own section; the panel shows the first of the others.
         setCurrent(list.find((i) => !isFound(i))?.id ?? null);
         // Titles come with the items; only items sent without one need their record for the list. A waiting file's
@@ -410,7 +469,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       flushTimer.current = null;
       arrived.current = new Map();
     };
-  }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget, holdQuiet]);
+  }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget, holdQuiet, putLayout]);
   // Unmounting moves the generation on: a decision answered after the screen closed changes nothing.
   useEffect(() => () => void gen.current++, []);
 
@@ -596,8 +655,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const { [id]: _drop, ...rest } = rec;
     return rest;
   };
-  /** A waiting file left the queue: the next waiting file (the same group, else the other), else the heading or the empty message. */
-  const fileLeft = (item: ReviewItem, said: (n: number) => string) => {
+  /**
+   * A waiting file left the queue (decided here, or found already decided). R319 a: its card stays where it is, without
+   * controls, saying what became of it; nothing moves, so no quiet starts. Focus goes to the next WAITING card's heading
+   * (the next in its group, else the one before it, else the first waiting card of the other group; decided and departed
+   * cards are skipped), else to the section's heading while other entries wait, else to the message that nothing waits.
+   */
+  const fileLeft = (item: ReviewItem, end: FileEnd, said: (n: number) => string) => {
     const list = itemsRef.current ?? [];
     const at = list.findIndex((x) => x.id === item.id);
     if (at < 0) return;
@@ -605,29 +669,47 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const active = document.activeElement;
     const card = fileCards.current.get(item.id);
     const hadFocus = !active || active === document.body || (!!card && card.contains(active));
-    const found = list.filter(isFound);
-    const mine = found.filter((x) => looksRight(x) === looksRight(item));
-    const theirs = found.filter((x) => looksRight(x) !== looksRight(item));
-    const k = mine.findIndex((x) => x.id === item.id);
-    const restMine = mine.filter((x) => x.id !== item.id);
-    const next = restMine[Math.min(k, restMine.length - 1)] ?? theirs[0];
     const rest = list.filter((x) => x.id !== item.id);
+    const layout = laidRef.current;
+    const ended = { ...(layout?.ended ?? {}), [item.id]: end };
+    const still = new Set(rest.map((x) => x.id));
+    const waiting = (x: ReviewItem) => still.has(x.id) && !ended[x.id];
+    const laidOut = layout?.items ?? [];
+    const mine = laidOut.filter((x) => looksRight(x) === looksRight(item));
+    const k = mine.findIndex((x) => x.id === item.id);
+    const next =
+      mine.slice(k + 1).find(waiting) ?? mine.slice(0, Math.max(0, k)).reverse().find(waiting) ?? laidOut.filter((x) => looksRight(x) !== looksRight(item)).find(waiting);
     itemsRef.current = rest;
-    // R313 c: the next card now lies where this one was; a press meant for this one must not fall on it.
-    holdQuiet(Date.now());
+    if (layout) putLayout({ ...layout, ended });
     setItems(rest);
     setSelected((s) => s.filter((x) => x !== item.id));
+    setHeldErrors((cur) => withoutKey(cur, item.id));
     setStatus(said(at + 1));
-    if (hadFocus) setFileFocus({ to: next ? next.id : rest.length ? ":title" : ":empty" });
+    if (hadFocus) setFileFocus({ to: next ? next.id : rest.length ? ":section" : ":empty" });
+  };
+  /**
+   * R319 c: "Show them" — the section laid out afresh from the queue as last read: decided and departed cards go, the
+   * files that arrived come in, each in its group. Focus goes to the section's heading, it is said once, and the quiet
+   * holds (the cards have moved, as the researcher asked).
+   */
+  const layOutAgain = () => {
+    const list = itemsRef.current ?? [];
+    putLayout({ items: list.filter(isFound) as HeldItem[], ended: {} });
+    holdQuiet(Date.now());
+    setStatus(FOUND_FILES_TEXT.laidOut);
+    setFileFocus({ to: ":section" });
   };
   useEffect(() => {
     if (!fileFocus) return;
     const t = fileFocus.to;
     // R313 a: a waiting file's heading, never a control that decides.
-    const el = t === ":empty" ? emptyNote.current : t === ":title" ? title.current : (fileHeads.current.get(t) ?? title.current);
+    const el =
+      t === ":empty" ? emptyNote.current : t === ":title" ? title.current : t === ":section" ? (foundHead.current ?? title.current) : (fileHeads.current.get(t) ?? title.current);
     el?.focus();
   }, [fileFocus]);
   const decideHeld = async (item: ReviewItem, decision: HeldFileDecision) => {
+    // R319 a: a file decided here, or no longer listed, has no control that decides; nothing may decide it again.
+    if (laidRef.current?.ended[item.id] || !(itemsRef.current ?? []).some((x) => x.id === item.id)) return;
     const now = Date.now();
     // R318 b: a press on a card whose own decision is out is not taken, and starts the quiet again from this press; it
     // says nothing more (its button already says it is working).
@@ -668,7 +750,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       const body: HeldFileDecisionRequest = { projectId, decision };
       await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body, signal: abort.signal });
       if (late || g !== gen.current) return;
-      fileLeft(item, (n) => `${decision === "attach" ? "File added to its record" : "File removed; the record keeps no file"}: ${titleFor(item, n)}`);
+      fileLeft(item, decision, (n) => `${FOUND_FILES_TEXT.result[decision]}: ${titleFor(item, n)}`);
     } catch (e) {
       if (late || g !== gen.current) return;
       if (isProjectLocked(e)) {
@@ -678,7 +760,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       // R282 d: the entry leaves only when the service says it was already decided; any other refusal (paused, the
       // record gone, …) is said in the service's sentence and the entry stays.
       if (e instanceof ApiClientError && e.code === "CONFLICT" && e.reason === ("already-decided" satisfies HeldFileRefusalReason)) {
-        fileLeft(item, (n) => `This entry had already been decided, so it left the queue: ${titleFor(item, n)}`);
+        fileLeft(item, "already", (n) => `${FOUND_FILES_TEXT.result.already}: ${titleFor(item, n)}`);
         return;
       }
       setHeldErrors((cur) => ({ ...cur, [item.id]: e instanceof ApiClientError && e.message ? e.message : errorText(e) }));
@@ -740,7 +822,14 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const item = currentItem;
   /** The entries listed beside the panel, and the waiting files, shown in their own section (R303 b). */
   const listed = useMemo(() => (projectWide ? (items ?? []).filter((i) => !isFound(i)) : (items ?? [])), [items, projectWide]);
-  const found = useMemo(() => (projectWide ? ((items ?? []).filter(isFound) as HeldItem[]) : []), [items, projectWide]);
+  /** R319: the waiting files the service lists now (by id); those not laid out have arrived during the visit. */
+  const waitingIds = useMemo(() => new Set((items ?? []).filter(isFound).map((i) => i.id)), [items]);
+  const arrivedCount = useMemo(() => {
+    const laidIds = new Set(laid?.items.map((i) => i.id));
+    let k = 0;
+    for (const id of waitingIds) if (!laidIds.has(id)) k++;
+    return k;
+  }, [laid, waitingIds]);
   const flagging = policy?.pseudonymizeNames === true;
   /** Only import entries can be edited together (the library's bulk edit takes import items). */
   const selectable = useMemo(() => listed.filter((i) => i.kind === "import"), [listed]);
@@ -786,9 +875,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         </p>
       ) : null}
       <ErrorNote error={error} />
-      <p className="ao-visually-hidden" role="status">
-        {said.text && <span key={said.n}>{said.text}</span>}
-      </p>
+      <div className="ao-visually-hidden" role="status">
+        {said.msgs.map((m) => (
+          <p key={m.n}>{m.text}</p>
+        ))}
+      </div>
       {locked && (
         <UnlockProject
           api={libApi}
@@ -876,8 +967,21 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           )}
         </div>
       )}
-      {!locked && items !== null && found.length > 0 && (
-        <FoundFiles items={found} store={store} busy={heldBusy} errors={heldErrors} headRef={headRefFor} cardRef={cardRefFor} onDecide={(i, d) => void decideHeld(i, d)} />
+      {!locked && items !== null && projectWide && laid && (laid.items.length > 0 || arrivedCount > 0) && (
+        <FoundFiles
+          items={laid.items}
+          waiting={waitingIds}
+          ended={laid.ended}
+          arrived={arrivedCount}
+          store={store}
+          busy={heldBusy}
+          errors={heldErrors}
+          sectionRef={foundHead}
+          headRef={headRefFor}
+          cardRef={cardRefFor}
+          onDecide={(i, d) => void decideHeld(i, d)}
+          onShowArrived={layOutAgain}
+        />
       )}
     </main>
   );
@@ -1026,16 +1130,40 @@ export const FOUND_FILES_TEXT = {
   right: (k: number) => `Files that look right (${fmt(k)})`,
   other: (k: number) => `Other files found (${fmt(k)})`,
   intro: "Each file waits for your decision. “Use this file” adds it to its record; “Not this file” removes it.",
+  /** What became of a file, said in the polite region (with the record's title) and on its card (as a sentence, R319 a). */
+  result: {
+    attach: "File added to its record",
+    discard: "File removed; the record keeps no file",
+    already: "This entry had already been decided, so it left the queue",
+  } satisfies Record<FileEnd, string>,
+  /** R319 a: the label on a card decided in this visit. */
+  decided: "Decided",
+  /** R319 b: a card whose file the service no longer lists. */
+  gone: "No longer waiting.",
+  /** R319 c: the line that counts the files that arrived during the visit, and its control. */
+  arrived: (k: number) => (k === 1 ? "1 more file has arrived since this list was opened." : `${fmt(k)} more files have arrived since this list was opened.`),
+  showThem: "Show them",
+  /** R319 c: said once after "Show them". */
+  laidOut: "The list was laid out again.",
 } as const;
 
 interface FoundFilesProps {
+  /** The cards as laid out (R319): they stay in their places for the visit. */
   items: HeldItem[];
+  /** The waiting files the service lists now. */
+  waiting: ReadonlySet<string>;
+  /** What became of the files decided in this visit. */
+  ended: Readonly<Record<string, FileEnd>>;
+  /** Waiting files that arrived during the visit, not laid out (R319 c). */
+  arrived: number;
   store: RecordStore;
   busy: Readonly<Record<string, HeldFileDecision>>;
   errors: Readonly<Record<string, string>>;
   headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
+  sectionRef: Ref<HTMLHeadingElement>;
   onDecide(item: HeldItem, decision: HeldFileDecision): void;
+  onShowArrived(): void;
 }
 
 /** What the app's check says of a file, in the app's own words; nothing for a `why` it does not have (R313 f). */
@@ -1057,8 +1185,14 @@ function describeRecord(item: HeldItem, record: SourceFile | undefined): string 
  * each group under its heading with its number; a group with no file is not shown. No control here decides more than
  * one file. R313 g: each file's controls are named so that two files can be told apart — the record's title, first
  * creator and year, and "file k of n" where two would still be named alike.
+ *
+ * R319: nothing moves under the pointer. The cards are those laid out; each stays in its place for the visit — a file
+ * decided here keeps its card with what was decided in words and no control, a file the service no longer lists keeps
+ * its card saying it no longer waits — and a group's number counts the files still waiting (a group all decided shows 0
+ * and stays). Files that arrive are only counted, on a line in a place kept for it above the groups (laid out whether
+ * or not it says anything, so its appearing moves nothing); "Show them" lays the section out afresh.
  */
-function FoundFiles({ items, store, busy, errors, headRef, cardRef, onDecide }: FoundFilesProps) {
+function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, headRef, cardRef, onDecide, onShowArrived }: FoundFilesProps) {
   // Re-rendered when a record is read: the names depend on every waiting file's record.
   useSyncExternalStore(store.subscribe, store.version);
   const right = items.filter(looksRight);
@@ -1076,6 +1210,8 @@ function FoundFiles({ items, store, busy, errors, headRef, cardRef, onDecide }: 
     }
   }
   const id = useId();
+  /** A card still waiting: listed by the service now, and not decided here (R319 a: only these are counted). */
+  const isWaiting = (i: HeldItem) => waiting.has(i.id) && !ended[i.id];
   const group = (key: string, heading: string, list: HeldItem[]) =>
     list.length > 0 && (
       <section className="ao-review__group" aria-labelledby={`${id}-${key}`}>
@@ -1084,17 +1220,51 @@ function FoundFiles({ items, store, busy, errors, headRef, cardRef, onDecide }: 
         </h3>
         <ul className="ao-review__files" aria-label={heading}>
           {list.map((i) => (
-            <FileCard key={i.id} item={i} store={store} named={names.get(i.id)!} busy={busy[i.id]} error={errors[i.id]} headRef={headRef} cardRef={cardRef} onDecide={onDecide} />
+            <FileCard
+              key={i.id}
+              item={i}
+              store={store}
+              named={names.get(i.id)!}
+              end={ended[i.id] ?? (waiting.has(i.id) ? undefined : "gone")}
+              busy={busy[i.id]}
+              error={errors[i.id]}
+              headRef={headRef}
+              cardRef={cardRef}
+              onDecide={onDecide}
+            />
           ))}
         </ul>
       </section>
     );
   return (
     <section className="ao-review__found" aria-labelledby={`${id}-t`}>
-      <h2 id={`${id}-t`}>{FOUND_FILES_TEXT.section}</h2>
+      <h2 id={`${id}-t`} ref={sectionRef} tabIndex={-1} className="ao-review__found-title">
+        {FOUND_FILES_TEXT.section}
+      </h2>
       <p className="ao-import__hint">{FOUND_FILES_TEXT.intro}</p>
-      {group("right", FOUND_FILES_TEXT.right(right.length), right)}
-      {group("other", FOUND_FILES_TEXT.other(other.length), other)}
+      {/*
+       * R319 c: the place kept for the line about files that arrived. Its height is set by a stand-in of the line that is
+       * always laid out and never seen (hidden, inert, out of the accessibility tree), stacked in one grid cell with the
+       * line itself: the line's appearing and going changes nothing below it.
+       */}
+      <div className="ao-review__arrivals">
+        <p className="ao-review__ghost" aria-hidden="true" inert>
+          <span>{FOUND_FILES_TEXT.arrived(99)}</span>
+          <button type="button" tabIndex={-1}>
+            {FOUND_FILES_TEXT.showThem}
+          </button>
+        </p>
+        {arrived > 0 && (
+          <p>
+            <span>{FOUND_FILES_TEXT.arrived(arrived)}</span>
+            <button type="button" onClick={onShowArrived}>
+              {FOUND_FILES_TEXT.showThem}
+            </button>
+          </p>
+        )}
+      </div>
+      {group("right", FOUND_FILES_TEXT.right(right.filter(isWaiting).length), right)}
+      {group("other", FOUND_FILES_TEXT.other(other.filter(isWaiting).length), other)}
     </section>
   );
 }
@@ -1108,6 +1278,8 @@ interface FileCardProps {
   busy: HeldFileDecision | undefined;
   /** The service's sentence when the last decision on this file was refused, or HELD_NO_ANSWER_TEXT. */
   error: string | undefined;
+  /** R319: what became of this file — decided here, found already decided, or no longer listed; undefined while it waits. */
+  end: FileEnd | "gone" | undefined;
   headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
   onDecide(item: HeldItem, decision: HeldFileDecision): void;
@@ -1122,7 +1294,7 @@ interface FileCardProps {
  * "Removing this file…" and looks busy, the other looks unavailable; R318 b: the press renews the quiet); R313 b — a key held down never decides: a repeated keydown
  * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
-const FileCard = memo(function FileCard({ item, store, named, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
+const FileCard = memo(function FileCard({ item, store, named, end, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
   const h = item.heldFile;
   const record = useRecord(store, item.sourceId);
   const s = record?.source;
@@ -1151,7 +1323,7 @@ const FileCard = memo(function FileCard({ item, store, named, busy, error, headR
   /** R318 a: the pressed control says it is working; its name still says which file. */
   const words = (d: HeldFileDecision) => (busy === d ? HELD_DECIDE_WORDS[d].working : HELD_DECIDE_WORDS[d].idle);
   return (
-    <li className="ao-review__file" ref={(el) => cardRef(item.id, el)}>
+    <li className={end ? "ao-review__file ao-review__file--ended" : "ao-review__file"} ref={(el) => cardRef(item.id, el)}>
       <h4 className="ao-review__title ao-review__file-title" tabIndex={-1} ref={(el) => headRef(item.id, el)}>
         <UserText>{recordTitle || "Untitled"}</UserText>
       </h4>
@@ -1214,42 +1386,71 @@ const FileCard = memo(function FileCard({ item, store, named, busy, error, headR
           </>
         )}
       </dl>
-      {error && (
-        <p role="alert" className="ao-error">
-          {error === HELD_NO_ANSWER_TEXT ? (
-            HELD_NO_ANSWER_TEXT
-          ) : (
-            <>
-              The decision was not recorded. <UserText>{error}</UserText>
-            </>
-          )}
-        </p>
+      {end ? (
+        // R319 a, b: the controls are replaced by what became of the file, in words, in the same place. A stand-in of
+        // the two controls (hidden, inert, out of the accessibility tree, with no action) shares the grid cell, so the
+        // card keeps its height and nothing below it moves.
+        <div className="ao-review__file-act">
+          <div className="ao-import__actions ao-review__ghost" aria-hidden="true" inert>
+            <button type="button" className="ao-import__primary" tabIndex={-1}>
+              {HELD_DECIDE_WORDS.attach.idle}
+            </button>
+            <button type="button" tabIndex={-1}>
+              {HELD_DECIDE_WORDS.discard.idle}
+            </button>
+          </div>
+          <p className="ao-review__file-outcome">
+            {end === "gone" ? (
+              FOUND_FILES_TEXT.gone
+            ) : end === "already" ? (
+              `${FOUND_FILES_TEXT.result.already}.`
+            ) : (
+              <>
+                <span className="ao-review__file-mark">{FOUND_FILES_TEXT.decided}</span> {`${FOUND_FILES_TEXT.result[end]}.`}
+              </>
+            )}
+          </p>
+        </div>
+      ) : (
+        <>
+        {error && (
+          <p role="alert" className="ao-error">
+            {error === HELD_NO_ANSWER_TEXT ? (
+              HELD_NO_ANSWER_TEXT
+            ) : (
+              <>
+                The decision was not recorded. <UserText>{error}</UserText>
+              </>
+            )}
+          </p>
+        )}
+        <div className="ao-import__actions">
+          <button
+            type="button"
+            className="ao-import__primary"
+            aria-label={`${words("attach")} for ${named}`}
+            aria-disabled={busy ? true : undefined}
+            aria-busy={busy === "attach" || undefined}
+            onKeyDown={onKeyDown}
+            onKeyUp={onKeyUp}
+            onClick={press("attach")}
+          >
+            {words("attach")}
+          </button>
+          <button
+            type="button"
+            aria-label={`${words("discard")} for ${named}`}
+            aria-disabled={busy ? true : undefined}
+            aria-busy={busy === "discard" || undefined}
+            onKeyDown={onKeyDown}
+            onKeyUp={onKeyUp}
+            onClick={press("discard")}
+          >
+            {words("discard")}
+          </button>
+        </div>
+        </>
       )}
-      <div className="ao-import__actions">
-        <button
-          type="button"
-          className="ao-import__primary"
-          aria-label={`${words("attach")} for ${named}`}
-          aria-disabled={busy ? true : undefined}
-          aria-busy={busy === "attach" || undefined}
-          onKeyDown={onKeyDown}
-          onKeyUp={onKeyUp}
-          onClick={press("attach")}
-        >
-          {words("attach")}
-        </button>
-        <button
-          type="button"
-          aria-label={`${words("discard")} for ${named}`}
-          aria-disabled={busy ? true : undefined}
-          aria-busy={busy === "discard" || undefined}
-          onKeyDown={onKeyDown}
-          onKeyUp={onKeyUp}
-          onClick={press("discard")}
-        >
-          {words("discard")}
-        </button>
-      </div>
     </li>
   );
 });

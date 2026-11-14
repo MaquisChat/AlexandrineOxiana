@@ -552,3 +552,60 @@ span.ao-import__hint {
 .ao-review__file button[aria-busy="true"] {
   cursor: progress;
 }
+
+/* R319 c: the focus ring on the found files' section heading ("Show them", or the last waiting file, brings focus here). */
+.ao-review__found-title:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/*
+ * R319: nothing in the found files' section moves unless the researcher asks. A stand-in (.ao-review__ghost) that is
+ * always laid out and never seen shares one grid cell with what may appear there, so the place keeps its height:
+ *  - on a card that no longer waits, the stand-in of its two controls under what became of the file;
+ *  - above the groups, the stand-in of the line about files that arrived, under the line itself.
+ */
+.ao-review__file-act,
+.ao-review__arrivals {
+  display: grid;
+  align-items: center;
+}
+
+.ao-review__file-act {
+  margin: var(--space-3) 0;
+}
+
+.ao-review__arrivals {
+  margin: var(--space-2) 0;
+}
+
+.ao-review__file-act > .ao-review__ghost,
+.ao-review__file-act > .ao-review__file-outcome,
+.ao-review__arrivals > p {
+  grid-area: 1 / 1;
+  margin: 0;
+}
+
+.ao-review__arrivals > p {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ao-review__ghost {
+  visibility: hidden;
+}
+
+/* R319 a, b: a card that no longer waits looks quieter (in addition to its words: "Decided", "No longer waiting."). */
+.ao-review__file--ended {
+  border-style: dashed;
+  color: var(--muted);
+}
+
+.ao-review__file-mark {
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font-weight: 600;
+  padding: 0 var(--space-1);
+}
