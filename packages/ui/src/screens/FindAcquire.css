@@ -168,3 +168,13 @@
 .ao-find__works input[aria-disabled="true"] {
   cursor: not-allowed;
 }
+
+/* "Where to get it" (F11): the entry's offers as a short list of links. */
+.ao-find__where ul {
+  margin: 0 0 var(--space-1);
+  padding-left: var(--space-4);
+}
+
+.ao-find__where-title {
+  font-weight: 700;
+}
