@@ -11,10 +11,17 @@
  * The parent sends the request and owns `busy` and `error`: while busy, "Use this one" shows it is working and a
  * press does nothing; a refusal (the entry no longer waits for a choice, the index is not ready) is the service's
  * sentence, said here, and nothing is changed.
+ *
+ * R279 d: when the typed words may also name an author (the entry's author offer; the parent passes `onShowAuthor`),
+ * below the candidates: "“<typed>” may also be an author." and the button "Show this author's works", which sends the
+ * act (the parent closes the dialog on its answer). R291 d: when the service refuses it ("This entry has no author to
+ * show."), the parent stops passing `onShowAuthor`: the offer goes, the works stay, and focus — if it was on the button
+ * that went — moves to the dialog's first remaining control (the candidates' group), never to the page.
  */
 import type { FindEntryView, FindWorkCandidate } from "@ao/shared";
-import { useId, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { creatorsText, identifierText, kindWords, usableCandidates, wherePublished, yearOf } from "../api/find";
+import { shortTyped } from "./FindEntryRow";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
 
@@ -26,6 +33,10 @@ export interface ChooseWorkDialogProps {
   busy?: boolean;
   /** The service's sentence for a refusal. */
   error?: string;
+  /** R279 d: the entry may also name an author — "Show this author's works" is offered. */
+  onShowAuthor?: () => void;
+  /** That act is being sent. */
+  busyAuthor?: boolean;
 }
 
 /** The details of a candidate after its title, each part outside text. */
@@ -63,13 +74,23 @@ function Details({ c, id }: { c: FindWorkCandidate; id: string }) {
   );
 }
 
-export function ChooseWorkDialog({ entry, onChoose, onClose, busy = false, error }: ChooseWorkDialogProps) {
+export function ChooseWorkDialog({ entry, onChoose, onClose, busy = false, error, onShowAuthor, busyAuthor = false }: ChooseWorkDialogProps) {
   const id = useId();
   // A malformed candidate is left out (R262 N6).
   const candidates = usableCandidates(entry);
   /** undefined: nothing chosen yet; null: "None of these". */
   const [chosen, setChosen] = useState<string | null | undefined>(undefined);
   const name = `${id}-pick`;
+  const root = useRef<HTMLDivElement>(null);
+  const offered = !!onShowAuthor;
+  useEffect(() => {
+    if (offered) return;
+    const el = root.current;
+    const now = document.activeElement;
+    if (!el || (now && now !== document.body && now.isConnected)) return;
+    const radios = [...el.querySelectorAll<HTMLInputElement>('input[type="radio"]')];
+    (radios.find((r) => r.checked) ?? radios[0] ?? el.querySelector<HTMLElement>("button:not([disabled])"))?.focus();
+  }, [offered]);
 
   const close = () => {
     if (!busy) onClose();
@@ -95,7 +116,7 @@ export function ChooseWorkDialog({ entry, onChoose, onClose, busy = false, error
 
   return (
     <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={close} busy={busy} className="ao-find__dialog">
-      <div onKeyDown={onKeyDown}>
+      <div onKeyDown={onKeyDown} ref={root}>
         <h2 id={`${id}-t`}>
           Choose the work for “<UserText>{entry.typed}</UserText>”
         </h2>
@@ -121,6 +142,27 @@ export function ChooseWorkDialog({ entry, onChoose, onClose, busy = false, error
             </li>
           </ul>
         </div>
+        {onShowAuthor && (
+          <div className="ao-find__author-offer">
+            <p>
+              “<UserText>{entry.typed}</UserText>” may also be an author.
+            </p>
+            <p>
+              <button
+                type="button"
+                aria-label={`Show this author's works: “${shortTyped(entry.typed)}”`}
+                aria-disabled={busy || undefined}
+                aria-busy={busyAuthor || undefined}
+                onClick={() => {
+                  if (busy) return;
+                  onShowAuthor();
+                }}
+              >
+                Show this author's works
+              </button>
+            </p>
+          </div>
+        )}
         {error && (
           <p role="alert" className="ao-error">
             <UserText>{error}</UserText>
@@ -137,7 +179,7 @@ export function ChooseWorkDialog({ entry, onChoose, onClose, busy = false, error
               onChoose(chosen);
             }}
           >
-            {busy ? "Using…" : "Use this one"}
+            {busy && !busyAuthor ? "Using…" : "Use this one"}
           </button>
           <button type="button" aria-disabled={busy || undefined} onClick={close}>
             Cancel

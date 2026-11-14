@@ -1,0 +1,1073 @@
+{
+ "meta": {
+  "count": 18,
+  "db_response_time_ms": 0,
+  "page": 1,
+  "per_page": 100,
+  "groups_count": null
+ },
+ "results": [
+  {
+   "id": "https://openalex.org/W3014205122",
+   "doi": "https://doi.org/10.1111/1468-4446.12726",
+   "title": "Underground testing: Name‐altering practices as probes in electronic music",
+   "display_name": "Underground testing: Name‐altering practices as probes in electronic music",
+   "publication_year": 2020,
+   "publication_date": "2020-04-21",
+   "ids": {
+    "openalex": "https://openalex.org/W3014205122",
+    "doi": "https://doi.org/10.1111/1468-4446.12726",
+    "mag": "3014205122",
+    "pmid": "https://pubmed.ncbi.nlm.nih.gov/32314353"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1111/1468-4446.12726",
+    "doi": "https://doi.org/10.1111/1468-4446.12726",
+    "is_oa": true,
+    "landing_page_url": "https://doi.org/10.1111/1468-4446.12726",
+    "source": {
+     "id": "https://openalex.org/S173252385",
+     "display_name": "British Journal of Sociology",
+     "issn_l": "0007-1315",
+     "issn": [
+      "0007-1315",
+      "1468-4446"
+     ],
+     "host_organization": "https://openalex.org/P4310320595",
+     "host_organization_name": "Wiley",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5079539188",
+      "display_name": "Giovanni Formilan",
+      "orcid": "https://orcid.org/0000-0002-6989-516X"
+     },
+     "raw_author_name": "Giovanni Formilan"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "71",
+    "issue": "3",
+    "first_page": "572",
+    "last_page": "589"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W3017144034",
+   "doi": "https://doi.org/10.1111/1468-4446.12757",
+   "title": "Preface to a special issue on the sociology of testing",
+   "display_name": "Preface to a special issue on the sociology of testing",
+   "publication_year": 2020,
+   "publication_date": "2020-04-20",
+   "ids": {
+    "openalex": "https://openalex.org/W3017144034",
+    "doi": "https://doi.org/10.1111/1468-4446.12757",
+    "mag": "3017144034",
+    "pmid": "https://pubmed.ncbi.nlm.nih.gov/32307693"
+   },
+   "language": "en",
+   "type": "editorial",
+   "primary_location": {
+    "id": "doi:10.1111/1468-4446.12757",
+    "doi": "https://doi.org/10.1111/1468-4446.12757",
+    "is_oa": true,
+    "landing_page_url": "https://doi.org/10.1111/1468-4446.12757",
+    "source": {
+     "id": "https://openalex.org/S173252385",
+     "display_name": "British Journal of Sociology",
+     "issn_l": "0007-1315",
+     "issn": [
+      "0007-1315",
+      "1468-4446"
+     ],
+     "host_organization": "https://openalex.org/P4310320595",
+     "host_organization_name": "Wiley",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5000997821",
+      "display_name": "Noortje Marres",
+      "orcid": "https://orcid.org/0000-0002-8237-6946"
+     },
+     "raw_author_name": "Noortje Marres"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "71",
+    "issue": "3",
+    "first_page": "420",
+    "last_page": "422"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W3015927993",
+   "doi": "https://doi.org/10.1111/1468-4446.12746",
+   "title": "Put to the test: For a new sociology of testing",
+   "display_name": "Put to the test: For a new sociology of testing",
+   "publication_year": 2020,
+   "publication_date": "2020-04-19",
+   "ids": {
+    "openalex": "https://openalex.org/W3015927993",
+    "doi": "https://doi.org/10.1111/1468-4446.12746",
+    "mag": "3015927993",
+    "pmid": "https://pubmed.ncbi.nlm.nih.gov/32307705",
+    "pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/7317497"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1111/1468-4446.12746",
+    "doi": "https://doi.org/10.1111/1468-4446.12746",
+    "is_oa": true,
+    "landing_page_url": "https://doi.org/10.1111/1468-4446.12746",
+    "source": {
+     "id": "https://openalex.org/S173252385",
+     "display_name": "British Journal of Sociology",
+     "issn_l": "0007-1315",
+     "issn": [
+      "0007-1315",
+      "1468-4446"
+     ],
+     "host_organization": "https://openalex.org/P4310320595",
+     "host_organization_name": "Wiley",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5000997821",
+      "display_name": "Noortje Marres",
+      "orcid": "https://orcid.org/0000-0002-8237-6946"
+     },
+     "raw_author_name": "Noortje Marres"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "71",
+    "issue": "3",
+    "first_page": "423",
+    "last_page": "443"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W3139580722",
+   "doi": "https://doi.org/10.17323/1726-3247-2020-4-70-106",
+   "title": "Testing and Being Tested in Pandemic Times",
+   "display_name": "Testing and Being Tested in Pandemic Times",
+   "publication_year": 2020,
+   "publication_date": "2020-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W3139580722",
+    "doi": "https://doi.org/10.17323/1726-3247-2020-4-70-106",
+    "mag": "3139580722"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.17323/1726-3247-2020-4-70-106",
+    "doi": "https://doi.org/10.17323/1726-3247-2020-4-70-106",
+    "is_oa": true,
+    "landing_page_url": "https://doi.org/10.17323/1726-3247-2020-4-70-106",
+    "source": {
+     "id": "https://openalex.org/S4210182383",
+     "display_name": "Journal of Economic Sociology",
+     "issn_l": "1726-3247",
+     "issn": [
+      "1726-3247"
+     ],
+     "host_organization": "https://openalex.org/P4310312710",
+     "host_organization_name": "National Research University – Higher School of Economics",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "21",
+    "issue": "4",
+    "first_page": "70",
+    "last_page": "106"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2621405455",
+   "doi": "https://doi.org/10.1108/s0733-558x20170000052011",
+   "title": "For What It’s Worth",
+   "display_name": "For What It’s Worth",
+   "publication_year": 2017,
+   "publication_date": "2017-06-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2621405455",
+    "doi": "https://doi.org/10.1108/s0733-558x20170000052011",
+    "mag": "2621405455"
+   },
+   "language": "en",
+   "type": "book-chapter",
+   "primary_location": {
+    "id": "doi:10.1108/s0733-558x20170000052011",
+    "doi": "https://doi.org/10.1108/s0733-558x20170000052011",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1108/s0733-558x20170000052011",
+    "source": {
+     "id": "https://openalex.org/S4210170888",
+     "display_name": "Research in the sociology of organizations",
+     "issn_l": "0733-558X",
+     "issn": [
+      "0733-558X"
+     ],
+     "host_organization": "https://openalex.org/P4310319811",
+     "host_organization_name": "Emerald Publishing Limited",
+     "type": "book series"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": null,
+    "issue": null,
+    "first_page": "383",
+    "last_page": "397"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2038217319",
+   "doi": "https://doi.org/10.1086/681213",
+   "title": "Game Changer: The Topology of Creativity",
+   "display_name": "Game Changer: The Topology of Creativity",
+   "publication_year": 2015,
+   "publication_date": "2015-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2038217319",
+    "doi": "https://doi.org/10.1086/681213",
+    "mag": "2038217319",
+    "pmid": "https://pubmed.ncbi.nlm.nih.gov/26046227"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/681213",
+    "doi": "https://doi.org/10.1086/681213",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1086/681213",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5044125536",
+      "display_name": "Mathijs de Vaan",
+      "orcid": "https://orcid.org/0000-0003-1971-7290"
+     },
+     "raw_author_name": "Mathijs de Vaan"
+    },
+    {
+     "author_position": "middle",
+     "author": {
+      "id": "https://openalex.org/A5057226228",
+      "display_name": "Balázs Vedres",
+      "orcid": "https://orcid.org/0000-0002-9469-8774"
+     },
+     "raw_author_name": "Balazs Vedres"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "120",
+    "issue": "4",
+    "first_page": "1144",
+    "last_page": "1194"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2126435912",
+   "doi": "https://doi.org/10.17323/1726-3247-2000-2-7-34",
+   "title": "Ambiguous Assets for Uncertain Environments: Heterarchy in Postsocialist Firms",
+   "display_name": "Ambiguous Assets for Uncertain Environments: Heterarchy in Postsocialist Firms",
+   "publication_year": 2010,
+   "publication_date": "2010-12-31",
+   "ids": {
+    "openalex": "https://openalex.org/W2126435912",
+    "doi": "https://doi.org/10.17323/1726-3247-2000-2-7-34",
+    "mag": "2126435912"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.17323/1726-3247-2000-2-7-34",
+    "doi": "https://doi.org/10.17323/1726-3247-2000-2-7-34",
+    "is_oa": true,
+    "landing_page_url": "https://doi.org/10.17323/1726-3247-2000-2-7-34",
+    "source": {
+     "id": "https://openalex.org/S4210182383",
+     "display_name": "Journal of Economic Sociology",
+     "issn_l": "1726-3247",
+     "issn": [
+      "1726-3247"
+     ],
+     "host_organization": "https://openalex.org/P4310312710",
+     "host_organization_name": "National Research University – Higher School of Economics",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "1",
+    "issue": "2",
+    "first_page": "7",
+    "last_page": "34"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W1902009078",
+   "doi": "https://doi.org/10.1086/649497",
+   "title": "Structural Folds: Generative Disruption in Overlapping Groups",
+   "display_name": "Structural Folds: Generative Disruption in Overlapping Groups",
+   "publication_year": 2010,
+   "publication_date": "2010-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W1902009078",
+    "doi": "https://doi.org/10.1086/649497",
+    "mag": "1902009078"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/649497",
+    "doi": "https://doi.org/10.1086/649497",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1086/649497",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5057226228",
+      "display_name": "Balázs Vedres",
+      "orcid": "https://orcid.org/0000-0002-9469-8774"
+     },
+     "raw_author_name": "Balázs Vedres"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "115",
+    "issue": "4",
+    "first_page": "1150",
+    "last_page": "1190"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2588831772",
+   "doi": "https://doi.org/10.1515/9781400831005",
+   "title": "The Sense of Dissonance: Accounts of Worth in Economic Life",
+   "display_name": "The Sense of Dissonance: Accounts of Worth in Economic Life",
+   "publication_year": 2009,
+   "publication_date": "2009-12-31",
+   "ids": {
+    "openalex": "https://openalex.org/W2588831772",
+    "doi": "https://doi.org/10.1515/9781400831005",
+    "mag": "2588831772"
+   },
+   "language": "en",
+   "type": "book",
+   "primary_location": {
+    "id": "doi:10.1515/9781400831005",
+    "doi": "https://doi.org/10.1515/9781400831005",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1515/9781400831005",
+    "source": {
+     "id": "https://openalex.org/S4306463805",
+     "display_name": "Princeton University Press eBooks",
+     "issn_l": null,
+     "issn": null,
+     "host_organization": "https://openalex.org/P4310316492",
+     "host_organization_name": "Princeton University Press",
+     "type": "ebook platform"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": null,
+    "issue": null,
+    "first_page": null,
+    "last_page": null
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W4240969682",
+   "doi": "https://doi.org/10.7551/mitpress/7838.003.0012",
+   "title": "Tools of the Trade: The Socio-Technology of Arbitrage in a Wall Street Trading Room",
+   "display_name": "Tools of the Trade: The Socio-Technology of Arbitrage in a Wall Street Trading Room",
+   "publication_year": 2008,
+   "publication_date": "2008-10-10",
+   "ids": {
+    "openalex": "https://openalex.org/W4240969682",
+    "doi": "https://doi.org/10.7551/mitpress/7838.003.0012"
+   },
+   "language": "en",
+   "type": "book-chapter",
+   "primary_location": {
+    "id": "doi:10.7551/mitpress/7838.003.0012",
+    "doi": "https://doi.org/10.7551/mitpress/7838.003.0012",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.7551/mitpress/7838.003.0012",
+    "source": {
+     "id": "https://openalex.org/S4306463997",
+     "display_name": "The MIT Press eBooks",
+     "issn_l": null,
+     "issn": null,
+     "host_organization": "https://openalex.org/P4310315718",
+     "host_organization_name": "The MIT Press",
+     "type": "ebook platform"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5022339012",
+      "display_name": "Daniel Beunza",
+      "orcid": "https://orcid.org/0000-0003-0164-7095"
+     },
+     "raw_author_name": "Daniel Beunza"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": null,
+    "issue": null,
+    "first_page": "253",
+    "last_page": "290"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2140588791",
+   "doi": "https://doi.org/10.1086/499507",
+   "title": "Social Times of Network Spaces: Network Sequences and Foreign Investment in Hungary",
+   "display_name": "Social Times of Network Spaces: Network Sequences and Foreign Investment in Hungary",
+   "publication_year": 2006,
+   "publication_date": "2006-03-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2140588791",
+    "doi": "https://doi.org/10.1086/499507",
+    "mag": "2140588791"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/499507",
+    "doi": "https://doi.org/10.1086/499507",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1086/499507",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5057226228",
+      "display_name": "Balázs Vedres",
+      "orcid": "https://orcid.org/0000-0002-9469-8774"
+     },
+     "raw_author_name": "Balázs Vedres"
+    }
+   ],
+   "biblio": {
+    "volume": "111",
+    "issue": "5",
+    "first_page": "1367",
+    "last_page": "1411"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2144414458",
+   "doi": "https://doi.org/10.1093/oso/9780199275595.003.0005",
+   "title": "How to Recognize Opportunities: Heterarchical Search in a Trading Room",
+   "display_name": "How to Recognize Opportunities: Heterarchical Search in a Trading Room",
+   "publication_year": 2004,
+   "publication_date": "2004-10-14",
+   "ids": {
+    "openalex": "https://openalex.org/W2144414458",
+    "doi": "https://doi.org/10.1093/oso/9780199275595.003.0005",
+    "mag": "2144414458"
+   },
+   "language": "en",
+   "type": "book-chapter",
+   "primary_location": {
+    "id": "doi:10.1093/oso/9780199275595.003.0005",
+    "doi": "https://doi.org/10.1093/oso/9780199275595.003.0005",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1093/oso/9780199275595.003.0005",
+    "source": {
+     "id": "https://openalex.org/S4306463708",
+     "display_name": "Oxford University Press eBooks",
+     "issn_l": null,
+     "issn": null,
+     "host_organization": "https://openalex.org/P4310311648",
+     "host_organization_name": "Oxford University Press",
+     "type": "ebook platform"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5022339012",
+      "display_name": "Daniel Beunza",
+      "orcid": "https://orcid.org/0000-0003-0164-7095"
+     },
+     "raw_author_name": "Daniel Beunza"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": null,
+    "issue": null,
+    "first_page": "84",
+    "last_page": "101"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2018705971",
+   "doi": "https://doi.org/10.1086/320301",
+   "title": "One Way or Multiple Paths: For a Comparative Sociology of East European Capitalism",
+   "display_name": "One Way or Multiple Paths: For a Comparative Sociology of East European Capitalism",
+   "publication_year": 2001,
+   "publication_date": "2001-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2018705971",
+    "doi": "https://doi.org/10.1086/320301",
+    "mag": "2018705971"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/320301",
+    "doi": "https://doi.org/10.1086/320301",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1086/320301",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5035895341",
+      "display_name": "László Bruszt",
+      "orcid": "https://orcid.org/0000-0001-7624-0308"
+     },
+     "raw_author_name": "László Bruszt"
+    }
+   ],
+   "biblio": {
+    "volume": "106",
+    "issue": "4",
+    "first_page": "1129",
+    "last_page": "1137"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W4256615503",
+   "doi": "https://doi.org/10.2307/2654643",
+   "title": "The Rise of the Network Society",
+   "display_name": "The Rise of the Network Society",
+   "publication_year": 1997,
+   "publication_date": "1997-11-01",
+   "ids": {
+    "openalex": "https://openalex.org/W4256615503",
+    "doi": "https://doi.org/10.2307/2654643"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.2307/2654643",
+    "doi": "https://doi.org/10.2307/2654643",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.2307/2654643",
+    "source": {
+     "id": "https://openalex.org/S4789869",
+     "display_name": "Contemporary Sociology A Journal of Reviews",
+     "issn_l": "0094-3061",
+     "issn": [
+      "0094-3061",
+      "1939-8638"
+     ],
+     "host_organization": "https://openalex.org/P4310320017",
+     "host_organization_name": "SAGE Publishing",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5108111179",
+      "display_name": "Manuel Castells",
+      "orcid": null
+     },
+     "raw_author_name": "Manuel Castells"
+    }
+   ],
+   "biblio": {
+    "volume": "26",
+    "issue": "6",
+    "first_page": "725",
+    "last_page": "725"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2065401570",
+   "doi": "https://doi.org/10.1086/230786",
+   "title": "Recombinant Property in East European Capitalism",
+   "display_name": "Recombinant Property in East European Capitalism",
+   "publication_year": 1996,
+   "publication_date": "1996-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2065401570",
+    "doi": "https://doi.org/10.1086/230786",
+    "mag": "2065401570"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.1086/230786",
+    "doi": "https://doi.org/10.1086/230786",
+    "is_oa": true,
+    "landing_page_url": "https://doi.org/10.1086/230786",
+    "source": {
+     "id": "https://openalex.org/S122471516",
+     "display_name": "American Journal of Sociology",
+     "issn_l": "0002-9602",
+     "issn": [
+      "0002-9602",
+      "1537-5390"
+     ],
+     "host_organization": "https://openalex.org/P4310315672",
+     "host_organization_name": "University of Chicago Press",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "101",
+    "issue": "4",
+    "first_page": "993",
+    "last_page": "1027"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2327255455",
+   "doi": "https://doi.org/10.2307/2076239",
+   "title": "From System Identity to Organizational Diversity: Analyzing Social Change in Eastern Europe",
+   "display_name": "From System Identity to Organizational Diversity: Analyzing Social Change in Eastern Europe",
+   "publication_year": 1992,
+   "publication_date": "1992-05-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2327255455",
+    "doi": "https://doi.org/10.2307/2076239",
+    "mag": "2327255455"
+   },
+   "language": "en",
+   "type": "article",
+   "primary_location": {
+    "id": "doi:10.2307/2076239",
+    "doi": "https://doi.org/10.2307/2076239",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.2307/2076239",
+    "source": {
+     "id": "https://openalex.org/S4789869",
+     "display_name": "Contemporary Sociology A Journal of Reviews",
+     "issn_l": "0094-3061",
+     "issn": [
+      "0094-3061",
+      "1939-8638"
+     ],
+     "host_organization": "https://openalex.org/P4310320017",
+     "host_organization_name": "SAGE Publishing",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    }
+   ],
+   "biblio": {
+    "volume": "21",
+    "issue": "3",
+    "first_page": "299",
+    "last_page": "299"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2328191396",
+   "doi": "https://doi.org/10.2307/2073186",
+   "title": "State Socialism in Transition",
+   "display_name": "State Socialism in Transition",
+   "publication_year": 1990,
+   "publication_date": "1990-11-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2328191396",
+    "doi": "https://doi.org/10.2307/2073186",
+    "mag": "2328191396"
+   },
+   "language": "en",
+   "type": "book-review",
+   "primary_location": {
+    "id": "doi:10.2307/2073186",
+    "doi": "https://doi.org/10.2307/2073186",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.2307/2073186",
+    "source": {
+     "id": "https://openalex.org/S4789869",
+     "display_name": "Contemporary Sociology A Journal of Reviews",
+     "issn_l": "0094-3061",
+     "issn": [
+      "0094-3061",
+      "1939-8638"
+     ],
+     "host_organization": "https://openalex.org/P4310320017",
+     "host_organization_name": "SAGE Publishing",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5080794726",
+      "display_name": "Andrew G. Walder",
+      "orcid": "https://orcid.org/0000-0001-7515-4854"
+     },
+     "raw_author_name": "Andrew G. Walder"
+    },
+    {
+     "author_position": "middle",
+     "author": {
+      "id": "https://openalex.org/A5042188047",
+      "display_name": "Victor G. Nee",
+      "orcid": "https://orcid.org/0000-0002-5097-8491"
+     },
+     "raw_author_name": "Victor Nee"
+    },
+    {
+     "author_position": "middle",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5083550905",
+      "display_name": "Mark Selden",
+      "orcid": null
+     },
+     "raw_author_name": "Mark Selden"
+    }
+   ],
+   "biblio": {
+    "volume": "19",
+    "issue": "6",
+    "first_page": "819",
+    "last_page": "819"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  },
+  {
+   "id": "https://openalex.org/W2332360861",
+   "doi": "https://doi.org/10.2307/2069161",
+   "title": "Redistributive Injustice",
+   "display_name": "Redistributive Injustice",
+   "publication_year": 1985,
+   "publication_date": "1985-07-01",
+   "ids": {
+    "openalex": "https://openalex.org/W2332360861",
+    "doi": "https://doi.org/10.2307/2069161",
+    "mag": "2332360861"
+   },
+   "language": "en",
+   "type": "book-review",
+   "primary_location": {
+    "id": "doi:10.2307/2069161",
+    "doi": "https://doi.org/10.2307/2069161",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.2307/2069161",
+    "source": {
+     "id": "https://openalex.org/S4789869",
+     "display_name": "Contemporary Sociology A Journal of Reviews",
+     "issn_l": "0094-3061",
+     "issn": [
+      "0094-3061",
+      "1939-8638"
+     ],
+     "host_organization": "https://openalex.org/P4310320017",
+     "host_organization_name": "SAGE Publishing",
+     "type": "journal"
+    }
+   },
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5055013655",
+      "display_name": "David Stark",
+      "orcid": "https://orcid.org/0000-0003-2435-9619"
+     },
+     "raw_author_name": "David Stark"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5049334294",
+      "display_name": "Iván Szelényi",
+      "orcid": "https://orcid.org/0000-0003-0520-2552"
+     },
+     "raw_author_name": "Ivan Szelenyi"
+    }
+   ],
+   "biblio": {
+    "volume": "14",
+    "issue": "4",
+    "first_page": "442",
+    "last_page": "442"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  }
+ ]
+}

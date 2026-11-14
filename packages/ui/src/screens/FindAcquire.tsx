@@ -28,12 +28,32 @@
  *
  * Focus: after "Remove from the queue" focus goes to the next row's text (the previous one's for the last; the box
  * when the queue is empty). When any other control the researcher used goes away (its state passed, the dialog
- * closed on a row that changed), focus goes to that row's next control, else its text — never to the page.
+ * closed on a row that changed), focus goes to that row's next control, else its text; when the row itself has gone,
+ * to the next row, else the box — never to the page.
+ *
+ * An author alone (Task F9; R267, R270–R272): "Choose the person" and "Choose works" open their dialogs; the lists
+ * are read from the entry's `options` when a dialog opens (the queue's answer carries counts only), are dropped with
+ * the dialog, and are forgotten with everything else when another library opens. "This is the person" and "Add the
+ * chosen works" are acts like the others: their answers take their place in the order (R262, R263).
+ *   - R272 a: while a change of "Check everything I have" is out, an add is not sent; it is sent as soon as the
+ *     change is confirmed, or — if the change fails — not at all, the text kept and the failure said.
+ *   - R291 a: a change with no answer in SWITCH_TIMEOUT_MS may still have been stored (only its answer was lost): the
+ *     screen then reads the settings (`GET /find/screen`) before anything else, the switch and "Add" busy meanwhile;
+ *     the switch shows what the service holds, and a waiting add is sent only if that is the position asked for. If
+ *     that read fails too, the settings are unreadable (M3: the queue's answer says what is stored) and nothing is added.
+ *   - R291 b: an event about the library already held never resets the screen; it reads again only what has not been
+ *     read successfully. The full reset is for another library, or when nothing has been read yet.
+ *   - R272 b: the result of the researcher's own act ("Added 2 references.", "Added 3 works.", "Removed …") is said
+ *     first and stays for ACT_SAID_MS; rows' changes arriving meanwhile are said after it — each row's latest as
+ *     shown then, never the same change twice.
  */
 import {
   FIND_ROUTE_TEXT,
   type FindAddResponse,
+  type FindChosenPerson,
   type FindEntryView,
+  type FindPersonCandidate,
+  type FindPersonWork,
   type FindQueueResponse,
   type FindScreenSettings,
 } from "@ao/shared";
@@ -42,8 +62,10 @@ import { ApiClientError, type ApiClient, type ServiceEvent } from "../api/client
 import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { isValidId } from "../api/import";
 import { isProjectLocked, libraryApi, type Collection, type LibraryApi, type LibraryState, type ProjectSummary } from "../api/library";
+import { ChoosePersonDialog } from "../components/ChoosePersonDialog";
 import { ChooseWorkDialog } from "../components/ChooseWorkDialog";
-import { FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
+import { ChooseWorksDialog } from "../components/ChooseWorksDialog";
+import { authorOfferOf, entryLabel, FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
 import { navigate, projectInQuery, type AppLocation } from "../navigation";
@@ -60,7 +82,25 @@ export const FIND_SCREEN_TEXT = {
   projectsUnreadable: "The projects could not be read.",
   screenUnreadable: "This computer's Find and acquire settings could not be read.",
   addTimedOut: "The service did not answer. Nothing was added that the queue does not show.",
+  /** R272 a: an add waits for a change of the switch; that change failed, so the add is not sent. */
+  addSwitchFailed: "Nothing was added, because “Check everything I have” could not be changed. The text is kept: press “Add” to add it with the switch as it is now.",
+  optionsUnreadable: "The list could not be read. Close this and try again.",
+  /**
+   * R291 a: an add waited for a change of the switch that got no answer, and the settings read afterwards shows another
+   * position than the one asked for, or cannot be read: the add is not sent.
+   */
+  addSwitchNoAnswer: "Nothing was added. The text is kept: press “Add” to add it with the switch as it is now.",
 } as const;
+
+/** R291 a: beside the switch after a change with no answer, once the settings were read again: what the service holds. */
+export const switchReadText = (on: boolean) => `The service did not answer in time. “Check everything I have” is ${on ? "on" : "off"}.`;
+
+/** The result of the researcher's own act stays in the status region at least this long before rows' changes are said (R272 b). */
+export const ACT_SAID_MS = 1000;
+/** Up to this many rows' changes are said one by one in one message; more are counted. */
+const ROWS_SAID_MAX = 3;
+
+const addedWorksText = (k: number) => (k === 1 ? "Added 1 work." : `Added ${k} works.`);
 
 const RECONNECT_MS = 2000;
 /** At most this many "where is it" questions out at once. */
@@ -71,6 +111,20 @@ const EVENT_COALESCE_MS = 50;
 const READ_GAP_MS = 400;
 /** An add with no answer for this long is given up (R262 N5). */
 const ADD_TIMEOUT_MS = 60_000;
+/** A change of the switch with no answer for this long is given up (R281 c). */
+export const SWITCH_TIMEOUT_MS = 60_000;
+
+/**
+ * How a change of the switch ended, for an add that waited for it (R272 a, R281 c, R291 a): "ok" — the service holds the
+ * position asked for (confirmed, or read after a change with no answer); "failed" — refused; "not-stored" — no answer,
+ * and the settings read afterwards show the other position (`note`: the sentence beside the switch); "unknown" — no
+ * answer, and the settings could not be read either.
+ */
+export type SwitchOutcome = "ok" | "failed" | "not-stored" | "unknown";
+export interface SwitchResult {
+  outcome: SwitchOutcome;
+  note?: string;
+}
 
 /** -1, 0 or 1: which of two entries the service stamped later (`updatedAt`); 0 when equal or not comparable. */
 function stampOrder(a: FindEntryView, b: FindEntryView): number {
@@ -101,7 +155,7 @@ interface Said {
 }
 
 /** What is said about one entry's state: “typed”: words. */
-const saidOf = (v: FindEntryView, stopped: boolean): Words => ["“", { user: typeof v.typed === "string" ? v.typed : "" }, "”: ", ...stateWords(v, { stopped }), "."];
+const saidOf = (v: FindEntryView, stopped: boolean, origin: string | null | undefined): Words => [...entryLabel(v, origin), ": ", ...stateWords(v, { stopped }), "."];
 
 const byCreated = (a: FindEntryView, b: FindEntryView) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 const same = (a: FindEntryView, b: FindEntryView) => a === b || JSON.stringify(a) === JSON.stringify(b);
@@ -111,7 +165,7 @@ const isElsewhere = (e: FindEntryView) => !!e.elsewhere && (e.state === "already
 // The screen: project, collection, the switch; the queue of the chosen project below
 
 /** What the screen passes on to the queue from the one event stream it listens to. */
-type QueueSignal = { kind: "event"; ev: ServiceEvent } | { kind: "refresh" };
+type QueueSignal = { kind: "event"; ev: ServiceEvent } | { kind: "refresh" } | { kind: "say"; words: Words };
 interface QueueBus {
   subscribe(fn: (s: QueueSignal) => void): () => void;
 }
@@ -129,6 +183,8 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   /** The switch while its change is being sent. */
   const [checkSending, setCheckSending] = useState<boolean | undefined>();
   const [switchError, setSwitchError] = useState<string | undefined>();
+  /** R291 a: what the service holds, read after a change of the switch that got no answer (beside the switch). */
+  const [switchNote, setSwitchNote] = useState<string | undefined>();
   const [settingsError, setSettingsError] = useState<string | undefined>();
   /** The project the researcher chose on this screen (else the address's, else the remembered one). */
   const [chosen, setChosen] = useState<string | undefined>();
@@ -145,8 +201,26 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   const switchBusy = useRef(false);
   /** The last answer of the service about the remembered settings; every PUT is built from it plus its own change (R258 M2). */
   const confirmed = useRef<FindScreenSettings>({ checkEverything: false });
+  /** The time limits of PUTs and settings reads still out (cleared on unmount and when the library goes). */
+  const putTimers = useRef(new Set<ReturnType<typeof setTimeout> | undefined>());
+  /** Their requests, aborted when the library goes. */
+  const putAborts = useRef(new Set<AbortController>());
   /** The PUTs, one at a time. */
   const putChain = useRef<Promise<void>>(Promise.resolve());
+  /**
+   * A change of the switch still out (R272 a): an add waits for it — true once the service confirmed it, false when it
+   * failed or the library went.
+   */
+  const switchWait = useRef<{ p: Promise<SwitchResult>; resolve: (r: SwitchResult) => void; taken: boolean } | null>(null);
+  /** The first reads of this library (projects, remembered settings) have both answered (R281 e). */
+  const projectsRead_ok = useRef(false);
+  const screenRead_ok = useRef(false);
+  const waitForSwitch = useCallback(() => {
+    const w = switchWait.current;
+    if (!w) return undefined;
+    w.taken = true;
+    return w.p;
+  }, []);
   /** GET /find/screen failed and nothing has been confirmed since: the queue's answer says what is stored (M3). */
   const screenUnread = useRef(false);
   /** Moves on with the library: an answer about the library that went is dropped. */
@@ -193,6 +267,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
             if (!alive.current || g !== libGen.current) return;
             setProjects(r.projects);
             setProjectsError(undefined);
+            projectsRead_ok.current = true;
           } catch (err) {
             if (!alive.current || g !== libGen.current) return;
             setProjects((cur) => cur ?? []);
@@ -205,33 +280,82 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     })();
   }, [lib]);
 
-  // ---- at load, and afresh for each library ----
-  useEffect(() => {
-    const g = libGen.current;
-    readProjects();
-    api.screen().then(
-      (s) => {
-        if (!alive.current || g !== libGen.current) return;
+  /**
+   * One read of the remembered settings (`timeoutMs`: given up after that long, as a failure). Its answer is the new
+   * confirmed one; a failure is the state for settings that cannot be read (M3: the queue's answer says what is stored).
+   * "gone": the screen or the library went meanwhile, and nothing was changed.
+   */
+  const screenOnce = useCallback(
+    async (timeoutMs?: number): Promise<"ok" | "failed" | "gone"> => {
+      const g = libGen.current;
+      const ac = new AbortController();
+      const timer = timeoutMs === undefined ? undefined : setTimeout(() => ac.abort(), timeoutMs);
+      putTimers.current.add(timer);
+      putAborts.current.add(ac);
+      try {
+        const s = await api.screen({ signal: ac.signal });
+        if (!alive.current || g !== libGen.current) return "gone";
         confirmed.current = { ...s };
         screenUnread.current = false;
+        screenRead_ok.current = true;
+        setScreenError(undefined);
         setRemembered(s);
-      },
-      (err: unknown) => {
-        if (!alive.current || g !== libGen.current) return;
-        confirmed.current = { checkEverything: false };
+        return "ok";
+      } catch (err) {
+        if (!alive.current || g !== libGen.current) return "gone";
         screenUnread.current = true;
         setScreenError(sentenceOf(err, FIND_SCREEN_TEXT.screenUnreadable));
-        setRemembered({ checkEverything: false });
-      },
-    );
-  }, [api, readProjects, epoch]);
+        setRemembered((cur) => cur ?? { ...confirmed.current });
+        return "failed";
+      } finally {
+        clearTimeout(timer);
+        putTimers.current.delete(timer);
+        putAborts.current.delete(ac);
+      }
+    },
+    [api],
+  );
+  /** A read of the settings in the order of the PUTs (an older answer never wins over a newer one); one at a time. */
+  const screenReading = useRef(false);
+  const readScreen = useCallback(
+    (timeoutMs?: number) => {
+      if (screenReading.current) return;
+      screenReading.current = true;
+      const g = libGen.current;
+      const run = async () => {
+        try {
+          if (alive.current && g === libGen.current) await screenOnce(timeoutMs);
+        } finally {
+          if (g === libGen.current) screenReading.current = false;
+        }
+      };
+      putChain.current = putChain.current.then(run, run);
+    },
+    [screenOnce],
+  );
+
+  // ---- at load, and afresh for each library ----
+  useEffect(() => {
+    readProjects();
+    readScreen();
+  }, [readScreen, readProjects, epoch]);
 
   /** Another library (or none): nothing of the old one is kept — lists, settings, answers still out (R258 I1). */
   const forgetLibrary = useCallback(() => {
     libGen.current++;
     projectsRead.current = null;
     putChain.current = Promise.resolve();
+    screenReading.current = false;
+    // What is still out about the old library is given up, and its time limits cleared.
+    for (const t of putTimers.current) clearTimeout(t);
+    putTimers.current.clear();
+    for (const ac of putAborts.current) ac.abort();
+    putAborts.current.clear();
     switchBusy.current = false;
+    switchWait.current?.resolve({ outcome: "failed" });
+    switchWait.current = null;
+    projectsRead_ok.current = false;
+    screenRead_ok.current = false;
     confirmed.current = { checkEverything: false };
     screenUnread.current = false;
     setProjects(undefined);
@@ -240,6 +364,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     setScreenError(undefined);
     setCheckSending(undefined);
     setSwitchError(undefined);
+    setSwitchNote(undefined);
     setSettingsError(undefined);
     setChosen(undefined);
     setCollections(undefined);
@@ -282,15 +407,30 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
               setNoLibrary(false);
               continue;
             }
+            // The library is open, and nothing the screen read of it has succeeded (it was loaded while the service was
+            // still reopening the library, say): everything is read again (R281 e). When something was read, only what
+            // has not been read successfully is read again — the screen is not reset: dialogs, focus and what is typed
+            // stay (R291 b).
+            const nothingRead = !projectsRead_ok.current && !screenRead_ok.current;
+            const rereadMissing = () => {
+              if (!projectsRead_ok.current) readProjects();
+              if (!screenRead_ok.current) readScreen(SWITCH_TIMEOUT_MS);
+            };
             if (d.libraryId && known === undefined) {
               known = d.libraryId;
-              if (noLibraryRef.current) {
+              if (noLibraryRef.current || nothingRead) {
                 forgetLibrary();
                 setNoLibrary(false);
-              }
+              } else rereadMissing();
+              continue;
+            }
+            if (d.open === true && nothingRead) {
+              forgetLibrary();
+              setNoLibrary(false);
               continue;
             }
             // The same library: a project may have been locked, unlocked, created or removed, or the mode changed (M8).
+            if (!screenRead_ok.current) readScreen(SWITCH_TIMEOUT_MS);
             readProjects();
             emit({ kind: "refresh" });
             continue;
@@ -308,7 +448,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
       clearTimeout(retry);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, readProjects, forgetLibrary]);
+  }, [client, readProjects, readScreen, forgetLibrary]);
 
   const asked = projectInQuery(loc.search);
   // A project named in the address again (a link) takes over from the one chosen here.
@@ -359,12 +499,31 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
    * One PUT of the remembered settings, after those before it: built from the last CONFIRMED answer plus its own
    * change. On success that answer is the new confirmed one; on a failure the controls show the confirmed one (M2).
    */
-  const put = (change: (base: FindScreenSettings) => FindScreenSettings, h: { done?: (s: FindScreenSettings) => void; failed: (err: unknown) => void; always?: () => void }) => {
+  const put = (
+    change: (base: FindScreenSettings) => FindScreenSettings,
+    h: {
+      done?: (s: FindScreenSettings) => void;
+      failed: (err: unknown, timedOut: boolean) => void;
+      /** R291 a: no answer in `timeoutMs` — run in place of `failed`, still in the order of the PUTs, before `always`. */
+      noAnswer?: () => Promise<void>;
+      always?: () => void;
+    },
+    timeoutMs?: number,
+  ) => {
     const g = libGen.current;
     const run = async () => {
       if (!alive.current || g !== libGen.current) return;
+      // R281 c: a PUT with no answer for `timeoutMs` is given up (aborted): the controls go back to what is confirmed.
+      const ac = new AbortController();
+      let timedOut = false;
+      const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+        timedOut = true;
+        ac.abort();
+      }, timeoutMs);
+      putTimers.current.add(timer);
+      putAborts.current.add(ac);
       try {
-        const s = await api.putScreen(change(confirmed.current));
+        const s = await api.putScreen(change(confirmed.current), { signal: ac.signal });
         if (!alive.current || g !== libGen.current) return;
         confirmed.current = { ...s };
         screenUnread.current = false;
@@ -372,9 +531,19 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
         h.done?.(s);
       } catch (err) {
         if (!alive.current || g !== libGen.current) return;
+        clearTimeout(timer);
+        putTimers.current.delete(timer);
+        putAborts.current.delete(ac);
+        if (timedOut && h.noAnswer) {
+          await h.noAnswer();
+          return;
+        }
         setRemembered({ ...confirmed.current });
-        h.failed(err);
+        h.failed(err, timedOut);
       } finally {
+        clearTimeout(timer);
+        putTimers.current.delete(timer);
+        putAborts.current.delete(ac);
         if (alive.current && g === libGen.current) h.always?.();
       }
     };
@@ -414,23 +583,68 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     put((b) => ({ checkEverything: b.checkEverything, ...(pid ? { projectId: pid } : {}), ...(cid ? { collectionId: cid } : {}) }), { failed: rememberFailed(before) });
   };
 
+  useEffect(
+    () => () => {
+      for (const t of putTimers.current) clearTimeout(t);
+    },
+    [],
+  );
+
   const confirmedCheck = remembered?.checkEverything ?? false;
   const shownCheck = checkSending ?? confirmedCheck;
   const toggle = () => {
     if (switchBusy.current || !remembered) return;
     switchBusy.current = true;
     const next = !shownCheck;
+    const g = libGen.current;
     setCheckSending(next);
     setSwitchError(undefined);
-    put((b) => ({ ...b, checkEverything: next }), {
-      done: () => setSwitchVersion((v) => v + 1),
-      // Back to what the service stores, and why.
-      failed: (err) => setSwitchError(`“Check everything I have” could not be changed. ${sentenceOf(err, "")}`.trim()),
-      always: () => {
-        switchBusy.current = false;
-        setCheckSending(undefined);
+    setSwitchNote(undefined);
+    let resolve!: (r: SwitchResult) => void;
+    const wait = { p: new Promise<SwitchResult>((r) => (resolve = r)), resolve: (r: SwitchResult) => resolve(r), taken: false };
+    switchWait.current = wait;
+    put(
+      (b) => ({ ...b, checkEverything: next }),
+      {
+        done: () => {
+          setSwitchVersion((v) => v + 1);
+          wait.resolve({ outcome: "ok" });
+        },
+        // Refused: back to what the service stores, and why.
+        failed: (err) => {
+          setSwitchError(`“Check everything I have” could not be changed. ${sentenceOf(err, "")}`.trim());
+          wait.resolve({ outcome: "failed" });
+        },
+        // R291 a: no answer in time — the change may have been stored. What the service holds is read before anything
+        // else; the switch and "Add" stay busy until it answers.
+        noAnswer: async () => {
+          const before = confirmed.current.checkEverything;
+          const r = await screenOnce(SWITCH_TIMEOUT_MS);
+          if (r === "gone" || !alive.current || g !== libGen.current) return;
+          if (r === "failed") {
+            // The state for settings that cannot be read: the queue is read, and its answer says what is stored (M3).
+            setSwitchVersion((v) => v + 1);
+            wait.resolve({ outcome: "unknown" });
+            return;
+          }
+          const on = confirmed.current.checkEverything;
+          const note = switchReadText(on);
+          setSwitchNote(note);
+          if (on !== before) setSwitchVersion((v) => v + 1);
+          const outcome: SwitchOutcome = on === next ? "ok" : "not-stored";
+          // Said once: by a waiting add, at the head of its own result (one message, so neither replaces the other
+          // unheard); else here.
+          if (!wait.taken) emit({ kind: "say", words: [note] });
+          wait.resolve({ outcome, note });
+        },
+        always: () => {
+          switchBusy.current = false;
+          setCheckSending(undefined);
+          if (switchWait.current === wait) switchWait.current = null;
+        },
       },
-    });
+      SWITCH_TIMEOUT_MS,
+    );
   };
 
   /** The queue's answer says what is stored; used only while the remembered settings could not be read (M3). */
@@ -486,11 +700,17 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
             checked={shownCheck}
             aria-busy={checkSending !== undefined || undefined}
             aria-disabled={checkSending !== undefined || !remembered || undefined}
+            aria-describedby={switchNote ? `${ids}-swnote` : undefined}
             onChange={toggle}
           />
           Check everything I have
         </label>
       </div>
+      {switchNote && (
+        <p id={`${ids}-swnote`} className="ao-find__note">
+          {switchNote}
+        </p>
+      )}
       {screenError && (
         <p role="alert" className="ao-error">
           <UserText>{screenError}</UserText>
@@ -526,6 +746,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           switchVersion={switchVersion}
           onStoredCheck={onStoredCheck}
           onUnlocked={readProjects}
+          waitForSwitch={waitForSwitch}
         />
       )}
     </main>
@@ -549,11 +770,11 @@ interface Meta {
   lockedProjectsNotChecked: number;
 }
 
-interface DialogState {
-  entry: FindEntryView;
-  busy: boolean;
-  error?: string;
-}
+/** The dialog open on a row: "Choose", or an author's two (their lists read from `options` when it opened). */
+type DialogState =
+  | { kind: "choose"; entry: FindEntryView; busy: boolean; busyAuthor?: boolean; error?: string | undefined; noAuthor?: boolean }
+  | { kind: "person"; token: number; entry: FindEntryView; busy: boolean; busyAuthor?: boolean; error?: string | undefined; people?: FindPersonCandidate[]; loadError?: string }
+  | { kind: "works"; token: number; entry: FindEntryView; busy: boolean; busyAuthor?: boolean; error?: string | undefined; works?: FindPersonWork[]; person?: FindChosenPerson; loadError?: string };
 
 function LiveRegion({ said }: { said: Said }) {
   return (
@@ -577,10 +798,17 @@ const Rows = memo(function Rows(props: {
   onAction: (a: FindAction) => void;
 }) {
   const { entries, places, busy, errors, readOnly, stopped, onAction } = props;
+  // An entry made from an author's entry says where it came from (R271 M7): that entry's typed text, or null when gone.
+  const typedOf = new Map(entries.map((e) => [e.id, e.typed] as const));
+  const originOf = (e: FindEntryView): string | null | undefined => {
+    if (typeof e.parentId !== "string") return undefined;
+    const t = typedOf.get(e.parentId);
+    return typeof t === "string" ? t : null;
+  };
   return (
     <>
       {entries.map((e) => (
-        <FindEntryRow key={e.id} entry={e} onAction={onAction} place={places[e.id]} busy={busy[e.id]} readOnly={readOnly} stopped={stopped} error={errors[e.id]} />
+        <FindEntryRow key={e.id} entry={e} onAction={onAction} place={places[e.id]} busy={busy[e.id]} readOnly={readOnly} stopped={stopped} error={errors[e.id]} origin={originOf(e)} />
       ))}
     </>
   );
@@ -600,8 +828,10 @@ function ProjectQueue(props: {
   onStoredCheck: (v: boolean) => void;
   /** The project was unlocked here: the project list is read again. */
   onUnlocked: () => void;
+  /** A change of "Check everything I have" still out: an add waits for it (R272 a). */
+  waitForSwitch: () => Promise<SwitchResult> | undefined;
 }) {
-  const { bus, api, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked } = props;
+  const { bus, api, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch } = props;
   const projectId = project.id;
   const ids = useId();
 
@@ -621,7 +851,7 @@ function ProjectQueue(props: {
   const [said, setSaid] = useState<Said>({ words: [], n: 0 });
   const [addBusy, setAddBusyState] = useState(false);
   const [addError, setAddError] = useState<string | undefined>();
-  const [focusTarget, setFocusTarget] = useState<{ to: string; n: number } | null>(null);
+  const [focusTarget, setFocusTarget] = useState<{ to: string; n: number; control?: string } | null>(null);
   const [focusUnlock, setFocusUnlock] = useState(0);
   const unlockRef = useRef<HTMLDivElement>(null);
 
@@ -640,7 +870,18 @@ function ProjectQueue(props: {
   const busyRef = useRef<Record<string, FindActKind>>({});
   const acting = useRef(new Set<string>());
   const dialogRef = useRef<DialogState | null>(null);
-  const pendingSay = useRef<Words | null>(null);
+  /** R272 b: until when the result of an act holds the status region (Date.now() time). */
+  const actHold = useRef(0);
+  const holdTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** Rows whose change waits to be said (after the act's result, or after the dialog closes). */
+  const pendingRows = useRef(new Set<string>());
+  /** The result of an act made while a dialog was open (said when it closes). */
+  const pendingAct = useRef<Words | null>(null);
+  /** What was last said of each row: the same change is never said twice. */
+  const lastSaid = useRef(new Map<string, string>());
+  const stoppedRef = useRef(false);
+  /** Each dialog opened on an author's entry: an answer of `options` for an earlier one is dropped. */
+  const dialogToken = useRef(0);
   const soon = useRef<{ again: boolean } | null>(null);
   const addBusyRef = useRef(false);
   const placeKeys = useRef(new Map<string, string>());
@@ -648,7 +889,7 @@ function ProjectQueue(props: {
   const placeRunning = useRef(0);
   const boxRef = useRef<HTMLTextAreaElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
-  const lastFocus = useRef<{ el: HTMLElement; entryId: string | undefined } | null>(null);
+  const lastFocus = useRef<{ el: HTMLElement; entryId: string | undefined; entry?: FindEntryView | undefined } | null>(null);
   const sourceRef = useRef<HTMLElement>(null);
   /** The latest `readOnce`, for a fresh read asked from inside applyQueue. */
   const readOnceRef = useRef<() => Promise<void>>(async () => {});
@@ -682,21 +923,83 @@ function ProjectQueue(props: {
       return next;
     });
 
-  /** Said once in the polite region; while the dialog is open (the page is inert) it waits for the dialog to close. */
-  const say = useCallback((words: Words) => {
-    if (dialogRef.current) {
-      pendingSay.current = words;
+  const speak = useCallback((words: Words) => setSaid((x) => ({ words, n: x.n + 1 })), []);
+  /** Where an entry made from an author's entry came from (R281 a): that entry's typed text, null when gone. */
+  const originOf = useCallback((v: FindEntryView): string | null | undefined => {
+    if (typeof v.parentId !== "string") return undefined;
+    const t = held.current.get(v.parentId)?.view.typed;
+    return typeof t === "string" ? t : null;
+  }, []);
+  const saidFor = (v: FindEntryView) => saidOf(v, !!meta?.stopped, originOf(v));
+
+  /**
+   * Rows' changes waiting to be said: each row's state AS SHOWN NOW (never an older one), unless it is what was last
+   * said of that row. Nothing while a dialog is open (the page is inert) or while the result of an act holds the region
+   * (R272 b): they are said when it closes, or when the act's result has stood for ACT_SAID_MS.
+   */
+  const flushRows = useCallback(() => {
+    if (dialogRef.current || Date.now() < actHold.current) return;
+    const ids = [...pendingRows.current];
+    pendingRows.current.clear();
+    const fresh: Words[] = [];
+    for (const id of ids) {
+      const v = held.current.get(id)?.view;
+      if (!v) continue;
+      const w = saidOf(v, stoppedRef.current, originOf(v));
+      const t = wordsText(w);
+      if (lastSaid.current.get(id) === t) continue;
+      lastSaid.current.set(id, t);
+      fresh.push(w);
+    }
+    if (fresh.length === 0) return;
+    if (fresh.length <= ROWS_SAID_MAX) speak(fresh.flatMap((w, i) => (i > 0 ? [" ", ...w] : w)));
+    else speak([`${fresh.length} entries in the queue changed.`]);
+  }, [speak, originOf]);
+
+  /**
+   * The result of the researcher's own act (R272 b): said first, and it holds the region for ACT_SAID_MS; then the rows'
+   * changes that arrived meanwhile. While a dialog is open it waits for it to close. `rowId`: the row the words are about.
+   */
+  const sayAct = useCallback(
+    (words: Words, rowId?: string) => {
+      if (rowId) {
+        lastSaid.current.set(rowId, wordsText(words));
+        pendingRows.current.delete(rowId);
+      }
+      if (dialogRef.current) {
+        pendingAct.current = words;
+        return;
+      }
+      speak(words);
+      actHold.current = Date.now() + ACT_SAID_MS;
+      clearTimeout(holdTimer.current);
+      holdTimer.current = setTimeout(() => {
+        if (alive.current) flushRows();
+      }, ACT_SAID_MS);
+    },
+    [speak, flushRows],
+  );
+
+  /** Rows whose shown state changed (a read): said now, or after the act's result or the dialog. */
+  const sayRows = useCallback(
+    (ids: string[]) => {
+      for (const id of ids) pendingRows.current.add(id);
+      flushRows();
+    },
+    [flushRows],
+  );
+
+  useEffect(() => {
+    if (dialog) return;
+    const w = pendingAct.current;
+    if (w) {
+      pendingAct.current = null;
+      sayAct(w);
       return;
     }
-    setSaid((s) => ({ words, n: s.n + 1 }));
-  }, []);
-  useEffect(() => {
-    if (!dialog && pendingSay.current) {
-      const w = pendingSay.current;
-      pendingSay.current = null;
-      setSaid((s) => ({ words: w, n: s.n + 1 }));
-    }
-  }, [dialog]);
+    flushRows();
+  }, [dialog, sayAct, flushRows]);
+  useEffect(() => () => clearTimeout(holdTimer.current), []);
 
   const commit = useCallback(() => {
     setEntries([...held.current.values()].map((h) => h.view).sort(byCreated));
@@ -827,12 +1130,10 @@ function ProjectQueue(props: {
         const b = before.get(v.id);
         return b && b !== v && wordsText(stateWords(b)) !== wordsText(stateWords(v)) && !acting.current.has(v.id);
       });
-      if (changed.length === 1) {
-        const v = changed[0]!;
-        say(saidOf(v, !!r.stopped));
-      } else if (changed.length > 1) say([`${changed.length} entries in the queue changed.`]);
+      stoppedRef.current = !!r.stopped;
+      if (changed.length > 0) sayRows(changed.map((v) => v.id));
     },
-    [commit, askPlaces, say, onStoredCheck, keep],
+    [commit, askPlaces, sayRows, onStoredCheck, keep],
   );
 
   const markLocked = useCallback(() => {
@@ -925,9 +1226,10 @@ function ProjectQueue(props: {
     () =>
       bus.subscribe((sig) => {
         if (!alive.current) return;
-        if (sig.kind === "refresh" || findProgressOf(sig.ev, projectId)) readSoon();
+        if (sig.kind === "say") sayAct(sig.words);
+        else if (sig.kind === "refresh" || findProgressOf(sig.ev, projectId)) readSoon();
       }),
-    [bus, projectId, readSoon],
+    [bus, projectId, readSoon, sayAct],
   );
   useEffect(() => {
     if (openSource) sourceRef.current?.focus();
@@ -939,8 +1241,13 @@ function ProjectQueue(props: {
   }, [focusUnlock]);
   useEffect(() => {
     if (!focusTarget) return;
-    if (focusTarget.to === "box") boxRef.current?.focus();
-    else listRef.current?.querySelector<HTMLElement>(`[data-entry-id="${CSS.escape(focusTarget.to)}"] [data-entry-text]`)?.focus();
+    if (focusTarget.to === "box") {
+      boxRef.current?.focus();
+      return;
+    }
+    const rowEl = listRef.current?.querySelector<HTMLElement>(`[data-entry-id="${CSS.escape(focusTarget.to)}"]`);
+    const control = focusTarget.control ? rowEl?.querySelector<HTMLElement>(`button[data-act="${CSS.escape(focusTarget.control)}"]:not([disabled])`) : null;
+    (control ?? rowEl?.querySelector<HTMLElement>("[data-entry-text]"))?.focus();
   }, [focusTarget]);
   // When the control the researcher used has gone, focus goes to its row's next control (else its text, else the box).
   useEffect(() => {
@@ -948,14 +1255,21 @@ function ProjectQueue(props: {
     const now = document.activeElement;
     if (!lf || lf.el.isConnected || (now && now !== document.body && now.isConnected)) return;
     const rowEl = lf.entryId ? listRef.current?.querySelector<HTMLElement>(`[data-entry-id="${CSS.escape(lf.entryId)}"]`) : null;
-    const target = rowEl?.querySelector<HTMLElement>(".ao-find__actions button:not([disabled])") ?? rowEl?.querySelector<HTMLElement>("[data-entry-text]") ?? boxRef.current;
-    target?.focus();
+    let target = rowEl?.querySelector<HTMLElement>(".ao-find__actions button:not([disabled])") ?? rowEl?.querySelector<HTMLElement>("[data-entry-text]") ?? null;
+    if (!target && !rowEl && lf.entry) {
+      // The row itself has gone (removed elsewhere while a dialog was open on it): the next row, in the queue's order.
+      const gone = lf.entry;
+      const next = [...held.current.values()].map((h) => h.view).sort(byCreated).find((v) => byCreated(v, gone) > 0);
+      if (next) target = listRef.current?.querySelector<HTMLElement>(`[data-entry-id="${CSS.escape(next.id)}"] [data-entry-text]`) ?? null;
+    }
+    (target ?? boxRef.current)?.focus();
   });
   const noteFocus = (e: FocusEvent<HTMLElement>) => {
     const el = e.target as HTMLElement;
     const inDialog = el.closest('[role="dialog"]');
     const entryId = inDialog ? dialogRef.current?.entry.id : el.closest<HTMLElement>("[data-entry-id]")?.dataset.entryId;
-    lastFocus.current = { el, entryId };
+    const entry = inDialog ? dialogRef.current?.entry : entryId ? held.current.get(entryId)?.view : undefined;
+    lastFocus.current = { el, entryId, entry };
   };
 
   // ---- acts ----
@@ -982,7 +1296,7 @@ function ProjectQueue(props: {
       const v = await call();
       if (!alive.current || g !== gen.current) return;
       const t = takeOne(v);
-      if (t.changed) say(saidOf(t.shown, !!meta?.stopped));
+      if (t.changed) sayAct(saidFor(t.shown), e.id);
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current || refused(err)) return;
@@ -1007,7 +1321,9 @@ function ProjectQueue(props: {
       held.current.delete(e.id);
       gone.current.set(e.id, Infinity);
       commit();
-      say(["Removed “", { user: e.typed }, "” from the queue."]);
+      lastSaid.current.delete(e.id);
+      pendingRows.current.delete(e.id);
+      sayAct(["Removed ", ...entryLabel(e, originOf(e)), " from the queue."]);
       setFocusTarget((f) => ({ to: next && next.id !== e.id ? next.id : "box", n: (f?.n ?? 0) + 1 }));
       readSoon();
     } catch (err) {
@@ -1044,7 +1360,13 @@ function ProjectQueue(props: {
     switch (a.kind) {
       case "choose":
         if (readOnly || dialogRef.current || busyRef.current[e.id]) return;
-        setDialog({ entry: e, busy: false });
+        setDialog({ kind: "choose", entry: e, busy: false });
+        return;
+      case "choose-person":
+        openAuthorDialog("person", e);
+        return;
+      case "choose-works":
+        openAuthorDialog("works", e);
         return;
       case "open": {
         const sid = e.state === "record-complete" ? e.sourceId : (e.duplicateOf ?? e.sourceId);
@@ -1073,33 +1395,151 @@ function ProjectQueue(props: {
   };
   const onAction = useCallback((a: FindAction) => actRef.current(a), []);
 
-  const choose = async (candidateId: string | null) => {
+  /**
+   * An author's dialog: opened at once (it says the list is being read), its list read from the entry's `options`
+   * (R267 b) — never from the queue's answer, never kept after it closes. A read that fails, or an entry that no longer
+   * holds that list, is the service's sentence in the dialog; nothing else changes.
+   */
+  /**
+   * A locked project met in a dialog (R281 b): the dialog closes with the rows, and focus goes to what the screen now
+   * offers — the unlock's field — never the page.
+   */
+  const lockedInDialog = () => {
+    markLocked();
+    setFocusUnlock((n) => n + 1);
+  };
+
+  /** The list of an author's dialog (`token`), read from `options`; an answer for an earlier dialog is dropped (M4). */
+  const loadOptions = (kind: "person" | "works", token: number, e: FindEntryView) => {
+    const g = gen.current;
+    const mine = (cur: DialogState | null): cur is Extract<DialogState, { kind: "person" | "works" }> => !!cur && cur.kind === kind && "token" in cur && cur.token === token;
+    api.options(projectId, e.id).then(
+      (r) => {
+        if (!alive.current || g !== gen.current) return;
+        setDialog((cur) => {
+          if (!mine(cur)) return cur;
+          const o = r && typeof r === "object" ? r : {};
+          if (cur.kind === "person") return Array.isArray(o.people) ? { ...cur, people: o.people } : { ...cur, loadError: FIND_ROUTE_TEXT.entryState };
+          if (!Array.isArray(o.works)) return { ...cur, loadError: FIND_ROUTE_TEXT.entryState };
+          return { ...cur, works: o.works, ...(o.person && typeof o.person === "object" ? { person: o.person } : {}) };
+        });
+      },
+      (err: unknown) => {
+        if (!alive.current || g !== gen.current) return;
+        if (isProjectLocked(err)) {
+          if (mine(dialogRef.current)) lockedInDialog();
+          return;
+        }
+        setDialog((cur) => (mine(cur) ? { ...cur, loadError: sentenceOf(err, FIND_SCREEN_TEXT.optionsUnreadable) } : cur));
+        if (err instanceof ApiClientError && (err.status === 404 || err.status === 409)) readSoon();
+      },
+    );
+  };
+
+  /**
+   * An author's dialog: opened at once (it says the list is being read), its list read from the entry's `options`
+   * (R267 b) — never from the queue's answer, never kept after it closes. A read that fails, or an entry that no longer
+   * holds that list, is the service's sentence in the dialog; nothing else changes.
+   */
+  const openAuthorDialog = (kind: "person" | "works", e: FindEntryView) => {
+    if (readOnly || dialogRef.current || busyRef.current[e.id]) return;
+    const token = ++dialogToken.current;
+    setDialog({ kind, token, entry: e, busy: false });
+    loadOptions(kind, token, e);
+  };
+
+  /**
+   * An act pressed in a dialog: one request; its answer takes its place in the order like any act's (R262, R263). A
+   * refusal is the service's sentence in the dialog and nothing changes; a locked project closes it and offers the unlock.
+   */
+  const dialogAct = async <T,>(kind: DialogState["kind"], call: (e: FindEntryView) => Promise<T>, done: (r: T, e: FindEntryView) => void, fallback: string, author = false) => {
     const d = dialogRef.current;
-    if (!d || d.busy || readOnly) return;
+    if (!d || d.kind !== kind || d.busy || readOnly) return;
     const e = d.entry;
-    setDialog({ ...d, busy: true, error: undefined });
+    setDialog({ ...d, busy: true, busyAuthor: author, error: undefined });
     acting.current.add(e.id);
     const g = gen.current;
     try {
-      const v = await api.choose(projectId, e.id, candidateId);
+      const r = await call(e);
       if (!alive.current || g !== gen.current) return;
-      const t = takeOne(v);
-      setDialog(null);
-      if (t.changed) say(saidOf(t.shown, !!meta?.stopped));
+      done(r, e);
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current) return;
       if (isProjectLocked(err)) {
-        markLocked();
+        lockedInDialog();
         return;
       }
-      // The service's sentence, in the dialog; nothing is changed here.
-      setDialog((cur) => (cur ? { ...cur, busy: false, error: sentenceOf(err, "The choice could not be made. Try again.") } : cur));
+      // The service's sentence, in the dialog; nothing is changed here — except that after "This entry has no author to
+      // show." the dialog no longer offers the author (R291 d).
+      const noAuthor = kind === "choose" && err instanceof ApiClientError && err.reason === "no-author";
+      setDialog((cur) => (cur && cur.kind === kind ? { ...cur, busy: false, busyAuthor: false, error: sentenceOf(err, fallback), ...(noAuthor ? { noAuthor: true } : {}) } : cur));
+      // "Already added" (M6): the works' marks are read again, so the dialog shows what the queue now holds.
+      const cur = dialogRef.current;
+      if (cur?.kind === "works" && err instanceof ApiClientError && err.reason === "already-added") loadOptions("works", cur.token, cur.entry);
       if (err instanceof ApiClientError && (err.status === 404 || err.status === 409)) readSoon();
     } finally {
       acting.current.delete(e.id);
     }
   };
+
+  const choose = (candidateId: string | null) =>
+    dialogAct(
+      "choose",
+      (e) => api.choose(projectId, e.id, candidateId),
+      (v, e) => {
+        const t = takeOne(v);
+        setDialog(null);
+        if (t.changed) sayAct(saidFor(t.shown), e.id);
+      },
+      "The choice could not be made. Try again.",
+    );
+
+  /**
+   * "Show this author's works" (R279 d): the entry is turned into the author's flow; its answer ("choose-person", or
+   * "looking-up" then "choose-works") takes its place like any act's. Focus: the row's next control, else its text.
+   */
+  const showAuthor = () =>
+    dialogAct(
+      "choose",
+      (e) => api.author(projectId, e.id),
+      (v, e) => {
+        const t = takeOne(v);
+        setDialog(null);
+        if (t.changed) sayAct(saidFor(t.shown), e.id);
+      },
+      "That could not be done. Try again.",
+      true,
+    );
+
+  /** "This is the person": answered at once with the entry "looking-up"; "Choose works" follows by an event. */
+  const choosePerson = (personId: string) =>
+    dialogAct(
+      "person",
+      (e) => api.person(projectId, e.id, personId),
+      (v, e) => {
+        const t = takeOne(v);
+        setDialog(null);
+        if (t.changed) sayAct(saidFor(t.shown), e.id);
+      },
+      "The choice could not be made. Try again.",
+    );
+
+  /** "Add the chosen works": an entry for each, and the author's entry as it now is; focus back on its "Choose works". */
+  const chooseWorks = (workIds: string[]) =>
+    dialogAct(
+      "works",
+      (e) => api.works(projectId, e.id, workIds),
+      (r, e) => {
+        const made = Array.isArray(r?.added) ? r.added.filter((v) => v && typeof v === "object" && typeof v.id === "string") : [];
+        for (const v of made) takeOne(v);
+        if (r?.entry && typeof r.entry === "object" && typeof r.entry.id === "string") takeOne(r.entry);
+        setDialog(null);
+        sayAct([addedWorksText(made.length)]);
+        setFocusTarget((f) => ({ to: e.id, control: "choose-works", n: (f?.n ?? 0) + 1 }));
+      },
+      "The works could not be added. Try again.",
+    );
 
   // ---- adding ----
   const submit = async () => {
@@ -1113,6 +1553,30 @@ function ProjectQueue(props: {
     setAddBusyState(true);
     setAddError(undefined);
     const g = gen.current;
+    // R272 a: a change of "Check everything I have" still out — the add waits for it, and is not sent if it fails (the
+    // service must hold the switch's new position before a reference is judged). The box stays read-only meanwhile.
+    const pendingSwitch = waitForSwitch();
+    /** R291 a: what the service holds, read after a change with no answer: said at the head of this add's result. */
+    let switchLead: string | undefined;
+    const lead = (w: string): Words => [switchLead ? `${switchLead} ${w}` : w];
+    if (pendingSwitch) {
+      const { outcome, note } = await pendingSwitch;
+      if (outcome === "ok" && note) switchLead = note;
+      if (!alive.current) return;
+      if (g !== gen.current || outcome !== "ok") {
+        addBusyRef.current = false;
+        setAddBusyState(false);
+        if (g === gen.current) {
+          // Not sent; the text kept; why, beside the box and once in the status region (R272 a, R281 c, R291 a) — after
+          // a change with no answer, with what the service holds first.
+          const why = outcome === "failed" ? FIND_SCREEN_TEXT.addSwitchFailed : FIND_SCREEN_TEXT.addSwitchNoAnswer;
+          setAddError(why);
+          sayAct([outcome === "not-stored" && note ? `${note} ${why}` : why]);
+          boxRef.current?.focus();
+        }
+        return;
+      }
+    }
     // No answer within ADD_TIMEOUT_MS: the add is given up, the text kept, and the queue read (R262 N5 b).
     const ac = new AbortController();
     let timedOut = false;
@@ -1128,16 +1592,17 @@ function ProjectQueue(props: {
       // The box was read-only while the add was out, so it holds exactly what was sent (R258 I2).
       setText("");
       boxRef.current?.focus();
-      say([addedText(r)]);
+      sayAct(lead(addedText(r)));
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current) return;
       if (timedOut) {
-        say([FIND_SCREEN_TEXT.addTimedOut]);
+        sayAct(lead(FIND_SCREEN_TEXT.addTimedOut));
         setAddError(FIND_SCREEN_TEXT.addTimedOut);
         readNow();
         return;
       }
+      if (switchLead) sayAct([switchLead]);
       if (isProjectLocked(err)) {
         lockedNow = true;
         markLocked();
@@ -1166,6 +1631,11 @@ function ProjectQueue(props: {
       e.preventDefault();
       void submit();
     }
+  };
+
+  /** Cancel or Escape: closed without a request (not while its act is out); its lists go with it. */
+  const closeDialog = () => {
+    if (!dialogRef.current?.busy) setDialog(null);
   };
 
   // ---- the page ----
@@ -1281,15 +1751,37 @@ function ProjectQueue(props: {
         </section>
       )}
 
-      {dialog && (
+      {dialog?.kind === "choose" && (
         <ChooseWorkDialog
           entry={dialog.entry}
           busy={dialog.busy}
           {...(dialog.error ? { error: dialog.error } : {})}
           onChoose={(id) => void choose(id)}
-          onClose={() => {
-            if (!dialogRef.current?.busy) setDialog(null);
-          }}
+          {...(authorOfferOf(dialog.entry) && !dialog.noAuthor ? { onShowAuthor: () => void showAuthor(), busyAuthor: !!dialog.busyAuthor } : {})}
+          onClose={closeDialog}
+        />
+      )}
+      {dialog?.kind === "person" && (
+        <ChoosePersonDialog
+          entry={dialog.entry}
+          {...(dialog.people ? { people: dialog.people } : {})}
+          {...(dialog.loadError ? { loadError: dialog.loadError } : {})}
+          busy={dialog.busy}
+          {...(dialog.error ? { error: dialog.error } : {})}
+          onChoose={(personId) => void choosePerson(personId)}
+          onClose={closeDialog}
+        />
+      )}
+      {dialog?.kind === "works" && (
+        <ChooseWorksDialog
+          entry={dialog.entry}
+          {...(dialog.works ? { works: dialog.works } : {})}
+          {...(dialog.person ? { person: dialog.person } : {})}
+          {...(dialog.loadError ? { loadError: dialog.loadError } : {})}
+          busy={dialog.busy}
+          {...(dialog.error ? { error: dialog.error } : {})}
+          onAdd={(ids) => void chooseWorks(ids)}
+          onClose={closeDialog}
         />
       )}
     </div>
