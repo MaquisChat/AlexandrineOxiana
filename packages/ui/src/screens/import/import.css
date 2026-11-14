@@ -532,3 +532,9 @@ span.ao-import__hint {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+/* R313 a: focus comes to a waiting file's heading after a decision; it shows where. */
+.ao-review__file-title:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

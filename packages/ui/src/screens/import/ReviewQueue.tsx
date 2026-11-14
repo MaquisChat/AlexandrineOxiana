@@ -36,7 +36,7 @@
  * a decision focus goes to the next waiting file's "Use this file" (in the same group, else the first of the other
  * group), else to the queue's heading, or to the message that nothing is waiting.
  */
-import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { ApiClientError, type ApiClient } from "../../api/client";
 import {
   importApi,
@@ -98,6 +98,8 @@ export function titleFromFileName(item: ReviewItem, sf: SourceFile | undefined):
 /** The source records loaded so far, by source id; a change tells only its readers (useRecord). */
 interface RecordStore {
   get(sid: string | undefined): SourceFile | undefined;
+  /** Moves on with every change (read by a list that names many records at once). */
+  version(): number;
   set(entries: Iterable<[string, SourceFile]>): void;
   subscribe(listener: () => void): () => void;
 }
@@ -105,10 +107,13 @@ interface RecordStore {
 function recordStore(): RecordStore {
   const map = new Map<string, SourceFile>();
   const listeners = new Set<() => void>();
+  let v = 0;
   return {
     get: (sid) => (sid ? map.get(sid) : undefined),
+    version: () => v,
     set(entries) {
-      for (const [k, v] of entries) map.set(k, v);
+      v++;
+      for (const [k, val] of entries) map.set(k, val);
       for (const l of listeners) l();
     },
     subscribe(listener) {
@@ -136,6 +141,20 @@ export interface ReviewQueueProps {
 
 /** Source requests in flight at once (R115 I4). */
 export const SOURCE_POOL = 6;
+
+/**
+ * R313 c: for this long after a waiting file leaves the list (or the list is read again and its cards move), no
+ * "Use this file" or "Not this file" acts — by key or by pointer. The card that takes a decided file's place lies under
+ * the same pointer, and a second press meant for the file that has just gone would otherwise fall on one the
+ * researcher has not looked at. Long enough for a double click or a quick second key press; short enough not to slow
+ * deliberate work. The controls are not shown disabled for it: they simply do not act.
+ */
+export const DECIDE_SETTLE_MS = 600;
+
+/** R313 e: a decision on a waiting file with no answer in this long is given up (the request aborted). */
+export const HELD_DECISION_TIMEOUT_MS = 60_000;
+/** R313 e: said on the card when a decision was given up. */
+export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
 
 /** Entries per page when the project's whole queue is read. */
 export const PROJECT_PAGE = 500;
@@ -220,7 +239,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const [status, setStatus] = useState("");
+  /** The polite region's words; a new `n` is a new node, so the same words twice are said twice (R313 g). */
+  const [said, setSaid] = useState({ text: "", n: 0 });
+  const setStatus = useCallback((text: string) => setSaid((cur) => ({ text, n: cur.n + 1 })), []);
   const [focusId, setFocusId] = useState<{ id: string | null } | null>(null);
   /** Waiting files (F11, R303): the decision under way on each, the service's sentence for a refused one, where focus goes after one. */
   const [heldBusy, setHeldBusy] = useState<Readonly<Record<string, HeldFileDecision>>>({});
@@ -237,9 +258,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const gen = useRef(0);
   const showButtons = useRef(new Map<string, HTMLButtonElement>());
   const title = useRef<HTMLHeadingElement>(null);
-  /** Each waiting file's "Use this file" and its card (R303 b: focus moves between them). */
-  const useButtons = useRef(new Map<string, HTMLButtonElement>());
+  /** Each waiting file's heading (R313 a: focus goes there after a decision) and its card. */
+  const fileHeads = useRef(new Map<string, HTMLHeadingElement>());
   const fileCards = useRef(new Map<string, HTMLElement>());
+  /** R313 c: until this time (Date.now()) no deciding control acts. */
+  const quietUntil = useRef(0);
+  /** R313 e: after a decision was given up and the queue read again, focus goes back to that file's heading. */
+  const refocusAfterRead = useRef<string | null>(null);
   /** The message that nothing is waiting: focus goes there after the last decision. */
   const emptyNote = useRef<HTMLParagraphElement>(null);
 
@@ -319,6 +344,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     pool.current = p;
     let live = true;
     const ok = () => live && g === gen.current;
+    // R313 c: a list read again moves its cards; the first read only shows them.
+    const reread = !!itemsRef.current?.some(isFound);
     setError(null);
     setItems(null);
     /** Every page of the project's queue, oldest first; a page for an older generation stops the read. */
@@ -335,7 +362,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     (batchId ? api.review(batchId) : readAll()).then(
       (list) => {
         if (!ok()) return;
+        if (reread && list.some(isFound)) quietUntil.current = Date.now() + DECIDE_SETTLE_MS;
         setItems(list);
+        const back = refocusAfterRead.current;
+        refocusAfterRead.current = null;
+        if (back) setFileFocus({ to: list.some((i) => i.id === back) ? back : ":title" });
         // A waiting file is shown in full in its own section; the panel shows the first of the others.
         setCurrent(list.find((i) => !isFound(i))?.id ?? null);
         // Titles come with the items; only items sent without one need their record for the list. A waiting file's
@@ -563,6 +594,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const next = restMine[Math.min(k, restMine.length - 1)] ?? theirs[0];
     const rest = list.filter((x) => x.id !== item.id);
     itemsRef.current = rest;
+    // R313 c: the next card now lies where this one was; a press meant for this one must not fall on it.
+    quietUntil.current = Date.now() + DECIDE_SETTLE_MS;
     setItems(rest);
     setSelected((s) => s.filter((x) => x !== item.id));
     setStatus(said(at + 1));
@@ -571,22 +604,40 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   useEffect(() => {
     if (!fileFocus) return;
     const t = fileFocus.to;
-    const el = t === ":empty" ? emptyNote.current : t === ":title" ? title.current : (useButtons.current.get(t) ?? title.current);
+    // R313 a: a waiting file's heading, never a control that decides.
+    const el = t === ":empty" ? emptyNote.current : t === ":title" ? title.current : (fileHeads.current.get(t) ?? title.current);
     el?.focus();
   }, [fileFocus]);
   const decideHeld = async (item: ReviewItem, decision: HeldFileDecision) => {
+    // R313 c: just after a file left (or the list was read again) a press does nothing at all.
+    if (Date.now() < quietUntil.current) return;
     if (heldBusyRef.current.has(item.id)) return;
     heldBusyRef.current.add(item.id);
     const g = gen.current;
     setHeldBusy((cur) => ({ ...cur, [item.id]: decision }));
     setHeldErrors((cur) => withoutKey(cur, item.id));
+    // R313 e: no answer in HELD_DECISION_TIMEOUT_MS: the request is aborted, the card usable again and saying so, and
+    // the queue read again (the decision may or may not have been recorded); its late answer changes nothing.
+    const abort = new AbortController();
+    let late = false;
+    const timer = setTimeout(() => {
+      late = true;
+      abort.abort();
+      heldBusyRef.current.delete(item.id);
+      setHeldBusy((cur) => withoutKey(cur, item.id));
+      setHeldErrors((cur) => ({ ...cur, [item.id]: HELD_NO_ANSWER_TEXT }));
+      const active = document.activeElement;
+      const card = fileCards.current.get(item.id);
+      if (!active || active === document.body || (!!card && card.contains(active))) refocusAfterRead.current = item.id;
+      setReadKey((k) => k + 1);
+    }, HELD_DECISION_TIMEOUT_MS);
     try {
       const body: HeldFileDecisionRequest = { projectId, decision };
-      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body });
-      if (g !== gen.current) return;
+      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body, signal: abort.signal });
+      if (late || g !== gen.current) return;
       fileLeft(item, (n) => `${decision === "attach" ? "File added to its record" : "File removed; the record keeps no file"}: ${titleFor(item, n)}`);
     } catch (e) {
-      if (g !== gen.current) return;
+      if (late || g !== gen.current) return;
       if (isProjectLocked(e)) {
         forget();
         return;
@@ -599,13 +650,16 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       }
       setHeldErrors((cur) => ({ ...cur, [item.id]: e instanceof ApiClientError && e.message ? e.message : errorText(e) }));
     } finally {
-      heldBusyRef.current.delete(item.id);
-      if (g === gen.current) setHeldBusy((cur) => withoutKey(cur, item.id));
+      clearTimeout(timer);
+      if (!late) {
+        heldBusyRef.current.delete(item.id);
+        if (g === gen.current) setHeldBusy((cur) => withoutKey(cur, item.id));
+      }
     }
   };
-  const useRefFor = useCallback((id: string, el: HTMLButtonElement | null) => {
-    if (el) useButtons.current.set(id, el);
-    else useButtons.current.delete(id);
+  const headRefFor = useCallback((id: string, el: HTMLHeadingElement | null) => {
+    if (el) fileHeads.current.set(id, el);
+    else fileHeads.current.delete(id);
   }, []);
   const cardRefFor = useCallback((id: string, el: HTMLElement | null) => {
     if (el) fileCards.current.set(id, el);
@@ -700,7 +754,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       ) : null}
       <ErrorNote error={error} />
       <p className="ao-visually-hidden" role="status">
-        {status}
+        {said.text && <span key={said.n}>{said.text}</span>}
       </p>
       {locked && (
         <UnlockProject
@@ -790,7 +844,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         </div>
       )}
       {!locked && items !== null && found.length > 0 && (
-        <FoundFiles items={found} store={store} busy={heldBusy} errors={heldErrors} useRef={useRefFor} cardRef={cardRefFor} onDecide={(i, d) => void decideHeld(i, d)} />
+        <FoundFiles items={found} store={store} busy={heldBusy} errors={heldErrors} headRef={headRefFor} cardRef={cardRefFor} onDecide={(i, d) => void decideHeld(i, d)} />
       )}
     </main>
   );
@@ -946,19 +1000,48 @@ interface FoundFilesProps {
   store: RecordStore;
   busy: Readonly<Record<string, HeldFileDecision>>;
   errors: Readonly<Record<string, string>>;
-  useRef(id: string, el: HTMLButtonElement | null): void;
+  headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
   onDecide(item: HeldItem, decision: HeldFileDecision): void;
+}
+
+/** What the app's check says of a file, in the app's own words; nothing for a `why` it does not have (R313 f). */
+const adviceOf = (h: ReviewHeldFile | undefined): string | undefined =>
+  h && typeof h.why === "string" && Object.hasOwn(HELD_FILE_WHY_TEXT, h.why) ? HELD_FILE_WHY_TEXT[h.why] : undefined;
+
+/** The record a waiting file was found for, as its two controls name it: its title, then its first creator's family name and its year. */
+function describeRecord(item: HeldItem, record: SourceFile | undefined): string {
+  const title = titleOf(record) || item.title || "this record";
+  const first = record?.source.creators[0];
+  const family = first ? (first.family ?? first.literal ?? "") : "";
+  const year = typeof record?.source.issued === "string" ? yearOf(record.source.issued) : undefined;
+  const more = [family, year].filter(Boolean).join(", ");
+  return more ? `${title} (${more})` : title;
 }
 
 /**
  * The waiting files (F11; R296 b, R303): those the app's check says look right gathered first, the others after them,
  * each group under its heading with its number; a group with no file is not shown. No control here decides more than
- * one file.
+ * one file. R313 g: each file's controls are named so that two files can be told apart — the record's title, first
+ * creator and year, and "file k of n" where two would still be named alike.
  */
-function FoundFiles({ items, store, busy, errors, useRef: useRefFor, cardRef, onDecide }: FoundFilesProps) {
+function FoundFiles({ items, store, busy, errors, headRef, cardRef, onDecide }: FoundFilesProps) {
+  // Re-rendered when a record is read: the names depend on every waiting file's record.
+  useSyncExternalStore(store.subscribe, store.version);
   const right = items.filter(looksRight);
   const other = items.filter((i) => !looksRight(i));
+  const ordered = [...right, ...other];
+  const base = new Map(ordered.map((i) => [i.id, describeRecord(i, store.get(i.sourceId))]));
+  const names = new Map<string, string>();
+  for (const i of ordered) {
+    const b = base.get(i.id)!;
+    const same = ordered.filter((x) => base.get(x.id) === b);
+    if (same.length < 2) names.set(i.id, b);
+    else {
+      const k = `file ${same.findIndex((x) => x.id === i.id) + 1} of ${same.length}`;
+      names.set(i.id, b.endsWith(")") ? `${b.slice(0, -1)}, ${k})` : `${b} (${k})`);
+    }
+  }
   const id = useId();
   const group = (key: string, heading: string, list: HeldItem[]) =>
     list.length > 0 && (
@@ -968,7 +1051,7 @@ function FoundFiles({ items, store, busy, errors, useRef: useRefFor, cardRef, on
         </h3>
         <ul className="ao-review__files" aria-label={heading}>
           {list.map((i) => (
-            <FileCard key={i.id} item={i} store={store} busy={busy[i.id]} error={errors[i.id]} useRef={useRefFor} cardRef={cardRef} onDecide={onDecide} />
+            <FileCard key={i.id} item={i} store={store} named={names.get(i.id)!} busy={busy[i.id]} error={errors[i.id]} headRef={headRef} cardRef={cardRef} onDecide={onDecide} />
           ))}
         </ul>
       </section>
@@ -986,37 +1069,53 @@ function FoundFiles({ items, store, busy, errors, useRef: useRefFor, cardRef, on
 interface FileCardProps {
   item: HeldItem;
   store: RecordStore;
+  /** How its controls name the record (R313 g). */
+  named: string;
   /** The decision under way on this file. */
   busy: HeldFileDecision | undefined;
-  /** The service's sentence when the last decision on this file was refused. */
+  /** The service's sentence when the last decision on this file was refused, or HELD_NO_ANSWER_TEXT. */
   error: string | undefined;
-  useRef(id: string, el: HTMLButtonElement | null): void;
+  headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
   onDecide(item: HeldItem, decision: HeldFileDecision): void;
 }
 
 /**
  * One waiting file: the record it was found for (title, creators, year — its source's, once read), the entry's own
- * sentence, what the app's check says (the service's words for its `why`; nothing when this build does not know it),
- * and the file's facts. Everything from the record, the file or the service is outside text (UserText). Its two
- * buttons are named with the record's title; while its decision is out they are busy (never disabled, so focus stays)
- * and a second press does nothing.
+ * sentence, what the app's check says (the service's words for its `why`; nothing when this build does not have it),
+ * and the file's facts. Everything from the record, the file or the service is outside text (UserText). Its heading is
+ * focusable (R313 a: focus comes here after a decision). Its two buttons: while its decision is out they are busy
+ * (never disabled, so focus stays) and a press does nothing; R313 b — a key held down never decides: a repeated keydown
+ * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
-const FileCard = memo(function FileCard({ item, store, busy, error, useRef: useRefFor, cardRef, onDecide }: FileCardProps) {
+const FileCard = memo(function FileCard({ item, store, named, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
   const h = item.heldFile;
   const record = useRecord(store, item.sourceId);
   const s = record?.source;
   const recordTitle = titleOf(record) || item.title || "";
-  const named = recordTitle || "this record";
   const creators = s ? creatorsText(s.creators) : "";
   const year = typeof s?.issued === "string" ? yearOf(s.issued) : undefined;
-  const advice = h ? (HELD_FILE_WHY_TEXT as Partial<Record<string, string>>)[h.why] : undefined;
+  const advice = adviceOf(h);
+  /** A repeated keydown was seen and not yet let go: the click it makes is not a press (R313 b). */
+  const repeating = useRef(false);
+  const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    if (e.repeat) {
+      e.preventDefault();
+      repeating.current = true;
+    } else repeating.current = false;
+  };
+  const onKeyUp = (e: KeyboardEvent<HTMLButtonElement>) => {
+    // Space makes its click on keyup, after this: a held Space still presses once, when it is let go.
+    if (e.key === "Enter" || e.key === " ") repeating.current = false;
+  };
   const press = (d: HeldFileDecision) => () => {
+    if (repeating.current) return;
     if (!busy) onDecide(item, d);
   };
   return (
     <li className="ao-review__file" ref={(el) => cardRef(item.id, el)}>
-      <h4 className="ao-review__title">
+      <h4 className="ao-review__title ao-review__file-title" tabIndex={-1} ref={(el) => headRef(item.id, el)}>
         <UserText>{recordTitle || "Untitled"}</UserText>
       </h4>
       {(creators || year) && (
@@ -1080,22 +1179,37 @@ const FileCard = memo(function FileCard({ item, store, busy, error, useRef: useR
       </dl>
       {error && (
         <p role="alert" className="ao-error">
-          The decision was not recorded. <UserText>{error}</UserText>
+          {error === HELD_NO_ANSWER_TEXT ? (
+            HELD_NO_ANSWER_TEXT
+          ) : (
+            <>
+              The decision was not recorded. <UserText>{error}</UserText>
+            </>
+          )}
         </p>
       )}
       <div className="ao-import__actions">
         <button
           type="button"
           className="ao-import__primary"
-          ref={(el) => useRefFor(item.id, el)}
           aria-label={`Use this file for ${named}`}
           aria-disabled={busy ? true : undefined}
           aria-busy={busy === "attach" || undefined}
+          onKeyDown={onKeyDown}
+          onKeyUp={onKeyUp}
           onClick={press("attach")}
         >
           Use this file
         </button>
-        <button type="button" aria-label={`Not this file for ${named}`} aria-disabled={busy ? true : undefined} aria-busy={busy === "discard" || undefined} onClick={press("discard")}>
+        <button
+          type="button"
+          aria-label={`Not this file for ${named}`}
+          aria-disabled={busy ? true : undefined}
+          aria-busy={busy === "discard" || undefined}
+          onKeyDown={onKeyDown}
+          onKeyUp={onKeyUp}
+          onClick={press("discard")}
+        >
           Not this file
         </button>
       </div>

@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ImportApi, ReviewItem, SourceFile } from "../../api/import";
@@ -7,7 +7,7 @@ import { BASE as SERVICE, mockService, PSEUDONYMISING_GOVERNANCE, server, type S
 import { renderToStaticMarkup } from "react-dom/server";
 import { HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { FilePreview } from "./FilePreview";
-import { ReviewQueue } from "./ReviewQueue";
+import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, ReviewQueue } from "./ReviewQueue";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
@@ -518,9 +518,16 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     sources: { s7: source(7, RECORD), s8: source(8, "Right One"), s9: source(9, "Doubted Two"), s10: source(10, "Right Two") },
   });
   let heldCalls: Array<{ id: string; body: unknown }> = [];
+  // The clock stands still (R313 c's guard is timed by it): a test moves it past the guard with `passGuard`.
   beforeEach(() => {
     heldCalls = [];
+    vi.useFakeTimers({ toFake: ["Date"] });
   });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  /** R313 c: the time after a file leaves in which no deciding control acts, passed. */
+  const passGuard = () => vi.setSystemTime(Date.now() + DECIDE_SETTLE_MS + 1);
   const open = (o: ServiceSetup) => {
     const m = mockService(o);
     const user = userEvent.setup();
@@ -533,7 +540,14 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     if (!li) throw new Error(`no card for ${title}`);
     return li;
   };
-  const use = (title: string) => screen.getByRole("button", { name: `Use this file for ${title}` });
+  const esc = (t: string) => t.replace(/[.*+?^${}()|[\]\\/]/gu, "\\$&");
+  /** A control's name: "<act> for <title>", then the record's first family name and year once its record is read (R313 g). */
+  const named = (act: string, title: string) => new RegExp(`^${esc(act)} for ${esc(title)}( \\(.*\\))?$`, "u");
+  const use = (title: string) => screen.getByRole("button", { name: named("Use this file", title) });
+  const not = (title: string) => screen.getByRole("button", { name: named("Not this file", title) });
+  const noUse = (title: string) => screen.queryByRole("button", { name: named("Use this file", title) });
+  /** The card's heading (the record's title), where focus goes after a decision (R313 a). */
+  const head = (title: string) => card(title).querySelector("h4")!;
 
   it("has its own group, and shows the record (title, creators, year), the entry's sentence and what the check found, as text only", async () => {
     open(project());
@@ -552,8 +566,9 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(within(c).getByText(/<b>A Different Paper<\/b>/u).closest("[dir=auto]")).toBeTruthy();
     expect(c.querySelector("b, img")).toBeNull();
     expect(within(c).getByText(/PDF, 2\.3 MB/u)).toBeTruthy();
-    expect(within(c).getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
-    expect(within(c).getByRole("button", { name: `Not this file for ${RECORD}` })).toBeTruthy();
+    // R313 g: named with the record's title, its first creator's family name and its year.
+    expect(within(c).getByRole("button", { name: `Use this file for ${RECORD} (Smith, 2020)` })).toBeTruthy();
+    expect(within(c).getByRole("button", { name: `Not this file for ${RECORD} (Smith, 2020)` })).toBeTruthy();
   });
 
   it("a file that looks right is shown with the service's sentence and advice, never with words of doubt", async () => {
@@ -606,42 +621,75 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     await waitFor(() => card("Right Two"));
     const section = screen.getByRole("region", { name: "Files found for records" });
     for (const t of ["Right One", "Right Two", RECORD, "Doubted Two"]) {
+      await waitFor(() => expect(within(card(t)).getByRole("button", { name: `Use this file for ${t} (Smith, 2020)` })).toBeTruthy());
       const buttons = within(card(t)).getAllByRole("button");
-      expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([`Use this file for ${t}`, `Not this file for ${t}`]);
+      expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([`Use this file for ${t} (Smith, 2020)`, `Not this file for ${t} (Smith, 2020)`]);
     }
     // No control in the section is about more than one file.
     for (const el of within(section).queryAllByRole("button")) expect(el.getAttribute("aria-label") ?? el.textContent).not.toMatch(/\ball\b|every|selected/iu);
     expect(within(section).queryAllByRole("checkbox")).toHaveLength(0);
-    // One request per press, one file per request.
-    await user.dblClick(use("Right One"));
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Use this file for Right One" })).toBeNull());
-    await user.click(screen.getByRole("button", { name: "Not this file for Doubted Two" }));
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Not this file for Doubted Two" })).toBeNull());
+    // One file per request: two files decided one after the other make two requests, each for its own file.
+    await user.click(use("Right One"));
+    await waitFor(() => expect(noUse("Right One")).toBeNull());
+    passGuard();
+    await user.click(not("Doubted Two"));
+    await waitFor(() => expect(screen.queryByRole("button", { name: named("Not this file", "Doubted Two") })).toBeNull());
     expect(heldCalls).toEqual([
       { id: "r8", body: { projectId: P1, decision: "attach" } },
       { id: "r9", body: { projectId: P1, decision: "discard" } },
     ]);
-    // The other two still wait, each with its own controls.
     expect(use("Right Two")).toBeTruthy();
     expect(use(RECORD)).toBeTruthy();
   });
 
-  it("after Use this file focus goes to the next waiting file; after the last, to the heading or the empty message", async () => {
+  it("a double press on one file while its decision is out sends one request (R313 i: the press guard)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const o = mixed([]);
+    o.extra = [
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        await gate;
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    const { user } = open(o);
+    await waitFor(() => card("Right Two"));
+    // The answer is held back, so both presses fall on the same file while its decision is out.
+    await user.dblClick(use("Right One"));
+    await user.click(not("Right One"));
+    await waitFor(() => expect(heldCalls).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 50));
+    release();
+    await waitFor(() => expect(noUse("Right One")).toBeNull());
+    expect(heldCalls).toEqual([{ id: "r8", body: { projectId: P1, decision: "attach" } }]);
+  });
+
+  // R313 a (it corrects R303 b): after a decision focus goes to the next file's CARD — its heading, the record's title —
+  // never to a control that decides; one Tab from there reaches that file's "Use this file".
+  it("after Use this file focus goes to the next waiting file's heading (R313 a); after the last, to the heading or the empty message", async () => {
     const { user } = open(mixed());
     await waitFor(() => card("Right Two"));
-    // The next in the same group.
+    // The next in the same group: its heading, focusable, never its "Use this file".
     await user.click(use("Right One"));
-    await waitFor(() => expect(document.activeElement).toBe(use("Right Two")));
+    await waitFor(() => expect(document.activeElement).toBe(head("Right Two")));
+    expect(head("Right Two").getAttribute("tabindex")).toBe("-1");
     expect(screen.getByRole("status").textContent).toBe("File added to its record: Right One");
+    // One Tab reaches that file's "Use this file".
+    await user.tab();
+    expect(document.activeElement).toBe(use("Right Two"));
     // The last of its group: the first file of the other group.
+    passGuard();
     await user.click(use("Right Two"));
-    await waitFor(() => expect(document.activeElement).toBe(use(RECORD)));
+    await waitFor(() => expect(document.activeElement).toBe(head(RECORD)));
     expect(screen.queryByRole("heading", { name: /^Files that look right/u })).toBeNull();
     // Not this file moves on the same way.
-    await user.click(screen.getByRole("button", { name: `Not this file for ${RECORD}` }));
-    await waitFor(() => expect(document.activeElement).toBe(use("Doubted Two")));
+    passGuard();
+    await user.click(not(RECORD));
+    await waitFor(() => expect(document.activeElement).toBe(head("Doubted Two")));
     expect(screen.getByRole("status").textContent).toBe(`File removed; the record keeps no file: ${RECORD}`);
     // The last file of all: the message that says nothing is waiting.
+    passGuard();
     await user.click(use("Doubted Two"));
     const empty = await screen.findByText("Nothing is waiting for review in this project.");
     await waitFor(() => expect(document.activeElement).toBe(empty));
@@ -660,6 +708,254 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(screen.getByRole("button", { name: /Show Dropped file/u })).toBeTruthy();
   });
 
+  it("R313 d: Enter on Use this file, then Enter again at once, decides exactly one file", async () => {
+    const { user } = open(mixed());
+    await waitFor(() => card("Right Two"));
+    use("Right One").focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(noUse("Right One")).toBeNull());
+    await user.keyboard("{Enter}");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(heldCalls).toEqual([{ id: "r8", body: { projectId: P1, decision: "attach" } }]);
+  });
+
+  it("R313 d: Not this file, then Enter, decides exactly one file", async () => {
+    const { user } = open(mixed());
+    await waitFor(() => card("Right Two"));
+    not("Right One").focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(noUse("Right One")).toBeNull());
+    await user.keyboard("{Enter}");
+    await user.keyboard(" ");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(heldCalls).toEqual([{ id: "r8", body: { projectId: P1, decision: "discard" } }]);
+  });
+
+  it("R313 d: Enter held down over five files decides exactly one (repeated keydowns and the clicks a browser makes of them)", async () => {
+    const o = project();
+    o.projectReview = { [P1]: [1, 2, 3, 4, 5].map((k) => rightItem(k + 10, `Right ${k}`)) };
+    o.sources = Object.fromEntries([1, 2, 3, 4, 5].map((k) => [`s${k + 10}`, source(k + 10, `Right ${k}`)]));
+    open(o);
+    await waitFor(() => card("Right 5"));
+    use("Right 1").focus();
+    // The first keydown, and the click it makes.
+    fireEvent.keyDown(document.activeElement!, { key: "Enter", code: "Enter" });
+    fireEvent.click(document.activeElement!);
+    // Held: the repeats fall on whatever has focus, each with its click, while the answers come in between.
+    for (let i = 0; i < 12; i++) {
+      await new Promise((r) => setTimeout(r, 15));
+      const el = document.activeElement!;
+      fireEvent.keyDown(el, { key: "Enter", code: "Enter", repeat: true });
+      fireEvent.click(el);
+    }
+    fireEvent.keyUp(document.activeElement!, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(noUse("Right 1")).toBeNull());
+    expect(heldCalls.map((c) => c.id)).toEqual(["r11"]);
+    for (const k of [2, 3, 4, 5]) expect(use(`Right ${k}`)).toBeTruthy();
+  });
+
+  it("R313 b: a repeated keydown on a deciding control does nothing, for Enter and for Space, even with focus kept there", async () => {
+    const GONE = "The record this file was found for is no longer in the library. Nothing was changed.";
+    const o = project();
+    o.extra = [
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        return HttpResponse.json({ error: { code: "CONFLICT", message: GONE, reason: "source-gone" } }, { status: 409 });
+      }),
+    ];
+    open(o);
+    await waitFor(() => card(RECORD));
+    // A refusal keeps the file and focus on the control pressed: the held key's repeats fall on it.
+    const u = use(RECORD);
+    u.focus();
+    fireEvent.keyDown(u, { key: "Enter", code: "Enter" });
+    fireEvent.click(u);
+    await within(card(RECORD)).findByRole("alert");
+    expect(heldCalls).toHaveLength(1);
+    for (const key of ["Enter", " "]) {
+      for (let i = 0; i < 3; i++) {
+        fireEvent.keyDown(u, { key, code: key === " " ? "Space" : "Enter", repeat: true });
+        fireEvent.click(u);
+      }
+      fireEvent.keyUp(u, { key, code: key === " " ? "Space" : "Enter" });
+    }
+    const n = not(RECORD);
+    fireEvent.keyDown(n, { key: "Enter", code: "Enter", repeat: true });
+    fireEvent.click(n);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(heldCalls).toHaveLength(1);
+    // A deliberate press after the key was let go acts.
+    fireEvent.keyDown(u, { key: "Enter", code: "Enter" });
+    fireEvent.click(u);
+    await waitFor(() => expect(heldCalls).toHaveLength(2));
+  });
+
+  it("R313 c, d: a second pointer press at once on the control that took the first's place does nothing; after the guard a deliberate Tab and Enter decides the next file", async () => {
+    const { user } = open(mixed());
+    await waitFor(() => card("Right Two"));
+    await user.click(use("Right One"));
+    await waitFor(() => expect(noUse("Right One")).toBeNull());
+    // The control now in the first one's place: "Use this file" of the next card. Pressed at once: nothing at all.
+    const next = use("Right Two");
+    await user.click(next);
+    await user.click(not("Right Two"));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(heldCalls.map((c) => c.id)).toEqual(["r8"]);
+    expect(next.getAttribute("aria-busy")).toBeNull();
+    expect(next.getAttribute("aria-disabled")).toBeNull();
+    // After the guard: from the card's heading, Tab and Enter decide that file.
+    passGuard();
+    head("Right Two").focus();
+    await user.tab();
+    expect(document.activeElement).toBe(use("Right Two"));
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]));
+    await waitFor(() => expect(document.activeElement).toBe(head(RECORD)));
+  });
+
+  it("R313 c: after the list is read again, no deciding control acts for the guard's time", async () => {
+    const o = project();
+    o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => new Promise<Response>(() => {}))];
+    const { m } = open(o);
+    await waitFor(() => card("A Second Record"));
+    const reads = () => m.calls.filter((c) => c.method === "GET" && c.path.startsWith(`/projects/${P1}/review`)).length;
+    const readsBefore = reads();
+    vi.useRealTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      // A decision with no answer is given up, and the queue read again (R313 e).
+      fireEvent.click(use(RECORD));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+    } finally {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
+    }
+    await waitFor(() => expect(reads()).toBeGreaterThan(readsBefore));
+    await waitFor(() => expect(within(card(RECORD)).getByText("The service did not answer. Look at the queue again before deciding.")).toBeTruthy());
+    await waitFor(() => expect(within(card("A Second Record")).getByRole("button", { name: named("Use this file", "A Second Record") })).toBeTruthy());
+    const before = heldCalls.length;
+    fireEvent.click(use("A Second Record"));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(use("A Second Record").getAttribute("aria-busy")).toBeNull();
+    expect(heldCalls.length).toBe(before);
+  });
+
+  it("R313 e: a decision with no answer in 60 seconds is given up: the card is usable again and says so, the queue is read again, and the late answer changes nothing", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const o = project();
+    o.extra = [
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        await gate;
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    const { m } = open(o);
+    await waitFor(() => card(RECORD));
+    const reads = () => m.calls.filter((c) => c.method === "GET" && c.path.startsWith(`/projects/${P1}/review`)).length;
+    const readsBefore = reads();
+    vi.useRealTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      fireEvent.click(use(RECORD));
+      await vi.advanceTimersByTimeAsync(10);
+      expect(use(RECORD).getAttribute("aria-busy")).toBe("true");
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS - 1_000);
+      expect(use(RECORD).getAttribute("aria-busy")).toBe("true");
+      await vi.advanceTimersByTimeAsync(1_500);
+    } finally {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
+    }
+    await waitFor(() => expect(reads()).toBeGreaterThan(readsBefore));
+    await waitFor(() => expect(within(card(RECORD)).getByText("The service did not answer. Look at the queue again before deciding.")).toBeTruthy());
+    expect(use(RECORD).getAttribute("aria-busy")).toBeNull();
+    expect(use(RECORD).getAttribute("aria-disabled")).toBeNull();
+    // The late answer: nothing changes.
+    release();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(use(RECORD)).toBeTruthy();
+    expect(within(card(RECORD)).getByText("The service did not answer. Look at the queue again before deciding.")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).not.toMatch(/File added/u);
+    // Usable again: after the guard a press decides it.
+    passGuard();
+    fireEvent.click(use(RECORD));
+    await waitFor(() => expect(heldCalls).toHaveLength(2));
+  });
+
+  it("R313 f: a why of __proto__, toString or constructor shows no advice and breaks nothing", async () => {
+    const o = project();
+    o.projectReview = {
+      [P1]: ["__proto__", "toString", "constructor"].map((why, k) => heldItem(20 + k, { sourceId: `s${20 + k}`, title: `Odd ${k}`, heldFile: { why, kind: "pdf", bytes: 1024 } } as unknown as Partial<ReviewItem>)),
+    };
+    o.sources = Object.fromEntries([0, 1, 2].map((k) => [`s${20 + k}`, source(20 + k, `Odd ${k}`)]));
+    open(o);
+    for (const k of [0, 1, 2]) {
+      const c = await waitFor(() => card(`Odd ${k}`));
+      expect(within(c).queryByText("What the app's check says")).toBeNull();
+      expect(within(c).getByText(DOUBTED)).toBeTruthy();
+    }
+  });
+
+  it("R313 i: a why this build does not know shows no sentence of the screen's own", async () => {
+    const o = project();
+    o.projectReview = { [P1]: [heldItem(7, { heldFile: { why: "from-a-later-build", kind: "pdf", bytes: 1024 } } as unknown as Partial<ReviewItem>)] };
+    open(o);
+    const c = await waitFor(() => card(RECORD));
+    expect(within(c).queryByText("What the app's check says")).toBeNull();
+    // Only the service's sentence and the file's facts.
+    const dds = [...c.querySelectorAll("dd")].map((d) => d.textContent);
+    expect(dds).toEqual(expect.arrayContaining(["PDF, 1 KB"]));
+    expect(c.textContent).not.toMatch(/did not clearly match its record|later build/u);
+  });
+
+  it("R313 g: two records of one title and author get controls with different names; two equal results in a row are both announced", async () => {
+    const o = project();
+    o.projectReview = { [P1]: [heldItem(31, { sourceId: "s31", title: "Same Title" }), heldItem(32, { sourceId: "s32", title: "Same Title" })] };
+    o.sources = { s31: source(31, "Same Title"), s32: source(32, "Same Title") };
+    const { user } = open(o);
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /^Use this file for Same Title \(Smith, 2020, file \d of 2\)$/u })).toHaveLength(2));
+    const names = screen.getAllByRole("button", { name: /^Use this file for / }).map((b) => b.getAttribute("aria-label"));
+    expect(names).toEqual(["Use this file for Same Title (Smith, 2020, file 1 of 2)", "Use this file for Same Title (Smith, 2020, file 2 of 2)"]);
+    // Each result is said, even when its words are the last one's.
+    const said: string[] = [];
+    const region = screen.getAllByRole("status").find((s) => !s.textContent?.includes("Loading"))!;
+    const mo = new MutationObserver((recs) => {
+      for (const r of recs) for (const n of r.addedNodes) if (n.textContent) said.push(n.textContent);
+    });
+    mo.observe(region, { childList: true, subtree: true, characterData: true });
+    await user.click(screen.getByRole("button", { name: "Use this file for Same Title (Smith, 2020, file 1 of 2)" }));
+    await waitFor(() => expect(said).toHaveLength(1));
+    passGuard();
+    await user.click(screen.getByRole("button", { name: /^Use this file for Same Title/u }));
+    await waitFor(() => expect(said).toEqual(["File added to its record: Same Title", "File added to its record: Same Title"]));
+    mo.disconnect();
+  });
+
+  it("R313 i: a researcher already at another file keeps their place when a decision ends", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const o = mixed([]);
+    o.extra = [
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        await gate;
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    const { user } = open(o);
+    await waitFor(() => card("Right Two"));
+    await user.click(use("Right One"));
+    await waitFor(() => expect(heldCalls).toHaveLength(1));
+    // Meanwhile the researcher goes to another file.
+    head(RECORD).focus();
+    release();
+    await waitFor(() => expect(noUse("Right One")).toBeNull());
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(document.activeElement).toBe(head(RECORD));
+  });
+
   it("one file's decision under way leaves the others usable", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -676,20 +972,19 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     await user.click(use("Right One"));
     await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
     // Its two buttons are busy and cannot be pressed again; focus stays on the one pressed.
-    const one = within(card("Right One"));
-    expect(one.getByRole("button", { name: "Use this file for Right One" }).getAttribute("aria-disabled")).toBe("true");
-    expect(one.getByRole("button", { name: "Use this file for Right One" }).getAttribute("aria-busy")).toBe("true");
-    expect(one.getByRole("button", { name: "Not this file for Right One" }).getAttribute("aria-disabled")).toBe("true");
+    expect(use("Right One").getAttribute("aria-disabled")).toBe("true");
+    expect(use("Right One").getAttribute("aria-busy")).toBe("true");
+    expect(not("Right One").getAttribute("aria-disabled")).toBe("true");
     expect(document.activeElement).toBe(use("Right One"));
     await user.click(use("Right One"));
-    await user.click(screen.getByRole("button", { name: "Not this file for Right One" }));
+    await user.click(not("Right One"));
     // Another file is decided meanwhile.
     expect(use("Right Two").getAttribute("aria-disabled")).toBeNull();
     await user.click(use("Right Two"));
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Use this file for Right Two" })).toBeNull());
+    await waitFor(() => expect(noUse("Right Two")).toBeNull());
     expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
     release();
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Use this file for Right One" })).toBeNull());
+    await waitFor(() => expect(noUse("Right One")).toBeNull());
     expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
   });
 
@@ -714,10 +1009,11 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     const o = project();
     o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: PAUSED, reason: "paused" } }, { status: 409 }))];
     const { user } = open(o);
-    await user.click(await screen.findByRole("button", { name: `Use this file for ${RECORD}` }));
+    await waitFor(() => card(RECORD));
+    await user.click(use(RECORD));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain(PAUSED);
-    expect(screen.getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
+    expect(use(RECORD)).toBeTruthy();
     expect(screen.queryByText(/had already been decided/u)).toBeNull();
   });
 
@@ -725,9 +1021,11 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     const o = project();
     o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: "This entry has already been reviewed.", reason: "already-decided" } }, { status: 409 }))];
     const { user } = open(o);
-    await user.click(await screen.findByRole("button", { name: `Use this file for ${RECORD}` }));
-    await waitFor(() => expect(screen.queryByRole("button", { name: `Use this file for ${RECORD}` })).toBeNull());
+    await waitFor(() => card(RECORD));
+    await user.click(use(RECORD));
+    await waitFor(() => expect(noUse(RECORD)).toBeNull());
     expect(screen.getByRole("status").textContent).toMatch(/had already been decided, so it left the queue: Rivers and Memory/u);
-    await waitFor(() => expect(document.activeElement).toBe(use("A Second Record")));
+    // R313 a: to the next file's heading.
+    await waitFor(() => expect(document.activeElement).toBe(head("A Second Record")));
   });
 });
