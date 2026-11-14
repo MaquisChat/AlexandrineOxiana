@@ -132,7 +132,7 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "record-removed": "The record was removed from the library.",
   "copy-store-not-allowed": "This project's rules do not allow storing the file found for this record.",
   "copy-no-legal-basis": "This project's rules need a legal basis to store the file found for this record, and the record has none.",
-  "library-unfinished": "A fetch through your library was not finished, and what this entry said before could not be read back. Nothing was added.",
+  "library-unfinished": "A fetch in the app's window was not finished, and what this entry said before could not be read back. Nothing was added.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */

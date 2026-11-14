@@ -100,6 +100,8 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     ]);
     expect(FIND_REASON_TEXT["copy-some-unreachable"]).toBe("Some services could not be reached, so a free copy may still exist. “Try again” looks again.");
     expect(FIND_REASON_TEXT["record-removed"]).toBe("The record was removed from the library.");
+    // R347 e: after a link's start too — so it names no library.
+    expect(FIND_REASON_TEXT["library-unfinished"]).toBe("A fetch in the app's window was not finished, and what this entry said before could not be read back. Nothing was added.");
     // Exhaustive by type (Record<FindReasonCode, string>) and checked here at run time: one plain sentence each.
     expect(Object.keys(FIND_REASON_TEXT).sort()).toEqual([...FIND_REASON_CODES].sort());
     // One plain sentence each (the plan's sentence for held files starts with its number).
