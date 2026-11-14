@@ -18,10 +18,7 @@
  * The copy part (Task F11; R282, R296, R301, R303): "Try again" where the engine takes it (a record whose copy the
  * rules or the waiting files' limit stopped; no open copy because some services could not be reached; a copy wait);
  * "Needs your check" offers the link "Check the file" to that record's entry in the review queue — the app never
- * attaches a found file by itself; "No open copy" lists the entry's offers under "Where to get it" (https: only, any
- * other address refused here); a record removed from the library offers only "Remove from the queue". In the desktop
- * app, which cannot open an outside address yet (R311 a), each place is its label and host with "Copy address" — no
- * link — under the line "Paste an address into your browser."; a copy is said once in the list's polite region.
+ * attaches a found file by itself; a record removed from the library offers only "Remove from the queue".
  *
  * The states of later slices are said in words, with "Remove from the queue" (and "Open" when the entry has a
  * record), and no control of a later slice.

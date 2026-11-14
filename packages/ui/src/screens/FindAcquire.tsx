@@ -989,13 +989,12 @@ function ProjectQueue(props: {
   const lastSoon = useRef(0);
   /**
    * R340 a, b: the ticket of the window this page opened, for the row that waits in it — in memory only, while it waits.
-   * `handedOver`: the shell handed the file over (its ticket ended there; a later close is not a cancel).
+   * `handedOver`: the shell handed the file over (its ticket ended there; a later close is not a cancel). `seen`: the
+   * row has been seen waiting — from then on its leaving the wait forgets the ticket. Once forgotten, an event of that
+   * window is no row's unless the one row that waits is taken for it (as after a fresh load); a row that went back by a
+   * cancel no longer waits, so a late event of its window changes nothing.
    */
-  const libTicket = useRef<{ entryId: string; ticket: string; handedOver?: boolean } | null>(null);
-  /** The ticket whose row has been seen waiting (from then on, the row's leaving the wait forgets the ticket). */
-  const seenWaiting = useRef<string | null>(null);
-  /** Tickets whose window this page no longer follows (cancelled, closed, or never opened): their events change nothing. */
-  const endedTickets = useRef(new Set<string>());
+  const libTicket = useRef<{ entryId: string; ticket: string; handedOver?: boolean; seen?: boolean } | null>(null);
   /** Rows whose file the shell handed over while the page held no ticket (loaded afresh): a later close is not a cancel. */
   const handedOverRows = useRef(new Set<string>());
   /** What each row's note last said (a note is said once; the same words again are not said again). */
@@ -1471,20 +1470,17 @@ function ProjectQueue(props: {
     const v = held.current.get(id)?.view;
     sayAct([...(v ? [...entryLabel(v, originOf(v)), ": "] : []), n.text]);
   };
-  /** The page no longer follows the window of this row: its ticket is forgotten, and its events change nothing. */
+  /** The page no longer follows the window of this row: its ticket is forgotten. */
   const endTicketOf = (id: string) => {
-    const t = libTicket.current;
-    if (!t || t.entryId !== id) return;
-    endedTickets.current.add(t.ticket);
-    libTicket.current = null;
+    if (libTicket.current?.entryId === id) libTicket.current = null;
   };
   // The ticket is held only while its row waits: once the row was seen waiting and no longer does, it is forgotten.
   useEffect(() => {
     const t = libTicket.current;
     if (!t) return;
     const v = held.current.get(t.entryId)?.view;
-    if (v?.state === "waiting-sign-in") seenWaiting.current = t.ticket;
-    else if (!v || seenWaiting.current === t.ticket) endTicketOf(t.entryId);
+    if (v?.state === "waiting-sign-in") t.seen = true;
+    else if (!v || t.seen) endTicketOf(t.entryId);
   });
 
   /**
@@ -1515,8 +1511,6 @@ function ProjectQueue(props: {
       let opened = false;
       // The screen was left (or the library changed) meanwhile: no window is opened, and the start is cancelled below.
       if (live() && ticket && address) {
-        const before = libTicket.current;
-        if (before) endedTickets.current.add(before.ticket);
         libTicket.current = { entryId: e.id, ticket };
         opened = (await shellWithin(shell.openLibraryWindow(ticket, address))) === true;
       }
@@ -1529,7 +1523,6 @@ function ProjectQueue(props: {
         return;
       }
       // Not opened (refused, failed, or no answer in time): the page forgets the ticket, and the entry goes back.
-      if (ticket) endedTickets.current.add(ticket);
       if (libTicket.current?.ticket === ticket) libTicket.current = null;
       try {
         const back = await libApi.cancel(projectId, e.id);
@@ -1614,7 +1607,6 @@ function ProjectQueue(props: {
   /** The shell's `library-window` events: only this page's window's, or — holding none — the one waiting row's. */
   const onWindowRef = useRef<(ev: LibraryWindowEvent) => void>(() => {});
   onWindowRef.current = (ev: LibraryWindowEvent) => {
-    if (ev.ticket !== null && endedTickets.current.has(ev.ticket)) return;
     const mine = libTicket.current;
     let id: string;
     if (mine) {
