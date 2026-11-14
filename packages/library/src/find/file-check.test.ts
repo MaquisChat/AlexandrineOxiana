@@ -75,43 +75,43 @@ const X = (why: "no-text" | "other-doi" | "other-kind" | "other-version" | "titl
 const MUST_NOT: Row[] = [
   // C1: another kind of document citing the record's DOI on its first page.
   // R292 2: the title only inside a sentence — no block (was other-kind).
-  { name: "a reply citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: ["Journal of Upland Studies", "A reply to Okafor", "Carl Young", `In ${T} (doi:${D}), Amara Okafor argues that`, ...BODY] }) },
+  { name: "a reply citing the record's DOI", rec: RIVERS, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: ["Journal of Upland Studies", "A reply to Okafor", "Carl Young", `In ${T} (doi:${D}), Amara Okafor argues that`, ...BODY] }) },
   // R292 2: "Comment on" on the title's line — no block (was other-kind).
-  { name: "a comment citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: [`Comment on ${T}`, "Carl Young", `doi:${D}`, `Amara Okafor argues that`, ...BODY] }) },
+  { name: "a comment citing the record's DOI", rec: RIVERS, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [`Comment on ${T}`, "Carl Young", `doi:${D}`, `Amara Okafor argues that`, ...BODY] }) },
   // R292 2: "Correction to" on the title's line — no block (was other-kind).
-  { name: "a correction citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: [`Correction to: ${T}`, A, `The original article can be found online at https://doi.org/${D}`, ...BODY] }) },
+  { name: "a correction citing the record's DOI", rec: RIVERS, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [`Correction to: ${T}`, A, `The original article can be found online at https://doi.org/${D}`, ...BODY] }) },
   { name: "an erratum (a header line) with the record's title, author and DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Erratum", T, A, `doi:${D}`, ...BODY] }) },
   // R292 2: "Retraction Note" on the title's line — no block (was other-kind).
-  { name: "a retraction note citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: [`Retraction Note: ${T}`, A, `doi:${D}`, ...BODY] }) },
+  { name: "a retraction note citing the record's DOI", rec: RIVERS, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [`Retraction Note: ${T}`, A, `doi:${D}`, ...BODY] }) },
   { name: "supplementary material citing the record's DOI", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Supplementary material for", T, A, `https://doi.org/${D}`, ...BODY] }) },
   // R292 2: the title only inside a citation — no block (was other-kind).
-  { name: "a book review citing the record's DOI", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: ["Book Review", `Okafor, Amara. ${T}.`, `Upland Press. doi:${D}`, "Reviewed by Carl Young", ...BODY] }) },
+  { name: "a book review citing the record's DOI", rec: RIVERS, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: ["Book Review", `Okafor, Amara. ${T}.`, `Upland Press. doi:${D}`, "Reviewed by Carl Young", ...BODY] }) },
   // C2: "Capital" volume II.
   // R292 3: "Volume II" directly below the block is not a line of names (was other-version).
-  { name: "'Capital' with 'Volume II' on the line after", rec: CAPITAL, want: X("title-absent"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["CAPITAL", "Volume II", "Wendel Brakkenridge", ...BODY] }) },
+  { name: "'Capital' with 'Volume II' on the line after", rec: CAPITAL, want: X("other-version") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["CAPITAL", "Volume II", "Wendel Brakkenridge", ...BODY] }) },
   // R292 3: the subtitle directly below the block is not a line of names (was other-version).
-  { name: "'Capital' with 'Volume II' two lines after, below a subtitle", rec: CAPITAL, want: X("title-absent"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["CAPITAL", "A Critique of Political Economy", "Volume II", "Wendel Brakkenridge", ...BODY] }) },
+  { name: "'Capital' with 'Volume II' two lines after, below a subtitle", rec: CAPITAL, want: X("other-version") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["CAPITAL", "A Critique of Political Economy", "Volume II", "Wendel Brakkenridge", ...BODY] }) },
   // R292 2: no line holds the title's content words exactly — no block (was other-version).
-  { name: "'Capital': the word first in a sentence, 'CAPITAL Volume II' later", rec: CAPITAL, want: X("title-absent"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["capital accumulates in the hands of a few, as every reader of this book knows.", ...BODY, "CAPITAL Volume II"] }) },
+  { name: "'Capital': the word first in a sentence, 'CAPITAL Volume II' later", rec: CAPITAL, want: X("other-version") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge", lines: ["capital accumulates in the hands of a few, as every reader of this book knows.", ...BODY, "CAPITAL Volume II"] }) },
   // C2: book reviews and comments by title.
   { name: "a book review whose embedded title is the reviewed book's ('BOOK REVIEWS' above the title)", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ title: T, author: A, lines: ["BOOK REVIEWS", T, "By Amara Okafor. Upland Press.", "Reviewed by Carl Young", ...BODY] }) },
   { name: "the same review without an embedded title", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ lines: ["BOOK REVIEWS", T, "By Amara Okafor. Upland Press.", "Carl Young", ...BODY] }) },
   { name: "'Reviewed Work:' then the title by the author", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ title: T, author: A, lines: ["Reviewed Work:", T, "by Amara Okafor", ...BODY] }) },
   { name: "'Erratum' as a header line above the title (no DOI)", rec: NO_DOI, want: X("other-kind"), file: () => pdf({ lines: ["Erratum", T, A, ...BODY] }) },
   // R292 2: the title only inside a sentence — no block (was other-kind).
-  { name: "a comment ('Comment' as a lone line) citing the record by title only", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: ["Comment", "Carl Young", `In her ${T}, Amara Okafor argues that`, ...BODY] }) },
+  { name: "a comment ('Comment' as a lone line) citing the record by title only", rec: RIVERS, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: ["Comment", "Carl Young", `In her ${T}, Amara Okafor argues that`, ...BODY] }) },
   // R292 2: "Correction to" on the title's line — no block (was other-kind).
-  { name: "'Correction to: <title>' with the author, no DOI", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [`Correction to: ${T}`, A, ...BODY] }) },
+  { name: "'Correction to: <title>' with the author, no DOI", rec: NO_DOI, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [`Correction to: ${T}`, A, ...BODY] }) },
   { name: "another paper with the record in a page-1 reference list", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: ["Mountain Pastures and Seasonal Work", "Carl Young", ...BODY, "References", `Okafor, A. (2020) ${T}. Upland Press.`] }) },
   // R292 2: "Notes on" on the title's line — no block (was other-kind).
-  { name: "another author's 'Notes on <title>' (the record's author's name read from 'Young people'; R284: 'notes on' before the title is a sign)", rec: { title: T, creators: [{ role: "author", given: "Ada", family: "Young" }] }, want: X("title-absent"), file: () => pdf({ lines: [`Notes on ${T}`, "Carl Other", "Young people in the hills tell it differently.", ...BODY] }) },
+  { name: "another author's 'Notes on <title>' (the record's author's name read from 'Young people'; R284: 'notes on' before the title is a sign)", rec: { title: T, creators: [{ role: "author", given: "Ada", family: "Young" }] }, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [`Notes on ${T}`, "Carl Other", "Young people in the hills tell it differently.", ...BODY] }) },
   // Version marks beside the title.
   // R292 3: "Part II" directly below the block is not a line of names holding the family name (was other-version).
-  { name: "'Part II' on the line after the title", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "Part II", A, ...BODY] }) },
+  { name: "'Part II' on the line after the title", rec: NO_DOI, want: X("other-version") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [T, "Part II", A, ...BODY] }) },
   // R292 3: "2nd edition" directly below the block is not a line of names (was other-version).
-  { name: "'2nd edition' on the line after the title", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "2nd edition", A, ...BODY] }) },
+  { name: "'2nd edition' on the line after the title", rec: NO_DOI, want: X("other-version") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [T, "2nd edition", A, ...BODY] }) },
   // R292 3: the subtitle directly below the block is not a line of names (was other-version).
-  { name: "'Volume 2' two lines below the title, under a subtitle", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "Essays on the North", "Volume 2", A, ...BODY] }) },
+  { name: "'Volume 2' two lines below the title, under a subtitle", rec: NO_DOI, want: X("other-version") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [T, "Essays on the North", "Volume 2", A, ...BODY] }) },
   // I4: no text.
   { name: "no text, with the right embedded title and author ('Capital')", rec: CAPITAL, want: X("no-text"), file: () => pdf({ title: "Capital", author: "Wendel Brakkenridge" }) },
   { name: "no text, with the right embedded title and author (a record with a DOI)", rec: RIVERS, want: X("no-text"), file: () => pdf({ title: T, author: A }) },
@@ -151,11 +151,11 @@ const MUST_NOT: Row[] = [
   { name: "R284: 'Review of <title>' on the line above the title", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Review of", T, "Amara Okafor, Upland Press", "Carl Young", `doi:${D}`, ...BODY] }) },
   { name: "R284: 'Reply to <family name>'", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Reply to Okafor", T, A, `doi:${D}`, ...BODY] }) },
   // R292 3: "Carl Young" below the block does not hold the family name (was other-kind).
-  { name: "R284: 'Notes on <title>' with the record's embedded title", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ title: T, author: A, lines: ["Notes on", T, "Carl Young", ...BODY] }) },
+  { name: "R284: 'Notes on <title>' with the record's embedded title", rec: NO_DOI, want: X("other-kind") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ title: T, author: A, lines: ["Notes on", T, "Carl Young", ...BODY] }) },
   { name: "R284: 'Capital' with 'Volume II' as a short line", rec: CAPITAL_DOI, want: X("other-version"), file: () => pdf({ lines: ["CAPITAL", "Wendel Brakkenridge", "Volume II", `doi:${CAPITAL_DOI.doi}`, ...BODY] }) },
   { name: "R284: 'Second edition' as a short line", rec: RIVERS, want: X("other-version"), file: () => pdf({ lines: [T, A, "Second edition", `doi:${D}`, ...BODY] }) },
   // R292 3: "Revised edition" directly below the block is not a line of names (was other-version).
-  { name: "R284: 'Revised edition' as a short line", rec: NO_DOI, want: X("title-absent"), file: () => pdf({ lines: [T, "Revised edition", A, ...BODY] }) },
+  { name: "R284: 'Revised edition' as a short line", rec: NO_DOI, want: X("other-version") /* R293 e: no place, the sign in the first 1,000 characters gives the reason (R292 had title-absent) */, file: () => pdf({ lines: [T, "Revised edition", A, ...BODY] }) },
   { name: "R284: 'Editorial' as a line of its own", rec: RIVERS, want: X("other-kind"), file: () => pdf({ lines: ["Editorial", T, A, `doi:${D}`, ...BODY] }) },
   { name: "R284: another paper citing the record, with its labelled DOI, at about character 1,500", rec: RIVERS, want: X("title-absent"), file: () => pdf({ lines: ["Mountain Pastures and Seasonal Work", "Carl Young", ...BODY, ...filler(13), `As ${A} showed in ${T} (doi:${D}), memory follows water.`] }) },
   { name: "R284: a citing paper with its own embedded title, the record's DOI and title on page 1", rec: RIVERS, want: X("title-absent"), file: () => pdf({ title: "Mountain Pastures and Seasonal Work", author: "Carl Young", lines: ["Mountain Pastures and Seasonal Work", "Carl Young", `This paper extends ${T} by ${A} (doi:${D}) to the high pastures.`, ...BODY] }) },

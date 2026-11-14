@@ -320,14 +320,14 @@ const project = async (o: { encrypted?: boolean; gov?: string; name?: string } =
   ).project;
 
 // Made-up works in the services' shapes (10.5555 is a test prefix; the people are invented).
-type Work = { doi?: string; title: string; family: string; given?: string; year: number; type?: string };
+type Work = { doi?: string; title: string; family: string; given?: string; year: number; type?: string; noContainer?: boolean };
 const crItem = (w: Work) => ({
   ...(w.doi ? { DOI: w.doi } : {}),
   type: w.type ?? "journal-article",
   title: [w.title],
   author: [{ given: w.given ?? "Mirabel", family: w.family }],
   issued: { "date-parts": [[w.year]] },
-  "container-title": ["Journal of Invented Studies"],
+  ...(w.noContainer ? {} : { "container-title": ["Journal of Invented Studies"] }),
 });
 const cr = (...ws: Work[]) => ({ status: "ok", "message-type": "work-list", message: { "total-results": ws.length, items: ws.map(crItem) } });
 const OA_EMPTY = { meta: { count: 0, page: 1, per_page: 5 }, results: [] };
@@ -2728,6 +2728,29 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect(await exists(folderOf(eid))).toBe(false);
     expect(activeTemp.has(`find-${eid}`)).toBe(false);
     expect(changes.filter((c) => c.entryId === eid).map((c) => c.state)).toEqual(["looking-up", "record-complete", "looking-for-copy", "fetching", "in-library"]);
+  });
+
+  // R293 a: the record's container title reaches the check (clause 4: a line holding it may stand directly above the title).
+  const journalAbove = () => buildPdf({ title: ZORBLATT.title, author: "Mirabel Quillfeather", lines: ["Journal of Invented Studies", ZORBLATT.title, "Mirabel Quillfeather", `doi:${ZORBLATT.doi}`, ...PAGE] });
+  it("R293 a: a file whose journal's name stands alone above the title is attached when the record names that journal", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await journalAbove());
+    const { p, eid, sid } = await recordMade();
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(1);
+  });
+  it("R293 a: the same file is held when the record names no journal", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await journalAbove());
+    know(LINE, cr({ ...ZORBLATT, noContainer: true }));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [LINE]);
+    const eid = added[0]!.id;
+    await until(async () => !!(await entryOf(p, eid))?.sourceId, "the record");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-other-kind" } });
   });
 
   it("no offer passes: the first failing file is held, one per entry, and the entry needs a check", async () => {
