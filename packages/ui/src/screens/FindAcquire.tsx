@@ -8,12 +8,15 @@
  *   - A row is what the service last said. `find.progress` carries only `{ projectId, entryId, state }`: an event
  *     means "read the queue again", coalesced — while a read is out, further events ask for ONE more read after it,
  *     so a burst of fifty events makes one or two reads.
- *   - Every read and every answer to an act draws a number when it starts (a read) or arrives (an answer); each
+ *   - Every read and every act draws a number when it STARTS (a read) or is SENT (an act, R258 M1); each
  *     entry keeps the number of what it was last taken from, and a read only replaces (or drops) entries holding a
- *     lower number. So of two reads the one STARTED later wins, whatever order they answer in, and a read started
- *     before an act's answer never undoes it. After every act the queue is read once more.
- *   - The screen is keyed by its project: changing the project drops the old rows, and every answer still out for
- *     the old project is dropped (it belongs to a component that has gone).
+ *     lower number. So of two reads the one STARTED later wins, whatever order they answer in; an act's answer never
+ *     undoes a read started after the act was sent, and the status says the state as shown. After every act the
+ *     queue is read once more. While events keep coming, coalesced reads start at least 400 ms apart (M7).
+ *   - The queue is keyed by its project and by the library: changing the project drops the old rows, and another
+ *     library opening forgets everything of the old one (rows, lists, settings, dialog, answers still out; R258 I1).
+ *   - The remembered settings are written one PUT at a time, each from the last confirmed answer (M2).
+ *   - While an add is out the box is read-only, so nothing typed is lost (I2).
  *   - One request per press: the pressed control shows it is working and ignores a second press.
  *
  * What was typed is the researcher's text: it goes to the service in a request BODY only (never into the address,
