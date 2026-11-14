@@ -12,10 +12,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { WorkerJobError, deviceDeps, type JobResult, type WorkerClient, type WorkerJob } from "@ao/library";
+import { WorkerJobError, deviceDeps, type FindEntry, type JobResult, type WorkerClient, type WorkerJob } from "@ao/library";
 // The real service (dev dependency), not the e2e stub: this test is the integration check.
 import { createService, type LibraryService, type WorkerProvider } from "@ao/library-service";
+// For the browser's fallback: a resting queue entry written as the runner writes it, a made-up PDF, the service's sentences.
+import { newId } from "../../../packages/core/src/ids.js";
+import { appendFindEntriesIn } from "../../../packages/library/src/repo/repo.js";
+import { FIND_BROWSER_TEXT } from "../../../packages/shared/src/index.js";
+import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { ApiError, createApi, type LocalStorageArea } from "./api.js";
+import { parseFileAnswer, parseWaiting } from "./find.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
@@ -131,6 +137,91 @@ describe("the extension's api.ts against the real service (R111)", () => {
     expect(await api.queueLinks(open, ["file:///etc/passwd"]).catch((e: unknown) => e)).toMatchObject({ code: "VALIDATION", status: 400 });
     // Every POST carried the paired origin.
     expect(sent.filter((s) => s.method === "POST").every((s) => s.origin === EXT)).toBe(true);
+  });
+});
+
+// Find and acquire, the browser's fallback (R348 f, i): the extension's two routes on the real service, called by the
+// extension's own client (api.ts) and read by its own parsers (find.ts). The work is made to wait by the desktop app's
+// token (`POST …/browser/start`), as the app does.
+describe("the browser's fallback against the real service (R348 f): the list and the PDF", () => {
+  const NO_FREE = `${GOV("manual_upload, browser_capture")}acquireMethods: [reference_lookup, library_access]\n`;
+  const TITLE = "Quillbrook Ledger of Habits";
+  const PAGE = "https://pdfs.publisher.example/content/quillbrook.pdf?accessToken=secret#page=2";
+
+  /** A library, "Your library" set, the extension paired, a project with a resting entry, the browser's wait started. */
+  async function waitingWork(): Promise<{ api: ReturnType<typeof createApi>; pid: string; eid: string; sent: Array<{ method: string; path: string; origin: string | undefined }> }> {
+    await ui("POST", "/libraries", { path: join(tmp, "Lib"), name: "Lib" });
+    const pid = (await ui("POST", "/projects", { name: "Habits", governanceYaml: NO_FREE, encryption: { enabled: false } })).project.id as string;
+    await ui("PUT", "/settings/your-library", { name: "Vexmoor University", access: { kind: "ezproxy-login", base: "https://ezproxy.vexmoor-univ.example.edu/login?url=" } });
+    const sent: Array<{ method: string; path: string; origin: string | undefined }> = [];
+    const api = createApi({ fetch: chromeLikeFetch(sent), storage: memoryStorage() });
+    const { code } = await ui("POST", "/extension/pair");
+    await api.pair(port, code);
+    // A record and a resting queue entry, written as the find runner writes them.
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      {
+        projectIds: [],
+        type: "article-journal",
+        title: { variants: [{ lang: "en", kind: "original", value: TITLE }] },
+        creators: [{ role: "author", family: "Mirabelle", given: "Ottoline" }],
+        issued: "1999",
+        identifiers: { doi: "10.5555/ao.f20b.quillbrook" },
+        caseAttributes: {},
+        availability: { status: "available" },
+        collectionIds: [],
+        tagIds: [],
+        participantIds: [],
+      },
+      [],
+      { provenance: { captureMethod: "reference_lookup", capturedAt: new Date().toISOString(), tool: { name: "find-and-acquire", version: "0" }, fileHashes: {}, legal: { status: "unknown" }, identifiable: false } },
+    );
+    const at = new Date().toISOString();
+    const entry: FindEntry = { id: newId(), projectId: pid, typed: "Mirabelle 1999 ledger", state: "no-open-copy", createdAt: at, updatedAt: at, attempts: 0, sourceId: sf.source.id };
+    await appendFindEntriesIn(repo, pid, [entry], "add");
+    // The desktop app's press: the work now waits in the browser.
+    const started = await ui("POST", `/projects/${pid}/find/${entry.id}/browser/start`);
+    expect(Object.keys(started)).toEqual(["url"]);
+    return { api, pid, eid: entry.id, sent };
+  }
+
+  it("nothing waiting: the list is { waiting: [] }, read as nothing", async () => {
+    const api = createApi({ fetch: chromeLikeFetch([]), storage: memoryStorage() });
+    const { code } = await ui("POST", "/extension/pair");
+    await api.pair(port, code);
+    const raw = await api.findWaiting();
+    expect(raw).toEqual({ waiting: [] });
+    expect(parseWaiting(raw)).toEqual([]);
+  });
+
+  it("paired: the list holds the waiting work (its ticket and label, nothing else); its PDF is sent and HELD for the researcher's check; then nothing waits", async () => {
+    const { api, pid, eid, sent } = await waitingWork();
+    const raw = await api.findWaiting();
+    const waiting = parseWaiting(raw);
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0]!.label).toBe(TITLE);
+    expect(waiting[0]!.ticket).toMatch(/^[0-9a-f]{32}$/);
+    expect(raw).toEqual({ waiting });
+
+    // A file that is not a PDF: the service's refusal, in its shape; the work still waits.
+    const notPdf = await api.sendFindPdf(waiting[0]!.ticket, PAGE, new Blob([new TextEncoder().encode("<html>not a pdf</html>")], { type: "application/pdf" })).catch((e: unknown) => e);
+    expect(notPdf).toBeInstanceOf(ApiError);
+    expect(notPdf).toMatchObject({ status: 400, reason: "browser-not-pdf", message: FIND_BROWSER_TEXT.notPdf, serviceShaped: true });
+    expect(parseWaiting(await api.findWaiting())).toEqual(waiting);
+
+    // A wrong ticket: the service's 404, its sentence.
+    expect(await api.sendFindPdf("f".repeat(32), PAGE, new Blob([new Uint8Array(await buildPdf({ title: TITLE }))])).catch((e: unknown) => e)).toMatchObject({ status: 404, reason: "browser-not-waiting", message: FIND_BROWSER_TEXT.notWaiting });
+
+    // The PDF: held, with the service's sentence; the work no longer waits in the browser.
+    const pdf = await buildPdf({ title: TITLE, author: "Ottoline Mirabelle", lines: [TITLE, "Ottoline Mirabelle", "Abstract. A ledger of invented habits, made up for these tests, with enough words to be read as text."] });
+    const answer = parseFileAnswer(await api.sendFindPdf(waiting[0]!.ticket, PAGE, new Blob([new Uint8Array(pdf)], { type: "application/pdf" })));
+    expect(answer).toEqual({ outcome: "held", sentence: FIND_BROWSER_TEXT.held });
+    expect(parseWaiting(await api.findWaiting())).toEqual([]);
+    const entry = (await ui("GET", `/projects/${pid}/find`)).entries.find((e: { id: string }) => e.id === eid);
+    expect(entry.state).toBe("needs-check");
+    // Every request carried the paired Origin (both routes need it); the token never in an address.
+    expect(sent.filter((s) => s.path.startsWith("/find/")).every((s) => s.method === "POST" && s.origin === EXT)).toBe(true);
   });
 });
 
