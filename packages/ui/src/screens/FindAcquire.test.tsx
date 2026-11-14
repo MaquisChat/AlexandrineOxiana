@@ -2733,7 +2733,8 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
   // The engine's list ("What the screens must now show"): every state and reason, its phrase, its sentence, exactly its controls.
   const cases: Case[] = [
     ...["copy-not-allowed", "copy-store-not-allowed", "copy-no-legal-basis", "held-full"].map((code) => ({ typed: `rc ${code}`, o: rc(code), phrase: "Record complete", sentence: FIND_REASON_TEXT[code as keyof typeof FIND_REASON_TEXT], controls: ["try", "open", "remove"] })),
-    { typed: "rc switched-off", o: rc("switched-off"), phrase: "Record complete", sentence: FIND_REASON_TEXT["switched-off"], controls: ["open", "remove"] },
+    // R326: "Try again" looks at the Search sources settings again.
+    { typed: "rc switched-off", o: withSource({ state: "record-complete", reason: { code: "switched-off", by: "settings" } }), phrase: "Record complete", sentence: FIND_REASON_TEXT["switched-off"], controls: ["try", "open", "remove"] },
     { typed: "rc plain", o: withSource({ state: "record-complete" }), phrase: "Record complete", controls: ["open", "remove"] },
     { typed: "looking for copy", o: withSource({ state: "looking-for-copy" }), phrase: "Looking for a copy", controls: ["open", "remove"] },
     { typed: "copy next try", o: withSource({ state: "looking-for-copy", nextTryAt: "2026-11-14T12:00:00.000Z" }), phrase: "Looking for a copy", controls: ["try", "open", "remove"] },

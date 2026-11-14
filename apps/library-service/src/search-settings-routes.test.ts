@@ -877,7 +877,9 @@ describe("R312 c: the copy part obeys the saved Search sources (through the serv
     await put({ ...ALL_ON, copies: copies(["openalex"]) });
     const second = await addAndSettle(await newProject("Second"), LINE);
     expect(second.state).toBe("no-open-copy");
-    expect([...copyAsked().entries()]).toEqual([["https://api.openalex.org", 1]]);
+    // R326: the save also woke the first entry (resting "switched off"): OpenAlex is asked for it as well (or its answer
+    // for the same work is the client's cached one) — never any other host.
+    expect([...copyAsked().keys()]).toEqual(["https://api.openalex.org"]);
   });
 
   it("no settings saved: F12's defaults for copies — every free-copy service but Unpaywall may be asked; Unpaywall is not", async () => {
@@ -888,6 +890,53 @@ describe("R312 c: the copy part obeys the saved Search sources (through the serv
     const asked = copyAsked();
     expect(asked.has("https://api.unpaywall.org")).toBe(false);
     for (const o of ["https://api.openalex.org", "https://www.ebi.ac.uk", "https://api.semanticscholar.org"]) expect(asked.get(o), o).toBe(1);
+  });
+
+  // R326 (Task F11b): a save of Search sources wakes the entries it had stopped, in every open project.
+  describe("R326: the PUT wakes the entries resting 'switched off' by the settings", () => {
+    const entryOf = async (pid: string, id: string) => (await call({ url: `/projects/${pid}/find` })).json.entries.find((x: { id: string }) => x.id === id);
+    const idOf = async (pid: string, line: string) => (await call({ url: `/projects/${pid}/find` })).json.entries.find((x: { typed: string }) => x.typed === line).id as string;
+    /** Two open projects, each with an entry resting "switched off" (every copy service off in the file). */
+    async function twoResting(): Promise<Array<{ pid: string; id: string }>> {
+      await start();
+      await put({ ...ALL_ON, copies: copies([]) });
+      const a = await openLibraryWithProject();
+      const b = await newProject("Second");
+      for (const pid of [a, b]) expect(await addAndSettle(pid, LINE)).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+      expect(copyAsked().size).toBe(0);
+      return Promise.all([a, b].map(async (pid) => ({ pid, id: await idOf(pid, LINE) })));
+    }
+
+    it("a save that switches a copy service on puts the entry of every open project to work", async () => {
+      const entries = await twoResting();
+      await put({ ...ALL_ON, copies: copies(["openalex"]) });
+      for (const { pid, id } of entries) {
+        const done = await until(async () => ((e) => (e?.state === "no-open-copy" ? e : undefined))(await entryOf(pid, id)), "the entry to go on");
+        expect(done.reason).toBeUndefined();
+      }
+      // The service's client answers the second project's identical work from its cache: asked at least once, nothing else.
+      expect([...copyAsked().keys()]).toEqual(["https://api.openalex.org"]);
+    });
+
+    it("a save that still switches every copy service off asks nothing and changes nothing", async () => {
+      const entries = await twoResting();
+      const before = await Promise.all(entries.map((x) => entryOf(x.pid, x.id)));
+      await put({ ...ALL_ON, copies: copies([]), crossrefEmail: CROSSREF_EMAIL });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(await Promise.all(entries.map((x) => entryOf(x.pid, x.id)))).toEqual(before);
+      expect(copyAsked().size).toBe(0);
+    });
+
+    it("a refused save wakes nothing", async () => {
+      const entries = await twoResting();
+      const before = await Promise.all(entries.map((x) => entryOf(x.pid, x.id)));
+      // Unpaywall on with no e-mail: refused (400), and an OpenAlex copy service on besides.
+      const refused = await call({ method: "PUT", url: "/settings/search-sources", body: { ...ALL_ON, copies: copies(["unpaywall", "openalex"]) } });
+      expect(refused.status).toBe(400);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(await Promise.all(entries.map((x) => entryOf(x.pid, x.id)))).toEqual(before);
+      expect(copyAsked().size).toBe(0);
+    });
   });
 });
 
