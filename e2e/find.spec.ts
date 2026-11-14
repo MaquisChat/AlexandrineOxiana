@@ -62,7 +62,6 @@ const WORDS = {
   elsewhere: (name: string) => `Already in your project ${name}`,
   elsewhereLocked: "Already in another project that is locked now.",
   lockedCount: (k: number) => (k === 1 ? "1 locked project was not checked" : `${k} locked projects were not checked`),
-  added: (k: number) => (k === 1 ? "Added 1 reference." : `Added ${k} references.`),
 };
 
 /** A row control's accessible name: "<Act>: “<typed, cut at 80 characters + …>”" (FindEntryRow.tsx shortTyped). */
@@ -103,11 +102,18 @@ async function openFind(page: Page, projectId: string): Promise<void> {
   await expect(page.getByRole("textbox", { name: "References" })).toBeEnabled({ timeout: STATE_TIMEOUT });
 }
 
-/** Types the lines into the box and presses "Add"; waits for the status the screen gives for it. */
+/**
+ * Types the lines into the box and presses "Add"; waits for what the screen shows once the add is answered: the box
+ * emptied and one more row per line. (The polite status region says "Added N references." first, but a row's change
+ * of state may replace it at once, so it is not what is waited for.)
+ */
 async function addLines(page: Page, lines: string[]): Promise<void> {
-  await page.getByRole("textbox", { name: "References" }).fill(lines.join("\n"));
+  const before = await rows(page).count();
+  const box = page.getByRole("textbox", { name: "References" });
+  await box.fill(lines.join("\n"));
   await page.getByRole("button", { name: "Add", exact: true }).click();
-  await expect(page.getByTestId("find-live")).toHaveText(WORDS.added(lines.length), { timeout: STATE_TIMEOUT });
+  await expect(box).toHaveValue("", { timeout: STATE_TIMEOUT });
+  await expect(rows(page)).toHaveCount(before + lines.length, { timeout: STATE_TIMEOUT });
 }
 
 async function sources(app: AppHarness, projectId: string, query = ""): Promise<SourceList> {
@@ -419,8 +425,8 @@ test("by keyboard only: add, choose, use this one", async ({ page, app }) => {
     await page.keyboard.type(CHOOSE_B);
     await expect(box).toHaveValue(`${SURE_A}\n${CHOOSE_B}`);
     await page.keyboard.press("Control+Enter");
-    await expect(page.getByTestId("find-live")).toHaveText(WORDS.added(2), { timeout: STATE_TIMEOUT });
-    await expect(box).toHaveValue("");
+    await expect(box).toHaveValue("", { timeout: STATE_TIMEOUT });
+    await expect(rows(page)).toHaveCount(2, { timeout: STATE_TIMEOUT });
     await expect(box).toBeFocused();
     await expect(stateOf(page, 0)).toHaveText(WORDS.recordComplete, { timeout: STATE_TIMEOUT });
     await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
