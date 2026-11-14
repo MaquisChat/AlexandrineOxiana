@@ -337,6 +337,25 @@ describe("settings (Accept 3)", () => {
     expect(await readFile(path, "utf8")).toBe(newer);
   });
 
+  it("R306 b: a save while another program holds the settings' lock: 409 with the lock's sentence, nothing written; once it lets go, the save goes through", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    expect((await saveSettings([linkOf(U, pid)], { everyMinutes: 60 })).status).toBe(200);
+    const path = join(deps.appConfigDir, "zotero-sync.json");
+    const before = await readFile(path, "utf8");
+    // Another program (the command line) holds the lock all along: a fresh lock file beside the settings.
+    const lock = `${path}.lock`;
+    await writeFile(lock, JSON.stringify({ token: "c".repeat(32), at: new Date().toISOString() }), { mode: 0o600 });
+    const r = await saveSettings([linkOf(U, pid)], { everyMinutes: 240 });
+    expect([r.status, r.json.error.code, r.json.error.message, r.json.error.reason]).toEqual([409, "CONFLICT", "The Zotero sync settings are in use by another program. Try again.", "settings-busy"]);
+    expect(r.body).not.toContain(deps.appConfigDir);
+    expect(await readFile(path, "utf8")).toBe(before);
+    await rm(lock);
+    const again = await saveSettings([linkOf(U, pid)], { everyMinutes: 240 });
+    expect(again.status, again.body).toBe(200);
+    expect((await state()).everyMinutes).toBe(240);
+  }, 30_000);
+
   it("R268 M4: the state says when the settings were written by a newer version (settingsNewer), exactly then", async () => {
     await openLibrary();
     const pid = await newProject();
@@ -1102,6 +1121,26 @@ describe("undo of a sync batch (R206, R242)", () => {
     expect(undone.status, undone.body).toBe(200);
     expect(undone.json).not.toHaveProperty("zoteroSync");
   });
+
+  it("R306 b: an undo whose pause cannot be written because another program holds the settings' lock says so: not paused, and why", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    addItems(U, 2);
+    await saveSettings([linkOf(U, pid)]);
+    const [run] = await runAndWait();
+    const path = join(deps.appConfigDir, "zotero-sync.json");
+    const before = await readFile(path, "utf8");
+    const lock = `${path}.lock`;
+    await writeFile(lock, JSON.stringify({ token: "c".repeat(32), at: new Date().toISOString() }), { mode: 0o600 });
+    try {
+      const undone = await call({ method: "POST", url: `/imports/${run.batchId}/undo` });
+      expect(undone.status, undone.body).toBe(200);
+      expect(undone.json.zoteroSync).toEqual({ paused: false, message: `${ZOTERO_SYNC_SENTENCES.undoNotPaused} The Zotero sync settings are in use by another program. Try again.` });
+      expect(await readFile(path, "utf8")).toBe(before);
+    } finally {
+      await rm(lock, { force: true });
+    }
+  }, 30_000);
 });
 
 describe("the state (point 8)", () => {

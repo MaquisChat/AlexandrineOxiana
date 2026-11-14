@@ -10,8 +10,9 @@
  *    request to a server or anything else that can wait.
  *  - A caller that finds it taken tries again every FILE_LOCK_RETRY_MS for up to FILE_LOCK_WAIT_MS, then fails with
  *    FileLockBusyError; `step` has not run, so nothing was written.
- *  - A lock whose FILE time (mtime, set by the system when the lock was created) is more than FILE_LOCK_STALE_MS old
- *    was left by a process that died, and is taken over. The time written inside is for a person looking at the file
+ *  - A lock whose FILE time (mtime, set by the system when the lock was created) differs from now by more than
+ *    FILE_LOCK_STALE_MS, either way, was left by a process that died, and is taken over (R306 c: dated in the future, it
+ *    was left before the clock was set back, and would otherwise hold the file until the clock caught up). The time written inside is for a person looking at the file
  *    and is not trusted: a file that died half-written has none, and the file's own time cannot be malformed.
  *  - Taking over is done by ONE waiter only: to remove a stale lock a waiter must first create, exclusively, the
  *    take-over file `<lock>.break-<the stale lock's token>`. Two waiters that both saw the same stale lock race for that
@@ -37,7 +38,7 @@ import * as fsp from "node:fs/promises";
 
 /** How long a caller waits for a lock that is taken before it gives up (R299 c: 5 seconds). */
 export const FILE_LOCK_WAIT_MS = 5_000;
-/** How old (by the lock file's own time) a lock must be to count as left by a process that died (R299 c: 30 seconds). */
+/** How far (by the lock file's own time, before or after now) a lock must be to count as left by a process that died (R299 c, R306 c: 30 seconds). */
 export const FILE_LOCK_STALE_MS = 30_000;
 /** How often a waiting caller tries again. */
 export const FILE_LOCK_RETRY_MS = 25;
@@ -113,7 +114,7 @@ async function tokenIn(path: string): Promise<string | undefined> {
 /**
  * What a lock file there now is: its identity (its token; for one with no readable token, which a process that died
  * between creating and writing it leaves, a digest of the file's identity and time) and whether it is stale by its
- * file time. Undefined when it is not there.
+ * file time (more than FILE_LOCK_STALE_MS from now, either way). Undefined when it is not there.
  */
 async function look(path: string): Promise<{ id: string; stale: boolean } | undefined> {
   let st;
@@ -124,7 +125,7 @@ async function look(path: string): Promise<{ id: string; stale: boolean } | unde
   }
   const token = await tokenIn(path);
   const id = token ?? `x${createHash("sha256").update(`${st.ino}:${st.mtimeMs}:${st.size}`).digest("hex").slice(0, 32)}`;
-  return { id, stale: Date.now() - st.mtimeMs > FILE_LOCK_STALE_MS };
+  return { id, stale: Math.abs(Date.now() - st.mtimeMs) > FILE_LOCK_STALE_MS };
 }
 
 /** Removes the lock at `path` only while it still carries `token` (only its holder removes a lock). Never throws. */

@@ -101,6 +101,16 @@ describe("withFileLock", () => {
     await expect(withFileLock(guarded, async () => undefined, { waitMs: 100, retryMs: 10 })).rejects.toBeInstanceOf(FileLockBusyError);
   });
 
+  it("R306 c: a lock dated more than the stale bound AHEAD of now (the clock was set back after it was left) is taken over; one just inside the bound is not", async () => {
+    await foreignLock(fileLockPath(guarded), -(FILE_LOCK_STALE_MS - 1_000));
+    await expect(withFileLock(guarded, async () => undefined, { waitMs: 100, retryMs: 10 })).rejects.toBeInstanceOf(FileLockBusyError);
+    await foreignLock(fileLockPath(guarded), -(FILE_LOCK_STALE_MS + 1_000));
+    let ran = false;
+    await withFileLock(guarded, async () => void (ran = true), { waitMs: 300, retryMs: 10 });
+    expect(ran).toBe(true);
+    expect(await leftovers()).toEqual([]);
+  });
+
   it("the file's time decides, not the time written in it: an old time in a fresh file is not stale", async () => {
     await foreignLock(fileLockPath(guarded), 0, JSON.stringify({ token: "e".repeat(32), at: "2001-01-01T00:00:00.000Z" }));
     await expect(withFileLock(guarded, async () => undefined, { waitMs: 100, retryMs: 10 })).rejects.toBeInstanceOf(FileLockBusyError);
@@ -121,6 +131,31 @@ describe("withFileLock", () => {
     for (let round = 0; round < 20; round++) {
       await foreignLock(fileLockPath(guarded), FILE_LOCK_STALE_MS + 1_000);
       // Both waiters have read the stale lock before either acts on it.
+      let looked = 0;
+      let open!: () => void;
+      const both = new Promise<void>((r) => (open = r));
+      const seenStale = async () => {
+        if (++looked === 2) open();
+        await Promise.race([both, sleep(200)]);
+      };
+      let active = 0;
+      let most = 0;
+      const step = async () => {
+        active++;
+        most = Math.max(most, active);
+        await sleep(15);
+        active--;
+      };
+      await Promise.all([withFileLock(guarded, step, { retryMs: 5, seenStale }), withFileLock(guarded, step, { retryMs: 5, seenStale })]);
+      expect(looked, `round ${round}`).toBeGreaterThanOrEqual(2);
+      expect(most, `round ${round}`).toBe(1);
+      expect(await leftovers()).toEqual([]);
+    }
+  });
+
+  it("R306 c: two waiters that both see the same FUTURE-dated stale lock do not both take it", async () => {
+    for (let round = 0; round < 10; round++) {
+      await foreignLock(fileLockPath(guarded), -(FILE_LOCK_STALE_MS + 1_000));
       let looked = 0;
       let open!: () => void;
       const both = new Promise<void>((r) => (open = r));

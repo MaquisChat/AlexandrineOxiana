@@ -20,6 +20,7 @@ import {
   ZOTERO_SYNC_NEWER_SENTENCE,
   ZoteroAccountError,
   ZoteroSyncFileNewerError,
+  ZoteroSyncFileBusyError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
   getSecret,
@@ -417,6 +418,9 @@ async function withCounts(s: Session, run: LibraryRun, read = true): Promise<Zot
 /** This computer's sync files, refused in our words (never a path). */
 function fileError(err: unknown): unknown {
   if (err instanceof ZoteroSyncFileNewerError) return new ApiError(409, "CONFLICT", err.message);
+  // R306 b: another program held the file's lock for the whole wait — a passing condition, said as one (409, as for a
+  // run already going), in the lock's own sentence; nothing was written.
+  if (err instanceof ZoteroSyncFileBusyError) return new ApiError(409, "CONFLICT", err.message, "settings-busy");
   if (err instanceof ZoteroSyncFileUnreadableError) return new ApiError(503, "UNAVAILABLE", ZOTERO_SYNC_SENTENCES.settingsUnreadable);
   return err;
 }

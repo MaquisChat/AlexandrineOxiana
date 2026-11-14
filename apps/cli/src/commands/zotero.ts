@@ -5,6 +5,7 @@ import {
   appConfigDir,
   listLibraries,
   ZoteroAccountError,
+  ZoteroSyncFileBusyError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
   readZoteroSyncHistory,
@@ -73,6 +74,16 @@ function keyCheckFailure(err: unknown): never {
     throw new ExitError(message, EXIT.failure);
   }
   throw new ExitError("The key could not be checked. Try again in a moment.", EXIT.failure);
+}
+
+/**
+ * This computer's sync files refused, in the service's words: R306 b, another program held their lock for the whole
+ * wait (the lock's own sentence); a file that could not be read (the shared sentence). Anything else as it is.
+ */
+function syncFileFailure(err: unknown): unknown {
+  if (err instanceof ZoteroSyncFileBusyError) return new ExitError(err.message, EXIT.failure);
+  if (err instanceof ZoteroSyncFileUnreadableError) return new ExitError(ZOTERO_SYNC_SENTENCES.settingsUnreadable, EXIT.failure);
+  return err;
 }
 
 /** What the researcher is told about a link that is paused (the sentences are the service's). */
@@ -167,8 +178,7 @@ export function registerZotero(program: Command): void {
         try {
           settings = await readZoteroSyncSettings(s.deps.appConfigDir, s.lib.id, { onNewer: () => (newer = true), onSetAside: () => (aside = true) });
         } catch (err) {
-          if (err instanceof ZoteroSyncFileUnreadableError) throw new ExitError(ZOTERO_SYNC_SENTENCES.settingsUnreadable, EXIT.failure);
-          throw err;
+          throw syncFileFailure(err);
         }
         if (newer) throw new ExitError(ZOTERO_SYNC_NEWER_SENTENCE, EXIT.failure);
         if (aside) {
@@ -180,8 +190,7 @@ export function registerZotero(program: Command): void {
         try {
           earlier = await readZoteroSyncHistory(s.deps.appConfigDir, s.lib.id);
         } catch (err) {
-          if (err instanceof ZoteroSyncFileUnreadableError) throw new ExitError(ZOTERO_SYNC_SENTENCES.settingsUnreadable, EXIT.failure);
-          throw err;
+          throw syncFileFailure(err);
         }
         const inForce = zoteroSyncBackoff(zoteroHistoryBackoff(earlier), Date.now());
         if (inForce !== undefined) throw new ExitError(zoteroSyncReasonText("backing-off", new Date(), new Date(inForce).toISOString()), EXIT.failure);

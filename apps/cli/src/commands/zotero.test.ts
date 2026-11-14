@@ -512,6 +512,27 @@ describe("ao zotero sync", () => {
     expect(z.requests).toEqual([]);
   });
 
+  it("R306 b: when the settings' damaged content cannot be set aside because another program holds their lock, it says so in the lock's sentence and runs nothing", async () => {
+    articles(1);
+    await linked(link(U));
+    const file = join(config, ZOTERO_SYNC_FILE);
+    await writeFile(file, "{ this is not json");
+    const lock = `${file}.lock`;
+    await writeFile(lock, JSON.stringify({ token: "c".repeat(32), at: new Date().toISOString() }), { mode: 0o600 });
+    try {
+      const r = await ao(["zotero", "sync"]);
+      expect(r.code).toBe(1);
+      expect(r.stderr.trim()).toBe("The Zotero sync settings are in use by another program. Try again.");
+      const j = await ao(["--json", "zotero", "sync"]);
+      expect(j.code).toBe(1);
+      expect(json(j).error).toBe("The Zotero sync settings are in use by another program. Try again.");
+      expect(await readFile(file, "utf8")).toBe("{ this is not json");
+      expect(z.requests).toEqual([]);
+    } finally {
+      await rm(lock, { force: true });
+    }
+  }, 60_000);
+
   it("a locked project is unlocked as other commands unlock one, or its link is skipped with the sentence", async () => {
     const made = await ao(["--json", "project", "create", "Sealed", "--encrypt", "--not-identifiable", "--capture", "zotero_import"]);
     expect(made.code, made.stderr).toBe(0);
