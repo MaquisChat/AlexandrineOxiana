@@ -162,15 +162,24 @@ export const DECIDE_SETTLE_MS = 600;
 export const HELD_DECISION_TIMEOUT_MS = 60_000;
 /** R313 e: said on the card when a decision was given up. */
 export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
-/** R318 c: said once per quiet, in the polite region, when a press was swallowed by the quiet. */
-export const PRESS_NOT_TAKEN_TEXT = "That press was not taken, because the list had just changed. Look at the file, then press again.";
-/** R322 a: said once per quiet, in the polite region, when a pointer press fell on a control that had moved under it. */
-export const PRESS_MOVED_TEXT = "That press was not taken, because what is under the pointer had just moved. Look at the file, then press again.";
 /** R322 a: how far (in CSS pixels, either way, on each axis) a control may stand from where it stood and still be "where it stood" (rounding). */
 export const PRESS_PLACE_TOLERANCE_PX = 1;
-/** R323 b: shown on the card, under its controls, where a press was not taken (until the pointer moves over the card, or a press there is taken). */
+/**
+ * R327 c: how long after a scroll of the page a mouse press is not taken (a file passing under the pointer of a page
+ * still moving was not pointed at): a mouse press whose pointer-down comes less than this after the last scroll is
+ * refused as "moved". Keyboard presses and touch or pen presses are not affected (touch has its own stillness rule).
+ */
+export const SCROLL_SETTLE_MS = 250;
+/**
+ * R327 c: one sentence for each cause of a press not taken, shown on the card under its controls (until the pointer
+ * moves over the card, or a press there is taken) and said, the same, in the polite region when it appears.
+ *  - `moved`: a mouse press not taken for its place, the pointer's movement or a scroll;
+ *  - `touch`: a tap or pen press on a control that had not stood still;
+ *  - `quiet`: a press inside the quiet (any pointer, or the keyboard).
+ */
 export const PRESS_SHOWN_TEXT = {
-  moved: "Not taken: the page had just moved. Move the pointer onto the button and press again.",
+  moved: "Not taken. Look at the file, then move the pointer and press again.",
+  touch: "Not taken: the page had just moved. Look at the file, then tap again.",
   quiet: "Not taken: the list had just changed. Look at the file, then press again.",
 } as const;
 export type PressNotice = keyof typeof PRESS_SHOWN_TEXT;
@@ -182,6 +191,7 @@ export type PressNotice = keyof typeof PRESS_SHOWN_TEXT;
  *    Client coordinates, not `movementX`/`movementY`: WebKit sends pointermoves after a scroll at the same point (with
  *    movement 0), and the engines do not agree on what `movementX/Y` hold; the same point twice is no movement in
  *    both. The first pointermove the screen sees of a pointer has nothing to differ from: it is not a movement.
+ *  - `lastScrollAt`: the time of the last of those scrolls (R327 b: SCROLL_SETTLE_MS).
  *  - `scrolls`: moved on by every `scroll` event of the window or of any element (capture phase, so an inner scroller
  *    is seen too): a place remembered before it is forgotten.
  */
@@ -189,10 +199,15 @@ interface Pointing {
   moved: WeakSet<Event>;
   last: Map<number, { x: number; y: number }>;
   scrolls: number;
+  /** R327 b: when (Date.now()) the last scroll was seen. */
+  lastScrollAt: number;
 }
 
-/** R322 a: what FileCard found of a press — taken as built ("ok"), or by a pointer on a control that moved under it ("moved"). */
-export type PressCheck = "ok" | "moved";
+/**
+ * R322 a, R327 c: what FileCard found of a press — taken as built ("ok"), by a mouse not where it was pointed
+ * ("moved"), or by touch or pen on a control that had not stood still ("moved-touch").
+ */
+export type PressCheck = "ok" | "moved" | "moved-touch";
 /** A waiting file's two controls: their words at rest, and while that decision is out (R318 a). */
 export const HELD_DECIDE_WORDS: Readonly<Record<HeldFileDecision, { idle: string; working: string }>> = {
   attach: { idle: "Use this file", working: "Using this file…" },
@@ -333,14 +348,17 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   /** R323 b: a press not taken, shown on its card. */
   const [heldNotices, setHeldNotices] = useState<Readonly<Record<string, PressNotice>>>({});
   /** R323 a: the pointer's real movements and the scrolls (see Pointing). */
-  const pointing = useMemo<Pointing>(() => ({ moved: new WeakSet(), last: new Map(), scrolls: 0 }), []);
+  const pointing = useMemo<Pointing>(() => ({ moved: new WeakSet(), last: new Map(), scrolls: 0, lastScrollAt: Number.NEGATIVE_INFINITY }), []);
   useEffect(() => {
     const onMove = (e: globalThis.PointerEvent) => {
       const was = pointing.last.get(e.pointerId);
       if (was && (was.x !== e.clientX || was.y !== e.clientY)) pointing.moved.add(e);
       pointing.last.set(e.pointerId, { x: e.clientX, y: e.clientY });
     };
-    const onScroll = () => void pointing.scrolls++;
+    const onScroll = () => {
+      pointing.scrolls++;
+      pointing.lastScrollAt = Date.now();
+    };
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("scroll", onScroll, true);
     return () => {
@@ -348,7 +366,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       window.removeEventListener("scroll", onScroll, true);
     };
   }, [pointing]);
+  /** The line each card shows now (a ref, so a press knows at once whether its sentence is already there). */
+  const noticesRef = useRef<Readonly<Record<string, PressNotice>>>({});
   const notice = useCallback((id: string, n: PressNotice | null) => {
+    const { [id]: _was, ...others } = noticesRef.current;
+    noticesRef.current = n ? { ...others, [id]: n } : others;
     setHeldNotices((cur) => {
       if ((cur[id] ?? null) === n) return cur;
       const { [id]: _drop, ...rest } = cur;
@@ -370,16 +392,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const fileCards = useRef(new Map<string, HTMLElement>());
   /** R313 c, R318 b: until this time (Date.now()) no deciding control acts (see DECIDE_SETTLE_MS for from when). */
   const quietUntil = useRef(0);
-  /** R318 c: the quiet in force has already said that a press was not taken. */
-  const quietSaid = useRef(false);
-  /** R322 a: the quiet in force has already said that a press fell on a control that had moved. */
-  const movedSaid = useRef(false);
-  /** R318 b: the quiet runs (again) for DECIDE_SETTLE_MS from `now`; a quiet that had ended starts afresh, unsaid. */
+  /** R318 b: the quiet runs (again) for DECIDE_SETTLE_MS from `now`. */
   const holdQuiet = useCallback((now: number) => {
-    if (now >= quietUntil.current) {
-      quietSaid.current = false;
-      movedSaid.current = false;
-    }
     quietUntil.current = Math.max(quietUntil.current, now + DECIDE_SETTLE_MS);
   }, []);
   /** R313 e: after a decision was given up and the queue read again, focus goes back to that file's heading. */
@@ -452,6 +466,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     setError(null);
     setHeldBusy({});
     setHeldErrors({});
+    noticesRef.current = {};
     setHeldNotices({});
     // Nothing of the found files' section outlives a lock: unlocked, it is laid out afresh.
     putLayout(null);
@@ -769,6 +784,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       t === ":empty" ? emptyNote.current : t === ":title" ? title.current : t === ":section" ? (foundHead.current ?? title.current) : (fileHeads.current.get(t) ?? title.current);
     el?.focus();
   }, [fileFocus]);
+  /** R327 c: a press was not taken: its sentence on the card, and in the polite region if the card's line was not that already. */
+  const refuse = (id: string, n: PressNotice) => {
+    if (noticesRef.current[id] !== n) setStatus(PRESS_SHOWN_TEXT[n]);
+    notice(id, n);
+  };
   const decideHeld = async (item: ReviewItem, decision: HeldFileDecision, how: PressCheck = "ok") => {
     // R319 a: a file decided here, or no longer listed, has no control that decides; nothing may decide it again.
     if (laidRef.current?.ended[item.id] || !(itemsRef.current ?? []).some((x) => x.id === item.id)) return;
@@ -779,26 +799,18 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       holdQuiet(now);
       return;
     }
-    // R322 a: a pointer press on a control that is not where the researcher pointed at it (it moved under the pointer,
-    // or the pointer never moved over it): not taken; it starts the quiet again (R318 b) and is said once per quiet.
-    if (how === "moved") {
-      holdQuiet(now);
-      notice(item.id, "moved");
-      if (!movedSaid.current) {
-        movedSaid.current = true;
-        setStatus(PRESS_MOVED_TEXT);
-      }
+    // R322 a, R327 a, c: a pointer press on a control that is not where the researcher pointed at it (it moved under the
+    // pointer, a scroll was just now, or the pointer never moved over it): not taken. It starts no quiet (the place check
+    // stands by itself). Its sentence is shown on the card and said when it appears there, not again while it stays.
+    if (how !== "ok") {
+      refuse(item.id, how === "moved" ? "moved" : "touch");
       return;
     }
-    // R313 c, R318 b, c: inside the quiet a press does nothing but start the quiet again from this press, and say,
-    // once per quiet, that it was not taken.
+    // R313 c, R318 b, c, R327 c: inside the quiet a press does nothing but start the quiet again from this press, and
+    // say (when the line appears) that it was not taken.
     if (now < quietUntil.current) {
       holdQuiet(now);
-      notice(item.id, "quiet");
-      if (!quietSaid.current) {
-        quietSaid.current = true;
-        setStatus(PRESS_NOT_TAKEN_TEXT);
-      }
+      refuse(item.id, "quiet");
       return;
     }
     heldBusyRef.current.add(item.id);
@@ -1435,7 +1447,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
    */
   const seen = useRef<Partial<Record<HeldFileDecision, Spot & { scrolls: number }>>>({});
   const still = useRef<Partial<Record<HeldFileDecision, Spot & { since: number }>>>({});
-  const down = useRef<{ d: HeldFileDecision; type: string; still: boolean } | null>(null);
+  const down = useRef<{ d: HeldFileDecision; type: string; still: boolean; at: number } | null>(null);
   const buttons = useRef<Partial<Record<HeldFileDecision, HTMLButtonElement | null>>>({});
   /** Measures where a control stands now: true when it has stood there for the quiet's time; a change is a move, now. */
   const measure = (d: HeldFileDecision, now: number): boolean => {
@@ -1465,7 +1477,8 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
   const noticeId = `${useId()}-not-taken`;
   const describedBy = notice ? noticeId : undefined;
   const onPointerDown = (d: HeldFileDecision) => (e: PointerEvent<HTMLButtonElement>) => {
-    down.current = { d, type: e.pointerType, still: e.pointerType !== "mouse" && measure(d, Date.now()) };
+    const at = Date.now();
+    down.current = { d, type: e.pointerType, still: e.pointerType !== "mouse" && measure(d, at), at };
   };
   const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
     if (e.key !== "Enter" && e.key !== " ") return;
@@ -1490,9 +1503,11 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
     if (p && p.d === d) {
       if (p.type === "mouse") {
         const was = seen.current[d];
-        how = was && was.scrolls === pointing.scrolls && sameSpot(was, spotOf(e.currentTarget, false)) ? "ok" : "moved";
-      } else how = p.still ? "ok" : "moved";
-    } else if (type === "mouse" || type === "touch" || type === "pen") how = "moved";
+        // R327 b: and not within SCROLL_SETTLE_MS after a scroll of the page.
+        how = was && was.scrolls === pointing.scrolls && sameSpot(was, spotOf(e.currentTarget, false)) && p.at - pointing.lastScrollAt >= SCROLL_SETTLE_MS ? "ok" : "moved";
+      } else how = p.still ? "ok" : "moved-touch";
+    } else if (type === "mouse") how = "moved";
+    else if (type === "touch" || type === "pen") how = "moved-touch";
     onDecide(item, d, how);
   };
   /** R318 a: the pressed control says it is working; its name still says which file. */

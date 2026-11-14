@@ -1,12 +1,12 @@
 /**
  * What the answer is used for now (R296): advice shown to the researcher beside a held file; nothing is attached on
- * it unless the runner's option for attaching by itself is on, which nothing in the app sets.
+ * it by the app, which has no option to attach a file by itself (R301): only the researcher's "Use this file" does.
  *
  * The file check (Find and acquire, Task F11; Ruling R277 a, rebuilt by R282 a–c, stated in closed form by R292): is
- * a downloaded file the work of the record it was found for? The app attaches a file by itself ("match") only on
- * strong, positive evidence that the file IS the record's work: ONE structure that the file's first page must show,
- * the same for every file, with or without a DOI. Everything else is a mismatch with its reason, and the runner holds
- * the file for the researcher's check. The cost is accepted (R292): more right files go to the researcher.
+ * a downloaded file the work of the record it was found for? The check answers "match" (the file "looks right") only
+ * on strong, positive evidence that the file IS the record's work: ONE structure that the file's first page must show,
+ * the same for every file, with or without a DOI. Everything else is a mismatch with its reason. Either way the runner
+ * holds the file for the researcher's check (R301): a "match" is advice too, and attaches nothing.
  *
  * The file's text and metadata are read through the library's own extraction (`extract/pdf.ts`, `extract/epub.ts`,
  * under their limits: the first 3 pages or sections, at most 20,000 characters, the R50 zip limits; nothing embedded

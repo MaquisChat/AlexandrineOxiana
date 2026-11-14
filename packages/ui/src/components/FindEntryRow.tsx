@@ -84,7 +84,7 @@ export const FIND_TEXT = {
   copyFailed: "Copying did not work here. Select the address and copy it.",
 } as const;
 
-/** Reasons on "record-complete" that "Try again" takes (F11: the rules, the store part, the waiting files' limit). */
+/** Reasons on "record-complete" that "Try again" takes (F11: the rules, the store part, the waiting files' limit; R326 adds "switched off" by the settings in `actionsOf`). */
 const COPY_RETRY_REASONS: ReadonlySet<string> = new Set<FindReasonCode>(["copy-not-allowed", "copy-store-not-allowed", "copy-no-legal-basis", "held-full"]);
 
 /** The record's entry in the project's review queue (the queue opened at that record's entries). */
@@ -272,7 +272,8 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
       out.push("retry");
       break;
     case "record-complete":
-      if (COPY_RETRY_REASONS.has(String(e.reason?.code))) out.push("retry");
+      // R326: also an entry the "Search sources" settings switched off (they are looked at again).
+      if (COPY_RETRY_REASONS.has(String(e.reason?.code)) || (e.reason?.code === "switched-off" && e.reason.by === "settings")) out.push("retry");
       if (e.sourceId) out.push("open");
       break;
     case "looking-for-copy":

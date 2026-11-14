@@ -4307,6 +4307,164 @@ processing:
       for (const h of copyHits) expect(COPY_HOSTS.filter((o) => o !== "https://api.unpaywall.org")).toContain(h.origin);
       for (const o of ["https://www.ebi.ac.uk", "https://api.semanticscholar.org"]) expect(copyHits.some((h) => h.origin === o), o).toBe(true);
     });
+
+    // ----------------------------------------------------------------------------------------------------------
+    // R326 (Task F11b): a save of Search sources wakes the entries that rest "switched off" by the settings.
+    describe("R326: a save of Search sources wakes the entries it had stopped (wakeSettings)", () => {
+      const queueOf = (p: Project) => readFile(join(lib.root, p.folder, "find", "queue.jsonl"));
+      const saveRecord = (on: boolean) =>
+        writeSearchSettings(dir(), { record: DEFAULT_SEARCH_SETTINGS.record.map((x) => ({ ...x, on })), copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ id: c.id, on: c.id === "openalex" })) }, new Date(NOW));
+      /** An entry of the record part resting "switched off" (every record service off in the file). */
+      async function recordStopped(): Promise<{ p: Project; r: FindRunner; eid: string }> {
+        await saveRecord(false);
+        know(LINE, cr(ZORBLATT));
+        const p = await project();
+        const r = runner();
+        const eid = (await r.add(p.id, [LINE])).added[0]!.id;
+        await until(async () => (await entryOf(p, eid))?.reason?.code === "switched-off", "the settings' refusal");
+        expect((await entryOf(p, eid))!).toMatchObject({ state: "failed", reason: { code: "switched-off", by: "settings" } });
+        expect((await entryOf(p, eid))!.sourceId).toBeUndefined();
+        return { p, r, eid };
+      }
+      const quiet = () => new Promise((res) => setTimeout(res, 100));
+
+      it("the copy part: a service switched on is asked at once, the entry looks for a copy, and finds what the transport offers", async () => {
+        await save([]);
+        const { p, r, eid } = await recordUnderFile();
+        await until(async () => (await entryOf(p, eid))?.reason?.code === "switched-off", "the settings' refusal");
+        expect(copyRequests).toEqual([]);
+        await save(["openalex"]);
+        await r.wakeSettings(p.id);
+        await copyDone(p, eid);
+        expect(copyRequests.length).toBe(1);
+        expect((await entryOf(p, eid))!.reason?.code).not.toBe("switched-off");
+        expect(changes.filter((c) => c.entryId === eid).map((c) => c.state)).toContain("looking-for-copy");
+      });
+
+      it("the copy part: settings that still stop it leave the entry as it is — no service asked, no new line in the queue", async () => {
+        await save([]);
+        const { p, r, eid } = await recordUnderFile();
+        await until(async () => (await entryOf(p, eid))?.reason?.code === "switched-off", "the settings' refusal");
+        const before = await queueOf(p);
+        await quiet();
+        const events = changes.length;
+        await save([]);
+        await r.wakeSettings(p.id);
+        await quiet();
+        expect(await queueOf(p)).toEqual(before);
+        expect(changes.length).toBe(events);
+        expect(copyRequests).toEqual([]);
+        expect(copyHits).toEqual([]);
+        expect(fileRequests).toEqual([]);
+      });
+
+      it("a held-full entry and an entry the rules stopped are not touched (no request, no new line)", async () => {
+        const { p, r, eid } = await atTheLimit();
+        const q = await project({ gov: GOV("acquireMethods: [reference_lookup]") });
+        know(LINE_2, cr({ ...ZORBLATT, doi: `${ZORBLATT.doi}.9` }));
+        const ruled = (await r.add(q.id, [LINE_2])).added[0]!.id;
+        await until(async () => (await entryOf(q, ruled))?.reason?.code === "copy-not-allowed", "the rules' refusal");
+        const [pb, qb] = [await queueOf(p), await queueOf(q)];
+        await save(["openalex", "europepmc"]);
+        await r.wakeSettings(p.id);
+        await r.wakeSettings(q.id);
+        await quiet();
+        expect((await entryOf(p, eid))!).toMatchObject({ state: "record-complete", reason: { code: "held-full" } });
+        expect((await entryOf(q, ruled))!).toMatchObject({ state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } });
+        expect(await queueOf(p)).toEqual(pb);
+        expect(await queueOf(q)).toEqual(qb);
+        expect(copyRequests).toEqual([]);
+        expect(copyHits).toEqual([]);
+      });
+
+      it("an entry at work (a download in flight) is neither aborted nor asked again", async () => {
+        oaCopies.set(`${ZORBLATT.doi!}.1`, ["https://arxiv.org/pdf/2101.00001"]);
+        holdFiles.add("https://arxiv.org/pdf/2101.00001");
+        await save(["openalex"]);
+        const { p, r, eid } = await recordUnderFile();
+        await until(() => heldFiles.length === 1, "the download to start");
+        const asked = copyRequests.length;
+        await r.wakeSettings(p.id);
+        await quiet();
+        expect(heldFiles[0]!.aborted).toBe(false);
+        expect(heldFiles.length).toBe(1);
+        expect(copyRequests.length).toBe(asked);
+        expect((await entryOf(p, eid))!.state).toBe("fetching");
+      });
+
+      it("a locked project: nothing is done", async () => {
+        await save([]);
+        const p = await project({ encrypted: true });
+        know(LINE, cr({ ...ZORBLATT, doi: `${ZORBLATT.doi}.7` }));
+        const r = runner();
+        const eid = (await r.add(p.id, [LINE])).added[0]!.id;
+        await until(async () => (await entryOf(p, eid))?.reason?.code === "switched-off", "the settings' refusal");
+        r.stop(p.id);
+        repo.lockProject(p.id);
+        await save(["openalex"]);
+        await r.wakeSettings(p.id);
+        await quiet();
+        expect(copyRequests).toEqual([]);
+        await repo.unlockProject(p.id, "pw");
+        expect((await entryOf(p, eid))!).toMatchObject({ state: "record-complete", reason: { code: "switched-off" } });
+        expect(copyRequests).toEqual([]);
+      });
+
+      it("the record part: a service switched on puts the entry back to work; it is asked and goes on", async () => {
+        const { p, r, eid } = await recordStopped();
+        expect(gated.sent).toEqual([]);
+        await saveRecord(true);
+        await r.wakeSettings(p.id);
+        await until(async () => (await entryOf(p, eid))?.reason?.code !== "switched-off", "the entry to go on");
+        await settled(p, eid);
+        expect(gated.sent.length).toBeGreaterThan(0);
+        expect((await entryOf(p, eid))!.reason?.code).not.toBe("switched-off");
+      });
+
+      it("the record part: settings that still stop it leave the entry as it is — no service asked, no new line", async () => {
+        const { p, r, eid } = await recordStopped();
+        const before = await queueOf(p);
+        await quiet();
+        const events = changes.length;
+        await saveRecord(false);
+        await r.wakeSettings(p.id);
+        await quiet();
+        expect(await queueOf(p)).toEqual(before);
+        expect(changes.length).toBe(events);
+        expect(gated.sent).toEqual([]);
+        expect((await entryOf(p, eid))!).toMatchObject({ state: "failed", reason: { code: "switched-off", by: "settings" } });
+      });
+
+      it("Try again: accepted on a copy entry resting switched off — it looks for a copy, never for its record again", async () => {
+        await save([]);
+        const { p, r, eid } = await recordUnderFile();
+        await until(async () => (await entryOf(p, eid))?.reason?.code === "switched-off", "the settings' refusal");
+        await quiet();
+        const seen = changes.length;
+        // The settings still stop it: it goes back to resting, asking nothing.
+        const again = await r.retry(p.id, eid);
+        expect(again.state).toBe("looking-for-copy");
+        await quiet();
+        expect((await entryOf(p, eid))!).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+        expect(copyRequests).toEqual([]);
+        // Switched on: it goes on.
+        await save(["openalex"]);
+        await r.retry(p.id, eid);
+        await copyDone(p, eid);
+        expect(copyRequests.length).toBe(1);
+        expect(changes.slice(seen).filter((c) => c.entryId === eid).map((c) => c.state)).not.toContain("looking-up");
+      });
+
+      it("Try again: accepted on a record entry resting switched off — it looks up its record again", async () => {
+        const { p, r, eid } = await recordStopped();
+        await saveRecord(true);
+        const again = await r.retry(p.id, eid);
+        expect(again.state).toBe("looking-up");
+        await settled(p, eid);
+        expect(gated.sent.length).toBeGreaterThan(0);
+        expect((await entryOf(p, eid))!.reason?.code).not.toBe("switched-off");
+      });
+    });
   });
 });
 
