@@ -76,6 +76,8 @@ interface StoredFile {
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const isEmail = (v: unknown): v is string => typeof v === "string" && v.length <= SEARCH_EMAIL_MAX && EMAIL_RE.test(v);
+/** An e-mail address the settings accept: the lookup client's EMAIL_RE, at most SEARCH_EMAIL_MAX characters. */
+export const isSearchEmail = isEmail;
 const isRows = (v: unknown): v is Array<{ id: string; on: boolean }> =>
   Array.isArray(v) &&
   v.length <= SOURCES_IN_FILE_MAX &&

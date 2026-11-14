@@ -34,6 +34,7 @@ import { registerTools } from "./routes/tools.js";
 import { registerWatchedFolders } from "./routes/watched-folders.js";
 import { registerFind } from "./routes/find.js";
 import { registerZoteroSync } from "./routes/zotero-sync.js";
+import { registerSearchSettings } from "./routes/search-settings.js";
 
 export type { ServiceWorker, WorkerProvider } from "./state.js";
 
@@ -319,6 +320,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerWatchedFolders(app, ctx);
   registerFind(app, ctx);
   registerZoteroSync(app, ctx);
+  registerSearchSettings(app, ctx);
 
   let closing: Promise<void> | undefined;
   return {

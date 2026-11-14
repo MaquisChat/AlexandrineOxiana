@@ -144,6 +144,11 @@ export const SEARCH_SETTINGS_TEXT = {
   keyShape: "That does not look like an API key: it is 8 to 256 letters, digits or signs, with no spaces.",
   noStoreForStatus:
     "No secure key store is available on this computer (the system keychain or credential manager), so no key can be kept here. Keys are never kept in plain files.",
+  /** The library's own sentence (SECRET_STORE_UNAVAILABLE), word for word: a PUT of a key with no password store. */
+  keyNotSaved:
+    "No secure key store is available on this computer (the system keychain or credential manager), so the key was not saved. Keys are never kept in plain files.",
+  keyFields: 'Only "apiKey" can be sent here.',
+  fields: "Only record, copies, crossrefEmail and unpaywallEmail can be sent here. Nothing was changed.",
   projectNotFound: "That project was not found.",
   notProject: "That is not a project's id.",
   uiOnly: "Search sources are set from the desktop app.",

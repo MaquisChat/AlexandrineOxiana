@@ -79,6 +79,7 @@ export {
   SEARCH_SOURCES_FILE,
   SearchSettingsNewerError,
   readSearchSettings,
+  isSearchEmail,
   searchContactEmail,
   searchKeyWanted,
   testSearchSource,

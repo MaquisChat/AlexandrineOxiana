@@ -60,6 +60,13 @@ import {
   DEFAULT_SEARCH_SETTINGS,
   type FindRunner,
   type IndexDb,
+  // Task F12: "Search sources" — the settings file, the keys by host, the e-mail by host.
+  getSecret,
+  readSearchSettings,
+  searchContactEmail,
+  searchKeyWanted,
+  type SearchSettings,
+  type SearchSettingsRead,
 } from "@ao/library";
 import type { CaptureQueueProgressEvent, CaptureStartedBy, DeviceNotice, FindProgressEvent } from "@ao/shared";
 import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
@@ -614,7 +621,8 @@ export class ServiceState {
       repo,
       ring,
       index,
-      http: new HttpClient({ libraryRoot: lib.root }),
+      // F12 (R290 a, e): OpenAlex's key and Crossref's e-mail by the request's host, from "Search sources".
+      http: new HttpClient({ libraryRoot: lib.root, keyFor: (h) => this.searchKeyForHost(h), contactEmailFor: (h) => this.searchEmailForHost(h) }),
       bulk: undefined,
       watches: new Map(),
       batches: new Map(),
@@ -1139,6 +1147,75 @@ export class ServiceState {
   /** "Check everything I have", as remembered on this computer (`find-screen.json`): read at open, set by PUT /find/screen. */
   findCheckEverything = false;
 
+  // ---- "Search sources" (Task F12; R290) ---------------------------------------------------
+  //
+  // The settings file is read anew for each entry and each GET; the copy kept here (`searchSettingsNow`) is what the
+  // lookup client's per-host e-mail and key follow between reads. Keys are read from the password store when needed
+  // (OpenAlex's while OpenAlex is on in either group; Elicit's only when the runner asks for it, or for a Test) and
+  // then held in memory only; a PUT or DELETE of the secret replaces what is held at once (no restart). A key is never
+  // logged, put in an error, an event, an audit line or a settings file.
+
+  /** The "Search sources" settings as last read or saved. */
+  searchSettingsNow: SearchSettings = { record: DEFAULT_SEARCH_SETTINGS.record.map((x) => ({ ...x })), copies: (DEFAULT_SEARCH_SETTINGS.copies ?? []).map((x) => ({ ...x })) };
+  /** Keys read from the password store (null: none stored); a name absent has not been read yet. Memory only. */
+  private readonly searchKeys = new Map<"elicit-api-key" | "openalex-api-key", string | null>();
+  /** Bumped by every PUT or DELETE of a key: a read that started before it does not overwrite what it set. */
+  private readonly searchKeyGen = new Map<string, number>();
+  /** When the password store last failed to answer for a key (it is not asked again for a minute). */
+  private readonly searchStoreFailedAt = new Map<string, number>();
+
+  /** Reads the settings file anew (never throws: an unreadable file gives the defaults and says so). */
+  async readSearchSources(): Promise<SearchSettingsRead> {
+    const r = await readSearchSettings(this.deps.appConfigDir);
+    this.searchSettingsNow = r.settings;
+    return r;
+  }
+
+  /** After a save: what the client follows from now on; OpenAlex's key is read in the background when it is wanted. */
+  searchSourcesSaved(s: SearchSettings): void {
+    this.searchSettingsNow = s;
+    if (searchKeyWanted(s, "openalex")) void this.searchKey("openalex-api-key");
+  }
+
+  /** A key, read from the password store once and then held (undefined when none is stored or the store cannot be read). */
+  async searchKey(name: "elicit-api-key" | "openalex-api-key"): Promise<string | undefined> {
+    if (this.searchKeys.has(name)) return this.searchKeys.get(name) ?? undefined;
+    if ((this.searchStoreFailedAt.get(name) ?? -Infinity) > Date.now() - 60_000) return undefined;
+    const gen = this.searchKeyGen.get(name) ?? 0;
+    let v: string | null;
+    try {
+      v = await getSecret(name);
+    } catch {
+      // No password store (or a locked one): nothing held; asked again after a minute, or at once after a PUT.
+      this.searchStoreFailedAt.set(name, Date.now());
+      return undefined;
+    }
+    if ((this.searchKeyGen.get(name) ?? 0) === gen) this.searchKeys.set(name, v);
+    return v ?? undefined;
+  }
+
+  /** A key saved (`value`) or removed (null) through the secrets routes: used by the next request. */
+  searchKeyChanged(name: "elicit-api-key" | "openalex-api-key", value: string | null): void {
+    this.searchKeyGen.set(name, (this.searchKeyGen.get(name) ?? 0) + 1);
+    this.searchStoreFailedAt.delete(name);
+    this.searchKeys.set(name, value);
+  }
+
+  /** The lookup client's key for a host: OpenAlex's for api.openalex.org, while OpenAlex is on; nothing else. */
+  searchKeyForHost(host: string): string | undefined {
+    if (host !== "api.openalex.org" || !searchKeyWanted(this.searchSettingsNow, "openalex")) return undefined;
+    if (!this.searchKeys.has("openalex-api-key")) {
+      void this.searchKey("openalex-api-key");
+      return undefined;
+    }
+    return this.searchKeys.get("openalex-api-key") ?? undefined;
+  }
+
+  /** The lookup client's contact e-mail for a host: Crossref's, to api.crossref.org only. */
+  searchEmailForHost(host: string): string | undefined {
+    return searchContactEmail(this.searchSettingsNow, host);
+  }
+
   private findIndexErrorCount(s: Session): number {
     // A compaction's note is not an index error (the queue store leaves its notes there too).
     return s.repo.indexErrors.filter((e) => e.op !== "project.find.compact").length;
@@ -1171,6 +1248,8 @@ export class ServiceState {
     void readFindScreen(this.deps.appConfigDir).then((v) => {
       if (this.session === s) this.findCheckEverything = v.checkEverything;
     });
+    // F12: the e-mail and key by host follow "Search sources" from the open on (imports' lookups included).
+    void this.readSearchSources().then((r) => (searchKeyWanted(r.settings, "openalex") ? this.searchKey("openalex-api-key") : undefined));
     const handle = s.index;
     // Always the index's live connection: a rebuild swaps it.
     const index = new Proxy({} as IndexDb, {
@@ -1185,8 +1264,15 @@ export class ServiceState {
       repo: s.repo,
       index,
       http: s.http,
-      // Task F12's "Search sources" settings do not exist yet: until then, its defaults (every service on but Elicit).
-      settings: async () => DEFAULT_SEARCH_SETTINGS,
+      // Task F12: "Search sources", read anew when each entry's work starts (a save takes effect for the next entry).
+      // OpenAlex's key is read (once, then held) before the entry asks anything, while OpenAlex is on.
+      settings: async () => {
+        const { settings } = await this.readSearchSources();
+        if (searchKeyWanted(settings, "openalex")) await this.searchKey("openalex-api-key");
+        return settings;
+      },
+      // Asked by the runner only when Elicit is on and the project's rules allow it.
+      elicitKey: () => this.searchKey("elicit-api-key"),
       checkEverything: () => this.findCheckEverything,
       onChange: (e) => {
         if (this.session === s) this.events.publish("find.progress", { projectId: e.projectId, entryId: e.entryId, state: e.state } satisfies FindProgressEvent);
