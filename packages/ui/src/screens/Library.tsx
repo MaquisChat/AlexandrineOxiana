@@ -562,6 +562,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           <a href={PATHS.appearance} onClick={(e) => follow(e, PATHS.appearance)}>
             Appearance
           </a>
+          <a href={PATHS.zotero} onClick={(e) => follow(e, PATHS.zotero)}>Zotero</a>
           <a href={PATHS.extension} onClick={(e) => follow(e, PATHS.extension)}>
             Browser extension
           </a>

@@ -11,7 +11,7 @@
 import { effectivePolicy } from "@ao/core/governance/merge";
 import { parseGovernance } from "@ao/core/governance/schema";
 import { isId } from "@ao/core/ids";
-import { PICTURE_MAX_BYTES, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse, type ZoteroSyncUndoNote } from "@ao/shared";
 import type { ApiClient } from "./client";
 
 export type { ProjectReviewPage, ReviewCause, ReviewGroup, WithdrawalReviewedResponse, ZoteroDataFolder };
@@ -155,6 +155,8 @@ export interface UndoResult {
   /** Of revertedMerges, by what the import had done (Z5; absent from an older service). */
   reverted?: { merged: number; updated: number; unmarked: number; remarked: number; /** Z6: sources whose waiting Zotero values were taken off (absent when none). */ conflicts?: number };
   kept: Array<{ kind: string; id: string; sourceId?: string; reason: string }>;
+  /** Z8: the undo of a Zotero sync's batch paused its link (or could not), in the service's words. */
+  zoteroSync?: ZoteroSyncUndoNote;
 }
 
 /** A lookup candidate (LookupResult, packages/library/src/lookup/context.ts). */

@@ -289,6 +289,7 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
               <p>
                 {undoneText(undone)}
               </p>
+              {undone.zoteroSync && <UserText as="p">{undone.zoteroSync.message}</UserText>}
               {undone.kept.length > 0 && (
                 <ul>
                   {undone.kept
