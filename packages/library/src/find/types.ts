@@ -5,6 +5,7 @@
  * `WorkCandidate` is Task F2's, in `./candidates.ts`.
  */
 import type { WorkCandidate } from "./candidates.js";
+import type { FreeCopySource } from "./free-copy.js";
 
 export type { WorkCandidate } from "./candidates.js";
 
@@ -120,9 +121,22 @@ export const FIND_TYPED_MAX = 500;
  * that is `on: false` is never asked. Settings can only narrow what a project's rules allow.
  */
 export type RecordSearchSource = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
-export type SearchSettings = { record: Array<{ id: RecordSearchSource; on: boolean }> };
+/**
+ * F11 adds `copies` (the free-copy services, asked in the plan's order; absent: none is asked) and `unpaywallEmail`
+ * (Unpaywall is asked only with one); F12 stores them, with `crossrefEmail`.
+ */
+export type SearchSettings = {
+  record: Array<{ id: RecordSearchSource; on: boolean }>;
+  copies?: Array<{ id: FreeCopySource; on: boolean }>;
+  unpaywallEmail?: string;
+  /** F12 (R290 e): sent to Crossref only, in the User-Agent of its requests (`contactEmailFor`). */
+  crossrefEmail?: string;
+};
 
-/** The settings until the researcher changes them (F12 keeps them in `search-sources.json`): every source on but Elicit. */
+/**
+ * The settings until the researcher changes them (F12 keeps them in `search-sources.json`): every source on but
+ * Elicit; every free-copy service on but Unpaywall (which needs an e-mail).
+ */
 export const DEFAULT_SEARCH_SETTINGS: Readonly<SearchSettings> = Object.freeze({
   record: Object.freeze([
     Object.freeze({ id: "crossref" as const, on: true }),
@@ -131,6 +145,9 @@ export const DEFAULT_SEARCH_SETTINGS: Readonly<SearchSettings> = Object.freeze({
     Object.freeze({ id: "loc" as const, on: true }),
     Object.freeze({ id: "elicit" as const, on: false }),
   ]) as SearchSettings["record"],
+  copies: Object.freeze(
+    (["openalex", "unpaywall", "arxiv", "europepmc", "semanticscholar", "doab", "internetarchive"] as const).map((id) => Object.freeze({ id, on: id !== "unpaywall" })),
+  ) as NonNullable<SearchSettings["copies"]>,
 });
 
 export const FIND_QUEUE_OPS = {

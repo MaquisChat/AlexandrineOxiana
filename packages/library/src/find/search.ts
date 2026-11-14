@@ -18,7 +18,15 @@
  * is not retried; OpenAlex searches through that same HttpClient pause until X-RateLimit-Reset
  * (never past the next 00:00 UTC), with the note "openalex-budget". The pause is kept
  * in `budgetPause`, a WeakMap keyed by the HttpClient, so it lasts as long as the client does and
- * no longer. An ordinary 429 is retried by the client as before and pauses nothing.
+ * no longer — and, within a client, per OpenAlex key in use (F12, A2, R290 h): told apart by the client's
+ * `keyTag` (a digest held in memory only, never the key), so that a key added or changed lifts a pause that belonged
+ * to "no key" (or to another key). An ordinary 429 is retried by the client as before and pauses nothing.
+ *
+ * F12 (R290 c): Elicit is one more source (`sources` may hold "elicit", asked with `opts.elicitKey` only): its
+ * candidates join the others through the same merge, and `decideMatch` is unchanged (a candidate only Elicit gave is
+ * never sure). Elicit's failure, refusal or pause never fails or delays the search beyond its own time limit: the
+ * others' answers stand, with the note "elicit-failed" (which the runner does not count against a complete answer
+ * while another source answered).
  */
 import { createHash } from "node:crypto";
 import { normalizeTitle, titleSimilarity, type Creator } from "@ao/core";
@@ -27,13 +35,14 @@ import { mapCrossref } from "../lookup/crossref.js";
 import { LookupHttpError, retryAfterMs, type GetOptions, type HttpClient, type RateLimitAnswer } from "../lookup/http.js";
 import { mapOpenAlex } from "../lookup/openalex.js";
 import type { WorkCandidate } from "./candidates.js";
+import { elicitAsk } from "./elicit.js";
 import { FIND_DOI_MAX } from "./types.js";
 import { cleanText, parseReference, segmentTokens, segmentsOf, tokensOf, type Reference, type Segment } from "./reference.js";
 
 export type { WorkCandidate } from "./candidates.js";
 
-export type SearchNote = "openalex-budget" | "crossref-failed" | "openalex-failed";
-export type SearchSource = "crossref" | "openalex";
+export type SearchNote = "openalex-budget" | "crossref-failed" | "openalex-failed" | "elicit-failed";
+export type SearchSource = "crossref" | "openalex" | "elicit";
 export type MatchDecision = { kind: "sure"; id: string } | { kind: "choose"; ids: string[] } | { kind: "none" };
 export type CandidateScore = { score: number; titleCover: number; creator: boolean; year: boolean };
 
@@ -69,12 +78,30 @@ export const openAlexSearchUrl = (text: string) => `https://api.openalex.org/wor
 // ---------------------------------------------------------------------------------------------
 // OpenAlex's daily allowance
 
-/** Per lookup client: until when (ms since the epoch) OpenAlex searches are paused. */
-const budgetPause = new WeakMap<HttpClient, number>();
+const OPENALEX_HOST = "api.openalex.org";
 
-/** Until when OpenAlex searches through this client are paused (ms since the epoch), or undefined. */
+/**
+ * Per lookup client, per OpenAlex key in use (its digest, "" for no key; never the key): until when (ms since the
+ * epoch) OpenAlex searches are paused.
+ */
+const budgetPause = new WeakMap<HttpClient, Map<string, number>>();
+
+/** The pause of the key in use now, if any. */
+function pauseOf(http: HttpClient): number | undefined {
+  return budgetPause.get(http)?.get(http.keyTag(OPENALEX_HOST));
+}
+function setPause(http: HttpClient, until: number): void {
+  const m = budgetPause.get(http) ?? new Map<string, number>();
+  m.set(http.keyTag(OPENALEX_HOST), until);
+  budgetPause.set(http, m);
+}
+function liftPause(http: HttpClient): void {
+  budgetPause.get(http)?.delete(http.keyTag(OPENALEX_HOST));
+}
+
+/** Until when OpenAlex searches through this client, with the key in use now, are paused (ms since the epoch), or undefined. */
 export function openAlexSearchPausedUntil(http: HttpClient): number | undefined {
-  return budgetPause.get(http);
+  return pauseOf(http);
 }
 
 const BUDGET_WORD = /\b(?:daily|budget|per[ -]day)\b/iu;
@@ -116,15 +143,15 @@ const nowOf = (ctx: LookupContext) => (ctx.clock?.() ?? new Date()).getTime();
  * a 429 that showed it spent there pauses every OpenAlex search through this client, exactly as a works search's does.
  */
 export function pauseOpenAlexSearches(ctx: LookupContext, reset: number | undefined): void {
-  budgetPause.set(ctx.http, budgetResetAt(reset, nowOf(ctx)));
+  setPause(ctx.http, budgetResetAt(reset, nowOf(ctx)));
 }
 
 /** Task F8: whether OpenAlex searches through this context's client are paused now (a pause that has ended is lifted). */
 export function openAlexSearchPaused(ctx: LookupContext): boolean {
-  const until = budgetPause.get(ctx.http);
+  const until = pauseOf(ctx.http);
   if (until === undefined) return false;
   if (nowOf(ctx) < until) return true;
-  budgetPause.delete(ctx.http);
+  liftPause(ctx.http);
   return false;
 }
 
@@ -142,6 +169,11 @@ function cut(s: string, max: number): string {
   const c = s.charCodeAt(end - 1);
   if (c >= 0xd800 && c <= 0xdbff) end--;
   return s.slice(0, end).trimEnd();
+}
+
+/** F12: a string from a service, cut and cleaned as every search answer's are; undefined when nothing is left. */
+export function boundedText(v: unknown, max = RAW_MAX): string | undefined {
+  return str(v, max);
 }
 
 /** A string from a service, cut and cleaned; undefined when it is not a string or nothing is left. */
@@ -227,6 +259,11 @@ function boundCreator(c: Creator): Creator | null {
   const name = (v: string | undefined) => (v ? cut(cleanText(v), FIND_NAME_MAX) || undefined : undefined);
   const out = defined({ family: name(c.family), given: name(c.given), literal: name(c.literal), role: c.role });
   return out.family || out.given || out.literal ? out : null;
+}
+
+/** F12: a mapped answer of any search service (Elicit's) as a candidate, bounded exactly as Crossref's and OpenAlex's are. */
+export function boundCandidate(r: LookupResult, provider: SearchSource): WorkCandidate | null {
+  return toCandidate(r, provider);
 }
 
 /** A mapped answer as a candidate (id given later), bounded; null without a title. */
@@ -317,13 +354,13 @@ async function askCrossref(ref: Reference, ctx: LookupContext): Promise<Asked> {
 
 async function askOpenAlex(ref: Reference, ctx: LookupContext): Promise<Asked> {
   if (!providerAllowed(ctx, "openalex")) return { found: [] };
-  const until = budgetPause.get(ctx.http);
+  const until = pauseOf(ctx.http);
   if (until !== undefined) {
     if (nowOf(ctx) < until) {
       ctx.debug?.("work search via openalex skipped: its free daily allowance is used up");
       return { found: [], note: "openalex-budget" };
     }
-    budgetPause.delete(ctx.http);
+    liftPause(ctx.http);
   }
   let results: unknown[] | null;
   try {
@@ -337,7 +374,7 @@ async function askOpenAlex(ref: Reference, ctx: LookupContext): Promise<Asked> {
     if (e instanceof BadAnswer) return badShape(ctx, "openalex");
     // Only a 429 that our own isOpenAlexBudgetSpent judged final pauses OpenAlex.
     if (e instanceof LookupHttpError && e.status === 429 && e.rateLimit?.final) {
-      budgetPause.set(ctx.http, budgetResetAt(e.rateLimit.reset, nowOf(ctx)));
+      setPause(ctx.http, budgetResetAt(e.rateLimit.reset, nowOf(ctx)));
       ctx.debug?.("work search via openalex paused: its free daily allowance is used up");
       return { found: [], note: "openalex-budget" };
     }
@@ -352,6 +389,17 @@ async function askOpenAlex(ref: Reference, ctx: LookupContext): Promise<Asked> {
     if (c) found.push(c);
   }
   return { found };
+}
+
+/**
+ * F12: Elicit, under its own time limit; any outcome but an answer is the note "elicit-failed" (no candidates), never
+ * an exception and never a wait beyond that limit. Its refusal by the rules is no note (as for the other sources).
+ */
+async function askElicit(ref: Reference, key: string, ctx: LookupContext, timeoutMs?: number): Promise<Asked> {
+  const out = await elicitAsk(ref.text, key, ctx, timeoutMs !== undefined ? { timeoutMs } : {});
+  if (out.kind === "answered") return { found: out.candidates };
+  if (out.kind === "not-allowed") return { found: [] };
+  return { found: [], note: "elicit-failed" };
 }
 
 /**
@@ -436,12 +484,15 @@ function withIds(list: WorkCandidate[]): WorkCandidate[] {
 export async function searchWorks(
   given: Reference,
   ctx: LookupContext,
-  opts: { sources: SearchSource[] },
+  opts: { sources: SearchSource[]; elicitKey?: string; elicitTimeoutMs?: number },
 ): Promise<{ candidates: WorkCandidate[]; notes: SearchNote[] }> {
   const ref = typeof given?.text === "string" ? parseReference(given.text) : null;
   if (!ref || !ref.tokens.length) return { candidates: [], notes: [] };
-  const sources = [...new Set(opts.sources)].filter((s): s is SearchSource => s === "crossref" || s === "openalex");
-  const asked = await Promise.all(sources.map((s) => (s === "crossref" ? askCrossref(ref, ctx) : askOpenAlex(ref, ctx))));
+  // F12: Elicit only with its key (else it is not asked at all, as if it were off).
+  const sources = [...new Set(opts.sources)].filter((s): s is SearchSource => s === "crossref" || s === "openalex" || (s === "elicit" && typeof opts.elicitKey === "string" && opts.elicitKey !== ""));
+  const asked = await Promise.all(
+    sources.map((s) => (s === "crossref" ? askCrossref(ref, ctx) : s === "openalex" ? askOpenAlex(ref, ctx) : askElicit(ref, opts.elicitKey!, ctx, opts.elicitTimeoutMs))),
+  );
   const merged: WorkCandidate[] = [];
   for (const c of asked.flatMap((a) => a.found)) {
     const i = merged.findIndex((m) => sameWork(m, c));

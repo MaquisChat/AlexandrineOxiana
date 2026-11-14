@@ -473,11 +473,11 @@ export class HttpClient {
           signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
         }),
       ]);
-      const { ua } = this.userAgentFor(u.hostname);
       const res = await request(u, {
         method: "POST",
         headers: {
-          "user-agent": ua,
+          // A POST carries no contact e-mail, whatever `contactEmailFor` says (Elicit receives the typed words only).
+          "user-agent": USER_AGENT,
           accept: "application/json",
           "content-type": "application/json",
           ...(key ? { authorization: `Bearer ${key}` } : {}),
