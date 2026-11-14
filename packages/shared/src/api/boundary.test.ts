@@ -1,7 +1,7 @@
 // Task 47: the constants both the service and the interface used to keep their own copy of, now
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
-import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin } from "../index.js";
+import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
   it("the service's error codes, each once", () => {
@@ -83,5 +83,16 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect(FIND_ROUTE_TEXT.readOnly).toBe("This library is open read-only, so nothing can be added.");
     expect(findLineRefusal(7)).toContain("Line 7");
     expect([FIND_ADD_LINES_MAX, FIND_LINE_MIN_CHARS, FIND_LINE_MAX_CHARS, FIND_BODY_MAX_BYTES, FIND_QUEUE_MAX, FIND_CANDIDATES_SENT]).toEqual([50, 2, 500, 65536, 500, 10]);
+  });
+
+  it("find and acquire, an author alone (F8, R267): the bounds, the sentences and the refusals, none repeating what was typed", () => {
+    expect([FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX]).toEqual([20, 200, 50]);
+    expect(FIND_MORE_PEOPLE_TEXT).toBe("More people have this name; add a word from a title to narrow it");
+    expect(FIND_MORE_WORKS_TEXT).toMatch(/^[A-Z].*\.$/);
+    for (const r of ["unknown-person", "unknown-work", "already-added", "person-id", "work-ids"] as const) expect(FIND_REFUSAL_REASONS).toContain(r);
+    for (const k of ["unknownPerson", "unknownWork", "noWorks", "tooManyWorks", "personId"] as const) expect(FIND_ROUTE_TEXT[k]).toMatch(/^[A-Z].*\.$/);
+    expect(FIND_ROUTE_TEXT.tooManyWorks).toBe("At most 50 works can be added at once. Nothing was added.");
+    expect(findAlreadyAddedRefusal(3)).toBe("Work 3 was already added from this entry. Nothing was added.");
+    expect(findWorkIdRefusal(2)).toBe("Work 2 is not a work's id that OpenAlex gives. Nothing was added.");
   });
 });

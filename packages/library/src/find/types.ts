@@ -44,8 +44,12 @@ export const FIND_STATES: readonly FindState[] = [
   "failed",
 ];
 
-/** Task F8: a person the author's name might mean. */
-export type PersonCandidate = { id: string; name: string; affiliation?: string; worksCount: number; sampleTitles: string[] };
+/**
+ * Task F8: a person the author's name might mean (OpenAlex's author `A<digits>`): name and affiliation at most 200
+ * characters each, and at most 3 subject names (each at most 100) from the same answer (R270 e: in place of the plan's
+ * sample titles, which would cost a request per person). For choosing only: shown through UserText, never audited.
+ */
+export type PersonCandidate = { id: string; name: string; affiliation?: string; worksCount: number; subjects: string[] };
 
 /** Tasks F10 and F15: a link under "Where to get it". */
 export type OfferLink = {
@@ -88,6 +92,16 @@ export interface FindEntry {
   nextTryAt?: string;
   parentId?: string;
   offers?: OfferLink[];
+  /** Task F8 (R267): OpenAlex reported more people of this name than the 20 kept ("More people have this name …"). */
+  morePeople?: true;
+  /** Task F8 (R267): the person has more works than those kept for choosing (at most 200, fewer if the line would not fit). */
+  moreWorks?: true;
+  /**
+   * Task F8 (R271 M5): on an entry made from an author's entry (`parentId`), the OpenAlex id (`W<digits>`) of the work
+   * it was made from; set once. What counts as "already added" from an author's entry is worked out from the live
+   * entries that carry it, never stored on the author's entry.
+   */
+  work?: string;
   /** Only ever on the line that takes an entry out of the queue (written by the "remove" operation). */
   removed?: true;
 }

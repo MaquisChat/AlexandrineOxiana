@@ -14,7 +14,7 @@ import { Writable } from "node:stream";
 import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FindRunnerClosedError, deviceDeps, rebuildIndexIfNeeded, type Deps } from "@ao/library";
-import { FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STOPPED_TEXT, type FindEntryView, type FindQueueResponse } from "@ao/shared";
+import { FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STOPPED_TEXT, findAlreadyAddedRefusal, findWorkIdRefusal, type FindEntryView, type FindQueueResponse } from "@ao/shared";
 import { serialStore } from "../../../packages/library/src/import/project-queue.js";
 import { runnerSeams } from "../../../packages/library/src/find/runner.js";
 import { existsSync } from "node:fs";
@@ -61,6 +61,10 @@ let previous: Dispatcher;
 let answers: Map<string, unknown>;
 /** Every error answer of this file. */
 const errorBodies: string[] = [];
+/** Task F8: OpenAlex's people per typed text, a person's works (newest first) per id, single works per id. */
+let peopleAnswers = new Map<string, unknown>();
+let personWorks = new Map<string, unknown[]>();
+let singles = new Map<string, unknown>();
 
 function textOf(path: string): string {
   const q = new URL(`https://x${path}`).searchParams;
@@ -121,9 +125,34 @@ function mockServices(): void {
     .intercept({ path: (p: string) => p.startsWith("/works?"), method: "GET" })
     .reply((o) => ({ statusCode: 200, data: JSON.stringify(answers.get(textOf(String(o.path))) ?? cr()), responseOptions: { headers: { "content-type": "application/json" } } }))
     .persist();
+  const json = (body: unknown) => ({ statusCode: 200, data: JSON.stringify(body), responseOptions: { headers: { "content-type": "application/json" } } });
+  // Task F8: OpenAlex's people, a person's works and single works (made-up answers; nobody and nothing by default).
   agent
     .get("https://api.openalex.org")
-    .intercept({ path: (p: string) => p.startsWith("/works?"), method: "GET" })
+    .intercept({ path: (p: string) => p.startsWith("/authors?"), method: "GET" })
+    .reply((o) => json(peopleAnswers.get(textOf(String(o.path))) ?? { meta: { count: 0 }, results: [] }))
+    .persist();
+  agent
+    .get("https://api.openalex.org")
+    .intercept({ path: (p: string) => p.startsWith("/works?") && p.includes("filter="), method: "GET" })
+    .reply((o) => {
+      const q = new URL(`https://x${String(o.path)}`).searchParams;
+      const all = personWorks.get(/author\.id:(A\d+)/u.exec(q.get("filter") ?? "")?.[1] ?? "") ?? [];
+      const n = Number(q.get("page"));
+      return json({ meta: { count: all.length }, results: all.slice((n - 1) * 100, n * 100) });
+    })
+    .persist();
+  agent
+    .get("https://api.openalex.org")
+    .intercept({ path: (p: string) => /^\/works\/W\d+$/u.test(p), method: "GET" })
+    .reply((o) => {
+      const w = singles.get(String(o.path).slice("/works/".length));
+      return w ? json(w) : { statusCode: 404, data: "{}" };
+    })
+    .persist();
+  agent
+    .get("https://api.openalex.org")
+    .intercept({ path: (p: string) => p.startsWith("/works?") && !p.includes("filter="), method: "GET" })
     .reply(() => ({ statusCode: 200, data: JSON.stringify(OA_EMPTY), responseOptions: { headers: { "content-type": "application/json" } } }))
     .persist();
   gated = new Gated(agent);
@@ -139,6 +168,9 @@ beforeEach(async () => {
     [AMBIGUOUS, cr(VEX_A, VEX_B)],
   ]);
   events = [];
+  peopleAnswers = new Map();
+  personWorks = new Map();
+  singles = new Map();
   mockServices();
 });
 afterEach(async () => {
@@ -959,3 +991,171 @@ describe("R247: the index, the cache, and work under way at a close or a move", 
 async function folderOfAt(_path: string, pid: string): Promise<string> {
   return svc!.state.session!.repo.getProject(pid).folder;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F8 (R267): an author alone — the person, then their works. Made-up people and works; "Vexmoor" is one of the
+// words looked for in every log line, error and event.
+
+describe("F8: an author alone", () => {
+  const NAME = "Ottoline Vexmoor";
+  const person = (n: number, name: string, aff: string) => ({ id: `https://openalex.org/A${n}`, display_name: name, works_count: 12, last_known_institutions: [{ display_name: aff }] });
+  const work = (n: number, title: string, date: string) => ({
+    id: `https://openalex.org/W${n}`,
+    title,
+    display_name: title,
+    publication_year: Number(date.slice(0, 4)),
+    publication_date: date,
+    type: "article",
+    doi: `https://doi.org/10.5555/ao.f8.r${n}`,
+    primary_location: { source: { display_name: "Vexmoor Review of Invented Studies" } },
+    authorships: [{ author: { display_name: NAME } }],
+  });
+  /** Two people of that name: A5001 with 60 works, A5002 with 3. */
+  function twoPeople(): void {
+    answers.set(NAME, cr());
+    peopleAnswers.set(NAME, { meta: { count: 2 }, results: [{ ...person(5001, NAME, "Vexmoor Institute of Made-up Things"), topics: [{ display_name: "Vexmoor Coastal Ledgers" }] }, person(5002, "Ottoline R. Vexmoor", "College of Vexmoor Studies")] });
+    personWorks.set("A5001", Array.from({ length: 60 }, (_, i) => work(1000 + i, `Vexmoor Ledger ${i}`, `${2024 - i}-01-01`)));
+    personWorks.set("A5002", Array.from({ length: 3 }, (_, i) => work(2000 + i, `Vexmoor Harbour ${i}`, `${2010 - i}-01-01`)));
+    for (const ws of personWorks.values()) for (const w of ws as Array<ReturnType<typeof work>>) singles.set(w.id.slice("https://openalex.org/".length), w);
+  }
+  const waitState = (pid: string, eid: string, s: string) => until(async () => ((e) => (e?.state === s ? e : undefined))(await entry(pid, eid)), `the entry to be ${s}`);
+
+  /** An entry in "choose-person" (two people). */
+  async function choosingPerson(): Promise<{ pid: string; eid: string }> {
+    twoPeople();
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const [e] = await add(pid, [NAME]);
+    await waitState(pid, e!.id, "choose-person");
+    return { pid, eid: e!.id };
+  }
+
+  it("the extension's token is refused on the three routes, the read included", async () => {
+    const { pid, eid } = await choosingPerson();
+    const token = await pairExtension();
+    const before = await entry(pid, eid);
+    for (const [method, url, body] of [
+      ["GET", `/projects/${pid}/find/${eid}/options`],
+      ["POST", `/projects/${pid}/find/${eid}/person`, { personId: "A5001" }],
+      ["POST", `/projects/${pid}/find/${eid}/works`, { workIds: ["W1000"] }],
+    ] as Array<[string, string, unknown?]>) {
+      const res = await svc!.app.inject({ method: method as "GET", url, headers: { authorization: `Bearer ${token}`, origin: EXT, ...(body !== undefined ? { "content-type": "application/json" } : {}) }, ...(body !== undefined ? { payload: JSON.stringify(body) } : {}) });
+      errorBodies.push(res.body);
+      expect(res.statusCode, `${method} ${url}`).toBe(403);
+    }
+    expect(await entry(pid, eid)).toEqual(before);
+  });
+
+  it("the queue's answer carries counts, not lists; options lists people or works, with added marked", async () => {
+    const { pid, eid } = await choosingPerson();
+    const q = await call({ url: `/projects/${pid}/find` });
+    const e = (q.json as FindQueueResponse).entries.find((x) => x.id === eid)!;
+    expect(e).toMatchObject({ state: "choose-person", peopleCount: 2 });
+    for (const k of ["people", "works", "added", "worksCount", "addedCount"]) expect(e).not.toHaveProperty(k);
+    expect(q.body).not.toContain("Made-up Things");
+    const o1 = await call({ url: `/projects/${pid}/find/${eid}/options` });
+    expect(o1.status).toBe(200);
+    expect(o1.headers["cache-control"]).toBe("no-store");
+    expect(o1.json).toEqual({ people: [
+      { id: "A5001", name: NAME, affiliation: "Vexmoor Institute of Made-up Things", worksCount: 12, subjects: ["Vexmoor Coastal Ledgers"] },
+      { id: "A5002", name: "Ottoline R. Vexmoor", affiliation: "College of Vexmoor Studies", worksCount: 12, subjects: [] },
+    ] });
+    const pressed = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A5001" } });
+    expect(pressed.status, pressed.body).toBe(200);
+    expect(pressed.json).toMatchObject({ state: "looking-up", chosen: "A5001", peopleCount: 1 });
+    const cw = await waitState(pid, eid, "choose-works");
+    expect(cw).toMatchObject({ worksCount: 60, peopleCount: 1 });
+    expect(cw).not.toHaveProperty("works");
+    expect(cw.addedCount).toBeUndefined();
+    const t = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1000", "W1002"] } });
+    expect(t.status, t.body).toBe(200);
+    expect(t.json.added).toHaveLength(2);
+    expect(t.json.added[0]).toMatchObject({ parentId: eid, work: "W1000", typed: "Vexmoor Ledger 0, Vexmoor" });
+    expect(t.json.entry).toMatchObject({ id: eid, state: "choose-works", worksCount: 60, addedCount: 2 });
+    expect(t.json.entry).not.toHaveProperty("added");
+    const o2 = await call({ url: `/projects/${pid}/find/${eid}/options` });
+    expect(o2.json.people).toBeUndefined();
+    // R271 M6: the person whose works these are is named.
+    expect(o2.json.person).toEqual({ name: NAME, affiliation: "Vexmoor Institute of Made-up Things", subjects: ["Vexmoor Coastal Ledgers"] });
+    expect(o2.json.works).toHaveLength(60);
+    expect(o2.json.works.filter((w: { added?: true }) => w.added).map((w: { id: string }) => w.id)).toEqual(["W1000", "W1002"]);
+    expect(o2.json.works[0]).toMatchObject({ id: "W1000", title: "Vexmoor Ledger 0", issued: "2024-01-01", type: "article-journal", container: "Vexmoor Review of Invented Studies", identifiers: { doi: "10.5555/ao.f8.r1000" } });
+    // Each work ticked goes on to a record of its own.
+    for (const k of t.json.added as FindEntryView[]) expect((await settled(pid, k.id)).state).toBe("record-complete");
+    // Nothing typed, no name, title or OpenAlex id in a log line (the events are checked after every test).
+    for (const w of ["A5001", "W1000", "Ledger", "Made-up"]) expect(logs.includes(w), w).toBe(false);
+    for (const ev of events) if (ev.type === "find.progress") expect(Object.keys(ev.data as object).sort()).toEqual(["entryId", "projectId", "state"]);
+  });
+
+  it("R271 M5: what was added follows the queue's live entries: remove an added entry, and the count, the mark and the tick follow", async () => {
+    const { pid, eid } = await choosingPerson();
+    await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A5001" } });
+    await waitState(pid, eid, "choose-works");
+    const t = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1003", "W1004"] } });
+    expect(t.json.entry.addedCount).toBe(2);
+    const kid = (t.json.added as FindEntryView[])[0]!;
+    expect((await call({ method: "DELETE", url: `/projects/${pid}/find/${kid.id}` })).status).toBe(200);
+    expect((await entry(pid, eid))!.addedCount).toBe(1);
+    const o = await call({ url: `/projects/${pid}/find/${eid}/options` });
+    expect(o.json.works.filter((w: { added?: true }) => w.added).map((w: { id: string }) => w.id)).toEqual(["W1004"]);
+    const again = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1003"] } });
+    expect(again.status, again.body).toBe(200);
+    expect(again.json.entry.addedCount).toBe(2);
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1003"] } })).json.error.reason).toBe("already-added");
+  });
+
+  it("a person id not among the entry's people is refused; so is a works id not among its works; choosePerson twice: the second is refused in words", async () => {
+    const { pid, eid } = await choosingPerson();
+    const bad = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A9999" } });
+    expect(bad.status).toBe(400);
+    expect(bad.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.unknownPerson, reason: "unknown-person" });
+    for (const personId of ["https://openalex.org/A5001", "A", 5001, null, "A5001 "]) {
+      const r = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId } });
+      expect(r.status, String(personId)).toBe(400);
+      expect(r.json.error.reason, String(personId)).toBe("person-id");
+    }
+    // Works on an entry that is not choosing works: 409 in words.
+    const early = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1000"] } });
+    expect(early.status).toBe(409);
+    expect(early.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.entryState, reason: "entry-state" });
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A5002" } })).status).toBe(200);
+    const again = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A5002" } });
+    expect(again.status).toBe(409);
+    expect(again.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.entryState, reason: "entry-state" });
+    await waitState(pid, eid, "choose-works");
+    const notHis = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W2000", "W1000"] } });
+    expect(notHis.status).toBe(400);
+    expect(notHis.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.unknownWork, reason: "unknown-work" });
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W2000", "x"] } })).json.error).toMatchObject({ message: findWorkIdRefusal(2), reason: "work-ids" });
+    // An entry of another project, or none: 404.
+    const other = await newProject(false, "Other");
+    expect((await call({ method: "POST", url: `/projects/${other}/find/${eid}/works`, body: { workIds: ["W2000"] } })).status).toBe(404);
+    expect((await call({ url: `/projects/${other}/find/${eid}/options` })).status).toBe(404);
+  });
+
+  it("51 ids are refused; an id already added is refused by its position; the queue full is refused whole", async () => {
+    const { pid, eid } = await choosingPerson();
+    await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A5001" } });
+    await waitState(pid, eid, "choose-works");
+    const ids = Array.from({ length: 51 }, (_, i) => `W${1000 + i}`);
+    const many = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ids } });
+    expect(many.status).toBe(400);
+    expect(many.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.tooManyWorks, reason: "work-ids" });
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: [] } })).json.error).toMatchObject({ message: FIND_ROUTE_TEXT.noWorks, reason: "work-ids" });
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: "W1000" } })).json.error.reason).toBe("work-ids");
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1003"] } })).status).toBe(200);
+    const twice = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1004", "W1003"] } });
+    expect(twice.status).toBe(409);
+    expect(twice.json.error).toMatchObject({ message: findAlreadyAddedRefusal(2), reason: "already-added" });
+    // The queue full (500 entries not removed): refused whole with the plan's sentence.
+    const lines = Array.from({ length: 50 }, (_, i) => `Filler line number ${String.fromCharCode(97 + (i % 26))}${String.fromCharCode(97 + Math.floor(i / 26))} entry`);
+    for (let k = 0; k < 9; k++) await add(pid, lines.map((l) => `${l} ${String.fromCharCode(97 + k)}`));
+    await add(pid, lines.slice(0, 48).map((l) => `${l} z`));
+    expect((await queue(pid)).entries.length).toBe(500);
+    const full = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1005"] } });
+    expect(full.status).toBe(409);
+    expect(full.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.queueFull, reason: "queue-full" });
+    expect((await queue(pid)).entries.length).toBe(500);
+  });
+});

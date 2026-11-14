@@ -29,8 +29,10 @@ import {
   FIND_STOP_SETTLE_MS,
   FIND_TOOL,
   FIND_INDEX_WAIT_MS,
+  FindAlreadyAddedError,
   FindEntryStateError,
   FindIndexNotReadyError,
+  FindUnknownOptionError,
   FindProjectStoppedError,
   FindRunnerClosedError,
   createFindRunner,
@@ -119,7 +121,9 @@ class Gated extends Dispatcher {
   override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
     const service = String(opts.origin).includes("crossref") ? "crossref" : "openalex";
     const text = textOf(String(opts.path)) ?? "";
-    this.sent.push({ service, text });
+    // `sent` is the works searches (F4's tests count them); F8's requests (people, a person's works, one work) are kept apart.
+    if (isWorksSearch(String(opts.path))) this.sent.push({ service, text });
+    else sentF8.push(String(opts.path));
     const gate = this.holds.get(`${service}|${text}`);
     if (!gate) return this.inner.dispatch(opts, handler);
     void gate.then(() => this.inner.dispatch(opts, handler));
@@ -137,6 +141,22 @@ function textOf(path: string): string | undefined {
   const q = new URL(`https://x${path}`).searchParams;
   return q.get("query.bibliographic") ?? q.get("search") ?? undefined;
 }
+const isWorksSearch = (path: string) => path.startsWith("/works?") && !path.includes("filter=");
+
+// Task F8: OpenAlex's people, a person's works and single works (made-up answers), and every such request.
+/** What the people search answers per typed text (default: nobody); "fail" or "budget" as for the works search. */
+let peopleAnswers: Map<string, unknown>;
+/** A person's works (all of them, newest first; the mock pages them by 100), per person id. */
+let personWorks: Map<string, unknown[]>;
+/** A page that fails or meets the spent allowance: `${personId}:${page}`. */
+let worksTrouble: Map<string, "fail" | "budget">;
+/** Single works by id (default: 404); "fail" for a 503. */
+let singleWorks: Map<string, unknown>;
+let askedPeople: string[];
+let askedWorks: Array<{ id: string; page: number }>;
+let askedSingle: string[];
+/** Every F8 request path as sent (before any hold). */
+let sentF8: string[] = [];
 
 const mkDeps = (): Deps => ({
   clock: () => new Date(NOW),
@@ -157,10 +177,46 @@ const coreOf = (r: Repo = repo) => (r as unknown as { core: RepoCore }).core;
 function mockServices(): void {
   agent = new MockAgent();
   agent.disableNetConnect();
+  const json = (body: unknown) => ({ statusCode: 200, data: JSON.stringify(body), responseOptions: { headers: { "content-type": "application/json" } } });
+  const BUDGET = { statusCode: 429, data: JSON.stringify({ error: "Rate limit exceeded", message: "You have exceeded your daily budget." }) };
+  const oa = agent.get("https://api.openalex.org");
+  oa.intercept({ path: (p: string) => p.startsWith("/authors?"), method: "GET" })
+    .reply((o) => {
+      const text = textOf(String(o.path)) ?? "";
+      askedPeople.push(text);
+      const a = peopleAnswers.get(text);
+      if (a === "fail") return { statusCode: 503, data: "unavailable" };
+      if (a === "budget") return BUDGET;
+      return json(a ?? { meta: { count: 0, page: 1, per_page: 20 }, results: [] });
+    })
+    .persist();
+  oa.intercept({ path: (p: string) => p.startsWith("/works?") && p.includes("filter="), method: "GET" })
+    .reply((o) => {
+      const q = new URL(`https://x${String(o.path)}`).searchParams;
+      const id = /authorships\.author\.id:(A\d+)/u.exec(q.get("filter") ?? "")?.[1] ?? "";
+      const n = Number(q.get("page"));
+      askedWorks.push({ id, page: n });
+      const trouble = worksTrouble.get(`${id}:${n}`);
+      if (trouble === "fail") return { statusCode: 503, data: "unavailable" };
+      if (trouble === "budget") return BUDGET;
+      const all = personWorks.get(id) ?? [];
+      return json({ meta: { count: all.length, page: n, per_page: 100 }, results: all.slice((n - 1) * 100, n * 100) });
+    })
+    .persist();
+  oa.intercept({ path: (p: string) => /^\/works\/W\d+$/u.test(p), method: "GET" })
+    .reply((o) => {
+      const id = String(o.path).slice("/works/".length);
+      askedSingle.push(id);
+      const w = singleWorks.get(id);
+      if (w === "fail") return { statusCode: 503, data: "unavailable" };
+      if (w === "budget") return BUDGET;
+      return w ? json(w) : { statusCode: 404, data: JSON.stringify({ error: "not found" }) };
+    })
+    .persist();
   for (const service of ["crossref", "openalex"] as const) {
     agent
       .get(service === "crossref" ? "https://api.crossref.org" : "https://api.openalex.org")
-      .intercept({ path: (p: string) => p.startsWith("/works?"), method: "GET" })
+      .intercept({ path: (p: string) => isWorksSearch(p), method: "GET" })
       .reply((o) => {
         const text = textOf(String(o.path)) ?? "";
         asked.push({ service, text });
@@ -200,6 +256,14 @@ beforeEach(async () => {
   changes = [];
   asked = [];
   answers = new Map();
+  peopleAnswers = new Map();
+  personWorks = new Map();
+  worksTrouble = new Map();
+  singleWorks = new Map();
+  askedPeople = [];
+  askedWorks = [];
+  askedSingle = [];
+  sentF8 = [];
   settings = DEFAULT_SEARCH_SETTINGS;
   settingsFn = async () => settings;
   everythingFn = () => everything;
@@ -1873,5 +1937,597 @@ describe("R247: a creation under way finishes before the lock goes; a half-made 
     expect((await entryOf(p, added[0]!.id))!.state).toBe("looking-up");
     releaseImport();
     await imported;
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F8 (R267): an author alone — the person, then their works. Made-up people and works.
+
+describe("F8: an author alone — the person, then their works", () => {
+  const NAME = "Ottoline Brackwater";
+  const AFFIL = "University of Invented Studies";
+  const oaPerson = (n: number, name: string, aff?: string) => ({ id: `https://openalex.org/A${n}`, display_name: name, works_count: 30, ...(aff ? { last_known_institutions: [{ display_name: aff }] } : {}) });
+  const peopleOf = (list: unknown[], count = list.length) => ({ meta: { count, page: 1, per_page: 20 }, results: list });
+  const oaWork = (n: number, title: string, date: string, doi?: string) => ({
+    id: `https://openalex.org/W${n}`,
+    title,
+    display_name: title,
+    publication_year: Number(date.slice(0, 4)),
+    publication_date: date,
+    type: "article",
+    ...(doi ? { doi: `https://doi.org/${doi}` } : {}),
+    primary_location: { source: { display_name: "Journal of Invented Studies" } },
+    authorships: [{ author: { display_name: NAME } }],
+  });
+  /** A person's works, newest first: W1000 is the newest. */
+  const worksFor = (n: number, title = (i: number) => `Tidal Ledger Number ${i}`) =>
+    Array.from({ length: n }, (_, i) => oaWork(1000 + i, title(i), `${2025 - Math.floor(i / 12)}-${String(12 - (i % 12)).padStart(2, "0")}-01`, `10.5555/ao.f8.w${1000 + i}`));
+  /** One person fits the name (the other does not cover "brackwater"), with `n` works. */
+  function onePerson(n = 150): void {
+    know(NAME, cr({ title: "Lanterns of the Estuary", family: "Brackwater", year: 2001, doi: "10.5555/ao.f8.lantern" }), OA_EMPTY);
+    peopleAnswers.set(NAME, peopleOf([oaPerson(5001, NAME, AFFIL), oaPerson(5002, "Ottoline Brackwell")]));
+    personWorks.set("A5001", worksFor(n));
+  }
+  /** Two people fit the name. */
+  function twoPeople(): void {
+    know(NAME, cr(), OA_EMPTY);
+    peopleAnswers.set(NAME, peopleOf([oaPerson(5001, NAME, AFFIL), oaPerson(5003, "Ottoline M. Brackwater", "College of Made-up Things")]));
+    personWorks.set("A5001", worksFor(20));
+    personWorks.set("A5003", worksFor(5, (i) => `Harbour Accounts ${i}`));
+  }
+  /** The entry is in state `s`, and that change is committed (its event was sent: a read can show a line not yet committed, A2). */
+  /** The works counted as added from an author's entry: those of the live entries made from it (R271 M5). */
+  const addedFrom = async (p: Project, parentId: string) => [...(await queue(p)).values()].filter((e) => e.parentId === parentId).map((e) => e.work!);
+  const stateIs = (p: Project, id: string, s: FindState) =>
+    until(async () => changes.some((c) => c.entryId === id && c.state === s) && (await entryOf(p, id))?.state === s, `the entry to be ${s}`);
+  /** The single-work answers for the works the mock knows: the list's title, and a second author only this answer carries (R273). */
+  function singlesFor(id: string): void {
+    for (const w of personWorks.get(id) ?? []) {
+      const o = w as ReturnType<typeof oaWork>;
+      singleWorks.set(o.id.slice("https://openalex.org/".length), { ...o, authorships: [...o.authorships, { author: { display_name: "Quentin Marsh" } }] });
+    }
+  }
+
+  it("a line with a clear title makes no people request (with or without a year)", async () => {
+    const p = await project();
+    const CLEAR = "Quillfeather, Zorblatt Grammar of Habitus";
+    know(CLEAR, cr(ZORBLATT), OA_EMPTY);
+    know(LINE, cr(ZORBLATT), OA_EMPTY);
+    const r = runner();
+    const { added } = await r.add(p.id, [CLEAR]);
+    await settled(p, added[0]!.id);
+    const { added: a2 } = await r.add(p.id, [LINE]);
+    await settled(p, a2[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("record-complete");
+    expect(askedPeople).toEqual([]);
+    expect(sentF8).toEqual([]);
+  });
+
+  it("an author's name makes ONE people request; two fit: choose-person, nothing added", async () => {
+    twoPeople();
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-person");
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(askedPeople).toEqual([NAME]);
+    expect(askedWorks).toEqual([]);
+    expect(e.people!.map((x) => x.id)).toEqual(["A5001", "A5003"]);
+    expect(e.people![0]).toEqual({ id: "A5001", name: NAME, affiliation: AFFIL, worksCount: 30, subjects: [] });
+    expect(e.morePeople).toBeUndefined();
+    expect(e.candidates).toBeUndefined();
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    expect((await queue(p)).size).toBe(1);
+  });
+
+  it("one person fits: straight to choose-works, newest first (one people request, two works pages)", async () => {
+    onePerson(150);
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-works");
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(askedPeople).toHaveLength(1);
+    expect(askedWorks).toEqual([
+      { id: "A5001", page: 1 },
+      { id: "A5001", page: 2 },
+    ]);
+    expect(askedSingle).toEqual([]);
+    expect(e.chosen).toBe("A5001");
+    expect(e.people!.map((x) => x.id)).toEqual(["A5001"]);
+    expect(e.works).toHaveLength(150);
+    expect(e.works![0]!.id).toBe("W1000");
+    const dates = e.works!.map((w) => w.issued!);
+    expect([...dates].sort().reverse()).toEqual(dates);
+    expect(e.moreWorks).toBeUndefined();
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("forty people: 20 listed, morePeople said, nothing added and no works asked", async () => {
+    know("Smith", cr(), OA_EMPTY);
+    peopleAnswers.set("Smith", peopleOf(Array.from({ length: 20 }, (_, i) => oaPerson(6000 + i, `${String.fromCharCode(65 + i)}. Smith`)), 40));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, ["Smith"]);
+    await stateIs(p, added[0]!.id, "choose-person");
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e.people).toHaveLength(20);
+    expect(e.morePeople).toBe(true);
+    expect(askedWorks).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    expect((await queue(p)).size).toBe(1);
+  });
+
+  it("200 works with 1,000-character titles make a line the store accepts (fewer kept, moreWorks said)", async () => {
+    know(NAME, cr(), OA_EMPTY);
+    peopleAnswers.set(NAME, peopleOf([oaPerson(5001, NAME, "長".repeat(1000))]));
+    personWorks.set("A5001", worksFor(230, (i) => `${i} ${"長".repeat(1000)}`));
+    const p = await project({ encrypted: true });
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-works");
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e.works!.length).toBeGreaterThan(0);
+    expect(e.works!.length).toBeLessThan(200);
+    expect(e.moreWorks).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify({ ...e, added: e.works!.map((w) => w.id) }), "utf8")).toBeLessThanOrEqual(65_536);
+  });
+
+  it("choosePerson: only one of the entry's own people; the works are fetched and the entry is choose-works; a second press is refused in words", async () => {
+    twoPeople();
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const id = added[0]!.id;
+    await stateIs(p, id, "choose-person");
+    const before = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"));
+    // A person id not among the entry's people (no request can make the app fetch an arbitrary author), or not an id.
+    await expect(r.choosePerson(p.id, id, "A9999")).rejects.toBeInstanceOf(FindUnknownOptionError);
+    await expect(r.choosePerson(p.id, id, "https://openalex.org/A5003")).rejects.toBeInstanceOf(InvalidInputError);
+    expect(await readFile(join(lib.root, p.folder, "find", "queue.jsonl"))).toEqual(before);
+    expect(askedWorks).toEqual([]);
+    const pressed = await r.choosePerson(p.id, id, "A5003");
+    expect(pressed).toMatchObject({ state: "looking-up", chosen: "A5003" });
+    await expect(r.choosePerson(p.id, id, "A5003")).rejects.toBeInstanceOf(FindEntryStateError);
+    await stateIs(p, id, "choose-works");
+    const e = (await entryOf(p, id))!;
+    expect(e.works!.map((w) => w.title)).toEqual(["Harbour Accounts 0", "Harbour Accounts 1", "Harbour Accounts 2", "Harbour Accounts 3", "Harbour Accounts 4"]);
+    expect(e.people!.map((x) => x.id)).toEqual(["A5003"]);
+    expect(askedPeople).toHaveLength(1);
+    expect(askedWorks).toEqual([{ id: "A5003", page: 1 }]);
+    // A press on an entry in another state is refused, and changes nothing.
+    await expect(r.choosePerson(p.id, id, "A5003")).rejects.toBeInstanceOf(FindEntryStateError);
+    expect(changes.filter((c) => c.entryId === id).map((c) => c.state)).toEqual(["looking-up", "choose-person", "looking-up", "choose-works"]);
+  });
+
+  it("ticking 3 works makes 3 entries, each checked for duplicates; each record comes from a fresh single-work request; the parent stays choose-works", async () => {
+    onePerson(20);
+    singlesFor("A5001");
+    const p = await project();
+    // One of the three is already in the project.
+    await importLikeAttach(p, { doi: "10.5555/ao.f8.w1001", title: "Tidal Ledger Number 1", family: "Brackwater", year: 2025 });
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const pid = added[0]!.id;
+    await stateIs(p, pid, "choose-works");
+    const auditBefore = await auditText(p);
+    const { added: kids, parent } = await r.chooseWorks(p.id, pid, ["W1000", "W1001", "W1002"]);
+    expect(kids).toHaveLength(3);
+    expect(parent).toMatchObject({ state: "choose-works" });
+    expect(await addedFrom(p, pid)).toEqual(["W1000", "W1001", "W1002"]);
+    for (const [i, k] of kids.entries()) {
+      expect(k).toMatchObject({ parentId: pid, state: "looking-up", work: `W${1000 + i}`, typed: `Tidal Ledger Number ${i}, Brackwater`, candidates: [{ id: `W${1000 + i}`, title: `Tidal Ledger Number ${i}` }] });
+    }
+    // ONE governed write for the three entries and the parent's line.
+    const newAudit = (await auditText(p)).slice(auditBefore.length).split("\n").filter((l) => l.includes("project.find."));
+    expect(newAudit).toHaveLength(1);
+    expect(newAudit[0]).toContain("project.find.add");
+    for (const k of kids) await settled(p, k.id);
+    const states = await Promise.all(kids.map(async (k) => (await entryOf(p, k.id))!.state));
+    expect(states).toEqual(["record-complete", "already", "record-complete"]);
+    expect(askedSingle.sort()).toEqual(["W1000", "W1001", "W1002"]);
+    // No text search was made for them.
+    expect(asked.filter((a) => a.text.includes("Tidal"))).toEqual([]);
+    const made = await sourcesOf(p);
+    expect(made).toHaveLength(3);
+    const rec = made.find((s) => s.source.identifiers.doi === "10.5555/ao.f8.w1000")!.source;
+    // The record comes from the fresh single-work answer (R267 c): it holds the second author only that answer carries.
+    expect(rec.title.variants[0]!.value).toBe("Tidal Ledger Number 0");
+    expect(rec.creators.map((c) => c.family)).toEqual(["Brackwater", "Marsh"]);
+    expect(rec.provenance).toMatchObject({ captureMethod: "reference_lookup", identification: { method: "find-chosen", confidence: 1 } });
+    expect((await entryOf(p, pid))!.state).toBe("choose-works");
+  });
+
+  for (const point of ["before-changes", "before-audit", "before-marker-delete"] as const) {
+    it(`ticking 3 works makes 3 entries with the parent's line in one write: a crash at ${point} leaves all or none`, async () => {
+      onePerson(10);
+      const p = await project();
+      const r = runner();
+      const { added } = await r.add(p.id, [NAME]);
+      const pid = added[0]!.id;
+      await stateIs(p, pid, "choose-works");
+      seams.crashAt = point;
+      await expect(r.chooseWorks(p.id, pid, ["W1000", "W1001", "W1002"])).rejects.toBeInstanceOf(SimulatedCrash);
+      for (const x of runners) await x.stopAll();
+      runners = [];
+      handle.close();
+      await lib.close();
+      lib = await openLibrary(lib.root, mkDeps());
+      handle = new IndexHandle(lib.root);
+      repo = await repoFor();
+      const q = await queue(p);
+      const kids = [...q.values()].filter((e) => e.parentId === pid);
+      if (point === "before-marker-delete") {
+        expect(kids).toHaveLength(3);
+        expect(kids.map((k) => k.work)).toEqual(["W1000", "W1001", "W1002"]);
+      } else {
+        expect(kids).toHaveLength(0);
+      }
+    });
+  }
+
+  it("the parent stays choose-works and a second tick adds more; an id already added is refused by its position; a duplicate in one call counts once", async () => {
+    onePerson(20);
+    singlesFor("A5001");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const pid = added[0]!.id;
+    await stateIs(p, pid, "choose-works");
+    await r.chooseWorks(p.id, pid, ["W1000", "W1001"]);
+    const err = await r.chooseWorks(p.id, pid, ["W1005", "W1001"]).catch((x: unknown) => x);
+    expect(err).toBeInstanceOf(FindAlreadyAddedError);
+    expect((err as Error).message).toBe("Work 2 was already added from this entry. Nothing was added.");
+    expect([...(await queue(p)).values()].filter((e) => e.parentId === pid)).toHaveLength(2);
+    const second = await r.chooseWorks(p.id, pid, ["W1005", "W1006", "W1005"]);
+    expect(second.added.map((k) => k.work)).toEqual(["W1005", "W1006"]);
+    expect(second.parent).toMatchObject({ state: "choose-works" });
+    expect(await addedFrom(p, pid)).toEqual(["W1000", "W1001", "W1005", "W1006"]);
+  });
+
+  it("51 ids are refused; so is none, an id that is not W-digits, and a works id not among the entry's works; and a press on another state", async () => {
+    onePerson(60);
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const pid = added[0]!.id;
+    await stateIs(p, pid, "choose-works");
+    const before = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"));
+    const ids = Array.from({ length: 51 }, (_, i) => `W${1000 + i}`);
+    await expect(r.chooseWorks(p.id, pid, ids)).rejects.toThrow("At most 50 works can be added at once. Nothing was added.");
+    await expect(r.chooseWorks(p.id, pid, [])).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(r.chooseWorks(p.id, pid, ["W1000", "A5001"])).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(r.chooseWorks(p.id, pid, ["W1000", "W99999"])).rejects.toBeInstanceOf(FindUnknownOptionError);
+    expect(await readFile(join(lib.root, p.folder, "find", "queue.jsonl"))).toEqual(before);
+    // Exactly 50 is fine.
+    const { added: kids } = await r.chooseWorks(p.id, pid, ids.slice(0, 50));
+    expect(kids).toHaveLength(50);
+    // An entry in another state (an added work's own entry) takes no tick.
+    await expect(r.chooseWorks(p.id, kids[0]!.id, ["W1000"])).rejects.toBeInstanceOf(FindEntryStateError);
+    await expect(r.choosePerson(p.id, pid, "A5001")).rejects.toBeInstanceOf(FindEntryStateError);
+  });
+
+  it("the queue full: a tick is refused whole with the plan's sentence, and nothing is written", async () => {
+    onePerson(10);
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const pid = added[0]!.id;
+    await stateIs(p, pid, "choose-works");
+    const at = new Date(NOW).toISOString();
+    const filler = Array.from({ length: FIND_QUEUE_MAX - 2 }, () => ({ id: newId(), projectId: p.id, typed: "filler line", state: "not-found" as const, createdAt: at, updatedAt: at, attempts: 0 }));
+    await appendFindEntries(coreOf(), p.id, filler, "add");
+    const before = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"));
+    const err = await r.chooseWorks(p.id, pid, ["W1000", "W1001"]).catch((x: unknown) => x);
+    expect(err).toBeInstanceOf(FindQueueFullError);
+    expect((err as Error).message).toBe("The queue holds 500 entries. Remove some finished ones first.");
+    expect(await readFile(join(lib.root, p.folder, "find", "queue.jsonl"))).toEqual(before);
+    expect((await r.chooseWorks(p.id, pid, ["W1000"])).added).toHaveLength(1);
+  });
+
+  it("the daily allowance used up in the middle (the second works page): the entry waits with budget, nothing half-stored, and resumes", async () => {
+    onePerson(150);
+    worksTrouble.set("A5001:2", "budget");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const id = added[0]!.id;
+    await until(async () => (await entryOf(p, id))?.reason?.code === "budget", "the entry to wait for the allowance");
+    const e = (await entryOf(p, id))!;
+    expect(e).toMatchObject({ state: "looking-up", chosen: "A5001", nextTryAt: "2026-11-14T00:00:00.000Z", attempts: 0 });
+    expect(e.works).toBeUndefined();
+    expect(e.people!.map((x) => x.id)).toEqual(["A5001"]);
+    // Paused: nothing more is asked of OpenAlex's searches meanwhile.
+    timers.advance(60 * 60_000);
+    await new Promise((res) => setTimeout(res, 50));
+    expect(askedWorks).toHaveLength(2);
+    // After midnight UTC the allowance is back: the works are asked again (not the people; page 1 is in the lookup
+    // cache), and the entry is choose-works.
+    worksTrouble.clear();
+    timers.advance(Date.parse("2026-11-14T00:00:00.000Z") - timers.now + 1);
+    await stateIs(p, id, "choose-works");
+    expect(askedPeople).toHaveLength(1);
+    expect(askedWorks.map((w) => w.page)).toEqual([1, 2, 2]);
+    expect((await entryOf(p, id))!.works).toHaveLength(150);
+  });
+
+  it("the people search meeting the spent allowance: the entry waits with budget (never a guess among the works found)", async () => {
+    know(NAME, cr({ title: "Lanterns of the Estuary", family: "Brackwater", year: 2001, doi: "10.5555/ao.f8.lantern" }), OA_EMPTY);
+    peopleAnswers.set(NAME, "budget");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await until(async () => (await entryOf(p, added[0]!.id))?.reason?.code === "budget", "the entry to wait");
+    expect((await entryOf(p, added[0]!.id))!).toMatchObject({ state: "looking-up", nextTryAt: "2026-11-14T00:00:00.000Z" });
+    expect((await entryOf(p, added[0]!.id))!.candidates).toBeUndefined();
+  });
+
+  it("a people search or a works page that fails goes the ordinary retry way", async () => {
+    onePerson(150);
+    worksTrouble.set("A5001:2", "fail");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const id = added[0]!.id;
+    await until(async () => (await entryOf(p, id))?.attempts === 1, "the first retry to be planned");
+    expect((await entryOf(p, id))!).toMatchObject({ state: "looking-up", chosen: "A5001", nextTryAt: new Date(NOW + FIND_RETRY_DELAYS_MS[0]!).toISOString() });
+    expect((await entryOf(p, id))!.works).toBeUndefined();
+    worksTrouble.clear();
+    await until(() => timers.pending.size > 0, "the retry's timer");
+    timers.advance(FIND_RETRY_DELAYS_MS[0]!);
+    await stateIs(p, id, "choose-works");
+    expect(askedPeople).toHaveLength(1);
+  });
+
+  it("a child whose single-work request fails is retried by its id; Try again asks the same work again, never a text search", async () => {
+    onePerson(5);
+    singleWorks.set("W1000", "fail");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-works");
+    const { added: kids } = await r.chooseWorks(p.id, added[0]!.id, ["W1000"]);
+    const kid = kids[0]!.id;
+    for (let i = 0; i < FIND_RETRY_DELAYS_MS.length; i++) {
+      await until(async () => (await entryOf(p, kid))!.attempts === i + 1, "the retry");
+      await until(() => timers.pending.size > 0, "the retry's timer");
+      timers.advance(FIND_RETRY_DELAYS_MS[i]!);
+    }
+    await settled(p, kid);
+    expect(askedSingle).toEqual(["W1000", "W1000", "W1000", "W1000"]);
+    expect((await entryOf(p, kid))!).toMatchObject({ state: "failed", reason: { code: "unreachable" }, work: "W1000" });
+    singlesFor("A5001");
+    const again = await r.retry(p.id, kid);
+    expect(again).toMatchObject({ state: "looking-up", work: "W1000", parentId: added[0]!.id });
+    await settled(p, kid);
+    expect((await entryOf(p, kid))!.state).toBe("record-complete");
+    expect(asked.filter((a) => a.text.includes("Tidal"))).toEqual([]);
+  });
+
+  it("no name, title, affiliation or OpenAlex id in any audit entry, note or event", async () => {
+    twoPeople();
+    singlesFor("A5003");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const id = added[0]!.id;
+    await stateIs(p, id, "choose-person");
+    await r.choosePerson(p.id, id, "A5003");
+    await stateIs(p, id, "choose-works");
+    const { added: kids } = await r.chooseWorks(p.id, id, ["W1000", "W1001"]);
+    for (const k of kids) await settled(p, k.id);
+    const audit = await auditText(p);
+    const said = [audit, notes.join("\n"), JSON.stringify(changes)].join("\n");
+    for (const w of ["Ottoline", "Brackwater", AFFIL, "Made-up Things", "Harbour Accounts", "A5003", "A5001", "W1000", "W1001", "Invented Studies"]) {
+      expect(said.includes(w), `"${w}" was audited, noted or sent`).toBe(false);
+    }
+    for (const c of changes) expect(Object.keys(c).sort()).toEqual(["entryId", "projectId", "state"]);
+    expect(audit).toContain("project.find.add");
+  });
+
+  it("OpenAlex refused by the rules or switched off: no people request, the works search decides as before", async () => {
+    know(NAME, cr(), OA_EMPTY);
+    peopleAnswers.set(NAME, peopleOf([oaPerson(5001, NAME)]));
+    const p = await project({ gov: GOV().replace("[crossref, openalex]", "[crossref]") });
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await settled(p, added[0]!.id);
+    expect((await entryOf(p, added[0]!.id))!.state).toBe("not-found");
+    settings = { record: [{ id: "crossref", on: true }, { id: "openalex", on: false }] };
+    const q = await project();
+    const { added: a2 } = await r.add(q.id, [NAME]);
+    await settled(q, a2[0]!.id);
+    expect(askedPeople).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------------------------------------------
+  // Round 2 (R270 d, e; R271)
+
+  it("I1: one person fits but OpenAlex reports more than twenty: choose-person with that one, morePeople, no works asked", async () => {
+    know(NAME, cr(), OA_EMPTY);
+    const others = Array.from({ length: 19 }, (_, i) => oaPerson(7000 + i, `${String.fromCharCode(65 + i)}. Quillon`));
+    peopleAnswers.set(NAME, peopleOf([oaPerson(5001, NAME, AFFIL), ...others], 40));
+    personWorks.set("A5001", worksFor(5));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-person");
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e.people!.map((x) => x.id)).toEqual(["A5001"]);
+    expect(e.morePeople).toBe(true);
+    expect(askedWorks).toEqual([]);
+  });
+
+  it("R270 d: J. Smith against John Smith and Jane Smith: choose-person", async () => {
+    know("J. Smith", cr(), OA_EMPTY);
+    peopleAnswers.set("J. Smith", peopleOf([oaPerson(5101, "John Smith"), oaPerson(5102, "Jane Smith"), oaPerson(5103, "Adam Smith")]));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, ["J. Smith"]);
+    await stateIs(p, added[0]!.id, "choose-person");
+    expect((await entryOf(p, added[0]!.id))!.people!.map((x) => x.id)).toEqual(["A5101", "A5102"]);
+  });
+
+  it("R270 d: P. Bourdieu with one Pierre Bourdieu: choose-person (not straight to works); Pierre Bourdieu: choose-works as before", async () => {
+    for (const line of ["P. Bourdieu", "Pierre Bourdieu"]) {
+      know(line, cr(), OA_EMPTY);
+      peopleAnswers.set(line, peopleOf([oaPerson(5201, "Pierre Bourdieu"), oaPerson(5202, "Marie-Claire Bourdieu")]));
+    }
+    personWorks.set("A5201", worksFor(3));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, ["P. Bourdieu"]);
+    await stateIs(p, added[0]!.id, "choose-person");
+    expect((await entryOf(p, added[0]!.id))!.people!.map((x) => x.id)).toEqual(["A5201"]);
+    expect(askedWorks).toEqual([]);
+    const { added: a2 } = await r.add(p.id, ["Pierre Bourdieu"]);
+    await stateIs(p, a2[0]!.id, "choose-works");
+    expect(askedWorks).toEqual([{ id: "A5201", page: 1 }]);
+  });
+
+  it("R270 e: each person carries up to three subject names from the same answer, never another request", async () => {
+    twoPeople();
+    peopleAnswers.set(NAME, peopleOf([{ ...oaPerson(5001, NAME, AFFIL), topics: [{ display_name: "Coastal Ledgers" }, { display_name: "Tidal Accounts" }] }, oaPerson(5003, "Ottoline M. Brackwater")]));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-person");
+    const e = (await entryOf(p, added[0]!.id))!;
+    expect(e.people!.map((x) => x.subjects)).toEqual([["Coastal Ledgers", "Tidal Accounts"], []]);
+    expect(askedPeople).toHaveLength(1);
+  });
+
+  it("M3: a single-work answer for another id ends that entry not found at once (no retries); the allowance spent there is the budget wait", async () => {
+    onePerson(5);
+    singlesFor("A5001");
+    const w1 = singleWorks.get("W1001") as Record<string, unknown>;
+    singleWorks.set("W1000", { ...w1 });
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-works");
+    const { added: kids } = await r.chooseWorks(p.id, added[0]!.id, ["W1000"]);
+    await settled(p, kids[0]!.id);
+    expect((await entryOf(p, kids[0]!.id))!).toMatchObject({ state: "not-found", attempts: 0 });
+    expect(askedSingle).toEqual(["W1000"]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    // A 429 that shows the allowance spent, on a single work.
+    singleWorks.set("W1002", "budget");
+    const { added: k2 } = await r.chooseWorks(p.id, added[0]!.id, ["W1002"]);
+    await until(async () => (await entryOf(p, k2[0]!.id))?.reason?.code === "budget", "the child to wait for the allowance");
+    expect((await entryOf(p, k2[0]!.id))!).toMatchObject({ state: "looking-up", attempts: 0, nextTryAt: "2026-11-14T00:00:00.000Z" });
+  });
+
+  for (const [what, change] of [
+    ["another DOI", { doi: "https://doi.org/10.5555/something.else" }],
+    ["another title", { title: "Something Else Entirely", display_name: "Something Else Entirely" }],
+  ] as const) {
+    it(`M4: the fresh record of a ticked work with the same id but ${what}: choose with that one fresh candidate, nothing created`, async () => {
+      onePerson(5);
+      singlesFor("A5001");
+      singleWorks.set("W1000", { ...(singleWorks.get("W1000") as object), ...change });
+      const p = await project();
+      const r = runner();
+      const { added } = await r.add(p.id, [NAME]);
+      await stateIs(p, added[0]!.id, "choose-works");
+      const { added: kids } = await r.chooseWorks(p.id, added[0]!.id, ["W1000"]);
+      await settled(p, kids[0]!.id);
+      const e = (await entryOf(p, kids[0]!.id))!;
+      expect(e.state).toBe("choose");
+      expect(e.candidates).toHaveLength(1);
+      expect(e.candidates![0]!.id).toBe("W1000");
+      if (what === "another DOI") expect(e.candidates![0]!.identifiers.doi).toBe("10.5555/something.else");
+      else expect(e.candidates![0]!.title).toBe("Something Else Entirely");
+      expect(repo.listSourceIds(p.id)).toEqual([]);
+      // The researcher may take it: the record is made from that fresh candidate.
+      const done = await r.choose(p.id, kids[0]!.id, "W1000");
+      expect(done.state).toBe("record-complete");
+    });
+  }
+
+  it("R273 I2: a ticked work with no DOI whose fresh title only begins with the kept one: choose, nothing created", async () => {
+    onePerson(5);
+    personWorks.set("A5001", [{ ...oaWork(1000, "The State", "2025-12-01"), doi: undefined }]);
+    singleWorks.set("W1000", { ...oaWork(1000, "The Statesman's Yearbook", "2025-12-01"), doi: undefined });
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-works");
+    const { added: kids } = await r.chooseWorks(p.id, added[0]!.id, ["W1000"]);
+    await settled(p, kids[0]!.id);
+    const e = (await entryOf(p, kids[0]!.id))!;
+    expect(e.state).toBe("choose");
+    expect(e.candidates![0]!.title).toBe("The Statesman's Yearbook");
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("M4: same id, same DOI and title: record complete as now", async () => {
+    onePerson(5);
+    singlesFor("A5001");
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-works");
+    const { added: kids } = await r.chooseWorks(p.id, added[0]!.id, ["W1000"]);
+    await settled(p, kids[0]!.id);
+    expect((await entryOf(p, kids[0]!.id))!.state).toBe("record-complete");
+    const made = await sourcesOf(p);
+    // The record comes from the fresh single-work answer: it holds the second author only that answer carries.
+    expect(made[0]!.source.creators.map((c) => c.family)).toEqual(["Brackwater", "Marsh"]);
+  });
+
+  for (const [what, fresh, state] of [
+    ["the same full title is the same work: record complete", (full: string) => full, "record-complete"],
+    ["a full title differing in an early word is not: choose, no source", (full: string) => full.replace("Long", "Wide"), "choose"],
+  ] as const) {
+    it(`R273 I2: a list title longer than the limit is kept cut; ${what}`, async () => {
+      const full = `Tidal Ledger Long${" commercialization of human feeling".repeat(20)}`;
+      onePerson(5);
+      personWorks.set("A5001", [oaWork(1000, full, "2025-12-01", "10.5555/ao.f8.w1000")]);
+      singleWorks.set("W1000", oaWork(1000, fresh(full), "2025-12-01", "10.5555/ao.f8.w1000"));
+      const p = await project();
+      const r = runner();
+      const { added } = await r.add(p.id, [NAME]);
+      await stateIs(p, added[0]!.id, "choose-works");
+      const { added: kids } = await r.chooseWorks(p.id, added[0]!.id, ["W1000"]);
+      await settled(p, kids[0]!.id);
+      expect((await entryOf(p, kids[0]!.id))!.state).toBe(state);
+      expect(repo.listSourceIds(p.id)).toHaveLength(state === "choose" ? 0 : 1);
+    });
+  }
+
+  it("M5: tick, remove the added entry, tick again: added again; two calls at once with the same id add it once", async () => {
+    onePerson(10);
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    const pid = added[0]!.id;
+    await stateIs(p, pid, "choose-works");
+    const { added: k1 } = await r.chooseWorks(p.id, pid, ["W1005"]);
+    await expect(r.chooseWorks(p.id, pid, ["W1005"])).rejects.toBeInstanceOf(FindAlreadyAddedError);
+    await r.remove(p.id, k1[0]!.id);
+    expect(await addedFrom(p, pid)).toEqual([]);
+    const { added: k2 } = await r.chooseWorks(p.id, pid, ["W1005"]);
+    expect(k2[0]!.work).toBe("W1005");
+    expect(await addedFrom(p, pid)).toEqual(["W1005"]);
+    const both = await Promise.allSettled([r.chooseWorks(p.id, pid, ["W1006"]), r.chooseWorks(p.id, pid, ["W1006"])]);
+    expect(both.filter((x) => x.status === "fulfilled")).toHaveLength(1);
+    expect((both.find((x) => x.status === "rejected") as PromiseRejectedResult).reason).toBeInstanceOf(FindAlreadyAddedError);
+    expect(await addedFrom(p, pid)).toEqual(["W1005", "W1006"]);
+  });
+
+  it("M6: morePeople is dropped once a person is chosen", async () => {
+    know("Smith", cr(), OA_EMPTY);
+    peopleAnswers.set("Smith", peopleOf(Array.from({ length: 20 }, (_, i) => oaPerson(6000 + i, `${String.fromCharCode(65 + i)}. Smith`)), 40));
+    personWorks.set("A6003", worksFor(4));
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, ["Smith"]);
+    await stateIs(p, added[0]!.id, "choose-person");
+    expect((await entryOf(p, added[0]!.id))!.morePeople).toBe(true);
+    const pressed = await r.choosePerson(p.id, added[0]!.id, "A6003");
+    expect(pressed.morePeople).toBeUndefined();
+    await stateIs(p, added[0]!.id, "choose-works");
+    expect((await entryOf(p, added[0]!.id))!.morePeople).toBeUndefined();
   });
 });

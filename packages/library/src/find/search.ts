@@ -111,6 +111,23 @@ function budgetResetAt(reset: number | undefined, now: number): number {
 
 const nowOf = (ctx: LookupContext) => (ctx.clock?.() ?? new Date()).getTime();
 
+/**
+ * Task F8: the people search and a person's works count against the same daily allowance (a search, a filtered list):
+ * a 429 that showed it spent there pauses every OpenAlex search through this client, exactly as a works search's does.
+ */
+export function pauseOpenAlexSearches(ctx: LookupContext, reset: number | undefined): void {
+  budgetPause.set(ctx.http, budgetResetAt(reset, nowOf(ctx)));
+}
+
+/** Task F8: whether OpenAlex searches through this context's client are paused now (a pause that has ended is lifted). */
+export function openAlexSearchPaused(ctx: LookupContext): boolean {
+  const until = budgetPause.get(ctx.http);
+  if (until === undefined) return false;
+  if (nowOf(ctx) < until) return true;
+  budgetPause.delete(ctx.http);
+  return false;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Bounding what a service returned
 
@@ -200,7 +217,7 @@ function openAlexItem(v: unknown): OpenAlexWorkIn | null {
 }
 
 /** A DOI in canonical form (lower case, no resolver prefix), or undefined when it is not a DOI. */
-function canonDoi(raw: string | undefined): string | undefined {
+export function canonDoi(raw: string | undefined): string | undefined {
   if (!raw || raw.length > DOI_MAX) return undefined;
   const d = raw.trim().replace(/^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)/iu, "").toLowerCase();
   return DOI_RE.test(d) ? d : undefined;
@@ -251,14 +268,14 @@ function badShape(ctx: LookupContext, provider: SearchSource): Asked {
 }
 
 /** An answer that is not JSON, or JSON of another shape: never cached, never an error to the caller. */
-class BadAnswer extends Error {}
+export class BadAnswer extends Error {}
 
 /**
  * The list of items in a service's answer, or null when it does not exist (404). The shape is
  * checked inside the client's `validate`, before anything is cached: an answer of the wrong shape
  * throws BadAnswer and is not kept (M6), so the next search asks again.
  */
-async function fetchItems(ctx: LookupContext, url: string, opts: GetOptions, pick: (json: unknown) => unknown[] | null): Promise<unknown[] | null> {
+export async function fetchItems(ctx: LookupContext, url: string, opts: GetOptions, pick: (json: unknown) => unknown[] | null): Promise<unknown[] | null> {
   const got: { items: unknown[] | null } = { items: null };
   const check = (body: string) => {
     let json: unknown;
@@ -335,6 +352,17 @@ async function askOpenAlex(ref: Reference, ctx: LookupContext): Promise<Asked> {
     if (c) found.push(c);
   }
   return { found };
+}
+
+/**
+ * Task F8: one OpenAlex work object (a single work asked by its id) as a candidate, checked and bounded exactly as an
+ * item of a works search is (title ≤ 1,000 characters, a name ≤ 200, at most 100 creators, a DOI only when it is one).
+ * Its `id` is left empty for the caller; null when it is not a work with a title.
+ */
+export function openAlexCandidate(item: unknown): WorkCandidate | null {
+  const w = openAlexItem(item);
+  const r = w ? mapOpenAlex(w) : null;
+  return r ? toCandidate(r, "openalex") : null;
 }
 
 // ---------------------------------------------------------------------------------------------
