@@ -160,6 +160,9 @@ async function filesUnder(dir: string): Promise<string[]> {
   return out;
 }
 
+/** R299 b: the refusal of a --ref that is not a library, exactly; it repeats nothing that was typed. */
+const NOT_A_LIBRARY = "That is not a Zotero library. Write --ref user:<number> or --ref group:<number>.";
+
 const link = (ref: string, extra: Partial<ZoteroSyncLink> = {}): ZoteroSyncLink => ({ ref, projectId, fullDone: false, options: { structure: "collections", duplicates: "merge" }, ...extra });
 const linked = (...links: ZoteroSyncLink[]) => writeZoteroSyncSettings(config, libraryId, { automatic: false, everyMinutes: 60, links });
 const history = () => readZoteroSyncHistory(config, libraryId);
@@ -231,6 +234,41 @@ describe("ao zotero check-key", () => {
       secrets = useMemorySecrets();
       await setSecret("zotero-api-key", z.key);
     }
+  });
+
+  it("R299 a: check-key obeys a back-off an earlier run recorded: it asks Zotero nothing, says the sentence with its time, exits 1; with the wait in the past it checks as before", async () => {
+    articles(2);
+    await linked(link(U));
+    z.backoffOnce(7200);
+    expect((await ao(["zotero", "sync"])).code).toBe(1);
+    expect((await history())[0]!.backoffUntil).toBeDefined();
+    const n = z.requests.length;
+    const r = await ao(["zotero", "check-key"]);
+    expect(r.code).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("Zotero asked this app to wait until");
+    const j = await ao(["--json", "zotero", "check-key"]);
+    expect(j.code).toBe(1);
+    expect(json(j).error).toContain("Zotero asked this app to wait until");
+    // Zero requests of any kind.
+    expect(z.requests.length).toBe(n);
+    // Another library of this computer recorded it: the same wait (a back-off is Zotero's answer to this computer's requests).
+    const other = join(tmp, "Other");
+    const made = await ao(["--json", "library", "create", other, "--name", "Other"]);
+    expect(made.code, made.stderr).toBe(0);
+    const fromOther = await ao(["zotero", "check-key"], { AO_LIBRARY: other });
+    expect(fromOther.code).toBe(1);
+    expect(fromOther.stderr).toContain("Zotero asked this app to wait until");
+    expect(z.requests.length).toBe(n);
+    // In the past: it checks.
+    const file = join(config, ZOTERO_SYNC_HISTORY_FILE);
+    const doc = JSON.parse(await readFile(file, "utf8"));
+    for (const x of doc.libraries[libraryId]) if (x.backoffUntil) x.backoffUntil = new Date(Date.now() - 60_000).toISOString();
+    await writeFile(file, JSON.stringify(doc));
+    const again = await ao(["zotero", "check-key"]);
+    expect(again.code, again.stderr).toBe(0);
+    expect(again.stdout.trim()).toBe("This key can read your library.");
+    expect(z.requests.length).toBeGreaterThan(n);
   });
 
   it("with no password store it says so and exits 1", async () => {
@@ -432,11 +470,30 @@ describe("ao zotero sync", () => {
     const n = z.requests.length;
     const bad = await ao(["zotero", "sync", "--ref", "library:7"]);
     expect(bad.code).toBe(1);
-    expect(bad.stderr).toContain("is not a Zotero library");
+    expect(bad.stderr).toContain(NOT_A_LIBRARY);
     const notLinked = await ao(["zotero", "sync", "--ref", "group:123"]);
     expect(notLinked.code).toBe(1);
     expect(notLinked.stderr).toContain(ZOTERO_SYNC_SENTENCES.notLinked);
     expect(z.requests.length).toBe(n);
+  });
+
+  it("R299 b: a refused --ref is never repeated, in text or in --json (a key typed there is in no output)", async () => {
+    await linked(link(U));
+    for (const args of [
+      ["zotero", "sync", "--ref", KEY],
+      ["zotero", "sync", `--ref=${KEY}`],
+      ["--json", "zotero", "sync", "--ref", KEY],
+      ["--json", "zotero", "sync", `--ref=${KEY}`],
+      ["zotero", "sync", "--ref", "library:7"],
+    ]) {
+      const r = await ao(args);
+      expect(r.code, args.join(" ")).toBe(1);
+      expect(`${r.stdout}${r.stderr}`).not.toContain(KEY);
+      expect(`${r.stdout}${r.stderr}`).not.toContain("library:7");
+      if (args[0] === "--json") expect(json(r).error).toBe(NOT_A_LIBRARY);
+      else expect(r.stderr.trim()).toBe(NOT_A_LIBRARY);
+    }
+    expect(z.requests).toEqual([]);
   });
 
   it("settings written by a newer version, or damaged, run nothing and say so", async () => {
@@ -502,5 +559,48 @@ describe("ao zotero sync", () => {
       secrets = useMemorySecrets();
       await setSecret("zotero-api-key", z.key);
     }
+  });
+});
+
+describe("R299 d: the program's own messages repeat nothing that was typed", () => {
+  /** Exit code, what kind of mistake it says, and that the usage text still follows; the key is in no output (afterEach). */
+  async function refused(args: string[], kind: RegExp) {
+    const r = await ao(args);
+    expect(r.code, args.join(" ")).toBe(1);
+    expect(`${r.stdout}${r.stderr}`).not.toContain(KEY);
+    expect(r.stderr).toMatch(kind);
+    return r;
+  }
+
+  it("a key as an unknown option of the program itself", async () => {
+    const r = await refused([`--key=${KEY}`, "zotero", "check-key"], /unknown option/u);
+    expect(r.stderr).toContain("Usage: ao");
+    await refused([`--${KEY}`, "tools", "versions"], /unknown option/u);
+    expect(z.requests).toEqual([]);
+  });
+
+  it("a key as an unknown option after another command", async () => {
+    const r = await refused(["tools", "versions", `--key=${KEY}`], /unknown option/u);
+    expect(r.stderr).toContain("Usage: ao tools versions");
+    await refused(["library", "open", libPath, `--key=${KEY}`], /unknown option/u);
+  });
+
+  it("a key as an excess argument, and as an unknown command", async () => {
+    const r = await refused(["tools", "versions", KEY], /too many arguments/u);
+    expect(r.stderr).toContain("Usage: ao tools versions");
+    await refused([KEY], /unknown command/u);
+    await refused(["library", KEY], /unknown command/u);
+  });
+
+  it("a missing argument still names the argument it wanted (the program's own word, not something typed)", async () => {
+    const r = await ao(["library", "create"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("missing required argument");
+  });
+
+  it("the zotero group keeps its own fixed message for a word it does not understand (a key between `zotero` and its command)", async () => {
+    const r = await refused(["zotero", `--key=${KEY}`, "check-key"], /That is not a zotero command ao understands/u);
+    expect(r.stderr).toContain("ao zotero check-key");
+    expect(z.requests).toEqual([]);
   });
 });

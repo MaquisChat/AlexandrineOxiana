@@ -10,7 +10,9 @@
  * screen counts them; a burst is one render, and a read asked for while one is out makes exactly one more after it).
  * Each read draws a number when it STARTS and an answer older than one already shown is dropped, as is an answer for a
  * project (or a closed library) left meanwhile. No polling, no timer. A state that cannot be read leaves the lines as
- * they were: this part of the screen never fails and never shows an error. The key is never involved: nothing here
+ * they were, except right after a finished sync (R299 e): then the lines are taken away, since a line from before the
+ * run could read as if the run that just ended had succeeded (nothing is better than an older success). This part of
+ * the screen never fails and never shows an error. The key is never involved: nothing here
  * checks it or starts a sync.
  */
 import { ZOTERO_SYNC_REASON_TEXT, type ZoteroSyncStateResponse } from "@ao/shared";
@@ -61,9 +63,10 @@ export function LibraryZotero({ api, projectId, open, events }: Props) {
   const eventCount = useRef(0);
   const latest = useRef({ api, projectId, open });
   latest.current = { api, projectId, open };
-  const startRead = useRef<() => void>(() => undefined);
+  /** `afterFinished`: this read follows a finished sync (R299 e: if it fails, the lines go). */
+  const startRead = useRef<(afterFinished?: boolean) => void>(() => undefined);
 
-  startRead.current = () => {
+  startRead.current = (afterFinished = false) => {
     const { api: a, projectId: pid, open: isOpen } = latest.current;
     if (!pid || !isOpen || !alive.current) return;
     const mine = gen.current;
@@ -75,20 +78,26 @@ export function LibraryZotero({ api, projectId, open, events }: Props) {
       out.current = false;
       if (pending.current) {
         pending.current = false;
-        startRead.current();
+        startRead.current(true); // asked for by a finished event
       }
+    };
+    /** A read that failed: right after a finished sync the lines are taken away; at any other time they stay as they were. */
+    const failed = () => {
+      if (!afterFinished || !alive.current || mine !== gen.current || seq < applied.current) return;
+      applied.current = seq;
+      setShown(undefined);
     };
     a.zotero
       .state()
       .then((s) => {
         if (!alive.current || mine !== gen.current || seq < applied.current) return;
-        if (!s || !Array.isArray(s.links)) return;
+        if (!s || !Array.isArray(s.links)) return failed();
         applied.current = seq;
         setShown({ projectId: pid, links: s.links.filter((l) => l.projectId === pid), ...(s.running ? { running: s.running } : {}) });
         // The run in progress comes from the events once one has arrived after this request started.
         if (eventCount.current === eventsThen) setRun(s.running ? { ref: s.running.ref, done: s.running.done, total: s.running.total } : undefined);
       })
-      .catch(() => undefined)
+      .catch(failed)
       .finally(done);
   };
 
@@ -120,7 +129,7 @@ export function LibraryZotero({ api, projectId, open, events }: Props) {
     if (events.finished !== seenFinished.current) {
       seenFinished.current = events.finished;
       if (out.current) pending.current = true;
-      else startRead.current();
+      else startRead.current(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events.n]);

@@ -288,16 +288,61 @@ describe("Library: the Zotero lines", () => {
     }
   });
 
-  it("an unreadable state after a finished event keeps the lines it had", async () => {
+  // R299 e (the review's M4): this test said "keeps the lines it had"; after a finished sync a line from before the run
+  // could read as if the run that just ended had succeeded, so a re-read that fails then takes the lines away.
+  it("R299 e: an unreadable state after a finished event takes the lines away (an older success is not left standing)", async () => {
+    for (const fail of [
+      () => serviceError(500, "INTERNAL", "boom"),
+      () => serviceError(503, "LIBRARY_OFFLINE", "The library is offline."),
+      () => HttpResponse.json({ nonsense: true }),
+      () => HttpResponse.text("not json", { status: 200 }),
+    ]) {
+      let n = 0;
+      const ok = run({ ref: "user:42" });
+      const svc = useService(() => (++n === 1 ? stateOf([{ ref: "user:42", projectId: "p1", lastRun: ok }]) : (fail() as never)));
+      const view = await open();
+      await waitFor(() => expect(lines()?.textContent).toContain("Last synced"));
+      svc.ev.send("zotero.sync", finished(run({ outcome: "failed", reason: "offline", counts: undefined as never })));
+      await waitFor(() => expect(n).toBe(2));
+      await waitFor(() => expect(lines()).toBeNull());
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(view.container.textContent).not.toMatch(/boom|offline\./u);
+      // The rest of the screen still works.
+      await screen.findByRole("table", { name: "Sources" });
+      view.unmount();
+      server.resetHandlers();
+    }
+  });
+
+  it("the generation guard alone: a slow answer started before the project was left, and come back to, is dropped", async () => {
+    const user = userEvent.setup();
     let n = 0;
-    const svc = useService(() => (++n === 1 ? stateOf([{ ref: "user:42", projectId: "p1", status: "kept line" }]) : serviceError(500, "INTERNAL", "boom")));
+    const gates = new Map<number, () => void>();
+    const svc = useService(async () => {
+      const mine = ++n;
+      if (mine === 2 || mine === 4) await new Promise<void>((r) => gates.set(mine, r));
+      // The read for the other project cannot be read: nothing newer is applied meanwhile, so the start order alone would not drop read 2.
+      if (mine === 3) return serviceError(500, "INTERNAL", "boom");
+      return stateOf([{ ref: "user:42", projectId: "p1", status: `read ${mine}` }, { ref: "group:5", projectId: "p2", status: `other ${mine}` }]);
+    });
     await open();
-    await waitFor(() => expect(lines()?.textContent).toContain("kept line"));
+    await waitFor(() => expect(lines()?.textContent).toContain("read 1"));
+    // Read 2 (an event, for the first project) is out and slow; the other project is shown (read 3, unreadable), then the first again (read 4, slow).
     svc.ev.send("zotero.sync", finished(run()));
     await waitFor(() => expect(n).toBe(2));
+    const nav = within(screen.getByRole("navigation", { name: "Projects" }));
+    await user.click(nav.getByRole("button", { name: /Clinic interviews/ }));
+    await waitFor(() => expect(n).toBe(3));
+    await delay(30);
+    await user.click(nav.getByRole("button", { name: /Dissertation/ }));
+    await waitFor(() => expect(n).toBe(4));
+    // Read 2 answers now: it started before the project was left, so it is not shown (it started after read 1, which the
+    // start order alone would let it replace).
+    await act(async () => gates.get(2)?.());
     await delay(60);
-    expect(screen.queryByRole("alert")).toBeNull();
-    expect(lines()?.textContent).toContain("kept line");
+    expect(lines()?.textContent ?? "").not.toContain("read 2");
+    await act(async () => gates.get(4)?.());
+    await waitFor(() => expect(lines()?.textContent).toContain("read 4"));
   });
 
   it("nothing is requested when no library is open", async () => {

@@ -20,8 +20,48 @@ import { openSessions } from "./session.js";
 
 export const packageName = "@ao/cli";
 
+/** Said in place of whatever was typed: it is never repeated (R299 d), since it may be a key typed by mistake (R78). */
+const NOT_SHOWN = "(what you typed is not shown, in case it was a key)";
+
+/**
+ * R299 d: the program's own messages for a mistake on the command line say what kind of mistake it was, never the
+ * offending word. Commander's messages repeat it (an unknown option or command, the excess arguments, a value it
+ * refused): those are replaced; the ones made only of the program's own words (a missing argument or option, two
+ * options that cannot go together) are kept as they are. The exit code (Commander's `code`) and the usage text that
+ * follows are not touched. A group may still write its own fixed message in place of this one (`zotero`, `secrets`).
+ */
+export function messageWithoutInput(message: string, code: string | undefined, command: Command): string {
+  switch (code) {
+    case "commander.unknownOption":
+      return `error: unknown option ${NOT_SHOWN}`;
+    case "commander.unknownCommand":
+      return `error: unknown command ${NOT_SHOWN}`;
+    case "commander.excessArguments":
+      return `error: too many arguments${command.parent ? ` for '${command.name()}'` : ""} ${NOT_SHOWN}`;
+    case "commander.invalidArgument":
+      return `error: a value given is not one this command accepts ${NOT_SHOWN}`;
+    case "commander.missingArgument":
+    case "commander.optionMissingArgument":
+    case "commander.missingMandatoryOptionValue":
+    case "commander.conflictingOption":
+      return message;
+    default:
+      return `error: that was not understood ${NOT_SHOWN}`;
+  }
+}
+
+/** The program and every command made under it: Commander's own error messages go through messageWithoutInput (R299 d). */
+class AoCommand extends Command {
+  override createCommand(name?: string): Command {
+    return new AoCommand(name);
+  }
+  override error(message: string, errorOptions?: { code?: string; exitCode?: number }): never {
+    return super.error(messageWithoutInput(message, errorOptions?.code, this), errorOptions);
+  }
+}
+
 export function buildProgram(): Command {
-  const program = new Command("ao")
+  const program = new AoCommand("ao")
     .description("Alexandrine Oxiana: capture links and profiles, and import or export references (and keep Zotero libraries in step), in a governed research library")
     .option("--library <path>", "the library folder (default: AO_LIBRARY, else the one you used last)")
     .option("--json", "print machine-readable JSON instead of text")

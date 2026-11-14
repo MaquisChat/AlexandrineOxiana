@@ -2,6 +2,8 @@ import type { Command } from "commander";
 import {
   HttpClient,
   ZOTERO_SYNC_NEWER_SENTENCE,
+  appConfigDir,
+  listLibraries,
   ZoteroAccountError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
@@ -38,6 +40,23 @@ const REF = /^(user|group):[1-9]\d{0,11}$/u;
 const NOT_UNDERSTOOD =
   "That is not a zotero command ao understands (what you typed is not shown, in case it was a key).\nUse: ao zotero check-key   or   ao zotero sync [--ref user:<id>|group:<id>]\n";
 const KEY_HINT = "Save it with: ao secrets set zotero-api-key";
+/** R299 b: a `--ref` that is not a Zotero library is refused without repeating what was typed (it may be a key, R78). */
+const NOT_A_LIBRARY = "That is not a Zotero library. Write --ref user:<number> or --ref group:<number>.";
+
+/**
+ * R299 a: the back-off recorded by any earlier run on this computer (the app's or the command line's), folded as the
+ * service folds it (`zoteroHistoryBackoff`, then the clock rule `zoteroSyncBackoff`). The service folds the history of
+ * the library it has open; this command opens none, so it folds the records of every library this computer knows: a
+ * back-off is Zotero's answer to this computer's requests (one key), so it is the same wait whichever library's run was
+ * told it, and none the service would obey is missed. A history that cannot be read counts as none, as in the service.
+ */
+async function recordedBackoff(): Promise<number | undefined> {
+  const dir = appConfigDir();
+  const known = await listLibraries({ appConfigDir: dir, clock: () => new Date() }).catch(() => []);
+  const runs: ZoteroSyncRun[] = [];
+  for (const lib of known) runs.push(...(await readZoteroSyncHistory(dir, lib.libraryId).catch(() => [])));
+  return zoteroSyncBackoff(zoteroHistoryBackoff(runs), Date.now());
+}
 
 /** Zotero's own refusal reasons are the sync's reasons by the same names, except that "no-key" is "key-missing". */
 const sentenceOfAccount = (reason: string, backoffUntil?: number): string => {
@@ -108,6 +127,10 @@ export function registerZotero(program: Command): void {
         throw new ExitError("A key is never accepted on the command line (it would stay in your shell history). Nothing was checked.", EXIT.failure, "Save it with `ao secrets set zotero-api-key` and run this again.");
       }
       const out = createOut((cmd.optsWithGlobals() as GlobalOpts).json === true);
+      // R299 a: inside a recorded back-off nothing is asked of Zotero (as the service's key check refuses): the sentence
+      // with its time, exit 1. (A back-off Zotero gives in answer to this check is not kept: the history holds runs.)
+      const inForce = await recordedBackoff();
+      if (inForce !== undefined) throw new ExitError(zoteroSyncReasonText("backing-off", new Date(), new Date(inForce).toISOString()), EXIT.failure);
       let access;
       try {
         access = await checkZoteroKey();
@@ -133,7 +156,7 @@ export function registerZotero(program: Command): void {
     .action(async (o: { ref?: string }, cmd: Command) => {
       if (cmd.args.length > 0) throw new ExitError(NOT_UNDERSTOOD.trim(), EXIT.failure);
       if (o.ref !== undefined && !REF.test(o.ref)) {
-        throw new ExitError(`"${o.ref}" is not a Zotero library.`, EXIT.failure, "Write --ref user:<id> (your user ID, in Zotero's Settings → Security) or --ref group:<id>.");
+        throw new ExitError(NOT_A_LIBRARY, EXIT.failure);
       }
       await withSession(cmd, true, async (s, out) => {
         // The settings are read through the library's own module: a file from a newer version is left as it is, a
