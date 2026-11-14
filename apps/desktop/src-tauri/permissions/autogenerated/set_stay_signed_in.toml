@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-stay-signed-in"
+description = "Enables the set_stay_signed_in command without any pre-configured scope."
+commands.allow = ["set_stay_signed_in"]
+
+[[permission]]
+identifier = "deny-set-stay-signed-in"
+description = "Denies the set_stay_signed_in command without any pre-configured scope."
+commands.deny = ["set_stay_signed_in"]
