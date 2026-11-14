@@ -853,14 +853,17 @@ export function YourLibrary({ client }: { client: ApiClient }) {
             </p>
           )}
           {/* F20c (R348 h): the researcher's own browser, with the paired extension, as the fallback. Last in the part, so
-              the order of its controls is as before. */}
-          <p className="ao-yl__note" data-testid="yl-browser-fallback">
-            {T.browserFallbackLead}
-            <a href={PATHS.extension} onClick={inAppLink}>
-              {T.browserFallbackLink}
-            </a>
-            {T.browserFallbackTail}
-          </p>
+              the order of its controls is as before. R356 e: in the desktop app only — it names a control that exists
+              only there. */}
+          {shell && (
+            <p className="ao-yl__note" data-testid="yl-browser-fallback">
+              {T.browserFallbackLead}
+              <a href={PATHS.extension} onClick={inAppLink}>
+                {T.browserFallbackLink}
+              </a>
+              {T.browserFallbackTail}
+            </p>
+          )}
         </section>
       )}
     </main>

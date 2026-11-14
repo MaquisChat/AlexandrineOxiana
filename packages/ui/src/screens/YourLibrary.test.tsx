@@ -1195,26 +1195,34 @@ describe("Your library: sentences (R334 d) and keyboard", () => {
 describe("Your library: the researcher's own browser as the fallback (F20c; R348 h)", () => {
   const SENTENCE =
     "If the sign-in window cannot sign you in — some libraries ask for a passkey, a security key or Google — use your own browser: pair the browser extension, then use “Get through my library in my own browser” on a work.";
-  for (const where of ["the desktop app", "a browser"] as const) {
-    it(`one sentence in the sign-in window's part, in ${where}, word for word, with "pair the browser extension" an in-app link to the Browser extension page`, async () => {
-      if (where === "a browser") fake.shell = undefined;
-      const svc = useSvc(SET);
-      await show(svc);
-      const section = screen.getByRole("region", { name: "The sign-in window" });
-      const p = within(section).getByTestId("yl-browser-fallback");
-      expect(p.textContent).toBe(SENTENCE);
-      expect(screen.getAllByTestId("yl-browser-fallback")).toHaveLength(1);
-      const link = within(p).getByRole("link", { name: "pair the browser extension" });
-      expect(link.getAttribute("href")).toBe(PATHS.extension);
-      expect(link.getAttribute("target")).toBeNull();
-      const before = svc.sent.length;
-      await userEvent.setup().click(link);
-      expect(window.location.pathname).toBe(PATHS.extension);
-      // Following it asks the service nothing of this screen's.
-      expect(svc.sent.slice(before)).toEqual([]);
-      window.history.pushState(null, "", "/");
-    });
-  }
+  it(`one sentence in the sign-in window's part, in the desktop app, word for word, with "pair the browser extension" an in-app link to the Browser extension page`, async () => {
+    const svc = useSvc(SET);
+    await show(svc);
+    const section = screen.getByRole("region", { name: "The sign-in window" });
+    const p = within(section).getByTestId("yl-browser-fallback");
+    expect(p.textContent).toBe(SENTENCE);
+    expect(screen.getAllByTestId("yl-browser-fallback")).toHaveLength(1);
+    const link = within(p).getByRole("link", { name: "pair the browser extension" });
+    expect(link.getAttribute("href")).toBe(PATHS.extension);
+    expect(link.getAttribute("target")).toBeNull();
+    const before = svc.sent.length;
+    await userEvent.setup().click(link);
+    expect(window.location.pathname).toBe(PATHS.extension);
+    // Following it asks the service nothing of this screen's.
+    expect(svc.sent.slice(before)).toEqual([]);
+    window.history.pushState(null, "", "/");
+  });
+  it("R356 e: outside the desktop app the sentence is absent (it names a control that exists only there), and the part is otherwise as before", async () => {
+    fake.shell = undefined;
+    const svc = useSvc(SET);
+    await show(svc);
+    const section = screen.getByRole("region", { name: "The sign-in window" });
+    expect(within(section).queryByTestId("yl-browser-fallback")).toBeNull();
+    expect(screen.queryByText(/Get through my library in my own browser/u)).toBeNull();
+    expect(within(section).queryByRole("link", { name: "pair the browser extension" })).toBeNull();
+    // The part itself is still shown, with its controls unavailable and why.
+    expect(within(section).getAllByText(T.onlyDesktop).length).toBeGreaterThan(0);
+  });
 });
 
 describe("Your library: the contract (each request exactly as the handler takes it)", () => {
