@@ -13,11 +13,13 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SECRET_STORE_UNAVAILABLE, deviceDeps, type Deps } from "@ao/library";
+import { SECRET_STORE_UNAVAILABLE, deviceDeps, lookupContextFor, lookupDoi, type Deps } from "@ao/library";
 import { SEARCH_SETTINGS_TEXT, SEARCH_TEST_TEXT, searchEmailRefusal, type SearchSourcesResponse } from "@ao/shared";
 import { useMemorySecrets, useNoSecretStore } from "../../../packages/library/src/secrets-testing.js";
 import { _resetElicitForTests } from "../../../packages/library/src/find/elicit.js";
+import { _setSecretBackend } from "../../../packages/library/src/secrets.js";
 import { createService, type LibraryService } from "./server.js";
+import { SEARCH_KEY_WAIT_MS } from "./state.js";
 import type { ServiceEvent } from "./events.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -52,6 +54,8 @@ let requests: Array<{ origin: string; path: string; method: string; headers: Rec
 const errorBodies: string[] = [];
 /** Delay (ms) of Crossref's answers (a test held open). */
 let crossrefDelay = 0;
+/** The status of Elicit's answers (200: nothing found). */
+let elicitStatus = 200;
 
 function headersOf(h: unknown): Record<string, string> {
   const out: Record<string, string> = {};
@@ -77,7 +81,7 @@ function mockServices(): void {
     })
     .persist();
   agent.get("https://api.openalex.org").intercept({ path: () => true, method: "GET" }).reply(() => json({ meta: { count: 0 }, results: [] })).persist();
-  agent.get("https://elicit.com").intercept({ path: "/api/v2/search/papers", method: "POST" }).reply(() => json({ papers: [] })).persist();
+  agent.get("https://elicit.com").intercept({ path: "/api/v2/search/papers", method: "POST" }).reply(() => (elicitStatus === 200 ? json({ papers: [] }) : { statusCode: elicitStatus, data: "no" })).persist();
   agent.get("https://api.unpaywall.org").intercept({ path: () => true, method: "GET" }).reply(() => json({ is_oa: false })).persist();
   agent.get("https://export.arxiv.org").intercept({ path: () => true, method: "GET" }).reply(() => ({ statusCode: 200, data: "<feed/>" })).persist();
   for (const o of ["https://www.ebi.ac.uk", "https://api.semanticscholar.org", "https://directory.doabooks.org", "https://archive.org"]) agent.get(o).intercept({ path: () => true, method: "GET" }).reply(() => json({})).persist();
@@ -91,6 +95,7 @@ beforeEach(async () => {
   events = [];
   requests = [];
   crossrefDelay = 0;
+  elicitStatus = 200;
   secrets = useMemorySecrets();
   _resetElicitForTests();
   mockServices();
@@ -315,6 +320,109 @@ describe("the Elicit and OpenAlex keys (R290 a)", () => {
 });
 
 // ------------------------------------------------------------------------------------------------
+describe("R297 b, R298 g: the OpenAlex key belongs to OpenAlex, is read lazily and never holds an entry", () => {
+  /** A password store whose OpenAlex read is counted, and answers after `delay` ms (never, for Infinity), or fails. */
+  function countingStore(o: { delay?: number; fail?: boolean } = {}) {
+    const seen = { reads: 0 };
+    _setSecretBackend({
+      get: async (n) => {
+        if (n !== "openalex-api-key") return secrets.values.get(n) ?? null;
+        seen.reads++;
+        if (o.fail) throw new Error("the store is locked");
+        if (o.delay === Infinity) return new Promise<never>(() => undefined);
+        if (o.delay) await new Promise((r) => setTimeout(r, o.delay));
+        return secrets.values.get(n) ?? null;
+      },
+      set: async (n, v) => void secrets.values.set(n, v),
+      delete: async (n) => secrets.values.delete(n),
+    });
+    return seen;
+  }
+  const OFF = { ...ALL_ON, record: ALL_ON.record.map((x) => (x.id === "openalex" ? { ...x, on: false } : x)), copies: ALL_ON.copies.map((x) => (x.id === "openalex" ? { ...x, on: false } : x)) };
+
+  it("with OpenAlex off in both groups, an import's OpenAlex request carries the saved key (read when that request is about to be made)", async () => {
+    await start();
+    secrets.values.set("openalex-api-key", OA_KEY);
+    const store = countingStore();
+    expect((await call({ method: "PUT", url: "/settings/search-sources", body: OFF })).status).toBe(200);
+    const pid = await openLibraryWithProject();
+    expect(store.reads).toBe(0);
+    // An import's DOI lookup: Crossref does not know it, so OpenAlex is asked (through the library's own client).
+    agent.get("https://api.crossref.org").intercept({ path: (p: string) => p.startsWith("/works/10.5555"), method: "GET" }).reply(404, "");
+    const s = svc!.state.requireSession();
+    await lookupDoi("10.5555/ao.f12.import", await lookupContextFor(s.repo, pid, s.http));
+    const oa = requests.filter((r) => r.origin === "https://api.openalex.org");
+    expect(oa.length).toBe(1);
+    expect(oa[0]!.headers.authorization).toBe(`Bearer ${OA_KEY}`);
+    expect(oa[0]!.path).not.toContain(OA_KEY);
+    expect(store.reads).toBe(1);
+    for (const r of requests.filter((x) => x.origin !== "https://api.openalex.org")) expect(JSON.stringify(r)).not.toContain(OA_KEY);
+  });
+
+  it(`a password store that never answers: the entry's search goes on without the key within the bound (${SEARCH_KEY_WAIT_MS} ms) and is not "unexpected"`, async () => {
+    expect(SEARCH_KEY_WAIT_MS).toBeGreaterThanOrEqual(1_000);
+    expect(SEARCH_KEY_WAIT_MS).toBeLessThanOrEqual(2_000);
+    await start();
+    secrets.values.set("openalex-api-key", OA_KEY);
+    const store = countingStore({ delay: Infinity });
+    const pid = await openLibraryWithProject();
+    const t0 = Date.now();
+    const e = await addAndSettle(pid, LINE);
+    expect(e.state).toBe("record-complete");
+    expect(e.reason).toBeUndefined();
+    const oa = requests.filter((r) => r.origin === "https://api.openalex.org");
+    expect(oa.length).toBeGreaterThan(0);
+    for (const r of oa) expect(r.headers.authorization).toBeUndefined();
+    expect(Date.now() - t0).toBeLessThan(SEARCH_KEY_WAIT_MS + 4_000);
+    // The next entry does not wait again on the read still in flight; the store was asked once.
+    const t1 = Date.now();
+    const second = await addAndSettle(pid, "Zorblatt Grammar of Habitus by Quillfeather 1999");
+    expect(second.state).toBe("already");
+    expect(second.reason).toBeUndefined();
+    expect(Date.now() - t1).toBeLessThan(SEARCH_KEY_WAIT_MS);
+    expect(store.reads).toBe(1);
+  });
+
+  it("a hundred requests at once make one read, and each request then carries the key", async () => {
+    await start();
+    secrets.values.set("openalex-api-key", OA_KEY);
+    const store = countingStore({ delay: 50 });
+    await openLibraryWithProject();
+    const s = svc!.state.requireSession();
+    await Promise.all(Array.from({ length: 100 }, () => svc!.state.searchKeyReady("api.openalex.org")));
+    expect(store.reads).toBe(1);
+    await Promise.all([1, 2, 3].map((i) => s.http.getJson(`https://api.openalex.org/works/W${i}`, { cacheKey: `t:${i}`, sensitive: true })));
+    expect(store.reads).toBe(1);
+    const oa = requests.filter((r) => r.origin === "https://api.openalex.org");
+    expect(oa.map((r) => r.headers.authorization)).toEqual([1, 2, 3].map(() => `Bearer ${OA_KEY}`));
+    // Never asked for another host.
+    await svc!.state.searchKeyReady("elicit.com");
+    await svc!.state.searchKeyReady("api.crossref.org");
+    expect(svc!.state.searchKeyForHost("elicit.com")).toBeUndefined();
+    expect(svc!.state.searchKeyForHost("api.crossref.org")).toBeUndefined();
+  });
+
+  it("a store that fails is asked once a minute at most; the requests go without the key meanwhile", async () => {
+    await start();
+    secrets.values.set("openalex-api-key", OA_KEY);
+    const store = countingStore({ fail: true });
+    await openLibraryWithProject();
+    const s = svc!.state.requireSession();
+    for (let i = 0; i < 5; i++) await s.http.getJson(`https://api.openalex.org/works/F${i}`, { cacheKey: `f:${i}`, sensitive: true });
+    expect(store.reads).toBe(1);
+    for (const r of requests) expect(r.headers.authorization).toBeUndefined();
+    const real = Date.now;
+    try {
+      Date.now = () => real() + 61_000;
+      await svc!.state.searchKeyReady("api.openalex.org");
+      expect(store.reads).toBe(2);
+    } finally {
+      Date.now = real;
+    }
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
 describe("GET and PUT /settings/search-sources (R290 b, d, e)", () => {
   it("the defaults: Crossref, OpenAlex and Elicit (off) — never Open Library or the Library of Congress, which Find and acquire does not ask", async () => {
     await start();
@@ -336,13 +444,14 @@ describe("GET and PUT /settings/search-sources (R290 b, d, e)", () => {
     const body = { ...ALL_ON, record: [ALL_ON.record[2]!, ALL_ON.record[0]!, ALL_ON.record[1]!], copies: ALL_ON.copies.map((x) => (x.id === "unpaywall" ? { ...x, on: true } : x)), crossrefEmail: CROSSREF_EMAIL, unpaywallEmail: UNPAYWALL_EMAIL };
     const r = await call({ method: "PUT", url: "/settings/search-sources", body });
     expect(r.status, r.body).toBe(200);
-    expect(r.json.record.map((x: { id: string }) => x.id)).toEqual(["elicit", "crossref", "openalex"]);
+    // R298 a: Elicit, sent first, is accepted and stored last (it cannot be moved).
+    expect(r.json.record.map((x: { id: string }) => x.id)).toEqual(["crossref", "openalex", "elicit"]);
     expect(r.json.crossrefEmail).toBe(CROSSREF_EMAIL);
     expect(r.json.unpaywallEmail).toBe(UNPAYWALL_EMAIL);
     const file = join(deps.appConfigDir, "search-sources.json");
     if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600);
     const stored = JSON.parse(await readFile(file, "utf8"));
-    expect(stored.record.map((x: { id: string }) => x.id)).toEqual(["elicit", "crossref", "openalex", "openlibrary", "loc"]);
+    expect(stored.record.map((x: { id: string }) => x.id)).toEqual(["crossref", "openalex", "openlibrary", "loc", "elicit"]);
     expect((await call({ url: "/settings/search-sources" })).json).toEqual(r.json);
   });
 
@@ -380,6 +489,42 @@ describe("GET and PUT /settings/search-sources (R290 b, d, e)", () => {
     expect(put.status).toBe(409);
     expect(put.json.error.message).toBe(SEARCH_SETTINGS_TEXT.newer);
     expect(await readFile(file, "utf8")).toBe(newer);
+  });
+
+  it("R298 a: Elicit is always the last record source: GET returns it last whatever the file holds; a PUT naming it first or between is stored with it last", async () => {
+    await start();
+    await mkdir(deps.appConfigDir, { recursive: true });
+    const file = join(deps.appConfigDir, "search-sources.json");
+    await writeFile(file, JSON.stringify({ v: 1, record: [{ id: "elicit", on: true }, { id: "openalex", on: true }, { id: "crossref", on: false }], copies: [] }));
+    const got = await call({ url: "/settings/search-sources" });
+    expect(got.json.problem).toBeUndefined();
+    expect(got.json.record.map((x: { id: string; on: boolean }) => `${x.id}:${x.on}`)).toEqual(["openalex:true", "crossref:false", "elicit:true"]);
+    for (const record of [
+      [ALL_ON.record[2]!, ALL_ON.record[1]!, ALL_ON.record[0]!],
+      [ALL_ON.record[1]!, ALL_ON.record[2]!, ALL_ON.record[0]!],
+    ]) {
+      const put = await call({ method: "PUT", url: "/settings/search-sources", body: { ...ALL_ON, record } });
+      expect(put.status, put.body).toBe(200);
+      expect(put.json.record.map((x: { id: string }) => x.id)).toEqual(["openalex", "crossref", "elicit"]);
+      expect(JSON.parse(await readFile(file, "utf8")).record.map((x: { id: string }) => x.id).at(-1)).toBe("elicit");
+      expect((await call({ url: "/settings/search-sources" })).json.record.map((x: { id: string }) => x.id)).toEqual(["openalex", "crossref", "elicit"]);
+    }
+  });
+
+  it("R298 d: a body that is not a JSON object is refused in this module's own sentences (settings: fields; a key: key fields; a Test: no body)", async () => {
+    await start();
+    const raw = async (method: "PUT" | "POST", url: string, payload: string, type = "application/json") => {
+      const res = await svc!.app.inject({ method, url, headers: { ...auth, "content-type": type }, payload });
+      if (res.statusCode >= 400) errorBodies.push(res.body);
+      return { status: res.statusCode, message: (res.json() as { error: { message: string } }).error.message };
+    };
+    for (const [payload, type] of [["[]", "application/json"], ['"a string"', "application/json"], ["42", "application/json"], ["just text", "text/plain"]] as const) {
+      expect(await raw("PUT", "/settings/search-sources", payload, type), payload).toEqual({ status: 400, message: SEARCH_SETTINGS_TEXT.fields });
+      for (const name of ["elicit-api-key", "openalex-api-key"]) expect(await raw("PUT", `/secrets/${name}`, payload, type), `${name} ${payload}`).toEqual({ status: 400, message: SEARCH_SETTINGS_TEXT.keyFields });
+      expect(await raw("POST", "/settings/search-sources/record/crossref/test", payload, type), payload).toEqual({ status: 400, message: SEARCH_SETTINGS_TEXT.noBody });
+    }
+    expect(requests).toEqual([]);
+    expect(secrets.values.size).toBe(0);
   });
 
   it("?project= adds whether that project's rules allow each source; a source the rules forbid says so whatever its setting", async () => {
@@ -431,6 +576,18 @@ describe("Test (R290 g)", () => {
     expect(requests).toHaveLength(1);
     expect(requests[0]!.headers.authorization).toBe(`Bearer ${ELICIT_KEY}`);
     expect(JSON.parse(requests[0]!.body!)).toEqual({ query: "Distinction Bourdieu", maxResults: 10 });
+  });
+
+  it("R298 c: a Test of Elicit during its five-minute pause asks nothing and answers the pause's own sentence (the row's note)", async () => {
+    await start();
+    await call({ method: "PUT", url: "/secrets/elicit-api-key", body: { apiKey: ELICIT_KEY } });
+    elicitStatus = 429;
+    expect((await call({ method: "POST", url: "/settings/search-sources/record/elicit/test" })).json).toEqual({ ok: false, sentence: SEARCH_TEST_TEXT.unreachable });
+    requests = [];
+    elicitStatus = 200;
+    expect((await call({ method: "POST", url: "/settings/search-sources/record/elicit/test" })).json).toEqual({ ok: false, sentence: SEARCH_SETTINGS_TEXT.elicitPaused });
+    expect(requests).toEqual([]);
+    expect((await call({ url: "/settings/search-sources" })).json.record.find((x: { id: string }) => x.id === "elicit").note).toBe(SEARCH_SETTINGS_TEXT.elicitPaused);
   });
 
   it("a second test of one source is refused while the first runs; another source may be tested meanwhile", async () => {

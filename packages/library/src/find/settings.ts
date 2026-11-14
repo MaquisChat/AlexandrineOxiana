@@ -337,7 +337,6 @@ export async function testSearchSource(
   } else {
     return "unreachable";
   }
-  const keyed = o.http.keyTag(target.host) !== "";
   const ask = async (): Promise<SearchSourceTestResult> => {
     try {
       const body = await o.http.getText(target.url, {
@@ -353,7 +352,8 @@ export async function testSearchSource(
       if (target.json) JSON.parse(body);
       return "answered";
     } catch (e) {
-      if (e instanceof LookupHttpError && (e.status === 401 || e.status === 403) && keyed) return "key-refused";
+      // Whether a key went with it, asked after the request (a key read lazily is held by then).
+      if (e instanceof LookupHttpError && (e.status === 401 || e.status === 403) && o.http.keyTag(target.host) !== "") return "key-refused";
       return "unreachable";
     }
   };

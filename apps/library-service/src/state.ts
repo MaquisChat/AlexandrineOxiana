@@ -64,7 +64,6 @@ import {
   getSecret,
   readSearchSettings,
   searchContactEmail,
-  searchKeyWanted,
   type SearchSettings,
   type SearchSettingsRead,
 } from "@ao/library";
@@ -218,6 +217,13 @@ export interface WorkControl {
 
 /** How long a close waits for registered work before abandoning what can be (default; Task 62). */
 export const CLOSE_GRACE_MS = 30_000;
+/**
+ * F12 (R297 b, R298 g): the longest any request waits for the password store's first answer about OpenAlex's key
+ * (one read, shared by every caller, counted from when it started). Past it the request goes without the key.
+ */
+export const SEARCH_KEY_WAIT_MS = 1_500;
+/** A password store that failed (or a read that never answered) is not asked again for this long. */
+const SEARCH_STORE_RETRY_MS = 60_000;
 /** Work a close or shutdown asks to stop between its items, and abandons after the grace period (N-5). */
 const STOPPED_AT_CLOSE: ReadonlySet<string> = new Set(["worker-resume", "transcription"]);
 
@@ -622,7 +628,12 @@ export class ServiceState {
       ring,
       index,
       // F12 (R290 a, e): OpenAlex's key and Crossref's e-mail by the request's host, from "Search sources".
-      http: new HttpClient({ libraryRoot: lib.root, keyFor: (h) => this.searchKeyForHost(h), contactEmailFor: (h) => this.searchEmailForHost(h) }),
+      http: new HttpClient({
+        libraryRoot: lib.root,
+        keyFor: (h) => this.searchKeyForHost(h),
+        keyReady: (h) => this.searchKeyReady(h),
+        contactEmailFor: (h) => this.searchEmailForHost(h),
+      }),
       bulk: undefined,
       watches: new Map(),
       batches: new Map(),
@@ -1150,10 +1161,16 @@ export class ServiceState {
   // ---- "Search sources" (Task F12; R290) ---------------------------------------------------
   //
   // The settings file is read anew for each entry and each GET; the copy kept here (`searchSettingsNow`) is what the
-  // lookup client's per-host e-mail and key follow between reads. Keys are read from the password store when needed
-  // (OpenAlex's while OpenAlex is on in either group; Elicit's only when the runner asks for it, or for a Test) and
-  // then held in memory only; a PUT or DELETE of the secret replaces what is held at once (no restart). A key is never
+  // lookup client's per-host e-mail follows between reads. Keys are read from the password store when needed and then
+  // held in memory only; a PUT or DELETE of the secret replaces what is held at once (no restart). A key is never
   // logged, put in an error, an event, an audit line or a settings file.
+  //   - OpenAlex's key belongs to OpenAlex (R297 b), not to Find's switches: when one is saved it goes with every
+  //     request the app makes to api.openalex.org, imports included. It is read lazily, when the first such request
+  //     is about to be made (the client's `keyReady`): ONE read in flight, shared by every caller, and no request
+  //     waits for it beyond SEARCH_KEY_WAIT_MS from its start (R298 g); past that, or when the store fails, the
+  //     request goes without the key and the store is not asked again for a minute. An entry never waits or fails
+  //     because of it (the runner's settings step does not read it).
+  //   - Elicit's key is read only when the runner asks for it (Elicit on, allowed, about to be asked), or for a Test.
 
   /** The "Search sources" settings as last read or saved. */
   searchSettingsNow: SearchSettings = { record: DEFAULT_SEARCH_SETTINGS.record.map((x) => ({ ...x })), copies: (DEFAULT_SEARCH_SETTINGS.copies ?? []).map((x) => ({ ...x })) };
@@ -1163,6 +1180,8 @@ export class ServiceState {
   private readonly searchKeyGen = new Map<string, number>();
   /** When the password store last failed to answer for a key (it is not asked again for a minute). */
   private readonly searchStoreFailedAt = new Map<string, number>();
+  /** The read of a key in flight (one per key, shared by every caller), and when it started. */
+  private readonly searchKeyReads = new Map<string, { read: Promise<string | undefined>; startedAt: number }>();
 
   /** Reads the settings file anew (never throws: an unreadable file gives the defaults and says so). */
   async readSearchSources(): Promise<SearchSettingsRead> {
@@ -1171,27 +1190,62 @@ export class ServiceState {
     return r;
   }
 
-  /** After a save: what the client follows from now on; OpenAlex's key is read in the background when it is wanted. */
+  /** After a save: what the client follows from now on (no key is read here: OpenAlex's is read lazily). */
   searchSourcesSaved(s: SearchSettings): void {
     this.searchSettingsNow = s;
-    if (searchKeyWanted(s, "openalex")) void this.searchKey("openalex-api-key");
   }
 
-  /** A key, read from the password store once and then held (undefined when none is stored or the store cannot be read). */
-  async searchKey(name: "elicit-api-key" | "openalex-api-key"): Promise<string | undefined> {
-    if (this.searchKeys.has(name)) return this.searchKeys.get(name) ?? undefined;
-    if ((this.searchStoreFailedAt.get(name) ?? -Infinity) > Date.now() - 60_000) return undefined;
+  /**
+   * A key, read from the password store once and then held (undefined when none is stored or the store cannot be
+   * read). One read in flight per key, shared by every caller; a store that fails, or a read that has not answered in
+   * a minute, is not asked again for a minute.
+   */
+  searchKey(name: "elicit-api-key" | "openalex-api-key"): Promise<string | undefined> {
+    if (this.searchKeys.has(name)) return Promise.resolve(this.searchKeys.get(name) ?? undefined);
+    const now = Date.now();
+    if ((this.searchStoreFailedAt.get(name) ?? -Infinity) > now - SEARCH_STORE_RETRY_MS) return Promise.resolve(undefined);
+    const inFlight = this.searchKeyReads.get(name);
+    if (inFlight && inFlight.startedAt > now - SEARCH_STORE_RETRY_MS) return inFlight.read;
     const gen = this.searchKeyGen.get(name) ?? 0;
-    let v: string | null;
+    const entry = { read: Promise.resolve<string | undefined>(undefined), startedAt: now };
+    entry.read = (async () => {
+      let v: string | null;
+      try {
+        v = await getSecret(name);
+      } catch {
+        // No password store (or a locked one): nothing held; asked again after a minute, or at once after a PUT.
+        this.searchStoreFailedAt.set(name, Date.now());
+        return undefined;
+      } finally {
+        if (this.searchKeyReads.get(name) === entry) this.searchKeyReads.delete(name);
+      }
+      if ((this.searchKeyGen.get(name) ?? 0) === gen) this.searchKeys.set(name, v);
+      return v ?? undefined;
+    })();
+    // Set before anything of the read has run past its first await (its own `finally` clears it).
+    this.searchKeyReads.set(name, entry);
+    return entry.read;
+  }
+
+  /**
+   * The lookup client's wait before a request to `host` (R297 b, R298 g): for api.openalex.org, while its key is not
+   * held yet, starts (or joins) the one read and waits for it at most until SEARCH_KEY_WAIT_MS after that read began.
+   * Never rejects; nothing for any other host.
+   */
+  async searchKeyReady(host: string): Promise<void> {
+    const name = "openalex-api-key";
+    if (host !== "api.openalex.org" || this.searchKeys.has(name)) return;
+    const read = this.searchKey(name);
+    const inFlight = this.searchKeyReads.get(name);
+    if (!inFlight) return;
+    const left = inFlight.startedAt + SEARCH_KEY_WAIT_MS - Date.now();
+    if (left <= 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      v = await getSecret(name);
-    } catch {
-      // No password store (or a locked one): nothing held; asked again after a minute, or at once after a PUT.
-      this.searchStoreFailedAt.set(name, Date.now());
-      return undefined;
+      await Promise.race([read.then(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, left)))]);
+    } finally {
+      clearTimeout(timer);
     }
-    if ((this.searchKeyGen.get(name) ?? 0) === gen) this.searchKeys.set(name, v);
-    return v ?? undefined;
   }
 
   /** A key saved (`value`) or removed (null) through the secrets routes: used by the next request. */
@@ -1201,13 +1255,12 @@ export class ServiceState {
     this.searchKeys.set(name, value);
   }
 
-  /** The lookup client's key for a host: OpenAlex's for api.openalex.org, while OpenAlex is on; nothing else. */
+  /**
+   * The lookup client's key for a host: OpenAlex's for api.openalex.org, whatever Find's switches say (R297 b);
+   * nothing for any other host. Only what is held: the read is `searchKeyReady`'s.
+   */
   searchKeyForHost(host: string): string | undefined {
-    if (host !== "api.openalex.org" || !searchKeyWanted(this.searchSettingsNow, "openalex")) return undefined;
-    if (!this.searchKeys.has("openalex-api-key")) {
-      void this.searchKey("openalex-api-key");
-      return undefined;
-    }
+    if (host !== "api.openalex.org") return undefined;
     return this.searchKeys.get("openalex-api-key") ?? undefined;
   }
 
@@ -1248,8 +1301,9 @@ export class ServiceState {
     void readFindScreen(this.deps.appConfigDir).then((v) => {
       if (this.session === s) this.findCheckEverything = v.checkEverything;
     });
-    // F12: the e-mail and key by host follow "Search sources" from the open on (imports' lookups included).
-    void this.readSearchSources().then((r) => (searchKeyWanted(r.settings, "openalex") ? this.searchKey("openalex-api-key") : undefined));
+    // F12: the e-mail by host follows "Search sources" from the open on (imports' lookups included). OpenAlex's key is
+    // read lazily, by the first request to api.openalex.org (R297 b).
+    void this.readSearchSources();
     const handle = s.index;
     // Always the index's live connection: a rebuild swaps it.
     const index = new Proxy({} as IndexDb, {
@@ -1265,12 +1319,8 @@ export class ServiceState {
       index,
       http: s.http,
       // Task F12: "Search sources", read anew when each entry's work starts (a save takes effect for the next entry).
-      // OpenAlex's key is read (once, then held) before the entry asks anything, while OpenAlex is on.
-      settings: async () => {
-        const { settings } = await this.readSearchSources();
-        if (searchKeyWanted(settings, "openalex")) await this.searchKey("openalex-api-key");
-        return settings;
-      },
+      // No key is read here (R298 g): OpenAlex's is read lazily by its first request, within its own short bound.
+      settings: async () => (await this.readSearchSources()).settings,
       // Asked by the runner only when Elicit is on and the project's rules allow it.
       elicitKey: () => this.searchKey("elicit-api-key"),
       checkEverything: () => this.findCheckEverything,

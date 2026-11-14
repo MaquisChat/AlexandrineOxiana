@@ -5,10 +5,12 @@
  * the caller again. None needs an open library, except the per-project part of the GET (`?project=`).
  *
  * The keys (R290 a): `GET/PUT/DELETE /secrets/elicit-api-key` and `/secrets/openalex-api-key`, ONE implementation
- * (`registerSearchKey`) behaving as the Zotero key's does (routes/zotero.ts, which this plan leaves untouched): the value
+ * (`registerSecretKey`, which the Zotero key's routes in routes/zotero.ts use too, R297 d): the value
  * is never sent back; a computer without a password store answers 503 in words and stores nothing anywhere else; the
  * body's field is `apiKey` (covered by the log's redaction); a refusal never repeats what was sent. A PUT or DELETE
- * takes effect for the next request (the service's held copy is replaced: `searchKeyChanged`).
+ * takes effect for the next request (the service's held copy is replaced: `searchKeyChanged`). A body that is not a JSON
+ * object is refused in this module's own sentences (R298 d): the settings' "fields", a key's "key fields", a Test's
+ * "no body".
  *
  * The settings (R290 b, d, e): the file is read anew for every GET (an unreadable or newer file is the defaults, said
  * in `problem`); a PUT lists every source of each group once, in order, with on or off; an e-mail is checked with the
@@ -21,7 +23,8 @@
  * answers in the service's place; nothing it gets is written to disk), with OpenAlex's key by host and Crossref's
  * e-mail as the app's own requests carry them; one test per source at a time; within FIND_SOURCE_TEST_TIMEOUT_MS.
  * A test is allowed for a source that is switched off (the researcher is trying it out), never for one whose key or
- * e-mail is missing: that answers its sentence and asks nothing.
+ * e-mail is missing: that answers its sentence and asks nothing; nor for Elicit during its five-minute pause, which
+ * answers the pause's own sentence (R298 c). OpenAlex's key reaches it as every OpenAlex request's does (R297 b).
  */
 import { join } from "node:path";
 import type { FastifyInstance, FastifyRequest } from "fastify";
@@ -33,6 +36,7 @@ import {
   HttpClient,
   SECRET_STORE_UNAVAILABLE,
   SEARCH_EMAIL_MAX as LIBRARY_EMAIL_MAX,
+  type SecretName,
   SearchSettingsNewerError,
   SecretStoreUnavailableError,
   deleteSecret,
@@ -78,7 +82,7 @@ import {
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
 import type { ServiceState } from "../state.js";
-import { bodyOf, paramsOf, queryOf, type Ctx, type Same } from "./util.js";
+import { bodyOf, paramsOf, queryOf, type Ctx, type Obj, type Same } from "./util.js";
 
 // The library's names and bounds and @ao/shared's are one and the same (Task 47).
 true satisfies Same<Exclude<RecordSearchSource, "openlibrary" | "loc">, SearchRecordSource>;
@@ -98,10 +102,24 @@ const TEST_ANSWER: Record<SearchSourceTestResult, SearchSourceTestResponse> = {
   "plan-cap": { ok: false, sentence: SEARCH_TEST_TEXT.elicitPlanCap },
   "needs-key": { ok: false, sentence: SEARCH_TEST_TEXT.needsElicitKey },
   "needs-email": { ok: false, sentence: SEARCH_TEST_TEXT.needsUnpaywallEmail },
+  // R298 c: the pause's own sentence (the one the settings row's note says), nothing asked.
+  paused: { ok: false, sentence: SEARCH_SETTINGS_TEXT.elicitPaused },
 };
 
-function uiOnly(req: FastifyRequest): void {
-  if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", SEARCH_SETTINGS_TEXT.uiOnly);
+/**
+ * Only the desktop app's token. A second guard (R298 e): the auth layer already refuses every other caller's token
+ * before any of these routes runs (none is in server.ts's EXTENSION_ROUTES); this stays behind it in case that changes.
+ */
+function uiOnly(req: FastifyRequest, sentence: string = SEARCH_SETTINGS_TEXT.uiOnly): void {
+  if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", sentence);
+}
+
+/** The body as a JSON object (absent: `{}`); anything else (an array, a string, text) is refused with `sentence` (R298 d). */
+function objectBody(req: FastifyRequest, sentence: string): Obj {
+  const b: unknown = req.body;
+  if (b === undefined || b === null) return {};
+  if (typeof b !== "object" || Array.isArray(b)) throw badRequest(sentence);
+  return b as Obj;
 }
 
 /** The password store's refusal, in words that fit what was asked (as for the Zotero key). */
@@ -109,43 +127,80 @@ function storeError(e: unknown, message: string): unknown {
   return e instanceof SecretStoreUnavailableError ? new ApiError(503, "UNAVAILABLE", message) : e;
 }
 
-/** One key's three routes: write-only, UI only, the same refusals as the Zotero key's. */
-function registerSearchKey(app: FastifyInstance, state: ServiceState, name: KeyName): void {
-  const path = `/secrets/${name}`;
+/** What tells one kept key's routes apart: its name, its sentences, its shape, and what follows a change. */
+export interface SecretKeyRoutes {
+  name: SecretName;
+  /** The 403 for a caller other than the desktop app. */
+  uiOnly: string;
+  /** The 503 of a GET or DELETE with no password store. */
+  noStoreForStatus: string;
+  /** A PUT with a field other than `apiKey`. */
+  keyFields: string;
+  /** A PUT whose `apiKey` is not of the shape (`isShape`). */
+  keyShape: string;
+  isShape: (v: unknown) => v is string;
+  /** A PUT whose body is not a JSON object: this sentence; unset, the general one of routes/util.ts (`bodyOf`). */
+  notObject?: string;
+  /** After a PUT (the value) or a DELETE (null) went through. */
+  changed?: (value: string | null) => void;
+}
+
+/**
+ * ONE implementation of a kept key's three routes (R290 a, R297 d: the Zotero, Elicit and OpenAlex keys): write-only
+ * (`GET` says whether one is stored, never the value), UI only; a refusal never repeats what was sent; with no password
+ * store, 503 in words and nothing stored anywhere else (a PUT's 503 is the library's own SECRET_STORE_UNAVAILABLE).
+ */
+export function registerSecretKey(app: FastifyInstance, k: SecretKeyRoutes): void {
+  const path = `/secrets/${k.name}`;
   app.get(path, async (req): Promise<SecretStatusResponse> => {
-    uiOnly(req);
+    uiOnly(req, k.uiOnly);
     try {
-      return { stored: (await getSecret(name)) !== null };
+      return { stored: (await getSecret(k.name)) !== null };
     } catch (e) {
-      throw storeError(e, SEARCH_SETTINGS_TEXT.noStoreForStatus);
+      throw storeError(e, k.noStoreForStatus);
     }
   });
   app.put(path, async (req): Promise<SecretStatusResponse> => {
-    uiOnly(req);
-    const b = bodyOf(req);
-    if (Object.keys(b).some((k) => k !== "apiKey")) throw badRequest(SEARCH_SETTINGS_TEXT.keyFields);
+    uiOnly(req, k.uiOnly);
+    const b = k.notObject !== undefined ? objectBody(req, k.notObject) : bodyOf(req);
+    if (Object.keys(b).some((x) => x !== "apiKey")) throw badRequest(k.keyFields);
     // The value is never echoed: the message describes the rule, not what was sent.
-    if (!isSearchApiKeyShape(b.apiKey)) throw badRequest(SEARCH_SETTINGS_TEXT.keyShape);
+    if (!k.isShape(b.apiKey)) throw badRequest(k.keyShape);
     try {
-      await setSecret(name, b.apiKey);
+      await setSecret(k.name, b.apiKey);
     } catch (e) {
       throw storeError(e, SECRET_STORE_UNAVAILABLE);
     }
-    state.searchKeyChanged(name, b.apiKey);
-    if (name === "elicit-api-key") forgetElicitRefusal();
+    k.changed?.(b.apiKey);
     return { stored: true };
   });
   app.delete(path, async (req): Promise<SecretDeleteResponse> => {
-    uiOnly(req);
+    uiOnly(req, k.uiOnly);
     let removed: boolean;
     try {
-      removed = await deleteSecret(name);
+      removed = await deleteSecret(k.name);
     } catch (e) {
-      throw storeError(e, SEARCH_SETTINGS_TEXT.noStoreForStatus);
+      throw storeError(e, k.noStoreForStatus);
     }
-    state.searchKeyChanged(name, null);
-    if (name === "elicit-api-key") forgetElicitRefusal();
+    k.changed?.(null);
     return { removed };
+  });
+}
+
+/** The Elicit or the OpenAlex key's routes: the shared sentences; a change replaces the key the service holds. */
+function registerSearchKey(app: FastifyInstance, state: ServiceState, name: KeyName): void {
+  registerSecretKey(app, {
+    name,
+    uiOnly: SEARCH_SETTINGS_TEXT.uiOnly,
+    noStoreForStatus: SEARCH_SETTINGS_TEXT.noStoreForStatus,
+    keyFields: SEARCH_SETTINGS_TEXT.keyFields,
+    keyShape: SEARCH_SETTINGS_TEXT.keyShape,
+    isShape: isSearchApiKeyShape,
+    notObject: SEARCH_SETTINGS_TEXT.keyFields,
+    changed: (value) => {
+      state.searchKeyChanged(name, value);
+      if (name === "elicit-api-key") forgetElicitRefusal();
+    },
   });
 }
 
@@ -243,7 +298,7 @@ export function registerSearchSettings(app: FastifyInstance, ctx: Ctx): void {
 
   app.put("/settings/search-sources", async (req): Promise<SearchSourcesResponse> => {
     uiOnly(req);
-    const b = bodyOf(req) as Record<string, unknown> & Partial<Record<keyof SearchSourcesRequest, unknown>>;
+    const b = objectBody(req, SEARCH_SETTINGS_TEXT.fields) as Record<string, unknown> & Partial<Record<keyof SearchSourcesRequest, unknown>>;
     if (Object.keys(b).some((k) => !["record", "copies", "crossrefEmail", "unpaywallEmail"].includes(k))) throw badRequest(SEARCH_SETTINGS_TEXT.fields);
     const record = rowsOf(b.record, SEARCH_RECORD_SOURCES);
     const copies = rowsOf(b.copies, SEARCH_COPY_SOURCES);
@@ -280,7 +335,7 @@ export function registerSearchSettings(app: FastifyInstance, ctx: Ctx): void {
       (SEARCH_SOURCE_GROUPS as readonly string[]).includes(group) &&
       (group === "record" ? (SEARCH_RECORD_SOURCES as readonly string[]) : (SEARCH_COPY_SOURCES as readonly string[])).includes(id);
     if (!known) throw new ApiError(404, "NOT_FOUND", SEARCH_SETTINGS_TEXT.unknownSource);
-    if (Object.keys(bodyOf(req)).length) throw badRequest(SEARCH_SETTINGS_TEXT.noBody);
+    if (Object.keys(objectBody(req, SEARCH_SETTINGS_TEXT.noBody)).length) throw badRequest(SEARCH_SETTINGS_TEXT.noBody);
     const slot = `${group}/${id}`;
     if (running.has(slot)) throw new ApiError(409, "CONFLICT", SEARCH_SETTINGS_TEXT.testRunning);
     running.add(slot);
@@ -288,12 +343,13 @@ export function registerSearchSettings(app: FastifyInstance, ctx: Ctx): void {
       const { settings } = await state.readSearchSources();
       // A key or an e-mail that is needed and missing: said, and nothing asked (testSearchSource asks nothing then).
       const key = group === "record" && id === "elicit" ? await state.searchKey("elicit-api-key") : undefined;
-      const openAlexKey = id === "openalex" ? await state.searchKey("openalex-api-key") : undefined;
       const http = new HttpClient({
         // A fresh client: nothing cached answers in the service's place. Its requests are made "sensitive" by the
         // library (memory only), so nothing it gets is written under this folder, which is never created.
         libraryRoot: join(state.deps.appConfigDir, "search-sources-test"),
-        keyFor: (h) => (h === "api.openalex.org" ? openAlexKey : undefined),
+        // OpenAlex's key as every request to api.openalex.org has it (R297 b): read lazily, within its short bound.
+        keyFor: (h) => state.searchKeyForHost(h),
+        keyReady: (h) => state.searchKeyReady(h),
         contactEmailFor: (h) => searchContactEmail(settings, h),
         maxRetries: 0,
         attemptTimeoutMs: FIND_SOURCE_TEST_TIMEOUT_MS,
