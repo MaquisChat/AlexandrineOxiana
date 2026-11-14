@@ -674,3 +674,79 @@ describe("SourceDetail: the transcript entry point", () => {
     expect(screen.queryByRole("link", { name: "Open the transcript" })).toBeNull();
   });
 });
+
+// Task F18b (R340 e, R330 b): how a file was got, from the asset's `acquired` record as the service's answer carries it
+// (apps/library-service/src/routes/sources.ts `sourceRecord` passes each asset on as stored).
+describe("SourceDetail: how a file was got (F18b; R340 e)", () => {
+  const AT = "2026-11-14T12:00:00.000Z";
+  const ADDED = `Fetched on Nov ${new Date(AT).getDate()}, 2026.`;
+  const tool = { name: "find-and-acquire", version: "0" };
+  const asset = (id: string, acquired?: unknown) => ({ ...SOURCE_FILE.assets[0]!, id, path: `Dissertation/Sources/s1/${id}.pdf`, ...(acquired !== undefined ? { acquired } : {}) });
+  async function filesWith(assets: unknown[]) {
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json({ ...SOURCE_FILE, assets })), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    const list = (await within(region).findByRole("heading", { name: "Files" })).nextElementSibling as HTMLElement;
+    return (id: string) => {
+      const li = [...list.querySelectorAll(":scope > li")].find((x) => x.textContent?.startsWith(`${id}.pdf`)) as HTMLElement | undefined;
+      if (!li) throw new Error(`no file ${id}`);
+      return li;
+    };
+  }
+  const how = (li: HTMLElement) => li.querySelector(".ao-source__acquired")?.textContent ?? undefined;
+
+  it("each method and each check result, in words", async () => {
+    const file = await filesWith([
+      asset("free-match", { method: "free_copy", via: "service", service: "arxiv", address: "https://arxiv.org/pdf/2101.00001", at: AT, tool, access: "public", check: { result: "match", by: "title" } }),
+      asset("free-no-service", { method: "free_copy", via: "service", address: "https://europepmc.org/articles/PMC1/pdf", at: AT, tool, access: "public", check: { result: "match", by: "doi" } }),
+      asset("free-doab", { method: "free_copy", via: "service", service: "doab", address: "https://library.oapen.org/bitstream/1/2.pdf", at: AT, tool, access: "public" }),
+      asset("library-doubt", { method: "library_access", via: "sign-in-window", address: "https://www.publisher.example/doi/pdf/10.5555/x", at: AT, tool, access: "signed-in-session", check: { result: "accepted-after-mismatch", why: "other-doi" } }),
+      asset("library-title", { method: "library_access", via: "sign-in-window", address: "https://www.publisher.example/doi/pdf/10.5555/y", at: AT, tool, access: "signed-in-session", check: { result: "accepted-after-mismatch", why: "title-absent" } }),
+      asset("later-method", { method: "some_later_way", via: "service", address: "https://files.example.org/a.pdf", at: AT, tool, access: "public" }),
+      asset("plain"),
+    ]);
+    expect(how(file("free-match"))).toBe(`A free copy from arxiv.org, found through arXiv. ${ADDED} The app's check had said it looked like the right file.`);
+    expect(how(file("free-no-service"))).toBe(`A free copy from europepmc.org. ${ADDED} The app's check had said it looked like the right file.`);
+    expect(how(file("free-doab"))).toBe(`A free copy from library.oapen.org, found through Directory of Open Access Books. ${ADDED}`);
+    expect(how(file("library-doubt"))).toBe(`Fetched through your library (www.publisher.example). ${ADDED} You used it although the app's check had a doubt: The file names another DOI as its own.`);
+    expect(how(file("library-title"))).toBe(`Fetched through your library (www.publisher.example). ${ADDED} You used it although the app's check had a doubt: The file does not show this record's title with its author.`);
+    expect(how(file("later-method"))).toBe(`Got through Find and acquire. ${ADDED}`);
+    // A file without such a record shows nothing new.
+    expect(how(file("plain"))).toBeUndefined();
+    expect(file("plain").textContent).toBe("plain.pdf pdf · 1 KB");
+  });
+
+  it("every service as the Search sources screen names it", async () => {
+    const names = { openalex: "OpenAlex", unpaywall: "Unpaywall", arxiv: "arXiv", europepmc: "Europe PMC", semanticscholar: "Semantic Scholar", doab: "Directory of Open Access Books", internetarchive: "Internet Archive" };
+    const file = await filesWith(Object.keys(names).map((s) => asset(s, { method: "free_copy", via: "service", service: s, address: "https://archive.org/download/x/x.pdf", at: AT, tool, access: "public" })));
+    for (const [s, name] of Object.entries(names)) expect(how(file(s))).toBe(`A free copy from archive.org, found through ${name}. ${ADDED}`);
+  });
+
+  it("the host is parsed from the recorded address, never taken as given; every part from the record through UserText; hostile values are text", async () => {
+    const file = await filesWith([
+      asset("userinfo", { method: "library_access", via: "sign-in-window", address: "https://someone:secret@ezproxy.example.edu:8443/x.pdf?token=abc#frag", at: AT, tool, access: "signed-in-session" }),
+      asset("markup", { method: "free_copy", via: "service", service: "<img src=x onerror=alert(1)>", address: "https://xn--bcher-kva.example/<b>bold</b>.pdf", at: AT, tool, access: "public", host: "<b>evil</b>" }),
+      asset("not-an-address", { method: "free_copy", via: "service", service: "arxiv", address: "javascript:alert(1)", at: AT, tool, access: "public" }),
+      asset("garbage", { method: "library_access", via: "sign-in-window", address: "not an address <i>x</i>", at: "not a date", tool, access: "signed-in-session", check: { result: "accepted-after-mismatch", why: "from-a-later-build" } }),
+      asset("looks-right-doubt", { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at: AT, tool, access: "public", check: { result: "accepted-after-mismatch", why: "looks-right" } }),
+      asset("later-check", { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at: AT, tool, access: "public", check: { result: "some-later-result" } }),
+      asset("not-an-object", "free_copy"),
+    ]);
+    expect(how(file("userinfo"))).toBe(`Fetched through your library (ezproxy.example.edu:8443). ${ADDED}`);
+    expect(file("userinfo").textContent).not.toMatch(/someone|secret|token|frag/u);
+    // An unknown service is no service; the host is the address's own; markup stays text.
+    expect(how(file("markup"))).toBe(`A free copy from xn--bcher-kva.example. ${ADDED}`);
+    expect(file("markup").querySelector("img, b")).toBeNull();
+    expect(file("markup").textContent).not.toContain("evil");
+    // No host can be read: said without one; no date: no "Fetched on"; a check this build does not know: no sentence.
+    expect(how(file("not-an-address"))).toBe(`A free copy, found through arXiv. ${ADDED}`);
+    expect(how(file("garbage"))).toBe("Fetched through your library.");
+    expect(file("garbage").querySelector("i")).toBeNull();
+    expect(how(file("looks-right-doubt"))).toBe(`A free copy from arxiv.org. ${ADDED}`);
+    expect(how(file("later-check"))).toBe(`A free copy from arxiv.org. ${ADDED}`);
+    expect(how(file("not-an-object"))).toBeUndefined();
+    // The parts from the record are outside text: bidi-isolated.
+    const parts = file("userinfo").querySelectorAll(".ao-source__acquired [dir=auto]");
+    expect([...parts].map((p) => p.textContent)).toEqual(["ezproxy.example.edu:8443", `Nov ${new Date(AT).getDate()}, 2026`]);
+  });
+});
