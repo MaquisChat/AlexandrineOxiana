@@ -29,6 +29,8 @@ describe("parseFileGrantLine: exactly the shell's line", () => {
     // (non-ASCII, a slash) are taken in exactly that form.
     const odd = "/tmp/a\"b\\c\u0001dé/ü.pdf";
     expect(parseFileGrantLine(good(odd))).toEqual({ id: ID, ticket: TICKET, path: odd });
+    // A pair of surrogates (one character outside the BMP) is well-formed text.
+    expect(parseFileGrantLine(good("/tmp/\u{1F4DA}.pdf"))).toEqual({ id: ID, ticket: TICKET, path: "/tmp/\u{1F4DA}.pdf" });
   });
 
   const hostile: Array<[string, string]> = [
@@ -60,6 +62,9 @@ describe("parseFileGrantLine: exactly the shell's line", () => {
     ["null", "null"],
     ["8 KiB + 1", good(`/${"a".repeat(8192 - good("/").length)}`)],
     ["a path over 4,096 bytes", good(`/${"é".repeat(2049)}`)],
+    // R338 c: a path that is not well-formed text (a lone surrogate, written as an escape) is no line.
+    ["a lone surrogate in the path", `{"type":"file-grant","id":"${ID}","ticket":"${TICKET}","path":"/x\\ud800.pdf"}`],
+    ["a lone low surrogate in the path", `{"type":"file-grant","id":"${ID}","ticket":"${TICKET}","path":"/x\\udc00.pdf"}`],
   ];
   for (const [what, text] of hostile) {
     it(`refuses ${what}`, () => {
@@ -131,7 +136,7 @@ function recording(around: Partial<Record<keyof InboxFs, (path: string, n: numbe
     lstat: wrap("lstat", (p: string) => fsp.lstat(p)),
     realpath: wrap("realpath", (p: string) => fsp.realpath(p)),
     open: wrap("open", (p: string, flags: number, mode?: number) => fsp.open(p, flags, mode)),
-    rm: wrap("rm", (p: string, o: { recursive?: boolean; force?: boolean }) => fsp.rm(p, o)),
+    unlink: wrap("unlink", (p: string) => fsp.unlink(p)),
   };
 }
 
@@ -194,13 +199,68 @@ describe("takeInboxFile: the path's checks", () => {
     await discardInboxFile(inbox, plain, recording());
     expect(await there(fifo)).toBe(true);
     expect(await there(plain)).toBe(true);
-    expect(calls.filter((c) => c.op === "rm")).toEqual([]);
+    expect(calls.filter((c) => c.op === "unlink")).toEqual([]);
   });
 
-  it("`..` segments that come back into the inbox are the inbox (the real parent decides), and ones that leave it are outside", async () => {
+  it("R338 b: `..` segments are outside even when they come back into the inbox (the folder is compared as text); nothing is touched", async () => {
     const f = await put(inInbox());
-    expect(await takeInboxFile(inbox, { id: ID, path: join(outside, "..", "config", "library-inbox", `${ID}.pdf`) }, target())).toEqual({ ok: true, bytes: PDF.length });
+    expect(await takeInboxFile(inbox, { id: ID, path: `${outside}/../config/library-inbox/${ID}.pdf` }, target())).toEqual({ ok: false, why: "outside" });
+    expect(await readFile(f)).toEqual(PDF);
+  });
+
+  it("R338 b: whether a path is inside is decided on its text before any call: nothing names the path or its folder (outside, a subfolder, `..`, a link in a middle folder)", async () => {
+    const f = await put(inInbox());
+    await mkdir(join(inbox, "sub"), { mode: 0o700 });
+    const sub = await put(join(inbox, "sub", `${ID}.pdf`));
+    const outsideFile = await put(join(outside, `${ID}.pdf`));
+    // A link to the settings folder: through it the path's REAL folder is the inbox.
+    await symlink(config, join(tmp, "via"));
+    const paths = [
+      outsideFile,
+      sub,
+      `${inbox}/../library-inbox/${ID}.pdf`,
+      `${inbox}/./${ID}.pdf`,
+      `${inbox}/sub/../${ID}.pdf`,
+      join(tmp, "via", LIBRARY_INBOX, `${ID}.pdf`),
+      `${inbox}//${ID}.pdf`,
+    ];
+    for (const path of paths) {
+      calls = [];
+      expect(await takeInboxFile(inbox, { id: ID, path }, target(), { fs: recording() }), path).toEqual({ ok: false, why: "outside" });
+      await discardInboxFile(inbox, path, recording());
+      // Only the inbox itself was looked at (its lstat and its real path).
+      expect(calls, path).toEqual([
+        { op: "lstat", path: inbox },
+        { op: "realpath", path: inbox },
+        { op: "lstat", path: inbox },
+        { op: "realpath", path: inbox },
+      ]);
+    }
+    expect(await readFile(f)).toEqual(PDF);
+    expect(await readFile(sub)).toEqual(PDF);
+    expect(await readFile(outsideFile)).toEqual(PDF);
+  });
+
+  it("R338 b: the inbox's real path counts as the inbox too (the settings folder reached through a link)", async () => {
+    await symlink(config, join(tmp, "via"));
+    const given = join(tmp, "via", LIBRARY_INBOX);
+    const f = await put(inInbox());
+    // The inbox given through the link; the line names the file by its real place.
+    expect(await takeInboxFile(given, { id: ID, path: f }, target(), { fs: recording() })).toEqual({ ok: true, bytes: PDF.length });
     expect(await there(f)).toBe(false);
+    // And by the place given.
+    await put(f);
+    expect(await takeInboxFile(given, { id: ID, path: join(given, `${ID}.pdf`) }, target(), { fs: recording() })).toEqual({ ok: true, bytes: PDF.length });
+    expect(await there(f)).toBe(false);
+  });
+
+  it("R338 a: a file in a subfolder of the inbox is outside: neither read nor removed", async () => {
+    await mkdir(join(inbox, "sub"), { mode: 0o700 });
+    const sub = await put(join(inbox, "sub", `${ID}.pdf`));
+    expect(await takeInboxFile(inbox, { id: ID, path: sub }, target(), { fs: recording() })).toEqual({ ok: false, why: "outside" });
+    await discardInboxFile(inbox, sub, recording());
+    expect(calls.some((c) => c.op === "open" || c.op === "unlink")).toBe(false);
+    expect(await readFile(sub)).toEqual(PDF);
   });
 
   it("a symlink in the inbox is refused: the link itself is removed, never its target, and the target is not read", async () => {
@@ -223,7 +283,7 @@ describe("takeInboxFile: the path's checks", () => {
     expect(await takeInboxFile(inbox, { id: ID, path: join(inbox, `${ID}.pdf`) }, target(), { fs: recording() })).toEqual({ ok: false, why: "inbox" });
     await discardInboxFile(inbox, join(inbox, `${ID}.pdf`), recording());
     expect(await there(f)).toBe(true);
-    expect(calls.some((c) => c.op === "rm" || c.op === "open")).toBe(false);
+    expect(calls.some((c) => c.op === "unlink" || c.op === "open")).toBe(false);
   });
 
   it("an inbox open to others (not 0700), missing, or not a folder refuses everything; nothing is removed", async () => {
@@ -271,11 +331,25 @@ describe("takeInboxFile: the path's checks", () => {
     expect(calls.some((c) => c.op === "open")).toBe(false);
   });
 
-  it("a directory named like a grant is refused and removed", async () => {
+  it("R338 d: a directory named like a grant is refused and left alone, with what is in it (never removed as a tree)", async () => {
     await mkdir(inInbox());
     await writeFile(join(inInbox(), "inner.pdf"), PDF);
-    expect(await takeInboxFile(inbox, { id: ID, path: inInbox() }, target())).toEqual({ ok: false, why: "not-regular" });
+    expect(await takeInboxFile(inbox, { id: ID, path: inInbox() }, target(), { fs: recording() })).toEqual({ ok: false, why: "not-regular" });
+    await discardInboxFile(inbox, inInbox(), recording());
+    expect(await readFile(join(inInbox(), "inner.pdf"))).toEqual(PDF);
+    expect(calls.some((c) => c.op === "open" || c.op === "unlink")).toBe(false);
+  });
+
+  it("R338 d: what the line names inside the inbox is removed as ONE entry: a file, or a link (its target stays)", async () => {
+    const f = await put(inInbox());
+    await discardInboxFile(inbox, f, recording());
+    expect(await there(f)).toBe(false);
+    const secret = await put(join(outside, "secret.pdf"));
+    await symlink(secret, inInbox());
+    await discardInboxFile(inbox, inInbox(), recording());
     expect(await there(inInbox())).toBe(false);
+    expect(await readFile(secret)).toEqual(PDF);
+    expect(calls.filter((c) => c.op === "unlink").map((c) => c.path)).toEqual([inInbox(), inInbox()]);
   });
 
   it("a FIFO in the inbox is refused without being opened, and removed", async () => {

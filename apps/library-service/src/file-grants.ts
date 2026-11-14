@@ -12,15 +12,21 @@
  * `parseFileGrantLine` is as strict as `parseGrantLine` (folder-grants.ts): the line must be byte for byte
  * `JSON.stringify` of the four keys in that order — no spaces, no other key, no duplicated key, no other escape form, no
  * byte-order mark — at most GRANT_LINE_MAX_BYTES; `id` and `ticket` 32 lower-case hexadecimal characters; `path`
- * absolute, without NUL, at most GRANT_PATH_MAX_BYTES in UTF-8 (the shell's own bound, `file_grant_line`). The one
- * tolerance is the line reader's (startup-token.ts): one `\r` before the line end is removed. A `..` in the path is a
- * string like any other here; the real-parent check below is what decides where the file is.
+ * absolute, well-formed text (no lone surrogate, R338 c), without NUL, at most GRANT_PATH_MAX_BYTES in UTF-8 (the
+ * shell's own bound, `file_grant_line`). The one tolerance is the line reader's (startup-token.ts): one `\r` before the
+ * line end is removed. A `..` in the path is a string like any other here; the check below makes such a path "outside".
  *
- * `takeInboxFile` takes the file, in this order, never acting on a path whose real parent is not the inbox:
+ * "Inside the inbox" means a file DIRECTLY in it (R338 a): a path in a subfolder of the inbox is outside, and is neither
+ * read nor removed (the shell makes no subfolders).
+ *
+ * `takeInboxFile` takes the file, in this order, never acting on a path outside the inbox:
  *  1. the inbox: `lstat` — a directory, not a symbolic link, the user's, mode 0700 — else everything is refused and
  *     NOTHING is touched (not even deleted: a folder that is not the shell's private one is not the app's to clean);
- *  2. the real parent: `realpath` of the path's folder must equal `realpath` of the inbox, else "outside": the path is
- *     never opened, never deleted, never echoed. From here on the file is addressed as `<real inbox>/<its name>` only;
+ *     then its real path (`realpath` of the inbox itself, the only one ever asked for);
+ *  2. the path's folder, AS TEXT (R338 b): `dirname(path)` must equal the inbox as given or the inbox's real path, else
+ *     "outside": the path, and its folder, are never looked up, opened, deleted or echoed — no call of the file system
+ *     names them (a `..`, a `.`, a doubled `/` or a link in a middle folder is outside). From here on the file is
+ *     addressed as `<real inbox>/<its name>` only;
  *  3. its name: exactly the line's `id` + ".pdf";
  *  4. `lstat`: a regular file (not a link, a folder or a FIFO), the user's, one link only (a hard link's other name
  *     may be any file of the user's), at most the limit;
@@ -28,8 +34,9 @@
  *     block), then `fstat` on the handle: regular, the same device and inode as the `lstat`, one link, within the limit;
  *  6. the bytes are read from that handle only, into a NEW file created exclusively (0600, O_NOFOLLOW), the limit
  *     enforced on what is read (a file that grows meanwhile is cut off and refused);
- *  7. in EVERY outcome from step 3 on — taken or refused — the inbox's entry of that name is removed (a symbolic link
- *     itself, never its target; a folder with what is in it).
+ *  7. in EVERY outcome from step 3 on — taken or refused — the inbox's entry of that name is removed as ONE entry
+ *     (R338 d): `unlink` of a file or of a symbolic link itself (never its target); a folder there is left alone, never
+ *     removed as a tree.
  * Every refusal is a code; no message, property or log line carries the path or the line.
  */
 import { constants as FS } from "node:fs";
@@ -44,6 +51,8 @@ export const inboxOf = (appConfigDir: string): string => join(appConfigDir, LIBR
 
 const FILE_GRANT_TYPE = "file-grant";
 const HEX32 = /^[0-9a-f]{32}$/u;
+/** A surrogate that is not half of a pair (R338 c: `!isWellFormed()`; a pair is one code point, never `Cs`). */
+const LONE_SURROGATE = /\p{Cs}/u;
 
 export interface FileGrant {
   id: string;
@@ -65,7 +74,7 @@ export function parseFileGrantLine(line: string): FileGrant | null {
   if (Object.keys(o).length !== 4 || o.type !== FILE_GRANT_TYPE) return null;
   const { id, ticket, path } = o;
   if (typeof id !== "string" || !HEX32.test(id) || typeof ticket !== "string" || !HEX32.test(ticket)) return null;
-  if (typeof path !== "string" || path === "" || path.includes("\u0000") || !isAbsolute(path) || Buffer.byteLength(path, "utf8") > GRANT_PATH_MAX_BYTES) return null;
+  if (typeof path !== "string" || path === "" || path.includes("\u0000") || LONE_SURROGATE.test(path) || !isAbsolute(path) || Buffer.byteLength(path, "utf8") > GRANT_PATH_MAX_BYTES) return null;
   // Exactly the shell's text: the keys in order, no spaces, the plain escapes, no duplicated or extra key.
   if (JSON.stringify({ type: FILE_GRANT_TYPE, id, ticket, path }) !== line) return null;
   return { id, ticket, path };
@@ -96,16 +105,16 @@ export interface InboxFs {
   lstat(path: string): Promise<import("node:fs").Stats>;
   realpath(path: string): Promise<string>;
   open(path: string, flags: number, mode?: number): Promise<fsp.FileHandle>;
-  rm(path: string, opts: { recursive?: boolean; force?: boolean }): Promise<void>;
+  unlink(path: string): Promise<void>;
 }
 const realFs: InboxFs = {
   lstat: (p) => fsp.lstat(p),
   realpath: (p) => fsp.realpath(p),
   open: (p, flags, mode) => fsp.open(p, flags, mode),
-  rm: (p, o) => fsp.rm(p, o),
+  unlink: (p) => fsp.unlink(p),
 };
 
-/** Why a file was not taken. `inbox` and `outside`: nothing was touched; every other: the inbox's entry was removed. */
+/** Why a file was not taken. `inbox` and `outside`: nothing was touched; every other: the inbox's entry was removed (a folder is left alone). */
 export type InboxRefusal = "inbox" | "outside" | "name" | "not-regular" | "not-yours" | "linked" | "too-large" | "changed" | "unreadable";
 
 const uid = (): number | undefined => (typeof process.getuid === "function" ? process.getuid() : undefined);
@@ -124,23 +133,26 @@ async function inboxReal(inbox: string, fs: InboxFs): Promise<string | null> {
   }
 }
 
-/** `<real inbox>/<name>` when the path's real parent is the inbox and its name is a plain one (step 2), else null. */
-async function insideInbox(realInbox: string, path: string, fs: InboxFs): Promise<string | null> {
+/**
+ * `<real inbox>/<name>` when the path's folder IS the inbox — compared as text with the inbox as given or its real path,
+ * before (and without) any call of the file system — and its name is a plain one (step 2), else null.
+ */
+function insideInbox(inbox: string, realInbox: string, path: string): string | null {
   if (typeof path !== "string" || !isAbsolute(path) || path.includes("\u0000")) return null;
   const name = basename(path);
   if (name === "" || name === "." || name === ".." || name.includes("/")) return null;
-  let parent: string;
-  try {
-    parent = await fs.realpath(dirname(path));
-  } catch {
-    return null;
-  }
-  return parent === realInbox ? join(realInbox, name) : null;
+  const folder = dirname(path);
+  return folder === inbox || folder === realInbox ? join(realInbox, name) : null;
 }
 
-/** Removes the inbox's entry `at` (already proved inside the inbox): a link itself, a folder with its contents. */
+/** Removes the inbox's entry `at` (already proved inside the inbox) as one entry: a file or a link; a folder stays. */
 async function removeInside(at: string, fs: InboxFs): Promise<void> {
-  await fs.rm(at, { recursive: true, force: true }).catch(() => undefined);
+  try {
+    if ((await fs.lstat(at)).isDirectory()) return;
+    await fs.unlink(at);
+  } catch {
+    // gone already, or not removable: nothing more is done
+  }
 }
 
 /**
@@ -158,7 +170,7 @@ export async function takeInboxFile(
   const max = Math.min(o.maxBytes ?? LIBRARY_FILE_MAX_BYTES, LIBRARY_FILE_MAX_BYTES);
   const realInbox = await inboxReal(inbox, fs);
   if (!realInbox) return { ok: false, why: "inbox" };
-  const at = await insideInbox(realInbox, grant.path, fs);
+  const at = insideInbox(inbox, realInbox, grant.path);
   if (!at) return { ok: false, why: "outside" };
   try {
     return await takeAt(at, grant.id, to, max, o.readChunk ?? 1 << 20, fs);
@@ -227,6 +239,6 @@ async function takeAt(at: string, id: string, to: string, max: number, chunk: nu
 export async function discardInboxFile(inbox: string, path: string, fs: InboxFs = realFs): Promise<void> {
   const realInbox = await inboxReal(inbox, fs);
   if (!realInbox) return;
-  const at = await insideInbox(realInbox, path, fs);
+  const at = insideInbox(inbox, realInbox, path);
   if (at) await removeInside(at, fs);
 }
