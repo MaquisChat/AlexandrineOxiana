@@ -26,6 +26,7 @@ import {
   FIND_TYPED_MAX,
   FindAlreadyAddedError,
   FindUnknownOptionError,
+  worksAddedFrom,
   isPersonId,
   isWorkId,
   type PersonCandidate,
@@ -102,7 +103,7 @@ true satisfies Same<FindStoppedFor["code"] | "index-needs-rebuild", FindStoppedC
 true satisfies Same<WorkCandidate, FindWorkCandidate>;
 true satisfies Same<OfferLink, FindOfferLink>;
 true satisfies Same<LibraryMatch, FindMatch>;
-true satisfies Same<Omit<FindEntry, "people" | "works" | "removed" | "added"> & { peopleCount?: number; worksCount?: number; addedCount?: number }, FindEntryView>;
+true satisfies Same<Omit<FindEntry, "people" | "works" | "removed"> & { peopleCount?: number; worksCount?: number; addedCount?: number }, FindEntryView>;
 true satisfies Same<PersonCandidate, FindPersonCandidate>;
 true satisfies Same<typeof LIBRARY_PEOPLE_MAX, typeof FIND_PEOPLE_MAX>;
 true satisfies Same<typeof LIBRARY_PERSON_WORKS_MAX, typeof FIND_PERSON_WORKS_MAX>;
@@ -113,28 +114,41 @@ true satisfies Same<typeof FIND_TYPED_MAX, typeof FIND_LINE_MAX_CHARS>;
 true satisfies Same<typeof REFERENCE_MIN_CHARS, typeof FIND_LINE_MIN_CHARS>;
 
 /**
- * An entry as the screen gets it: at most FIND_CANDIDATES_SENT candidates; an author's lists (people, works, the
- * works added) only as COUNTS (R267 b: a queue of 500 entries must not carry 200 works each) — the lists come from
- * `GET …/:eid/options`.
+ * An entry as the screen gets it: at most FIND_CANDIDATES_SENT candidates; an author's lists (people, works) only as
+ * COUNTS (R267 b: a queue of 500 entries must not carry 200 works each) — the lists come from `GET …/:eid/options`.
+ * `added` is the set of works added from it, worked out from the queue's live entries (R271 M5; `addedOf`).
  */
-export function entryView(e: FindEntry): FindEntryView {
-  const { people, works, added, removed: _removed, candidates, ...rest } = e;
+export function entryView(e: FindEntry, added?: ReadonlySet<string>): FindEntryView {
+  const { people, works, removed: _removed, candidates, ...rest } = e;
+  const n = works && added ? works.filter((w) => added.has(w.id)).length : 0;
   return {
     ...rest,
     ...(candidates ? { candidates: candidates.slice(0, FIND_CANDIDATES_SENT) } : {}),
     ...(people ? { peopleCount: people.length } : {}),
     ...(works ? { worksCount: works.length } : {}),
-    ...(added?.length ? { addedCount: added.length } : {}),
+    ...(n > 0 ? { addedCount: n } : {}),
   };
 }
 
-/** Task F8: the entry's lists for the dialog that opens on it; each work this entry already added is marked. */
-export function optionsOf(e: FindEntry): FindOptionsResponse {
-  const added = new Set(e.added ?? []);
+/** R271 M5: per author's entry, the works added from it — those of the live entries made from it. */
+function addedOf(entries: Iterable<FindEntry>): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  const all = [...entries];
+  for (const e of all) if (e.parentId !== undefined && !out.has(e.parentId)) out.set(e.parentId, worksAddedFrom(all, e.parentId));
+  return out;
+}
+
+/**
+ * Task F8: the entry's lists for the dialog that opens on it; each work added from it (worked out from the live
+ * entries, R271 M5) is marked; in "choose-works", whose works they are (R271 M6).
+ */
+export function optionsOf(e: FindEntry, added: ReadonlySet<string>): FindOptionsResponse {
+  const chosen = e.state === "choose-works" ? e.people?.find((p) => p.id === e.chosen) : undefined;
   return {
     ...(e.candidates ? { candidates: e.candidates.slice(0, FIND_CANDIDATES_SENT) } : {}),
     ...(e.people && e.state === "choose-person" ? { people: e.people } : {}),
     ...(e.works ? { works: e.works.map((w): FindPersonWork => (added.has(w.id) ? { ...w, added: true } : w)) } : {}),
+    ...(chosen ? { person: { name: chosen.name, ...(chosen.affiliation ? { affiliation: chosen.affiliation } : {}), subjects: chosen.subjects } } : {}),
   };
 }
 
@@ -250,8 +264,9 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     // Read from the file every time (R247 M10): right after an open, the answer never lags behind it.
     const screen = await readFindScreen(state.deps.appConfigDir);
     reply.header("Cache-Control", "no-store");
+    const added = addedOf(q.entries.values());
     return {
-      entries: [...q.entries.values()].map(entryView),
+      entries: [...q.entries.values()].map((e) => entryView(e, added.get(e.id))),
       checkEverything: screen.checkEverything,
       lockedProjectsNotChecked: runner && !readOnly ? runner.lockedNotChecked() : 0,
       readOnly,
@@ -277,7 +292,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const collectionId = b.collectionId;
     if (collectionId !== undefined && (typeof collectionId !== "string" || !isId(collectionId))) throw badRequest("The collection is not one of this project's.");
     const r = await pressed(s, projectId, () => runner.add(projectId, lines, collectionId), "Nothing was added.");
-    return { added: r.added.map(entryView), mergedLines: r.mergedLines };
+    return { added: r.added.map((e) => entryView(e)), mergedLines: r.mergedLines };
   });
 
   app.post("/projects/:id/find/:eid/choose", limit, async (req): Promise<FindEntryView> => {
@@ -348,7 +363,10 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
   app.get("/projects/:id/find/:eid/options", async (req, reply): Promise<FindOptionsResponse> => {
     const { s, projectId, entryId } = addressed(req, true);
     reply.header("Cache-Control", "no-store");
-    return optionsOf(await entryOf(s, projectId, entryId));
+    const q = await inWords(() => readFindQueueOf(s.repo, projectId));
+    const e = q.entries.get(entryId);
+    if (!e) throw new ApiError(404, "NOT_FOUND", FIND_ROUTE_TEXT.entryNotFound);
+    return optionsOf(e, worksAddedFrom(q.entries.values(), entryId));
   });
 
   /** The person meant, for an entry asking "which person" only; one of THAT entry's people (no request names another author). */
@@ -356,7 +374,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const { s, projectId, entryId } = addressed(req, true);
     const runner = runnerOf(s);
     const personId = bodyAs<FindPersonRequest>(req).personId;
-    if (!isPersonId(personId)) throw badRequest(FIND_ROUTE_TEXT.personId);
+    if (!isPersonId(personId)) throw new ApiError(400, "VALIDATION", FIND_ROUTE_TEXT.personId, "person-id");
     const cur = await entryOf(s, projectId, entryId);
     // A second press, or a press on any other state: a 409 in words, nothing changed.
     if (cur.state !== "choose-person") throw new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
@@ -369,11 +387,13 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const { s, projectId, entryId } = addressed(req, true);
     const runner = runnerOf(s);
     const workIds = bodyAs<FindWorksRequest>(req).workIds as unknown;
-    if (!Array.isArray(workIds)) throw badRequest('"workIds" must be a list of the works ticked.');
-    if (workIds.length === 0) throw badRequest(FIND_ROUTE_TEXT.noWorks);
-    if (workIds.length > FIND_CHOOSE_WORKS_MAX) throw badRequest(FIND_ROUTE_TEXT.tooManyWorks);
+    // Every refusal of a malformed list carries the reason "work-ids" (R271 M9).
+    const malformed = (message: string) => new ApiError(400, "VALIDATION", message, "work-ids");
+    if (!Array.isArray(workIds)) throw malformed('"workIds" must be a list of the works ticked.');
+    if (workIds.length === 0) throw malformed(FIND_ROUTE_TEXT.noWorks);
+    if (workIds.length > FIND_CHOOSE_WORKS_MAX) throw malformed(FIND_ROUTE_TEXT.tooManyWorks);
     workIds.forEach((id, i) => {
-      if (!isWorkId(id)) throw badRequest(findWorkIdRefusal(i + 1));
+      if (!isWorkId(id)) throw malformed(findWorkIdRefusal(i + 1));
     });
     const ids = workIds as string[];
     const cur = await entryOf(s, projectId, entryId);
@@ -381,7 +401,9 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     const offered = new Set((cur.works ?? []).map((w) => w.id));
     if (!ids.every((id) => offered.has(id))) throw new ApiError(400, "VALIDATION", FIND_ROUTE_TEXT.unknownWork, "unknown-work");
     const r = await pressed(s, projectId, () => runner.chooseWorks(projectId, entryId, ids), "Nothing was added.");
-    return { added: r.added.map(entryView), entry: entryView(r.parent) };
+    // The count is worked out from the queue as it now is (R271 M5).
+    const now = await inWords(() => readFindQueueOf(s.repo, projectId));
+    return { added: r.added.map((e) => entryView(e)), entry: entryView(r.parent, worksAddedFrom(now.entries.values(), entryId)) };
   });
 
   app.get("/find/screen", async (req): Promise<FindScreenSettings> => {

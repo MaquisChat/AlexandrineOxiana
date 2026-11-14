@@ -1013,7 +1013,7 @@ describe("F8: an author alone", () => {
   /** Two people of that name: A5001 with 60 works, A5002 with 3. */
   function twoPeople(): void {
     answers.set(NAME, cr());
-    peopleAnswers.set(NAME, { meta: { count: 2 }, results: [person(5001, NAME, "Vexmoor Institute of Made-up Things"), person(5002, "Ottoline R. Vexmoor", "College of Vexmoor Studies")] });
+    peopleAnswers.set(NAME, { meta: { count: 2 }, results: [{ ...person(5001, NAME, "Vexmoor Institute of Made-up Things"), topics: [{ display_name: "Vexmoor Coastal Ledgers" }] }, person(5002, "Ottoline R. Vexmoor", "College of Vexmoor Studies")] });
     personWorks.set("A5001", Array.from({ length: 60 }, (_, i) => work(1000 + i, `Vexmoor Ledger ${i}`, `${2024 - i}-01-01`)));
     personWorks.set("A5002", Array.from({ length: 3 }, (_, i) => work(2000 + i, `Vexmoor Harbour ${i}`, `${2010 - i}-01-01`)));
     for (const ws of personWorks.values()) for (const w of ws as Array<ReturnType<typeof work>>) singles.set(w.id.slice("https://openalex.org/".length), w);
@@ -1058,8 +1058,8 @@ describe("F8: an author alone", () => {
     expect(o1.status).toBe(200);
     expect(o1.headers["cache-control"]).toBe("no-store");
     expect(o1.json).toEqual({ people: [
-      { id: "A5001", name: NAME, affiliation: "Vexmoor Institute of Made-up Things", worksCount: 12, sampleTitles: [] },
-      { id: "A5002", name: "Ottoline R. Vexmoor", affiliation: "College of Vexmoor Studies", worksCount: 12, sampleTitles: [] },
+      { id: "A5001", name: NAME, affiliation: "Vexmoor Institute of Made-up Things", worksCount: 12, subjects: ["Vexmoor Coastal Ledgers"] },
+      { id: "A5002", name: "Ottoline R. Vexmoor", affiliation: "College of Vexmoor Studies", worksCount: 12, subjects: [] },
     ] });
     const pressed = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A5001" } });
     expect(pressed.status, pressed.body).toBe(200);
@@ -1071,11 +1071,13 @@ describe("F8: an author alone", () => {
     const t = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1000", "W1002"] } });
     expect(t.status, t.body).toBe(200);
     expect(t.json.added).toHaveLength(2);
-    expect(t.json.added[0]).toMatchObject({ parentId: eid, chosen: "W1000", typed: "Vexmoor Ledger 0, Vexmoor" });
+    expect(t.json.added[0]).toMatchObject({ parentId: eid, work: "W1000", typed: "Vexmoor Ledger 0, Vexmoor" });
     expect(t.json.entry).toMatchObject({ id: eid, state: "choose-works", worksCount: 60, addedCount: 2 });
     expect(t.json.entry).not.toHaveProperty("added");
     const o2 = await call({ url: `/projects/${pid}/find/${eid}/options` });
     expect(o2.json.people).toBeUndefined();
+    // R271 M6: the person whose works these are is named.
+    expect(o2.json.person).toEqual({ name: NAME, affiliation: "Vexmoor Institute of Made-up Things", subjects: ["Vexmoor Coastal Ledgers"] });
     expect(o2.json.works).toHaveLength(60);
     expect(o2.json.works.filter((w: { added?: true }) => w.added).map((w: { id: string }) => w.id)).toEqual(["W1000", "W1002"]);
     expect(o2.json.works[0]).toMatchObject({ id: "W1000", title: "Vexmoor Ledger 0", issued: "2024-01-01", type: "article-journal", container: "Vexmoor Review of Invented Studies", identifiers: { doi: "10.5555/ao.f8.r1000" } });
@@ -1086,6 +1088,23 @@ describe("F8: an author alone", () => {
     for (const ev of events) if (ev.type === "find.progress") expect(Object.keys(ev.data as object).sort()).toEqual(["entryId", "projectId", "state"]);
   });
 
+  it("R271 M5: what was added follows the queue's live entries: remove an added entry, and the count, the mark and the tick follow", async () => {
+    const { pid, eid } = await choosingPerson();
+    await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A5001" } });
+    await waitState(pid, eid, "choose-works");
+    const t = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1003", "W1004"] } });
+    expect(t.json.entry.addedCount).toBe(2);
+    const kid = (t.json.added as FindEntryView[])[0]!;
+    expect((await call({ method: "DELETE", url: `/projects/${pid}/find/${kid.id}` })).status).toBe(200);
+    expect((await entry(pid, eid))!.addedCount).toBe(1);
+    const o = await call({ url: `/projects/${pid}/find/${eid}/options` });
+    expect(o.json.works.filter((w: { added?: true }) => w.added).map((w: { id: string }) => w.id)).toEqual(["W1004"]);
+    const again = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1003"] } });
+    expect(again.status, again.body).toBe(200);
+    expect(again.json.entry.addedCount).toBe(2);
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1003"] } })).json.error.reason).toBe("already-added");
+  });
+
   it("a person id not among the entry's people is refused; so is a works id not among its works; choosePerson twice: the second is refused in words", async () => {
     const { pid, eid } = await choosingPerson();
     const bad = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId: "A9999" } });
@@ -1094,6 +1113,7 @@ describe("F8: an author alone", () => {
     for (const personId of ["https://openalex.org/A5001", "A", 5001, null, "A5001 "]) {
       const r = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/person`, body: { personId } });
       expect(r.status, String(personId)).toBe(400);
+      expect(r.json.error.reason, String(personId)).toBe("person-id");
     }
     // Works on an entry that is not choosing works: 409 in words.
     const early = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1000"] } });
@@ -1107,7 +1127,7 @@ describe("F8: an author alone", () => {
     const notHis = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W2000", "W1000"] } });
     expect(notHis.status).toBe(400);
     expect(notHis.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.unknownWork, reason: "unknown-work" });
-    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W2000", "x"] } })).json.error.message).toBe(findWorkIdRefusal(2));
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W2000", "x"] } })).json.error).toMatchObject({ message: findWorkIdRefusal(2), reason: "work-ids" });
     // An entry of another project, or none: 404.
     const other = await newProject(false, "Other");
     expect((await call({ method: "POST", url: `/projects/${other}/find/${eid}/works`, body: { workIds: ["W2000"] } })).status).toBe(404);
@@ -1121,9 +1141,9 @@ describe("F8: an author alone", () => {
     const ids = Array.from({ length: 51 }, (_, i) => `W${1000 + i}`);
     const many = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ids } });
     expect(many.status).toBe(400);
-    expect(many.json.error.message).toBe(FIND_ROUTE_TEXT.tooManyWorks);
-    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: [] } })).json.error.message).toBe(FIND_ROUTE_TEXT.noWorks);
-    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: "W1000" } })).status).toBe(400);
+    expect(many.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.tooManyWorks, reason: "work-ids" });
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: [] } })).json.error).toMatchObject({ message: FIND_ROUTE_TEXT.noWorks, reason: "work-ids" });
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: "W1000" } })).json.error.reason).toBe("work-ids");
     expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1003"] } })).status).toBe(200);
     const twice = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/works`, body: { workIds: ["W1004", "W1003"] } });
     expect(twice.status).toBe(409);

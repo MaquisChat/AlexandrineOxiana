@@ -105,6 +105,9 @@ export const FIND_REFUSAL_REASONS = [
   "unknown-person",
   "unknown-work",
   "already-added",
+  // R271 M9: a `personId` that is not OpenAlex's form; `workIds` that are not a list of 1 to 50 of OpenAlex's work ids.
+  "person-id",
+  "work-ids",
 ] as const;
 export type FindRefusalReason = (typeof FIND_REFUSAL_REASONS)[number];
 
@@ -251,13 +254,22 @@ export interface FindEntryView {
    */
   peopleCount?: number;
   worksCount?: number;
+  /** Worked out from the queue's live entries made from this entry (R271 M5), never stored. */
   addedCount?: number;
   morePeople?: true;
   moreWorks?: true;
+  /**
+   * F8: on an entry made from an author's entry (`parentId`), the OpenAlex id of the work it was made from. Its `typed`
+   * was built by the app (title, family name), not typed: F9 says where it came from (R271 M7).
+   */
+  work?: string;
 }
 
 /** Task F8: a person an author's name may mean (OpenAlex's author `A<digits>`). Every string is outside text. */
-export type FindPersonCandidate = { id: string; name: string; affiliation?: string; worksCount: number; sampleTitles: string[] };
+export type FindPersonCandidate = { id: string; name: string; affiliation?: string; worksCount: number; subjects: string[] };
+
+/** Task F8 (R271 M6): the person whose works an entry in "choose-works" lists. Outside text. */
+export type FindChosenPerson = { name: string; affiliation?: string; subjects: string[] };
 
 /** Task F8: a work of the chosen person, as kept for choosing; `added` when this entry already made an entry of it. */
 export type FindPersonWork = FindWorkCandidate & { added?: true };
@@ -270,6 +282,8 @@ export interface FindOptionsResponse {
   people?: FindPersonCandidate[];
   /** "choose-works": the person's works, newest first (at most 200). */
   works?: FindPersonWork[];
+  /** "choose-works": whose works these are (R271 M6). */
+  person?: FindChosenPerson;
 }
 
 /** Task F8: `POST /projects/:id/find/:eid/person`. */

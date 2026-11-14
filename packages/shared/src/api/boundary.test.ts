@@ -61,7 +61,7 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect([FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX]).toEqual([20, 200, 50]);
     expect(FIND_MORE_PEOPLE_TEXT).toBe("More people have this name; add a word from a title to narrow it");
     expect(FIND_MORE_WORKS_TEXT).toMatch(/^[A-Z].*\.$/);
-    for (const r of ["unknown-person", "unknown-work", "already-added"] as const) expect(FIND_REFUSAL_REASONS).toContain(r);
+    for (const r of ["unknown-person", "unknown-work", "already-added", "person-id", "work-ids"] as const) expect(FIND_REFUSAL_REASONS).toContain(r);
     for (const k of ["unknownPerson", "unknownWork", "noWorks", "tooManyWorks", "personId"] as const) expect(FIND_ROUTE_TEXT[k]).toMatch(/^[A-Z].*\.$/);
     expect(FIND_ROUTE_TEXT.tooManyWorks).toBe("At most 50 works can be added at once. Nothing was added.");
     expect(findAlreadyAddedRefusal(3)).toBe("Work 3 was already added from this entry. Nothing was added.");
