@@ -11,11 +11,14 @@
  *   POST /find/browser/file/:ticket   the PDF's bytes (`Content-Type: application/pdf`), header `x-ao-page` (the tab's
  *                                     address) → { outcome, sentence }. In this order: (i) the ticket (the open
  *                                     browser's, constant time) else 404 "browser-not-waiting", the body not taken;
- *                                     (ii) the page else 400 "browser-page"; (iii) one file at a time for the whole
- *                                     service else 409 "browser-busy"; (iv) the body STREAMED into
+ *                                     (ii) the page (given once, no ", " in it — R353 f) else 400 "browser-page";
+ *                                     (iii) one file at a time for the whole service else 409 "browser-busy"; the
+ *                                     inbox a private folder of the user's, else 503 "browser-inbox" (R353 g, nothing
+ *                                     written); (iv) the body STREAMED into
  *                                     `<AO_CONFIG_DIR>/browser-inbox/<32 hex>.pdf` (folder 0700, file 0600, created
  *                                     exclusively): over LIBRARY_FILE_MAX_BYTES 413 "browser-too-large", not `%PDF-`
- *                                     400 "browser-not-pdf", cut off or stalled 400 "browser-cut-off" — in each the
+ *                                     400 "browser-not-pdf", cut off, stalled or not ended FIND_BROWSER_TAKE_MS after
+ *                                     the ticket's check (R353 a) 400 "browser-cut-off" — in each the
  *                                     ticket stays open; (v) only then the seam (`libraryHandedOver(ticket,
  *                                     "browser")`; null is (i)'s answer) and F17's path (`acceptLibraryFile`, via
  *                                     "browser-extension", the tab's address), which HOLDS the file for the
@@ -43,6 +46,7 @@ import {
   FIND_BROWSER_PAGE_HEADER,
   FIND_BROWSER_PAGE_MAX,
   FIND_BROWSER_STALL_MS,
+  FIND_BROWSER_TAKE_MS,
   FIND_BROWSER_TEXT,
   LIBRARY_FILE_MAX_BYTES,
   type FindBrowserFileResponse,
@@ -78,9 +82,18 @@ export function browserLabel(title: string): string {
   return out;
 }
 
-/** The tab's address when it can be the record's: text of at most FIND_BROWSER_PAGE_MAX that parses as https, no user name or password. */
-function pageOf(h: unknown): string | null {
-  if (typeof h !== "string" || h.length === 0 || h.length > FIND_BROWSER_PAGE_MAX) return null;
+/**
+ * The tab's address when it can be the record's: text of at most FIND_BROWSER_PAGE_MAX that parses as https, no user
+ * name or password. R353 f: the header given once only (`rawHeaders`), and no comma followed by a space in it (how Node
+ * joins a header given twice).
+ */
+function pageOf(req: FastifyRequest): string | null {
+  const h: unknown = req.headers[FIND_BROWSER_PAGE_HEADER];
+  const raw = req.raw.rawHeaders;
+  let given = 0;
+  for (let i = 0; i < raw.length; i += 2) if (raw[i]!.toLowerCase() === FIND_BROWSER_PAGE_HEADER) given++;
+  if (given > 1) return null;
+  if (typeof h !== "string" || h.length === 0 || h.length > FIND_BROWSER_PAGE_MAX || h.includes(", ")) return null;
   try {
     const u = new URL(h);
     return u.protocol === "https:" && u.username === "" && u.password === "" ? h : null;
@@ -96,10 +109,11 @@ type Received = { ok: true } | { ok: false; why: "too-large" | "not-pdf" | "cut-
 /**
  * Writes the request stream into `fh` piece by piece (the stream paused while a piece is written), counting the bytes:
  * past LIBRARY_FILE_MAX_BYTES "too-large"; first five bytes not `%PDF-` "not-pdf" (said as soon as they are known);
- * no byte for `stallMs`, an error, a close before the end, or fewer bytes than declared "cut-off". `whole`: the request's
- * body was read to its end (else the connection is closed after the answer).
+ * no byte for `stallMs`, not ended within `takeMs` (R353 a: the overall end, what is left of it from the ticket's check),
+ * an error, a close before the end, or fewer bytes than declared "cut-off". `whole`: the request's body was read to its
+ * end (else the connection is closed after the answer).
  */
-function pump(src: Readable, fh: fsp.FileHandle, declared: number | undefined, stallMs: number): Promise<Received> {
+function pump(src: Readable, fh: fsp.FileHandle, declared: number | undefined, stallMs: number, takeMs: number): Promise<Received> {
   return new Promise((resolve) => {
     let total = 0;
     const head = Buffer.alloc(PDF_MAGIC.length);
@@ -108,10 +122,12 @@ function pump(src: Readable, fh: fsp.FileHandle, declared: number | undefined, s
     let ended = false;
     let writing: Promise<unknown> = Promise.resolve();
     let timer: NodeJS.Timeout | undefined;
+    let overall: NodeJS.Timeout | undefined;
     const settle = (r: Received) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (overall) clearTimeout(overall);
       src.off("data", onData);
       src.off("end", onEnd);
       src.off("error", onFail);
@@ -170,6 +186,7 @@ function pump(src: Readable, fh: fsp.FileHandle, declared: number | undefined, s
     src.on("aborted", onFail);
     src.on("close", onClose);
     arm();
+    overall = setTimeout(() => settle({ ok: false, why: "cut-off", whole: false }), Math.max(0, takeMs));
     src.resume();
   });
 }
@@ -185,6 +202,8 @@ export function registerFindBrowser(app: FastifyInstance, ctx: Ctx): void {
   // R47: the stall's time is a test's switch only under NODE_ENV=test or VITEST.
   const testing = process.env.NODE_ENV === "test" || process.env.VITEST !== undefined;
   const stallMs = testing && ctx.browserStallMs !== undefined ? ctx.browserStallMs : FIND_BROWSER_STALL_MS;
+  // R353 a: the body's overall end, counted from the ticket's check (the same switch rule).
+  const takeMs = testing && ctx.browserTakeMs !== undefined ? ctx.browserTakeMs : FIND_BROWSER_TAKE_MS;
   /** One file at a time for the whole service (R348 f iii): set from the busy check to the answer. */
   let taking = false;
 
@@ -214,8 +233,9 @@ export function registerFindBrowser(app: FastifyInstance, ctx: Ctx): void {
       const ticket = paramsOf(req).ticket ?? "";
       // (i) The ticket: the open browser's, before its end; nothing ended or changed. The same answer for every other.
       if (!state.session?.find?.browserTicketWaits(ticket)) throw notWaiting();
+      const checkedAt = Date.now();
       // (ii) The tab's address.
-      const page = pageOf(req.headers[FIND_BROWSER_PAGE_HEADER]);
+      const page = pageOf(req);
       if (!page) throw new ApiError(400, "VALIDATION", FIND_BROWSER_TEXT.page, "browser-page");
       // (iii) One at a time (checked and claimed with no wait since the ticket's check).
       if (taking) throw new ApiError(409, "CONFLICT", FIND_BROWSER_TEXT.busy, "browser-busy");
@@ -226,16 +246,23 @@ export function registerFindBrowser(app: FastifyInstance, ctx: Ctx): void {
       try {
         // (iv) The body, streamed into the inbox.
         const declared = declaredLength(req);
+        // R353 g: the inbox must be a real folder of the service's user with mode 0700 (made so when absent); else
+        // nothing is written: 503, a warning without the path, the ticket open (the flag goes in the finally).
+        const real = await fsp
+          .mkdir(inbox, { recursive: true, mode: 0o700 })
+          .then(() => privateInboxReal(inbox))
+          .catch(() => null);
+        if (!real) {
+          req.log.warn("The folder for files from the browser cannot be used (not a private folder of this user); nothing was written.");
+          throw new ApiError(503, "UNAVAILABLE", FIND_BROWSER_TEXT.inbox, "browser-inbox");
+        }
         const got = await (async (): Promise<Received> => {
           if (declared !== undefined && declared > LIBRARY_FILE_MAX_BYTES) return { ok: false, why: "too-large", whole: false };
-          await fsp.mkdir(inbox, { recursive: true, mode: 0o700 });
-          const real = await privateInboxReal(inbox);
-          if (!real) throw new Error("the browser's inbox is not a private folder");
           const fh = await fsp.open(join(real, `${id}.pdf`), FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL | FS.O_NOFOLLOW, 0o600);
           try {
             const body = req.body as Readable | undefined;
             if (!body || typeof body.on !== "function") return { ok: false, why: "not-pdf", whole: true };
-            return await pump(body, fh, declared, stallMs);
+            return await pump(body, fh, declared, stallMs, takeMs - (Date.now() - checkedAt));
           } finally {
             await fh.close().catch(() => undefined);
           }

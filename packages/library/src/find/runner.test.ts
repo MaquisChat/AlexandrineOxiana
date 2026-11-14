@@ -6016,6 +6016,59 @@ describe("F15: a fetch through the researcher's library", () => {
         }
       });
 
+      it("R353 d: endBrowserWait — a browser's wait returns exactly as by Cancel (its ticket ends, the label goes, the same change and audit); a window's wait and a file being taken are untouched", async () => {
+        const opsOf = async (p: Project) => [...(await auditText(p)).matchAll(/"op":"([^"]+)"/gu)].map((m) => m[1]);
+        const p = await project({ gov: NO_FREE });
+        const e = await resting(p, RESTING[2]!);
+        const r = runner();
+        // Cancel, for comparison: what it writes, says and audits.
+        await r.browserStart(p.id, e.id, EZ);
+        let ops = (await opsOf(p)).length;
+        let n = changes.length;
+        sameRest(await r.libraryCancel(p.id, e.id), RESTING[2]!);
+        const byCancel = { ops: (await opsOf(p)).slice(ops), changes: changes.slice(n) };
+        // The same by endBrowserWait: the ticket ends at once (before anything is written), the entry back at its rest.
+        const got = await r.browserStart(p.id, e.id, EZ);
+        ops = (await opsOf(p)).length;
+        n = changes.length;
+        const ending = r.endBrowserWait();
+        expect([r.browserWaiting(), r.browserTicketWaits(got.ticket), r.waitingIn(p.id, e.id)]).toEqual([null, false, null]);
+        const back = await ending;
+        sameRest(back!, RESTING[2]!);
+        sameRest(await entryOf(p, e.id), RESTING[2]!);
+        expect({ ops: (await opsOf(p)).slice(ops), changes: changes.slice(n) }).toEqual(byCancel);
+        expect(r.libraryHandedOver(got.ticket, "browser")).toBeNull();
+        // Nothing waiting in the browser: nothing happens.
+        expect(await r.endBrowserWait()).toBeNull();
+        // A window's wait is never touched.
+        const win = await r.libraryStart(p.id, e.id, EZ);
+        expect(await r.endBrowserWait()).toBeNull();
+        expect([r.waitingIn(p.id, e.id), (await entryOf(p, e.id))!.state]).toEqual(["window", "waiting-sign-in"]);
+        expect(r.libraryHandedOver(win.ticket, "window")).toEqual({ projectId: p.id, entryId: e.id });
+        await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(await goodPdf()).file);
+        // A browser's file already handed over (being taken): no ticket is open; its path goes on to its end.
+        timers.now += LIBRARY_PAUSE_MS;
+        const { p: q, e: f, r: r2 } = await browserHandedOver();
+        expect(await r2.endBrowserWait()).toBeNull();
+        expect(await r2.acceptLibraryFile(q.id, f.id, INBOX_PATH, "browser-extension", TAB, handedFile(await goodPdf()).file)).toEqual({ outcome: "held" });
+      });
+
+      it("R353 d: endBrowserWait when the entry cannot be written (its project stopped by a lock meanwhile): the ticket ends all the same; the entry comes back at the resume", async () => {
+        const p = await project({ gov: NO_FREE });
+        const e = await resting(p, RESTING[0]!);
+        const r = runner();
+        const got = await r.browserStart(p.id, e.id, EZ);
+        const ending = r.endBrowserWait();
+        // The lock lands before the write's turn: nothing is written, and the ending says so.
+        r.stop(p.id);
+        await expect(ending).rejects.toBeInstanceOf(FindProjectStoppedError);
+        expect([r.browserWaiting(), r.browserTicketWaits(got.ticket), r.libraryHandedOver(got.ticket, "browser")]).toEqual([null, false, null]);
+        expect((await entryOf(p, e.id))!.state).toBe("waiting-sign-in");
+        r.resume(p.id);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back at the resume");
+        sameRest(await entryOf(p, e.id), RESTING[0]!);
+      });
+
       it("the side and the address are checked again at the hand-over: a browser's hand-over as the window's (or the other way), or a tab address that is not https without user info, is not read (unreadable)", async () => {
         {
           const { p, e, r } = await browserHandedOver();

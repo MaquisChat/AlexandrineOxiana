@@ -706,6 +706,16 @@ export interface FindRunner {
    */
   browserTicketWaits(ticket: unknown): boolean;
   /**
+   * Task F20a round 2 (R353 d): the last browser extension was unpaired — the work waiting in the BROWSER (its open
+   * ticket is the browser's) returns to exactly what it was, as by "Cancel" (`libraryCancel`'s write, change and audit).
+   * Its ticket ends at once, before anything is awaited (no extension paired later can be handed it; the label goes
+   * with it). If the entry cannot be written now (its project stopped by a lock, the runner closed) the promise rejects
+   * and the entry comes back by the existing ways (the resume at the unlock or the next open). Resolves with the entry as
+   * written, or null when no work waits in the browser (none, a window's wait, a file already handed over) — those
+   * are untouched.
+   */
+  endBrowserWait(): Promise<FindEntry | null>;
+  /**
    * Task F18c (R345): the researcher's press "Open it here and fetch the PDF" on one of an entry's links — the second
    * entry point into the same start as `libraryStart` (one ticket for both, the pause, the limit of waiting files, the
    * same "waiting-sign-in", `returnTo` and ways back, the same governed change and audit). What differs: `url` must be
@@ -2976,8 +2986,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   function browserWaiting(): { ticket: string; projectId: string; entryId: string; title: string } | null {
     const t = libTicket;
-    if (closed || !t || t.where !== "browser" || now().getTime() >= t.expires || !repo.isUnlocked(t.projectId)) return null;
+    // (R353 e: no lock guard here — a lock stops the project, which ends its ticket, before its key is dropped.)
+    if (closed || !t || t.where !== "browser" || now().getTime() >= t.expires) return null;
     return { ticket: t.ticket, projectId: t.projectId, entryId: t.entryId, title: t.title };
+  }
+
+  async function endBrowserWait(): Promise<FindEntry | null> {
+    const t = libTicket;
+    if (closed || !t || t.where !== "browser") return null;
+    // The ticket ends now, whatever the write below does (R353 d).
+    dropTicket();
+    // Cancel's write (`returnedFrom`, "update"), in the project's act; refused when the project is stopped or the runner
+    // closed — then the entry comes back at the next resume.
+    return bringBack(t.projectId, t.entryId);
   }
 
   /**
@@ -3254,6 +3275,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     waitingIn,
     browserWaiting,
     browserTicketWaits,
+    endBrowserWait,
     libraryCancel,
     libraryHandedOver,
     atWork,

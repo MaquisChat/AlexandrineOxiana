@@ -776,8 +776,10 @@ export const FIND_BROWSER_PAGE_HEADER = "x-ao-page";
 export const FIND_BROWSER_PAGE_MAX = 2048;
 /** No byte of the PDF for this long: cut off. */
 export const FIND_BROWSER_STALL_MS = 120_000;
+/** R353 a: the body ends within this long of the ticket's check (else cut off), beside the stall's end. */
+export const FIND_BROWSER_TAKE_MS = 300_000;
 /** The file route's refusals, in the order they are checked (each with its sentence in FIND_BROWSER_TEXT). */
-export const FIND_BROWSER_REFUSALS = ["browser-not-waiting", "browser-page", "browser-busy", "browser-too-large", "browser-not-pdf", "browser-cut-off"] as const;
+export const FIND_BROWSER_REFUSALS = ["browser-not-waiting", "browser-page", "browser-busy", "browser-inbox", "browser-too-large", "browser-not-pdf", "browser-cut-off"] as const;
 export type FindBrowserRefusal = (typeof FIND_BROWSER_REFUSALS)[number];
 export const FIND_BROWSER_TEXT = {
   /** 409 "browser-not-paired" (the app's start). */
@@ -792,6 +794,8 @@ export const FIND_BROWSER_TEXT = {
   page: "This tab's address is not an https address, so the app does not take a file from it. The work is still waiting.",
   /** 409 "browser-busy". */
   busy: "A PDF from your browser is being taken in. Try again in a moment.",
+  /** 503 "browser-inbox" (R353 g): the inbox is not a real folder of the service's user with mode 0700; nothing written. */
+  inbox: "The app's folder for files from your browser cannot be used right now. Nothing was kept. The work is still waiting.",
   /** 413 "browser-too-large". */
   tooLarge: "That PDF is larger than 200 MB, so the app does not take it. The work is still waiting.",
   /** 400 "browser-not-pdf". */
