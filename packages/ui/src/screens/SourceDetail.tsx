@@ -14,10 +14,11 @@
  * in the meantime.
  *
  * Task F18b (R340 e, R330 b): a file got by Find and acquire says, under its line, how it was got — where from (a free
- * copy and the service that found it, as the Search sources screen names it; or through the researcher's library), when it
- * was fetched ("Fetched on <date>.", R342 g: the record's time is the fetch's, not when the file was used), and what the app's check had said when the researcher used it — from the file's own `acquired` record. The host is
- * parsed from the recorded address (never taken as given); every part from the record is shown through UserText. A
- * file without such a record shows nothing new.
+ * copy and the service that found it, as the Search sources screen names it; or through the researcher's library), when
+ * it was fetched ("Fetched on <date>.", R342 g: the record's time is the fetch's, not when the file was used), and what
+ * the app's check had said when the researcher used it — from the file's own `acquired` record. The host is parsed
+ * from the recorded address (never taken as given); every part from the record is shown through UserText. A file
+ * without such a record shows nothing new.
  */
 import { HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
