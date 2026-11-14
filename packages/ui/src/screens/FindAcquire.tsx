@@ -68,7 +68,8 @@ import { ChooseWorksDialog } from "../components/ChooseWorksDialog";
 import { authorOfferOf, entryLabel, FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
-import { navigate, projectInQuery, type AppLocation } from "../navigation";
+import { inAppLink, navigate, projectInQuery, type AppLocation } from "../navigation";
+import { searchSourcesHref } from "./SearchSources";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
 import "./FindAcquire.css";
@@ -706,6 +707,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           Check everything I have
         </label>
       </div>
+      <p><a href={searchSourcesHref(projectId)} onClick={inAppLink}>Search sources</a></p>
       {switchNote && (
         <p id={`${ids}-swnote`} className="ao-find__note">
           {switchNote}
