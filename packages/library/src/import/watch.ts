@@ -722,6 +722,8 @@ interface LiveWatch {
   flush(): Promise<void>;
   /** A line written by the researcher's act: the watch's own view follows it. */
   apply(e: WatchRegisterEntry): void;
+  /** The judgement the researcher's act just made of a registered file (R264 b): the watch's memory follows it. */
+  judged(key: string, p: ContentPresence): void;
 }
 const liveWatches = new WeakMap<Repo, Map<string, LiveWatch>>();
 const liveKey = (projectId: string, watchId: string) => `${projectId}\u0000${watchId}`;
@@ -885,6 +887,12 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   /** Of those, the ones not judged local: asked again with the files not downloaded (`recheck`), so that a download is seen. */
   const presenceRecheck = new Set<string>();
   const presenceKept = (e: WatchRegisterEntry | undefined) => !!e && (e.state === "changed" || e.state === "may-have-changed");
+  /** A registered file whose state keeps a judgement and which has none in memory now (R264 a). */
+  const unjudged = (rel: string): boolean => {
+    if (!regReady) return false;
+    const key = fileKey(rel);
+    return presenceKept(reg?.get(key)) && !judgedPresence.has(key);
+  };
   function forgetPresence(key: string) {
     judgedPresence.delete(key);
     presenceRecheck.delete(key);
@@ -1549,7 +1557,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       } else if (e.isFile() || e.isSymbolicLink()) {
         const rel = relName(p);
         w.found.add(rel);
-        addPending(rel, QUIET);
+        // R264 a: a file noted "changed" or "may-have-changed" whose judgement is not in memory (emptied by a lock, or
+        // never made: a new watch) is looked at in this walk — the reading it makes anyway, then the same batched
+        // judgement — even if its reading is as last seen. No other file is looked at more than before.
+        addPending(rel, QUIET | (unjudged(rel) ? FORCE : 0));
       }
     }
   }
@@ -1723,7 +1734,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       for (let i = stable.length - 1; i >= 0; i--) {
         const s = stable[i]!;
         const e = reg?.get(fileKey(s.rel));
-        if (e && (knownReading(e, s.b) || sourceRemoved(e))) {
+        // A "may-have-changed" file back at its registered size and time is NOT as known (R264 c): its content was never
+        // read since; it goes through the whole order below and is compared, as any changed reading is.
+        if (e && ((knownReading(e, s.b) && e.state !== "may-have-changed") || sourceRemoved(e))) {
           stable.splice(i, 1);
           if (!sourceRemoved(e) && (e.state === "changed" || e.state === "gone")) presenceOnly.push(s);
           else await registeredUnchanged(s.rel, e, s.b);
@@ -2528,6 +2541,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     apply: (e) => {
       if (regReady) putEntry(e);
     },
+    judged: (key, p) => {
+      if (regReady) keepPresence(key, p);
+    },
   };
   if (persist && !refused) {
     let m = liveWatches.get(deps.repo);
@@ -2691,13 +2707,19 @@ async function standaloneIo(deps: WatchDeps, projectId: string, watchId: string)
 }
 
 /** Runs one act: inside the running watch of the folder (its one call in flight, its lines written first), or on its own. */
-async function act<T>(deps: WatchDeps, projectId: string, watchId: string, needsFolder: boolean, fn: (io: FileIo | null, apply: (e: WatchRegisterEntry) => void) => Promise<T>): Promise<T> {
+async function act<T>(
+  deps: WatchDeps,
+  projectId: string,
+  watchId: string,
+  needsFolder: boolean,
+  fn: (io: FileIo | null, apply: (e: WatchRegisterEntry) => void, judged: (key: string, p: ContentPresence) => void) => Promise<T>,
+): Promise<T> {
   const live = liveWatches.get(deps.repo)?.get(liveKey(projectId, watchId));
-  if (live) return live.exclusive((io) => fn(io, live.apply));
+  if (live) return live.exclusive((io) => fn(io, live.apply, live.judged));
   // With no watch running, acts on the same watch run one after another (one call in flight on its folder; M7).
   const k = liveKey(projectId, watchId);
   const prev = standaloneActs.get(k) ?? Promise.resolve();
-  const run = prev.then(async () => fn(needsFolder ? await standaloneIo(deps, projectId, watchId) : null, () => {}));
+  const run = prev.then(async () => fn(needsFolder ? await standaloneIo(deps, projectId, watchId) : null, () => {}, () => {}));
   const tail = run.then(
     () => {},
     () => {},
@@ -2729,7 +2751,7 @@ async function registeredEntry(deps: WatchDeps, projectId: string, watchId: stri
  */
 export async function bringInNewVersion(deps: WatchDeps, projectId: string, watchId: string, key: string): Promise<AttachOutcome> {
   refuseUnwritable(deps, projectId);
-  return act(deps, projectId, watchId, true, async (io, apply) => {
+  return act(deps, projectId, watchId, true, async (io, apply, judged) => {
     const e = await registeredEntry(deps, projectId, watchId, key, ["changed", "may-have-changed"], "The file in the folder has not changed since it came in.");
     const f = io!;
     if (e.file.split("/").some((part) => nameRule(part) !== null)) throw new WatchFileNotLocalError();
@@ -2760,6 +2782,8 @@ export async function bringInNewVersion(deps: WatchDeps, projectId: string, watc
     const b = await read();
     if (!b || !sameReading(a, b)) throw new WatchFileNotLocalError();
     const c = (await f.judge([abs])).get(abs);
+    // The press's own judgement is kept by the running watch (R264 b); the guard below decides as before.
+    if (!c || c.presence !== "local" || sameReading(b, c)) judged(e.key, c?.presence ?? "unknown");
     if (!c || c.presence !== "local" || !sameReading(b, c)) throw new WatchFileNotLocalError();
     if (!(await inside())) throw new InvalidInputError(WATCH_REASONS.outside);
     // Checked: "local", exactly as the stability rule saw it; read at once (the window W2 describes, one file).
