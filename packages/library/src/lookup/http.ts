@@ -25,7 +25,9 @@
  *  - `GetOptions.query` (F10: the e-mail Unpaywall requires) is added to the address of the first request only. It is
  *    never part of the cache key (the caller's `cacheKey` names the request without it), a cached entry, an error's
  *    message or any property of an error, and a recorded answer is looked up by the address without it.
- *  - arXiv's export host: one request every 3 seconds (its API terms; F10; one at a time is kept by find/free-copy.ts).
+ *  - arXiv's export host: one request every 3 seconds, one at a time (its API terms; F10, R254 a).
+ *  - An answer whose body holds a value of the request's private `query` (an echoed e-mail) is returned but never
+ *    cached, on disk or in memory (R257 h). `GetOptions.final5xx` (R257 i) makes a 5xx final: not retried.
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -54,6 +56,7 @@ const DEFAULT_RATE = 1;
 /** Requests open at once, per host; a host not listed is unlimited. */
 export const DEFAULT_CONCURRENCY: Readonly<Record<string, number>> = {
   "api.crossref.org": 1,
+  "export.arxiv.org": 1,
 };
 /** The start of a 429's body shown to the caller's decision. */
 const RATE_LIMIT_BODY_BYTES = 4096;
@@ -147,6 +150,8 @@ export interface GetOptions {
   sensitive?: boolean;
   /** Consulted on a 429: true means retrying cannot help (e.g. a daily budget spent), so it is not retried. */
   final429?: (answer: RateLimitAnswer) => boolean;
+  /** True: a 5xx answer is final for this request (not retried). Free-copy lookups set it (R257 i). */
+  final5xx?: boolean;
   /**
    * Parameters added to the address when it is requested (F10: Unpaywall's `email`), percent-encoded. Never part of
    * the cache key, a cached entry, a log line, an error's message or any property of an error: the same answer is
@@ -252,9 +257,10 @@ export class HttpClient {
       }
     }
 
-    const res = await this.fetchWithRetries(url, opts.final429, opts.query);
+    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true);
     if (res.body !== null) validate?.(res.body); // throws: nothing is cached
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
+    if (res.body !== null && echoesQuery(res.body, opts.query)) return entry.body; // never cached (R257 h)
     this.remember(name, entry, sensitive);
     if (!sensitive) await this.writeCache(name, entry);
     return entry.body;
@@ -389,6 +395,7 @@ export class HttpClient {
     url: string,
     final429?: (a: RateLimitAnswer) => boolean,
     query?: Readonly<Record<string, string>>,
+    final5xx = false,
   ): Promise<{ status: 200 | 404; body: string | null }> {
     if (this.recorded) return this.recorded.answer(url);
     const params = query ? Object.entries(query) : [];
@@ -420,7 +427,7 @@ export class HttpClient {
           if (final) throw lastError;
         } else {
           lastError = new LookupHttpError(`The metadata service answered HTTP ${res.status}`, res.status);
-          if (res.status < 500) throw lastError;
+          if (res.status < 500 || final5xx) throw lastError;
         }
       }
       if (attempt < this.maxRetries) await this.sleep(this.retryDelay(attempt, res?.retryAfter));
@@ -484,6 +491,13 @@ export class HttpClient {
       }
     }
   }
+}
+
+/** True when `body` holds a value of the private query, as sent or percent-encoded (case ignored). */
+function echoesQuery(body: string, query: Readonly<Record<string, string>> | undefined): boolean {
+  if (!query) return false;
+  const lower = body.toLowerCase();
+  return Object.values(query).some((v) => v.length > 0 && (lower.includes(v.toLowerCase()) || lower.includes(encodeURIComponent(v).toLowerCase())));
 }
 
 /** A Retry-After (or Backoff) header — seconds or an HTTP date — in milliseconds from `now`; undefined when absent or unreadable. */

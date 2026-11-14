@@ -123,7 +123,8 @@ ${e.doi ? `    <arxiv:doi>${e.doi}</arxiv:doi>` : ""}
   )
   .join("\n")}
 </feed>`;
-const ARTICLE_TITLE_Q = `ti:"rivers and memory in upland villages" AND au:quill`;
+/** arXiv is asked by author and title, spelled as its manual spells it (`au:del_maestro+AND+ti:%22quantum+criticality%22`). */
+const ARTICLE_TITLE_Q = `au:quill AND ti:"rivers and memory in upland villages"`;
 const BOOK_TITLE = "the lantern keepers of ostrava";
 
 const openIaItem = (id: string, over: Record<string, unknown> = {}, files: unknown[] = [{ name: `${id}.pdf`, format: "Text PDF" }]) => ({
@@ -308,7 +309,7 @@ describe("findFreeCopies: the services", () => {
 
   it("arXiv: the address is built from the checked id; an id that is not one is dropped", async () => {
     arxiv(
-      `doi:"${DOI}"`,
+      ARTICLE_TITLE_Q,
       atom([
         { id: "2101.00001v2", title: "Rivers and Memory in Upland Villages", authors: ["Ada Quill"], doi: DOI },
         { id: "../../evil", title: "Rivers and Memory in Upland Villages", authors: ["Ada Quill"], doi: DOI },
@@ -324,22 +325,31 @@ describe("findFreeCopies: the services", () => {
     expect(JSON.stringify(got)).not.toContain("evil");
   });
 
-  it("arXiv by DOI first; an entry without that DOI must agree by title and author; then by title", async () => {
-    arxiv(`doi:"${DOI}"`, atom([{ id: "1901.11111", title: "Something Else Entirely", authors: ["Bo Other"] }]));
-    arxiv(ARTICLE_TITLE_Q, atom([{ id: "1901.22222", title: "Rivers and memory in upland villages", authors: ["A. Quill"] }]));
+  it("arXiv is asked by author and title only, spelled as its manual does; an entry with the record's DOI needs no title check", async () => {
+    arxiv(
+      ARTICLE_TITLE_Q,
+      atom([
+        { id: "1901.11111", title: "Something Else Entirely", authors: ["Bo Other"] },
+        { id: "1901.22222", title: "Rivers and memory in upland villages", authors: ["A. Quill"] },
+        { id: "1901.33333", title: "A Differently Titled Preprint", authors: ["Ada Quill"], doi: DOI.toUpperCase() },
+        { id: "1901.44444", title: "Rivers and Memory in Upland Villages, Volume 2", authors: ["Ada Quill"] },
+      ]),
+    );
     const got = await findFreeCopies(ARTICLE, ctx(), ["arxiv"]);
-    expect(got.offers).toEqual([{ source: "arxiv", url: "https://arxiv.org/pdf/1901.22222", kind: "pdf" }]);
-    expect(requests.map((r) => new URL(r.path, "https://x.invalid").searchParams.get("search_query"))).toEqual([`doi:"${DOI}"`, ARTICLE_TITLE_Q]);
+    expect(got.offers).toEqual([
+      { source: "arxiv", url: "https://arxiv.org/pdf/1901.22222", kind: "pdf" },
+      { source: "arxiv", url: "https://arxiv.org/pdf/1901.33333", kind: "pdf" },
+    ]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.path).toBe("/api/query?search_query=au:quill+AND+ti:%22rivers+and+memory+in+upland+villages%22&max_results=5");
+    expect(requests.some((r) => decodeURIComponent(r.path).includes("doi:"))).toBe(false);
   });
 
   it("arXiv is asked no more than once every 3 seconds", async () => {
     const http = client();
-    arxiv(`doi:"${DOI}"`, atom([]));
-    arxiv(ARTICLE_TITLE_Q, atom([]));
-    arxiv(`doi:"10.5555/second"`, atom([]));
-    arxiv(`ti:"a second study of rivers" AND au:quill`, atom([]));
-    const second = { ...ARTICLE, title: "A Second Study of Rivers", identifiers: { doi: "10.5555/second" } };
-    await Promise.all([findFreeCopies(ARTICLE, ctx(http), ["arxiv"]), findFreeCopies(second, ctx(http), ["arxiv"])]);
+    const works = ["Rivers and Memory in Upland Villages", "A Second Study of Rivers", "Third Notes on Mills", "Fourth Essay on Weirs"].map((title, i) => ({ ...ARTICLE, title, identifiers: { doi: `10.5555/w${i}` } }));
+    for (const w of works) arxiv(`au:quill AND ti:"${w.title.toLowerCase()}"`, atom([]));
+    await Promise.all(works.map((w) => findFreeCopies(w, ctx(http), ["arxiv"])));
     const times = requests.filter((r) => r.origin === "https://export.arxiv.org").map((r) => r.at);
     expect(times).toHaveLength(4);
     for (let i = 1; i < times.length; i++) expect(times[i]! - times[i - 1]!).toBeGreaterThanOrEqual(3000);
@@ -363,8 +373,8 @@ describe("findFreeCopies: the services", () => {
         })();
       })
       .times(4);
-    const second = { ...ARTICLE, title: "A Second Study of Rivers", identifiers: { doi: "10.5555/second" } };
-    await Promise.all([findFreeCopies(ARTICLE, ctx(http), ["arxiv"]), findFreeCopies(second, ctx(http), ["arxiv"])]);
+    const works = ["Rivers and Memory in Upland Villages", "A Second Study of Rivers", "Third Notes on Mills", "Fourth Essay on Weirs"].map((title, i) => ({ ...ARTICLE, title, identifiers: { doi: `10.5555/w${i}` } }));
+    await Promise.all(works.map((w) => findFreeCopies(w, ctx(http), ["arxiv"])));
     expect(requests.filter((r) => r.origin === "https://export.arxiv.org")).toHaveLength(4);
     expect(most).toBe(1);
   });
@@ -485,7 +495,7 @@ describe("findFreeCopies: the Internet Archive", () => {
     iaSearch(Q, ["otherwork", "otherauthor"]);
     iaMeta("otherwork", openIaItem("otherwork", { title: "The Lantern Keepers of Ostrava: Volume Two of the Northern Cycle" }));
     iaMeta("otherauthor", openIaItem("otherauthor", { creator: ["Brook, Tamsin"] }));
-    arxiv(`ti:"${BOOK_TITLE}" AND au:halloway`, atom([{ id: "2202.00002", title: "Lantern Keepers", authors: ["Mira Halloway"] }]));
+    arxiv(`au:halloway AND ti:"${BOOK_TITLE}"`, atom([{ id: "2202.00002", title: "Lantern Keepers", authors: ["Mira Halloway"] }]));
     expect(await findFreeCopies(BOOK, ctx(), ["internetarchive", "arxiv"])).toEqual({ offers: [], elsewhere: [] });
   });
 });
@@ -508,7 +518,7 @@ describe("findFreeCopies: bounds, failures and order", () => {
       ],
     });
     unpaywall({ oa_locations: many("europepmc.org") });
-    arxiv(`doi:"${DOI}"`, atom([1, 2, 3, 4].map((n) => ({ id: `2101.0000${n}`, title: "x", authors: ["y"], doi: DOI }))));
+    arxiv(ARTICLE_TITLE_Q, atom([1, 2, 3, 4].map((n) => ({ id: `2101.0000${n}`, title: "x", authors: ["y"], doi: DOI }))));
     epmc({ resultList: { result: [9, 10, 11, 12].map((n) => ({ doi: DOI, pmcid: `PMC${n}`, isOpenAccess: "Y" })) } });
     s2({ openAccessPdf: { url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC9/pdf/s.pdf" } });
     const got = await findFreeCopies(ARTICLE, ctx(), [...ALL].reverse(), EMAIL);
@@ -564,8 +574,7 @@ describe("findFreeCopies: bounds, failures and order", () => {
     openalex({ best_oa_location: "x", locations: [null, 7, "s", [], { is_oa: "true", pdf_url: "https://arxiv.org/pdf/1" }, { is_oa: true, pdf_url: ["https://arxiv.org/pdf/2"] }, { is_oa: true, pdf_url: "https://arxiv.org/pdf/3", version: { a: 1 }, license: 5 }] });
     s2({ openAccessPdf: { url: { href: "https://arxiv.org/pdf/4" } } });
     epmc([1, 2, 3]);
-    arxiv(`doi:"${DOI}"`, `<!DOCTYPE feed [<!ENTITY a "aaaaaaaaaa">]><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>&a;</id></entry></feed>`);
-    arxiv(ARTICLE_TITLE_Q, "<feed><entry><id>http://arxiv.org/abs/2101.00009</id>"); // not well-formed
+    arxiv(ARTICLE_TITLE_Q, `<!DOCTYPE feed [<!ENTITY a "aaaaaaaaaa">]><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>&a;</id></entry></feed>`);
     unpaywall({ oa_locations: { length: 1e9 } });
     const got = await findFreeCopies(ARTICLE, ctx(), ALL, EMAIL);
     expect(got).toEqual({ offers: [{ source: "openalex", url: "https://arxiv.org/pdf/3", kind: "pdf" }], elsewhere: [] });
@@ -597,5 +606,136 @@ describe("findFreeCopies: bounds, failures and order", () => {
     await findFreeCopies(ARTICLE, ctx(), ALL, EMAIL);
     expect(requests.length).toBeGreaterThan(0);
     expect(requests.every((r) => r.headers.authorization === undefined)).toBe(true);
+  });
+});
+
+const Q2 = `title:("${BOOK_TITLE}") AND creator:(halloway) AND mediatype:texts`;
+
+describe("round 2 (R256, R257)", () => {
+  const LONG: WorkCandidate = { ...BOOK, id: "w-long", title: "Rivers Lanterns and Keepers of the Old Upland Mills in Northern Moravia" };
+  const LONG_T = "rivers lanterns and keepers of the old upland mills in northern moravia";
+  const LONG_Q = `title:("${LONG_T}") AND creator:(halloway) AND mediatype:texts`;
+
+  it("a title search offers only the same title: no volume, review, edition or one-sided subtitle; case and punctuation do not matter", async () => {
+    const titles: Array<[string, string]> = [
+      ["vol2", "Rivers Lanterns and Keepers of the Old Upland Mills in Northern Moravia, Volume 2"],
+      ["review", "Rivers Lanterns and Keepers of the Old Upland Mills in Northern Moravia (review)"],
+      ["second", "Rivers Lanterns and Keepers of the Old Upland Mills in Northern Moravia. Second edition"],
+      ["subtitle", "Rivers Lanterns and Keepers of the Old Upland Mills in Northern Moravia: A History"],
+      ["same", "RIVERS, LANTERNS, AND KEEPERS OF THE OLD UPLAND MILLS IN NORTHERN MORAVIA."],
+    ];
+    iaSearch(LONG_Q, titles.map(([id]) => id));
+    for (const [id, title] of titles) iaMeta(id, openIaItem(id, { title }));
+    const got = await findFreeCopies(LONG, ctx(), ["internetarchive"]);
+    expect(got).toEqual({ offers: [{ source: "internetarchive", url: "https://archive.org/download/same/same.pdf", kind: "pdf" }], elsewhere: [] });
+  });
+
+  it("a subtitle on the record's side only is not the same title either", async () => {
+    const withSub = { ...BOOK, title: "The Lantern Keepers of Ostrava: Night Work in a Mining Town" };
+    iaSearch(`title:("the lantern keepers of ostrava night work in a mining town") AND creator:(halloway) AND mediatype:texts`, ["nosub"]);
+    iaMeta("nosub", openIaItem("nosub"));
+    expect(await findFreeCopies(withSub, ctx(), ["internetarchive"])).toEqual({ offers: [], elsewhere: [] });
+  });
+
+  it("a near match is not made an elsewhere link either (DOAB)", async () => {
+    doab(LONG_T, [
+      {
+        name: "Rivers Lanterns and Keepers of the Old Upland Mills in Northern Moravia, Volume 2",
+        metadata: [{ key: "dc.contributor.author", value: "Halloway, Mira" }],
+        bitstreams: [{ name: "v2.pdf", mimeType: "application/pdf", retrieveLink: "https://mirror.example.org/v2.pdf" }],
+      },
+    ]);
+    expect(await findFreeCopies(LONG, ctx(), ["doab"])).toEqual({ offers: [], elsewhere: [] });
+  });
+
+  it("the Internet Archive's file is chosen by its format, never an encrypted one", async () => {
+    iaSearch(Q2, ["fmt", "encnames"]);
+    iaMeta(
+      "fmt",
+      openIaItem("fmt", {}, [
+        { name: "fmt_encrypted.pdf", format: "ACS Encrypted PDF" },
+        { name: "fmt_lcp.epub", format: "LCP Encrypted EPUB" },
+        { name: "fmt_meta.pdf", format: "Metadata" },
+        { name: "fmt.epub", format: "EPUB" },
+        { name: "fmt.pdf", format: "Text PDF" },
+      ]),
+    );
+    iaMeta("encnames", openIaItem("encnames", {}, [{ name: "encnames_encrypted.pdf" }, { name: "encnames_lcp.epub" }, { name: "x.pdf", format: "Encrypted something" }]));
+    expect((await findFreeCopies(BOOK, ctx(), ["internetarchive"])).offers.map((o) => o.url)).toEqual(["https://archive.org/download/fmt/fmt.pdf", "https://archive.org/download/fmt/fmt.epub"]);
+  });
+
+  it("an Internet Archive identifier starts with a letter or digit", async () => {
+    iaSearch(Q2, ["..", ".", "-x", "_x", ".hidden"]);
+    expect(await findFreeCopies(BOOK, ctx(), ["internetarchive"])).toEqual({ offers: [], elsewhere: [] });
+    expect(requests.filter((r) => r.path.startsWith("/metadata"))).toEqual([]);
+  });
+
+  it("a fragment is dropped before anything else; only kept offers count as already offered", async () => {
+    unpaywall({ oa_locations: ["", "#a", "#b"].map((f) => ({ url_for_pdf: `https://arxiv.org/pdf/2101.00001${f}` })) });
+    openalex({ locations: [1, 2, 3, 4].map((n) => ({ is_oa: true, pdf_url: `https://europepmc.org/articles/PMC${n}?pdf=render` })) });
+    s2({ openAccessPdf: { url: "https://europepmc.org/articles/PMC4?pdf=render#page=2" } });
+    const got = await findFreeCopies(ARTICLE, ctx(), ["openalex", "unpaywall", "semanticscholar"], EMAIL);
+    expect(got.offers.map((o) => `${o.source} ${o.url}`)).toEqual([
+      "openalex https://europepmc.org/articles/PMC1?pdf=render",
+      "openalex https://europepmc.org/articles/PMC2?pdf=render",
+      "openalex https://europepmc.org/articles/PMC3?pdf=render",
+      "unpaywall https://arxiv.org/pdf/2101.00001",
+      "semanticscholar https://europepmc.org/articles/PMC4?pdf=render",
+    ]);
+  });
+
+  it("an elsewhere link to a private-network name is refused; a trailing slash is not a second link", async () => {
+    openalex({
+      locations: [
+        "https://printer.local/x.pdf",
+        "https://wiki.intranet.corp/x.pdf",
+        "https://a.internal/x.pdf",
+        "https://nas.lan/x.pdf",
+        "https://box.home.arpa/x.pdf",
+        "https://app.localhost/x.pdf",
+        "https://[2001:db8::1]/x.pdf",
+        "https://10.0.0.8/x.pdf",
+        "https://intranet/x.pdf",
+        "https://repo.example.org/x.pdf",
+        "https://repo.example.org/x.pdf/",
+      ].map((pdf_url) => ({ is_oa: true, pdf_url })),
+    });
+    expect((await findFreeCopies(ARTICLE, ctx(), ["openalex"])).elsewhere).toEqual([{ host: "repo.example.org", url: "https://repo.example.org/x.pdf" }]);
+  });
+
+  it("format and control characters are stripped from the licence", async () => {
+    openalex({ best_oa_location: { is_oa: true, pdf_url: "https://arxiv.org/pdf/2101.00001", license: "cc-by‮gnp.exe\u0007​" } });
+    const [offer] = (await findFreeCopies(ARTICLE, ctx(), ["openalex"])).offers;
+    expect(offer!.licence).toBe("cc-bygnp.exe");
+  });
+
+  it("an answer that echoes the e-mail is used but not cached", async () => {
+    unpaywall({ doi: DOI, note: `asked by ${EMAIL}`, best_oa_location: { url_for_pdf: "https://arxiv.org/pdf/2101.00001", version: "publishedVersion" } });
+    const got = await findFreeCopies(ARTICLE, ctx(), ["unpaywall"], EMAIL);
+    expect(got.offers).toHaveLength(1);
+    for (const f of await filesUnder(join(tmp, "Lib"))) expect(f).not.toContain(EMAIL);
+    // Not cached in memory either: the next call asks again.
+    unpaywall({ doi: DOI, best_oa_location: null });
+    await findFreeCopies(ARTICLE, ctx(), ["unpaywall"], EMAIL);
+    expect(requests.filter((r) => r.origin === "https://api.unpaywall.org")).toHaveLength(2);
+  });
+
+  it("a 5xx is not retried within one call", async () => {
+    const http = client({ maxRetries: 3 });
+    agent.get("https://api.semanticscholar.org").intercept({ path: `/graph/v1/paper/DOI:${DOI}?fields=openAccessPdf`, method: "GET" }).reply(503, "busy").persist();
+    await findFreeCopies(ARTICLE, ctx(http), ["semanticscholar"]);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("a 429 on one Internet Archive item keeps what the source's earlier items found", async () => {
+    iaSearch(Q2, ["first", "second"]);
+    iaMeta("first", openIaItem("first"));
+    agent.get("https://archive.org").intercept({ path: "/metadata/second", method: "GET" }).reply(429, "");
+    expect((await findFreeCopies({ ...BOOK }, ctx(), ["internetarchive"])).offers.map((o) => o.url)).toEqual(["https://archive.org/download/first/first.pdf"]);
+  });
+
+  it("an arXiv answer that is not well-formed gives nothing and throws nothing", async () => {
+    arxiv(ARTICLE_TITLE_Q, "<feed><entry><id>http://arxiv.org/abs/2101.00009</id>");
+    expect(await findFreeCopies(ARTICLE, ctx(), ["arxiv"])).toEqual({ offers: [], elsewhere: [] });
   });
 });

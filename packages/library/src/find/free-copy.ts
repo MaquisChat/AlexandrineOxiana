@@ -17,9 +17,11 @@
  *  - Unpaywall, by DOI, only with a well-formed e-mail, sent as `email=` through the client's `query` option (never
  *    in the cache key, a cached file, a log line or an error): `best_oa_location.url_for_pdf`, then
  *    `oa_locations[].url_for_pdf` (at most 20 read).
- *  - arXiv: by DOI first, then — when the DOI found no entry — by title and the first author's family name. The
- *    Atom answer is checked by `prescanXml` (no declarations, well-formed) and parsed with @xmldom/xmldom; at most 5
- *    entries are read. The offer's address is built from the entry's id, checked (`ARXIV_ID_NEW`/`ARXIV_ID_OLD`).
+ *  - arXiv: by the first author's family name and the title only (R256 a: arXiv has no DOI search field), spelled as
+ *    its manual spells it: `au:<family>+AND+ti:%22<title words>%22`. An entry whose `arxiv:doi` is the record's DOI
+ *    needs no title check. The Atom answer is checked by `prescanXml` (no declarations, well-formed) and parsed with
+ *    @xmldom/xmldom; at most 5 entries are read. The offer's address is built from the entry's id, checked
+ *    (`ARXIV_ID_NEW`/`ARXIV_ID_OLD`).
  *  - Europe PMC, by DOI: a result with the same DOI, `isOpenAccess` "Y" and a `pmcid` matching `^PMC\d{1,9}$`
  *    gives `https://europepmc.org/articles/<pmcid>?pdf=render` (UNVERIFIED address form: the owner's first run).
  *  - Semantic Scholar, by DOI: `openAccessPdf.url`.
@@ -28,22 +30,25 @@
  *  - The Internet Archive (books only), by title and family name: identifiers checked (`^[A-Za-z0-9._-]{1,100}$`),
  *    each item's metadata read, and only an item that is not access-restricted (lending), not in a lending
  *    collection, and under a public-domain or Creative Commons licence address or a copyright status saying it is
- *    not in copyright gives its `.pdf`/`.epub` file (name ≤ 200 characters, no `/` or `\`) at
- *    `https://archive.org/download/<id>/<encoded name>`. Anything unknown or malformed means "no".
- *  - A copy found by title (arXiv by title, or an arXiv entry without the record's DOI; DOAB; the Internet Archive)
- *    is taken only when its title is the same work's by `titleSimilarity` ≥ 0.9 (F2's Dice comparison, the plan's
- *    file-match threshold) AND one of its creators' names holds a family name of the record. A copy found by DOI
- *    needs no such check.
+ *    not in copyright gives its file (name ≤ 200 characters, no `/` or `\`) at
+ *    `https://archive.org/download/<id>/<encoded name>`: chosen by `format` where the list gives one ("Text PDF" or
+ *    "PDF", "EPUB"), else the first plain `.pdf`/`.epub`; never one whose name or format says encrypted (R256 d).
+ *    Identifiers start with a letter or digit (R257 d). Anything unknown or malformed means "no".
+ *  - A copy found by title (an arXiv entry without the record's DOI; DOAB; the Internet Archive) is taken only when
+ *    its title is the record's title (R257 a): the two titles' content words — F2's tokens (`tokensOf`, reference.ts)
+ *    without the plan's small joining words (F2's `STOP_WORDS` in search.ts: and, et, al, by, the, of, in) — are the
+ *    same set, nothing extra on either side; AND one of its creators' names holds a family name of the record. A
+ *    near match is neither offered nor linked. A copy found by DOI needs no such check.
+ *  - Every address loses its fragment when it is parsed (R257 e); only offers that are kept count as already offered.
  *
  * Every request carries the client's User-Agent (no `mailto`), no cookie and no key. A service that fails, answers
  * nonsense or answers 429 (not retried: `final429`) is skipped for this call and the others still answer; a broken
  * answer is never cached. `findFreeCopies` never rejects (it takes no signal; the caller bounds it in time).
- * Rates live in the shared lookup client (`DEFAULT_RATE_LIMITS`): arXiv one request every 3 s, OpenAlex 5/s, every
- * other host here 1/s (the client's default). arXiv's "one connection" is kept here (`arxivTurn`, per client, so
- * across every caller that shares the service's client), because the client's per-host concurrency defaults are
- * pinned by F2's tests.
+ * Rates live in the shared lookup client: `DEFAULT_RATE_LIMITS` (arXiv one request every 3 s, OpenAlex 5/s, every
+ * other host here 1/s, the client's default) and `DEFAULT_CONCURRENCY` (arXiv one at a time, R254 a). Every request
+ * here is asked once per call: a 429 or a 5xx is not retried (`final429`, `final5xx`).
  */
-import { normalizeTitle, titleSimilarity, type Creator } from "@ao/core";
+import { normalizeTitle, type Creator } from "@ao/core";
 import { DOMParser, type Element } from "@xmldom/xmldom";
 import { prescanXml } from "../import/zotero-rdf.js";
 import { isSensitive, providerAllowed, type LookupContext } from "../lookup/context.js";
@@ -51,6 +56,7 @@ import { encodeDoi } from "../lookup/crossref.js";
 import { EMAIL_RE, LookupHttpError, type GetOptions } from "../lookup/http.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FIND_DOI_MAX } from "./types.js";
+import { tokensOf } from "./reference.js";
 
 /** The largest free copy the app downloads (100 MiB). */
 export const FREE_COPY_MAX_BYTES = 104_857_600;
@@ -68,7 +74,6 @@ const DOAB_BITSTREAMS_READ = 20;
 const IA_FILES_READ = 500;
 const LICENCE_MAX = 100;
 const TITLE_QUERY_MAX = 300;
-const SAME_TITLE = 0.9;
 const TTL_DAYS = 7;
 
 /** The only hosts a free copy is downloaded from (with `ia<digits>.us.archive.org`, see `fileHostAllowed`). */
@@ -96,13 +101,14 @@ export type ElsewhereLink = { host: string; url: string };
 
 /**
  * An address parsed ONCE (resolved against `base` when given, as a `Location` is against the address that
- * answered); null when it is not a string, is longer than 2,000 characters, or does not parse. The URL returned is
- * what is checked and what is fetched or shown (`href`): the original string is never used again.
+ * answered), without its fragment; null when it is not a string, is longer than 2,000 characters, or does not parse.
+ * The URL returned is what is checked and what is fetched or shown (`href`): the original string is never used again.
  */
 export function parseFreeCopyAddress(raw: unknown, base?: URL): URL | null {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > FREE_COPY_ADDRESS_MAX) return null;
   try {
     const u = base ? new URL(raw, base) : new URL(raw);
+    u.hash = ""; // the fragment is dropped before anything else (R257 e)
     return u.href.length <= FREE_COPY_ADDRESS_MAX ? u : null;
   } catch {
     return null;
@@ -121,12 +127,18 @@ export function fileHostAllowed(u: URL): boolean {
   return FREE_COPY_FILE_HOSTS.includes(u.hostname) || IA_NODE.test(u.hostname);
 }
 
-/** An "elsewhere" link may be opened in a browser: https only, no credentials, a named public host (no IP literal, no single label, no trailing dot, not localhost). */
+/** Names that belong to a private network, never to a public repository (R257 f). */
+const PRIVATE_SUFFIXES = [".local", ".localhost", ".internal", ".lan", ".corp", ".home.arpa"];
+
+/**
+ * An "elsewhere" link may be opened in a browser: https only, no credentials, a named public host — not an IP
+ * address, not a single label, no trailing dot, not `localhost` and not under a private-network suffix (R257 f).
+ */
 function elsewhereAllowed(u: URL): boolean {
   if (u.protocol !== "https:" || u.username !== "" || u.password !== "") return false;
   const h = u.hostname;
   if (!h.includes(".") || h.endsWith(".") || h.startsWith("[") || /^\d+\.\d+\.\d+\.\d+$/u.test(h)) return false;
-  return h !== "localhost" && !h.endsWith(".localhost");
+  return h !== "localhost" && !PRIVATE_SUFFIXES.some((x) => h.endsWith(x) || h === x.slice(1));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -140,7 +152,12 @@ const text = (v: unknown, max = 4000): string | undefined => (typeof v === "stri
 
 const VERSIONS: Readonly<Record<string, CopyOffer["version"]>> = { publishedVersion: "published", acceptedVersion: "accepted", submittedVersion: "submitted" };
 const versionOf = (v: unknown): CopyOffer["version"] | undefined => (typeof v === "string" && Object.hasOwn(VERSIONS, v) ? VERSIONS[v] : undefined);
-const licenceOf = (v: unknown): string | undefined => (typeof v === "string" && v.trim() && v.length <= LICENCE_MAX && !/[\u0000-\u001f\u007f-\u009f]/u.test(v) ? v.trim() : undefined);
+/** A licence code: format and control characters stripped first (R257 g), then at most 100 characters. */
+const licenceOf = (v: unknown): string | undefined => {
+  if (typeof v !== "string" || v.length > 4000) return undefined;
+  const t = v.replace(/[\p{Cf}\p{Cc}]/gu, "").trim();
+  return t && t.length <= LICENCE_MAX ? t : undefined;
+};
 
 const DOI_RE = /^10\.\d{4,9}\/\S+$/u;
 const doiOf = (w: WorkCandidate): string | undefined => {
@@ -152,7 +169,7 @@ const sameDoi = (v: unknown, doi: string) => typeof v === "string" && v.length <
 export const ARXIV_ID_NEW = /^\d{4}\.\d{4,5}(v\d{1,3})?$/u;
 export const ARXIV_ID_OLD = /^[a-z-]+(\.[A-Z]{2})?\/\d{7}(v\d{1,3})?$/u;
 const PMCID = /^PMC\d{1,9}$/u;
-const IA_ID = /^[A-Za-z0-9._-]{1,100}$/u;
+const IA_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u;
 
 /** Percent-encodes every character outside the URL-unreserved set. */
 const enc = (s: string) => encodeURIComponent(s).replace(/[!'()*]/gu, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
@@ -174,9 +191,20 @@ function firstFamily(w: WorkCandidate): string | undefined {
   return f ? f.slice(0, 200) : undefined;
 }
 
-/** True when the found item is the record's work: the same title (Dice ≥ 0.9) and a creator holding a family name of the record. */
+/** The plan's small joining words, as F2's `STOP_WORDS` (search.ts, not exported there): left out of a title's content words. */
+const TITLE_STOP_WORDS: ReadonlySet<string> = new Set(["and", "et", "al", "by", "the", "of", "in"]);
+const contentWords = (t: string): Set<string> => new Set(tokensOf(t.slice(0, 4000)).filter((x) => !TITLE_STOP_WORDS.has(x)));
+
+/** True when two titles have the same content words: the same set, nothing extra on either side (R257 a). */
+function sameTitle(a: string, b: string): boolean {
+  const A = contentWords(a);
+  const B = contentWords(b);
+  return A.size > 0 && A.size === B.size && [...A].every((x) => B.has(x));
+}
+
+/** True when the found item is the record's work: the same title (`sameTitle`) and a creator holding a family name of the record. */
 function sameWork(w: WorkCandidate, foundTitle: string | undefined, foundNames: string[]): boolean {
-  if (!foundTitle || typeof w.title !== "string" || titleSimilarity(foundTitle.slice(0, 4000), w.title) < SAME_TITLE) return false;
+  if (!foundTitle || typeof w.title !== "string" || !sameTitle(foundTitle, w.title)) return false;
   const families = (Array.isArray(w.creators) ? w.creators.slice(0, 100) : []).map(familyOf).filter((f) => f.length >= 2);
   return foundNames.some((name) => {
     const words = ` ${normalizeTitle(name.slice(0, 1000))} `;
@@ -206,7 +234,7 @@ async function ask<T>(ctx: LookupContext, url: string, cacheKey: string, check: 
       throw new BadAnswer();
     }
   };
-  const opts: GetOptions & { validate: (b: string) => void } = { cacheKey, ttlDays: TTL_DAYS, sensitive: isSensitive(ctx), final429: noRetry429, validate, ...(query ? { query } : {}) };
+  const opts: GetOptions & { validate: (b: string) => void } = { cacheKey, ttlDays: TTL_DAYS, sensitive: isSensitive(ctx), final429: noRetry429, final5xx: true, validate, ...(query ? { query } : {}) };
   let body: string | null;
   try {
     body = await ctx.http.getText(url, opts);
@@ -305,38 +333,27 @@ function arxivId(entryId: string): string | undefined {
   return id && (ARXIV_ID_NEW.test(id) || ARXIV_ID_OLD.test(id)) ? id : undefined;
 }
 
-const arxivQueryUrl = (q: string) => `https://export.arxiv.org/api/query?search_query=${enc(q)}&max_results=${RESULTS_READ}`;
-
-/** Per lookup client: the arXiv request in progress (one at a time; its API terms ask for one connection). */
-const arxivChain = new WeakMap<object, Promise<unknown>>();
-function arxivTurn<T>(ctx: LookupContext, work: () => Promise<T>): Promise<T> {
-  const prev = arxivChain.get(ctx.http) ?? Promise.resolve();
-  const next = prev.then(work, work);
-  arxivChain.set(ctx.http, next.catch(() => {}));
-  return next;
-}
+/**
+ * A `search_query` value spelled as arXiv's manual spells it (`au:del_maestro+AND+ti:%22quantum+criticality%22`):
+ * spaces as `+`, quotes as `%22`, the field colons as they are; every other character percent-encoded.
+ */
+const arxivSpelling = (q: string) => encodeURIComponent(q).replace(/%20/gu, "+").replace(/%3A/gu, ":");
+const arxivQueryUrl = (q: string) => `https://export.arxiv.org/api/query?search_query=${arxivSpelling(q)}&max_results=${RESULTS_READ}`;
 
 async function fromArxiv(w: WorkCandidate, ctx: LookupContext): Promise<Raw[]> {
   const doi = doiOf(w);
-  const pick = (entries: AtomEntry[], byDoi: string | undefined): Raw[] =>
-    entries.flatMap((e) => {
-      const id = arxivId(e.id);
-      if (!id) return [];
-      const found = byDoi && e.doi && sameDoi(e.doi, byDoi);
-      if (!found && !sameWork(w, e.title, e.authors)) return [];
-      return [{ url: `https://arxiv.org/pdf/${id}`, kind: "pdf" as const, built: true as const }];
-    });
-  if (doi) {
-    const q = `doi:"${doi}"`;
-    const entries = await arxivTurn(ctx, () => ask(ctx, arxivQueryUrl(q), `free-copy:arxiv:${q}`, atomEntries));
-    const got = pick(entries ?? [], doi);
-    if (got.length) return got;
-  }
   const title = titleWords(w);
   const family = firstFamily(w);
   if (!title || !family) return [];
-  const q = `ti:"${title}" AND au:${family.replace(/ /gu, "_")}`;
-  return pick((await arxivTurn(ctx, () => ask(ctx, arxivQueryUrl(q), `free-copy:arxiv:${q}`, atomEntries))) ?? [], undefined);
+  const q = `au:${family.replace(/ /gu, "_")} AND ti:"${title}"`;
+  const entries = (await ask(ctx, arxivQueryUrl(q), `free-copy:arxiv:${q}`, atomEntries)) ?? [];
+  return entries.flatMap((e) => {
+    const id = arxivId(e.id);
+    if (!id) return [];
+    const byDoi = !!doi && !!e.doi && sameDoi(e.doi, doi); // the entry itself names the record's DOI
+    if (!byDoi && !sameWork(w, e.title, e.authors)) return [];
+    return [{ url: `https://arxiv.org/pdf/${id}`, kind: "pdf" as const, built: true as const }];
+  });
 }
 
 async function fromEuropePmc(w: WorkCandidate, ctx: LookupContext): Promise<Raw[]> {
@@ -423,6 +440,36 @@ const names = (v: unknown): string[] => (typeof v === "string" ? [v.slice(0, 100
 const iaFileName = (v: unknown): string | undefined =>
   typeof v === "string" && v.length <= 200 && !/[/\\]/u.test(v) && !/[\u0000-\u001f\u007f]/u.test(v) && /\.(?:pdf|epub)$/iu.test(v) && !v.startsWith(".") ? v : undefined;
 
+const ENCRYPTED_NAME = /_(?:encrypted|lcp)\.(?:pdf|epub)$/iu;
+const PDF_FORMATS = new Set(["Text PDF", "PDF"]);
+
+/**
+ * The item's PDF and EPUB (R256 d): chosen by `format` where a file gives one ("Text PDF" or "PDF" for a `.pdf`,
+ * "EPUB" for a `.epub`), else the first plain `.pdf`/`.epub` without a format; never a file whose name ends
+ * `_encrypted.pdf`/`_lcp.epub` (and the like) or whose format mentions encryption or LCP.
+ */
+function iaFiles(files: unknown): { pdf?: string; epub?: string } {
+  const byFormat: { pdf?: string; epub?: string } = {};
+  const plain: { pdf?: string; epub?: string } = {};
+  for (const f of list(files, IA_FILES_READ)) {
+    const n = isRecord(f) ? iaFileName(f.name) : undefined;
+    if (!n || ENCRYPTED_NAME.test(n)) continue;
+    const isPdf = /\.pdf$/iu.test(n);
+    const format = isRecord(f) ? f.format : undefined;
+    if (format === undefined) {
+      if (isPdf) plain.pdf ??= n;
+      else plain.epub ??= n;
+      continue;
+    }
+    if (typeof format !== "string" || /encrypt|lcp/iu.test(format)) continue;
+    if (isPdf && PDF_FORMATS.has(format)) byFormat.pdf ??= n;
+    else if (!isPdf && format === "EPUB") byFormat.epub ??= n;
+  }
+  const pdf = byFormat.pdf ?? plain.pdf;
+  const epub = byFormat.epub ?? plain.epub;
+  return { ...(pdf ? { pdf } : {}), ...(epub ? { epub } : {}) };
+}
+
 async function fromInternetArchive(w: WorkCandidate, ctx: LookupContext): Promise<Raw[]> {
   const title = titleWords(w);
   const family = firstFamily(w);
@@ -440,20 +487,17 @@ async function fromInternetArchive(w: WorkCandidate, ctx: LookupContext): Promis
     try {
       item = await ask(ctx, `https://archive.org/metadata/${id}`, `free-copy:internetarchive:metadata:${id}`, recordOf);
     } catch (e) {
-      if (e instanceof Throttled) throw e;
+      // A failed item never throws away what the earlier items found (R256 a); a 429 stops asking for more.
+      if (e instanceof Throttled) {
+        ctx.debug?.("free copy via internetarchive: it asked the app to slow down; no more items asked");
+        break;
+      }
       ctx.debug?.("free copy via internetarchive: one item's details could not be read");
       continue;
     }
     if (!item || !isRecord(item.metadata) || !iaItemOpen(item.metadata)) continue;
     if (!sameWork(w, text(item.metadata.title), names(item.metadata.creator))) continue;
-    let pdf: string | undefined;
-    let epub: string | undefined;
-    for (const f of list(item.files, IA_FILES_READ)) {
-      const n = isRecord(f) ? iaFileName(f.name) : undefined;
-      if (!n) continue;
-      if (/\.pdf$/iu.test(n)) pdf ??= n;
-      else epub ??= n;
-    }
+    const { pdf, epub } = iaFiles(item.files);
     if (pdf) out.push({ url: `https://archive.org/download/${id}/${encodeURIComponent(pdf)}`, kind: "pdf", built: true });
     if (epub) out.push({ url: `https://archive.org/download/${id}/${encodeURIComponent(epub)}`, kind: "epub", built: true });
   }
@@ -516,22 +560,28 @@ export async function findFreeCopies(
   const linked = new Set<string>();
   order.forEach((source, i) => {
     const mine: CopyOffer[] = [];
+    const seen = new Set<string>();
     for (const r of raws[i] ?? []) {
       const u = parseFreeCopyAddress(r.url, r.base);
       if (!u) continue;
       if (fileHostAllowed(u)) {
-        if (offered.has(u.href)) continue;
-        offered.add(u.href);
+        if (offered.has(u.href) || seen.has(u.href)) continue;
+        seen.add(u.href);
         mine.push({ source, url: u.href, kind: r.kind, ...(r.version ? { version: r.version } : {}), ...(r.licence ? { licence: r.licence } : {}) });
       } else if (!r.built && elsewhereAllowed(u)) {
-        const key = `${u.hostname}${u.pathname}`;
+        const key = `${u.hostname}${u.pathname.replace(/\/+$/u, "")}`; // a trailing slash is not a second link
         if (linked.has(key) || elsewhere.length >= FREE_COPY_ELSEWHERE_MAX) continue;
         linked.add(key);
         elsewhere.push({ host: u.hostname, url: u.href });
       }
     }
     mine.sort((a, b) => rank(a.version) - rank(b.version));
-    for (const o of mine.slice(0, FREE_COPY_OFFERS_PER_SOURCE)) if (offers.length < FREE_COPY_OFFERS_MAX) offers.push(o);
+    // Only the offers kept count as already offered (R257 e): one cut by a cap does not hide another service's copy.
+    for (const o of mine.slice(0, FREE_COPY_OFFERS_PER_SOURCE)) {
+      if (offers.length >= FREE_COPY_OFFERS_MAX) break;
+      offers.push(o);
+      offered.add(o.url);
+    }
   });
   return { offers, elsewhere };
 }

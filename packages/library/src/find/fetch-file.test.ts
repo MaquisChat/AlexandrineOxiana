@@ -294,7 +294,7 @@ describe("fetchFile: refusals leave the folder empty", () => {
     reply("https://arxiv.org", "/p", 206, PDF, { "content-range": "bytes 0-10/100" });
     expect((await refusal(get("https://arxiv.org/p"))).code).toBe("status");
     reply("https://arxiv.org", "/n", 404, PDF);
-    expect((await refusal(get("https://arxiv.org/n"))).message).toBe("The service did not send the file (it answered HTTP 404).");
+    expect((await refusal(get("https://arxiv.org/n"))).message).toBe("The service did not send the file.");
     reply("https://arxiv.org", "/s", 500, PDF);
     expect((await refusal(get("https://arxiv.org/s"))).code).toBe("status");
     reply("https://arxiv.org", "/r", 302, "");
@@ -491,5 +491,82 @@ describe("a crash's leftovers", () => {
     activeTemp.delete("find-in-use");
     await openTestRepo(lib, new KeyRing(), { scryptN: 2 ** 10, actor: "tester" });
     expect(existsSync(stale)).toBe(false);
+  });
+});
+
+describe("round 2 (R257)", () => {
+  it("the folder's in-use mark is counted per call: the first of two downloads to finish leaves it marked", async () => {
+    holdKeys.add("https://arxiv.org/a");
+    holdKeys.add("https://archive.org/b");
+    const a = get("https://arxiv.org/a");
+    const b = fetchFile("https://archive.org/b", { maxBytes: FREE_COPY_MAX_BYTES, deadlineMs: 180_000, into: join(dir, "2") });
+    await settle(() => held.length === 2);
+    expect(isStaleWorkDir("find-e1")).toBe(false);
+    held.find((h) => h.path === "/a")!.respond(200, {}, [PDF], true);
+    await a;
+    expect(isStaleWorkDir("find-e1")).toBe(false); // b still writes there
+    held.find((h) => h.path === "/b")!.respond(200, {}, [PDF], true);
+    await b;
+    expect(isStaleWorkDir("find-e1")).toBe(true);
+    expect((await readdir(dir)).sort()).toEqual(["1", "2"]);
+  });
+
+  it("a mark someone else holds is left in place", async () => {
+    activeTemp.add("find-e1");
+    try {
+      pdfAt("https://arxiv.org", "/held");
+      await get("https://arxiv.org/held");
+      expect(activeTemp.has("find-e1")).toBe(true);
+    } finally {
+      activeTemp.delete("find-e1");
+    }
+  });
+
+  it("an abort while a download waits for its place ends the call with the abort's reason and leaves nothing on disk", async () => {
+    holdKeys.add("https://arxiv.org/1");
+    const first = get("https://arxiv.org/1");
+    first.catch(() => {});
+    await settle(() => held.length === 1);
+    const ac = new AbortController();
+    const otherFolder = join(root, ".tmp", "find-waiting");
+    const reason = new Error("The download was stopped.");
+    const same = fetchFile("https://arxiv.org/2", { maxBytes: FREE_COPY_MAX_BYTES, deadlineMs: 180_000, into: join(dir, "2"), signal: ac.signal });
+    const other = fetchFile("https://arxiv.org/3", { maxBytes: FREE_COPY_MAX_BYTES, deadlineMs: 180_000, into: join(otherFolder, "f"), signal: ac.signal });
+    ac.abort(reason);
+    await expect(same).rejects.toBe(reason);
+    await expect(other).rejects.toBe(reason);
+    expect(existsSync(otherFolder)).toBe(false);
+    held[0]!.respond(200, {}, [PDF], true);
+    await first;
+    expect(await readdir(dir)).toEqual(["1"]);
+    expect(requests.map((r) => r.path)).toEqual(["/1"]);
+  });
+
+  it("any content-encoding other than identity refuses, also among several values", async () => {
+    for (const [path, enc] of [
+      ["/e1", "identity, gzip"],
+      ["/e2", "br"],
+      ["/e3", ["identity", "gzip"]],
+    ] as const) {
+      agent.get("https://arxiv.org").intercept({ path, method: "GET" }).reply(200, PDF, { headers: { "content-encoding": enc as string | string[] } as never });
+      expect((await refusal(get(`https://arxiv.org${path}`))).code).toBe("encoded");
+    }
+    pdfAt("https://arxiv.org", "/ok", { "content-encoding": "identity" });
+    expect((await get("https://arxiv.org/ok")).mime).toBe("application/pdf");
+  });
+
+  it("a non-200 answer that is not a redirect is said as 'The service did not send the file.' (a 304 included)", async () => {
+    for (const [path, status] of [
+      ["/n", 404],
+      ["/s", 503],
+      ["/nm", 304],
+      ["/p", 206],
+    ] as const) {
+      reply("https://arxiv.org", path, status, status === 304 ? "" : PDF, status === 304 ? { location: "/elsewhere" } : {});
+      const e = await refusal(get(`https://arxiv.org${path}`));
+      expect(e.code).toBe("status");
+      expect(e.message).toBe("The service did not send the file.");
+    }
+    await empty();
   });
 });

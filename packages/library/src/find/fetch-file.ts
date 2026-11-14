@@ -20,9 +20,11 @@
  *    `application/pdf`; an EPUB when `file-type` says `application/epub+zip` AND the archive opens under the R50
  *    zip limits (`openZip`) with `mimetype` as its first entry holding exactly `application/epub+zip`. Only then is
  *    the part renamed to `into`. `content-type` and `content-disposition` are never read.
+ *  - A 301, 302, 303, 307 or 308 is a redirect; any other answer that is not a 200 is "The service did not send the
+ *    file." Every `content-encoding` value (several headers, or a list) must be `identity`.
  *  - **Nothing is left behind:** on every ending that is not success (a refusal, an abort through `signal`, a time
  *    limit, the size limit, the wrong type, a write error, a throw from anything) the part file this call created is
- *    removed before the promise settles. The folder's name is in `activeTemp` while the call runs; `.tmp/find-*`
+ *    removed before the promise settles. The folder's name is in `activeTemp` while any call into it runs (counted per call); `.tmp/find-*`
  *    left by a crash is swept when the library is opened (`isStaleWorkDir`, R59's sweep).
  *  - **Politeness, across every caller in the process:** at most one download at a time per host and two in all
  *    (`slots` below, module-wide: the runner works on two entries at once and each may download).
@@ -89,6 +91,7 @@ const SENTENCES = {
   unreachable: "The service could not be reached.",
   notPdf: "The service sent something that is not a PDF or EPUB.",
   write: "The file could not be saved in the library's temporary folder.",
+  status: "The service did not send the file.",
 } as const;
 
 const refuse = (code: FetchFileErrorCode, message: string) => new FetchFileError(code, message);
@@ -181,6 +184,34 @@ async function privateFolder(folder: string): Promise<void> {
   if (process.platform !== "win32") await fsp.chmod(folder, 0o700);
 }
 
+/** Every value of a header, split at commas, trimmed and lower-cased (a header may come several times). */
+const headerValues = (h: Record<string, string | string[] | undefined>, n: string): string[] => {
+  const v = h[n];
+  return (Array.isArray(v) ? v : v === undefined ? [] : [v]).flatMap((x) => String(x).split(",")).map((x) => x.trim().toLowerCase()).filter((x) => x !== "");
+};
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * The "in use" mark of a `find-<id>` folder (`activeTemp`), counted per call (R257 b): the folder stays marked while
+ * any download into it runs. A mark already held by someone else (F11) when the first call starts is left in place.
+ */
+const tempUsers = new Map<string, { calls: number; external: boolean }>();
+function markInUse(name: string): void {
+  const u = tempUsers.get(name);
+  if (u) u.calls++;
+  else {
+    tempUsers.set(name, { calls: 1, external: activeTemp.has(name) });
+    activeTemp.add(name);
+  }
+}
+function unmarkInUse(name: string): void {
+  const u = tempUsers.get(name);
+  if (!u) return;
+  if (--u.calls > 0) return;
+  tempUsers.delete(name);
+  if (!u.external) activeTemp.delete(name);
+}
+
 const header = (h: Record<string, string | string[] | undefined>, n: string): string | undefined => {
   const v = h[n];
   return Array.isArray(v) ? v[0] : v;
@@ -231,8 +262,7 @@ export async function fetchFile(
   const folder = dirname(into);
   const part = `${into}.part`;
   const folderName = basename(folder);
-  const ownsTemp = !activeTemp.has(folderName);
-  if (ownsTemp) activeTemp.add(folderName);
+  markInUse(folderName);
 
   // One controller ends everything: the caller's abort, the deadline and each request's header limit.
   const ac = new AbortController();
@@ -274,7 +304,7 @@ export async function fetchFile(
         clearTimeout(headersTimer);
       }
       const status = res.statusCode;
-      if (status >= 300 && status < 400) {
+      if (REDIRECTS.has(status)) {
         res.body.destroy();
         const loc = header(res.headers, "location");
         if (!loc) throw refuse("redirect-refused", SENTENCES.redirectRefused);
@@ -288,10 +318,9 @@ export async function fetchFile(
       }
       if (status !== 200) {
         res.body.destroy();
-        throw refuse("status", `The service did not send the file (it answered HTTP ${status}).`);
+        throw refuse("status", SENTENCES.status);
       }
-      const encoding = header(res.headers, "content-encoding")?.trim().toLowerCase();
-      if (encoding && encoding !== "identity") {
+      if (headerValues(res.headers, "content-encoding").some((v) => v !== "identity")) {
         res.body.destroy();
         throw refuse("encoded", SENTENCES.encoded);
       }
@@ -359,6 +388,6 @@ export async function fetchFile(
     clearTimeout(headersTimer);
     release?.();
     opts.signal?.removeEventListener("abort", onCallerAbort);
-    if (ownsTemp) activeTemp.delete(folderName);
+    unmarkInUse(folderName);
   }
 }
