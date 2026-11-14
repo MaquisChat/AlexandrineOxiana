@@ -1318,9 +1318,12 @@ export function readFindQueueDetailedIn(repo: Repo, projectId: string): Promise<
   return readFindQueueDetailed(cores.get(repo)!, projectId);
 }
 
-/** Package-internal (Find and acquire): one governed change of the queue (`project.find.add|update|remove`). */
-export function appendFindEntriesIn(repo: Repo, projectId: string, entries: FindEntry[], op: "add" | "update" | "remove"): Promise<void> {
-  return appendFindEntries(cores.get(repo)!, projectId, entries, op);
+/**
+ * Package-internal (Find and acquire): one governed change of the queue (`project.find.add|update|remove`); with an
+ * add, `alongside` are new lines of live entries written in the same change (F8: the author's entry whose works are added).
+ */
+export function appendFindEntriesIn(repo: Repo, projectId: string, entries: FindEntry[], op: "add" | "update" | "remove", alongside: FindEntry[] = []): Promise<void> {
+  return appendFindEntries(cores.get(repo)!, projectId, entries, op, alongside);
 }
 
 /**

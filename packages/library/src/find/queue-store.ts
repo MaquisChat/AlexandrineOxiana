@@ -201,6 +201,8 @@ export function sanitizeEntry(x: unknown): FindEntry | null {
     if (typeof attempts !== "number" || !Number.isSafeInteger(attempts) || attempts < 0) throw new Bad();
     if (e.elsewhere !== undefined && e.elsewhere !== true) throw new Bad();
     if (e.removed !== undefined && e.removed !== true) throw new Bad();
+    if (e.morePeople !== undefined && e.morePeople !== true) throw new Bad();
+    if (e.moreWorks !== undefined && e.moreWorks !== true) throw new Bad();
     let out: Record<string, unknown> = { id: id(e.id), projectId: str(e.projectId, 64, 1) };
     out = put(out, "collectionId", opt(e.collectionId, id));
     out.typed = str(e.typed, FIND_TYPED_MAX);
@@ -240,6 +242,10 @@ export function sanitizeEntry(x: unknown): FindEntry | null {
     out = put(out, "nextTryAt", opt(e.nextTryAt, (v) => str(v, 64)));
     out = put(out, "parentId", opt(e.parentId, id));
     out = put(out, "offers", opt(e.offers, (v) => list(v, 20, offerOf)));
+    // Task F8 (R267): an author's entry says whether more people or works exist than are kept, and which works were added.
+    out = put(out, "morePeople", e.morePeople);
+    out = put(out, "moreWorks", e.moreWorks);
+    out = put(out, "added", opt(e.added, (v) => list(v, WORKS_MAX, (w) => str(w, 40, 1))));
     out = put(out, "removed", e.removed);
     return out as unknown as FindEntry;
   } catch (err) {
@@ -510,6 +516,9 @@ type Op = "add" | "update" | "remove";
  * - `update`: an entry that is not in the queue or is removed is passed by (the runner may finish work on an
  *   entry the researcher removed meanwhile; it must not come back). `removed` is not written by an update.
  * - `remove`: writes a line `removed: true`; an entry not in the queue or already removed is passed by.
+ * - `alongside` (Task F8, R267; with `add` only): new lines of entries that ARE live in the queue (an author's entry
+ *   whose works are added), written after the added entries in the same change and audited with them; one that is no
+ *   longer in the queue refuses the whole add (InvalidInputError). They do not count against `FIND_QUEUE_MAX`.
  *
  * What is handed in is copied (nothing the caller keeps can change the queue). Nothing is written, and nothing
  * audited, when nothing is left to write. Refuses a read-only library (ReadOnlyLibraryError) and a locked
@@ -520,7 +529,7 @@ type Op = "add" | "update" | "remove";
  * the top of this file), it is compacted by a change of its own, which never fails this call (a failure leaves
  * a note in `core.indexErrors`).
  */
-export async function appendFindEntries(core: RepoCore, projectId: string, entries: FindEntry[], op: Op): Promise<void> {
+export async function appendFindEntries(core: RepoCore, projectId: string, entries: FindEntry[], op: Op, alongside: FindEntry[] = []): Promise<void> {
   core.assertWritable();
   if (op !== "add" && op !== "update" && op !== "remove") throw new InvalidInputError("This is not a change the queue knows.");
   const st0 = core.state(projectId);
@@ -530,20 +539,24 @@ export async function appendFindEntries(core: RepoCore, projectId: string, entri
     if (op === "add") throw new FindQueueFullError();
     throw new InvalidInputError("The queue entries are not a list of at most 500.");
   }
+  // Task F8 (R267): an add may carry the new lines of entries already in the queue (the author's entry whose works
+  // are added), written in the SAME governed change; each must be live in the queue then, or the whole add is refused.
+  if (!Array.isArray(alongside) || alongside.length > FIND_QUEUE_MAX || (alongside.length > 0 && op !== "add")) throw new InvalidInputError("This is not a change the queue knows.");
   const seen = new Set<string>();
-  const cleaned: FindEntry[] = [];
-  for (const e of entries) {
+  const clean = (e: FindEntry): FindEntry => {
     const c = sanitizeEntry(e);
     if (!c) throw new InvalidInputError(NOT_WELL_FORMED);
     if (c.projectId !== projectId) throw new InvalidInputError("A queue entry belongs to another project.");
     if (seen.has(c.id) && op === "add") throw new InvalidInputError("A queue entry is given twice.");
     seen.add(c.id);
     if (Buffer.byteLength(JSON.stringify(c), "utf8") > FIND_LINE_MAX_BYTES) throw new FindEntryTooLargeError();
-    cleaned.push(c);
-  }
+    return c;
+  };
+  const cleaned = entries.map(clean);
+  const updates = alongside.map(clean);
   if (cleaned.length === 0) return;
   try {
-    await write(core, projectId, op, cleaned);
+    await write(core, projectId, op, cleaned, updates);
   } catch (err) {
     if (err instanceof NothingToWrite) return;
     // A file-system error's message names the file: never passed on (R96).
@@ -559,7 +572,7 @@ export async function appendFindEntries(core: RepoCore, projectId: string, entri
   }
 }
 
-function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[]): Promise<void> {
+function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[], alongside: FindEntry[] = []): Promise<void> {
   let written: FindEntry[] = [];
   return runMutation(
     core,
@@ -583,9 +596,17 @@ function write(core: RepoCore, projectId: string, op: Op, given: FindEntry[]): P
           } else byId.set(c.id, removalOf(cur, c.updatedAt));
         }
       }
-      const todo = [...byId.values()];
-      if (todo.length === 0) throw new NothingToWrite();
-      if (op === "add" && liveOf(folded).length + todo.length > FIND_QUEUE_MAX) throw new FindQueueFullError();
+      const added = [...byId.values()];
+      if (added.length === 0) throw new NothingToWrite();
+      if (op === "add" && liveOf(folded).length + added.length > FIND_QUEUE_MAX) throw new FindQueueFullError();
+      // The lines of live entries that go with this add (F8): an entry no longer in the queue refuses the whole add.
+      const along = alongside.map((c) => {
+        const cur = folded.map.get(c.id);
+        if (!cur || cur.removed === true) throw new InvalidInputError("That entry is no longer in the queue. Nothing was added.");
+        const { removed: _r, ...rest } = c;
+        return rest;
+      });
+      const todo = [...added, ...along];
       written = todo;
 
       const rel = queueRel(st.rel);
