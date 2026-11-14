@@ -42,7 +42,8 @@ export function findApi(client: ApiClient) {
     /** GET /projects/:id/find: the queue (409 with the store's sentence when it cannot be read at all). */
     queue: (pid: string, opts: { signal?: AbortSignal } = {}) => r<FindQueueResponse>("GET", queuePath(pid), opts.signal ? { signal: opts.signal } : {}),
     /** POST /projects/:id/find: what was typed, in the body only. */
-    add: (pid: string, body: FindAddRequest) => r<FindAddResponse>("POST", queuePath(pid), { body: { lines: body.lines, ...(body.collectionId ? { collectionId: body.collectionId } : {}) } }),
+    add: (pid: string, body: FindAddRequest, opts: { signal?: AbortSignal } = {}) =>
+      r<FindAddResponse>("POST", queuePath(pid), { body: { lines: body.lines, ...(body.collectionId ? { collectionId: body.collectionId } : {}) }, ...(opts.signal ? { signal: opts.signal } : {}) }),
     /** POST …/:eid/choose: a candidate's id, or null for "None of these". */
     choose: (pid: string, eid: string, candidateId: string | null) => r<FindEntryView>("POST", `${entryPath(pid, eid)}/choose`, { body: { candidateId } }),
     /** POST …/:eid/duplicate: the same work (true), or a different one (false). */
@@ -132,7 +133,18 @@ export const wherePublished = (c: FindWorkCandidate): string | undefined => c.co
 
 /** The identifier: "DOI …" or "ISBN …" (the first ISBN). */
 export function identifierText(c: FindWorkCandidate): string | undefined {
-  if (c.identifiers.doi) return `DOI ${c.identifiers.doi}`;
-  const isbn = c.identifiers.isbn?.[0];
-  return isbn ? `ISBN ${isbn}` : undefined;
+  const ids = c.identifiers as FindWorkCandidate["identifiers"] | undefined;
+  if (typeof ids?.doi === "string" && ids.doi) return `DOI ${ids.doi}`;
+  const isbn = Array.isArray(ids?.isbn) ? ids.isbn[0] : undefined;
+  return typeof isbn === "string" && isbn ? `ISBN ${isbn}` : undefined;
 }
+
+/** A candidate this build can show: an id, title text, a list of people and an identifiers object (R262 N6). */
+export function wellFormedCandidate(c: unknown): c is FindWorkCandidate {
+  if (!c || typeof c !== "object") return false;
+  const x = c as Record<string, unknown>;
+  return typeof x.id === "string" && typeof x.title === "string" && x.title.trim() !== "" && Array.isArray(x.creators) && !!x.identifiers && typeof x.identifiers === "object" && !Array.isArray(x.identifiers);
+}
+
+/** The candidates of an entry that can be shown; a malformed one is left out. */
+export const usableCandidates = (e: { candidates?: unknown }): FindWorkCandidate[] => (Array.isArray(e.candidates) ? e.candidates.filter(wellFormedCandidate) : []);

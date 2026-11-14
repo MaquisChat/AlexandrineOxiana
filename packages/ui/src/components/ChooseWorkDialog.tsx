@@ -14,7 +14,7 @@
  */
 import type { FindEntryView, FindWorkCandidate } from "@ao/shared";
 import { useId, useState, type KeyboardEvent, type ReactNode } from "react";
-import { creatorsText, identifierText, kindWords, wherePublished, yearOf } from "../api/find";
+import { creatorsText, identifierText, kindWords, usableCandidates, wherePublished, yearOf } from "../api/find";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
 
@@ -65,7 +65,8 @@ function Details({ c, id }: { c: FindWorkCandidate; id: string }) {
 
 export function ChooseWorkDialog({ entry, onChoose, onClose, busy = false, error }: ChooseWorkDialogProps) {
   const id = useId();
-  const candidates = entry.candidates ?? [];
+  // A malformed candidate is left out (R262 N6).
+  const candidates = usableCandidates(entry);
   /** undefined: nothing chosen yet; null: "None of these". */
   const [chosen, setChosen] = useState<string | null | undefined>(undefined);
   const name = `${id}-pick`;

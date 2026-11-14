@@ -14,7 +14,7 @@ import {
   type FindScreenSettings,
   type FindWorkCandidate,
 } from "@ao/shared";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1160,6 +1160,263 @@ describe("FindAcquire: round 3 (R258)", () => {
     const made = reads() - before;
     expect(made).toBeGreaterThanOrEqual(2);
     expect(made).toBeLessThanOrEqual(6);
+  });
+});
+
+describe("FindAcquire: round 4 (R262)", () => {
+  const libState = (libraryId: string) => ({ type: "library.state", data: { open: true, libraryId, name: "L", mode: "read-write" } });
+  const rowTexts = () => rows().map((r) => r.querySelector("[data-entry-text]")?.textContent);
+  const stateOf = (typed: string) => row(typed).querySelector(".ao-find__state")?.textContent;
+
+  it("N1 (A2): after Try again, a stale read arriving late does not put back the old state, and the status never says it", async () => {
+    const e = entry({ typed: "Merton", state: "not-found", updatedAt: "2026-11-13T10:00:00.000Z" });
+    let hold: ReturnType<typeof held<void>> | undefined;
+    useService({
+      queues: {
+        [PID]: async () => {
+          if (hold) {
+            const h = hold;
+            hold = undefined;
+            await h.p;
+            return HttpResponse.json(queue([e])); // read the queue before the retry was applied
+          }
+          return HttpResponse.json(queue([e]));
+        },
+      },
+    });
+    server.use(http.post(url(`/projects/${PID}/find/${e.id}/retry`), () => HttpResponse.json({ ...e, state: "looking-up", updatedAt: "2026-11-13T10:05:00.000Z" })));
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const h = heard();
+    const stale = held<void>();
+    hold = stale;
+    const before = reads();
+    await user.click(within(row("Merton")).getByRole("button", { name: "Try again: “Merton”" }));
+    await waitFor(() => expect(stateOf("Merton")).toBe("Looking it up"));
+    await waitFor(() => expect(reads()).toBeGreaterThan(before));
+    stale.release();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(stateOf("Merton")).toBe("Looking it up");
+    expect(h.said.some((s) => s.includes("Not found"))).toBe(false);
+    h.stop();
+  });
+
+  it("N1 (A3): rows just added do not vanish when a read that started before the add's answer arrives", async () => {
+    let hold: ReturnType<typeof held<void>> | undefined;
+    let stored: FindEntryView[] = [];
+    useService({
+      queues: {
+        [PID]: async () => {
+          if (hold) {
+            const h = hold;
+            hold = undefined;
+            await h.p;
+            return HttpResponse.json(queue([])); // read before the add was written
+          }
+          return HttpResponse.json(queue(stored));
+        },
+      },
+    });
+    const addAnswer = held<void>();
+    server.use(
+      http.post(url(`/projects/${PID}/find`), async () => {
+        await addAnswer.p;
+        stored = [entry({ typed: "one added" }), entry({ typed: "two added" })];
+        return HttpResponse.json({ added: stored, mergedLines: 0 });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(box().disabled).toBe(false));
+    await waitFor(() => expect(events.open()).toBe(true));
+    await user.type(box(), "one added{Enter}two added{Control>}{Enter}{/Control}");
+    const stale = held<void>();
+    hold = stale;
+    const before = reads();
+    events.push({ type: "find.progress", data: { projectId: PID, entryId: eid(), state: "looking-up" } });
+    await waitFor(() => expect(reads()).toBeGreaterThan(before));
+    addAnswer.release();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    // From now on the rows never vanish, not even for a moment.
+    const counts: number[] = [];
+    const mo = new MutationObserver(() => counts.push(rows().length));
+    mo.observe(queueList(), { childList: true, subtree: true });
+    stale.release();
+    await new Promise((r) => setTimeout(r, 300));
+    mo.disconnect();
+    expect(rowTexts()).toEqual(["one added", "two added"]);
+    expect(counts.every((c) => c === 2)).toBe(true);
+  });
+
+  it("N1: of two reads with equal stamps, the later-started wins whatever order they answer in", async () => {
+    const e = entry({ typed: "same stamp", state: "looking-up", updatedAt: "2026-11-13T10:00:00.000Z" });
+    const first = held<void>();
+    let k = 0;
+    useService({
+      queues: {
+        [PID]: async () => {
+          const mine = ++k;
+          if (mine === 1) {
+            await first.p;
+            return HttpResponse.json(queue([{ ...e, state: "choose", candidates: [cand({ id: "c1" })] }]));
+          }
+          return HttpResponse.json(queue([e]));
+        },
+      },
+    });
+    const user = userEvent.setup();
+    show();
+    const sw = await screen.findByRole("switch", { name: "Check everything I have" });
+    await waitFor(() => expect(k).toBe(1));
+    await user.click(sw);
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    first.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(stateOf("same stamp")).toBe("Looking it up");
+  });
+
+  it("N1: a removed row is not brought back by a stale read", async () => {
+    const a = entry({ typed: "gone one", state: "not-found" });
+    const b = entry({ typed: "kept one", state: "not-found" });
+    let hold: ReturnType<typeof held<void>> | undefined;
+    useService({
+      queues: {
+        [PID]: async () => {
+          if (hold) {
+            const h = hold;
+            hold = undefined;
+            await h.p;
+            return HttpResponse.json(queue([a, b]));
+          }
+          return HttpResponse.json(queue([b]));
+        },
+      },
+    });
+    server.use(http.delete(url(`/projects/${PID}/find/:eid`), () => HttpResponse.json({ removed: true })));
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    // The first load showed only b; put a back by a fresh read that holds a and b, then remove a while a stale read is out.
+    queues[PID] = queue([a, b]);
+    await waitFor(() => expect(events.open()).toBe(true));
+    events.push({ type: "find.progress", data: { projectId: PID, entryId: a.id, state: "not-found" } });
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    queues[PID] = async () => {
+      if (hold) {
+        const h = hold;
+        hold = undefined;
+        await h.p;
+        return HttpResponse.json(queue([a, b]));
+      }
+      return HttpResponse.json(queue([b]));
+    };
+    const stale = held<void>();
+    hold = stale;
+    const before = reads();
+    events.push({ type: "find.progress", data: { projectId: PID, entryId: a.id, state: "not-found" } });
+    await waitFor(() => expect(reads()).toBeGreaterThan(before));
+    await user.click(within(row("gone one")).getByRole("button", { name: "Remove from the queue: “gone one”" }));
+    await waitFor(() => expect(rowTexts()).toEqual(["kept one"]));
+    stale.release();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(rowTexts()).toEqual(["kept one"]);
+  });
+
+  it("N2: a refused change of project goes back, select and address, when nothing was remembered before", async () => {
+    useService();
+    server.use(http.put(url("/find/screen"), () => refusal(503, "UNAVAILABLE", "This computer's settings could not be written.")));
+    const user = userEvent.setup();
+    show();
+    const project = (await screen.findByRole("combobox", { name: "Project" })) as HTMLSelectElement;
+    await waitFor(() => expect(project.value).toBe(PID));
+    await user.selectOptions(project, PID_OTHER);
+    expect(await screen.findByText(/could not remember the choice/)).toBeTruthy();
+    await waitFor(() => expect(project.value).toBe(PID));
+    expect(new URLSearchParams(window.location.search).get("project")).toBe(PID);
+  });
+
+  it("N3 (B4): the project shown stays when it is locked elsewhere; the unlock is offered", async () => {
+    useService();
+    show();
+    const project = (await screen.findByRole("combobox", { name: "Project" })) as HTMLSelectElement;
+    await waitFor(() => expect(project.value).toBe(PID));
+    await waitFor(() => expect(events.open()).toBe(true));
+    events.push(libState("lib-1"));
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === PID ? { ...p, encrypted: true, unlocked: false } : p)) })));
+    queues[PID] = () => refusal(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
+    events.push(libState("lib-1"));
+    await waitFor(() => expect(within(project).getAllByRole("option").map((o) => o.textContent)).toContain("Market study (locked)"));
+    expect(await screen.findByRole("heading", { name: /Market study is locked/ })).toBeTruthy();
+    expect(project.value).toBe(PID);
+  });
+
+  it("N4: after a change of library, focus goes to the screen's heading", async () => {
+    const e = entry({ typed: "focus here", state: "not-found" });
+    useService({ queues: { [PID]: queue([e]) } });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(events.open()).toBe(true));
+    events.push(libState("lib-1"));
+    within(row("focus here")).getByRole("button", { name: "Try again: “focus here”" }).focus();
+    events.push(libState("lib-2"));
+    const heading = screen.getByRole("heading", { level: 1, name: "Find and acquire" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    expect(heading.getAttribute("tabindex")).toBe("-1");
+  });
+
+  it("N5 (a): after an add refused because the project was locked, focus goes to the unlock's field", async () => {
+    useService();
+    server.use(http.post(url(`/projects/${PID}/find`), () => refusal(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked")));
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(box().disabled).toBe(false));
+    await user.type(box(), "Weber{Control>}{Enter}{/Control}");
+    const field = await screen.findByLabelText("Passphrase or recovery code");
+    await waitFor(() => expect(document.activeElement).toBe(field));
+  });
+
+  it("N5 (b): an add with no answer for 60 seconds is given up: the box is editable, its text kept, the status says so, and the queue is read", async () => {
+    useService();
+    server.use(http.post(url(`/projects/${PID}/find`), () => new Promise<Response>(() => {})));
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(box().disabled).toBe(false));
+    await user.type(box(), "Weber");
+    const before = reads();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      fireEvent.keyDown(box(), { key: "Enter", ctrlKey: true });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(box().readOnly).toBe(true);
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(box().readOnly).toBe(true);
+      await vi.advanceTimersByTimeAsync(1_500);
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(box().readOnly).toBe(false));
+    expect(box().value).toBe("Weber");
+    await waitFor(() => expect(live().textContent).toBe("The service did not answer. Nothing was added that the queue does not show."));
+    await waitFor(() => expect(reads()).toBeGreaterThan(before));
+  });
+
+  it("N6 (E3): a malformed candidate is left out; with none left the row offers only Remove", async () => {
+    const bad = { id: "cx", title: "No identifiers", creators: [], type: "book", providers: [] } as unknown as FindWorkCandidate;
+    const notitle = { id: "cy", creators: [], type: "book", identifiers: {}, providers: [] } as unknown as FindWorkCandidate;
+    const a = entry({ typed: "one good", state: "choose", candidates: [bad, cand({ id: "c1", title: "Good title" }), notitle] });
+    const b = entry({ typed: "all bad", state: "choose", candidates: [bad, notitle] });
+    useService({ queues: { [PID]: queue([a, b]) } });
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    expect(stateOf("one good")).toBe("1 possible match");
+    expect(stateOf("all bad")).toBe("No possible matches.");
+    expect(within(row("all bad")).getAllByRole("button").map((x) => x.getAttribute("aria-label"))).toEqual(["Remove from the queue: “all bad”"]);
+    await user.click(within(row("one good")).getByRole("button", { name: "Choose: “one good”" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getAllByRole("radio")).toHaveLength(2);
+    expect(screen.getByRole("heading", { level: 1, name: "Find and acquire" })).toBeTruthy();
   });
 });
 

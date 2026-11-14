@@ -15,7 +15,7 @@
  */
 import { FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
 import { Component, memo, type ReactNode } from "react";
-import { creatorsText, isKnownState, kindWords, yearOf } from "../api/find";
+import { creatorsText, isKnownState, kindWords, usableCandidates, yearOf } from "../api/find";
 import { UserText } from "./UserText";
 
 export type FindActKind = "choose" | "open" | "open-there" | "add-here" | "same" | "different" | "retry" | "remove";
@@ -53,7 +53,7 @@ export const FIND_TEXT = {
 
 /** An entry this build can show: a known state and text that was typed (else "needs a newer version", R258 M6). */
 export const entryKnown = (e: FindEntryView): boolean => isKnownState(e.state) && typeof e.typed === "string";
-const candidatesOf = (e: FindEntryView) => (Array.isArray(e.candidates) ? e.candidates : []);
+const candidatesOf = (e: FindEntryView) => usableCandidates(e);
 
 /** The plan's words for each state (Accept 3), and the design's for the states of later slices. */
 const STATE_WORDS = {
@@ -116,7 +116,7 @@ export function shortTyped(typed: unknown): string {
 }
 
 /** The candidate the entry was matched to, if any. */
-export const matchedWork = (e: FindEntryView): FindWorkCandidate | undefined => (e.chosen ? candidatesOf(e).find((c) => c && c.id === e.chosen) : undefined);
+export const matchedWork = (e: FindEntryView): FindWorkCandidate | undefined => (e.chosen ? candidatesOf(e).find((c) => c.id === e.chosen) : undefined);
 
 /** The acts a row offers, in order. Slice 1 only. */
 export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {

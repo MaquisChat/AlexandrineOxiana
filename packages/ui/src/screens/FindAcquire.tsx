@@ -8,11 +8,13 @@
  *   - A row is what the service last said. `find.progress` carries only `{ projectId, entryId, state }`: an event
  *     means "read the queue again", coalesced — while a read is out, further events ask for ONE more read after it,
  *     so a burst of fifty events makes one or two reads.
- *   - Every read and every act draws a number when it STARTS (a read) or is SENT (an act, R258 M1); each
- *     entry keeps the number of what it was last taken from, and a read only replaces (or drops) entries holding a
- *     lower number. So of two reads the one STARTED later wins, whatever order they answer in; an act's answer never
- *     undoes a read started after the act was sent, and the status says the state as shown. After every act the
- *     queue is read once more. While events keep coming, coalesced reads start at least 400 ms apart (M7).
+ *   - Which version of an entry is shown is decided by the SERVICE's stamp (`updatedAt`, R262 N1): whenever a read or
+ *     an act's answer holds an entry already shown, the later stamp is kept; with equal stamps, what arrived later,
+ *     except that of two reads the one STARTED later wins. A row missing from a read goes only if that read started
+ *     after the last act's answer naming the row (and after the read that last gave it); otherwise it stays and one
+ *     fresh read is made at once. A row removed here never comes back. The status says a row's change only when
+ *     what is shown changed. After every act the queue is read once more. While events keep coming, coalesced reads
+ *     start at least 400 ms apart (R258 M7).
  *   - The queue is keyed by its project and by the library: changing the project drops the old rows, and another
  *     library opening forgets everything of the old one (rows, lists, settings, dialog, answers still out; R258 I1).
  *   - The remembered settings are written one PUT at a time, each from the last confirmed answer (M2).
@@ -41,7 +43,7 @@ import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { isValidId } from "../api/import";
 import { isProjectLocked, libraryApi, type Collection, type LibraryApi, type LibraryState, type ProjectSummary } from "../api/library";
 import { ChooseWorkDialog } from "../components/ChooseWorkDialog";
-import { FindEntryRow, stateWords, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
+import { FindEntryRow, stateWords, wordsText, WordsView, type FindAction, type FindActKind, type FindPlace, type Words } from "../components/FindEntryRow";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
 import { navigate, projectInQuery, type AppLocation } from "../navigation";
@@ -57,6 +59,7 @@ export const FIND_SCREEN_TEXT = {
   noLibrary: "No library is open. Open one from the library to use Find and acquire.",
   projectsUnreadable: "The projects could not be read.",
   screenUnreadable: "This computer's Find and acquire settings could not be read.",
+  addTimedOut: "The service did not answer. Nothing was added that the queue does not show.",
 } as const;
 
 const RECONNECT_MS = 2000;
@@ -66,6 +69,17 @@ const PLACE_CONCURRENCY = 4;
 const EVENT_COALESCE_MS = 50;
 /** While events keep coming, coalesced reads of the queue start at least this far apart (R258 M7). */
 const READ_GAP_MS = 400;
+/** An add with no answer for this long is given up (R262 N5). */
+const ADD_TIMEOUT_MS = 60_000;
+
+/** -1, 0 or 1: which of two entries the service stamped later (`updatedAt`); 0 when equal or not comparable. */
+function stampOrder(a: FindEntryView, b: FindEntryView): number {
+  const ta = typeof a.updatedAt === "string" ? Date.parse(a.updatedAt) : NaN;
+  const tb = typeof b.updatedAt === "string" ? Date.parse(b.updatedAt) : NaN;
+  if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta > tb ? 1 : -1;
+  if (typeof a.updatedAt === "string" && typeof b.updatedAt === "string" && a.updatedAt !== b.updatedAt && !Number.isFinite(ta + tb)) return a.updatedAt > b.updatedAt ? 1 : -1;
+  return 0;
+}
 
 /** The service's own sentence for a refusal (plain words, never what was typed), or a fallback. */
 const sentenceOf = (err: unknown, fallback: string): string => (err instanceof ApiClientError && err.message ? err.message : fallback);
@@ -304,6 +318,22 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   const projectId =
     projects && remembered ? (holds(chosen) ? chosen : holds(asked) ? asked : holds(remembered.projectId) ? remembered.projectId : (list.find((p) => p.unlocked)?.id ?? list[0]?.id)) : undefined;
   const project = list.find((p) => p.id === projectId);
+  // The project shown never changes without the researcher's act (R262 N3): once shown, it is pinned.
+  useEffect(() => {
+    if (projectId && chosen === undefined) setChosen(projectId);
+  }, [projectId, chosen]);
+
+  // N4: after a change of library, focus goes to the heading (never the page body).
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const firstEpoch = useRef(true);
+  useEffect(() => {
+    if (firstEpoch.current) {
+      firstEpoch.current = false;
+      return;
+    }
+    const now = document.activeElement;
+    if (!now || now === document.body || !now.isConnected) headingRef.current?.focus();
+  }, [epoch, noLibrary]);
 
   // The chosen project's collections; the remembered collection only if it is one of them.
   useEffect(() => {
@@ -351,30 +381,37 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     putChain.current = putChain.current.then(run, run);
   };
 
-  /** After a refused change of a select: both selects show what the service last confirmed. */
-  const selectsBack = () => {
+  /**
+   * After a refused change of a select: the selects and the address show what the service last confirmed or, with
+   * nothing confirmed, what was shown before the change (R262 N2).
+   */
+  const selectsBack = (before: { projectId: string | undefined; collectionId: string }) => {
     const c = confirmed.current;
-    setChosen(c.projectId);
-    if (c.projectId) navigate(findHref(c.projectId), { replace: true });
-    setCollectionId(c.collectionId && collections?.some((x) => x.id === c.collectionId) ? c.collectionId : "");
+    const pid = c.projectId && holds(c.projectId) ? c.projectId : before.projectId;
+    setChosen(pid);
+    navigate(findHref(pid), { replace: true });
+    const cid = c.projectId === pid && c.collectionId ? c.collectionId : pid === before.projectId ? before.collectionId : "";
+    setCollectionId(cid);
   };
-  const rememberFailed = (err: unknown) => {
+  const rememberFailed = (before: { projectId: string | undefined; collectionId: string }) => (err: unknown) => {
     setSettingsError(`This computer could not remember the choice. ${sentenceOf(err, "")}`.trim());
-    selectsBack();
+    selectsBack(before);
   };
 
   const pickProject = (pid: string) => {
     if (!holds(pid) || pid === projectId) return;
+    const before = { projectId, collectionId };
     setChosen(pid);
     setSettingsError(undefined);
     navigate(findHref(pid), { replace: true });
-    put((b) => ({ checkEverything: b.checkEverything, projectId: pid }), { failed: rememberFailed });
+    put((b) => ({ checkEverything: b.checkEverything, projectId: pid }), { failed: rememberFailed(before) });
   };
   const pickCollection = (cid: string) => {
+    const before = { projectId, collectionId };
     setCollectionId(cid);
     setSettingsError(undefined);
     const pid = projectId;
-    put((b) => ({ checkEverything: b.checkEverything, ...(pid ? { projectId: pid } : {}), ...(cid ? { collectionId: cid } : {}) }), { failed: rememberFailed });
+    put((b) => ({ checkEverything: b.checkEverything, ...(pid ? { projectId: pid } : {}), ...(cid ? { collectionId: cid } : {}) }), { failed: rememberFailed(before) });
   };
 
   const confirmedCheck = remembered?.checkEverything ?? false;
@@ -406,7 +443,9 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   if (noLibrary) {
     return (
       <main className="ao-page ao-find" aria-labelledby={`${ids}-h`}>
-        <h1 id={`${ids}-h`}>Find and acquire</h1>
+        <h1 id={`${ids}-h`} ref={headingRef} tabIndex={-1}>
+          Find and acquire
+        </h1>
         <p role="status">{FIND_SCREEN_TEXT.noLibrary}</p>
       </main>
     );
@@ -414,7 +453,9 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
 
   return (
     <main className="ao-page ao-find" aria-labelledby={`${ids}-h`}>
-      <h1 id={`${ids}-h`}>Find and acquire</h1>
+      <h1 id={`${ids}-h`} ref={headingRef} tabIndex={-1}>
+        Find and acquire
+      </h1>
       <div className="ao-find__bar">
         <label className="ao-find__field">
           Project
@@ -496,7 +537,9 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
 
 interface Held {
   view: FindEntryView;
-  seq: number;
+  /** Taken from a read (its start number) or an act's answer (its arrival number). */
+  from: "read" | "act";
+  n: number;
 }
 
 interface Meta {
@@ -579,6 +622,8 @@ function ProjectQueue(props: {
   const [addBusy, setAddBusyState] = useState(false);
   const [addError, setAddError] = useState<string | undefined>();
   const [focusTarget, setFocusTarget] = useState<{ to: string; n: number } | null>(null);
+  const [focusUnlock, setFocusUnlock] = useState(0);
+  const unlockRef = useRef<HTMLDivElement>(null);
 
   const alive = useRef(true);
   /** Moves on at a lock or when the library goes: every answer of the time before is dropped. */
@@ -586,6 +631,8 @@ function ProjectQueue(props: {
   /** The order of what the screen took from the service (see the header). */
   const clock = useRef(0);
   const held = useRef(new Map<string, Held>());
+  /** For each row, the number at which the screen last received an act's answer naming it (R262 N1). */
+  const ackAt = useRef(new Map<string, number>());
   /** Entries known gone, with the number of what said so. */
   const gone = useRef(new Map<string, number>());
   const metaSeq = useRef(0);
@@ -603,6 +650,8 @@ function ProjectQueue(props: {
   const listRef = useRef<HTMLUListElement>(null);
   const lastFocus = useRef<{ el: HTMLElement; entryId: string | undefined } | null>(null);
   const sourceRef = useRef<HTMLElement>(null);
+  /** The latest `readOnce`, for a fresh read asked from inside applyQueue. */
+  const readOnceRef = useRef<() => Promise<void>>(async () => {});
   /** When the last coalesced read started (R258 M7). */
   const lastSoon = useRef(0);
 
@@ -690,19 +739,39 @@ function ProjectQueue(props: {
   );
 
   /**
-   * One entry from an act's answer, in its place in the order: `seq` was drawn when the act was SENT, so a read that
-   * started after it wins (R258 M1). Returns the entry as now shown.
+   * Keeps the later of what is shown and what came in, by the SERVICE's stamp (`updatedAt`); equal stamps: what came
+   * in, except a read started before the read that gave what is shown (R262 N1). True when what is shown changed.
    */
+  const keep = useCallback((v: FindEntryView, from: Held["from"], n: number): boolean => {
+    const cur = held.current.get(v.id);
+    if (cur) {
+      const o = stampOrder(v, cur.view);
+      if (o < 0) return false;
+      if (o === 0 && from === "read" && cur.from === "read" && n < cur.n) return false;
+      const unchanged = same(cur.view, v);
+      held.current.set(v.id, { view: unchanged ? cur.view : v, from, n });
+      return !unchanged;
+    }
+    held.current.set(v.id, { view: v, from, n });
+    return true;
+  }, []);
+
+  /** One entry from an act's answer: kept if the service stamped it no earlier than what is shown. Returns the entry shown. */
   const takeOne = useCallback(
-    (v: FindEntryView, seq: number): FindEntryView => {
-      const cur = held.current.get(v.id);
-      if ((gone.current.get(v.id) ?? -1) >= seq || (cur && cur.seq > seq)) return cur?.view ?? v;
-      held.current.set(v.id, { view: cur && same(cur.view, v) ? cur.view : v, seq });
+    (v: FindEntryView): { shown: FindEntryView; changed: boolean } => {
+      const n = ++clock.current;
+      ackAt.current.set(v.id, n);
+      if (gone.current.get(v.id) === Infinity) return { shown: v, changed: false };
+      gone.current.delete(v.id);
+      const before = held.current.get(v.id)?.view;
+      keep(v, "act", n);
+      const shown = held.current.get(v.id)!.view;
       commit();
-      askPlaces([v]);
-      return v;
+      askPlaces([shown]);
+      const changed = !before || wordsText(stateWords(before)) !== wordsText(stateWords(shown));
+      return { shown, changed };
     },
-    [commit, askPlaces],
+    [commit, askPlaces, keep],
   );
 
   /** A whole queue, read from `start`: it replaces or drops only what was taken from something older. */
@@ -714,14 +783,18 @@ function ProjectQueue(props: {
         if (!v || typeof v !== "object" || typeof v.id !== "string") continue;
         present.add(v.id);
         if ((gone.current.get(v.id) ?? -1) >= start) continue;
-        const cur = held.current.get(v.id);
-        if (cur && cur.seq > start) continue;
-        held.current.set(v.id, { view: cur && same(cur.view, v) ? cur.view : v, seq: start });
+        gone.current.delete(v.id);
+        keep(v, "read", start);
       }
+      // A row missing from this read goes only if the read started after the last act's answer naming it (and after
+      // the read that last gave it); otherwise it stays and one fresh read is made at once (R262 N1).
+      let fresh = false;
       for (const [id, h] of [...held.current]) {
-        if (present.has(id) || h.seq > start) continue;
-        held.current.delete(id);
-        gone.current.set(id, start);
+        if (present.has(id) || (h.from === "read" && h.n > start)) continue;
+        if (start > (ackAt.current.get(id) ?? -1)) {
+          held.current.delete(id);
+          gone.current.set(id, start);
+        } else fresh = true;
       }
       if (start > metaSeq.current) {
         metaSeq.current = start;
@@ -735,6 +808,7 @@ function ProjectQueue(props: {
       commit();
       const now = [...held.current.values()].map((h) => h.view);
       askPlaces(now);
+      if (fresh) void readOnceRef.current();
       // A row's change of state is said; several at once are counted, not each one.
       if (firstRead.current) {
         firstRead.current = false;
@@ -742,14 +816,14 @@ function ProjectQueue(props: {
       }
       const changed = now.filter((v) => {
         const b = before.get(v.id);
-        return b && b.state !== v.state && !acting.current.has(v.id);
+        return b && b !== v && wordsText(stateWords(b)) !== wordsText(stateWords(v)) && !acting.current.has(v.id);
       });
       if (changed.length === 1) {
         const v = changed[0]!;
         say(saidOf(v, !!r.stopped));
       } else if (changed.length > 1) say([`${changed.length} entries in the queue changed.`]);
     },
-    [commit, askPlaces, say, onStoredCheck],
+    [commit, askPlaces, say, onStoredCheck, keep],
   );
 
   const markLocked = useCallback(() => {
@@ -794,6 +868,7 @@ function ProjectQueue(props: {
     }
   }, [api, projectId, applyQueue, markLocked]);
 
+  readOnceRef.current = readOnce;
   const readNow = useCallback(() => void readOnce(), [readOnce]);
   /**
    * A read asked for by an event (or after an act), coalesced: it starts EVENT_COALESCE_MS after the first ask (asks
@@ -851,6 +926,9 @@ function ProjectQueue(props: {
 
   // ---- focus ----
   useEffect(() => {
+    if (focusUnlock > 0) unlockRef.current?.querySelector<HTMLElement>("input")?.focus();
+  }, [focusUnlock]);
+  useEffect(() => {
     if (!focusTarget) return;
     if (focusTarget.to === "box") boxRef.current?.focus();
     else listRef.current?.querySelector<HTMLElement>(`[data-entry-id="${CSS.escape(focusTarget.to)}"] [data-entry-text]`)?.focus();
@@ -891,11 +969,11 @@ function ProjectQueue(props: {
     acting.current.add(e.id);
     setErrorFor(e.id, undefined);
     const g = gen.current;
-    const seq = ++clock.current;
     try {
       const v = await call();
       if (!alive.current || g !== gen.current) return;
-      say(saidOf(takeOne(v, seq), !!meta?.stopped));
+      const t = takeOne(v);
+      if (t.changed) say(saidOf(t.shown, !!meta?.stopped));
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current || refused(err)) return;
@@ -993,13 +1071,12 @@ function ProjectQueue(props: {
     setDialog({ ...d, busy: true, error: undefined });
     acting.current.add(e.id);
     const g = gen.current;
-    const seq = ++clock.current;
     try {
       const v = await api.choose(projectId, e.id, candidateId);
       if (!alive.current || g !== gen.current) return;
-      const shown = takeOne(v, seq);
+      const t = takeOne(v);
       setDialog(null);
-      say(saidOf(shown, !!meta?.stopped));
+      if (t.changed) say(saidOf(t.shown, !!meta?.stopped));
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current) return;
@@ -1027,11 +1104,18 @@ function ProjectQueue(props: {
     setAddBusyState(true);
     setAddError(undefined);
     const g = gen.current;
-    const seq = ++clock.current;
+    // No answer within ADD_TIMEOUT_MS: the add is given up, the text kept, and the queue read (R262 N5 b).
+    const ac = new AbortController();
+    let timedOut = false;
+    let lockedNow = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ac.abort();
+    }, ADD_TIMEOUT_MS);
     try {
-      const r = await api.add(projectId, { lines: kept.map((k) => k.line), ...(collectionId ? { collectionId } : {}) });
+      const r = await api.add(projectId, { lines: kept.map((k) => k.line), ...(collectionId ? { collectionId } : {}) }, { signal: ac.signal });
       if (!alive.current || g !== gen.current) return;
-      for (const v of r.added) takeOne(v, seq);
+      for (const v of r.added) takeOne(v);
       // The box was read-only while the add was out, so it holds exactly what was sent (R258 I2).
       setText("");
       boxRef.current?.focus();
@@ -1039,8 +1123,16 @@ function ProjectQueue(props: {
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current) return;
+      if (timedOut) {
+        say([FIND_SCREEN_TEXT.addTimedOut]);
+        readNow();
+        return;
+      }
       if (isProjectLocked(err)) {
+        lockedNow = true;
         markLocked();
+        // Focus goes to what the screen now offers: the unlock's field (R262 N5 a).
+        setFocusUnlock((n) => n + 1);
         return;
       }
       let msg = sentenceOf(err, "The references could not be added.");
@@ -1051,10 +1143,11 @@ function ProjectQueue(props: {
       setAddError(msg);
       if (err instanceof ApiClientError && err.code === "READ_ONLY") readSoon();
     } finally {
+      clearTimeout(timer);
       addBusyRef.current = false;
       if (alive.current) {
         setAddBusyState(false);
-        boxRef.current?.focus();
+        if (!lockedNow) boxRef.current?.focus();
       }
     }
   };
@@ -1132,6 +1225,7 @@ function ProjectQueue(props: {
       {meta && meta.unreadableLines > 0 && !unreadable && <p className="ao-find__note">{unreadableText(meta.unreadableLines)}</p>}
 
       {locked && (
+        <div ref={unlockRef}>
         <UnlockProject
           api={lib}
           project={project}
@@ -1141,6 +1235,7 @@ function ProjectQueue(props: {
             onUnlocked();
           }}
         />
+        </div>
       )}
 
       <h2 id={`${ids}-queue`}>Queue</h2>
