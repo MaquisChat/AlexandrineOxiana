@@ -23,6 +23,7 @@ import { ToolsSetupRoute } from "./screens/ToolsSetup";
 import { WatchedFoldersRoute } from "./screens/WatchedFolders";
 import { ZoteroSync } from "./screens/ZoteroSync";
 import { ResearcherNameSetting } from "./screens/ResearcherName";
+import { SearchSources } from "./screens/SearchSources";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
 
@@ -49,6 +50,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: (p) => p === PATHS.tools, render: (loc, client) => <ToolsSetupRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.watchedFolders, render: (loc, client) => <WatchedFoldersRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.zotero, render: (_loc, client) => <ZoteroSync client={client} />, back: true },
+  { matches: (p) => p === PATHS.searchSources, render: (loc, client) => <SearchSources client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.about, render: () => <About />, back: true },
   {
     matches: (p) => p === PATHS.appearance,

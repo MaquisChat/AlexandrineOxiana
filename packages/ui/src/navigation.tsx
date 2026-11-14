@@ -17,6 +17,7 @@ export const PATHS = {
   tools: "/settings/tools",
   watchedFolders: "/settings/watched-folders",
   zotero: "/settings/zotero",
+  searchSources: "/settings/search-sources",
   importWizard: "/import",
   reviewQueue: "/import/review",
   governance: "/governance",
