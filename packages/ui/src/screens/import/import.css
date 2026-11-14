@@ -538,3 +538,17 @@ span.ao-import__hint {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+/*
+ * R318 a: a waiting file's decision under way. Both controls stay focusable (aria-disabled, never disabled) and look
+ * unavailable, as a disabled control here does; the one pressed also says so in words ("Using this file…") and shows
+ * the busy pointer, as busy controls do on the other screens.
+ */
+.ao-review__file button[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.ao-review__file button[aria-busy="true"] {
+  cursor: progress;
+}

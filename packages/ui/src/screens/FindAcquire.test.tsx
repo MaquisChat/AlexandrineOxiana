@@ -2871,7 +2871,11 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
       const hint = within(r).getByText("Paste an address into your browser.");
       expect(hint.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       const copies = within(list).getAllByRole("button", { name: /^Copy address: / });
-      expect(copies.map((b) => b.getAttribute("aria-label"))).toEqual(["Copy address: Publisher's page (doi.org)", "Copy address: Your library's catalogue (catalogue.example.edu)"]);
+      // R318 e: each Copy address is named with its row, as the links are.
+      expect(copies.map((b) => b.getAttribute("aria-label"))).toEqual([
+        "Copy address: Publisher's page (doi.org): “with offers”",
+        "Copy address: Your library's catalogue (catalogue.example.edu): “with offers”",
+      ]);
       for (const b of copies) expect(b.textContent).toBe("Copy address");
       // Label and host shown as outside text (UserText): markup stays text.
       expect(list.querySelector("b")).toBeNull();
@@ -2913,7 +2917,7 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
       show();
       await waitFor(() => expect(rows()).toHaveLength(1));
       const r = row("lying offer");
-      expect(within(r).getByRole("button", { name: "Copy address: Publisher's page (evil.example.net)" })).toBeTruthy();
+      expect(within(r).getByRole("button", { name: "Copy address: Publisher's page (evil.example.net): “lying offer”" })).toBeTruthy();
       expect(within(r).getByText("evil.example.net")).toBeTruthy();
       expect(r.textContent).not.toContain("doi.org");
     });

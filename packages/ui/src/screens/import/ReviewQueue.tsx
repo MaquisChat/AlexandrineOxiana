@@ -143,11 +143,16 @@ export interface ReviewQueueProps {
 export const SOURCE_POOL = 6;
 
 /**
- * R313 c: for this long after a waiting file leaves the list (or the list is read again and its cards move), no
- * "Use this file" or "Not this file" acts — by key or by pointer. The card that takes a decided file's place lies under
- * the same pointer, and a second press meant for the file that has just gone would otherwise fall on one the
- * researcher has not looked at. Long enough for a double click or a quick second key press; short enough not to slow
- * deliberate work. The controls are not shown disabled for it: they simply do not act.
+ * R313 c, R318 b: the quiet. While it is in force no "Use this file" or "Not this file" acts — by key or by pointer. It
+ * lasts this long from the LATEST of these moments:
+ *  - a waiting file leaving the list (decided, or already decided);
+ *  - the list being read again while it holds waiting files (its cards move; the first read only shows them);
+ *  - a press on a deciding control that is not taken: on a card whose own decision is out (that card is still
+ *    working, or is about to leave), or a press swallowed by the quiet itself.
+ * A press that is taken (a card at rest, no quiet in force) starts no quiet: one file's wait does not hold back a
+ * deliberate decision on another. So steady pressing at one spot never reaches the card that takes a decided file's
+ * place: only a press after this long without any press on a deciding control (and without a file leaving or the list
+ * moving) acts. Long enough for a double click or a quick second key press; short enough not to slow deliberate work.
  */
 export const DECIDE_SETTLE_MS = 600;
 
@@ -155,6 +160,13 @@ export const DECIDE_SETTLE_MS = 600;
 export const HELD_DECISION_TIMEOUT_MS = 60_000;
 /** R313 e: said on the card when a decision was given up. */
 export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
+/** R318 c: said once per quiet, in the polite region, when a press was swallowed by the quiet. */
+export const PRESS_NOT_TAKEN_TEXT = "That press was not taken, because the list had just changed. Look at the file, then press again.";
+/** A waiting file's two controls: their words at rest, and while that decision is out (R318 a). */
+export const HELD_DECIDE_WORDS: Readonly<Record<HeldFileDecision, { idle: string; working: string }>> = {
+  attach: { idle: "Use this file", working: "Using this file…" },
+  discard: { idle: "Not this file", working: "Removing this file…" },
+};
 
 /** Entries per page when the project's whole queue is read. */
 export const PROJECT_PAGE = 500;
@@ -261,8 +273,15 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   /** Each waiting file's heading (R313 a: focus goes there after a decision) and its card. */
   const fileHeads = useRef(new Map<string, HTMLHeadingElement>());
   const fileCards = useRef(new Map<string, HTMLElement>());
-  /** R313 c: until this time (Date.now()) no deciding control acts. */
+  /** R313 c, R318 b: until this time (Date.now()) no deciding control acts (see DECIDE_SETTLE_MS for from when). */
   const quietUntil = useRef(0);
+  /** R318 c: the quiet in force has already said that a press was not taken. */
+  const quietSaid = useRef(false);
+  /** R318 b: the quiet runs (again) for DECIDE_SETTLE_MS from `now`; a quiet that had ended starts afresh, unsaid. */
+  const holdQuiet = useCallback((now: number) => {
+    if (now >= quietUntil.current) quietSaid.current = false;
+    quietUntil.current = Math.max(quietUntil.current, now + DECIDE_SETTLE_MS);
+  }, []);
   /** R313 e: after a decision was given up and the queue read again, focus goes back to that file's heading. */
   const refocusAfterRead = useRef<string | null>(null);
   /** The message that nothing is waiting: focus goes there after the last decision. */
@@ -362,7 +381,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     (batchId ? api.review(batchId) : readAll()).then(
       (list) => {
         if (!ok()) return;
-        if (reread && list.some(isFound)) quietUntil.current = Date.now() + DECIDE_SETTLE_MS;
+        if (reread && list.some(isFound)) holdQuiet(Date.now());
         setItems(list);
         const back = refocusAfterRead.current;
         refocusAfterRead.current = null;
@@ -391,7 +410,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       flushTimer.current = null;
       arrived.current = new Map();
     };
-  }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget]);
+  }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget, holdQuiet]);
   // Unmounting moves the generation on: a decision answered after the screen closed changes nothing.
   useEffect(() => () => void gen.current++, []);
 
@@ -595,7 +614,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const rest = list.filter((x) => x.id !== item.id);
     itemsRef.current = rest;
     // R313 c: the next card now lies where this one was; a press meant for this one must not fall on it.
-    quietUntil.current = Date.now() + DECIDE_SETTLE_MS;
+    holdQuiet(Date.now());
     setItems(rest);
     setSelected((s) => s.filter((x) => x !== item.id));
     setStatus(said(at + 1));
@@ -609,9 +628,23 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     el?.focus();
   }, [fileFocus]);
   const decideHeld = async (item: ReviewItem, decision: HeldFileDecision) => {
-    // R313 c: just after a file left (or the list was read again) a press does nothing at all.
-    if (Date.now() < quietUntil.current) return;
-    if (heldBusyRef.current.has(item.id)) return;
+    const now = Date.now();
+    // R318 b: a press on a card whose own decision is out is not taken, and starts the quiet again from this press; it
+    // says nothing more (its button already says it is working).
+    if (heldBusyRef.current.has(item.id)) {
+      holdQuiet(now);
+      return;
+    }
+    // R313 c, R318 b, c: inside the quiet a press does nothing but start the quiet again from this press, and say,
+    // once per quiet, that it was not taken.
+    if (now < quietUntil.current) {
+      holdQuiet(now);
+      if (!quietSaid.current) {
+        quietSaid.current = true;
+        setStatus(PRESS_NOT_TAKEN_TEXT);
+      }
+      return;
+    }
     heldBusyRef.current.add(item.id);
     const g = gen.current;
     setHeldBusy((cur) => ({ ...cur, [item.id]: decision }));
@@ -1085,7 +1118,8 @@ interface FileCardProps {
  * sentence, what the app's check says (the service's words for its `why`; nothing when this build does not have it),
  * and the file's facts. Everything from the record, the file or the service is outside text (UserText). Its heading is
  * focusable (R313 a: focus comes here after a decision). Its two buttons: while its decision is out they are busy
- * (never disabled, so focus stays) and a press does nothing; R313 b — a key held down never decides: a repeated keydown
+ * (never disabled, so focus stays) and a press decides nothing (R318 a: the one pressed says "Using this file…" or
+ * "Removing this file…" and looks busy, the other looks unavailable; R318 b: the press renews the quiet); R313 b — a key held down never decides: a repeated keydown
  * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
 const FileCard = memo(function FileCard({ item, store, named, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
@@ -1109,10 +1143,13 @@ const FileCard = memo(function FileCard({ item, store, named, busy, error, headR
     // Space makes its click on keyup, after this: a held Space still presses once, when it is let go.
     if (e.key === "Enter" || e.key === " ") repeating.current = false;
   };
+  // Every press goes to the screen, also while this file's decision is out: one that is not taken renews the quiet (R318 b).
   const press = (d: HeldFileDecision) => () => {
     if (repeating.current) return;
-    if (!busy) onDecide(item, d);
+    onDecide(item, d);
   };
+  /** R318 a: the pressed control says it is working; its name still says which file. */
+  const words = (d: HeldFileDecision) => (busy === d ? HELD_DECIDE_WORDS[d].working : HELD_DECIDE_WORDS[d].idle);
   return (
     <li className="ao-review__file" ref={(el) => cardRef(item.id, el)}>
       <h4 className="ao-review__title ao-review__file-title" tabIndex={-1} ref={(el) => headRef(item.id, el)}>
@@ -1192,25 +1229,25 @@ const FileCard = memo(function FileCard({ item, store, named, busy, error, headR
         <button
           type="button"
           className="ao-import__primary"
-          aria-label={`Use this file for ${named}`}
+          aria-label={`${words("attach")} for ${named}`}
           aria-disabled={busy ? true : undefined}
           aria-busy={busy === "attach" || undefined}
           onKeyDown={onKeyDown}
           onKeyUp={onKeyUp}
           onClick={press("attach")}
         >
-          Use this file
+          {words("attach")}
         </button>
         <button
           type="button"
-          aria-label={`Not this file for ${named}`}
+          aria-label={`${words("discard")} for ${named}`}
           aria-disabled={busy ? true : undefined}
           aria-busy={busy === "discard" || undefined}
           onKeyDown={onKeyDown}
           onKeyUp={onKeyUp}
           onClick={press("discard")}
         >
-          Not this file
+          {words("discard")}
         </button>
       </div>
     </li>

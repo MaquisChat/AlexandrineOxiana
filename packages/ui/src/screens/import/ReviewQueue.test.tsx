@@ -858,11 +858,13 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     vi.useRealTimers();
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
-      fireEvent.click(use(RECORD));
+      // While it is out the button says "Using this file…" (R318 a): held by its element.
+      const u = use(RECORD);
+      fireEvent.click(u);
       await vi.advanceTimersByTimeAsync(10);
-      expect(use(RECORD).getAttribute("aria-busy")).toBe("true");
+      expect(u.getAttribute("aria-busy")).toBe("true");
       await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS - 1_000);
-      expect(use(RECORD).getAttribute("aria-busy")).toBe("true");
+      expect(u.getAttribute("aria-busy")).toBe("true");
       await vi.advanceTimersByTimeAsync(1_500);
     } finally {
       vi.useRealTimers();
@@ -971,14 +973,17 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     await waitFor(() => card("Right Two"));
     await user.click(use("Right One"));
     await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
-    // Its two buttons are busy and cannot be pressed again; focus stays on the one pressed.
-    expect(use("Right One").getAttribute("aria-disabled")).toBe("true");
-    expect(use("Right One").getAttribute("aria-busy")).toBe("true");
-    expect(not("Right One").getAttribute("aria-disabled")).toBe("true");
-    expect(document.activeElement).toBe(use("Right One"));
-    await user.click(use("Right One"));
-    await user.click(not("Right One"));
-    // Another file is decided meanwhile.
+    // Its two buttons are busy and cannot be pressed again; focus stays on the one pressed (its words say it is
+    // working, R318 a: held by its element).
+    const [u, n] = within(card("Right One")).getAllByRole("button") as [HTMLElement, HTMLElement];
+    expect(u.getAttribute("aria-disabled")).toBe("true");
+    expect(u.getAttribute("aria-busy")).toBe("true");
+    expect(n.getAttribute("aria-disabled")).toBe("true");
+    expect(document.activeElement).toBe(u);
+    await user.click(u);
+    await user.click(n);
+    // Another file is decided meanwhile — deliberately, after the quiet those two presses started again (R318 b).
+    passGuard();
     expect(use("Right Two").getAttribute("aria-disabled")).toBeNull();
     await user.click(use("Right Two"));
     await waitFor(() => expect(noUse("Right Two")).toBeNull());
@@ -1015,6 +1020,211 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(alert.textContent).toContain(PAUSED);
     expect(use(RECORD)).toBeTruthy();
     expect(screen.queryByText(/had already been decided/u)).toBeNull();
+  });
+
+  // R318: on a clock that MOVES. The service answers a decision in one second; the presses come as a pointer at one
+  // spot (or a quick keyboard) would make them.
+  describe("R318: a press that is not taken renews the quiet (a moving clock)", () => {
+    const NOT_TAKEN = "That press was not taken, because the list had just changed. Look at the file, then press again.";
+    /** The service answers each decision after `ms` (a fake timer: it moves with the clock). */
+    const slow = (ms: number) => [
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        await new Promise((r) => setTimeout(r, ms));
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    /** The four files of `mixed`, the service's own handler replaced by a slow one. */
+    const mixedSlow = (ms: number) => ({ ...mixed(), extra: slow(ms) });
+    const section = () => screen.getByRole("region", { name: "Files found for records" });
+    /** The deciding control at one spot of the section: the first card's first (or second) button, whichever card that is now. */
+    const atSpot = (k: 0 | 1) => section().querySelectorAll<HTMLButtonElement>(".ao-review__file button")[k]!;
+    /** A press at that spot (nothing there once the section is empty). */
+    const pressAt = (k: 0 | 1) => {
+      const b = document.querySelectorAll<HTMLButtonElement>(".ao-review__found .ao-review__file button")[k];
+      if (b) fireEvent.click(b);
+    };
+    /** The clock moves from here on: timers and Date together. */
+    const moving = () => {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    };
+    const tick = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+    /** Each text put in the polite region from now on. */
+    const listen = () => {
+      const said: string[] = [];
+      const region = screen.getAllByRole("status").find((s) => !s.textContent?.includes("Loading"))!;
+      const mo = new MutationObserver((recs) => {
+        for (const r of recs) for (const n of r.addedNodes) if (n.textContent) said.push(n.textContent);
+      });
+      mo.observe(region, { childList: true, subtree: true, characterData: true });
+      return { said, stop: () => mo.disconnect() };
+    };
+
+    it("R318 d: a press at one spot every 250 ms for ten seconds, against an answer that takes a second, decides ONE file; after a pause one deliberate press decides the next", async () => {
+      open(mixedSlow(1_000));
+      await waitFor(() => card("Right Two"));
+      await waitFor(() => expect(within(card("Right Two")).getByRole("button", { name: "Use this file for Right Two (Smith, 2020)" })).toBeTruthy());
+      moving();
+      const h = listen();
+      for (let t = 0; t < 10_000; t += 250) {
+        pressAt(0);
+        await tick(250);
+      }
+      await tick(1_000);
+      expect(heldCalls).toEqual([{ id: "r8", body: { projectId: P1, decision: "attach" } }]);
+      // R318 c: said once, not at every press.
+      expect(h.said.filter((s) => s === NOT_TAKEN)).toHaveLength(1);
+      h.stop();
+      // A pause of more than the quiet, then one deliberate press: the file then shown first.
+      await tick(DECIDE_SETTLE_MS + 100);
+      expect(within(card("Right Two")).getByRole("button", { name: "Use this file for Right Two (Smith, 2020)" })).toBe(atSpot(0));
+      fireEvent.click(atSpot(0));
+      await tick(1_100);
+      expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
+    });
+
+    it("R318 d: the same with Not this file", async () => {
+      open(mixedSlow(1_000));
+      await waitFor(() => card("Right Two"));
+      moving();
+      for (let t = 0; t < 10_000; t += 250) {
+        pressAt(1);
+        await tick(250);
+      }
+      await tick(1_000);
+      expect(heldCalls).toEqual([{ id: "r8", body: { projectId: P1, decision: "discard" } }]);
+      await tick(DECIDE_SETTLE_MS + 100);
+      fireEvent.click(atSpot(1));
+      await tick(1_100);
+      expect(heldCalls).toEqual([
+        { id: "r8", body: { projectId: P1, decision: "discard" } },
+        { id: "r10", body: { projectId: P1, decision: "discard" } },
+      ]);
+    });
+
+    it("R318 b: one file's wait does not block a deliberate decision on another — B is decided more than 600 ms after A's press, A still out; a press within 600 ms of a press not taken is not", async () => {
+      open(mixedSlow(5_000));
+      await waitFor(() => card("Right Two"));
+      moving();
+      const a = use("Right One");
+      fireEvent.click(a);
+      await tick(DECIDE_SETTLE_MS + 100);
+      // A is still out; B, pressed deliberately, is decided.
+      expect(a.getAttribute("aria-busy")).toBe("true");
+      fireEvent.click(use("Right Two"));
+      await tick(10);
+      expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
+      // A press on A while it is out is not taken, and starts the quiet again from that press: a press on another
+      // file within 600 ms of it is not taken either; one after 600 ms without a press is.
+      fireEvent.click(a);
+      await tick(300);
+      fireEvent.click(use(RECORD));
+      await tick(10);
+      expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
+      await tick(DECIDE_SETTLE_MS + 100);
+      fireEvent.click(use(RECORD));
+      await tick(10);
+      expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10", "r7"]);
+    });
+
+    it("R318 c: a quick Tab and Enter inside the quiet is not taken and is said once; the same press again after the quiet is taken", async () => {
+      open(mixedSlow(1_000));
+      await waitFor(() => card("Right Two"));
+      moving();
+      /** Enter on the focused control: its keydown and the click it makes (user-event's waits hang on a moving fake clock). */
+      const enter = () => {
+        const el = document.activeElement!;
+        fireEvent.keyDown(el, { key: "Enter", code: "Enter" });
+        fireEvent.click(el);
+        fireEvent.keyUp(el, { key: "Enter", code: "Enter" });
+      };
+      fireEvent.click(use("Right One"));
+      await tick(1_000);
+      expect(document.activeElement).toBe(head("Right Two"));
+      const h = listen();
+      // 150 ms after focus landed on the next card's heading: Tab (one step on, to its "Use this file"), then Enter.
+      await tick(150);
+      use("Right Two").focus();
+      enter();
+      await tick(100);
+      enter();
+      await tick(10);
+      expect(heldCalls.map((c) => c.id)).toEqual(["r8"]);
+      expect(h.said).toEqual([NOT_TAKEN]);
+      // Nothing changed on the card: it was not taken.
+      expect(use("Right Two").getAttribute("aria-busy")).toBeNull();
+      await tick(DECIDE_SETTLE_MS + 100);
+      enter();
+      await tick(10);
+      expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
+      h.stop();
+    });
+
+    it("R318 a: while a decision is out its button says it is working and the other looks unavailable; both back to normal after a refusal and after a give-up", async () => {
+      let refuse = true;
+      const o = mixed([
+        http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+          heldCalls.push({ id: params.itemId as string, body: await request.json() });
+          if (refuse) {
+            await new Promise((r) => setTimeout(r, 1_000));
+            return HttpResponse.json({ error: { code: "CONFLICT", message: "Paused.", reason: "paused" } }, { status: 409 });
+          }
+          return new Promise<Response>(() => {});
+        }),
+      ]);
+      o.extra = o.extra!.slice(-1);
+      open(o);
+      await waitFor(() => card("Right Two"));
+      await waitFor(() => expect(within(card("Right One")).getByRole("button", { name: "Use this file for Right One (Smith, 2020)" })).toBeTruthy());
+      moving();
+      const [u, n] = within(card("Right One")).getAllByRole("button") as [HTMLButtonElement, HTMLButtonElement];
+      const idle = () => {
+        expect(u.textContent).toBe("Use this file");
+        expect(n.textContent).toBe("Not this file");
+        expect(u.getAttribute("aria-label")).toBe("Use this file for Right One (Smith, 2020)");
+        expect(n.getAttribute("aria-label")).toBe("Not this file for Right One (Smith, 2020)");
+        for (const b of [u, n]) {
+          expect(b.getAttribute("aria-busy")).toBeNull();
+          expect(b.getAttribute("aria-disabled")).toBeNull();
+        }
+      };
+      idle();
+      fireEvent.click(u);
+      await tick(10);
+      // The pressed button says it is working, in words, and still names its file; the other looks unavailable.
+      expect(u.textContent).toBe("Using this file…");
+      expect(u.getAttribute("aria-label")).toBe("Using this file… for Right One (Smith, 2020)");
+      expect(u.getAttribute("aria-busy")).toBe("true");
+      expect(u.getAttribute("aria-disabled")).toBe("true");
+      expect(n.textContent).toBe("Not this file");
+      expect(n.getAttribute("aria-disabled")).toBe("true");
+      expect(n.getAttribute("aria-busy")).toBeNull();
+      // Both stay focusable (never disabled).
+      expect(u.disabled || n.disabled).toBe(false);
+      await tick(1_000);
+      expect(within(card("Right One")).getByRole("alert").textContent).toContain("Paused.");
+      idle();
+      // Not this file, given up after 60 seconds.
+      refuse = false;
+      await tick(DECIDE_SETTLE_MS + 100);
+      fireEvent.click(n);
+      await tick(10);
+      expect(n.textContent).toBe("Removing this file…");
+      expect(n.getAttribute("aria-label")).toBe("Removing this file… for Right One (Smith, 2020)");
+      expect(n.getAttribute("aria-busy")).toBe("true");
+      expect(u.textContent).toBe("Use this file");
+      expect(u.getAttribute("aria-disabled")).toBe("true");
+      await tick(HELD_DECISION_TIMEOUT_MS + 100);
+      expect(within(card("Right One")).getByText("The service did not answer. Look at the queue again before deciding.")).toBeTruthy();
+      const [u2, n2] = within(card("Right One")).getAllByRole("button");
+      expect(u2!.textContent).toBe("Use this file");
+      expect(n2!.textContent).toBe("Not this file");
+      for (const b of [u2!, n2!]) {
+        expect(b.getAttribute("aria-busy")).toBeNull();
+        expect(b.getAttribute("aria-disabled")).toBeNull();
+      }
+    });
   });
 
   it("R282 d: a 409 whose reason says already decided takes the entry away", async () => {

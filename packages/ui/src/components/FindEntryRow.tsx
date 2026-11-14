@@ -455,7 +455,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
               copyOnly ? (
                 <li key={`${i}:${o.url}`}>
                   <UserText>{o.label}</UserText> (<UserText>{o.host}</UserText>){" "}
-                  <button type="button" data-act="copy-address" aria-label={`${FIND_TEXT.copyAddress}: ${o.label} (${o.host})`} onClick={() => void copyAddress(o.url, i)}>
+                  <button type="button" data-act="copy-address" aria-label={short ? `${FIND_TEXT.copyAddress}: ${o.label} (${o.host}): ${label}` : `${FIND_TEXT.copyAddress}: ${o.label} (${o.host})`} onClick={() => void copyAddress(o.url, i)}>
                     {FIND_TEXT.copyAddress}
                   </button>
                   <div aria-live="polite">
