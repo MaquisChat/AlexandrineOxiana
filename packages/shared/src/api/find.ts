@@ -73,8 +73,8 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   unexpected: "Something went wrong while looking this up. Try again.",
   /** F8b (R283 a): on a "choose" entry whose people search could not be had; "Try again" is offered on it. */
   "people-unavailable": "People of this name could not be looked up just now. “Try again” looks again.",
-  /** F12 (R297 a): the only record source switched on (and allowed) needs a key that is not saved (Elicit). "Try again" goes on once it is. */
-  "needs-key": "The only search source switched on needs a key that is not saved. Add it in Search sources.",
+  /** F12 (R297 a, R308): the only record source switched on (and allowed) needs a key (Elicit) and none is available — not saved, or the password store could not be read. "Try again" goes on once one is. */
+  "needs-key": "The only search source switched on needs a key, and none is available. Add it in Search sources, then try again.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */

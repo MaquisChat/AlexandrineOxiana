@@ -114,7 +114,7 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
 
   it("F12 round 2 (R297 a, R298 a): the reason for a source switched on alone without its key; Elicit cannot be moved", () => {
     expect(FIND_REASON_CODES).toContain("needs-key");
-    expect(FIND_REASON_TEXT["needs-key"]).toBe("The only search source switched on needs a key that is not saved. Add it in Search sources.");
+    expect(FIND_REASON_TEXT["needs-key"]).toBe("The only search source switched on needs a key, and none is available. Add it in Search sources, then try again.");
     expect(FIND_REASON_TEXT["needs-key"]).not.toBe(FIND_REASON_TEXT["switched-off"]);
     // The screen offers "Move up" / "Move down" only for a source that can be moved: Elicit is always last.
     expect(Object.fromEntries(SEARCH_RECORD_SOURCES.map((id) => [id, SEARCH_SOURCE_INFO.record[id].movable]))).toEqual({ crossref: true, openalex: true, elicit: false });
