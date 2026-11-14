@@ -401,7 +401,12 @@ describe("the start (R324 a–c)", () => {
     expect(Object.keys(ok.json).sort()).toEqual(["ticket", "url"]);
     expect(no.json.error).toMatchObject({ code: "CONFLICT", message: FIND_LIBRARY_TEXT.busy, reason: "library-busy" });
     const [startedP, startedE] = ok === both[0] ? [p1, a.id] : [p2, b.id];
-    expect((await view(startedP, startedE)).state).toBe("waiting-sign-in");
+    const waiting = await view(startedP, startedE);
+    expect(waiting.state).toBe("waiting-sign-in");
+    // A waiting entry is offered neither links nor a start (R324 a, d: "and of no other"), and says nothing of the address.
+    expect(waiting.offers).toBeUndefined();
+    expect(waiting.library).toBeUndefined();
+    expect(waiting.reason).toBeUndefined();
     // The hand-over (Task F17's seam): the ticket ends, the pause starts.
     expect(svc!.state.session!.find!.libraryHandedOver(ok.json.ticket)).toEqual({ projectId: startedP, entryId: startedE });
     const paused = await startFetch(p2, c.id);

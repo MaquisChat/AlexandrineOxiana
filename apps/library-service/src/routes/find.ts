@@ -135,8 +135,9 @@ true satisfies Same<typeof REFERENCE_MIN_CHARS, typeof FIND_LINE_MIN_CHARS>;
 export function entryView(e: FindEntry, added?: ReadonlySet<string>, library?: LibraryParts): FindEntryView {
   // F15: what a waiting entry returns to stays in the library (`returnTo` is never sent).
   const { people, works, removed: _removed, candidates, morePeople, returnTo: _returnTo, offers: stored, ...rest } = e;
-  // F15: on an entry with library parts, its offers are the joined list (none: no offers); otherwise as stored.
-  const offers = library ? library.offers : stored;
+  // F15: on an entry with library parts, its offers are the joined list (none: no offers); on an entry waiting in the
+  // sign-in window none (its stored links are kept for its return); otherwise as stored.
+  const offers = library ? library.offers : e.state === "waiting-sign-in" ? undefined : stored;
   const n = works && added ? works.filter((w) => added.has(w.id)).length : 0;
   // F8b (R279 c): an entry asking among works with people stored beside them carries an author offer — counts only.
   const offer = e.state === "choose" && people?.length ? { peopleCount: people.length, ...(morePeople ? { morePeople } : {}) } : undefined;
