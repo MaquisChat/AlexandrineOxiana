@@ -1,4 +1,7 @@
 /**
+ * What the answer is used for now (R296): advice shown to the researcher beside a held file; nothing is attached on
+ * it unless the runner's option for attaching by itself is on, which nothing in the app sets.
+ *
  * The file check (Find and acquire, Task F11; Ruling R277 a, rebuilt by R282 a–c, stated in closed form by R292): is
  * a downloaded file the work of the record it was found for? The app attaches a file by itself ("match") only on
  * strong, positive evidence that the file IS the record's work: ONE structure that the file's first page must show,
@@ -18,16 +21,21 @@
  *     FILE_CHECK_TEXT_CHARS (2,000) characters of the text, whose content words taken together are EXACTLY the
  *     record's title's content words in the same sequence (the first TITLE_WORDS_MAX of them) — no missing word, no
  *     extra word; joining words and punctuation do not count. A word hyphenated across a line end (the next line
- *     starting in lower case) is tried both joined and as two words.
+ *     starting in lower case) is tried both joined and as two words. Lines longer together than WORDS_MAX_CHARS
+ *     (4,000) characters are no block (R296 e, A1: fail closed, so no word beyond the bound goes unseen).
  *  3. **The author line directly below:** the next line after the block (a line with no letter and no digit — a
  *     rule, asterisks — counts as empty: R293 d) is a line of names holding the first author's family name
- *     (`firstFamily`: the first creator with the role author, else the first creator). Commas, semicolons and full
- *     stops are left out, and so are affiliation marks glued to a name (NAME_MARKS: digits, *, †, ‡, §, ¶,
- *     superscripts) and a number of one or two digits standing by itself ("1", "1,2": R293 c); then every token must
- *     be a name of a creator of the record, a capitalised word, an initial, or one of NAME_JOINING_WORDS. A number of
- *     three or more digits (a year among them), a price, "pp.", a web or e-mail address, or one of NOT_NAME_WORDS
- *     (volume, vol, part, book, edition, chapter, section, issue: R293 c) makes it not a line of names; so do more
- *     than NAME_LINE_TOKENS_MAX (30) tokens.
+ *     (`firstFamily`: the first creator with the role author, else the first creator). NAME_SEPARATORS ("|", "·",
+ *     "•", "–") separate names as commas do (R296 e). Commas, semicolons and full stops are left out, and so are
+ *     affiliation marks glued to a name (NAME_MARKS: digits, *, †, ‡, §, ¶, superscripts) and marks standing by
+ *     themselves (MARK_PART: one or two digits and/or those symbols, joined by commas — "1", "1,2", "1,*", "1,2,†":
+ *     R293 c, R296 e); then every token must be a name of a creator of the record, a capitalised word, an initial,
+ *     or one of NAME_JOINING_WORDS. A number of three or more digits (a year among them), a decimal number ("24.95"),
+ *     a price (a currency sign; or one of CURRENCY_WORDS next to a number: "EUR 24.95", "30 dollars"), a year with a
+ *     letter ("2020a") or in roman numerals (four or more of M, D, C, L, X, V, I reading 1500–2099), "pp.", a web or
+ *     e-mail address, or one of NOT_NAME_WORDS (volume, vol, part, book, edition, chapter, section, issue: R293 c)
+ *     makes it not a line of names; so do more than NAME_LINE_TOKENS_MAX (30) tokens, and a line longer than
+ *     WORDS_MAX_CHARS (4,000) characters (R296 e, A1).
  *  4. **Nothing unexplained directly above:** the line directly above the block (a line with no letter and no digit
  *     counts as empty: R293 d) is none (the block opens the text); a
  *     line holding a digit, a web address or an e-mail address; a line holding the record's container title (when
@@ -35,7 +43,8 @@
  *     line, in any case. Anything else ("Supporting Information", "Symposium", a journal's name the record does not
  *     give, a line of punctuation alone) is "other-kind": the rule fails closed on a label it does not know.
  *  5. **No sign of another kind of document in the title zone:** the lines from the top of the text to
- *     ZONE_LINES_AFTER (3) lines after the block, and the embedded title (R282 a, R284 a as built). A sign is one of
+ *     ZONE_LINES_AFTER (3) lines after the block, and the embedded title (R282 a, R284 a as built). A zone longer
+ *     than WORDS_MAX_CHARS (4,000) characters does not satisfy this clause (R296 e, A1: fail closed). A sign is one of
  *     OTHER_KIND_PHRASES as whole words anywhere in the zone; one of ABOUT_LABELS ("review of", "reply to", …)
  *     followed directly by the record's title (its first six words) or its first author's family name ("the",
  *     colons, quotes and line breaks may stand between); a line that is only one of OTHER_KIND_LINES; or a line that
@@ -64,9 +73,9 @@
  * one of them also satisfies 4–6, judged around THAT place; 1, 7 and 8 hold for the file as a whole. Otherwise the
  * reason is the first of no-text, other-doi, other-kind, other-version, title-absent among those that apply (to any
  * place). A match says `by: "title"` always: the asset's provenance records it (`AcquiredFrom.check.by`).
- * **The reason when no place satisfies 2 and 3 (R293 e):** "other-kind" or "other-version" if a sign of clause 5 or
- * 6 (the embedded title's included) stands on a line beginning within REASON_ZONE_CHARS (1,000) characters,
- * otherwise "title-absent". It is worked out only after "no match" is decided, and never changes it.
+ * **The reason when no place satisfies 2 and 3 (R293 e):** "other-kind" if a sign of clause 5 stands in the first
+ * REASON_ZONE_CHARS (1,000) characters of the text or in the embedded title; else "other-version" if a sign of
+ * clause 6 stands on a line beginning within them or in the embedded title; otherwise "title-absent". It is worked out only after "no match" is decided, and never changes it.
  *
  * What the check found is returned for the review queue (R277 d), bounded and cleaned (invisible and control
  * characters removed): the first labelled DOI that is not the record's, the embedded title and the start of the
@@ -102,15 +111,24 @@ const ZONE_LINES_AFTER = 3;
 const VERSION_LINES_ABOVE = 3;
 /** Clause 6: … to this many lines below it (M10). */
 const VERSION_LINES_BELOW = 12;
-/** R293 e: with no place, a sign on a line beginning within this many characters gives the reason. */
+/** R293 e: with no place, a sign in this many characters of the text gives the reason. */
 const REASON_ZONE_CHARS = 1000;
+/** A1 (R296 e): the bound on the text whose words are compared; a block, a line of names or a title zone longer than it fails its clause. */
+const WORDS_MAX_CHARS = 4000;
 
 /** Clause 3: the small words that join or begin names (any case). */
 const NAME_JOINING_WORDS: ReadonlySet<string> = new Set(["and", "&", "by", "with", "et", "al", "de", "del", "della", "der", "den", "di", "da", "dos", "du", "la", "le", "van", "von", "bin", "ibn", "al", "el", "y", "e", "i", "jr", "sr"]);
 /** Clause 3 (R293 c): a line holding one of these words (whole word, any case) is not a line of names. */
 const NOT_NAME_WORDS: ReadonlySet<string> = new Set(["volume", "vol", "part", "book", "edition", "chapter", "section", "issue"]);
-/** Clause 3 (R293 c): a number of one or two digits standing by itself is an affiliation mark ("1", "1,2", "¹"). */
-const AFFILIATION_NUMBER = /^[\d\u00B2\u00B3\u00B9\u2070-\u2079]{1,2}$/u;
+/** Clause 3 (R296 e): between names these separate as commas do. */
+const NAME_SEPARATORS = /[|\u00B7\u2022\u2013]/gu;
+/** Clause 3 (R296 e): a mark standing by itself — one or two digits and/or symbols ("1", "1*", "*", "†"); joined by commas: "1,*", "1,2,†". */
+const MARK_PART = /^(?:[\d\u00B2\u00B3\u00B9\u2070-\u2079]{1,2}[*†‡§¶]*|[*†‡§¶]+)$/u;
+/** Clause 3 (R296 e, A2): a currency code or word next to a number makes a price. */
+const CURRENCY_WORDS: ReadonlySet<string> = new Set(["eur", "usd", "gbp", "jpy", "chf", "cad", "aud", "euro", "euros", "dollar", "dollars", "pound", "pounds", "yen"]);
+/** Clause 3 (R296 e, A2): a year in roman numerals reads as 1500–2099 (four or more of M, D, C, L, X, V, I). */
+const ROMAN_YEAR_MIN = 1500;
+const ROMAN_YEAR_MAX = 2099;
 /** Clause 3: affiliation marks glued to the start or end of a name (digits, *, †, ‡, §, ¶, superscript characters). */
 const NAME_MARKS = /^[\p{Nd}*†‡§¶²³¹⁰-₟ᴬ-ᵪ]+|[\p{Nd}*†‡§¶²³¹⁰-₟ᴬ-ᵪ]+$/gu;
 /** Clause 4: the ordinary article labels, allowed as the whole line directly above the block (any case). */
@@ -251,7 +269,12 @@ async function kindOf(path: string): Promise<"pdf" | "epub"> {
   }
 }
 
-const plainWords = (s: string): string[] => segmentsOf(s.slice(0, 4000)).flatMap((x: Segment) => segmentTokens(x));
+/**
+ * The words of `s` (at most WORDS_MAX_CHARS characters are read). Every caller whose clause could MATCH on what lies
+ * beyond the bound fails closed first (R296 e, A1): a block, a line of names or a title zone longer than the bound
+ * does not satisfy its clause, so no word or sign is silently dropped on a path to a match.
+ */
+const plainWords = (s: string): string[] => segmentsOf(s.slice(0, WORDS_MAX_CHARS)).flatMap((x: Segment) => segmentTokens(x));
 /** A title's content words in order (F10's `contentWords`: F2's tokens without F2's small joining words). */
 const contentWords = (s: string): string[] => plainWords(s).filter((w) => !STOP_WORDS.has(w));
 const containsRun = (hay: readonly string[], run: readonly string[]): boolean => run.length > 0 && ` ${hay.join(" ")} `.includes(` ${run.join(" ")} `);
@@ -283,6 +306,8 @@ function linesOf(text: string): Line[] {
 function blockWords(lines: readonly Line[], i: number, j: number): string[][] {
   const part = lines.slice(i, j + 1);
   const joined = part.reduce((acc, l, k) => (k === 0 ? l.text : HYPHEN_END.test(part[k - 1]!.text) && LOWER_START.test(l.text) ? acc.slice(0, -1) + l.text : `${acc} ${l.text}`), "");
+  // A1 (R296 e): lines longer than the bound are no block (fail closed): no word beyond it is dropped unseen.
+  if (joined.length > WORDS_MAX_CHARS) return [[]];
   return [contentWords(joined), contentWords(part.map((l) => l.text).join(" "))];
 }
 
@@ -310,19 +335,31 @@ const hasAddress = (s: string): boolean => s.split(/\s+/u).some((t) => WEB_ADDRE
 /** Clause 3: is `line` a line of names holding `family`? `names` are the words of every creator's names. */
 function nameLine(line: string, family: readonly string[], names: ReadonlySet<string>): boolean {
   const clean = cleanText(line).replace(/\p{Cf}/gu, "");
+  // A1 (R296 e): a line longer than the bound is not a line of names (fail closed).
+  if (clean.length > WORDS_MAX_CHARS) return false;
   if (plainWords(clean).some((w) => NOT_NAME_WORDS.has(w))) return false;
-  const raw = clean.split(/\s+/u);
+  const raw = clean.replace(NAME_SEPARATORS, " , ").split(/\s+/u).filter(Boolean);
+  // A2 (R296 e): a currency code or word next to a number is a price.
+  const bare = (x: string | undefined) => (x ?? "").replace(/[^\p{L}]/gu, "").toLowerCase();
+  if (raw.some((tok, k) => CURRENCY_WORDS.has(bare(tok)) && (/\p{N}/u.test(raw[k - 1] ?? "") || /\p{N}/u.test(raw[k + 1] ?? "")))) return false;
   const kept: string[] = [];
   for (const tok of raw) {
-    if (!tok) continue;
     if (WEB_ADDRESS.test(tok) || EMAIL_ADDRESS.test(tok) || PRICE.test(tok)) return false;
-    // A number standing by itself: one or two digits are affiliation marks, left out (R293 c); more (a year) fail.
+    // A number standing by itself: a decimal number fails (A2); marks of one or two digits and symbols, joined by
+    // commas ("1", "1,2", "1,*", "1,2,†"), are left out (R293 c, R296 e); anything more (a year) fails.
     if (!/\p{L}/u.test(tok) && /\p{N}/u.test(tok)) {
-      if (tok.split(/[,;.]/u).every((x) => !x || AFFILIATION_NUMBER.test(x))) continue;
+      if (/\p{N}\.\p{N}/u.test(tok)) return false;
+      if (tok.split(/[,;.]/u).every((x) => !x || MARK_PART.test(x))) continue;
       return false;
     }
     const t = tok.replace(/[,;.]/gu, "");
     if (!t) continue;
+    // A2 (R296 e): a year with a letter suffix ("2020a"), a year in roman numerals ("MMXX").
+    if (/^\p{N}{4}\p{L}$/u.test(t)) return false;
+    if (/^[MDCLXVI]{4,}$/u.test(t)) {
+      const v = numberValue(t.toLowerCase(), "part");
+      if (v !== undefined && v >= ROMAN_YEAR_MIN && v <= ROMAN_YEAR_MAX) return false;
+    }
     kept.push(t);
     if (kept.length > NAME_LINE_TOKENS_MAX) return false;
     if (t === "&") continue;
@@ -524,6 +561,8 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
     const zoneLines = [...zone];
     const textZoneWords = plainWords(zoneLines.join("\n"));
     if (embedded) zoneLines.push(embedded);
+    // A1 (R296 e): a zone longer than the bound does not satisfy clause 5 (fail closed).
+    if (zoneLines.join("\n").length > WORDS_MAX_CHARS) return true;
     const zoneWords = plainWords(zoneLines.join("\n"));
     return (
       OTHER_KIND_PHRASES.some((ph) => {
@@ -577,7 +616,7 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   // beginning within the first 1,000 characters (and in the embedded title), else title-absent.
   if (!places.length) {
     const early = lines.flatMap((l, k) => (l.start < REASON_ZONE_CHARS ? [k] : []));
-    if (kindIn(early.map((k) => lines[k]!.text))) return no("other-kind");
+    if (kindIn(linesOf(fullText.slice(0, REASON_ZONE_CHARS)).map((l) => l.text))) return no("other-kind");
     if (versionIn(early)) return no("other-version");
     return no("title-absent");
   }
