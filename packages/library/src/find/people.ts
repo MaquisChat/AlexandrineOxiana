@@ -215,7 +215,8 @@ export function decidePerson(ref: Reference, people: PersonCandidate[], works: W
   const fitOf = (p: PersonCandidate): { fits: boolean; byInitial: boolean } => {
     const named = tokensOf(cut(p.name, FIND_PERSON_NAME_MAX));
     const set = new Set(named);
-    let byInitial = false;
+    // R273 M10: a typed single letter is always an initial, whatever the name holds.
+    let byInitial = ref.tokens.some(isInitial);
     for (const t of ref.tokens) {
       if (set.has(t)) continue;
       if (isInitial(t) && named.some((n) => n.startsWith(t))) {
@@ -494,17 +495,23 @@ export function fitAuthorEntry(e: FindEntry): FindEntry {
 /**
  * R271 M4: whether the fresh record of a ticked work (`fresh`, from `works/<id>`) IS the work kept for choosing (`kept`):
  *  - when a DOI was kept, the fresh one has that same DOI;
- *  - the title's normalised words agree on the kept length: the fresh title is cut to the kept title's length (the
- *    kept one was cut there from the same text, so a word cut in the middle is cut alike in both).
+ *  - the titles' normalised words are the same, whole (R273 I2); only a kept title cut at FIND_PERSON_TITLE_MAX is
+ *    compared on its words, without its last word, as the beginning of the fresh title.
  * Otherwise the entry asks ("choose", with that one fresh candidate) and nothing is made by itself.
  */
 export function sameWork(kept: WorkCandidate, fresh: WorkCandidate): boolean {
   const keptDoi = kept.identifiers.doi?.toLowerCase();
   if (keptDoi && fresh.identifiers.doi?.toLowerCase() !== keptDoi) return false;
-  const words = (s: string) => normalizeTitle(s.replace(/[^\p{L}\p{N}\p{M}]+/gu, " ")).split(" ").filter(Boolean).join(" ");
+  const words = (s: string) => normalizeTitle(s.replace(/[^\p{L}\p{N}\p{M}]+/gu, " ")).split(" ").filter(Boolean);
   const keptTitle = cleanText(kept.title);
   const a = words(keptTitle);
-  return a !== "" && a === words(cleanText(fresh.title).slice(0, keptTitle.length));
+  const b = words(cleanText(fresh.title));
+  if (!a.length) return false;
+  // R273 I2: whole titles, word for word. Only a kept title that was cut at the stored limit is compared on its words:
+  // without its last word (the cut may have split it) it must be the first words of the fresh title.
+  if (Array.from(keptTitle).length < FIND_PERSON_TITLE_MAX) return a.length === b.length && a.every((w, i) => w === b[i]);
+  const head = a.slice(0, -1);
+  return head.length > 0 && head.every((w, i) => w === b[i]);
 }
 
 export function childTyped(w: WorkCandidate): string {

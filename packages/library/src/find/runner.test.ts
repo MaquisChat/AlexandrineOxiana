@@ -1980,11 +1980,11 @@ describe("F8: an author alone — the person, then their works", () => {
   const addedFrom = async (p: Project, parentId: string) => [...(await queue(p)).values()].filter((e) => e.parentId === parentId).map((e) => e.work!);
   const stateIs = (p: Project, id: string, s: FindState) =>
     until(async () => changes.some((c) => c.entryId === id && c.state === s) && (await entryOf(p, id))?.state === s, `the entry to be ${s}`);
-  /** The single-work answers for the works the mock knows, with a full title longer than the list keeps. */
+  /** The single-work answers for the works the mock knows: the list's title, and a second author only this answer carries (R273). */
   function singlesFor(id: string): void {
     for (const w of personWorks.get(id) ?? []) {
       const o = w as ReturnType<typeof oaWork>;
-      singleWorks.set(o.id.slice("https://openalex.org/".length), { ...o, title: `${o.title} — the full title ${"of the work ".repeat(30)}`.trim() });
+      singleWorks.set(o.id.slice("https://openalex.org/".length), { ...o, authorships: [...o.authorships, { author: { display_name: "Quentin Marsh" } }] });
     }
   }
 
@@ -2131,8 +2131,9 @@ describe("F8: an author alone — the person, then their works", () => {
     const made = await sourcesOf(p);
     expect(made).toHaveLength(3);
     const rec = made.find((s) => s.source.identifiers.doi === "10.5555/ao.f8.w1000")!.source;
-    // The title is the single work's full title, not the list's trimmed one.
-    expect(rec.title.variants[0]!.value).toContain("the full title");
+    // The record comes from the fresh single-work answer (R267 c): it holds the second author only that answer carries.
+    expect(rec.title.variants[0]!.value).toBe("Tidal Ledger Number 0");
+    expect(rec.creators.map((c) => c.family)).toEqual(["Brackwater", "Marsh"]);
     expect(rec.provenance).toMatchObject({ captureMethod: "reference_lookup", identification: { method: "find-chosen", confidence: 1 } });
     expect((await entryOf(p, pid))!.state).toBe("choose-works");
   });
@@ -2444,6 +2445,22 @@ describe("F8: an author alone — the person, then their works", () => {
     });
   }
 
+  it("R273 I2: a ticked work with no DOI whose fresh title only begins with the kept one: choose, nothing created", async () => {
+    onePerson(5);
+    personWorks.set("A5001", [{ ...oaWork(1000, "The State", "2025-12-01"), doi: undefined }]);
+    singleWorks.set("W1000", { ...oaWork(1000, "The Statesman's Yearbook", "2025-12-01"), doi: undefined });
+    const p = await project();
+    const r = runner();
+    const { added } = await r.add(p.id, [NAME]);
+    await stateIs(p, added[0]!.id, "choose-works");
+    const { added: kids } = await r.chooseWorks(p.id, added[0]!.id, ["W1000"]);
+    await settled(p, kids[0]!.id);
+    const e = (await entryOf(p, kids[0]!.id))!;
+    expect(e.state).toBe("choose");
+    expect(e.candidates![0]!.title).toBe("The Statesman's Yearbook");
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
   it("M4: same id, same DOI and title: record complete as now", async () => {
     onePerson(5);
     singlesFor("A5001");
@@ -2455,8 +2472,29 @@ describe("F8: an author alone — the person, then their works", () => {
     await settled(p, kids[0]!.id);
     expect((await entryOf(p, kids[0]!.id))!.state).toBe("record-complete");
     const made = await sourcesOf(p);
-    expect(made[0]!.source.title.variants[0]!.value).toContain("the full title");
+    // The record comes from the fresh single-work answer: it holds the second author only that answer carries.
+    expect(made[0]!.source.creators.map((c) => c.family)).toEqual(["Brackwater", "Marsh"]);
   });
+
+  for (const [what, fresh, state] of [
+    ["the same full title is the same work: record complete", (full: string) => full, "record-complete"],
+    ["a full title differing in an early word is not: choose, no source", (full: string) => full.replace("Long", "Wide"), "choose"],
+  ] as const) {
+    it(`R273 I2: a list title longer than the limit is kept cut; ${what}`, async () => {
+      const full = `Tidal Ledger Long${" commercialization of human feeling".repeat(20)}`;
+      onePerson(5);
+      personWorks.set("A5001", [oaWork(1000, full, "2025-12-01", "10.5555/ao.f8.w1000")]);
+      singleWorks.set("W1000", oaWork(1000, fresh(full), "2025-12-01", "10.5555/ao.f8.w1000"));
+      const p = await project();
+      const r = runner();
+      const { added } = await r.add(p.id, [NAME]);
+      await stateIs(p, added[0]!.id, "choose-works");
+      const { added: kids } = await r.chooseWorks(p.id, added[0]!.id, ["W1000"]);
+      await settled(p, kids[0]!.id);
+      expect((await entryOf(p, kids[0]!.id))!.state).toBe(state);
+      expect(repo.listSourceIds(p.id)).toHaveLength(state === "choose" ? 0 : 1);
+    });
+  }
 
   it("M5: tick, remove the added entry, tick again: added again; two calls at once with the same id add it once", async () => {
     onePerson(10);

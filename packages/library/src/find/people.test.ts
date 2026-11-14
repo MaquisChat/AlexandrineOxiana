@@ -407,6 +407,11 @@ describe("round 2: an initial counts, but always asks (R270 d)", () => {
   it("Pierre Bourdieu with one: one, not by an initial (straight to works as before)", () => {
     expect(decidePerson(ref("Pierre Bourdieu"), [p("A1", "Pierre Bourdieu")], [])).toEqual({ kind: "one", person: p("A1", "Pierre Bourdieu"), byInitial: false });
   });
+  it("R273 M10: a typed single letter is always an initial, even against a name that holds that bare letter", () => {
+    expect(decidePerson(ref("J. Smith"), [p("A1", "J. Smith")], [])).toEqual({ kind: "one", person: p("A1", "J. Smith"), byInitial: true });
+    expect(decidePerson(ref("J Smith"), [p("A1", "J Smith")], [])).toEqual({ kind: "one", person: p("A1", "J Smith"), byInitial: true });
+    expect(decidePerson(ref("John Smith"), [p("A1", "John Smith")], [])).toEqual({ kind: "one", person: p("A1", "John Smith"), byInitial: false });
+  });
   it("a typed word of two letters or more is never an initial", () => {
     expect(decidePerson(ref("Pi Bourdieu"), [p("A1", "Pierre Bourdieu")], [])).toEqual({ kind: "none" });
   });
@@ -511,6 +516,18 @@ describe("round 2: a single work (R271 M3, M4)", () => {
     expect(sameWork({ ...kept, title: cutKept }, { ...fresh, title: `Another Title ${long}` })).toBe(false);
     // Punctuation and case are not a difference.
     expect(sameWork(kept, { ...fresh, title: "the managed heart." })).toBe(true);
+  });
+  it("sameWork (R273 I2): titles are compared whole; only a title cut at the stored limit is compared on its words", () => {
+    const kept: WorkCandidate = { id: "W1", title: "The State", creators: [], type: "book", identifiers: {}, providers: ["openalex"] };
+    const fresh: WorkCandidate = { ...kept, creators: [{ family: "Hochschild", role: "author" }] };
+    expect(sameWork(kept, { ...fresh, title: "The Statesman's Yearbook" })).toBe(false);
+    expect(sameWork({ ...kept, title: "Capital" }, { ...fresh, title: "Capital, Volume 3: The Process of Capitalist Production" })).toBe(false);
+    expect(sameWork(kept, { ...fresh, title: "the STATE!" })).toBe(true);
+    const long = `The Managed Heart ${"commercialization of human feeling ".repeat(20)}`.trim();
+    const cutKept = long.slice(0, FIND_PERSON_TITLE_MAX).trimEnd();
+    expect(sameWork({ ...kept, title: cutKept }, { ...fresh, title: long })).toBe(true);
+    const other = `The Hidden Heart ${"commercialization of human feeling ".repeat(20)}`.trim();
+    expect(sameWork({ ...kept, title: cutKept }, { ...fresh, title: other })).toBe(false);
   });
   it("once a person is chosen, morePeople is dropped (R271 M6)", () => {
     const e: FindEntry = {
