@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-library-window-take-pdf"
+description = "Enables the library_window_take_pdf command without any pre-configured scope."
+commands.allow = ["library_window_take_pdf"]
+
+[[permission]]
+identifier = "deny-library-window-take-pdf"
+description = "Denies the library_window_take_pdf command without any pre-configured scope."
+commands.deny = ["library_window_take_pdf"]

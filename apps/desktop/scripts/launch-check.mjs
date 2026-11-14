@@ -103,8 +103,19 @@ export const NOT_PROBED_IPC = { "watch.pick": "allow-pick-watch-folder" };
 
 export const CAPABILITIES_DIR = join(REPO, "apps", "desktop", "src-tauri", "capabilities");
 export const TAURI_CONF = join(REPO, "apps", "desktop", "src-tauri", "tauri.conf.json");
-/** Exactly what the main window is granted, in this order. */
-const MAIN_WINDOW_PERMISSIONS = ["core:event:allow-listen", "core:event:allow-unlisten", "dialog:allow-open", "allow-pick-watch-folder"];
+/** Exactly what the main window is granted, in this order (the last six: the library sign-in window, Task F16). */
+const MAIN_WINDOW_PERMISSIONS = [
+  "core:event:allow-listen",
+  "core:event:allow-unlisten",
+  "dialog:allow-open",
+  "allow-pick-watch-folder",
+  "allow-open-library-window",
+  "allow-library-window-take-pdf",
+  "allow-close-library-window",
+  "allow-sign-out-of-library",
+  "allow-set-stay-signed-in",
+  "allow-open-in-browser",
+];
 const CAPABILITY_KEYS = new Set(["$schema", "identifier", "description", "windows", "local", "permissions"]);
 
 /**

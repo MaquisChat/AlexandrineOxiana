@@ -1,0 +1,39 @@
+{
+ "status": "ok",
+ "message-type": "work-list",
+ "message-version": "1.0.0",
+ "message": {
+  "facets": {},
+  "total-results": 1,
+  "items": [
+   {
+    "DOI": "10.5555/ao.f14.wrong",
+    "title": [
+     "Salt Roads and Seasonal Labour in Upland Parishes"
+    ],
+    "author": [
+     {
+      "given": "Idris",
+      "family": "Calloway",
+      "sequence": "first",
+      "affiliation": []
+     }
+    ],
+    "issued": {
+     "date-parts": [
+      [
+       2017,
+       6
+      ]
+     ]
+    },
+    "type": "journal-article",
+    "container-title": [
+     "Journal of Invented Rural History"
+    ],
+    "publisher": "Invented Press for Tests"
+   }
+  ],
+  "items-per-page": 5
+ }
+}

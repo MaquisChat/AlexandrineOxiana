@@ -18,6 +18,7 @@
 pub mod connection;
 pub mod grant;
 pub mod helper_env;
+pub mod library_window;
 pub mod paths;
 #[cfg(debug_assertions)]
 pub mod probe;
@@ -63,6 +64,8 @@ struct Shell {
     failed: AtomicBool,
     /// The watched-folder chooser: one at a time.
     picker: grant::Picker,
+    /// The sign-in window (Task F16): its ticket, its fetch, its store.
+    library: Arc<library_window::Library>,
 }
 
 impl grant::GrantTarget for Shell {
@@ -120,7 +123,7 @@ fn fail(app: &AppHandle, shell: &Shell, message: &str) -> ! {
     std::process::exit(1);
 }
 
-fn launch(app: AppHandle, shell: Arc<Shell>) {
+fn launch(app: AppHandle, shell: Arc<Shell>, main_thread: std::thread::ThreadId) {
     let resources = app.path().resource_dir().ok();
     let helpers = match paths::resolve(resources.as_deref(), &paths::Overrides::from_env()) {
         Ok(p) => p,
@@ -139,6 +142,16 @@ fn launch(app: AppHandle, shell: Arc<Shell>) {
     for d in [&config_dir, &tools_dir, &models_dir] {
         let _ = std::fs::create_dir_all(d);
     }
+    // The sign-in window (Task F16): its inbox emptied and its store emptied unless kept, before
+    // anything else runs (this also catches a forced quit, a crash or a power loss).
+    shell.library.configure(library_window::Config {
+        device: data.join(library_window::DEVICE_FILE),
+        config_dir: config_dir.clone(),
+        test_mode: test_mode(),
+        main_thread,
+    });
+    let _ = library_window::empty_inbox(&config_dir);
+    shell.library.at_start(&library_host(&app, &shell));
     let token = match token::new_token() {
         Ok(t) => t,
         Err(m) => fail(&app, &shell, &format!("A new access key could not be made: {m}.")),
@@ -177,6 +190,15 @@ fn launch(app: AppHandle, shell: Arc<Shell>) {
     }
     match builder.build() {
         Ok(w) => {
+            // Closing the main window closes the sign-in window too, so the app still quits.
+            let main_app = app.clone();
+            w.on_window_event(move |e| {
+                if let tauri::WindowEvent::Destroyed = e {
+                    if let Some(l) = main_app.get_webview_window(library_window::LABEL) {
+                        let _ = l.close();
+                    }
+                }
+            });
             if test_mode() {
                 println!("AO_SHELL_WINDOW label={} visible={}", w.label(), w.is_visible().unwrap_or(false));
             }
@@ -248,6 +270,76 @@ async fn pick_watch_folder(app: AppHandle, window: tauri::WebviewWindow, title: 
     Some(picked.to_json())
 }
 
+/// The sign-in window's controller with the app as its host.
+fn library_host(app: &AppHandle, shell: &Arc<Shell>) -> library_window::TauriHost {
+    library_window::TauriHost::new(app.clone(), shell.library.clone(), shell.clone())
+}
+
+/// Runs `f` on a thread of its own, outside the async runtime (the window and store calls wait on
+/// the main thread, and `block_on` may not run inside the runtime), and awaits its answer.
+async fn detached<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv().ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// The sign-in window's commands (Task F16), granted to the main window only
+/// (capabilities/main-window.json). Each also checks its caller's label itself: from any other
+/// window it answers false and does nothing (library_window.rs, `Library`).
+#[tauri::command]
+async fn open_library_window(app: AppHandle, window: tauri::WebviewWindow, ticket: String, url: String) -> bool {
+    let Some(shell) = app.try_state::<Arc<Shell>>().map(|s| s.inner().clone()) else { return false };
+    let label = window.label().to_string();
+    detached(move || shell.library.open(&library_host(&app, &shell), &label, &ticket, &url)).await.unwrap_or(false)
+}
+
+#[tauri::command]
+async fn library_window_take_pdf(app: AppHandle, window: tauri::WebviewWindow) -> bool {
+    let Some(shell) = app.try_state::<Arc<Shell>>().map(|s| s.inner().clone()) else { return false };
+    let label = window.label().to_string();
+    detached(move || shell.library.take_pdf(&library_host(&app, &shell), &label, std::time::Instant::now())).await.unwrap_or(false)
+}
+
+#[tauri::command]
+async fn close_library_window(app: AppHandle, window: tauri::WebviewWindow) {
+    let Some(shell) = app.try_state::<Arc<Shell>>().map(|s| s.inner().clone()) else { return };
+    let label = window.label().to_string();
+    detached(move || shell.library.close(&library_host(&app, &shell), &label)).await;
+}
+
+#[tauri::command]
+async fn sign_out_of_library(app: AppHandle, window: tauri::WebviewWindow) -> bool {
+    let Some(shell) = app.try_state::<Arc<Shell>>().map(|s| s.inner().clone()) else { return false };
+    let label = window.label().to_string();
+    detached(move || shell.library.sign_out(&library_host(&app, &shell), &label)).await.unwrap_or(false)
+}
+
+#[tauri::command]
+async fn set_stay_signed_in(app: AppHandle, window: tauri::WebviewWindow, on: bool) -> bool {
+    let Some(shell) = app.try_state::<Arc<Shell>>().map(|s| s.inner().clone()) else { return false };
+    let label = window.label().to_string();
+    detached(move || shell.library.set_stay(&library_host(&app, &shell), &label, on)).await.unwrap_or(false)
+}
+
+/// Test mode never starts the system's opener: it says that it would have (no address).
+fn test_opener(_url: &str) -> bool {
+    println!("AO_SHELL_BROWSER_OPENED");
+    true
+}
+
+#[tauri::command]
+async fn open_in_browser(window: tauri::WebviewWindow, url: String) -> bool {
+    let opener: fn(&str) -> bool = if test_mode() { test_opener } else { library_window::system_opener };
+    library_window::open_in_browser(window.label(), &url, &opener)
+}
+
 /// SIGTERM, SIGINT and SIGHUP end the app the same way closing the window does.
 #[cfg(unix)]
 fn on_termination_signals(app: AppHandle) {
@@ -309,7 +401,15 @@ pub fn run() {
         // First, so that a second launch hands over to the first before it starts anything.
         .plugin(tauri_plugin_single_instance::init(move |app, _argv, _cwd| focus_main(app, &instance_shell)))
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![pick_watch_folder])
+        .invoke_handler(tauri::generate_handler![
+            pick_watch_folder,
+            open_library_window,
+            library_window_take_pdf,
+            close_library_window,
+            sign_out_of_library,
+            set_stay_signed_in,
+            open_in_browser
+        ])
         .setup(move |app| {
             app.manage(setup_shell.clone());
             let handle = app.handle().clone();
@@ -319,7 +419,8 @@ pub fn run() {
                 test_commands(handle.clone());
             }
             let shell = setup_shell.clone();
-            std::thread::spawn(move || launch(handle, shell));
+            let main_thread = std::thread::current().id();
+            std::thread::spawn(move || launch(handle, shell, main_thread));
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -348,7 +449,11 @@ pub fn run() {
             let app = app.clone();
             let shell = loop_shell.clone();
             std::thread::spawn(move || {
+                // The sign-in window closes and its store is emptied unless kept (on this thread:
+                // the event loop still runs); the inbox is emptied once the service is gone.
+                shell.library.at_quit(&library_host(&app, &shell));
                 stop_helpers(&shell);
+                empty_library_inbox(&shell);
                 shell.helpers_stopped.store(true, Ordering::SeqCst);
                 if shell.relaunch.load(Ordering::SeqCst) {
                     if test_mode() {
@@ -363,7 +468,15 @@ pub fn run() {
     });
     // Normally already done above; this covers an event loop that ended any other way.
     stop_helpers(&shell);
+    empty_library_inbox(&shell);
     std::process::exit(if shell.failed.load(Ordering::SeqCst) { 1 } else { code });
+}
+
+/// Empties the sign-in window's inbox (R325 g), once the service that reads it is gone.
+fn empty_library_inbox(shell: &Shell) {
+    if let Some(c) = shell.library.config() {
+        let _ = library_window::empty_inbox(&c.config_dir);
+    }
 }
 
 /// Stops the service (which stops the worker) and waits for both to be gone (see `Service::stop`).
