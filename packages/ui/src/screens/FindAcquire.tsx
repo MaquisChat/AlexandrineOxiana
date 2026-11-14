@@ -739,15 +739,24 @@ function ProjectQueue(props: {
   );
 
   /**
-   * Keeps the later of what is shown and what came in, by the SERVICE's stamp (`updatedAt`); equal stamps: what came
-   * in, except a read started before the read that gave what is shown (R262 N1). True when what is shown changed.
+   * Keeps one version of an entry. A read that started after the last act's answer naming the row (or for a row no act
+   * named) is taken as it is, the later-started read winning; otherwise the SERVICE's stamp (`updatedAt`) decides, equal
+   * stamps taking what came in except a read started before the read that gave what is shown (R262 N1, R263).
+   * True when what is shown changed.
    */
   const keep = useCallback((v: FindEntryView, from: Held["from"], n: number): boolean => {
     const cur = held.current.get(v.id);
     if (cur) {
-      const o = stampOrder(v, cur.view);
-      if (o < 0) return false;
-      if (o === 0 && from === "read" && cur.from === "read" && n < cur.n) return false;
+      const ack = ackAt.current.get(v.id);
+      if (from === "read" && (ack === undefined || n > ack)) {
+        // A read for a row no act's answer ever named, or one started after the last such answer, is taken as it is
+        // whatever the stamps say; of two such reads the later-started wins (R263).
+        if (cur.from === "read" && n < cur.n) return false;
+      } else {
+        const o = stampOrder(v, cur.view);
+        if (o < 0) return false;
+        if (o === 0 && from === "read" && cur.from === "read" && n < cur.n) return false;
+      }
       const unchanged = same(cur.view, v);
       held.current.set(v.id, { view: unchanged ? cur.view : v, from, n });
       return !unchanged;
@@ -1125,6 +1134,7 @@ function ProjectQueue(props: {
       if (!alive.current || g !== gen.current) return;
       if (timedOut) {
         say([FIND_SCREEN_TEXT.addTimedOut]);
+        setAddError(FIND_SCREEN_TEXT.addTimedOut);
         readNow();
         return;
       }

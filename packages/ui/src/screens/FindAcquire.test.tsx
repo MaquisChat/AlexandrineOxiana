@@ -1168,7 +1168,9 @@ describe("FindAcquire: round 4 (R262)", () => {
   const rowTexts = () => rows().map((r) => r.querySelector("[data-entry-text]")?.textContent);
   const stateOf = (typed: string) => row(typed).querySelector(".ao-find__state")?.textContent;
 
-  it("N1 (A2): after Try again, a stale read arriving late does not put back the old state, and the status never says it", async () => {
+  it("N1 (A2): after Try again, a read that started while the act was out and answers late does not put back the old state, and the status never says it", async () => {
+    // Order: the retry's answer is held; Try again is pressed; a read starts while the act is out (the service handles
+    // it first, so it sees the old entry) and is held; the act's answer arrives; then the older read's answer arrives.
     const e = entry({ typed: "Merton", state: "not-found", updatedAt: "2026-11-13T10:00:00.000Z" });
     let hold: ReturnType<typeof held<void>> | undefined;
     useService({
@@ -1184,17 +1186,26 @@ describe("FindAcquire: round 4 (R262)", () => {
         },
       },
     });
-    server.use(http.post(url(`/projects/${PID}/find/${e.id}/retry`), () => HttpResponse.json({ ...e, state: "looking-up", updatedAt: "2026-11-13T10:05:00.000Z" })));
+    const answer = held<void>();
+    server.use(
+      http.post(url(`/projects/${PID}/find/${e.id}/retry`), async () => {
+        await answer.p;
+        return HttpResponse.json({ ...e, state: "looking-up", updatedAt: "2026-11-13T10:05:00.000Z" });
+      }),
+    );
     const user = userEvent.setup();
     show();
     await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(events.open()).toBe(true));
     const h = heard();
+    await user.click(within(row("Merton")).getByRole("button", { name: "Try again: “Merton”" }));
     const stale = held<void>();
     hold = stale;
     const before = reads();
-    await user.click(within(row("Merton")).getByRole("button", { name: "Try again: “Merton”" }));
-    await waitFor(() => expect(stateOf("Merton")).toBe("Looking it up"));
+    events.push({ type: "find.progress", data: { projectId: PID, entryId: e.id, state: "not-found" } });
     await waitFor(() => expect(reads()).toBeGreaterThan(before));
+    answer.release();
+    await waitFor(() => expect(stateOf("Merton")).toBe("Looking it up"));
     stale.release();
     await new Promise((r) => setTimeout(r, 300));
     expect(stateOf("Merton")).toBe("Looking it up");
@@ -1399,6 +1410,92 @@ describe("FindAcquire: round 4 (R262)", () => {
     expect(box().value).toBe("Weber");
     await waitFor(() => expect(live().textContent).toBe("The service did not answer. Nothing was added that the queue does not show."));
     await waitFor(() => expect(reads()).toBeGreaterThan(before));
+  });
+
+  it("R263 (R4-3 a): the sentence for an add with no answer is also visible beside the box, tied to it, and said once in the status", async () => {
+    useService();
+    server.use(http.post(url(`/projects/${PID}/find`), () => new Promise<Response>(() => {})));
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(box().disabled).toBe(false));
+    await user.type(box(), "Weber");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      fireEvent.keyDown(box(), { key: "Enter", ctrlKey: true });
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(60_500);
+    } finally {
+      vi.useRealTimers();
+    }
+    const sentence = "The service did not answer. Nothing was added that the queue does not show.";
+    const visible = await screen.findByRole("alert");
+    expect(visible.textContent).toBe(sentence);
+    expect(visible.className).toBe("ao-error");
+    expect(box().getAttribute("aria-describedby")?.split(" ")).toContain(visible.id);
+    await waitFor(() => expect(live().textContent).toBe(sentence));
+    expect(screen.getAllByText(sentence, { exact: true }).filter((x) => live().contains(x))).toHaveLength(1);
+  });
+
+  it("R263 (C1): a read started after the last act's answer is taken whatever its stamp (a clock that stepped back)", async () => {
+    const e = entry({ typed: "Merton", state: "not-found", updatedAt: "2026-11-13T10:00:00.000Z" });
+    let current: FindEntryView = e;
+    useService({ queues: { [PID]: async () => HttpResponse.json(queue([current])) } });
+    server.use(
+      http.post(url(`/projects/${PID}/find/${e.id}/retry`), () => {
+        current = { ...e, state: "record-complete", updatedAt: "2026-11-13T11:59:00.000Z" };
+        return HttpResponse.json({ ...e, state: "looking-up", updatedAt: "2026-11-13T12:00:00.000Z" });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await user.click(within(row("Merton")).getByRole("button", { name: "Try again: “Merton”" }));
+    await waitFor(() => expect(stateOf("Merton")).toBe("Record complete"));
+  });
+
+  it("R263 (C3): reads with unreadable stamps: the later-started wins", async () => {
+    const e = entry({ typed: "Garbled", state: "looking-up", updatedAt: "garbage" });
+    const first = held<void>();
+    let k = 0;
+    useService({
+      queues: {
+        [PID]: async () => {
+          const mine = ++k;
+          if (mine === 1) {
+            await first.p;
+            return HttpResponse.json(queue([{ ...e, state: "choose", candidates: [cand({ id: "c1" })], updatedAt: "garbage" }]));
+          }
+          return HttpResponse.json(queue([{ ...e, updatedAt: "aaa" }]));
+        },
+      },
+    });
+    const user = userEvent.setup();
+    show();
+    const sw = await screen.findByRole("switch", { name: "Check everything I have" });
+    await waitFor(() => expect(k).toBe(1));
+    await user.click(sw);
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(stateOf("Garbled")).toBe("Looking it up"));
+    first.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(stateOf("Garbled")).toBe("Looking it up");
+  });
+
+  it("R263 (C3b): a read after an act's answer is taken even when its stamp is missing", async () => {
+    const e = entry({ typed: "Nostamp", state: "not-found", updatedAt: "2026-11-13T10:00:00.000Z" });
+    let current: FindEntryView = e;
+    useService({ queues: { [PID]: async () => HttpResponse.json(queue([current])) } });
+    server.use(
+      http.post(url(`/projects/${PID}/find/${e.id}/retry`), () => {
+        current = { ...e, state: "record-complete", updatedAt: undefined } as unknown as FindEntryView;
+        return HttpResponse.json({ ...e, state: "looking-up", updatedAt: "2026-11-13T12:00:00.000Z" });
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await user.click(within(row("Nostamp")).getByRole("button", { name: "Try again: “Nostamp”" }));
+    await waitFor(() => expect(stateOf("Nostamp")).toBe("Record complete"));
   });
 
   it("N6 (E3): a malformed candidate is left out; with none left the row offers only Remove", async () => {
