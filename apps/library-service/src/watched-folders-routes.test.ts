@@ -23,7 +23,7 @@ vi.mock("node:fs/promises", async (orig) => {
   }) as typeof real.realpath;
   return { ...real, default: { ...real, realpath }, realpath };
 });
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -551,7 +551,7 @@ describe("set again, retry, remove", () => {
     const reason = WATCH_REASONS.notResponding.replace("{provider}", "the system");
     const stuckStatus: WatchStatus = { watchId: wid, state: "unreachable", reason, provider: null, scanning: false, counts: { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 } };
     const stop = vi.fn(async () => {});
-    const stuck: FolderWatch = { ready: Promise.resolve(), stopped: false, stop, status: () => stuckStatus, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {} };
+    const stuck: FolderWatch = { ready: Promise.resolve(), stopped: false, stop, status: () => stuckStatus, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {}, presence: () => "unknown" };
     s.watches.set(pid, [stuck]);
     const r = await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` });
     expect(r.status, r.body).toBe(200);
@@ -571,7 +571,7 @@ describe("set again, retry, remove", () => {
     await until(async () => (await svc!.state.session!.repo.watchRegister(pid, wid)).size === 1, 20_000, "the register");
     expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { paused: true } })).status).toBe(200);
     const origin = await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` });
-    expect(origin.json.origins).toEqual([{ watchId: wid, folderLabel: "Team drive", folderRemoved: false, file: "kept.pdf", state: "in-library", local: true }]);
+    expect(origin.json.origins).toEqual([{ watchId: wid, folderLabel: "Team drive", folderRemoved: false, file: "kept.pdf", state: "in-library", presence: "unknown" }]);
     const watch = svc!.state.session!.watches.get(pid)!.find((w) => w.status().watchId === wid)!;
     const r = await call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${wid}` });
     expect([r.status, r.json]).toEqual([200, { removed: true }]);
@@ -579,7 +579,7 @@ describe("set again, retry, remove", () => {
     expect(await sourceIds(pid)).toEqual([sid]);
     expect((await call({ url: `/projects/${pid}/watched-folders` })).json.folders).toEqual([]);
     const gone = await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` });
-    expect(gone.json.origins).toEqual([{ watchId: wid, folderLabel: "", folderRemoved: true, file: "kept.pdf", state: "in-library", local: false }]);
+    expect(gone.json.origins).toEqual([{ watchId: wid, folderLabel: "", folderRemoved: true, file: "kept.pdf", state: "in-library", presence: "unknown" }]);
     const choices = JSON.parse(await readFile(join(deps.appConfigDir, "watched-folder-choices.json"), "utf8"));
     expect(JSON.stringify(choices)).not.toContain(wid);
     expect(await readFile(join(deps.appConfigDir, "watched-folders.json"), "utf8")).not.toContain(wid);
@@ -590,6 +590,126 @@ describe("set again, retry, remove", () => {
     const again = await add(other, dir);
     expect(again.status, again.body).toBe(201);
   }, 60_000);
+});
+
+describe("whether a changed file's new version is on this computer (R251, Task W11)", () => {
+  beforeEach(() => start());
+  /** Whole seconds: a time put back with `utimes` is the same to the nanosecond, as a provider keeps it. */
+  const T = 1_750_000_000;
+  const LONG_AGO = 1_000_000_000;
+  /** Writes a PDF aside, sets its time, and moves it into place whole (a colleague's new version arriving). */
+  async function replace(file: string, title: string): Promise<Buffer> {
+    const data = await buildPdf({ title, author: "Ana Souza", lines: [`${title}: a line of text.`] });
+    const aside = join(tmp, `aside-${randomBytes(4).toString("hex")}`);
+    await writeFile(aside, data);
+    await utimes(aside, T, T);
+    await rename(aside, file);
+    return data;
+  }
+  /** A cloud drive evicting the file: its blocks go; inode, size and exact time stay. */
+  async function evict(file: string): Promise<void> {
+    const before = await lstat(file, { bigint: true });
+    await truncate(file, 0);
+    await truncate(file, Number(before.size));
+    await utimes(file, LONG_AGO, T);
+    const after = await lstat(file, { bigint: true });
+    expect([after.ino, after.size, after.mtimeNs, after.blocks]).toEqual([before.ino, before.size, before.mtimeNs, 0n]);
+  }
+  /** A cloud drive downloading it again: its bytes written in place, its time kept. */
+  async function download(file: string, data: Buffer): Promise<void> {
+    const fh = await open(file, "r+");
+    try {
+      await fh.write(data, 0, data.length, 0);
+    } finally {
+      await fh.close();
+    }
+    await utimes(file, LONG_AGO, T);
+  }
+  async function originOf(pid: string, sid: string) {
+    const r = await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` });
+    expect(r.status, r.body).toBe(200);
+    return r.json.origins[0] as { state: string; presence: string } & Record<string, unknown>;
+  }
+  async function cameIn(name: string, title: string) {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await folder(name);
+    const file = join(dir, "paper.pdf");
+    await pdf(file, title);
+    const wid = (await add(pid, dir)).json.id as string;
+    const repo = svc!.state.session!.repo;
+    await until(async () => (await repo.watchRegister(pid, wid)).get("paper.pdf")?.state === "in-library", 40_000, "the file registered");
+    const sid = (await repo.watchRegister(pid, wid)).get("paper.pdf")!.sourceId;
+    return { pid, wid, dir, file, sid, repo };
+  }
+
+  it("presence is the engine's judgement: local, then not downloaded once evicted (and Bring in still refused), then local once downloaded", async () => {
+    const { pid, wid, file, sid, repo } = await cameIn("Judged", "A Paper That Will Change");
+    expect(await originOf(pid, sid)).toEqual({ watchId: wid, folderLabel: "Judged", folderRemoved: false, file: "paper.pdf", state: "in-library", presence: "unknown" });
+    const v2 = await replace(file, "The Paper As A Colleague Rewrote It");
+    const changed = await until(async () => {
+      const o = await originOf(pid, sid);
+      return o.state === "changed" ? o : undefined;
+    }, 30_000, "changed");
+    expect(changed).toEqual({ watchId: wid, folderLabel: "Judged", folderRemoved: false, file: "paper.pdf", state: "changed", newBytes: v2.length, presence: "local" });
+    await evict(file);
+    await until(async () => (await originOf(pid, sid)).presence === "not-downloaded", 20_000, "not downloaded");
+    expect((await originOf(pid, sid)).state).toBe("changed");
+    // The guard at the press decides, as before: nothing is added.
+    const assets = (await repo.getSource(pid, sid)).assets.length;
+    const bring = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "bring-in-new-version" } });
+    expect([bring.status, bring.json.error.code]).toEqual([409, "CONFLICT"]);
+    expect((await repo.getSource(pid, sid)).assets.length).toBe(assets);
+    expect((await lstat(file, { bigint: true })).atimeNs).toBe(BigInt(LONG_AGO) * 1_000_000_000n); // never opened
+    await download(file, v2);
+    await until(async () => (await originOf(pid, sid)).presence === "local", 20_000, "local again");
+    // Settled by the researcher: no judgement is kept for it any more.
+    const keep = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "keep-as-it-is" } });
+    expect(keep.status, keep.body).toBe(200);
+    expect(await originOf(pid, sid)).toMatchObject({ state: "settled", presence: "unknown" });
+  }, 120_000);
+
+  it("a paused or stopped watch and a folder not set up answer unknown", async () => {
+    const { pid, wid, file, sid } = await cameIn("Unsure", "A Paper Whose Folder Goes Quiet");
+    await replace(file, "Its Second Version");
+    await until(async () => (await originOf(pid, sid)).presence === "local", 30_000, "changed and local");
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { paused: true } })).status).toBe(200);
+    expect(await originOf(pid, sid)).toMatchObject({ state: "changed", presence: "unknown" });
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { paused: false } })).status).toBe(200);
+    await until(async () => (await originOf(pid, sid)).presence === "local", 20_000, "local after the resume");
+    // Stopped.
+    const watch = svc!.state.session!.watches.get(pid)!.find((w) => w.status().watchId === wid && !w.stopped)!;
+    await watch.stop();
+    expect(await originOf(pid, sid)).toMatchObject({ state: "changed", presence: "unknown" });
+    // Not set up on this computer (as if added on another one).
+    const store = join(deps.appConfigDir, "watched-folders.json");
+    const saved = JSON.parse(await readFile(store, "utf8"));
+    for (const p of Object.values(saved) as any[]) for (const w of Object.values(p) as any[]) delete w[wid];
+    await writeFile(store, JSON.stringify(saved));
+    expect(await summary(pid, wid)).toMatchObject({ state: "not-set-up" });
+    expect(await originOf(pid, sid)).toMatchObject({ state: "changed", presence: "unknown", folderRemoved: false });
+  }, 120_000);
+
+  it("a file of another state: may-have-changed gives the engine's judgement; gone is unknown", async () => {
+    const { pid, wid, file, sid } = await cameIn("Others", "A Paper Of Many States");
+    // Replaced by a version that is not on this computer: its content cannot be read, so "may-have-changed".
+    const aside = join(tmp, "aside-sparse.pdf");
+    await writeFile(aside, "");
+    await truncate(aside, 90_000);
+    await utimes(aside, LONG_AGO, T);
+    await rename(aside, file);
+    const mhc = await until(async () => {
+      const o = await originOf(pid, sid);
+      return o.state === "may-have-changed" ? o : undefined;
+    }, 30_000, "may-have-changed");
+    expect(mhc).toMatchObject({ newBytes: 90_000, presence: "not-downloaded" });
+    // Gone: there is no file to judge.
+    await rm(file);
+    // A file is noted gone after a complete listing: the restart of the watch makes one at once.
+    expect((await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` })).status).toBe(200);
+    await until(async () => (await originOf(pid, sid)).state === "gone", 30_000, "gone");
+    expect((await originOf(pid, sid)).presence).toBe("unknown");
+  }, 120_000);
 });
 
 describe("files and origins", () => {
@@ -668,7 +788,7 @@ describe("files and origins", () => {
 
     // The source's origin, and the two acts.
     const o1 = await call({ url: `/projects/${pid}/sources/${sid("one.pdf")}/watch-origin` });
-    expect(o1.json.origins).toEqual([{ watchId: wid, folderLabel: "Changes", folderRemoved: false, file: "one.pdf", state: "changed", newBytes: expect.any(Number), local: true }]);
+    expect(o1.json.origins).toEqual([{ watchId: wid, folderLabel: "Changes", folderRemoved: false, file: "one.pdf", state: "changed", newBytes: expect.any(Number), presence: "local" }]);
     const keep = await call({ method: "POST", url: `/projects/${pid}/sources/${sid("one.pdf")}/watch-origin/action`, body: { watchId: wid, action: "keep-as-it-is" } });
     expect([keep.status, keep.json]).toEqual([200, { done: "settled", sourceId: sid("one.pdf") }]);
     expect((await call({ url: `/projects/${pid}/sources/${sid("one.pdf")}/watch-origin` })).json.origins[0].state).toBe("settled");
@@ -951,7 +1071,7 @@ describe("fix round 1 (R233)", () => {
     const s = svc!.state.session!;
     await s.watches.get(pid)![0]!.stop();
     const st: WatchStatus = { watchId: wid, state: "watching", provider: null, scanning: false, counts: { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 } };
-    const hung: FolderWatch = { ready: Promise.resolve(), stopped: false, stop: () => new Promise(() => {}), status: () => st, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {} };
+    const hung: FolderWatch = { ready: Promise.resolve(), stopped: false, stop: () => new Promise(() => {}), status: () => st, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {}, presence: () => "unknown" };
     s.watches.set(pid, [hung]);
     expect(await answersWithin(call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${wid}` }), 2000)).toBe(200);
     expect((await call({ url: `/projects/${pid}/watched-folders` })).json.folders).toEqual([]);
