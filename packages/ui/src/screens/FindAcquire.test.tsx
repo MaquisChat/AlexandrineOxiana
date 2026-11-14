@@ -28,7 +28,7 @@ import { PATHS } from "../navigation";
 import type { LibraryWindowEvent } from "../desktopShell";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
 import { SOURCE_FILE, server, testClient, url, useMockService } from "../test/service";
-import { ACT_SAID_MS, FindAcquire, LIBRARY_SHELL_TIMEOUT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
+import { ACT_SAID_MS, FindAcquire, LIBRARY_CLOSE_WAIT_MS, LIBRARY_SHELL_TIMEOUT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
 
 useMockService();
 
@@ -3034,9 +3034,15 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
 
   beforeEach(() => {
     fake.shell = fakeShell();
+    // As the shell does (A13): closeLibraryWindow answers nothing; the closing is reported by the event `closed` (here
+    // without a ticket — at once when no window is open). R342 b waits for it before it asks the shell again.
+    const shell = fake.shell;
+    shell.closeLibraryWindow.mockImplementation(async () => {
+      queueMicrotask(() => shell.libraryWindow({ ticket: null, state: "closed" }));
+    });
   });
 
-  type Case = { typed: string; o: Partial<FindEntryView>; phrase: string; sentence?: string; libText?: string; controls: string[] };
+  type Case ={ typed: string; o: Partial<FindEntryView>; phrase: string; sentence?: string; libText?: string; controls: string[] };
   const cases: Case[] = [
     { typed: "startable", o: startable(), phrase: "No open copy", controls: ["library", "open", "remove"] },
     { typed: "startable unreachable", o: startable({ reason: { code: "copy-some-unreachable" } }), phrase: "No open copy", sentence: FIND_REASON_TEXT["copy-some-unreachable"], controls: ["try", "library", "open", "remove"] },
@@ -3603,5 +3609,455 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
     expect(calls.slice(before).filter((c) => c.method !== "GET")).toEqual([]);
     // Cancel is the service's own act: it works wherever the row is.
     expect(btn("waiting in a browser", "Cancel").getAttribute("aria-disabled")).toBeNull();
+  });
+
+  describe("round 2 (R342)", () => {
+    const LEFTOVER = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SECOND = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const NOT_OPENED = "The sign-in window could not be opened. Nothing was changed.";
+    const stateOf = (typed: string) => row(typed).querySelector(".ao-find__state")?.textContent;
+    const now = (e: FindEntryView) => current.find((x) => x.id === e.id)!;
+    const quiet = () => new Promise((r) => setTimeout(r, 300));
+    const progress = (e: FindEntryView, state: string) => events.push({ type: "find.progress", data: { projectId: PID, entryId: e.id, state } });
+    /** The service as F15 holds it: a start makes the entry wait; a cancel puts a waiting entry back, else 409 entry-state. */
+    function serveOne(typed: string, o: Partial<FindEntryView> = startable(), more: FindEntryView[] = []) {
+      const e = entry({ typed, ...o });
+      let starts = 0;
+      serve([...more, e], {
+        cancel: (id) => {
+          const v = current.find((x) => x.id === id)!;
+          if (v.state !== "waiting-sign-in") return refusal(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
+          becomes(later(v, { state: "no-open-copy", library: { canStart: true } }, "2026-11-13T12:00:00.000Z"));
+          return HttpResponse.json(current.find((x) => x.id === id));
+        },
+      });
+      server.use(
+        // Each start a ticket of its own (the first TICKET, then SECOND).
+        http.post(url("/projects/:id/find/:eid/library/start"), ({ params }) => {
+          const v = current.find((x) => x.id === params.eid)!;
+          becomes(later(v, { state: "waiting-sign-in", library: undefined }));
+          return HttpResponse.json({ url: LIB_URL, ticket: starts++ === 0 ? TICKET : SECOND });
+        }),
+        http.delete(url(`/projects/${PID}/find/:eid`), ({ params }) => {
+          current = current.filter((x) => x.id !== params.eid);
+          return HttpResponse.json({ removed: true });
+        }),
+      );
+      return e;
+    }
+    /** A page that pressed "Get through my library" itself, the shell opening the window: the row waits. */
+    async function started(typed: string, more: FindEntryView[] = []) {
+      const e = serveOne(typed, startable(), more);
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1 + more.length));
+      await user.click(btn(typed, "Get through my library"));
+      await waitFor(() => expect(stateOf(typed)).toBe("Waiting for you in the sign-in window"));
+      return { e, user };
+    }
+
+    // ---- R342 a (I1, M2): the window never outlives the wait it was opened for ----
+
+    it("R342 a (probe A): removing the waiting row whose window this page opened closes the window, once; that window's late events change nothing", async () => {
+      const { user } = await started("remove me", [entry({ typed: "stays", ...noc() })]);
+      const h = heard();
+      await user.click(btn("remove me", "Remove from the queue"));
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      for (const s of ["fetching", "handed-over", "closed"] as const) await say({ ticket: TICKET, state: s });
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(posts("/library/cancel")).toHaveLength(0);
+      expect(h.said.join(" ")).not.toMatch(/Fetching the PDF|The file was fetched|The sign-in window was closed/u);
+      h.stop();
+    });
+
+    it("R342 a (probe B): the service returns the row by itself (as at the ticket's end): the window is closed, once; its late events change nothing", async () => {
+      const { e } = await started("returned");
+      becomes(later(now(e), { state: "no-open-copy", library: { canStart: true } }, "2026-11-13T12:00:00.000Z"));
+      progress(e, "no-open-copy");
+      await waitFor(() => expect(stateOf("returned")).toBe("No open copy"));
+      await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      const h = heard();
+      for (const s of ["fetching", "not-a-pdf", "handed-over", "closed"] as const) await say({ ticket: TICKET, state: s });
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(posts("/library/cancel")).toHaveLength(0);
+      expect(h.said).toEqual([]);
+      expect(note("returned")).toBeUndefined();
+      h.stop();
+    });
+
+    it("R342 a (probe G): an open the page gave up on that the shell then carries out: the window is closed, once; the start is cancelled and the row says so", async () => {
+      serveOne("late shell");
+      let answer!: (v: boolean) => void;
+      fake.shell!.openLibraryWindow.mockReturnValue(new Promise<boolean>((r) => (answer = r)));
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const b = btn("late shell", "Get through my library");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        fireEvent.click(b);
+        await vi.advanceTimersByTimeAsync(50);
+        await vi.waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(LIBRARY_SHELL_TIMEOUT_MS + 500);
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+      await waitFor(() => expect(note("late shell")).toBe(NOT_OPENED));
+      // The shell opens the window after all: the page closes it.
+      act(() => answer(true));
+      await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      // Its closing, reported with the ticket, is no row's.
+      await say({ ticket: TICKET, state: "closed" });
+      await say({ ticket: TICKET, state: "fetching" });
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(note("late shell")).toBe(NOT_OPENED);
+    });
+
+    it("R342 a: no close when the row leaves the wait by the hand-over", async () => {
+      const { e } = await started("handed on");
+      await say({ ticket: TICKET, state: "handed-over" });
+      becomes(later(now(e), { state: "needs-check", reason: { code: "file-looks-right" } }, "2026-11-13T12:00:00.000Z"));
+      progress(e, "needs-check");
+      await waitFor(() => expect(stateOf("handed on")).toBe("Needs your check"));
+      await say({ ticket: null, state: "closed" });
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).not.toHaveBeenCalled();
+      expect(posts("/library/cancel")).toHaveLength(0);
+    });
+
+    it("R342 a: no close for a row whose window this page did not open (returned by the service, or removed)", async () => {
+      const w = entry({ typed: "theirs", ...waiting() });
+      const x = entry({ typed: "theirs too", ...waiting() });
+      serveOne("unrelated", noc(), [w, x]);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(3));
+      becomes(later(w, { state: "no-open-copy", library: { canStart: true } }, "2026-11-13T12:00:00.000Z"));
+      progress(w, "no-open-copy");
+      await waitFor(() => expect(stateOf("theirs")).toBe("No open copy"));
+      await user.click(btn("theirs too", "Remove from the queue"));
+      await waitFor(() => expect(rows()).toHaveLength(2));
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).not.toHaveBeenCalled();
+      expect(posts("/library/cancel")).toHaveLength(0);
+    });
+
+    // ---- R342 b: a window left over from before never blocks a start ----
+
+    it("R342 b: a leftover window (the settings screen's Test) is closed, the shell asked once more with the same ticket and address; the row waits; ONE start", async () => {
+      serveOne("leftover");
+      // As the shell: ONE ticket at a time; an open while one is open is refused; the close reports the ticket it ended.
+      let open: string | null = LEFTOVER;
+      const shell = fake.shell!;
+      shell.openLibraryWindow.mockImplementation(async (t) => {
+        if (open !== null) return false;
+        open = t;
+        return true;
+      });
+      shell.closeLibraryWindow.mockImplementation(async () => {
+        const t = open;
+        open = null;
+        queueMicrotask(() => shell.libraryWindow({ ticket: t, state: "closed" }));
+      });
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const h = heard();
+      await user.click(btn("leftover", "Get through my library"));
+      await waitFor(() => expect(stateOf("leftover")).toBe("Waiting for you in the sign-in window"));
+      expect(posts("/library/start")).toHaveLength(1);
+      expect(shell.openLibraryWindow.mock.calls).toEqual([
+        [TICKET, LIB_URL],
+        [TICKET, LIB_URL],
+      ]);
+      expect(shell.closeLibraryWindow).toHaveBeenCalledTimes(1);
+      const [first, second] = shell.openLibraryWindow.mock.invocationCallOrder;
+      expect(shell.closeLibraryWindow.mock.invocationCallOrder[0]).toBeGreaterThan(first!);
+      expect(shell.closeLibraryWindow.mock.invocationCallOrder[0]).toBeLessThan(second!);
+      expect(open).toBe(TICKET);
+      await quiet();
+      expect(posts("/library/cancel")).toHaveLength(0);
+      expect(h.said.join(" ")).not.toMatch(/could not be opened|was closed/u);
+      h.stop();
+    });
+
+    it("R342 b: the shell refuses twice: ONE cancel at the service, and the row says the window could not be opened", async () => {
+      serveOne("refused twice");
+      fake.shell!.openLibraryWindow.mockResolvedValue(false);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await user.click(btn("refused twice", "Get through my library"));
+      await waitFor(() => expect(note("refused twice")).toBe(NOT_OPENED));
+      expect(stateOf("refused twice")).toBe("No open copy");
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(posts("/library/start")).toHaveLength(1);
+      expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([
+        [TICKET, LIB_URL],
+        [TICKET, LIB_URL],
+      ]);
+      expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
+    });
+
+    it("R342 b: no closed within 5 seconds: the shell is not asked again; ONE cancel, and the row says so; the control busy meanwhile", async () => {
+      serveOne("no close");
+      fake.shell!.openLibraryWindow.mockResolvedValue(false);
+      fake.shell!.closeLibraryWindow.mockImplementation(async () => {});
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const b = btn("no close", "Get through my library");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        fireEvent.click(b);
+        await vi.advanceTimersByTimeAsync(50);
+        await vi.waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(LIBRARY_CLOSE_WAIT_MS - 500);
+        expect(posts("/library/cancel")).toHaveLength(0);
+        expect(row("no close").querySelector('button[data-act="library"]')?.getAttribute("aria-busy")).toBe("true");
+        await vi.advanceTimersByTimeAsync(1_000);
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+      await waitFor(() => expect(note("no close")).toBe(NOT_OPENED));
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(LIBRARY_CLOSE_WAIT_MS).toBe(5_000);
+      // A close reported after the wait changes nothing.
+      await say({ ticket: null, state: "closed" });
+      await quiet();
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(posts("/library/cancel")).toHaveLength(1);
+    });
+
+    // ---- R342 c (M1): the focus after a start ----
+
+    it("R342 c: Enter held or pressed twice on Get through my library starts once and takes nothing; the focus is on the row's own words", async () => {
+      serveOne("by keyboard");
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      fake.shell!.libraryWindowTakePdf.mockResolvedValue(true);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      act(() => btn("by keyboard", "Get through my library").focus());
+      await user.keyboard("{Enter}{Enter}");
+      await waitFor(() => expect(stateOf("by keyboard")).toBe("Waiting for you in the sign-in window"));
+      const words = row("by keyboard").querySelector<HTMLElement>(".ao-find__state")!;
+      await waitFor(() => expect(document.activeElement).toBe(words));
+      expect(words.getAttribute("tabindex")).toBe("-1");
+      // The key still held: it repeats on what has the focus.
+      await user.keyboard("{Enter}{Enter}");
+      await quiet();
+      expect(fake.shell!.libraryWindowTakePdf).not.toHaveBeenCalled();
+      expect(posts("/library/cancel")).toHaveLength(0);
+      expect(posts("/library/start")).toHaveLength(1);
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(words);
+    });
+
+    // ---- R342 d (M3): which events count for "the one row that waits" ----
+
+    it("R342 d (probe F): after this page ended its own ticket, another window's events are no row's — not the one waiting row's; the later closes change nothing", async () => {
+      const w = entry({ typed: "from before", ...waiting() });
+      const { user } = await started("mine now", [w]);
+      await user.click(btn("mine now", "Cancel"));
+      await waitFor(() => expect(stateOf("mine now")).toBe("No open copy"));
+      expect(posts("/library/cancel")).toHaveLength(1);
+      const h = heard();
+      await say({ ticket: OTHER_TICKET, state: "handed-over" });
+      await say({ ticket: OTHER_TICKET, state: "closed" });
+      await say({ ticket: TICKET, state: "closed" });
+      await say({ ticket: null, state: "failed", reason: "no-ticket" });
+      await quiet();
+      expect(note("from before")).toBeUndefined();
+      expect(note("mine now")).toBeUndefined();
+      expect(h.said).toEqual([]);
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(stateOf("from before")).toBe("Waiting for you in the sign-in window");
+      h.stop();
+    });
+
+    it("R342 d: an event carrying the ticket this page ended changes nothing, even with one row waiting", async () => {
+      const w = entry({ typed: "still waits", ...waiting() });
+      const { e } = await started("ended here", [w]);
+      becomes(later(now(e), { state: "no-open-copy", library: { canStart: true } }, "2026-11-13T12:00:00.000Z"));
+      progress(e, "no-open-copy");
+      await waitFor(() => expect(stateOf("ended here")).toBe("No open copy"));
+      await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      const h = heard();
+      await say({ ticket: TICKET, state: "handed-over" });
+      await say({ ticket: TICKET, state: "closed" });
+      await quiet();
+      expect(h.said).toEqual([]);
+      expect(note("still waits")).toBeUndefined();
+      expect(posts("/library/cancel")).toHaveLength(0);
+      h.stop();
+    });
+
+    // ---- R342 e (M4) ----
+
+    it("R342 e: the shell says there is no ticket: The sign-in window is not open for this work. Cancel, then use “Get through my library” again.", async () => {
+      serve([entry({ typed: "no window", ...waiting() })]);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await say({ ticket: null, state: "failed", reason: "no-ticket" });
+      const SAID = "The sign-in window is not open for this work. Cancel, then use “Get through my library” again.";
+      await waitFor(() => expect(note("no window")).toBe(SAID));
+      await waitFor(() => expect(live().textContent).toBe(`“no window”: ${SAID}`));
+    });
+
+    // ---- R342 f (M5) ----
+
+    it("R342 f (probe D): the window closed before the queue's read shows the row waiting: the start is still cancelled at the service, and the row says so", async () => {
+      serveOne("closed at once");
+      const shell = fake.shell!;
+      shell.openLibraryWindow.mockImplementation(async () => {
+        queueMicrotask(() => shell.libraryWindow({ ticket: TICKET, state: "closed" }));
+        return true;
+      });
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await user.click(btn("closed at once", "Get through my library"));
+      await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+      await waitFor(() => expect(stateOf("closed at once")).toBe("No open copy"));
+      expect(note("closed at once")).toBe("The sign-in window was closed.");
+      await quiet();
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(shell.closeLibraryWindow).not.toHaveBeenCalled();
+    });
+
+    // ---- R342 i (M9) ----
+
+    it("R342 i: outside the desktop app a press on an unavailable library control says Only in the desktop app, once per press, and makes no request", async () => {
+      fake.shell = undefined;
+      serve([entry({ typed: "in a browser", ...startable() }), entry({ typed: "waiting in a browser", ...waiting() })]);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(2));
+      const h = heard();
+      const before = calls.length;
+      const only = () => h.said.filter((s) => s === "Only in the desktop app").length;
+      await user.click(btn("in a browser", "Get through my library"));
+      await waitFor(() => expect(only()).toBe(1));
+      await user.click(btn("waiting in a browser", "Add the PDF showing in the sign-in window"));
+      await waitFor(() => expect(only()).toBe(2));
+      await new Promise((r) => setTimeout(r, ACT_SAID_MS + 200));
+      expect(only()).toBe(2);
+      expect(h.said).toHaveLength(2);
+      expect(calls.slice(before).filter((c) => c.method !== "GET")).toEqual([]);
+      h.stop();
+    });
+
+    for (const [why, give, sentence] of [
+      ["read-only", () => refusal(409, "READ_ONLY", FIND_ROUTE_TEXT.readOnly, "read-only"), FIND_ROUTE_TEXT.readOnly],
+      ["stopped", () => refusal(409, "CONFLICT", FIND_ROUTE_TEXT.projectStopped, "stopped"), FIND_ROUTE_TEXT.projectStopped],
+    ] as const) {
+      it(`R342 i: the cancel after a closed window refused with 409 ${why}: the service's sentence on the row (only entry-state is no error)`, async () => {
+        const { e } = await started(`refused ${why}`);
+        server.use(http.post(url(`/projects/${PID}/find/${e.id}/library/cancel`), () => give()));
+        await say({ ticket: TICKET, state: "closed" });
+        await waitFor(() => expect(within(row(`refused ${why}`)).getByRole("alert").textContent).toBe(sentence));
+        expect(posts("/library/cancel")).toHaveLength(1);
+      });
+    }
+
+    // ---- R342 j (M6): the guards no test held ----
+
+    it("R342 j: after the hand-over a close while the row is still shown waiting cancels nothing (the guard: not handed over)", async () => {
+      await started("handed, still shown waiting");
+      await say({ ticket: TICKET, state: "handed-over" });
+      await waitFor(() => expect(note("handed, still shown waiting")).toBe("The file was fetched and is being checked."));
+      await say({ ticket: null, state: "closed" });
+      await quiet();
+      expect(stateOf("handed, still shown waiting")).toBe("Waiting for you in the sign-in window");
+      expect(posts("/library/cancel")).toHaveLength(0);
+      expect(note("handed, still shown waiting")).toBe("The file was fetched and is being checked.");
+    });
+
+    it("R342 j: the ticket is held only while its row waits — after the hand-over and the row's change, a later event with it changes nothing", async () => {
+      const { e } = await started("forgotten");
+      await say({ ticket: TICKET, state: "handed-over" });
+      becomes(later(now(e), { state: "needs-check", reason: { code: "file-looks-right" } }, "2026-11-13T12:00:00.000Z"));
+      progress(e, "needs-check");
+      await waitFor(() => expect(stateOf("forgotten")).toBe("Needs your check"));
+      await quiet();
+      const h = heard();
+      await say({ ticket: TICKET, state: "fetching" });
+      await say({ ticket: TICKET, state: "not-a-pdf" });
+      await quiet();
+      expect(h.said).toEqual([]);
+      h.stop();
+    });
+
+    it("R342 j: the ticket is held only while its row waits — after Cancel, and after a closed window, a later event with it changes nothing", async () => {
+      const a = entry({ typed: "closed one", ...startable() });
+      const { user } = await started("cancelled one", [a]);
+      await user.click(btn("cancelled one", "Cancel"));
+      await waitFor(() => expect(stateOf("cancelled one")).toBe("No open copy"));
+      await user.click(btn("closed one", "Get through my library"));
+      await waitFor(() => expect(stateOf("closed one")).toBe("Waiting for you in the sign-in window"));
+      await say({ ticket: SECOND, state: "closed" });
+      await waitFor(() => expect(stateOf("closed one")).toBe("No open copy"));
+      await quiet();
+      const h = heard();
+      for (const t of [TICKET, SECOND]) {
+        await say({ ticket: t, state: "fetching" });
+        await say({ ticket: t, state: "closed" });
+      }
+      await quiet();
+      expect(h.said).toEqual([]);
+      expect(posts("/library/cancel")).toHaveLength(2);
+      h.stop();
+    });
+
+    it("R342 j: the control stays busy until the queue is read again — a second press before that read sends no second start", async () => {
+      serveOne("one read");
+      let gate: Promise<void> | undefined;
+      server.use(
+        http.get(url(`/projects/${PID}/find`), async () => {
+          if (gate) await gate;
+          return HttpResponse.json(queue(current));
+        }),
+      );
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const g = held<void>();
+      gate = g.p;
+      fireEvent.click(btn("one read", "Get through my library"));
+      await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+      await new Promise((r) => setTimeout(r, 100));
+      // The read after the start has not answered: the row is still shown at rest, its control busy.
+      expect(stateOf("one read")).toBe("No open copy");
+      fireEvent.click(row("one read").querySelector<HTMLElement>('button[data-act="library"]')!);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(posts("/library/start")).toHaveLength(1);
+      gate = undefined;
+      g.release();
+      await waitFor(() => expect(stateOf("one read")).toBe("Waiting for you in the sign-in window"));
+      expect(posts("/library/start")).toHaveLength(1);
+    });
+
+    it("R342 j: two presses in the same moment (before the row shows itself busy) send ONE start", async () => {
+      serveOne("twice at once");
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      const b = btn("twice at once", "Get through my library");
+      act(() => {
+        b.click();
+        b.click();
+      });
+      await waitFor(() => expect(stateOf("twice at once")).toBe("Waiting for you in the sign-in window"));
+      expect(posts("/library/start")).toHaveLength(1);
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+    });
   });
 });

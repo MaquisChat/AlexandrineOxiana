@@ -28,7 +28,8 @@
  * gives the service's sentence and a link to "Your library"; the view's `lastFile` gives the service's sentence for a
  * file that was not kept (none for a code this build does not know). A row waiting in the sign-in window has "Add the
  * PDF showing in the sign-in window" and "Cancel". Outside the desktop app the two controls that need the shell are
- * shown unavailable ("Only in the desktop app"), stay reachable by keyboard, and a press does nothing. What the shell
+ * shown unavailable ("Only in the desktop app"), stay reachable by keyboard, and a press only makes the screen say so
+ * (R342 i). The state's words are focusable from script (R342 c: the focus after a start). What the shell
  * reported for the row is the screen's `note`. "Where to get it" is WhereToGetIt, on every row whose view carries links
  * (never on a record removed from the library).
  */
@@ -106,6 +107,8 @@ export const FIND_TEXT = {
   fetchPause: "The sign-in window rests for a few seconds between files. Try again shortly.",
   fetchBusy: "The PDF is already being fetched.",
   fetchFailed: "The PDF could not be fetched. Try again in the sign-in window.",
+  /** R342 e: the shell's `failed` with `no-ticket` — no window is open for this work (as after the page was loaded afresh). */
+  noWindow: "The sign-in window is not open for this work. Cancel, then use “Get through my library” again.",
   handedOver: "The file was fetched and is being checked.",
   appSilent: "The app did not answer. Try again.",
 } as const;
@@ -442,8 +445,8 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
         aria-busy={working || undefined}
         aria-describedby={noShell ? unavailableId : undefined}
         onClick={() => {
-          // Outside the desktop app the press does nothing: no request, no call (R340 a).
-          if (working || waiting || noShell) return;
+          // Outside the desktop app the screen says why and makes no request, no call (R340 a, R342 i).
+          if (working || waiting) return;
           onAction({ kind, entry: e });
         }}
       >
@@ -478,7 +481,8 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
             {mark}{" "}
           </span>
         )}
-        <span className="ao-find__state">
+        {/* R342 c: focusable from script only — after a start the focus is put here, never on a control that acts. */}
+        <span className="ao-find__state" tabIndex={-1} data-entry-state="">
           <WordsView words={words} />
         </span>
       </p>

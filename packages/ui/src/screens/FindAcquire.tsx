@@ -63,6 +63,17 @@
  *     it no longer waits is not an error: the file is being checked). "Cancel" is the service's cancel, then the
  *     window is closed. "Add the PDF showing in the sign-in window" is the shell's take: the shell fetches the PDF and
  *     hands it to the service, where it waits in the review queue for the researcher's check.
+ *   - R342 a: the window never outlives the wait it was opened for. When the row this page opened it for stops waiting
+ *     by any way but the hand-over (Cancel, its removal here, the service returning it), the window is closed, once;
+ *     an open the page gave up on is closed if the shell then answers that it opened it. Such a ticket is kept as
+ *     "ended" until the shell reports its window closed, and none of its events is any row's.
+ *   - R342 b: a window left over from before never blocks a start: if the shell refuses the open (exactly `false`), the
+ *     page closes the window, waits for the shell's next `closed` (at most LIBRARY_CLOSE_WAIT_MS) and asks once more,
+ *     within the same press; only if that fails too is the start cancelled and said.
+ *   - R342 c: after a start the focus goes to the row's own words, never onto a control that acts.
+ *   - R342 d, f: an event without the page's own ticket counts for the one waiting row only on a page that has held no
+ *     ticket since it was loaded; an event with the page's own ticket counts for its row even before a read shows it
+ *     waiting.
  */
 import {
   FIND_ROUTE_TEXT,
@@ -135,6 +146,8 @@ const ADD_TIMEOUT_MS = 60_000;
 export const SWITCH_TIMEOUT_MS = 60_000;
 /** A call to the desktop shell with no answer for this long is given up (the house's limit, as on Your library). */
 export const LIBRARY_SHELL_TIMEOUT_MS = 60_000;
+/** R342 b: how long a start waits for the shell to report a leftover window closed before it asks the shell once more. */
+export const LIBRARY_CLOSE_WAIT_MS = 5_000;
 
 /**
  * F15's start and cancel (apps/library-service/src/routes/your-library.ts), as their handlers take them: no body. Ids
@@ -154,8 +167,8 @@ export function findLibraryApi(client: ApiClient) {
 }
 export type FindLibraryApi = ReturnType<typeof findLibraryApi>;
 
-/** What came of a call to the shell given at most `ms`: its answer, or "gave-up" (its late answer is ignored); a throw is `false`. */
-function shellWithin<V>(p: Promise<V>, ms = LIBRARY_SHELL_TIMEOUT_MS): Promise<V | false | "gave-up"> {
+/** What came of a call to the shell given at most `ms`: its answer, "threw", or "gave-up" (its late answer is ignored here). */
+function shellWithin<V>(p: Promise<V>, ms = LIBRARY_SHELL_TIMEOUT_MS): Promise<V | "threw" | "gave-up"> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve("gave-up"), ms);
     p.then(
@@ -165,7 +178,7 @@ function shellWithin<V>(p: Promise<V>, ms = LIBRARY_SHELL_TIMEOUT_MS): Promise<V
       },
       () => {
         clearTimeout(timer);
-        resolve(false);
+        resolve("threw");
       },
     );
   });
@@ -179,6 +192,8 @@ function windowSentence(e: LibraryWindowEvent): string | undefined {
     case "not-a-pdf":
       return FIND_TEXT.notAPdf;
     case "failed":
+      // R342 e: no ticket is open in the shell — no window for this work.
+      if (e.reason === "no-ticket") return FIND_TEXT.noWindow;
       return e.reason === "pause" ? FIND_TEXT.fetchPause : e.reason === "busy" ? FIND_TEXT.fetchBusy : FIND_TEXT.fetchFailed;
     case "handed-over":
       return FIND_TEXT.handedOver;
@@ -990,11 +1005,19 @@ function ProjectQueue(props: {
   /**
    * R340 a, b: the ticket of the window this page opened, for the row that waits in it — in memory only, while it waits.
    * `handedOver`: the shell handed the file over (its ticket ended there; a later close is not a cancel). `seen`: the
-   * row has been seen waiting — from then on its leaving the wait forgets the ticket. Once forgotten, an event of that
-   * window is no row's unless the one row that waits is taken for it (as after a fresh load); a row that went back by a
-   * cancel no longer waits, so a late event of its window changes nothing.
+   * row has been seen waiting — from then on its leaving the wait ends the ticket here (R342 a: the window is closed
+   * unless the file was handed over).
    */
   const libTicket = useRef<{ entryId: string; ticket: string; handedOver?: boolean; seen?: boolean } | null>(null);
+  /**
+   * R342 a, d: tickets whose window this page closed (or gave up on) while the shell may still hold them — kept, in
+   * memory only, until the shell reports that window closed, so that none of its events is taken for another row.
+   */
+  const endedTickets = useRef(new Set<string>());
+  /** R342 d: this page has held a ticket since it was loaded (set at the first start's answer, never cleared). */
+  const heldATicket = useRef(false);
+  /** R342 b: a start waiting for the shell's next `closed` (any ticket or none). */
+  const closedWaiters = useRef(new Set<() => void>());
   /** Rows whose file the shell handed over while the page held no ticket (loaded afresh): a later close is not a cancel. */
   const handedOverRows = useRef(new Set<string>());
   /** What each row's note last said (a note is said once; the same words again are not said again). */
@@ -1470,18 +1493,82 @@ function ProjectQueue(props: {
     const v = held.current.get(id)?.view;
     sayAct([...(v ? [...entryLabel(v, originOf(v)), ": "] : []), n.text]);
   };
-  /** The page no longer follows the window of this row: its ticket is forgotten. */
+  /** The page no longer follows the window of this row (the shell ended its ticket): the ticket is forgotten. */
   const endTicketOf = (id: string) => {
     if (libTicket.current?.entryId === id) libTicket.current = null;
   };
-  // The ticket is held only while its row waits: once the row was seen waiting and no longer does, it is forgotten.
+  /**
+   * R342 a: the page ends the window it opened for `ticket` — closed once, and the ticket kept as ended until the shell
+   * reports the close (its events are then no row's).
+   */
+  const endWindow = (ticket: string) => {
+    if (libTicket.current?.ticket === ticket) libTicket.current = null;
+    if (endedTickets.current.has(ticket)) return;
+    endedTickets.current.add(ticket);
+    if (shell) void shellWithin(shell.closeLibraryWindow());
+  };
+  // The ticket is held only while its row waits. Once the row was seen waiting and no longer does (the service returned
+  // it: the ticket's end, a lock, a save of the rules), or it is gone (removed here), the window is closed — unless the
+  // shell handed the file over, which ended the ticket there (R342 a).
   useEffect(() => {
     const t = libTicket.current;
     if (!t) return;
     const v = held.current.get(t.entryId)?.view;
-    if (v?.state === "waiting-sign-in") t.seen = true;
-    else if (!v || t.seen) endTicketOf(t.entryId);
+    if (v?.state === "waiting-sign-in") {
+      t.seen = true;
+      return;
+    }
+    if (v && !t.seen) return;
+    if (t.handedOver) endTicketOf(t.entryId);
+    else endWindow(t.ticket);
   });
+
+  /** R342 b: true when the shell reports a window closed (any ticket or none) within `ms`, false otherwise. */
+  const nextClosed = (ms: number) =>
+    new Promise<boolean>((resolve) => {
+      const done = (v: boolean) => {
+        clearTimeout(timer);
+        closedWaiters.current.delete(heard);
+        resolve(v);
+      };
+      const heard = () => done(true);
+      const timer = setTimeout(() => done(false), ms);
+      closedWaiters.current.add(heard);
+    });
+
+  /**
+   * The shell asked to open the sign-in window for `ticket`; true when it did. R342 b: refused (exactly `false`) — a
+   * window left over from before holds the shell's one ticket — the page closes that window, waits for the shell to
+   * report it closed (at most LIBRARY_CLOSE_WAIT_MS) and asks ONCE more, all within the same press. R342 a: an open the
+   * page gave up on (no answer in time) may still be carried out by the shell: its ticket is ended here, and if the
+   * shell then answers that it opened the window, the window is closed.
+   */
+  const openWindow = async (ticket: string, address: string, live: () => boolean): Promise<boolean> => {
+    if (!shell) return false;
+    const ask = async (): Promise<boolean | "refused"> => {
+      const p = shell.openLibraryWindow(ticket, address);
+      const r = await shellWithin(p);
+      if (r === "gave-up") {
+        endedTickets.current.add(ticket);
+        if (libTicket.current?.ticket === ticket) libTicket.current = null;
+        p.then(
+          (late) => {
+            if (late === true) void shellWithin(shell.closeLibraryWindow());
+          },
+          () => {},
+        );
+        return false;
+      }
+      return r === true ? true : r === false ? "refused" : false;
+    };
+    const first = await ask();
+    if (first !== "refused") return first;
+    if (!live()) return false;
+    const closed = nextClosed(LIBRARY_CLOSE_WAIT_MS);
+    void shellWithin(shell.closeLibraryWindow());
+    if (!(await closed) || !live()) return false;
+    return (await ask()) === true;
+  };
 
   /**
    * "Get through my library": ONE start at the service; with its answer, the sign-in window opened by the shell. The
@@ -1489,7 +1576,12 @@ function ProjectQueue(props: {
    * `libTicket` while the row waits). A window that did not open leaves nothing waiting: the start is cancelled.
    */
   const startLibrary = async (e: FindEntryView) => {
-    if (!shell || busyRef.current[e.id] || readOnly) return;
+    // R342 i: outside the desktop app a press says why, once, and asks nothing.
+    if (!shell) {
+      sayAct([FIND_TEXT.onlyDesktop]);
+      return;
+    }
+    if (busyRef.current[e.id] || readOnly) return;
     setBusyFor(e.id, "library");
     acting.current.add(e.id);
     setErrorFor(e.id, undefined);
@@ -1506,15 +1598,21 @@ function ProjectQueue(props: {
         setErrorFor(e.id, sentenceOf(err, "That could not be done. Try again."));
         return;
       }
+      // R342 d: from the first start's answer on, this page has held a ticket.
+      heldATicket.current = true;
       const ticket = typeof got?.ticket === "string" ? got.ticket : "";
       const address = typeof got?.url === "string" ? got.url : "";
       let opened = false;
       // The screen was left (or the library changed) meanwhile: no window is opened, and the start is cancelled below.
       if (live() && ticket && address) {
         libTicket.current = { entryId: e.id, ticket };
-        opened = (await shellWithin(shell.openLibraryWindow(ticket, address))) === true;
+        opened = await openWindow(ticket, address, live);
       }
       if (opened) {
+        // R342 c: the focus goes to the row's own words — never onto a control that acts (the start's control goes).
+        const at = document.activeElement;
+        const rowEl = listRef.current?.querySelector<HTMLElement>(`[data-entry-id="${CSS.escape(e.id)}"]`);
+        if (!at || at === document.body || rowEl?.contains(at)) rowEl?.querySelector<HTMLElement>("[data-entry-state]")?.focus();
         // The start's answer is no view of the entry: the control stays busy until the queue is read again, so a second
         // press of a double click finds the row waiting and sends nothing.
         // The row's change that read shows is said as any row's change is.
@@ -1522,7 +1620,7 @@ function ProjectQueue(props: {
         if (live()) await readOnce();
         return;
       }
-      // Not opened (refused, failed, or no answer in time): the page forgets the ticket, and the entry goes back.
+      // Not opened (refused twice, failed, or no answer in time): the page forgets the ticket, and the entry goes back.
       if (libTicket.current?.ticket === ticket) libTicket.current = null;
       try {
         const back = await libApi.cancel(projectId, e.id);
@@ -1543,7 +1641,12 @@ function ProjectQueue(props: {
 
   /** "Add the PDF showing in the sign-in window": the shell's take (what came of it, the shell's events say). */
   const takePdf = async (e: FindEntryView) => {
-    if (!shell || busyRef.current[e.id] || readOnly) return;
+    // R342 i: outside the desktop app a press says why, once, and asks nothing.
+    if (!shell) {
+      sayAct([FIND_TEXT.onlyDesktop]);
+      return;
+    }
+    if (busyRef.current[e.id] || readOnly) return;
     setBusyFor(e.id, "library-take");
     setErrorFor(e.id, undefined);
     setNoteFor(e.id, undefined);
@@ -1560,9 +1663,12 @@ function ProjectQueue(props: {
     acting.current.add(e.id);
     setErrorFor(e.id, undefined);
     const g = gen.current;
+    // The window this page opened for the row is ended as R342 a says (closed once); one it did not open (a page loaded
+    // afresh) is closed as before.
     const closeWindow = () => {
-      endTicketOf(e.id);
-      if (shell) void shellWithin(shell.closeLibraryWindow());
+      const t = libTicket.current;
+      if (t?.entryId === e.id) endWindow(t.ticket);
+      else if (shell) void shellWithin(shell.closeLibraryWindow());
     };
     try {
       const v = await libApi.cancel(projectId, e.id);
@@ -1599,14 +1705,23 @@ function ProjectQueue(props: {
         return;
       }
       readSoon();
-      // A 409 because it no longer waits is not an error: the file is being checked.
-      if (!(err instanceof ApiClientError && err.status === 409)) setErrorFor(v.id, sentenceOf(err, "That could not be done. Try again."));
+      // R342 i: only "the entry is no longer waiting" is not an error (the file is being checked); any other refusal is
+      // shown on the row as the service says it.
+      if (!(err instanceof ApiClientError && err.status === 409 && err.reason === "entry-state")) setErrorFor(v.id, sentenceOf(err, "That could not be done. Try again."));
     }
   };
 
-  /** The shell's `library-window` events: only this page's window's, or — holding none — the one waiting row's. */
+  /**
+   * The shell's `library-window` events: only this page's window's, or — on a page that has held no ticket since it was
+   * loaded (R342 d) — the one waiting row's. An event of a ticket this page ended is no row's (its close is noted).
+   */
   const onWindowRef = useRef<(ev: LibraryWindowEvent) => void>(() => {});
   onWindowRef.current = (ev: LibraryWindowEvent) => {
+    if (ev.state === "closed") for (const w of [...closedWaiters.current]) w();
+    if (ev.ticket !== null && endedTickets.current.has(ev.ticket)) {
+      if (ev.state === "closed") endedTickets.current.delete(ev.ticket);
+      return;
+    }
     const mine = libTicket.current;
     let id: string;
     if (mine) {
@@ -1614,6 +1729,7 @@ function ProjectQueue(props: {
       if (ev.ticket === mine.ticket || (mine.handedOver && ev.ticket === null && ev.state === "closed")) id = mine.entryId;
       else return;
     } else {
+      if (heldATicket.current) return;
       const waitingNow = [...held.current.values()].map((h) => h.view).filter((v) => v.state === "waiting-sign-in");
       if (waitingNow.length !== 1) return;
       id = waitingNow[0]!.id;
@@ -1624,7 +1740,10 @@ function ProjectQueue(props: {
       const handed = !!mine?.handedOver || handedOverRows.current.has(id);
       if (mine) endTicketOf(id);
       handedOverRows.current.delete(id);
-      if (!handed && v.state === "waiting-sign-in") void windowClosed(v);
+      // Not handed over: the start is cancelled. R342 f: an event with the page's own ticket counts for its row even
+      // before a read shows the row waiting; a row taken without a ticket is the one that waits. (The former second
+      // condition — the row shown waiting — could no longer be false here, and is out: R342 j.)
+      if (!handed) void windowClosed(v);
       return;
     }
     const text = windowSentence(ev);
