@@ -408,6 +408,12 @@ export interface FindRunnerDeps {
    * entry and creates nothing; it asks again every FIND_INDEX_WAIT_MS and goes on by itself.
    */
   indexReady?: () => boolean;
+  /**
+   * Task F15 (R328 f): where the time of the last hand-over (ms since the epoch; -Infinity: none) is kept — by the
+   * caller (the service), so that it outlives this runner: a runner made for a library closed and opened again sees
+   * it. Absent: kept in this runner only.
+   */
+  libraryHandOver?: { get(): number; set(at: number): void };
 }
 
 /** Why the runner does nothing for a project now. */
@@ -2482,11 +2488,13 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   // researcher's press, left by cancel, the ticket's end, start-up (`resume`), a lock or a close. The runner never
   // fetches anything from the library: it hands back an address and a ticket. ONE ticket at a time, in memory only.
 
-  /** The open ticket (at most one), and when the last hand-over was (the pause). */
+  /** The open ticket (at most one). */
   let libTicket: { ticket: string; projectId: string; entryId: string; expires: number; timer: unknown } | undefined;
   /** A start between its synchronous check and its ticket: another start meanwhile is "busy". */
   let libClaimed = false;
-  let lastHandOver = Number.NEGATIVE_INFINITY;
+  /** When the last hand-over was (the pause): the caller's (R328 f), else this runner's own. */
+  let ownHandOver = Number.NEGATIVE_INFINITY;
+  const handOver = deps.libraryHandOver ?? { get: () => ownHandOver, set: (at: number) => void (ownHandOver = at) };
 
   function dropTicket(): void {
     if (libTicket) timers.clearTimeout(libTicket.timer);
@@ -2505,8 +2513,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     if (readOnly()) throw new ReadOnlyLibraryError();
     // Checked and claimed without awaiting anything: two presses at the same moment, in any projects, give one ticket.
     if (libTicket || libClaimed) throw new FindLibraryRefusedError("busy");
-    const since = now().getTime() - lastHandOver;
-    if (since < LIBRARY_PAUSE_MS) throw new FindLibraryRefusedError("pause", Math.max(1, Math.ceil((LIBRARY_PAUSE_MS - since) / 1000)));
+    const at = now().getTime();
+    // R328 f: a clock stepped backwards (the last hand-over now in the future) counts the pause from now: never more
+    // than the pause's own length is said, and it ends after it.
+    if (handOver.get() > at) handOver.set(at);
+    const since = at - handOver.get();
+    if (since < LIBRARY_PAUSE_MS) throw new FindLibraryRefusedError("pause", Math.min(LIBRARY_PAUSE_MS / 1000, Math.max(1, Math.ceil((LIBRARY_PAUSE_MS - since) / 1000))));
     libClaimed = true;
     try {
       return await act(projectId, async () => {
@@ -2576,7 +2588,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       return null;
     }
     dropTicket();
-    lastHandOver = at;
+    handOver.set(at);
     return { projectId: t.projectId, entryId: t.entryId };
   }
 

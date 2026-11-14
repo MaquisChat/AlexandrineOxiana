@@ -460,6 +460,25 @@ describe("the start (R324 a–c)", () => {
     expect((await call({ method: "POST", url: `/projects/${pid}/find/${e.id}/library/cancel` })).json.offers.map((o: { url: string }) => o.url)).toContain(free.url);
   });
 
+  it("R328 f: the pause outlives the library's close and reopening (the service keeps the time of the hand-over)", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    await setLibrary();
+    const a = await resting(pid, { state: "no-open-copy" });
+    const b = await resting(pid, { state: "no-open-copy" });
+    const r = await startFetch(pid, a.id);
+    expect(r.status).toBe(200);
+    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket)).toEqual({ projectId: pid, entryId: a.id });
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const paused = await startFetch(pid, b.id);
+    expect(paused.status).toBe(409);
+    expect(paused.json.error.reason).toBe("library-pause");
+    expect(paused.json.error.message).toMatch(/^Ready in (1\d|20) seconds\.$/u);
+    expect((await view(pid, b.id)).state).toBe("no-open-copy");
+  });
+
   it("waiting entries return to what they were at start, and the ticket is gone (R324 b replaces 'No open copy')", async () => {
     await start();
     const path = await openNewLibrary();

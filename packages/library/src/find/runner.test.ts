@@ -4735,6 +4735,31 @@ describe("F15: a fetch through the researcher's library", () => {
     expect(LIBRARY_PAUSE_MS).toBe(20_000);
   });
 
+  it("R328 f: the time of the last hand-over is the caller's (a runner made anew sees it); a clock stepped back never shows more than the pause", async () => {
+    const p = await project();
+    const [a, b] = [await resting(p, RESTING[0]!), await resting(p, RESTING[0]!)];
+    let kept = Number.NEGATIVE_INFINITY;
+    const handOver = { get: () => kept, set: (at: number) => void (kept = at) };
+    const r1 = runner({ libraryHandOver: handOver });
+    const { ticket } = await r1.libraryStart(p.id, a.id, EZ);
+    expect(r1.libraryHandedOver(ticket)).toEqual({ projectId: p.id, entryId: a.id });
+    expect(kept).toBe(timers.now);
+    await r1.stopAll();
+    // The library closed and opened again: a new runner, the same pause.
+    const r2 = runner({ libraryHandOver: handOver });
+    timers.now += 5_000;
+    expect((await refusal(r2.libraryStart(p.id, b.id, EZ))).message).toBe("Ready in 15 seconds.");
+    // The clock stepped back an hour: at most the pause's own length, and the pause then really ends after it.
+    timers.now -= 3_600_000;
+    const back = await refusal(r2.libraryStart(p.id, b.id, EZ));
+    expect(back.code).toBe("pause");
+    expect(back.message).toBe("Ready in 20 seconds.");
+    timers.now += 19_000;
+    expect((await refusal(r2.libraryStart(p.id, b.id, EZ))).message).toBe("Ready in 1 second.");
+    timers.now += 1_000;
+    expect((await r2.libraryStart(p.id, b.id, EZ)).ticket).toMatch(/^[0-9a-f]{32}$/u);
+  });
+
   it("an expired ticket is not taken by the seam, and its entry comes back", async () => {
     const p = await project({ gov: NO_FREE });
     const e = await resting(p, RESTING[0]!);

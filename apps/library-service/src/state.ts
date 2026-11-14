@@ -1158,6 +1158,12 @@ export class ServiceState {
   /** "Check everything I have", as remembered on this computer (`find-screen.json`): read at open, set by PUT /find/screen. */
   findCheckEverything = false;
 
+  /**
+   * Task F15 (R328 f): when the last hand-over through the library was (ms; -Infinity: none). Kept by the service, in
+   * memory only, so that the pause outlives a library's close and reopening; given to each runner.
+   */
+  private libraryHandOverAt = Number.NEGATIVE_INFINITY;
+
   // ---- "Search sources" (Task F12; R290) ---------------------------------------------------
   //
   // The settings file is read anew for each entry and each GET; the copy kept here (`searchSettingsNow`) is what the
@@ -1347,6 +1353,13 @@ export class ServiceState {
         if (this.session === s) this.events.publish("find.progress", { projectId: e.projectId, entryId: e.entryId, state: e.state } satisfies FindProgressEvent);
       },
       indexReady: () => this.findIndexReady(s),
+      // F15 (R328 f): the pause after a hand-over is the service's, not the runner's.
+      libraryHandOver: {
+        get: () => this.libraryHandOverAt,
+        set: (at) => {
+          this.libraryHandOverAt = at;
+        },
+      },
       // Error kinds only (never what was typed, never an error's text: the runner's promise).
       debug: (note) => this.opts.log.info({ note }, "find and acquire"),
     });
