@@ -1077,12 +1077,26 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   // ------------------------------------------------------------------------------------------------------------
   // Writing an entry: one governed change, then the event.
 
-  /** `alongside` (with an add only, F8): new lines of live entries written in the same governed change; returned after `next`. */
-  async function write(pid: string, next: FindEntry[], op: "add" | "update" | "remove" | "library-start", alongside: FindEntry[] = []): Promise<FindEntry[]> {
+  /**
+   * `alongside` (with an add only, F8): new lines of live entries written in the same governed change; returned after `next`.
+   * F17 (R338 i): the view's last outcome of a handed-over file is dropped at any write of the entry's line by another
+   * cause: a line that takes it out of its rest (the copy part looking again, "Try again", a new start, a file waiting,
+   * "In your library") and its removal. A line that only puts it in another rest (the copy part, woken by the return
+   * itself, saying the rules' or the settings' reason anew) is no new event for the researcher and keeps it, so that
+   * an outcome never goes before it can be read. `outcome` is the hand-over's own return (one entry): kept from before
+   * its line can be read (a view that reads the line returned reads why), and dropped again if the line is not written.
+   */
+  async function write(pid: string, next: FindEntry[], op: "add" | "update" | "remove" | "library-start", alongside: FindEntry[] = [], outcome?: FindLibraryFileOutcome): Promise<FindEntry[]> {
     const fitted = [...next.map(fit), ...alongside.map(fit)];
-    await appendFindEntriesIn(repo, pid, fitted.slice(0, next.length), op, fitted.slice(next.length));
-    // F17 (R338 i): the view's last outcome of a handed-over file is dropped at any later write of the entry's line.
-    for (const e of fitted) dropFileOutcome(pid, e.id);
+    for (const e of fitted) if (op === "remove" || !restsForLibrary(e)) dropFileOutcome(pid, e.id);
+    const kept = outcome && fitted.length === 1 ? fitted[0]! : undefined;
+    if (kept) fileOutcomes.set(keyOfRun(pid, kept.id), outcome!);
+    try {
+      await appendFindEntriesIn(repo, pid, fitted.slice(0, next.length), op, fitted.slice(next.length));
+    } catch (err) {
+      if (kept) dropFileOutcome(pid, kept.id);
+      throw err;
+    }
     if (op !== "remove") {
       for (const e of fitted) {
         if (e.state !== "looking-up") madeHere.delete(e.id);
@@ -2711,9 +2725,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    */
   const handed = new Map<string, { address: string; taking?: true }>();
   /**
-   * F17 (R329 g): what became of the last file of an entry that could not be held. In memory only; set only with the
-   * entry's own return (`bringBack`, which writes the entry back: never for an entry that is gone), dropped at any later
-   * write of the entry's line, its removal included (`write`, R338 i). An entry with an outcome rests; every write of a
+   * F17 (R329 g): what became of the last file of an entry that could not be held. In memory only; set only with the entry's own return (`bringBack`, which writes the entry back: never for an
+   * entry that is gone), dropped at any later write of the entry's line by another cause (one that takes it out of its
+   * rest), and at its removal (`write`, R338 i). An entry with an outcome rests; every write of a
    * resting entry goes through `write` (the other writers of the queue — a hold, a decision, a removal with its waiting
    * file, a record's removal — touch only an entry that is fetching or holds a waiting file).
    */
@@ -2804,8 +2818,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur || cur.state !== "waiting-sign-in" || ticketFor(projectId, entryId)) return null;
-      const [w] = await write(projectId, [returnedFrom(cur, stamp())], "update");
-      if (w && outcome) fileOutcomes.set(keyOfRun(projectId, entryId), outcome);
+      const [w] = await write(projectId, [returnedFrom(cur, stamp())], "update", [], outcome);
       return w ?? null;
     });
   }

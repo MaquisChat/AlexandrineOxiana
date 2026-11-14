@@ -5417,6 +5417,15 @@ describe("F15: a fetch through the researcher's library", () => {
         expect(v!.lastFile).toBeUndefined();
       });
 
+      it("R338 i: a write that only puts the entry in another rest (the copy part, woken by the return, saying the rules' reason anew) keeps the outcome", async () => {
+        // Returned as "switched off by the settings"; the rules allow no free copy, so the copy part rewrites its reason.
+        const { p, e, r } = await handedOver({ rest: RESTING[4]! });
+        await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(Buffer.from("not a pdf")).file);
+        await until(async () => (await entryOf(p, e.id))!.reason?.code === "copy-not-allowed", "the copy part to say the rules' reason");
+        expect((await entryOf(p, e.id))!.state).toBe("record-complete");
+        expect((await lastFileOf(p, (await queue(p)).values(), r, e.id))?.lastFile).toBe("not-pdf");
+      });
+
       it("R338 i: an outcome that comes after the entry's removal is not kept (observed through the view of the removed entry's last line)", async () => {
         const { p, e, r } = await handedOver();
         const d = deferred();
