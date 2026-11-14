@@ -128,12 +128,27 @@ the service) against a stand-in library and publisher (`e2e/library-standin.ts`)
 session cookie for the proxy's domain and a second cookie for the whole made-up domain, a SAML-like
 path that fails the run if asked twice or by the shell, publisher pages with and without
 `citation_pdf_url`, a PDF sent as a download, a PDF address that answers the shell with a redirect to a
-third host). Six scenarios: the marked page fetched by the shell and waiting in the review queue until
+third host; and, for Task F18d, a library catalogue that is also a repository, its landing page and its PDF on
+one host, and a PDF on the proxy's own sign-in host). Eight scenarios: the marked page fetched by the shell and waiting in the review queue until
 "Use this file"; a page without the mark and "Add the PDF showing in the sign-in window"; a download;
 the shell's own request redirected to a third host (its hop to the publisher carries the proxy's
 cookie, its hop to the third host does not — while the whole domain's cookie does — its `Referer` holds
 no query, and the file waits); the window closed while the entry waits; a quit and a new start (no
-cookie at the first request). The sign-in window is typed into with xdotool (WebDriver does not reach
+cookie at the first request); "Open it here and fetch the PDF" on the catalogue's link (set on "Your
+library" to the stand-in's catalogue), its PDF on the host the window was opened at fetched and waiting for
+the check, then used as a fetched copy; and its twin, "Get through my library" reaching a PDF on the
+library's own sign-in host, which the shell never asks ("That is a sign-in page, …").
+
+**The sign-in window** (`src-tauri/src/library_window.rs`) is opened by the page with the kind of start
+(`open_library_window(ticket, url, from)`, R347 a): "library" (or none) — the host it is opened at is the
+library's sign-in host and is never fetched from — or "link" — no host is a sign-in host; the sign-in
+paths and queries (`/login`, `/saml`, a SAML or CAS ticket, …) are never fetched for either; any other
+`from` is refused. The kind is the ticket's and ends with the window. It has no address bar, so its title
+says where it is (R347 b): the host of the top page shown (its ASCII form, the port when not 443, a host
+over 64 characters by its end), set by the shell at every top-level navigation, then
+"sign in to your library, then open the PDF and the app will fetch it for you to check" or "open the PDF
+on this page and the app will fetch it for you to check". A page cannot set it. The scenarios find the
+window by that exact title. The sign-in window is typed into with xdotool (WebDriver does not reach
 it: it is a web view of its own ephemeral context). The stand-in tells the shell's request from the
 window's by two marks that must agree — `Accept: application/pdf` alone, and no `Sec-Fetch-Mode` (which
 WebKitGTK sends with every request and the shell never does); a request where they disagree fails every
@@ -204,7 +219,7 @@ It needs, as the machine's own tools (not dependencies of the project): `openssl
 (util-linux) and `python3`. With the switch set, any obstacle — not Linux, not root, a tool missing, no
 namespace, another run holding the lock, leftovers that cannot be put back — **fails the run**, with
 the reason in its last lines ("FAILED: the library scenarios were asked for (AO_E2E_SYSTEM_SETUP=1) but
-the machine's set-up cannot be made: …"). Without the switch the six scenarios are skipped and the run's
+the machine's set-up cannot be made: …"). Without the switch the eight scenarios are skipped and the run's
 last lines say so: "6 library scenarios NOT RUN (skipped), not passed — not run: AO_E2E_SYSTEM_SETUP=1
 is not set …"; the exit is as before.
 

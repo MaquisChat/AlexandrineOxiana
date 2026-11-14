@@ -31,6 +31,11 @@
  *                             (R346 b: the shell's own request meets the redirect).
  *  - `cdn.ao-library-standin.test` — a third host, NOT under the proxy's domain: `/<slug>.pdf` (inline);
  *    records which cookies it is sent.
+ *  - `catalogue.ao-library-standin.test` (Task F18d) — the library's catalogue, which is also a repository:
+ *    `/search?q=…` (no sign-in) a landing page with a focused link to its PDF on the SAME host
+ *    (`/items/linked.pdf`, inline); the page sets a title of its own pretending to be the library's sign-in.
+ *  - On the proxy's host itself (Task F18d), for the work `10.5555/ao.f19.own`: once signed in, `/login`
+ *    sends the window to `/files/own.pdf`, a PDF on the sign-in host, which the shell must never ask.
  * No page's path holds what the shell takes for a PDF's address (`/download`, `/pdf/`, `.pdf`, …;
  * library_window.rs `looks_like_pdf_address`) except where a PDF is meant to be seen there: the shell
  * would fetch such a page as soon as it loaded.
@@ -61,6 +66,7 @@ export const HOSTS = {
   doi: `doi-org.${PROXY_DOMAIN}`,
   publisher: `www-invented-journals-example.${PROXY_DOMAIN}`,
   third: `cdn.${STANDIN_DOMAIN}`,
+  catalogue: `catalogue.${STANDIN_DOMAIN}`,
 } as const;
 export const STANDIN_NAMES: string[] = Object.values(HOSTS);
 /** The proxy's session cookie (its name; its value is random per sign-in and never recorded). */
@@ -74,7 +80,14 @@ export const READER = { user: "test-only-reader", password: "not-a-real-password
 export const SAML_PATH = "/saml/SSO";
 
 /** The publisher's pages by kind; a work's DOI ends with its kind (10.5555/ao.f19.<kind>). */
-export type PageKind = "marked" | "unmarked" | "attachment" | "redirect";
+export type PageKind = "marked" | "unmarked" | "attachment" | "redirect" | "linked" | "own";
+/** The catalogue's search address as "Your library" takes it (F18d: its link is opened by "Open it here and fetch the PDF"). */
+export const CATALOGUE_SEARCH_PATH = "/search";
+export const CATALOGUE_PDF_PATH = "/items/linked.pdf";
+/** The proxy's own PDF (F18d: on the sign-in host itself, never fetched by the shell). */
+export const PROXY_PDF_PATH = "/files/own.pdf";
+/** What the catalogue's page sets as its own title (F18d, R347 b: the window never shows it). */
+export const SPOOF_TITLE = `${HOSTS.proxy} — sign in to your library, then open the PDF and the app will fetch it for you to check`;
 
 export interface StandinRequest {
   at: number;
@@ -187,6 +200,8 @@ export async function startStandin(tls: { certPem: string; keyPem: string }, pdf
       if (url.pathname === "/login") {
         const target = url.searchParams.get("url") ?? "";
         if (signedIn(req)) {
+          // F18d: the work whose PDF is the proxy's own, on this very host.
+          if (target === "https://doi.org/10.5555/ao.f19.own") return redirect(res, `${origin(HOSTS.proxy)}${PROXY_PDF_PATH}`);
           const m = /^https:\/\/doi\.org\/(10\.5555\/ao\.f19\.[a-z-]+)$/.exec(target);
           return m ? redirect(res, `${origin(HOSTS.doi)}/${m[1]}`) : send(res, 404, html("Not here", "<p>The stand-in proxies only its own works.</p>"));
         }
@@ -201,6 +216,7 @@ export async function startStandin(tls: { certPem: string; keyPem: string }, pdf
           ),
         );
       }
+      if (url.pathname === PROXY_PDF_PATH) return signedIn(req) ? pdf(res, "own") : toSignIn(res, "https://doi.org/10.5555/ao.f19.own");
       return send(res, 404, "");
     }
     if (host === HOSTS.doi) {
@@ -229,6 +245,24 @@ export async function startStandin(tls: { certPem: string; keyPem: string }, pdf
       const p = /^\/pdf\/([a-z]+)\.pdf$/.exec(url.pathname);
       const k = p ? kindOf(p[1]!) : undefined;
       return k ? pdf(res, k) : send(res, 404, "");
+    }
+    // F18d: a library's catalogue that is also a repository — its search page (no sign-in) shows the work's
+    // landing with a focused link to its PDF on THIS host. The page sets a title of its own that pretends to be the
+    // library's sign-in (`SPOOF_TITLE`), at once and again later: the window's title must stay the shell's.
+    if (host === HOSTS.catalogue) {
+      if (url.pathname === CATALOGUE_SEARCH_PATH) {
+        const spoof = JSON.stringify(SPOOF_TITLE);
+        return send(
+          res,
+          200,
+          html(
+            SPOOF_TITLE.replace(/&/g, "&amp;").replace(/</g, "&lt;"),
+            `<h1>Invented Repository</h1><p>One record found.</p><p><a id="pdf" href="${CATALOGUE_PDF_PATH}">Full text (PDF)</a></p><script>document.title=${spoof};setTimeout(function(){document.title=${spoof}+" ";},50);</script>${ready("catalogue", "pdf")}`,
+          ),
+        );
+      }
+      if (url.pathname === CATALOGUE_PDF_PATH) return pdf(res, "linked");
+      return send(res, 404, "");
     }
     if (host === HOSTS.third) {
       if (url.pathname === "/redirect.pdf") return pdf(res, "redirect");
