@@ -14,8 +14,8 @@
  * in the meantime.
  *
  * Task F18b (R340 e, R330 b): a file got by Find and acquire says, under its line, how it was got — where from (a free
- * copy and the service that found it, as the Search sources screen names it; or through the researcher's library), when,
- * and what the app's check had said when the researcher used it — from the file's own `acquired` record. The host is
+ * copy and the service that found it, as the Search sources screen names it; or through the researcher's library), when it
+ * was fetched ("Fetched on <date>.", R342 g: the record's time is the fetch's, not when the file was used), and what the app's check had said when the researcher used it — from the file's own `acquired` record. The host is
  * parsed from the recorded address (never taken as given); every part from the record is shown through UserText. A
  * file without such a record shows nothing new.
  */
@@ -120,7 +120,7 @@ export function acquiredWords(a: Asset): AcquiredWords | undefined {
     out.push(...(host ? ["Fetched through your library (", { user: host }, ")."] : ["Fetched through your library."]));
   } else out.push("Added by Find and acquire.");
   const when = typeof at === "string" ? new Date(at) : undefined;
-  if (when && !Number.isNaN(when.getTime())) out.push(" Added on ", { user: ACQUIRED_DATE.format(when) }, ".");
+  if (when && !Number.isNaN(when.getTime())) out.push(" Fetched on ", { user: ACQUIRED_DATE.format(when) }, ".");
   const c = check && typeof check === "object" ? (check as Record<string, unknown>) : undefined;
   if (c?.result === "match") out.push(" The app's check had said it looked like the right file.");
   else if (c?.result === "accepted-after-mismatch" && typeof c.why === "string" && DOUBTS.has(c.why))

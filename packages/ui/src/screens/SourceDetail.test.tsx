@@ -679,7 +679,7 @@ describe("SourceDetail: the transcript entry point", () => {
 // (apps/library-service/src/routes/sources.ts `sourceRecord` passes each asset on as stored).
 describe("SourceDetail: how a file was got (F18b; R340 e)", () => {
   const AT = "2026-11-14T12:00:00.000Z";
-  const ADDED = `Added on Nov ${new Date(AT).getDate()}, 2026.`;
+  const ADDED = `Fetched on Nov ${new Date(AT).getDate()}, 2026.`;
   const tool = { name: "find-and-acquire", version: "0" };
   const asset = (id: string, acquired?: unknown) => ({ ...SOURCE_FILE.assets[0]!, id, path: `Dissertation/Sources/s1/${id}.pdf`, ...(acquired !== undefined ? { acquired } : {}) });
   async function filesWith(assets: unknown[]) {
@@ -738,7 +738,7 @@ describe("SourceDetail: how a file was got (F18b; R340 e)", () => {
     expect(how(file("markup"))).toBe(`A free copy from xn--bcher-kva.example. ${ADDED}`);
     expect(file("markup").querySelector("img, b")).toBeNull();
     expect(file("markup").textContent).not.toContain("evil");
-    // No host can be read: said without one; no date: no "Added on"; a check this build does not know: no sentence.
+    // No host can be read: said without one; no date: no "Fetched on"; a check this build does not know: no sentence.
     expect(how(file("not-an-address"))).toBe(`A free copy, found through arXiv. ${ADDED}`);
     expect(how(file("garbage"))).toBe("Fetched through your library.");
     expect(file("garbage").querySelector("i")).toBeNull();
