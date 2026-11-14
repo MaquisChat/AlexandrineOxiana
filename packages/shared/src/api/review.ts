@@ -9,20 +9,30 @@
  * A source that is removed takes its pending entries with it (resolved in the removal's change).
  */
 
+import { FIND_REASON_TEXT } from "./find.js";
+
 /**
  * What queued a verification entry (R176 3). A capture-conflict entry written when a later check
  * added data to an existing source records `foundBy: "later-check"` (R190).
  */
-export type ReviewCause = { kind: "capture-conflict"; foundBy?: "later-check" } | { kind: "consent-withdrawal"; consentIds: string[] };
+export type ReviewCause =
+  | { kind: "capture-conflict"; foundBy?: "later-check" }
+  | { kind: "consent-withdrawal"; consentIds: string[] }
+  /**
+   * Find and acquire (F11, R277; R296 a): a file found for the source's record, held for the researcher — every found
+   * file, whether the check matched it ("looks-right") or not (the kind's name is the one stored since F11).
+   */
+  | { kind: "acquired-file-mismatch"; findEntryId: string };
 
 /**
  * Where an entry came from, so a person can tell entries apart:
  * - `import`: an item of an import batch (`batchId` names it);
  * - `attach`: a file added by hand (drag and drop), an import entry with no batch;
  * - `capture`: a capture saved with fields that need review;
- * - `withdrawal`: a source flagged because a participant's consent was withdrawn.
+ * - `withdrawal`: a source flagged because a participant's consent was withdrawn;
+ * - `found-file`: a file Find and acquire found for the record, waiting for the researcher's check (F11; R296 a).
  */
-export type ReviewGroup = "import" | "attach" | "capture" | "withdrawal";
+export type ReviewGroup = "import" | "attach" | "capture" | "withdrawal" | "found-file";
 
 /**
  * The group of an entry, from its kind, batch and cause. The cause of a verification entry is the
@@ -31,6 +41,7 @@ export type ReviewGroup = "import" | "attach" | "capture" | "withdrawal";
  */
 export function reviewGroup(e: { kind: string; batchId?: string | undefined; cause?: ReviewCause | undefined }): ReviewGroup {
   if (e.kind === "import") return e.batchId ? "import" : "attach";
+  if (e.cause?.kind === "acquired-file-mismatch") return "found-file";
   return e.cause?.kind === "consent-withdrawal" ? "withdrawal" : "capture";
 }
 
@@ -58,7 +69,74 @@ export interface ProjectReviewEntry {
   candidates?: unknown[];
   duplicateOf?: { sourceId: string; reason: string };
   hints?: string[];
+  /** Cause "acquired-file-mismatch" (F11): what the check found about the held file, for the researcher to judge by. */
+  heldFile?: ReviewHeldFile;
 }
+
+/**
+ * What the file check said of a held file: why it did not clearly match its record, or (R296 b) "looks-right" — the
+ * check matched it; advice only, every found file waits for the researcher.
+ */
+export type HeldFileWhy = "other-doi" | "title-absent" | "no-text" | "other-version" | "other-kind" | "looks-right";
+
+/**
+ * What the check found about a held file (R277 d). Every string is outside text (from the file), bounded by the
+ * library (at most 300 characters each) and shown only through UserText. Nothing of the file's address is sent.
+ */
+export interface ReviewHeldFile {
+  why: HeldFileWhy;
+  kind: "pdf" | "epub";
+  /** The file's size in bytes. */
+  bytes: number;
+  /** The DOI the file presents as its own, when it is not the record's. */
+  fileDoi?: string;
+  /** The title embedded in the file. */
+  embeddedTitle?: string;
+  /** The first characters of the file's text (at most 300). */
+  textStart?: string;
+}
+
+/** The review entry's own sentence for a held file the check did not match (R277 d). */
+export const HELD_FILE_REVIEW_TEXT = "A file was found for this record, but it did not clearly match.";
+/** R296 b: the review entry's own sentence for a held file the check matched (advice: it still waits for the researcher). */
+export const HELD_FILE_LOOKS_RIGHT_TEXT = "A file was found for this record. It looks like the right file: its first page shows the record's title with the author directly below.";
+/** The review entry's own sentence for a held file, by what the check said of it (the library records it as the entry's reason). */
+export const heldFileReviewText = (why: HeldFileWhy): string => (why === "looks-right" ? HELD_FILE_LOOKS_RIGHT_TEXT : HELD_FILE_REVIEW_TEXT);
+
+/** What the check said of a held file, in words: the find queue's sentence for the same code (`file-<why>`), declared once there. */
+export const HELD_FILE_WHY_TEXT: Record<HeldFileWhy, string> = {
+  "other-doi": "The file names another DOI as its own.",
+  "title-absent": "The file does not show this record's title with its author.",
+  "no-text": "The file has no text that could be read (a scan, or a damaged file).",
+  "other-version": "The file seems to be another volume, part or edition of this work.",
+  "other-kind": "The file looks like another kind of document (a review, a reply, a correction or a supplement), not the work itself.",
+  "looks-right": FIND_REASON_TEXT["file-looks-right"],
+};
+
+/**
+ * `POST /review/:itemId/held-file` (F11): the researcher's decision on a held file. "attach" ("Use this file") adds
+ * it to the record's source as the file that was found (its record says what the check had said: "match" for a file
+ * that looked right, else that the researcher accepted it after the check did not match it); a decision also wakes
+ * the project's entries waiting for a place among the waiting files (R296 d);
+ * "discard" ("Not this file") destroys the held copy. One governed change each. A second decision is 409 CONFLICT;
+ * the record no longer in the library is 409 with the library's sentence; a locked project 423.
+ */
+export const HELD_FILE_DECISIONS = ["attach", "discard"] as const;
+export type HeldFileDecision = (typeof HELD_FILE_DECISIONS)[number];
+export interface HeldFileDecisionRequest {
+  projectId: string;
+  decision: HeldFileDecision;
+}
+export interface HeldFileDecisionResponse {
+  decided: true;
+}
+/**
+ * R282 d: the `reason` of a 409 refusal of a held-file decision. Only "already-decided" means the entry is no longer
+ * waiting (the screen takes it away); "paused" (Find and acquire is stopped for the project now) and "source-gone"
+ * (the record is no longer in the library) leave it waiting, with the service's sentence.
+ */
+export const HELD_FILE_REFUSAL_REASONS = ["already-decided", "paused", "source-gone"] as const;
+export type HeldFileRefusalReason = (typeof HELD_FILE_REFUSAL_REASONS)[number];
 
 /** `GET /projects/:id/review?offset&limit&source`: one page of the queue, oldest first; `total` counts every entry the query matches. */
 export interface ProjectReviewPage {

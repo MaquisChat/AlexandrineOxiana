@@ -70,7 +70,15 @@ import {
   type Repo,
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
+import * as fsp from "node:fs/promises";
+import { join } from "node:path";
+import type { AcquiredFrom, SourceFile } from "@ao/core";
+import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
+import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, sourceHasFile, type HeldFileFacts } from "../repo/review.js";
 import type { WorkCandidate } from "./candidates.js";
+import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
+import { checkFileAgainstRecord, type FileCheckResult } from "./file-check.js";
+import { FREE_COPY_ELSEWHERE_MAX, FREE_COPY_MAX_BYTES, FREE_COPY_SOURCES, findFreeCopies, type CopyOffer, type FreeCopySource } from "./free-copy.js";
 import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, authorOfferProbe, childTyped, fetchWork, fitAuthorEntry, fitPeople, hasInitial, isPersonId, isWorkId, peopleSearchWanted, sameWork, searchPeople, titleCovered, worksOf, type PersonDecision } from "./people.js";
 import { FindQueueUnreadableError, sanitizeEntry } from "./queue-store.js";
 import { parseReference, type Reference } from "./reference.js";
@@ -118,6 +126,50 @@ export const FIND_ENTRY_KEY = "find-entry";
 export const FIND_LEGAL_CATEGORY = "reference-lookup";
 /** At most this many candidates are kept on an entry. */
 const CANDIDATES_KEPT = 10;
+/**
+ * Task F11: one download call may take this long IN ALL, its wait for a download place included (F10 counts its own
+ * 180 s from the place granted): 60 s to get a place, then F10's 180 s. Past it the call is aborted through its signal
+ * and leaves nothing behind (F10).
+ */
+export const FIND_DOWNLOAD_TIMEOUT_MS = 60_000 + FETCH_FILE_DEADLINE_MS;
+/** Task F11: the file check of one file (the library's extraction, in this process) may take this long; past it the file "needs a check" ("no-text"). */
+export const FIND_CHECK_TIMEOUT_MS = 60_000;
+/**
+ * R282 g (M1): while an entry's file is downloaded and checked, whether its record is still in the library is looked at
+ * this often (an in-memory read); a record removed meanwhile aborts the download.
+ */
+export const FIND_SOURCE_WATCH_MS = 2_000;
+
+/**
+ * Task F11: a free copy's address as `Asset.acquired` keeps it: user name, password, query and fragment removed
+ * (a session token or a key in a query never survives), at most 2,000 characters. "" when it does not parse.
+ */
+export function cleanAcquiredAddress(raw: string): string {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return "";
+  }
+  u.username = "";
+  u.password = "";
+  u.search = "";
+  u.hash = "";
+  const out = u.href;
+  return out.length <= 2000 ? out : "";
+}
+
+/** Task F11: the states of the free-copy part of an entry's life (an entry with its record made, and no file yet). */
+const COPY_STATES: ReadonlySet<FindState> = new Set(["record-complete", "looking-for-copy", "fetching"]);
+/**
+ * An entry with its record waiting for a place among the files waiting for the researcher's check: "record-complete /
+ * held-full", or (R310 b) "failed / held-full" as builds before R296 d stored it — woken alike, and judged again from
+ * "looking for a copy" like the others.
+ */
+const waitsForPlace = (e: FindEntry): boolean => !!e.sourceId && (e.state === "record-complete" || e.state === "failed") && e.reason?.code === "held-full";
+/** R297 c: waiting for OpenAlex's daily allowance (the record part's wait; a saved key wakes it: `wakeAllowance`). */
+const waitsForAllowance = (e: FindEntry): boolean => e.state === "looking-up" && e.reason?.code === "budget" && !!e.nextTryAt;
+const inCopyPart = (e: FindEntry): boolean => (!!e.sourceId && COPY_STATES.has(e.state)) || waitsForPlace(e);
 
 const VERSION: string = libraryVersion();
 
@@ -272,8 +324,34 @@ export interface FindRunner {
    * "choose-works". Refused after `stop` or `stopAll` (R245).
    */
   asAuthor(projectId: string, entryId: string): Promise<FindEntry>;
+  /** Removes the entry; a file held for it is destroyed and its review entry closed in the same change (F11, R277 c). */
   remove(projectId: string, entryId: string): Promise<void>;
-  /** At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry (nothing else). */
+  /**
+   * Task F11: the researcher's decision in the review queue on a file held for an entry ("Use this file": "attach";
+   * "Not this file": "discard"), one governed change (refused after `stop` or `stopAll`, like every act).
+   */
+  resolveHeld(projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<FindEntry | null>;
+  /**
+   * R305 b: wakes ONLY the project's entries waiting for a place among the waiting files ("held-full", stored
+   * "record-complete" or, R310 b, "failed"); nothing in flight is touched (no download aborted or restarted, no service
+   * asked again for an entry already at work). R310 a: every way a waiting file goes calls it — `resolveHeld` after each
+   * decision, `remove` after removing an entry whose file was waiting, and the service after it deletes a record (whose
+   * change resolves that record's waiting file). The project-wide `resume` stays for a save of the rules, an opening and
+   * an unlocking. Does nothing for a project the runner is not running (stopped or never resumed).
+   */
+  wakeHeldFull(projectId: string): Promise<void>;
+  /**
+   * R312 c (R297 c): an OpenAlex key was saved — the project's entries waiting for OpenAlex's daily allowance
+   * ("looking-up", reason "budget", a `nextTryAt`) go on now instead of at the pause's end: their wait is cleared in one
+   * write and they are queued (the allowance's pause is kept per key, so the next search asks with the new key). Nothing
+   * else is touched: no other waiting entry, nothing in flight. Does nothing for a project the runner is not running.
+   */
+  wakeAllowance(projectId: string): Promise<void>;
+  /**
+   * At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry, and (F11) every entry in the free
+   * copy's part — "record-complete" (its source without a file), "looking-for-copy", and "fetching" (which resumes as
+   * "looking-for-copy": a download is never resumed).
+   */
   resume(projectId: string): void;
   /** At lock (together with the lock) or close: nothing more is written for the project; its work in flight is let go. */
   stop(projectId: string): void;
@@ -489,6 +567,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   };
 
   let closed = false;
+  /** `stopAll()` has returned: from then on nothing at all is written into the library's folder (R247 c). */
+  let released = false;
   let active = 0;
   let serveSeq = 0;
   const runs = new Map<string, Run>();
@@ -665,14 +745,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     if (op !== "remove") {
       for (const e of fitted) {
         if (e.state !== "looking-up") madeHere.delete(e.id);
-        try {
-          deps.onChange({ projectId: pid, entryId: e.id, state: e.state });
-        } catch {
-          // a listener's error never undoes a committed change
-        }
+        notify(pid, e.id, e.state);
+        // F11: a record this queue just completed goes on by itself to look for a free copy.
+        if (e.state === "record-complete" && e.sourceId && !e.reason) enqueue(pid, e.id);
       }
     }
     return fitted;
+  }
+  function notify(pid: string, eid: string, state: FindState): void {
+    try {
+      deps.onChange({ projectId: pid, entryId: eid, state });
+    } catch {
+      // a listener's error never undoes a committed change
+    }
   }
   const stamp = () => now().toISOString();
 
@@ -1010,21 +1095,28 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       }
       return;
     }
-    if (!live() || !entry || entry.state !== "looking-up") return;
+    if (!live() || !entry) return;
+    const copying = inCopyPart(entry);
+    if (entry.state !== "looking-up" && !copying) return;
     if (entry.nextTryAt && Date.parse(entry.nextTryAt) > now().getTime()) {
       later(pid, eid, entry.nextTryAt);
       return;
     }
-    const at0 = entry;
+    /** The version of the entry this work last saw or wrote: every write is made only on it. */
+    let at0 = entry;
 
-    /** Writes `patch` on the entry in a turn, if it is still the version this work started from. */
-    const finish = async (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = []) =>
-      (await inTurn(r, pid, live, async () => {
-        const cur = await current(pid, eid);
-        if (!cur || !sameVersion(cur, at0)) return null;
-        const [w] = await write(pid, [evolve(cur, patch, drop, stamp())], "update");
-        return w!;
-      })) ?? null;
+    /** Writes `patch` on the entry in a turn, if it is still the version this work last saw or wrote. */
+    const finish = async (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = []) => {
+      const w =
+        (await inTurn(r, pid, live, async () => {
+          const cur = await current(pid, eid);
+          if (!cur || !sameVersion(cur, at0)) return null;
+          const [w] = await write(pid, [evolve(cur, patch, drop, stamp())], "update");
+          return w!;
+        })) ?? null;
+      if (w) at0 = w;
+      return w;
+    };
 
     /**
      * No answer this time: tried again after the next delay, then "failed" with `code`. `patch` is what was decided
@@ -1043,7 +1135,14 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     };
 
     try {
-      await workOn(pid, eid, at0, r, live, finish, tryLater);
+      if (copying) {
+        await copyOn(pid, eid, at0, r, live, finish, tryLater, {
+          get: () => at0,
+          set: (e: FindEntry) => {
+            at0 = e;
+          },
+        });
+      } else await workOn(pid, eid, at0, r, live, finish, tryLater);
     } catch (err) {
       if (err instanceof Abandoned || !live()) return;
       if (err instanceof Error && err.name === "SimulatedCrash" && process.env.NODE_ENV === "test") {
@@ -1357,6 +1456,390 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   // ------------------------------------------------------------------------------------------------------------
+  // Task F11: the free copy — looked for, downloaded, checked against the record, and held for the researcher, who
+  // alone attaches it ("Use this file"; R301: the app never attaches a found file by itself).
+
+  /** Whether the project's rules allow the acquiring method `free_copy` (asked before ANY free-copy service). */
+  function copyAllowed(ctx: LookupContext): boolean {
+    if (!ctx.policy) return false;
+    const d = evaluate(ctx.policy, {
+      action: "capture",
+      projectId: ctx.projectId,
+      actor: ctx.actor,
+      now: (ctx.clock?.() ?? new Date()).toISOString(),
+      ...(ctx.tz ? { tz: ctx.tz } : {}),
+      capture: { method: "free_copy" },
+    });
+    return d.result !== "deny";
+  }
+  const COPY_RULES: FindReason = { code: "copy-not-allowed", by: "rules" };
+  /** R282 g (M8): the rules' STORE part refuses the file (or a legal basis is missing), said as such. */
+  const COPY_STORE: FindReason = { code: "copy-store-not-allowed", by: "rules" };
+  const COPY_NO_BASIS: FindReason = { code: "copy-no-legal-basis", by: "rules" };
+  /** The reasons of an entry the rules stopped (R282 f: woken when the rules are saved; "Try again" accepted). */
+  const STOPPED_BY_RULES: ReadonlySet<string> = new Set([COPY_RULES.code, COPY_STORE.code, COPY_NO_BASIS.code]);
+  const RECORD_REMOVED: FindReason = { code: "record-removed" };
+  /** R296 d: FIND_HELD_MAX files already wait for the researcher: the entry waits, "record-complete", asking nothing. */
+  const HELD_FULL: FindReason = { code: "held-full" };
+  /**
+   * Why the rules refused a free copy's file at its hold (M8): the capture of `free_copy`, or its store. (At "Use this
+   * file" the same rules are evaluated again by `resolveHeldFile`, and a refusal is the service's usual sentence.)
+   */
+  async function copyRefusal(pid: string, err: PolicyDeniedError, prov: Provenance): Promise<FindReason> {
+    if (err.action !== "store") return COPY_RULES;
+    return (await refusalOf(pid, err, { identifiable: prov.identifiable, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) })) === NO_LEGAL_BASIS ? COPY_NO_BASIS : COPY_STORE;
+  }
+  /** Whether the rules' store part refuses a file for the record now (asked before ANY free-copy service, M8). */
+  async function storeRefusal(ctx: LookupContext, pid: string, prov: Provenance): Promise<FindReason | null> {
+    const d = evaluate(ctx.policy!, {
+      action: "store",
+      projectId: ctx.projectId,
+      actor: ctx.actor,
+      now: (ctx.clock?.() ?? new Date()).toISOString(),
+      ...(ctx.tz ? { tz: ctx.tz } : {}),
+      store: { identifiable: prov.identifiable, hasLocation: false, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) },
+    });
+    return d.result === "deny" ? copyRefusal(pid, new PolicyDeniedError(d.reason ?? "", "store"), prov) : null;
+  }
+  /** Entry → the abort of its download in flight (R282 g, M2: removing the entry aborts it). */
+  const downloads = new Map<string, AbortController>();
+
+  /** The free-copy services the settings switch on, in the plan's order (F12's settings; until then its defaults). */
+  function copySources(s: SearchSettings): FreeCopySource[] {
+    const on = new Set((s.copies ?? []).filter((x) => x.on).map((x) => x.id));
+    return FREE_COPY_SOURCES.filter((x) => on.has(x));
+  }
+
+  /** The record as the free-copy lookups and the file check take it (from the source as stored now). */
+  function workOfSource(sf: SourceFile): WorkCandidate {
+    const s = sf.source;
+    return {
+      id: s.id,
+      title: primary(s.title) ?? "",
+      creators: s.creators.slice(0, 100),
+      type: s.type,
+      identifiers: { ...(s.identifiers.doi ? { doi: s.identifiers.doi } : {}), ...(s.identifiers.isbn?.length ? { isbn: s.identifiers.isbn.slice(0, 20) } : {}) },
+      ...(s.issued ? { issued: s.issued } : {}),
+      providers: [],
+    };
+  }
+
+  /** "Where to get it": the free copies on other hosts (and, when nothing could be downloaded, the offers), at most FREE_COPY_ELSEWHERE_MAX. */
+  function linksOf(elsewhere: Array<{ host: string; url: string }>, offers: CopyOffer[] = []): FindEntry["offers"] {
+    const out: NonNullable<FindEntry["offers"]> = [];
+    const seen = new Set<string>();
+    const add = (url: string) => {
+      let host: string;
+      try {
+        host = new URL(url).hostname;
+      } catch {
+        return;
+      }
+      if (seen.has(url) || url.length > 2000 || host.length > 253 || out.length >= FREE_COPY_ELSEWHERE_MAX) return;
+      seen.add(url);
+      out.push({ label: "A free copy may be at", url, host });
+    };
+    for (const l of elsewhere) add(l.url);
+    for (const o of offers) add(o.url);
+    return out;
+  }
+
+  /** How the file was got (its address cleaned), for `Asset.acquired` and a held file's facts. */
+  function acquiredFor(offer: CopyOffer): Omit<AcquiredFrom, "check"> {
+    return { method: "free_copy", via: "service", service: offer.source, address: cleanAcquiredAddress(offer.url), at: stamp(), tool: { name: FIND_TOOL, version: VERSION }, access: "public" };
+  }
+
+  /**
+   * One download, bounded AS A WHOLE (its wait for a place included) by FIND_DOWNLOAD_TIMEOUT_MS, and aborted through
+   * its signal at a stop, a lock or a close. F10 removes what it wrote on every ending but success.
+   */
+  async function download(url: string, into: string, stop: AbortSignal): Promise<Awaited<ReturnType<typeof fetchFile>>> {
+    const ac = new AbortController();
+    const onStop = () => ac.abort(stop.reason);
+    if (stop.aborted) onStop();
+    else stop.addEventListener("abort", onStop, { once: true });
+    const h = timers.setTimeout(() => ac.abort(new TimedOut()), FIND_DOWNLOAD_TIMEOUT_MS);
+    try {
+      return await fetchFile(url, { maxBytes: FREE_COPY_MAX_BYTES, deadlineMs: FETCH_FILE_DEADLINE_MS, into, signal: ac.signal });
+    } finally {
+      timers.clearTimeout(h);
+      stop.removeEventListener("abort", onStop);
+    }
+  }
+
+  /**
+   * The free-copy part of an entry's life (R277): its record made, its source without a readable file. R301: no path
+   * of it attaches a file to the source; only the researcher's "Use this file" on the held file does (`resolveHeld`).
+   *
+   *   record-complete ──► looking-for-copy ──► no-open-copy   (no offer: the "elsewhere" links are kept)
+   *                                       ──► fetching ──► needs-check   (R296 a: the first file the check matches is held,
+   *                                                                       "file-looks-right"; no offer matches: the FIRST
+   *                                                                       file that did not is held, "file-<why>")
+   *                                                    ──► record-complete / held-full (the hold found FIND_HELD_MAX
+   *                                                                       files waiting meanwhile: the file is dropped)
+   *                                                    ──► in-library    (R305 c: the source gained a readable file
+   *                                                                       meanwhile: refused inside the hold's change,
+   *                                                                       nothing held, the file dropped)
+   *                                                    ──► no-open-copy  (no offer could be downloaded: its links kept)
+   *   record-complete / held-full (R296 d): FIND_HELD_MAX files already wait — looked at BEFORE any free-copy service
+   *   is asked or any file downloaded; the entry waits, asking nothing, until a waiting file goes — a decision on it,
+   *   the removal of its entry, the deletion of its record (`wakeHeldFull`, R305 b, R310 a: only such entries) — or
+   *   "Try again", opening or unlocking wakes it.
+   *
+   * Nothing is asked of any free-copy service, and nothing downloaded, unless the rules allow `free_copy` (else the
+   * entry stays "record-complete" with the reason "copy-not-allowed", and is looked at again at a save of the rules,
+   * "Try again", an opening and an unlocking). Settings that switch every copy service off leave a "record-complete" entry as it is. A source that has
+   * a readable file is "in-library". A crash, a lock or a close in the middle resumes as "looking-for-copy".
+   */
+  async function copyOn(
+    pid: string,
+    eid: string,
+    entry: FindEntry,
+    r: Run,
+    live: () => boolean,
+    finish: (patch: Partial<FindEntry>, drop?: Array<keyof FindEntry>) => Promise<FindEntry | null>,
+    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>) => Promise<void>,
+    version: { get(): FindEntry; set(e: FindEntry): void },
+  ): Promise<void> {
+    const sid = entry.sourceId!;
+    let sf: SourceFile;
+    try {
+      sf = await guard(r, repo.getSource(pid, sid));
+    } catch (err) {
+      if (!(err instanceof NotFoundError)) throw err;
+      // The record is no longer in the library: no file will be fetched for it; the entry says so (R282 g).
+      await finish({ state: "no-open-copy", reason: RECORD_REMOVED }, ["nextTryAt", "offers"]);
+      return;
+    }
+    if (!live()) return;
+    if (sourceHasFile(sf)) {
+      // Its source has a readable file already (the researcher's own: added by hand, or a held file used).
+      await finish({ state: "in-library" }, ["nextTryAt", "reason"]);
+      return;
+    }
+    const ctx = await guard(r, lookupContextFor(repo, pid, http, deps.debug ? { debug } : {}));
+    if (!live()) return;
+    if (!ctx.policy) {
+      block(pid, "rules-unreadable");
+      return;
+    }
+    // Said in words on the entry; not tried again until the rules change (their save, "Try again", the next open or
+    // unlock: R282 f). The store part too, before anything is asked (M8).
+    const refused = copyAllowed(ctx) ? await storeRefusal(ctx, pid, sf.source.provenance) : COPY_RULES;
+    if (refused) {
+      if (!(entry.state === "record-complete" && entry.reason?.code === refused.code)) await finish({ state: "record-complete", reason: refused }, ["nextTryAt"]);
+      return;
+    }
+    let s: SearchSettings;
+    try {
+      s = await guard(r, deps.settings(), FIND_SETTINGS_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof TimedOut) {
+        debug("find: the search settings did not answer in time");
+        await tryLater("unexpected");
+        return;
+      }
+      throw err;
+    }
+    if (!live()) return;
+    const sources = copySources(s);
+    if (!sources.length) {
+      // R312 c: every copy service switched off in Search sources: the entry rests with its record complete and says
+      // so ("switched off" by the settings) — a record just made included; written once (nothing when it already says so).
+      if (!(entry.state === "record-complete" && entry.reason?.code === SETTINGS.code)) await finish({ state: "record-complete", reason: SETTINGS }, ["nextTryAt"]);
+      return;
+    }
+    // R296 d: no service is asked and nothing downloaded while FIND_HELD_MAX files already wait for the researcher's
+    // check (one read of the project's review file); the entry waits with its record complete, and is woken by a
+    // decision on a waiting file, "Try again", opening or unlocking. Woken while the limit is still reached, it goes
+    // back to waiting having asked nothing (and writes nothing when it was already waiting).
+    if ((await guard(r, heldWaitingCountIn(repo, pid))) >= FIND_HELD_MAX) {
+      if (!live()) return;
+      if (!(entry.state === "record-complete" && entry.reason?.code === HELD_FULL.code)) await finish({ state: "record-complete", reason: HELD_FULL }, ["nextTryAt", "offers"]);
+      return;
+    }
+    if (!live()) return;
+    if (entry.state !== "looking-for-copy") {
+      if (!(await finish({ state: "looking-for-copy", attempts: 0 }, ["nextTryAt", "reason", "offers"]))) return;
+    }
+    const email = typeof s.unpaywallEmail === "string" && s.unpaywallEmail ? s.unpaywallEmail : undefined;
+    let found: Awaited<ReturnType<typeof findFreeCopies>>;
+    try {
+      // findFreeCopies takes no signal and never rejects: bounded here by the runner's own limit (R254 c).
+      found = await guard(r, findFreeCopies(workOfSource(sf), ctx, sources, email), FIND_LOOKUP_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof TimedOut) {
+        debug("find: the free-copy services did not answer in time");
+        await tryLater("unreachable");
+        return;
+      }
+      throw err;
+    }
+    if (!live()) return;
+    if (!found.offers.length) {
+      // R282 e: every service asked failed: "could not be reached", tried again by the ordinary retries. Some failed:
+      // "no open copy", saying that a copy may still exist ("Try again" is accepted). Unpaywall is asked only with an e-mail.
+      const asked = sources.filter((x) => x !== "unpaywall" || email);
+      if (found.failed.length && found.failed.length >= asked.length) {
+        debug("find: no free-copy service could be reached");
+        await tryLater("unreachable");
+        return;
+      }
+      const links = linksOf(found.elsewhere);
+      await finish({ state: "no-open-copy", ...(found.failed.length ? { reason: { code: "copy-some-unreachable" } } : {}), ...(links?.length ? { offers: links } : {}) }, ["nextTryAt", "reason", "offers"]);
+      return;
+    }
+    if (!(await finish({ state: "fetching" }, ["nextTryAt", "reason", "offers"]))) return;
+
+    const record = { title: primary(sf.source.title) ?? "", creators: sf.source.creators, ...(sf.source.identifiers.doi ? { doi: sf.source.identifiers.doi } : {}), ...(sf.source.container && primary(sf.source.container) ? { container: primary(sf.source.container)! } : {}) };
+    const folderName = `find-${eid}`;
+    const folder = join(repoLibrary(repo).root, ".tmp", folderName);
+    // The folder is held in use from before the first download until the file is stored or dropped (R257 b, R261 e).
+    const release = holdFindTemp(folderName);
+    const stop = new AbortController();
+    void r.stopSignal.then(() => stop.abort(new Abandoned()));
+    // R282 g: removing the entry (M2), or its record (M1, looked at every FIND_SOURCE_WATCH_MS), aborts the download.
+    const dk = keyOfRun(pid, eid);
+    downloads.set(dk, stop);
+    let gone = false;
+    let watch: unknown;
+    const look = () => {
+      watch = timers.setTimeout(() => {
+        if (stop.signal.aborted) return;
+        if (liveIds(pid).has(sid)) return look();
+        gone = true;
+        stop.abort(new Abandoned());
+      }, FIND_SOURCE_WATCH_MS);
+    };
+    look();
+    const removedRecord = () => finish({ state: "no-open-copy", reason: RECORD_REMOVED }, ["nextTryAt", "offers"]);
+    let held: { path: string; offer: CopyOffer; check: FileCheckResult } | undefined;
+    try {
+      let n = 0;
+      for (const offer of found.offers) {
+        if (!live()) return;
+        const into = join(folder, `${++n}.${offer.kind}`);
+        let got: Awaited<ReturnType<typeof fetchFile>>;
+        try {
+          got = await download(offer.url, into, stop.signal);
+        } catch (err) {
+          if (!live()) return;
+          if (stop.signal.aborted) {
+            if (gone) await removedRecord();
+            return;
+          }
+          // Refused or failed (its sentence names no address): the next offer is tried.
+          debug(`find: a free copy could not be downloaded (${err instanceof FetchFileError ? err.code : errName(err)})`);
+          continue;
+        }
+        let check: FileCheckResult;
+        try {
+          check = await guard(r, checkFileAgainstRecord(got.path, record), FIND_CHECK_TIMEOUT_MS);
+        } catch (err) {
+          if (err instanceof Abandoned) return;
+          if (!(err instanceof TimedOut)) throw err;
+          debug("find: the file check did not end in time");
+          check = { match: false, why: "no-text", evidence: { kind: offer.kind, bytes: got.bytes } };
+        }
+        if (!live() || stop.signal.aborted) {
+          if (live() && gone) await removedRecord();
+          return;
+        }
+        if (check.match) {
+          // R296 a, R301: the app never attaches a found file by itself. The file the check matched waits for the
+          // researcher like any other, with the advice that it looks right; a file kept before it that did not match is
+          // dropped (one held file per entry).
+          if (held) await fsp.rm(held.path, { force: true });
+          await holdOne(pid, eid, r, live, version, sid, sf.source.provenance, { path: got.path, offer, check });
+          return;
+        }
+        // A file that fails the check is dropped — except the first, kept until every offer was tried (R277 b).
+        if (!held) held = { path: got.path, offer, check };
+        else await fsp.rm(got.path, { force: true });
+      }
+      if (!live()) return;
+      if (held) {
+        await holdOne(pid, eid, r, live, version, sid, sf.source.provenance, held);
+        return;
+      }
+      // Nothing could be downloaded: no open copy here; the addresses stay as links for the researcher.
+      const links = linksOf(found.elsewhere, found.offers);
+      await finish({ state: "no-open-copy", ...(links?.length ? { offers: links } : {}) }, ["nextTryAt", "reason", "offers"]);
+    } finally {
+      timers.clearTimeout(watch);
+      if (downloads.get(dk) === stop) downloads.delete(dk);
+      stop.abort(new Abandoned());
+      release();
+      // The folder is removed when the entry is done (also at a stop or a close, while stopAll waits for the work in
+      // flight); once the library's lock is released nothing is written (the next open sweeps what is left, R59).
+      if (!released) await fsp.rm(folder, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * What the entry says when a file could not be held (R282 g), or null for an error not foreseen: the record removed
+   * meanwhile (M1); the record gained a readable file meanwhile ("in-library", R305 c: refused inside the hold's change,
+   * nothing held, the download dropped with its folder); the rules (M8).
+   */
+  async function copyEnded(pid: string, err: unknown, prov: Provenance): Promise<Partial<FindEntry> | null> {
+    if (err instanceof NotFoundError) return { state: "no-open-copy", reason: RECORD_REMOVED };
+    if (err instanceof HeldFileSourceHasFileError) return { state: "in-library" };
+    if (err instanceof PolicyDeniedError) return { state: "record-complete", reason: await copyRefusal(pid, err, prov) };
+    return null;
+  }
+
+  /**
+   * A found file held for the researcher (R277; R296 a: the first file the check matched, or else the first that did
+   * not): the file, its review entry and the entry's line in ONE change. The check's answer goes with it as advice
+   * (R296 b): "looks-right" (with what it matched by) or why it did not clearly match.
+   */
+  async function holdOne(
+    pid: string,
+    eid: string,
+    r: Run,
+    live: () => boolean,
+    version: { get(): FindEntry; set(e: FindEntry): void },
+    sid: string,
+    prov: Provenance,
+    held: { path: string; offer: CopyOffer; check: FileCheckResult },
+  ): Promise<void> {
+    await inTurn(r, pid, live, async () => {
+      const cur = await current(pid, eid);
+      if (!cur || !sameVersion(cur, version.get())) return;
+      const ev = held.check.evidence;
+      const facts: HeldFileFacts = {
+        ...(held.check.match ? { why: "looks-right", by: held.check.by } : { why: held.check.why }),
+        kind: ev.kind,
+        bytes: ev.bytes,
+        ...(ev.fileDoi ? { fileDoi: ev.fileDoi } : {}),
+        ...(ev.embeddedTitle ? { embeddedTitle: ev.embeddedTitle } : {}),
+        ...(ev.textStart ? { textStart: ev.textStart } : {}),
+        acquired: acquiredFor(held.offer),
+      };
+      const next = fit(evolve(cur, { state: "needs-check", reason: { code: `file-${facts.why}` } }, ["nextTryAt", "offers"], stamp()));
+      try {
+        await holdMismatchedFileIn(repo, pid, { entry: next, sourceId: sid, fromPath: held.path, facts });
+      } catch (err) {
+        if (err instanceof HeldFileEntryGoneError) return;
+        if (err instanceof HeldFileLimitError) {
+          // R296 d: the last place was taken while this file was fetched (the limit is looked at before asking): not
+          // kept (the folder goes as the work ends); the entry waits, as one that found the limit before asking does.
+          const [w] = await write(pid, [evolve(cur, { state: "record-complete", reason: HELD_FULL }, ["nextTryAt", "offers"], stamp())], "update");
+          if (w) version.set(w);
+          return;
+        }
+        const said = await copyEnded(pid, err, prov);
+        if (!said) throw err;
+        const [w] = await write(pid, [evolve(cur, said, ["nextTryAt", "reason", "offers"], stamp())], "update");
+        if (w) version.set(w);
+        return;
+      }
+      version.set(next);
+      notify(pid, eid, "needs-check");
+    });
+  }
+
+  // ------------------------------------------------------------------------------------------------------------
   // What the researcher does.
 
   function assertOpen(): void {
@@ -1476,11 +1959,23 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     const w = await act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
-      const waiting = cur.state === "looking-up" && !!cur.nextTryAt;
+      const waiting = (cur.state === "looking-up" || cur.state === "looking-for-copy") && !!cur.nextTryAt;
+      // R282 e, f: "no open copy" because some services could not be reached, and an entry the rules stopped (their
+      // free-copy or store part: the rules are evaluated again), look for a copy again; so does (R296 d) an entry
+      // waiting because FIND_HELD_MAX files wait (the limit is looked at again, before anything is asked).
+      const copyAgain =
+        !!cur.sourceId &&
+        ((cur.state === "no-open-copy" && cur.reason?.code === "copy-some-unreachable") || (cur.state === "record-complete" && (STOPPED_BY_RULES.has(cur.reason?.code ?? "") || cur.reason?.code === HELD_FULL.code)));
       // R283 a: a "choose" made while people of the name could not be looked up: Try again looks again (afresh).
       const peopleUnseen = cur.state === "choose" && cur.reason?.code === "people-unavailable";
-      if (cur.state !== "failed" && cur.state !== "not-found" && !waiting && !peopleUnseen) throw new FindEntryStateError();
+      if (cur.state !== "failed" && cur.state !== "not-found" && !waiting && !copyAgain && !peopleUnseen) throw new FindEntryStateError();
       cancelLater(projectId, entryId);
+      // F11: an entry whose record is made failed in the free copy's part (the services unreachable, …; "held-full" as
+      // stored by builds before R296 d): it looks for a copy again, never for its record.
+      if (cur.sourceId && (cur.state === "failed" || cur.state === "looking-for-copy" || copyAgain)) {
+        const [next] = await write(projectId, [evolve(cur, { state: "looking-for-copy", attempts: 0 }, ["reason", "nextTryAt", "offers"], stamp())], "update");
+        return next!;
+      }
       // F8: a work added from a person's list keeps its work (it is asked again by its id, never searched by text),
       // and an author's entry keeps the person whose works did not come.
       // An added work keeps `work` (never dropped); the line kept for choosing (its candidate) is kept only when no fresh
@@ -1500,15 +1995,72 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function remove(projectId: string, entryId: string): Promise<void> {
     assertOpen();
     assertId(entryId);
-    await act(projectId, async () => {
+    const freed = await act(projectId, async () => {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       cancelLater(projectId, entryId);
       const r = runs.get(projectId);
       if (r) r.pending = r.pending.filter((e) => e !== entryId);
-      // Only the entry goes: a source it made stays in the library.
-      await write(projectId, [cur], "remove");
+      // Only the entry goes: a source it made stays in the library. A file held for it goes with it, and its review
+      // entry is closed, in the same change (F11, R277 c).
+      if (cur.state !== "needs-check") {
+        await write(projectId, [cur], "remove");
+        return false;
+      }
+      await removeFindEntryIn(repo, projectId, cur);
+      return true;
     });
+    // R282 g (M2): its download in flight is aborted (its folder removed and given up as the work ends).
+    downloads.get(keyOfRun(projectId, entryId))?.abort(new Abandoned());
+    // R310 a: its waiting file went with it, so a place is free: the entries waiting for one go on (the same light
+    // wake as after a decision; nothing in flight is touched). An entry that had no waiting file wakes nothing.
+    if (freed) await wakeHeldFull(projectId);
+  }
+
+  async function resolveHeld(projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<FindEntry | null> {
+    assertOpen();
+    if (typeof reviewId !== "string" || !isId(reviewId)) throw new NotFoundError("Review entry", "unknown");
+    const done = await act(projectId, async () => {
+      const { entry } = await resolveHeldFileIn(repo, projectId, reviewId, decision);
+      if (entry) notify(projectId, entry.id, entry.state);
+      return entry;
+    });
+    // R296 d, R305 b: the decision freed a place: the entries waiting for one go on (and nothing else is touched).
+    await wakeHeldFull(projectId);
+    return done;
+  }
+
+  async function wakeHeldFull(projectId: string): Promise<void> {
+    if (closed || readOnly()) return;
+    const r = runs.get(projectId);
+    if (!r || r.stopped) return;
+    let q: Map<string, FindEntry>;
+    try {
+      q = await readFindQueueIn(repo, projectId);
+    } catch {
+      return; // locked or unreadable meanwhile: the next open or unlock resumes the project
+    }
+    for (const e of q.values()) if (waitsForPlace(e)) enqueue(projectId, e.id);
+  }
+
+  async function wakeAllowance(projectId: string): Promise<void> {
+    if (closed || readOnly()) return;
+    const r = runs.get(projectId);
+    if (!r || r.stopped) return;
+    let woken: string[];
+    try {
+      woken = await act(projectId, async () => {
+        const waiting = [...(await readFindQueueIn(repo, projectId)).values()].filter(waitsForAllowance);
+        if (waiting.length) await write(projectId, waiting.map((e) => evolve(e, {}, ["nextTryAt", "reason"], stamp())), "update");
+        return waiting.map((e) => e.id);
+      });
+    } catch {
+      return; // stopped, locked or unreadable meanwhile: the pause's end, Try again, the next open or unlock look again
+    }
+    for (const id of woken) {
+      cancelLater(projectId, id);
+      enqueue(projectId, id);
+    }
   }
 
   function resume(projectId: string): void {
@@ -1549,6 +2101,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // with `elsewhere`): "not-found", "failed" and "already" here neither are nor move the scan's bound back (m1).
       const madeFrom = (e: FindEntry) => e.state === "choose" || e.state === "maybe-duplicate" || (e.state === "already" && e.elsewhere === true);
       const unmade = [...q.values()].filter((e) => madeFrom(e) && !e.sourceId);
+      // F11: the free copy's part goes on (a "fetching" entry resumes as "looking-for-copy": a download is never resumed).
+      for (const e of q.values()) {
+        if (!inCopyPart(e)) continue;
+        if (e.nextTryAt && Date.parse(e.nextTryAt) > now().getTime()) later(projectId, e.id, e.nextTryAt);
+        else enqueue(projectId, e.id);
+      }
       if (!waiting.length && !unmade.length) return;
       // Sources made for an entry whose line was never written (a crash or a stop in between): read once here,
       // outside any store turn, never per entry. Ids are UUIDv7, ordered by the time they were made, and such a
@@ -1622,6 +2180,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     if (h) clearTimeout(h);
     // What is inside a store turn finishes: no time limit (R247 d), so nothing of it lands after the lock is released.
     while (inTurnNow.size) await Promise.allSettled([...inTurnNow]);
+    released = true;
   }
 
   async function elsewhere(projectId: string, entryId: string): Promise<{ projectId: string; sourceId: string } | null> {
@@ -1749,5 +2308,5 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return w;
   }
 
-  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks, asAuthor };
+  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resolveHeld, wakeHeldFull, wakeAllowance, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks, asAuthor };
 }

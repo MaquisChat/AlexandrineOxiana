@@ -1,6 +1,30 @@
 import { z } from "zod";
 import { Id, LibraryRelativePath, LinkedRelativePath, Timestamp } from "./text.js";
 
+/**
+ * How a file was got (Find and acquire, plan ruling 6 / R225): set once, when the asset is added, because the
+ * source's provenance is immutable and was written when the record came in. `address` is the file's address with
+ * user name, password, query and fragment removed (and a proxy host turned back into the publisher's host, F15+).
+ * `check` (F11, R277): how the file came to be attached — it matched its record (`by` DOI or title), or the
+ * researcher accepted it in the review queue after the check found it did not clearly match (`why`).
+ */
+export const AcquiredFrom = z.object({
+  method: z.enum(["free_copy", "library_access"]),
+  via: z.enum(["service", "sign-in-window", "browser-extension"]),
+  service: z.enum(["openalex", "unpaywall", "arxiv", "europepmc", "semanticscholar", "doab", "internetarchive"]).optional(),
+  address: z.string().max(2000),
+  at: Timestamp,
+  tool: z.object({ name: z.string().max(200), version: z.string().max(100) }),
+  access: z.enum(["public", "signed-in-session"]),
+  check: z
+    .union([
+      z.object({ result: z.literal("match"), by: z.enum(["doi", "title"]) }),
+      z.object({ result: z.literal("accepted-after-mismatch"), why: z.enum(["other-doi", "title-absent", "no-text", "other-version", "other-kind"]) }),
+    ])
+    .optional(),
+});
+export type AcquiredFrom = z.infer<typeof AcquiredFrom>;
+
 export const Asset = z
   .object({
   id: Id,
@@ -33,6 +57,8 @@ export const Asset = z
    * evidence and the destruction certificate names it.
    */
   status: z.enum(["destroyed"]).optional(),
+  /** Find and acquire: how this file was got (set once, when it is added). */
+  acquired: AcquiredFrom.optional(),
   /** When the file was destroyed (with `status: "destroyed"`). */
   destroyedAt: Timestamp.optional(),
   metadata: z

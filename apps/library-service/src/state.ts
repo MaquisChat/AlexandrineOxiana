@@ -1360,6 +1360,17 @@ export class ServiceState {
     for (const p of s.repo.listProjects()) if ((projectId === undefined || p.id === projectId) && s.repo.isUnlocked(p.id)) r.resume(p.id);
   }
 
+  /**
+   * R312 c (R297 c): an OpenAlex key was saved — in every unlocked project of the open library, the entries waiting for
+   * OpenAlex's spent allowance go on now (the runner's `wakeAllowance`: only those; nothing in flight is aborted).
+   */
+  wakeFindAllowance(): void {
+    const s = this.session;
+    const r = s?.find;
+    if (!s || !r || this.moving) return;
+    for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) void r.wakeAllowance(p.id);
+  }
+
   /** At an encrypted project's lock, before its key is dropped: nothing more is written for it until `resumeFind`. */
   stopFind(s: Session, projectId: string): void {
     s.find?.stop(projectId);
