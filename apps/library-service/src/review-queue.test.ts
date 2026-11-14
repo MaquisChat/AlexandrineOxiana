@@ -14,7 +14,7 @@ import { newId, type SourceDraft } from "@ao/core";
 import type { FindEntry } from "@ao/library";
 import { appendFindEntriesIn, holdMismatchedFileIn } from "../../../packages/library/src/repo/repo.js";
 import { deviceDeps, type Deps } from "@ao/library";
-import { FIND_ROUTE_TEXT, type ProjectReviewEntry } from "@ao/shared";
+import { FIND_ROUTE_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT, type ProjectReviewEntry } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService } from "./server.js";
 
@@ -415,18 +415,18 @@ describe("a conflict found by a later check enters the queue (Task 72, D19, R190
 
 describe("F11: a file found for a record that did not clearly match it (R277)", () => {
   /** A record made by Find and acquire, and a file held for it with its review entry (as the runner holds one). */
-  async function heldFor(pid: string, title = "Rivers and Memory in Upland Villages"): Promise<{ sid: string; eid: string }> {
+  async function heldFor(pid: string, title = "Rivers and Memory in Upland Villages", looksRight = false): Promise<{ sid: string; eid: string }> {
     const repo = svc.state.session!.repo;
     const sf = await repo.createSource(pid, draft(title, { type: "article-journal", creators: [{ role: "author", family: "Okafor", given: "Amara" }] }), [], { provenance: provenance() });
     const at = new Date().toISOString();
     const entry: FindEntry = { id: newId(), projectId: pid, typed: "Okafor, Rivers", state: "fetching", createdAt: at, updatedAt: at, attempts: 0, sourceId: sf.source.id };
     await appendFindEntriesIn(repo, pid, [entry], "add");
     await holdMismatchedFileIn(repo, pid, {
-      entry: { ...entry, state: "needs-check", reason: { code: "file-other-doi" } },
+      entry: { ...entry, state: "needs-check", reason: { code: looksRight ? "file-looks-right" : "file-other-doi" } },
       sourceId: sf.source.id,
       fromPath: await fixturePdf("held.pdf", "A Different Paper Entirely"),
       facts: {
-        why: "other-doi",
+        ...(looksRight ? { why: "looks-right" as const, by: "title" as const } : { why: "other-doi" as const }),
         kind: "pdf",
         bytes: 2048,
         fileDoi: "10.5555/ao.f11.other",
@@ -455,6 +455,17 @@ describe("F11: a file found for a record that did not clearly match it (R277)", 
     expect(e!.heldFile).not.toHaveProperty("acquired");
     expect(r.body).not.toContain("arxiv.org");
     expect(r.body).not.toContain("find/held");
+  });
+
+  it("R296 b: a file the check found to look right is listed in the same group with the service's sentence and its advice; Use this file records the check's match", async () => {
+    const pid = await newProject();
+    const { sid, eid } = await heldFor(pid, undefined, true);
+    const [e] = (await queue(pid)).items;
+    expect(e).toMatchObject({ group: "found-file", reasons: [HELD_FILE_LOOKS_RIGHT_TEXT], cause: { kind: "acquired-file-mismatch", findEntryId: eid }, heldFile: { why: "looks-right", kind: "pdf" } });
+    expect(HELD_FILE_WHY_TEXT[e!.heldFile!.why]).toBe("This looks like the right file. Check it, then use it.");
+    const r = await held(pid, e!.id, "attach");
+    expect(r.status, r.body).toBe(200);
+    expect((await svc.state.session!.repo.getSource(pid, sid)).assets[0]!.acquired).toMatchObject({ method: "free_copy", check: { result: "match", by: "title" } });
   });
 
   it("Use this file attaches it: one decision, the entry leaves the queue, the source has its file; a second decision is a conflict in words", async () => {

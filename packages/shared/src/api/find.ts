@@ -69,8 +69,11 @@ export const FIND_REASON_CODES = [
   // F8b (R283 a): on a "choose" entry whose people search could not be had ("Try again" looks again).
   "people-unavailable",
   // Task F11: the free copy. "copy-not-allowed" (the entry stays "record-complete"; looked at again when the rules
-  // change, at the next open or unlock); "held-full" ("failed", with "Try again"); "not-this-file" ("no-open-copy");
-  // on "needs-check", why the file did not clearly match its record.
+  // change, at the next open or unlock); "held-full" (R296 d: FIND_HELD_MAX files already wait; the entry waits
+  // "record-complete" and goes on by itself after a decision on a waiting file, "Try again", opening or unlocking —
+  // an older entry stored "failed" with it is still accepted by "Try again"); "not-this-file" ("no-open-copy"); on
+  // "needs-check", what the file check said of the file that waits: why it did not clearly match, or (R296 b)
+  // "file-looks-right" — advice only, the file still waits for the researcher.
   "copy-not-allowed",
   "held-full",
   "not-this-file",
@@ -79,6 +82,7 @@ export const FIND_REASON_CODES = [
   "file-no-text",
   "file-other-version",
   "file-other-kind",
+  "file-looks-right",
   // R282 e: no offer, and some free-copy services could not be reached ("no-open-copy", with "Try again"). R282 g: the
   // record was removed from the library ("no-open-copy", removal only); the rules' STORE part (or a missing legal
   // basis) refused the file (the entry stays "record-complete", woken when the rules are saved, and "Try again").
@@ -89,6 +93,12 @@ export const FIND_REASON_CODES = [
 ] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
+
+/**
+ * Task F11, R296 d: at most this many files found for records wait for the researcher's check in one project; an
+ * entry that finds the limit reached waits ("record-complete", reason "held-full") and asks nothing until then.
+ */
+export const FIND_HELD_MAX = 50;
 
 /** The one sentence for each reason: the only place the screen takes them from. */
 export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
@@ -103,13 +113,14 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   /** F8b (R283 a): on a "choose" entry whose people search could not be had; "Try again" is offered on it. */
   "people-unavailable": "People of this name could not be looked up just now. “Try again” looks again.",
   "copy-not-allowed": "This project's rules do not allow fetching free copies of works.",
-  "held-full": "20 files are already waiting for your check. Decide on some of them, then try again.",
+  "held-full": `${FIND_HELD_MAX} files are already waiting for your check. This one goes on by itself when you have decided on some of them.`,
   "not-this-file": "You said the file found was not this work.",
   "file-other-doi": "The file names another DOI as its own.",
   "file-title-absent": "The file does not show this record's title with its author.",
   "file-no-text": "The file has no text that could be read (a scan, or a damaged file).",
   "file-other-version": "The file seems to be another volume, part or edition of this work.",
   "file-other-kind": "The file looks like another kind of document (a review, a reply, a correction or a supplement), not the work itself.",
+  "file-looks-right": "This looks like the right file. Check it, then use it.",
   "copy-some-unreachable": "Some services could not be reached, so a free copy may still exist. “Try again” looks again.",
   "record-removed": "The record was removed from the library.",
   "copy-store-not-allowed": "This project's rules do not allow storing the file found for this record.",

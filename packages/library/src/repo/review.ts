@@ -7,6 +7,7 @@
  */
 import { createHash } from "node:crypto";
 import { REQUIRED_FIELDS, newId, type AcquiredFrom, type Asset } from "@ao/core";
+import { FIND_HELD_MAX as SHARED_FIND_HELD_MAX, FIND_REASON_TEXT, HELD_FILE_REVIEW_TEXT, heldFileReviewText } from "@ao/shared";
 import { appendFindLinesInTx, findStateCounts, readFindQueue } from "../find/queue-store.js";
 import { FIND_QUEUE_OPS, type FindEntry } from "../find/types.js";
 import { addOriginalInTx } from "./assets.js";
@@ -35,8 +36,11 @@ export type ReviewCause =
 
 export type HeldFileCause = { kind: "acquired-file-mismatch"; findEntryId: string; held: string };
 
-/** Why a file did not clearly match its record (the file check's reasons, `find/file-check.ts`). */
-export type HeldFileWhy = "other-doi" | "title-absent" | "no-text" | "other-version" | "other-kind";
+/**
+ * What the file check (`find/file-check.ts`) said of a held file: why it did not clearly match its record, or (R296 b)
+ * "looks-right" — it matched; advice only, since every found file waits for the researcher.
+ */
+export type HeldFileWhy = "other-doi" | "title-absent" | "no-text" | "other-version" | "other-kind" | "looks-right";
 
 /**
  * What the check found about a held file (R277 d), for the researcher to judge by: outside text, bounded by the check
@@ -45,6 +49,8 @@ export type HeldFileWhy = "other-doi" | "title-absent" | "no-text" | "other-vers
  */
 export interface HeldFileFacts {
   why: HeldFileWhy;
+  /** With "looks-right": what the check matched by (recorded in the asset's `acquired.check` if the file is used). */
+  by?: "doi" | "title";
   kind: "pdf" | "epub";
   bytes: number;
   fileDoi?: string;
@@ -474,20 +480,23 @@ export function parseReviewFile(text: string, projectId: string, key: Uint8Array
 // ---------------------------------------------------------------------------------------------------------------
 // Find and acquire (Task F11, R277): a file that did not clearly match its record, held for the researcher.
 
-/** At most this many held files wait in one project (plan A1 point 9). */
-export const FIND_HELD_MAX = 20;
+/** At most this many held files wait in one project (R296 d: 50; declared once in the shared module with its sentence). */
+export const FIND_HELD_MAX: number = SHARED_FIND_HELD_MAX;
 /** Where held files are kept, in the project's folder. */
 export const FIND_HELD_DIR = "find/held";
 /** The audit ops of the held file's changes (ids and counts only, R177). */
 export const FIND_HELD_OPS = { hold: "project.find.hold", attach: "project.find.held-attach", discard: "project.find.held-discard" } as const;
-/** The review entry's own sentence (R277 d). */
-export const HELD_FILE_REASON = "A file was found for this record, but it did not clearly match.";
+/** The review entry's own sentence for a file the check did not match (R277 d), declared in the shared module. */
+export const HELD_FILE_REASON = HELD_FILE_REVIEW_TEXT;
 
-/** FIND_HELD_MAX files already wait for the researcher's check: the file was not kept. Nothing was written. */
+/**
+ * FIND_HELD_MAX files already wait for the researcher's check: the file was not kept. Nothing was written. Its message is
+ * the queue's sentence for an entry that waits for a place (R296 d).
+ */
 export class HeldFileLimitError extends Error {
   override name = "HeldFileLimitError";
   constructor() {
-    super(`${FIND_HELD_MAX} files are already waiting for your check. Decide on some of them, then try again.`);
+    super(FIND_REASON_TEXT["held-full"]);
   }
 }
 
@@ -524,6 +533,16 @@ async function pendingHeld(core: RepoCore, st: ProjectState): Promise<Array<Revi
   return (await readReviewEntries(core, st)).filter((e): e is ReviewEntry & { cause: HeldFileCause } => e.status === "pending" && isHeldEntry(e));
 }
 
+/**
+ * R296 d: how many files wait for the researcher's check in the project now — one read of its review file, outside any
+ * change (the runner looks at it before any free-copy service is asked; the hold itself counts again inside its change).
+ */
+export async function heldWaitingCount(core: RepoCore, projectId: string): Promise<number> {
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  return (await pendingHeld(core, st)).length;
+}
+
 export interface HoldInput {
   /** The queue entry's new line ("needs-check"): written in the same change. */
   entry: FindEntry;
@@ -535,7 +554,8 @@ export interface HoldInput {
 }
 
 /**
- * Holds a file that did not clearly match its record (R277 b, c): the file copied to `find/held/<entryId>.<ext>`
+ * Holds a file found for a record (R277 b, c; R296 a: every found file, whatever the check said — `facts.why` is
+ * "looks-right" for a file the check matched, else why it did not clearly match): the file copied to `find/held/<entryId>.<ext>`
  * (`tx.copyFile`: encrypted in an encrypted project, 0600), its review entry (cause "acquired-file-mismatch", with
  * what the check found) and the queue entry's new line, in ONE governed change (capture `free_copy` and `store`
  * evaluated and audited, `project.find.hold` with ids and counts only): a crash leaves all of it or none.
@@ -566,7 +586,8 @@ export async function holdMismatchedFile(core: RepoCore, projectId: string, inpu
         sourceId: input.sourceId,
         kind: "verification",
         fields: {},
-        reasons: [HELD_FILE_REASON],
+        // R296 b: the check's answer as advice, in the shared module's words.
+        reasons: [heldFileReviewText(input.facts.why)],
         cause: { kind: "acquired-file-mismatch", findEntryId: eid, held },
         heldFile: input.facts,
       });
@@ -585,6 +606,16 @@ export async function holdMismatchedFile(core: RepoCore, projectId: string, inpu
 }
 
 type HeldReview = ReviewEntry & { cause: HeldFileCause; sourceId: string; heldFile: HeldFileFacts };
+
+/**
+ * What the asset's provenance records of the check when the researcher uses a held file: the check's own answer —
+ * "match" (R296 b, a file that looked right; `@ao/core`'s model has no field for who decided: the review entry's
+ * decision "file-attached" and the audit's `project.find.held-attach` say the researcher did), or
+ * "accepted-after-mismatch" with why it did not clearly match.
+ */
+function checkOf(h: HeldFileFacts): NonNullable<AcquiredFrom["check"]> {
+  return h.why === "looks-right" ? { result: "match", by: h.by ?? "title" } : { result: "accepted-after-mismatch", why: h.why };
+}
 
 /** The pending held-file entry `reviewId` of the project (NotFoundError, ReviewEntryDecidedError, InvalidInputError). */
 async function heldEntry(core: RepoCore, st: ProjectState, reviewId: string): Promise<HeldReview> {
@@ -609,8 +640,8 @@ async function entryLine(core: RepoCore, projectId: string, entryId: string, pat
  * The researcher's decision on a held file (R277; review queue "Use this file" / "Not this file"), ONE governed change
  * each, audited with ids and counts only:
  *  - "attach": the held file becomes an original of the source, exactly as a file that matched (method `free_copy`,
- *    its `acquired` record), with `check: { result: "accepted-after-mismatch", why }` — the record says the researcher
- *    accepted it after the check failed; the held copy goes; the review entry is resolved ("file-attached"); the queue
+ *    its `acquired` record), with the check's answer (`checkOf`: "match" for a file that looked right, R296 b, else
+ *    `{ result: "accepted-after-mismatch", why }` — the researcher accepted it after the check failed); the held copy goes; the review entry is resolved ("file-attached"); the queue
  *    entry is "in-library". Capture `free_copy` and `store` are evaluated as for any added original. A source that is
  *    no longer there refuses (HeldFileSourceGoneError) and nothing changes.
  *  - "discard": the held copy is destroyed (overwritten, then removed); the review entry is resolved
@@ -646,7 +677,7 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
           ext: kind,
           mime: mimeFor(kind),
           label: `free copy ${tx.at.slice(0, 10)}`,
-          acquired: { ...e.heldFile.acquired, check: { result: "accepted-after-mismatch", why: e.heldFile.why } },
+          acquired: { ...e.heldFile.acquired, check: checkOf(e.heldFile) },
         });
         await tx.trash(rel);
         await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: "file-attached" });

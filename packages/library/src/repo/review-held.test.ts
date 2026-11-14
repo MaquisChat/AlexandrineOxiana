@@ -20,6 +20,7 @@ import {
   HELD_FILE_REASON,
   HeldFileEntryGoneError,
   HeldFileLimitError,
+  heldWaitingCount,
   holdMismatchedFile,
   readReviewEntries,
   removeFindEntryWithHeld,
@@ -27,6 +28,7 @@ import {
   type HeldFileFacts,
 } from "./review.js";
 import { SimulatedCrash, seams, type CrashPoint } from "./testing.js";
+import { FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_REVIEW_TEXT } from "@ao/shared";
 import type { RepoCore } from "./state.js";
 
 let kit: Kit;
@@ -69,8 +71,10 @@ async function world(encrypted = false): Promise<World> {
   return { p, sourceId: sf.source.id, entry, pdf };
 }
 
-const needsCheck = (w: World): FindEntry => ({ ...w.entry, state: "needs-check", reason: { code: "file-other-doi" }, updatedAt: "2026-11-10T09:31:00.000Z" });
-const hold = (w: World) => holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w), sourceId: w.sourceId, fromPath: w.pdf, facts: facts() });
+/** R296 b: what the check said of a file it matched — advice only; the file waits for the researcher all the same. */
+const LOOKS_RIGHT: Partial<HeldFileFacts> = { why: "looks-right", by: "title" };
+const needsCheck = (w: World, why: HeldFileFacts["why"] = "other-doi"): FindEntry => ({ ...w.entry, state: "needs-check", reason: { code: `file-${why}` }, updatedAt: "2026-11-10T09:31:00.000Z" });
+const hold = (w: World, extra: Partial<HeldFileFacts> = {}) => holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w, extra.why), sourceId: w.sourceId, fromPath: w.pdf, facts: facts(extra) });
 const heldDir = (w: World) => join(kit.lib.root, kit.repo.getProject(w.p.id).folder, "find", "held");
 const heldFiles = async (w: World) => {
   try {
@@ -123,13 +127,31 @@ describe("holding a file", () => {
     for (const e of entries.slice(0, FIND_HELD_MAX)) await holdMismatchedFile(coreOf(), w.p.id, { entry: { ...e, state: "needs-check" }, sourceId: w.sourceId, fromPath: w.pdf, facts: facts() });
     const last = entries[FIND_HELD_MAX]!;
     await expect(holdMismatchedFile(coreOf(), w.p.id, { entry: { ...last, state: "needs-check" }, sourceId: w.sourceId, fromPath: w.pdf, facts: facts() })).rejects.toBeInstanceOf(HeldFileLimitError);
+    // R296 d: at most 50, and the refusal says so in the queue's own words; the count is one read of the review file.
+    expect(FIND_HELD_MAX).toBe(50);
+    expect(new HeldFileLimitError().message).toBe(FIND_REASON_TEXT["held-full"]);
+    expect(await heldWaitingCount(coreOf(), w.p.id)).toBe(FIND_HELD_MAX);
     expect(await heldFiles(w)).toHaveLength(FIND_HELD_MAX);
     expect(await pending(w)).toHaveLength(FIND_HELD_MAX);
     expect((await readFindQueue(coreOf(), w.p.id)).get(last.id)?.state).toBe("fetching");
     // A decision frees a place.
     await resolveHeldFile(coreOf(), w.p.id, (await pending(w))[0]!.id, "discard");
+    expect(await heldWaitingCount(coreOf(), w.p.id)).toBe(FIND_HELD_MAX - 1);
     await holdMismatchedFile(coreOf(), w.p.id, { entry: { ...last, state: "needs-check" }, sourceId: w.sourceId, fromPath: w.pdf, facts: facts() });
     expect(await heldFiles(w)).toHaveLength(FIND_HELD_MAX);
+  });
+
+  it("R296 b: a file the check matched is held exactly as one it did not match, with the looks-right sentence as its reason", async () => {
+    const w = await world();
+    const r = await hold(w, LOOKS_RIGHT);
+    expect(r.held).toBe(`find/held/${w.entry.id}.pdf`);
+    expect(await heldFiles(w)).toEqual([`${w.entry.id}.pdf`]);
+    const [e] = await pending(w);
+    expect(e).toMatchObject({ id: r.reviewId, sourceId: w.sourceId, kind: "verification", reasons: [HELD_FILE_LOOKS_RIGHT_TEXT], cause: { kind: "acquired-file-mismatch", findEntryId: w.entry.id, held: r.held } });
+    expect(e!.heldFile).toEqual(facts(LOOKS_RIGHT));
+    expect((await readFindQueue(coreOf(), w.p.id)).get(w.entry.id)).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    // The mismatch's sentence is the one declared in the shared module.
+    expect(HELD_FILE_REASON).toBe(HELD_FILE_REVIEW_TEXT);
   });
 
   it("an entry removed meanwhile: nothing is kept (no orphaned file or review entry)", async () => {
@@ -140,12 +162,13 @@ describe("holding a file", () => {
     expect(await pending(w)).toEqual([]);
   });
 
+  for (const [what, extra] of [["did not match", {}], ["looks right (R296)", LOOKS_RIGHT]] as const)
   for (const encrypted of [false, true]) {
     for (const point of ["before-changes", "before-audit", "between-audit", "before-marker-delete"] as CrashPoint[]) {
-      it(`the held file, its review entry and the entry's line are one change: a crash at ${point} leaves all or none (${encrypted ? "sealed" : "plain"})`, async () => {
+      it(`the held file (${what}), its review entry and the entry's line are one change: a crash at ${point} leaves all or none (${encrypted ? "sealed" : "plain"})`, async () => {
         const w = await world(encrypted);
         seams.crashAt = point;
-        await expect(hold(w)).rejects.toBeInstanceOf(SimulatedCrash);
+        await expect(hold(w, extra)).rejects.toBeInstanceOf(SimulatedCrash);
         await kit.reopen();
         if (encrypted) await kit.repo.unlockProject(w.p.id, PASS);
         const files = await heldFiles(w);
@@ -192,6 +215,19 @@ describe("the researcher's decision", () => {
     });
   }
 
+  for (const encrypted of [false, true]) {
+    it(`R296 b: Use this file on a file that looks right records the check's result, match (${encrypted ? "sealed" : "plain"})`, async () => {
+      const w = await world(encrypted);
+      const r = await hold(w, LOOKS_RIGHT);
+      const out = await resolveHeldFile(coreOf(), w.p.id, r.reviewId, "attach");
+      expect(out.entry?.state).toBe("in-library");
+      const a = (await kit.repo.getSource(w.p.id, w.sourceId)).assets.find((x) => x.role === "original")!;
+      expect(a.acquired).toEqual({ ...facts().acquired, check: { result: "match", by: "title" } });
+      expect(await heldFiles(w)).toEqual([]);
+      expect((await readReviewEntries(coreOf(), coreOf().state(w.p.id)))[0]).toMatchObject({ status: "resolved", decision: "file-attached" });
+    });
+  }
+
   it("a locked project refuses a decision before anything is read", async () => {
     const w = await world(true);
     const r = await hold(w);
@@ -199,11 +235,12 @@ describe("the researcher's decision", () => {
     await expect(resolveHeldFile(coreOf(), w.p.id, r.reviewId, "attach")).rejects.toBeInstanceOf(ProjectLockedError);
   });
 
+  for (const [what, extra] of [["did not match", {}], ["looks right (R296)", LOOKS_RIGHT]] as const)
   for (const decision of ["attach", "discard"] as const) {
     for (const point of ["before-audit", "before-marker-delete"] as CrashPoint[]) {
-      it(`${decision}: a crash at ${point} leaves the decision whole or not at all`, async () => {
+      it(`${decision} (${what}): a crash at ${point} leaves the decision whole or not at all`, async () => {
         const w = await world();
-        const r = await hold(w);
+        const r = await hold(w, extra);
         seams.crashAt = point;
         await expect(resolveHeldFile(coreOf(), w.p.id, r.reviewId, decision)).rejects.toBeInstanceOf(SimulatedCrash);
         await kit.reopen();

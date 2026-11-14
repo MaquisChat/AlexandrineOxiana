@@ -72,9 +72,11 @@ export type FindReasonCode =
   // F8b (R283 a): on a "choose" entry: people of this name could not be looked up ("Try again" looks again).
   | "people-unavailable"
   // Task F11: the free copy. The rules refuse the acquiring method `free_copy` (the entry stays "record-complete"
-  // and is not tried again until the rules change); FIND_HELD_MAX files already wait ("failed", with "Try again");
-  // the researcher said the held file was not this work ("no-open-copy"); and why a held file did not match
-  // ("needs-check": one code per reason of the file check).
+  // and is not tried again until the rules change); FIND_HELD_MAX files already wait (R296 d: "record-complete",
+  // woken by a decision on a waiting file, "Try again", opening and unlocking; an entry stored "failed" with it by an
+  // earlier build is still accepted by "Try again"); the researcher said the held file was not this work
+  // ("no-open-copy"); and what the file check said of the file that waits ("needs-check": one code per reason it did
+  // not match, or R296 b "file-looks-right" — advice only).
   | "copy-not-allowed"
   | "held-full"
   | "not-this-file"
@@ -83,6 +85,7 @@ export type FindReasonCode =
   | "file-no-text"
   | "file-other-version"
   | "file-other-kind"
+  | "file-looks-right"
   // R282 e: no offer, and some free-copy services could not be reached ("no-open-copy", with "Try again"). R282 g:
   // the record was removed from the library ("no-open-copy", removal only); the rules' store part, or a missing
   // legal basis, refused the file ("record-complete", like "copy-not-allowed").

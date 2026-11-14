@@ -1,7 +1,7 @@
 // Task 47: the constants both the service and the interface used to keep their own copy of, now
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
-import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin } from "../index.js";
+import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
   it("the service's error codes, each once", () => {
@@ -85,6 +85,8 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "file-no-text",
       "file-other-version",
       "file-other-kind",
+      // R296 b: the check found the file looks right (advice; the file still waits for the researcher).
+      "file-looks-right",
       // R282 e–g: some free-copy services could not be reached; the record removed; the rules' store part refused.
       "copy-some-unreachable",
       "record-removed",
@@ -107,7 +109,11 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     // F11: the rules' refusal in words (never the raw method name); the plan's sentence for 20 held files.
     expect(FIND_REASON_TEXT["copy-not-allowed"]).toBe("This project's rules do not allow fetching free copies of works.");
     expect(FIND_REASON_TEXT["copy-not-allowed"]).not.toContain("free_copy");
-    expect(FIND_REASON_TEXT["held-full"]).toBe("20 files are already waiting for your check. Decide on some of them, then try again.");
+    // R296 d: at most 50 files wait; an entry that finds the limit reached waits too, and says so (built from the bound).
+    expect(FIND_HELD_MAX).toBe(50);
+    expect(FIND_REASON_TEXT["held-full"]).toBe("50 files are already waiting for your check. This one goes on by itself when you have decided on some of them.");
+    // R296 b: the queue entry of a file the check found to look right.
+    expect(FIND_REASON_TEXT["file-looks-right"]).toBe("This looks like the right file. Check it, then use it.");
     expect(FIND_REASON_TEXT["not-this-file"]).toBe("You said the file found was not this work.");
     expect(FIND_REASON_TEXT["no-legal-basis"]).toBe("This project's rules need a legal basis for records made from typed references. Record one in the project's Governance settings.");
     expect(Object.keys(FIND_STOPPED_TEXT).sort()).toEqual([...FIND_STOPPED_CODES].sort());

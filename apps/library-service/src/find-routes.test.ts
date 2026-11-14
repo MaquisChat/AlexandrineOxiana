@@ -12,16 +12,30 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 // The service has no undici of its own: the library's (the one its lookup client uses) sets the global dispatcher.
 import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FindRunnerClosedError, deviceDeps, rebuildIndexIfNeeded, type Deps } from "@ao/library";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FindRunnerClosedError, deviceDeps, rebuildIndexIfNeeded, type Deps, type FindEntry, type FindRunnerDeps } from "@ao/library";
 import { FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STOPPED_TEXT, findAlreadyAddedRefusal, findWorkIdRefusal, type FindEntryView, type FindQueueResponse } from "@ao/shared";
 import { serialStore } from "../../../packages/library/src/import/project-queue.js";
 import { runnerSeams } from "../../../packages/library/src/find/runner.js";
-import { appendFindEntriesIn } from "../../../packages/library/src/repo/repo.js";
+import { appendFindEntriesIn, holdMismatchedFileIn } from "../../../packages/library/src/repo/repo.js";
+import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { newId } from "@ao/core";
 import { existsSync } from "node:fs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 import type { ServiceEvent } from "./events.js";
+
+// R296 c: what the service gives its runner, seen as the runner is made (the runner itself is the library's own).
+const runnerDeps = vi.hoisted(() => [] as Array<Record<string, unknown>>);
+vi.mock("@ao/library", async (importOriginal) => {
+  const lib = await importOriginal<typeof import("@ao/library")>();
+  return {
+    ...lib,
+    createFindRunner: (d: FindRunnerDeps) => {
+      runnerDeps.push(d as unknown as Record<string, unknown>);
+      return lib.createFindRunner(d);
+    },
+  };
+});
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const PASS = "correct horse battery staple";
@@ -610,6 +624,50 @@ describe("refusals", () => {
     expect(put.status, put.body).toBe(200);
     expect((await until(async () => ((x) => (x?.state === "no-open-copy" ? x : undefined))(await entry(pid, e!.id)), "the entry to go on")).state).toBe("no-open-copy");
     expect(doiAsked()).toBeGreaterThan(before);
+  });
+
+  it("R296 c: the service's runner has the option that attaches a found file by itself off", async () => {
+    runnerDeps.length = 0;
+    await start();
+    await openNewLibrary();
+    expect(runnerDeps.length).toBeGreaterThan(0);
+    for (const d of runnerDeps) {
+      expect(d.attachBySelf).toBeUndefined();
+      expect(d.attachBySelf === true).toBe(false);
+    }
+  });
+
+  it("R296 d: a decision on a waiting file, through the review route, wakes the project's entries waiting for the limit", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const [a] = await add(pid, [LINE]);
+    const sid = (await until(async () => ((x) => (x?.state === "no-open-copy" && x.sourceId ? x : undefined))(await entry(pid, a!.id)), "the record")).sourceId!;
+    const repo = svc!.state.session!.repo;
+    const at = new Date().toISOString();
+    // A file waits for the researcher's check (held as the runner holds one) …
+    const heldFor: FindEntry = { id: newId(), projectId: pid, typed: "x y", state: "fetching", createdAt: at, updatedAt: at, attempts: 0, sourceId: sid };
+    // … and an entry waits because the limit was reached when it was looked at (as an earlier run left it).
+    const waiting: FindEntry = { id: newId(), projectId: pid, typed: "y z", state: "record-complete", reason: { code: "held-full" }, createdAt: at, updatedAt: at, attempts: 0, sourceId: sid };
+    await appendFindEntriesIn(repo, pid, [heldFor, waiting], "add");
+    const pdf = join(tmp, "held.pdf");
+    await writeFile(pdf, await buildPdf({ title: "A Different Paper Entirely", lines: ["A Different Paper Entirely"] }));
+    await holdMismatchedFileIn(repo, pid, {
+      entry: { ...heldFor, state: "needs-check", reason: { code: "file-title-absent" } },
+      sourceId: sid,
+      fromPath: pdf,
+      facts: { why: "title-absent", kind: "pdf", bytes: 1, acquired: { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at, tool: { name: "find-and-acquire", version: "0" }, access: "public" } },
+    });
+    await sleep(100);
+    expect(await entry(pid, waiting.id)).toMatchObject({ state: "record-complete", reason: { code: "held-full" } });
+    const items = (await call({ url: `/projects/${pid}/review` })).json.items as Array<{ id: string; group: string }>;
+    const item = items.find((i) => i.group === "found-file")!;
+    const r = await call({ method: "POST", url: `/review/${item.id}/held-file`, body: { projectId: pid, decision: "discard" } });
+    expect(r.status, r.body).toBe(200);
+    expect(await entry(pid, heldFor.id)).toMatchObject({ state: "no-open-copy", reason: { code: "not-this-file" } });
+    // Woken without a restart: it looked for a copy again (this world has none; the answer may come from the cache).
+    expect((await until(async () => ((x) => (x?.state === "no-open-copy" ? x : undefined))(await entry(pid, waiting.id)), "the waiting entry to go on")).state).toBe("no-open-copy");
+    expect(events.some((e) => e.type === "find.progress" && (e.data as { entryId?: string }).entryId === waiting.id && (e.data as { state?: string }).state === "looking-for-copy")).toBe(true);
   });
 
   it("a typed line never appears in the log", async () => {

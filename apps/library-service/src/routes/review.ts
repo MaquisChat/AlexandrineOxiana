@@ -163,6 +163,9 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
       throw err;
     }
     state.publishState();
+    // R296 d: a decision frees a place among the files waiting for the researcher's check: the project's entries that
+    // wait for one are woken (the same resume a save of the rules calls; they look at the limit again before asking).
+    state.resumeFind(s, projectId);
     return { decided: true };
   });
 

@@ -74,8 +74,8 @@ import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AcquiredFrom, SourceFile } from "@ao/core";
 import { kindFor, mimeFor } from "../repo/io.js";
-import { addCapturedOriginal, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
-import { HeldFileEntryGoneError, HeldFileLimitError, type HeldFileFacts } from "../repo/review.js";
+import { addCapturedOriginal, heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
+import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, type HeldFileFacts } from "../repo/review.js";
 import { SourceHasFileError } from "../repo/assets.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
@@ -267,6 +267,13 @@ export interface FindRunnerDeps {
    * entry and creates nothing; it asks again every FIND_INDEX_WAIT_MS and goes on by itself.
    */
   indexReady?: () => boolean;
+  /**
+   * R296 c: whether a found file the check matches is attached by the runner itself (as built in F11). Default OFF:
+   * every found file waits for the researcher (R296 a), the check's answer recorded as advice. Nothing in the app sets
+   * it (no setting, environment variable, route or screen); only the tests of attaching by itself turn it on. Whether
+   * the app should ever attach by itself is the owner's decision.
+   */
+  attachBySelf?: boolean;
 }
 
 /** Why the runner does nothing for a project now. */
@@ -522,6 +529,8 @@ const errName = (err: unknown) => (err instanceof Error ? err.name : "error");
 
 export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const { repo, http } = deps;
+  /** R296 c: the one reader of the option (off unless a caller sets it to true). */
+  const attachBySelf = deps.attachBySelf === true;
   const now = () => deps.now?.() ?? new Date();
   const debug = (n: string) => {
     try {
@@ -1423,6 +1432,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   /** The reasons of an entry the rules stopped (R282 f: woken when the rules are saved; "Try again" accepted). */
   const STOPPED_BY_RULES: ReadonlySet<string> = new Set([COPY_RULES.code, COPY_STORE.code, COPY_NO_BASIS.code]);
   const RECORD_REMOVED: FindReason = { code: "record-removed" };
+  /** R296 d: FIND_HELD_MAX files already wait for the researcher: the entry waits, "record-complete", asking nothing. */
+  const HELD_FULL: FindReason = { code: "held-full" };
   /** Why the rules refused a free copy's file at attach or hold (M8): the capture of `free_copy`, or its store. */
   async function copyRefusal(pid: string, err: PolicyDeniedError, prov: Provenance): Promise<FindReason> {
     if (err.action !== "store") return COPY_RULES;
@@ -1510,10 +1521,17 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    * The free-copy part of an entry's life (R277): its record made, its source without a readable file.
    *
    *   record-complete ──► looking-for-copy ──► no-open-copy   (no offer: the "elsewhere" links are kept)
-   *                                       ──► fetching ──► in-library    (the first file that passes the check is attached)
-   *                                                    ──► needs-check   (no offer passes: the FIRST failing file is held)
-   *                                                    ──► failed        (FIND_HELD_MAX files already wait: "held-full")
+   *                                       ──► fetching ──► needs-check   (R296 a: the first file the check matches is held,
+   *                                                                       "file-looks-right"; no offer matches: the FIRST
+   *                                                                       file that did not is held, "file-<why>")
+   *                                                    ──► in-library    (only with the option `attachBySelf`, off: the
+   *                                                                       first file that passes is attached)
+   *                                                    ──► record-complete / held-full (the hold found FIND_HELD_MAX
+   *                                                                       files waiting meanwhile: the file is dropped)
    *                                                    ──► no-open-copy  (no offer could be downloaded: its links kept)
+   *   record-complete / held-full (R296 d): FIND_HELD_MAX files already wait — looked at BEFORE any free-copy service
+   *   is asked or any file downloaded; the entry waits, asking nothing, until a decision on a waiting file (the service
+   *   resumes the project), "Try again", opening or unlocking wakes it.
    *
    * Nothing is asked of any free-copy service, and nothing downloaded, unless the rules allow `free_copy` (else the
    * entry stays "record-complete" with the reason "copy-not-allowed", and is looked at again only at the next open or
@@ -1576,6 +1594,16 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       if (entry.state !== "record-complete" || entry.reason) await finish({ state: "record-complete", reason: SETTINGS }, ["nextTryAt"]);
       return;
     }
+    // R296 d: no service is asked and nothing downloaded while FIND_HELD_MAX files already wait for the researcher's
+    // check (one read of the project's review file); the entry waits with its record complete, and is woken by a
+    // decision on a waiting file, "Try again", opening or unlocking. Woken while the limit is still reached, it goes
+    // back to waiting having asked nothing (and writes nothing when it was already waiting).
+    if ((await guard(r, heldWaitingCountIn(repo, pid))) >= FIND_HELD_MAX) {
+      if (!live()) return;
+      if (!(entry.state === "record-complete" && entry.reason?.code === HELD_FULL.code)) await finish({ state: "record-complete", reason: HELD_FULL }, ["nextTryAt", "offers"]);
+      return;
+    }
+    if (!live()) return;
     if (entry.state !== "looking-for-copy") {
       if (!(await finish({ state: "looking-for-copy", attempts: 0 }, ["nextTryAt", "reason", "offers"]))) return;
     }
@@ -1630,7 +1658,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     };
     look();
     const removedRecord = () => finish({ state: "no-open-copy", reason: RECORD_REMOVED }, ["nextTryAt", "offers"]);
-    let held: { path: string; offer: CopyOffer; check: FileCheckResult & { match: false } } | undefined;
+    let held: { path: string; offer: CopyOffer; check: FileCheckResult } | undefined;
     try {
       let n = 0;
       for (const offer of found.offers) {
@@ -1662,8 +1690,15 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           if (live() && gone) await removedRecord();
           return;
         }
-        if (check.match) {
+        if (check.match && attachBySelf) {
           await attach(pid, eid, r, live, version, sid, sf.source.provenance, got, offer, check.by);
+          return;
+        }
+        if (check.match) {
+          // R296 a: the file the check matched waits for the researcher like any other, with the advice that it looks
+          // right; a file kept before it that did not match is dropped (one held file per entry).
+          if (held) await fsp.rm(held.path, { force: true });
+          await holdOne(pid, eid, r, live, version, sid, sf.source.provenance, { path: got.path, offer, check });
           return;
         }
         // A file that fails the check is dropped — except the first, kept until every offer was tried (R277 b).
@@ -1740,7 +1775,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return null;
   }
 
-  /** The first file that failed the check, held for the researcher: the file, its review entry and the entry's line in ONE change. */
+  /**
+   * A found file held for the researcher (R277; R296 a: the first file the check matched, or else the first that did
+   * not): the file, its review entry and the entry's line in ONE change. The check's answer goes with it as advice
+   * (R296 b): "looks-right" (with what it matched by) or why it did not clearly match.
+   */
   async function holdOne(
     pid: string,
     eid: string,
@@ -1749,14 +1788,14 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     version: { get(): FindEntry; set(e: FindEntry): void },
     sid: string,
     prov: Provenance,
-    held: { path: string; offer: CopyOffer; check: FileCheckResult & { match: false } },
+    held: { path: string; offer: CopyOffer; check: FileCheckResult },
   ): Promise<void> {
     await inTurn(r, pid, live, async () => {
       const cur = await current(pid, eid);
       if (!cur || !sameVersion(cur, version.get())) return;
       const ev = held.check.evidence;
       const facts: HeldFileFacts = {
-        why: held.check.why,
+        ...(held.check.match ? { why: "looks-right", by: held.check.by } : { why: held.check.why }),
         kind: ev.kind,
         bytes: ev.bytes,
         ...(ev.fileDoi ? { fileDoi: ev.fileDoi } : {}),
@@ -1764,14 +1803,15 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         ...(ev.textStart ? { textStart: ev.textStart } : {}),
         acquired: acquiredFor(held.offer),
       };
-      const next = fit(evolve(cur, { state: "needs-check", reason: { code: `file-${held.check.why}` } }, ["nextTryAt", "offers"], stamp()));
+      const next = fit(evolve(cur, { state: "needs-check", reason: { code: `file-${facts.why}` } }, ["nextTryAt", "offers"], stamp()));
       try {
         await holdMismatchedFileIn(repo, pid, { entry: next, sourceId: sid, fromPath: held.path, facts });
       } catch (err) {
         if (err instanceof HeldFileEntryGoneError) return;
         if (err instanceof HeldFileLimitError) {
-          // Not kept: the entry says why, with "Try again".
-          const [w] = await write(pid, [evolve(cur, { state: "failed", reason: { code: "held-full" } }, ["nextTryAt", "offers"], stamp())], "update");
+          // R296 d: the last place was taken while this file was fetched (the limit is looked at before asking): not
+          // kept (the folder goes as the work ends); the entry waits, as one that found the limit before asking does.
+          const [w] = await write(pid, [evolve(cur, { state: "record-complete", reason: HELD_FULL }, ["nextTryAt", "offers"], stamp())], "update");
           if (w) version.set(w);
           return;
         }
@@ -1908,15 +1948,17 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       const waiting = (cur.state === "looking-up" || cur.state === "looking-for-copy") && !!cur.nextTryAt;
       // R282 e, f: "no open copy" because some services could not be reached, and an entry the rules stopped (their
-      // free-copy or store part: the rules are evaluated again), look for a copy again.
+      // free-copy or store part: the rules are evaluated again), look for a copy again; so does (R296 d) an entry
+      // waiting because FIND_HELD_MAX files wait (the limit is looked at again, before anything is asked).
       const copyAgain =
-        !!cur.sourceId && ((cur.state === "no-open-copy" && cur.reason?.code === "copy-some-unreachable") || (cur.state === "record-complete" && STOPPED_BY_RULES.has(cur.reason?.code ?? "")));
+        !!cur.sourceId &&
+        ((cur.state === "no-open-copy" && cur.reason?.code === "copy-some-unreachable") || (cur.state === "record-complete" && (STOPPED_BY_RULES.has(cur.reason?.code ?? "") || cur.reason?.code === HELD_FULL.code)));
       // R283 a: a "choose" made while people of the name could not be looked up: Try again looks again (afresh).
       const peopleUnseen = cur.state === "choose" && cur.reason?.code === "people-unavailable";
       if (cur.state !== "failed" && cur.state !== "not-found" && !waiting && !copyAgain && !peopleUnseen) throw new FindEntryStateError();
       cancelLater(projectId, entryId);
-      // F11: an entry whose record is made failed in the free copy's part ("held-full", the services unreachable, …):
-      // it looks for a copy again, never for its record.
+      // F11: an entry whose record is made failed in the free copy's part (the services unreachable, …; "held-full" as
+      // stored by builds before R296 d): it looks for a copy again, never for its record.
       if (cur.sourceId && (cur.state === "failed" || cur.state === "looking-for-copy" || copyAgain)) {
         const [next] = await write(projectId, [evolve(cur, { state: "looking-for-copy", attempts: 0 }, ["reason", "nextTryAt", "offers"], stamp())], "update");
         return next!;

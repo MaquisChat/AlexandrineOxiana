@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup, HELD_FILE_WHY_TEXT, HELD_FILE_REVIEW_TEXT, HELD_FILE_DECISIONS, DEVICE_NOTICE_KINDS, isDeviceNoticeKind } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup, HELD_FILE_WHY_TEXT, HELD_FILE_REVIEW_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, heldFileReviewText, FIND_REASON_TEXT, HELD_FILE_DECISIONS, DEVICE_NOTICE_KINDS, isDeviceNoticeKind } from "./index.js";
 
 describe("@ao/shared", () => {
   it("credential query keys (R96/R98), any case", () => {
@@ -104,9 +104,16 @@ describe("font names a researcher's own file cannot take (Task 57 M5): one list"
   });
 
   it("a held file's reasons each have one plain sentence (F11, R277 d)", () => {
-    expect(Object.keys(HELD_FILE_WHY_TEXT).sort()).toEqual(["no-text", "other-doi", "other-kind", "other-version", "title-absent"]);
+    expect(Object.keys(HELD_FILE_WHY_TEXT).sort()).toEqual(["looks-right", "no-text", "other-doi", "other-kind", "other-version", "title-absent"]);
     for (const t of Object.values(HELD_FILE_WHY_TEXT)) expect(t).toMatch(/^[A-Z].*\.$/);
     expect(HELD_FILE_REVIEW_TEXT).toBe("A file was found for this record, but it did not clearly match.");
+    // R296 b: a file the check found to look right waits all the same; its review entry and its reason say so.
+    expect(HELD_FILE_LOOKS_RIGHT_TEXT).toBe("A file was found for this record. It looks like the right file: its first page shows the record's title with the author directly below.");
+    expect(HELD_FILE_WHY_TEXT["looks-right"]).toBe("This looks like the right file. Check it, then use it.");
+    // Each held file's reason is the find queue's sentence for the same code, declared once.
+    for (const [why, t] of Object.entries(HELD_FILE_WHY_TEXT)) expect(t).toBe(FIND_REASON_TEXT[`file-${why}` as keyof typeof FIND_REASON_TEXT]);
+    expect(heldFileReviewText("looks-right")).toBe(HELD_FILE_LOOKS_RIGHT_TEXT);
+    for (const why of ["other-doi", "title-absent", "no-text", "other-version", "other-kind"] as const) expect(heldFileReviewText(why)).toBe(HELD_FILE_REVIEW_TEXT);
     expect(HELD_FILE_DECISIONS).toEqual(["attach", "discard"]);
   });
 });
