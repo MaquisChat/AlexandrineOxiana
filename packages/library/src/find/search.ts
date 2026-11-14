@@ -52,7 +52,7 @@ const DOI_RE = /^10\.\d{4,9}\/\S+$/u;
 const SEARCH_TTL_DAYS = 7;
 
 /** Typed words that need no explaining (rule 3). */
-const STOP_WORDS: ReadonlySet<string> = new Set(["and", "et", "al", "by", "the", "of", "in"]);
+export const STOP_WORDS: ReadonlySet<string> = new Set(["and", "et", "al", "by", "the", "of", "in"]);
 /** Parts of a family name that do not identify it on their own ("de" Beauvoir, "van" Gennep). */
 const PARTICLES: ReadonlySet<string> = new Set(["de", "da", "di", "du", "del", "della", "der", "den", "des", "van", "von", "la", "le", "y", "bin", "ibn", "al", "el", "ten", "ter"]);
 

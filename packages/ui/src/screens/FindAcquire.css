@@ -1,0 +1,130 @@
+/* The "Find and acquire" screen (Task F6). Colours from theme tokens only; focus rings come from base.css.
+   What was typed and what a search service sent can be very long or right-to-left: it wraps anywhere and never
+   widens the page. */
+.ao-find {
+  max-width: 64rem;
+  overflow-wrap: anywhere;
+}
+
+.ao-find__bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-4);
+  margin: var(--space-2) 0 var(--space-3);
+}
+
+.ao-find__field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-width: 100%;
+}
+
+.ao-find__field select {
+  max-width: 100%;
+}
+
+.ao-find__switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ao-find__label {
+  display: block;
+  font-weight: 700;
+  margin-bottom: var(--space-1);
+}
+
+.ao-find__box {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  resize: vertical;
+}
+
+.ao-find__note {
+  color: var(--ink-2);
+}
+
+.ao-find__queue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.ao-find__entry {
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+
+.ao-find__entry p {
+  margin: var(--space-1) 0;
+}
+
+.ao-find__typed {
+  font-weight: 700;
+}
+
+.ao-find__typed-text:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.ao-find__work {
+  font-style: italic;
+}
+
+.ao-find__reason {
+  color: var(--ink-2);
+}
+
+.ao-find__actions {
+  flex-wrap: wrap;
+}
+
+.ao-find__source:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.ao-find [aria-disabled="true"] {
+  cursor: progress;
+}
+
+/* The Choose dialog: long titles wrap, many candidates scroll inside it. */
+.ao-find__dialog {
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.ao-find__candidates {
+  list-style: none;
+  margin: var(--space-2) 0;
+  padding: 0;
+}
+
+.ao-find__candidate {
+  margin: var(--space-1) 0;
+}
+
+.ao-find__option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.ao-find__candidate-title {
+  display: block;
+  font-weight: 700;
+}
+
+.ao-find__candidate-details {
+  display: block;
+  color: var(--ink-2);
+}

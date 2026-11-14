@@ -27,6 +27,7 @@ export const PATHS = {
   transcript: "/transcript",
   reader: "/reader",
   capture: "/capture",
+  find: "/find",
   about: "/about",
 } as const;
 

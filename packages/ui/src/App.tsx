@@ -18,6 +18,7 @@ import { About } from "./screens/About";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import { CaptureRoute } from "./screens/Capture";
 import { ExtensionPairingRoute } from "./screens/ExtensionPairing";
+import { FindAcquire } from "./screens/FindAcquire";
 import { ToolsSetupRoute } from "./screens/ToolsSetup";
 import { WatchedFoldersRoute } from "./screens/WatchedFolders";
 import { ZoteroSync } from "./screens/ZoteroSync";
@@ -43,6 +44,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: isTranscriptPath, render: (loc, client) => <TranscriptRoute client={client} loc={loc} />, back: true },
   { matches: isReaderPath, render: (loc, client) => <ReaderRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.capture, render: (loc, client) => <CaptureRoute client={client} loc={loc} />, back: true },
+  { matches: (p) => p === PATHS.find, render: (loc, client) => <FindAcquire client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.extension, render: (_loc, client, port) => <ExtensionPairingRoute client={client} port={port} />, back: true },
   { matches: (p) => p === PATHS.tools, render: (loc, client) => <ToolsSetupRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.watchedFolders, render: (loc, client) => <WatchedFoldersRoute client={client} loc={loc} />, back: true },

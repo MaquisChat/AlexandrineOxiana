@@ -891,7 +891,7 @@ describe("hostile and broken answers", () => {
 
 describe("the lookup client's per-host concurrency", () => {
   it("Crossref is asked one request at a time by default", () => {
-    expect(DEFAULT_CONCURRENCY).toEqual({ "api.crossref.org": 1 });
+    expect(DEFAULT_CONCURRENCY).toEqual({ "api.crossref.org": 1, "export.arxiv.org": 1 });
   });
 
   it("a host limited to 1 never has two requests open; an unlimited host may", async () => {

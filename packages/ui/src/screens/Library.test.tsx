@@ -196,6 +196,32 @@ describe("Library screen", () => {
     expect(screen.queryByRole("link", { name: "Capture from the web" })).toBeNull();
   });
 
+  it("the Library screen links to Find and acquire beside Capture, under the same conditions (Task F6, R253)", async () => {
+    server.use(...libraryHandlers());
+    const view = renderLibrary();
+    const user = userEvent.setup();
+    const capture = await screen.findByRole("link", { name: "Capture from the web" });
+    const find = screen.getByRole("link", { name: "Find and acquire" });
+    expect(find.getAttribute("href")).toBe("/find?project=p1");
+    // Directly after Capture: the same element in the same row, next in the tab order.
+    expect(capture.nextElementSibling).toBe(find);
+    expect(find.tagName).toBe(capture.tagName);
+    expect(find.className).toBe(capture.className);
+    capture.focus();
+    await user.tab();
+    expect(document.activeElement).toBe(find);
+    // The locked project p2: no link until it is unlocked.
+    await user.click(screen.getByRole("button", { name: /Clinic interviews/ }));
+    await screen.findByRole("heading", { name: /is locked/ });
+    expect(screen.queryByRole("link", { name: "Find and acquire" })).toBeNull();
+    view.unmount();
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" };
+    server.use(...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    await screen.findByRole("link", { name: "Governance and records" });
+    expect(screen.queryByRole("link", { name: "Find and acquire" })).toBeNull();
+  });
+
   it("a read-only library offers no new project", async () => {
     server.use(...libraryHandlers({ current: { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" } }));
     renderLibrary({ libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" });
