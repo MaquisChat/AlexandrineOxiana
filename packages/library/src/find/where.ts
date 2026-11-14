@@ -10,7 +10,8 @@
  *      original host) → `https://<the rest>/login?url=`;
  *   3. `go.openathens.net/redirector/<domain>?url=` (UNVERIFIED against a real institution) → that redirector;
  *   4. a query with `url_ver=Z39.88-2004`, `ctx_ver=`, `rft_id=` or an `rft.` key (an OpenURL resolver) → its origin
- *      and path (a `;jsessionid=…` in the path is cut).
+ *      and path, every path parameter (`;…` in any segment, as `;jsessionid=…`) dropped (R328 b); a path one of whose
+ *      segments looks like a session's key (16 or more characters of hex or base64url alone, or `(S(…))`) is refused.
  * A link is refused, with a code the service says in words (`YOUR_LIBRARY_DERIVE_TEXT`), when it is over
  * LIBRARY_LINK_MAX characters, holds a control character or a space (outside the spaces and line ends around it, which
  * a paste brings), cannot be read as an address, is not https, holds a user name or password, or names its host by a
@@ -44,7 +45,7 @@ import type { OfferLink } from "./types.js";
 /** How the researcher's library builds its links. `base` is always an https address this module built. */
 export type LibraryAccess = { kind: "ezproxy-login"; base: string } | { kind: "openathens"; base: string } | { kind: "openurl"; base: string };
 /** Why a pasted link gives no address. */
-export type DeriveRefusal = "not-https" | "userinfo" | "too-long" | "unreadable" | "bad-host" | "not-library";
+export type DeriveRefusal = "not-https" | "userinfo" | "too-long" | "unreadable" | "bad-host" | "not-library" | "session-key";
 
 /** The longest link read, and the longest address produced. */
 export const LIBRARY_LINK_MAX = 4096;
@@ -86,6 +87,13 @@ const addressOk = (u: URL): boolean => hostOk(u.hostname) && u.port !== "0";
 
 /** `https://<host>` as URL keeps it: lower case, punycode, a port only when not 443. */
 const authorityOf = (u: URL): string => u.host;
+
+/**
+ * R328 b: a path segment that looks like a session's key — 16 or more characters of hex or base64url alone (letters,
+ * digits, `-`, `_`; hex is a part of it), or ASP.NET's `(S(…))`.
+ */
+const SESSION_SEGMENT = /^(?:[A-Za-z0-9_-]{16,}|\(S\(.*\)\))$/u;
+const holdsSessionKey = (path: string): boolean => path.split("/").some((seg) => SESSION_SEGMENT.test(seg));
 
 /** The labels of an EZproxy hyphenated first label, or null when it does not read as a host with dots. */
 function hyphenHost(label: string): string[] | null {
@@ -150,8 +158,12 @@ export function deriveLibraryAccessWhy(link: unknown): { access: LibraryAccess }
   }
   // 4. An OpenURL resolver.
   if (q.get("url_ver") === "Z39.88-2004" || q.has("ctx_ver") || keys.some((k) => k === "rft_id" || k.startsWith("rft."))) {
-    const path = u.pathname.split(";")[0] || "/";
-    const base = `https://${authorityOf(u)}${path}`;
+    const path = u.pathname
+      .split("/")
+      .map((seg) => seg.split(";")[0])
+      .join("/");
+    if (holdsSessionKey(path)) return { refused: "session-key" };
+    const base = `https://${authorityOf(u)}${path || "/"}`;
     if (base.length <= LIBRARY_BASE_MAX && isLibraryAccess({ kind: "openurl", base })) return { access: { kind: "openurl", base } };
     return { refused: "not-library" };
   }
@@ -190,7 +202,7 @@ export function isLibraryAccess(v: unknown): v is LibraryAccess {
       return !!m && hostOk(m[1]!);
     }
     case "openurl":
-      return u.search === "" && u.hash === "" && !base.includes("?") && !base.includes("#") && !u.pathname.includes(";") && base === `https://${authorityOf(u)}${u.pathname}`;
+      return u.search === "" && u.hash === "" && !base.includes("?") && !base.includes("#") && !u.pathname.includes(";") && !holdsSessionKey(u.pathname) && base === `https://${authorityOf(u)}${u.pathname}`;
     default:
       return false;
   }
@@ -200,6 +212,19 @@ export function isLibraryAccess(v: unknown): v is LibraryAccess {
 export function libraryAccessHost(a: LibraryAccess): string {
   try {
     return new URL(a.base).host;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * What the derive sentence names (R328 b): the host (and port, when not 443) of the library's address, and for a link
+ * resolver, whose address keeps its path, the path as well.
+ */
+export function libraryAccessPlace(a: LibraryAccess): string {
+  try {
+    const u = new URL(a.base);
+    return a.kind === "openurl" ? `${u.host}${u.pathname}` : u.host;
   } catch {
     return "";
   }

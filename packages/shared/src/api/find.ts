@@ -500,7 +500,7 @@ export interface YourLibraryDeriveRequest {
 }
 export interface YourLibraryDeriveResponse {
   access: LibraryAccess | null;
-  /** On success "Your library's address: <host> (<kind>)"; otherwise why the link cannot be used. Never the link. */
+  /** On success "Your library's address: <host> (<kind>)" (a resolver: "<host><path>"); otherwise why the link cannot be used. Never the link. */
   sentence: string;
 }
 /** `POST …/library/start`: the library's address for the work, and the one-time ticket (32 hex). */
@@ -528,7 +528,7 @@ export const WHERE_TO_GET_IT_MAX = 12;
 export const WHERE_TO_GET_IT_URL_MAX = 2048;
 
 /** Why a pasted link gives no address (the library's `DeriveRefusal`), each with its sentence. */
-export const YOUR_LIBRARY_DERIVE_REFUSALS = ["not-https", "userinfo", "too-long", "unreadable", "bad-host", "not-library"] as const;
+export const YOUR_LIBRARY_DERIVE_REFUSALS = ["not-https", "userinfo", "too-long", "unreadable", "bad-host", "not-library", "session-key"] as const;
 export type YourLibraryDeriveRefusal = (typeof YOUR_LIBRARY_DERIVE_REFUSALS)[number];
 export const YOUR_LIBRARY_DERIVE_TEXT: Record<YourLibraryDeriveRefusal, string> = {
   "not-https": "Only a link that starts with https:// can be used. Paste one you reached by signing in through your library.",
@@ -537,8 +537,13 @@ export const YOUR_LIBRARY_DERIVE_TEXT: Record<YourLibraryDeriveRefusal, string> 
   unreadable: "That is not a link the app can read. Copy the whole address from your browser and paste it again.",
   "bad-host": "That link's address cannot be used: it needs a full host name, not a number or a single word.",
   "not-library": "That link does not go through a library. Paste one you reached by signing in through your library.",
+  /** R328 b: a link resolver's path holding what looks like a session's key. */
+  "session-key": "That link holds what looks like a session's key in its address. Paste the link of your library's own search page instead.",
 };
-/** The derive sentence for an address worked out (the plan's F18 words): the host and the kind, never the link. */
+/**
+ * The derive sentence for an address worked out (the plan's F18 words): the host and the kind, never the link; for a
+ * link resolver, whose address keeps its path, `host` is the host AND the path (R328 b).
+ */
 export const yourLibraryAddressSentence = (host: string, kind: LibraryAccessKind): string => `Your library's address: ${host} (${LIBRARY_ACCESS_KIND_TEXT[kind]})`;
 
 /** The pause's refusal: "Ready in N seconds." in whole seconds, rounded up by the caller ("Ready in 1 second."). */

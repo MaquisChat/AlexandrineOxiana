@@ -11,7 +11,7 @@
  *   POST /projects/:id/find/:eid/library/cancel  no body → FindEntryView
  *
  * The pasted link is read and dropped: it is never stored, logged, put in an error, or repeated in an answer (only the
- * worked-out address's host and kind are said). The PUT never trusts the page: an address is accepted only in the form
+ * worked-out address's host — and a link resolver's path — and kind are said). The PUT never trusts the page: an address is accepted only in the form
  * `deriveLibraryAccess` gives (`isLibraryAccess`), the catalogue address only as `catalogueTemplateOk` allows; a
  * refusal names the field, never what was sent.
  *
@@ -38,7 +38,7 @@ import {
   catalogueTemplateOk,
   deriveLibraryAccessWhy,
   isLibraryAccess,
-  libraryAccessHost,
+  libraryAccessPlace,
   readFindQueueOf,
   readYourLibrary,
   writeYourLibrary,
@@ -147,7 +147,7 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
     // The link is read here and dropped: only the address worked out from it (or a refusal's code) goes on.
     const r = deriveLibraryAccessWhy(b.link);
     if ("refused" in r) return { access: null, sentence: YOUR_LIBRARY_DERIVE_TEXT[r.refused] };
-    return { access: r.access, sentence: yourLibraryAddressSentence(libraryAccessHost(r.access), r.access.kind) };
+    return { access: r.access, sentence: yourLibraryAddressSentence(libraryAccessPlace(r.access), r.access.kind) };
   });
 
   // ------------------------------------------------------------------------------------------------------------

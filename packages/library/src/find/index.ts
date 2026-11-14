@@ -106,6 +106,7 @@ export {
   deriveLibraryAccessWhy,
   isLibraryAccess,
   libraryAccessHost,
+  libraryAccessPlace,
   libraryAddressFor,
   whereToGetIt,
 } from "./where.js";

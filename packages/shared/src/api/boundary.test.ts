@@ -198,6 +198,9 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect(libraryReadyIn(12)).toBe("Ready in 12 seconds.");
     expect(libraryReadyIn(1)).toBe("Ready in 1 second.");
     expect(FIND_LIBRARY_TEXT.heldFull).toBe("50 files are already waiting for your check. Decide on some of them, then try again.");
+    // R328 b: the resolver's sentence names host and path; a session's key in a link's path is refused in words.
+    expect(yourLibraryAddressSentence("r.example.edu/openurl", "openurl")).toBe("Your library's address: r.example.edu/openurl (link resolver)");
+    expect(YOUR_LIBRARY_DERIVE_TEXT["session-key"]).toBe("That link holds what looks like a session's key in its address. Paste the link of your library's own search page instead.");
     expect(YOUR_LIBRARY_DERIVE_TEXT["not-library"]).toBe("That link does not go through a library. Paste one you reached by signing in through your library.");
     expect(Object.keys(YOUR_LIBRARY_DERIVE_TEXT).sort()).toEqual([...YOUR_LIBRARY_DERIVE_REFUSALS].sort());
     for (const t of [...Object.values(YOUR_LIBRARY_DERIVE_TEXT), ...Object.values(YOUR_LIBRARY_TEXT), ...Object.values(FIND_LIBRARY_TEXT)]) expect(t).toMatch(/^[A-Z0-9“].*\.$/u);

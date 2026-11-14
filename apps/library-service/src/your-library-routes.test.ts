@@ -266,6 +266,8 @@ describe("the settings", () => {
       [{ name: "", access: { kind: "openurl", base: `https://${LIB_HOST}/login?url=` } }, YOUR_LIBRARY_TEXT.access],
       [{ name: "", access: { kind: "openathens", base: `https://${LIB_HOST}/redirector/x.edu?url=` } }, YOUR_LIBRARY_TEXT.access],
       [{ name: "", access: LINK }, YOUR_LIBRARY_TEXT.access],
+      // R328 b: a stored resolver's address is checked by the derive's rule (no session's key in its path).
+      [{ name: "", access: { kind: "openurl", base: `https://${LIB_HOST}/(S(${SESSION}))/openurl` } }, YOUR_LIBRARY_TEXT.access],
       [{ name: "", access: null, catalogueSearch: `http://${LIB_HOST}/?q={query}` }, YOUR_LIBRARY_TEXT.catalogueSearch],
       [{ name: "", access: null, catalogueSearch: `https://{query}.${LIB_HOST}/` }, YOUR_LIBRARY_TEXT.catalogueSearch],
       [{ name: "", access: null, catalogueSearch: `https://${LIB_HOST}/?q={query}&r={query}` }, YOUR_LIBRARY_TEXT.catalogueSearch],
@@ -307,7 +309,8 @@ describe("derive: the address from one pasted link", () => {
     expect(r.body).not.toContain(SESSION);
     expect(r.body).not.toContain("jstor");
     const ou = await call({ method: "POST", url: "/settings/your-library/derive", body: { link: "https://resolver.example.edu/openurl?url_ver=Z39.88-2004&rft_id=x" } });
-    expect(ou.json.sentence).toBe("Your library's address: resolver.example.edu (link resolver)");
+    // R328 b: a resolver's address keeps its path, so the sentence names host AND path.
+    expect(ou.json.sentence).toBe("Your library's address: resolver.example.edu/openurl (link resolver)");
     const oa = await call({ method: "POST", url: "/settings/your-library/derive", body: { link: "https://go.openathens.net/redirector/example.edu?url=x" } });
     expect(oa.json.sentence).toBe("Your library's address: go.openathens.net (OpenAthens)");
   });
@@ -328,6 +331,9 @@ describe("derive: the address from one pasted link", () => {
       [`https://${LIB_HOST}/log\u0000in?url=${SESSION}`, "unreadable"],
       [`https://${LIB_HOST}/login ?url=${SESSION}`, "unreadable"],
       [`https://${LIB_HOST}/login?url=${SESSION}${"a".repeat(4096)}`, "too-long"],
+      // R328 b: a resolver's path holding what looks like a session's key.
+      [`https://${LIB_HOST}/(S(${SESSION}))/openurl?url_ver=Z39.88-2004`, "session-key"],
+      [`https://${LIB_HOST}/openurl/${SESSION}0123456789?url_ver=Z39.88-2004`, "session-key"],
     ];
     for (const [link, code] of cases) {
       const r = await call({ method: "POST", url: "/settings/your-library/derive", body: { link } });

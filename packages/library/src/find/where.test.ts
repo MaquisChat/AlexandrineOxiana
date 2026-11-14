@@ -14,6 +14,7 @@ import {
   deriveLibraryAccessWhy,
   isLibraryAccess,
   libraryAccessHost,
+  libraryAccessPlace,
   libraryAddressFor,
   whereToGetIt,
   type LibraryAccess,
@@ -445,5 +446,42 @@ describe("Round 2 (R328 i): Where to get it — the app's host rule, and one add
       "https://repository.example.edu/a%2Fb?q=%26",
       "https://repository.example.edu/a/b?q=&",
     ]);
+  });
+});
+
+describe("Round 2 (R328 b): a link resolver's path keeps no parameter and no session's key", () => {
+  const ou = (path: string) => `https://resolver.example.edu${path}?url_ver=Z39.88-2004&rft_id=info:doi/10.1/x`;
+  it("every path parameter is dropped, in any segment", () => {
+    expect(deriveLibraryAccess(ou("/openurl;a=1/44EX;jsessionid=x"))).toEqual(OU);
+    expect(deriveLibraryAccess(ou("/openurl/SESSION-abc;jsessionid=S"))).toEqual({ kind: "openurl", base: "https://resolver.example.edu/openurl/SESSION-abc" });
+  });
+  it("a path holding what looks like a session's key is refused with its own code", () => {
+    for (const path of [
+      "/(S(lit3py55t21z5v55vlm25s55))/openurl",
+      "/openurl/(S(x))",
+      "/openurl/0123456789abcdef",
+      "/openurl/0123456789ABCDEF0123",
+      "/openurl/aGVsbG8td29ybGQtMTIz",
+      "/openurl/ab_cd-efgh_ijkl-mn",
+      "/0123456789abcdef0123;jsessionid=x/openurl",
+    ]) {
+      expect(deriveLibraryAccessWhy(ou(path)), path).toEqual({ refused: "session-key" });
+    }
+  });
+  it("an ordinary resolver's path is kept", () => {
+    for (const path of ["/openurl", "/sfxlcl41", "/discovery/openurl", "/openurl/44EX", "/sfx_local"]) {
+      expect(deriveLibraryAccess(ou(path)), path).toEqual({ kind: "openurl", base: `https://resolver.example.edu${path}` });
+    }
+  });
+  it("a stored address of that kind is checked by the same rule", () => {
+    expect(isLibraryAccess({ kind: "openurl", base: "https://resolver.example.edu/(S(lit3py55t21z5v55vlm25s55))/openurl" })).toBe(false);
+    expect(isLibraryAccess({ kind: "openurl", base: "https://resolver.example.edu/openurl/0123456789abcdef" })).toBe(false);
+    expect(isLibraryAccess({ kind: "openurl", base: "https://resolver.example.edu/discovery/openurl" })).toBe(true);
+  });
+  it("what the sentence names: host and path for a resolver, the host alone otherwise", () => {
+    expect(libraryAccessPlace(OU)).toBe("resolver.example.edu/openurl/44EX");
+    expect(libraryAccessPlace({ kind: "openurl", base: "https://resolver.example.edu:444/" })).toBe("resolver.example.edu:444/");
+    expect(libraryAccessPlace(EZ)).toBe("ezproxy.lib.example.edu");
+    expect(libraryAccessPlace(OA)).toBe("go.openathens.net");
   });
 });
