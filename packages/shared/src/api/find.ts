@@ -11,6 +11,9 @@
  *   POST   /projects/:id/find/:eid/retry         → FindEntryView
  *   DELETE /projects/:id/find/:eid               → FindRemoveResponse
  *   GET    /projects/:id/find/:eid/elsewhere     → FindElsewhereResponse (null: not known, or that project is locked now)
+ *   GET    /projects/:id/find/:eid/options       → FindOptionsResponse (F8: the entry's lists, for its dialog)
+ *   POST   /projects/:id/find/:eid/person        FindPersonRequest → FindEntryView (F8: "choose-person" only)
+ *   POST   /projects/:id/find/:eid/works         FindWorksRequest → FindWorksResponse (F8: "choose-works" only)
  *   GET    /find/screen                          → FindScreenSettings
  *   PUT    /find/screen                          FindScreenSettings → FindScreenSettings
  *
@@ -87,7 +90,22 @@ export const FIND_STOPPED_TEXT: Record<FindStoppedCode, string> = {
 };
 
 /** The `reason` of the refusals the screen may act on. */
-export const FIND_REFUSAL_REASONS = ["read-only", "locked", "queue-full", "queue-unreadable", "entry-state", "index-not-ready", "closed", "stopped", "unknown-candidate", "line"] as const;
+export const FIND_REFUSAL_REASONS = [
+  "read-only",
+  "locked",
+  "queue-full",
+  "queue-unreadable",
+  "entry-state",
+  "index-not-ready",
+  "closed",
+  "stopped",
+  "unknown-candidate",
+  "line",
+  // Task F8 (R267): a person or a work not among the entry's own; a work already added from the entry.
+  "unknown-person",
+  "unknown-work",
+  "already-added",
+] as const;
 export type FindRefusalReason = (typeof FIND_REFUSAL_REASONS)[number];
 
 /** The routes' own sentences (besides FIND_REASON_TEXT and FIND_STOPPED_TEXT). */
@@ -108,7 +126,32 @@ export const FIND_ROUTE_TEXT = {
   tooManyLines: "At most 50 lines can be added at once. Nothing was added.",
   /** Elsewhere: the other project was locked meanwhile (the screen's sentence). */
   elsewhereLocked: "Already in another project that is locked now.",
+  // Task F8 (R267): an author alone.
+  /** The person pressed is not one of the people offered for THIS entry (400). */
+  unknownPerson: "That is not one of the people offered for this entry. Nothing was changed.",
+  /** A work ticked is not one of the works offered for THIS entry (400). */
+  unknownWork: "That is not one of the works offered for this entry. Nothing was added.",
+  /** `personId` is not OpenAlex's form of a person's id (400). */
+  personId: "That is not a person's id that OpenAlex gives. Nothing was changed.",
+  noWorks: "Tick at least one work. Nothing was added.",
+  tooManyWorks: "At most 50 works can be added at once. Nothing was added.",
 } as const;
+
+/** Work `n` (counting from 1, in the request) was already added from this entry: the whole tick is refused (409). Never its title. */
+export const findAlreadyAddedRefusal = (n: number): string => `Work ${n} was already added from this entry. Nothing was added.`;
+/** Work `n` (counting from 1, in the request) is not in OpenAlex's form of a work's id (400). */
+export const findWorkIdRefusal = (n: number): string => `Work ${n} is not a work's id that OpenAlex gives. Nothing was added.`;
+
+/** Task F8: at most this many people are kept and listed for an entry. */
+export const FIND_PEOPLE_MAX = 20;
+/** Task F8: at most this many works of a person are kept for choosing (fewer when they would not fit the queue's line). */
+export const FIND_PERSON_WORKS_MAX = 200;
+/** Task F8: one tick adds at most this many works. */
+export const FIND_CHOOSE_WORKS_MAX = 50;
+/** Task F8: said under "Choose the person" when `morePeople` is set (the plan's words). */
+export const FIND_MORE_PEOPLE_TEXT = "More people have this name; add a word from a title to narrow it";
+/** Task F8: said under "Choose works" when `moreWorks` is set. */
+export const FIND_MORE_WORKS_TEXT = "Only this person's newest works are listed; add a word from a title to find an older one.";
 
 /** Line `n` (counting from 1) is outside the bounds: the whole add is refused. Never the line's text. */
 export const findLineRefusal = (n: number): string => `Line ${n} must be 2 to 500 characters (after spaces at either end are left out). Nothing was added.`;
@@ -177,7 +220,10 @@ export type FindOfferLink = {
 
 export type FindMatch = { method: "find-match" | "find-chosen"; confidence: number };
 
-/** An entry as the screen gets it: the library's FindEntry without `people` and `works`, at most 10 candidates. */
+/**
+ * An entry as the screen gets it: the library's FindEntry without `people`, `works` and `added` (their counts instead,
+ * F8), at most 10 candidates.
+ */
 export interface FindEntryView {
   id: string;
   projectId: string;
@@ -198,6 +244,48 @@ export interface FindEntryView {
   nextTryAt?: string;
   parentId?: string;
   offers?: FindOfferLink[];
+  /**
+   * Task F8 (R267): an author's entry carries COUNTS, never its lists (those come from `GET …/:eid/options`): how many
+   * people ("choose-person"), how many works and how many of them were added ("choose-works"), and whether more exist
+   * than are kept. Absent when the entry holds no such list.
+   */
+  peopleCount?: number;
+  worksCount?: number;
+  addedCount?: number;
+  morePeople?: true;
+  moreWorks?: true;
+}
+
+/** Task F8: a person an author's name may mean (OpenAlex's author `A<digits>`). Every string is outside text. */
+export type FindPersonCandidate = { id: string; name: string; affiliation?: string; worksCount: number; sampleTitles: string[] };
+
+/** Task F8: a work of the chosen person, as kept for choosing; `added` when this entry already made an entry of it. */
+export type FindPersonWork = FindWorkCandidate & { added?: true };
+
+/** Task F8: `GET /projects/:id/find/:eid/options` — the entry's lists, for the dialog that opens on it. */
+export interface FindOptionsResponse {
+  /** "choose": the works offered (at most 10). */
+  candidates?: FindWorkCandidate[];
+  /** "choose-person": the people (at most 20). */
+  people?: FindPersonCandidate[];
+  /** "choose-works": the person's works, newest first (at most 200). */
+  works?: FindPersonWork[];
+}
+
+/** Task F8: `POST /projects/:id/find/:eid/person`. */
+export interface FindPersonRequest {
+  personId: string;
+}
+
+/** Task F8: `POST /projects/:id/find/:eid/works` (1 to 50 ids). */
+export interface FindWorksRequest {
+  workIds: string[];
+}
+
+/** Task F8: the entries made, one per work, and the author's entry as it now is (still "choose-works"). */
+export interface FindWorksResponse {
+  added: FindEntryView[];
+  entry: FindEntryView;
 }
 
 export interface FindQueueResponse {
