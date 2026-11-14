@@ -1,0 +1,82 @@
+{
+ "meta": {
+  "count": 1,
+  "db_response_time_ms": 0,
+  "page": 1,
+  "per_page": 5,
+  "groups_count": null
+ },
+ "results": [
+  {
+   "id": "https://openalex.org/W3021418509",
+   "doi": "https://doi.org/10.1007/978-1-349-62397-6_10",
+   "title": "Deep Play: Notes on the Balinese Cockfight",
+   "display_name": "Deep Play: Notes on the Balinese Cockfight",
+   "publication_year": 2000,
+   "publication_date": "2000-01-01",
+   "ids": {
+    "openalex": "https://openalex.org/W3021418509",
+    "doi": "https://doi.org/10.1007/978-1-349-62397-6_10",
+    "mag": "3021418509"
+   },
+   "language": "en",
+   "primary_location": {
+    "id": "doi:10.1007/978-1-349-62397-6_10",
+    "doi": "https://doi.org/10.1007/978-1-349-62397-6_10",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1007/978-1-349-62397-6_10",
+    "pdf_url": null,
+    "source": {
+     "id": "https://openalex.org/S4306463717",
+     "display_name": "Palgrave Macmillan US eBooks",
+     "issn_l": null,
+     "issn": null,
+     "is_oa": false,
+     "is_in_doaj": false,
+     "is_core": false,
+     "listed_in": [],
+     "host_organization": "https://openalex.org/P4310319703",
+     "host_organization_name": "Palgrave Macmillan",
+     "host_organization_lineage": [
+      "https://openalex.org/P4310319703",
+      "https://openalex.org/P4310319965"
+     ],
+     "host_organization_lineage_names": [
+      "Palgrave Macmillan",
+      "Springer Nature"
+     ],
+     "type": "ebook platform"
+    },
+    "license": null,
+    "license_id": null,
+    "version": "publishedVersion",
+    "is_accepted": true,
+    "is_published": true,
+    "raw_source_name": "Culture and Politics",
+    "raw_type": "book-chapter"
+   },
+   "type": "book-chapter",
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5110330477",
+      "display_name": "Clifford Geertz",
+      "orcid": null,
+      "observed_orcids": []
+     },
+     "raw_author_name": "Clifford Geertz"
+    }
+   ],
+   "biblio": {
+    "volume": null,
+    "issue": null,
+    "first_page": "175",
+    "last_page": "201"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  }
+ ],
+ "group_by": []
+}

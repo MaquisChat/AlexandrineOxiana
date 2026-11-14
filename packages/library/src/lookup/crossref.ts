@@ -91,7 +91,7 @@ export function mapCrossref(w: CrossrefWork, doi: string): LookupResult | null {
   const issued = datePartsToEdtf(w.issued?.["date-parts"]) ?? datePartsToEdtf(w.published?.["date-parts"]);
   const container = clean(w["container-title"]?.[0] ?? "");
   return {
-    title: sub ? `${title}: ${sub}` : title,
+    title: sub ? (/[:?!]$/.test(title.trimEnd()) ? `${title.trimEnd()} ${sub}` : `${title}: ${sub}`) : title,
     creators: [...people(w.author, "author"), ...people(w.editor, "editor"), ...people(w.translator, "translator")],
     ...(issued ? { issued } : {}),
     ...(container ? { container } : {}),
