@@ -6,7 +6,7 @@
  * tab stop over the checkboxes: the arrow keys move between works, Space ticks), so a list of 200 works never puts 200
  * stops between the filters and the buttons.
  */
-import type { FindChosenPerson, FindEntryView, FindPersonWork, FindSourceType } from "@ao/shared";
+import { FIND_MORE_WORKS_TEXT, type FindChosenPerson, type FindEntryView, type FindPersonWork, type FindSourceType } from "@ao/shared";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Profiler, useState } from "react";
@@ -277,10 +277,10 @@ describe("ChooseWorksDialog", () => {
     let dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("Reading this person's works…")).toBeTruthy();
     expect(within(dialog).getByRole("heading", { level: 2 }).textContent).toBe("Choose works for “David Stark”");
-    expect(dialog.textContent).toContain("More works exist than are listed here.");
+    expect(dialog.textContent).toContain(FIND_MORE_WORKS_TEXT);
     view.unmount();
     const second = await openIt();
-    expect(second.dialog.textContent).not.toContain("More works exist than are listed here.");
+    expect(second.dialog.textContent).not.toContain(FIND_MORE_WORKS_TEXT);
     second.view.unmount();
     const onAdd = vi.fn();
     const busy = await openIt({ onAdd, busy: true, error: "The queue holds 500 entries. Remove some finished ones first." });
@@ -291,6 +291,38 @@ describe("ChooseWorksDialog", () => {
     await busy.user.click(add);
     expect(onAdd).not.toHaveBeenCalled();
     expect(within(dialog).getByRole("alert").textContent).toBe("The queue holds 500 entries. Remove some finished ones first.");
+  });
+
+  it("round 2 (R281 f): the dialog's name holds the person's affiliation; words match whole words of the title and where published, never the year; Article covers journal articles and preprints", async () => {
+    const works = [
+      ...WORKS,
+      work({ id: "W9001", title: "Testing in pandemic times", issued: "2020-01-01", type: "preprint", container: "SocArXiv" }),
+      work({ id: "W9002", title: "Worthiness and its tests", issued: "2002-01-01", container: "Sociological Forum" }),
+    ];
+    const { user, dialog } = await openIt({ works, person: { name: "David Stark", affiliation: "Columbia University", subjects: [] } });
+    // M3: the accessible name tells two people of one name apart.
+    expect(screen.getByRole("dialog", { name: "Choose works by David Stark (Columbia University)" })).toBe(dialog);
+    // M5: whole words; a year typed as a word matches nothing by its year.
+    const words = within(dialog).getByRole("textbox", { name: "Filter by words" });
+    await user.type(words, "worth");
+    expect(boxes(dialog).map(titleOf)).toEqual(["For What It’s Worth", "The Sense of Dissonance: Accounts of Worth in Economic Life"]);
+    await user.clear(words);
+    await user.type(words, "2020");
+    expect(boxes(dialog)).toHaveLength(0);
+    await user.clear(words);
+    await user.type(words, "tes");
+    expect(boxes(dialog)).toHaveLength(0);
+    await user.clear(words);
+    await user.type(words, "tests");
+    expect(boxes(dialog).map(titleOf)).toEqual(["Worthiness and its tests"]);
+    await user.clear(words);
+    await user.type(words, "sociological forum");
+    expect(boxes(dialog).map(titleOf)).toEqual(["Worthiness and its tests"]);
+    await user.clear(words);
+    // M8: a preprint is an article.
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: "Kind" }), "Article");
+    expect(boxes(dialog).map(titleOf)).toContain("Testing in pandemic times");
+    expect(boxes(dialog)).toHaveLength(6);
   });
 
   it("200 works stay usable: rendered once, a tick re-renders quickly (measured), and the list is still one stop", async () => {

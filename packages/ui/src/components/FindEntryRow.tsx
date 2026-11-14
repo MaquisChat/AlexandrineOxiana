@@ -56,6 +56,8 @@ export const FIND_TEXT = {
   noMatches: "No possible matches.",
   // Task F9 (R267, R271): an author alone.
   authorLead: "Author: ",
+  /** R281 a: an entry made from an author's entry is a work the app added, not a line typed. */
+  workLead: "Work: ",
   /** The plan's words (FIND_MORE_PEOPLE_TEXT), as a sentence. */
   morePeople: `${FIND_MORE_PEOPLE_TEXT}.`,
   noWorks: "No works are listed for this person.",
@@ -70,7 +72,35 @@ const countOf = (v: unknown): number | undefined => (typeof v === "number" && Nu
  * An author's entry (F8, R267): one that holds people or works — its counts say so — or asks for a person or works.
  * It stays one after the person is chosen (while the works are fetched, and after works were added from it).
  */
-export const isAuthorEntry = (e: FindEntryView): boolean => e.state === "choose-person" || e.state === "choose-works" || countOf(e.peopleCount) !== undefined || countOf(e.worksCount) !== undefined;
+export const isAuthorEntry = (e: FindEntryView): boolean =>
+  e.state === "choose-person" || e.state === "choose-works" || (e.state !== "choose" && (countOf(e.peopleCount) !== undefined || countOf(e.worksCount) !== undefined));
+
+/**
+ * R279 (F8b's contract, built against the ruling): an entry in "choose" whose words may also name an author carries
+ * `authorOffer`. Read defensively: a later build's shape that is not this one counts as no offer.
+ */
+export type FindAuthorOffer = { peopleCount: number; morePeople?: true };
+export function authorOfferOf(e: FindEntryView): FindAuthorOffer | undefined {
+  const o = (e as FindEntryView & { authorOffer?: unknown }).authorOffer;
+  if (e.state !== "choose" || !o || typeof o !== "object") return undefined;
+  const k = countOf((o as Record<string, unknown>).peopleCount);
+  if (k === undefined) return undefined;
+  return { peopleCount: k, ...((o as Record<string, unknown>).morePeople === true ? { morePeople: true as const } : {}) };
+}
+
+/**
+ * How an entry is named in a button's name and in the status region (R281 a). What the researcher typed is in
+ * quotation marks ("“Bourdieu, Distinction”"); an entry made from an author's entry is named by the line the app built
+ * for it, WITHOUT those marks, and where it came from: "Game Changer, Vaan (added from “David Stark”)", or "… (added
+ * from an author's works)" when that entry is gone. `origin`: undefined for an ordinary entry; the author's typed text,
+ * or null, for an added one. `max`: cut the entry's own line to this many characters (names: 80).
+ */
+export function entryLabel(e: FindEntryView, origin: string | null | undefined, max?: number): Words {
+  const own = typeof e.typed === "string" ? (max === undefined ? e.typed : shortTyped(e.typed)) : "";
+  if (origin === undefined || typeof e.parentId !== "string") return own ? ["“", { user: own }, "”"] : [];
+  const from: Words = typeof origin === "string" ? [" (added from “", { user: max === undefined ? origin : shortTyped(origin) }, "”)"] : [" (added from an author's works)"];
+  return own ? [{ user: own }, ...from] : from;
+}
 
 /** An entry this build can show: a known state and text that was typed (else "needs a newer version", R258 M6). */
 export const entryKnown = (e: FindEntryView): boolean => isKnownState(e.state) && typeof e.typed === "string";
@@ -109,6 +139,8 @@ export function stateWords(e: FindEntryView, ctx: { stopped?: boolean; place?: F
       return [ctx.stopped ? FIND_TEXT.notNow : STATE_WORDS["looking-up"]];
     case "choose": {
       const k = candidatesOf(e).length;
+      // R279 d: the words may also name an author.
+      if (authorOfferOf(e)) return [`${k === 1 ? "1 possible match" : `${k} possible matches`}, or an author of this name`];
       if (k === 0) return [FIND_TEXT.noMatches];
       return [k === 1 ? "1 possible match" : `${k} possible matches`];
     }
@@ -156,7 +188,7 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
   switch (e.state) {
     case "choose":
       // Nothing to choose from: no dialog (R258 M5).
-      if (candidatesOf(e).length > 0) out.push("choose");
+      if (candidatesOf(e).length > 0 || authorOfferOf(e)) out.push("choose");
       break;
     case "maybe-duplicate":
       out.push("same", "different");
@@ -252,6 +284,9 @@ function Matched({ c }: { c: FindWorkCandidate }) {
 
 function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, stopped = false, error, origin }: FindEntryRowProps) {
   const short = shortTyped(e.typed);
+  /** An entry made from an author's entry (R281 a): named as a work, with where it came from. */
+  const added = typeof e.parentId === "string" && origin !== undefined;
+  const label = wordsText(entryLabel(e, origin, 80));
   const known = entryKnown(e);
   const words = stateWords(e, { stopped, place });
   const work = known ? matchedWork(e) : undefined;
@@ -264,6 +299,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
       <p className="ao-find__typed">
         <span tabIndex={-1} data-entry-text="" className="ao-find__typed-text">
           {author && <span className="ao-find__lead">{FIND_TEXT.authorLead}</span>}
+          {known && added && !author && <span className="ao-find__lead">{FIND_TEXT.workLead}</span>}
           {typeof e.typed === "string" && <UserText>{e.typed}</UserText>}
         </span>
       </p>
@@ -307,7 +343,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
               type="button"
               className={kind === "remove" ? "ao-find__remove" : undefined}
               data-act={kind}
-              aria-label={short ? `${text}: “${short}”` : text}
+              aria-label={short ? `${text}: ${label}` : text}
               disabled={readOnly && !READS.has(kind)}
               aria-disabled={working || waiting || undefined}
               aria-busy={working || undefined}

@@ -21,7 +21,7 @@
  * while they are read the dialog says so; a read that failed is the service's sentence (`loadError`). The parent sends
  * the request and owns `busy` and `error` (the service's sentence for a refusal; the ticks stay, nothing else changes).
  */
-import { FIND_CHOOSE_WORKS_MAX, type FindChosenPerson, type FindEntryView, type FindPersonWork } from "@ao/shared";
+import { FIND_CHOOSE_WORKS_MAX, FIND_MORE_WORKS_TEXT, type FindChosenPerson, type FindEntryView, type FindPersonWork } from "@ao/shared";
 import { memo, useCallback, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { kindWords, wellFormedCandidate, wherePublished, yearOf } from "../api/find";
 import { DialogShell } from "./ReasonDialog";
@@ -30,7 +30,8 @@ import { UserText } from "./UserText";
 export const CHOOSE_WORKS_TEXT = {
   loading: "Reading this person's works…",
   describe: "Tick the works to add. Each becomes an entry of its own in the queue, and its record is made for you.",
-  more: "More works exist than are listed here.",
+  /** The shared module's sentence (R281: where @ao/shared has one, it is used). */
+  more: FIND_MORE_WORKS_TEXT,
   limit: `Choose at most ${FIND_CHOOSE_WORKS_MAX} at a time.`,
   none: "No works are listed for this person.",
   added: "Added",
@@ -39,11 +40,19 @@ export const CHOOSE_WORKS_TEXT = {
 export const KIND_FILTERS = ["Any", "Article", "Book", "Chapter", "Other"] as const;
 type KindFilter = (typeof KIND_FILTERS)[number];
 
-/** Which filter a work's kind falls under: a journal article is "Article", a book "Book", a chapter "Chapter"; anything else "Other". */
-const kindFilterOf = (type: string): Exclude<KindFilter, "Any"> => (type === "article-journal" ? "Article" : type === "book" ? "Book" : type === "chapter" ? "Chapter" : "Other");
+/**
+ * Which filter a work's kind falls under (R281 f, M8): "Article" is an article of a journal, magazine or newspaper
+ * (the library's one kind `article-journal`, to which OpenAlex's article, review, letter and editorial map — it has no
+ * kind of its own for a magazine or newspaper article) and a preprint (`preprint`); "Book" a book; "Chapter" a chapter;
+ * every other kind "Other".
+ */
+const ARTICLE_KINDS: ReadonlySet<string> = new Set(["article-journal", "preprint"]);
+const kindFilterOf = (type: string): Exclude<KindFilter, "Any"> => (ARTICLE_KINDS.has(type) ? "Article" : type === "book" ? "Book" : type === "chapter" ? "Chapter" : "Other");
 
 /** Lower case, without accents: "Économie" and "economie" are the same words to the filter. */
 const fold = (s: string) => s.normalize("NFD").replace(/\p{M}+/gu, "").toLowerCase();
+/** The whole words of a text, folded (R281 f, M5: the filter matches whole words). */
+const wordsOf = (s: string): string[] => fold(s).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
 
 const yearNumber = (s: string): number | undefined => (/^\s*\d{1,4}\s*$/.test(s) ? Number(s) : undefined);
 
@@ -69,8 +78,8 @@ interface Item {
   w: FindPersonWork;
   year: number | undefined;
   kind: Exclude<KindFilter, "Any">;
-  /** Folded text the words filter looks in: title, where published, year. */
-  hay: string;
+  /** The whole words the words filter looks for: the title's and where it was published (not the year: it has its own filters). */
+  hay: ReadonlySet<string>;
 }
 
 /** One work of the list. Memoised: a tick re-renders only the work ticked and the one that loses the tab stop. */
@@ -126,7 +135,7 @@ export function ChooseWorksDialog({ entry, works, person, loadError, onAdd, onCl
     () =>
       works?.filter(wellFormedCandidate).map((w) => {
         const y = yearOf(w.issued);
-        return { w, year: y === undefined ? undefined : Number(y), kind: kindFilterOf(w.type), hay: fold([w.title, wherePublished(w) ?? "", y ?? ""].join(" ")) };
+        return { w, year: y === undefined ? undefined : Number(y), kind: kindFilterOf(w.type), hay: new Set(wordsOf(`${w.title} ${wherePublished(w) ?? ""}`)) };
       }),
     [works],
   );
@@ -144,12 +153,12 @@ export function ChooseWorksDialog({ entry, works, person, loadError, onAdd, onCl
     if (!items) return [];
     const lo = yearNumber(from);
     const hi = yearNumber(to);
-    const want = fold(words).split(/\s+/).filter(Boolean);
+    const want = wordsOf(words);
     return items.filter((it) => {
       if (lo !== undefined && (it.year === undefined || it.year < lo)) return false;
       if (hi !== undefined && (it.year === undefined || it.year > hi)) return false;
       if (kind !== "Any" && it.kind !== kind) return false;
-      return want.every((x) => it.hay.includes(x));
+      return want.every((x) => it.hay.has(x));
     });
   }, [items, from, to, kind, words]);
 
@@ -206,6 +215,13 @@ export function ChooseWorksDialog({ entry, works, person, loadError, onAdd, onCl
         {person && typeof person.name === "string" ? (
           <>
             Choose works by <UserText>{person.name}</UserText>
+            {affiliationLine.length > 0 && (
+              <>
+                {" ("}
+                <UserText>{affiliationLine[0]}</UserText>
+                {")"}
+              </>
+            )}
           </>
         ) : (
           <>
@@ -213,13 +229,8 @@ export function ChooseWorksDialog({ entry, works, person, loadError, onAdd, onCl
           </>
         )}
       </h2>
-      {(affiliationLine.length > 0 || subjects.length > 0) && (
+      {subjects.length > 0 && (
         <p className="ao-find__person">
-          {affiliationLine.length > 0 && (
-            <span className="ao-find__line">
-              <UserText>{affiliationLine[0]}</UserText>
-            </span>
-          )}
           {subjects.length > 0 && (
             <span className="ao-find__line">
               Works on: <UserText>{subjects.join(", ")}</UserText>

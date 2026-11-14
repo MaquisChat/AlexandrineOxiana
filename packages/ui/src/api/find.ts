@@ -64,11 +64,19 @@ export function findApi(client: ApiClient) {
     person: (pid: string, eid: string, personId: string) => r<FindEntryView>("POST", `${entryPath(pid, eid)}/person`, { body: { personId } }),
     /** POST …/:eid/works: the works ticked (1 to 50): an entry for each, and the author's entry as it now is. */
     works: (pid: string, eid: string, workIds: string[]) => r<FindWorksResponse>("POST", `${entryPath(pid, eid)}/works`, { body: { workIds: [...workIds] } }),
+    /**
+     * POST …/:eid/author (no body; Ruling R279, Task F8b): an entry in "choose" that may also name an author is turned
+     * into the author's flow ("choose-person", or "looking-up" then "choose-works"); 409 for an entry without the offer.
+     */
+    author: (pid: string, eid: string) => r<FindEntryView>("POST", `${entryPath(pid, eid)}/author`),
     /** GET /find/screen: this computer's remembered switch, project and collection. */
     screen: () => r<FindScreenSettings>("GET", "/find/screen"),
     /** PUT /find/screen: the whole settings (the handler refuses any other key). */
-    putScreen: (s: FindScreenSettings) =>
-      r<FindScreenSettings>("PUT", "/find/screen", { body: { checkEverything: s.checkEverything, ...(s.projectId ? { projectId: s.projectId } : {}), ...(s.collectionId ? { collectionId: s.collectionId } : {}) } }),
+    putScreen: (s: FindScreenSettings, opts: { signal?: AbortSignal } = {}) =>
+      r<FindScreenSettings>("PUT", "/find/screen", {
+        body: { checkEverything: s.checkEverything, ...(s.projectId ? { projectId: s.projectId } : {}), ...(s.collectionId ? { collectionId: s.collectionId } : {}) },
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      }),
   };
 }
 
