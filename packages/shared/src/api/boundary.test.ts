@@ -281,6 +281,7 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     expect(FIND_REFUSAL_REASONS).toContain("browser-not-paired");
     expect(FIND_BROWSER_TEXT).toEqual({
       notPaired: "No browser is paired with this app. Pair the browser extension first (Browser extension, in the settings). Nothing was changed.",
+      extensionOnly: "This is the browser extension's route.",
       listBody: "This request takes an empty object ({}) and nothing else.",
       notWaiting: "That work is no longer waiting for a PDF from your browser. Nothing was kept.",
       page: "This tab's address is not an https address, so the app does not take a file from it. The work is still waiting.",

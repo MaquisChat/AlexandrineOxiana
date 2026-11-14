@@ -5,8 +5,9 @@
  * `{ error: { code, message, reason? } }` with absolute paths scrubbed (errors.ts).
  *
  * Request bodies are JSON, at most 1 MB, except: `POST /capture/browser` (32 MB: a full-page
- * screenshot and the page's HTML) and `POST /projects/:id/sources/:sid/transcripts` (10 MB: a
- * whole edited transcript).
+ * screenshot and the page's HTML), `POST /projects/:id/sources/:sid/transcripts` (10 MB: a
+ * whole edited transcript) and `POST /find/browser/file/:ticket` (Task F20a, R348: a PDF's bytes,
+ * `application/pdf`, streamed to a file — that type is parsed by that route only).
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { appConfigDir, deviceDeps, deviceNoticesIdle, type Deps, type LocationEnv, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
@@ -36,6 +37,7 @@ import { registerFind } from "./routes/find.js";
 import { registerZoteroSync } from "./routes/zotero-sync.js";
 import { registerSearchSettings } from "./routes/search-settings.js";
 import { registerYourLibrary } from "./routes/your-library.js";
+import { emptyBrowserInbox, registerFindBrowser } from "./routes/find-browser.js";
 
 export type { ServiceWorker, WorkerProvider } from "./state.js";
 
@@ -84,6 +86,8 @@ export interface ServiceOptions {
   watchLocationEnv?: LocationEnv;
   /** Test seam (NODE_ENV=test or VITEST only, R47): the watched-folder routes' time limit for a folder's file calls. */
   watchFsTimeoutMs?: number;
+  /** Test seam (NODE_ENV=test or VITEST only, R47): how long the browser's PDF may send no byte (default FIND_BROWSER_STALL_MS; Task F20a). */
+  browserStallMs?: number;
 }
 
 export interface LibraryService {
@@ -107,8 +111,12 @@ declare module "fastify" {
   }
 }
 
-/** What the extension token may reach (R96, R111). */
-const EXTENSION_ROUTES = new Set(["POST /capture/browser", "POST /capture/browser/links", "GET /projects"]);
+/**
+ * What the extension token may reach (R96, R111). Task F20a (R348 f): the list of works waiting for a PDF from the
+ * browser and the PDF itself — both with the paired Origin (neither is a no-Origin route; the list is a POST so that
+ * Chrome sends it).
+ */
+const EXTENSION_ROUTES = new Set(["POST /capture/browser", "POST /capture/browser/links", "GET /projects", "POST /find/browser/waiting", "POST /find/browser/file/:ticket"]);
 /**
  * Extension routes reached without an Origin header (R111): Chrome sends none on a GET to a host the
  * extension has permission for. Only this read; every POST needs the paired origin.
@@ -124,6 +132,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   const deps = opts.deps ?? deviceDeps(appConfigDir());
   // A notice raised while this device's identity was read (Task 68) is written before the first state.
   await deviceNoticesIdle();
+  // Task F20a (R348 f iv): what a browser's PDF left in its inbox (a crash, a kill) goes at the start.
+  await emptyBrowserInbox(deps.appConfigDir);
   const app = Fastify({
     bodyLimit: BODY_LIMIT,
     // Never echo request bodies or query strings into the log.
@@ -300,7 +310,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   });
   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
 
-  const ctx = { state, pairing, token: opts.token, folderGrants, ...(opts.watchLocationEnv ? { watchLocationEnv: opts.watchLocationEnv } : {}), ...(opts.watchFsTimeoutMs !== undefined ? { watchFsTimeoutMs: opts.watchFsTimeoutMs } : {}), ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}), ...(opts.readerPdfMaxBytes !== undefined ? { readerPdfMaxBytes: opts.readerPdfMaxBytes } : {}), ...(opts.documentBeforeRead ? { documentBeforeRead: opts.documentBeforeRead } : {}) };
+  const ctx = { state, pairing, token: opts.token, folderGrants, ...(opts.watchLocationEnv ? { watchLocationEnv: opts.watchLocationEnv } : {}), ...(opts.watchFsTimeoutMs !== undefined ? { watchFsTimeoutMs: opts.watchFsTimeoutMs } : {}), ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}), ...(opts.readerPdfMaxBytes !== undefined ? { readerPdfMaxBytes: opts.readerPdfMaxBytes } : {}), ...(opts.documentBeforeRead ? { documentBeforeRead: opts.documentBeforeRead } : {}), ...(opts.browserStallMs !== undefined ? { browserStallMs: opts.browserStallMs } : {}) };
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
@@ -323,6 +333,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerZoteroSync(app, ctx);
   registerSearchSettings(app, ctx);
   registerYourLibrary(app, ctx);
+  registerFindBrowser(app, ctx);
 
   let closing: Promise<void> | undefined;
   return {
@@ -363,7 +374,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 }
 
-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; folderGrants: FolderGrants; watchLocationEnv?: LocationEnv; watchFsTimeoutMs?: number; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void>; readerPdfMaxBytes?: number; documentBeforeRead?: () => Promise<void> };
+export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; folderGrants: FolderGrants; watchLocationEnv?: LocationEnv; watchFsTimeoutMs?: number; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void>; readerPdfMaxBytes?: number; documentBeforeRead?: () => Promise<void>; browserStallMs?: number };
 
 /** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
 function decodedPath(path: string): string {
@@ -388,13 +399,25 @@ export function isMediaPath(url: string): boolean {
 }
 
 /**
+ * Whether a request path is (any spelling of) the browser's file address (Task F20a, R348 f): `/find/browser/file/…`,
+ * decoded, any case, repeated or backward slashes — its ticket is a credential carried in the path.
+ */
+function isBrowserFilePath(path: string): boolean {
+  const file = /^[/\\]+find[/\\]+browser[/\\]+file(?:[/\\]|$)/iu;
+  return file.test(path) || file.test(decodedPath(path));
+}
+
+/**
  * The path of a request as logged (R135): no query string; any spelling of a media address
- * becomes `/media/[redacted]`; and anywhere else, a run of 40 or more ticket characters (no id of
- * ours is that long) is replaced too, so a ticket sent to another route is not logged either.
+ * becomes `/media/[redacted]`, and of the browser's file address `/find/browser/file/[redacted]`
+ * (Task F20a: its ticket, 32 hex, is shorter than the run below); and anywhere else, a run of 40 or
+ * more ticket characters (no id of ours is that long) is replaced too, so a ticket sent to another
+ * route is not logged either.
  */
 export function logUrl(url: string): string {
   const path = url.split("?")[0] ?? "";
   if (isMediaPath(path)) return "/media/[redacted]";
+  if (isBrowserFilePath(path)) return "/find/browser/file/[redacted]";
   // An encoded separator could split a ticket into halves shorter than 40: then every run of 16 or
   // more ticket characters is replaced (review M4).
   const run = /%2f|%5c/i.test(path) ? /[A-Za-z0-9_-]{16,}/g : /[A-Za-z0-9_-]{40,}/g;

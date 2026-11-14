@@ -25,6 +25,11 @@
  * Task F18c (R345): such an entry's view also says whether "Open it here and fetch the PDF" may start at its links
  * (`linkStart: true`, only when it carries links), a file of a link's start not kept says so (`library.lastFileFrom`),
  * and an entry waiting in the sign-in window opened at one of its links says so (`windowStart: "link"`).
+ *
+ * Task F20a (R348 e): `browserStart: true` on an entry offered a library start while a browser extension is paired;
+ * `waitingIn: "browser"` on an entry waiting in the researcher's own browser; `library.lastFileFrom: "browser"` for a
+ * file sent from the browser and not kept. All worked out here (the runner's memory and the pairings), never by the
+ * screen.
  */
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { isId } from "@ao/core";
@@ -121,7 +126,7 @@ true satisfies Same<FindStoppedFor["code"] | "index-needs-rebuild", FindStoppedC
 true satisfies Same<WorkCandidate, FindWorkCandidate>;
 true satisfies Same<OfferLink, FindOfferLink>;
 true satisfies Same<LibraryMatch, FindMatch>;
-true satisfies Same<Omit<FindEntry, "people" | "works" | "removed" | "returnTo"> & { peopleCount?: number; worksCount?: number; addedCount?: number; authorOffer?: FindAuthorOffer; library?: FindLibraryChance; linkStart?: true; windowStart?: "link" }, FindEntryView>;
+true satisfies Same<Omit<FindEntry, "people" | "works" | "removed" | "returnTo"> & { peopleCount?: number; worksCount?: number; addedCount?: number; authorOffer?: FindAuthorOffer; library?: FindLibraryChance; linkStart?: true; windowStart?: "link"; browserStart?: true; waitingIn?: "browser" }, FindEntryView>;
 true satisfies Same<PersonCandidate, FindPersonCandidate>;
 true satisfies Same<typeof LIBRARY_PEOPLE_MAX, typeof FIND_PEOPLE_MAX>;
 true satisfies Same<typeof LIBRARY_PERSON_WORKS_MAX, typeof FIND_PERSON_WORKS_MAX>;
@@ -161,6 +166,10 @@ export function entryView(e: FindEntry, added?: ReadonlySet<string>, library?: L
     ...(library?.linkStart && offers?.length ? { linkStart: true as const } : {}),
     // F18c (R345 e): a wait in the sign-in window opened at one of the entry's links.
     ...(e.state === "waiting-sign-in" && library?.windowStart === "link" ? { windowStart: "link" as const } : {}),
+    // F20a (R348 e): "Get through my library in my own browser" — only beside a library start that is offered.
+    ...(library?.browserStart && library.library?.canStart === true ? { browserStart: true as const } : {}),
+    // F20a (R348 e): a wait in the researcher's own browser.
+    ...(e.state === "waiting-sign-in" && library?.waitingIn === "browser" ? { waitingIn: "browser" as const } : {}),
   };
 }
 
@@ -168,7 +177,7 @@ export function entryView(e: FindEntry, added?: ReadonlySet<string>, library?: L
  * Task F15: the parts of an entry's view about the library (only for an entry resting as R324 a names). F18c: whether
  * a link start may be made (`linkStart`); for an entry waiting in the sign-in window, only `windowStart` (no offers).
  */
-export type LibraryParts = { offers: OfferLink[]; library?: FindLibraryChance; linkStart?: true; windowStart?: "link" };
+export type LibraryParts = { offers: OfferLink[]; library?: FindLibraryChance; linkStart?: true; windowStart?: "link"; browserStart?: true; waitingIn?: "browser" };
 
 /**
  * Task F15 (R324 a, d): for the entries of a project's queue, the library parts of their views: "Where to get it" (the
@@ -176,13 +185,20 @@ export type LibraryParts = { offers: OfferLink[]; library?: FindLibraryChance; l
  * from the addresses) and `library` (whether "Get through my library" may start, or "no-library"). "Your library" is
  * read anew; the rules, each resting entry's record and the runner's work are asked by the library's
  * `libraryChancesOf` — through the runner's `libraryChances`, which reads a record only when its file changed (R328 e).
- * A project that cannot be read now gives nothing (the view is then as before).
+ * A project that cannot be read now gives nothing (the view is then as before). F20a (R348 e): `paired` — at least one
+ * browser extension is paired (the caller's `pairing.list()`), for `browserStart`.
  */
-export async function libraryPartsOf(appConfigDir: string, s: Session, projectId: string, entries: Iterable<FindEntry>): Promise<Map<string, LibraryParts>> {
+export async function libraryPartsOf(appConfigDir: string, s: Session, projectId: string, entries: Iterable<FindEntry>, o: { paired: boolean }): Promise<Map<string, LibraryParts>> {
   const out = new Map<string, LibraryParts>();
   const list = [...entries];
-  // F18c (R345 e): an entry waiting in the sign-in window opened at one of its links (the runner's memory only).
-  for (const e of list) if (e.state === "waiting-sign-in" && s.find?.windowStartOf(projectId, e.id) === "link") out.set(e.id, { offers: [], windowStart: "link" });
+  // F18c (R345 e): an entry waiting in the sign-in window opened at one of its links; F20a (R348 e): or waiting in the
+  // researcher's own browser (the runner's memory only).
+  for (const e of list) {
+    if (e.state !== "waiting-sign-in") continue;
+    const link = s.find?.windowStartOf(projectId, e.id) === "link";
+    const browser = s.find?.waitingIn(projectId, e.id) === "browser";
+    if (link || browser) out.set(e.id, { offers: [], ...(link ? { windowStart: "link" as const } : {}), ...(browser ? { waitingIn: "browser" as const } : {}) });
+  }
   if (!list.some(restsForLibrary)) return out;
   const { settings } = await readYourLibrary(appConfigDir);
   const runner = s.find;
@@ -199,8 +215,8 @@ export async function libraryPartsOf(appConfigDir: string, s: Session, projectId
     const offers = whereToGetIt(c.work, settings, byId.get(id)?.offers ?? []);
     const chance: FindLibraryChance | undefined = c.chance === "yes" ? { canStart: true } : c.chance === "no-library" ? { canStart: false, reason: "no-library" } : undefined;
     // Task F17 (R329 g): what became of the last file handed over that could not be held (the runner's memory only).
-    const library: FindLibraryChance | undefined = c.lastFile ? { ...(chance ?? { canStart: false, reason: "not-offered" }), lastFile: c.lastFile, ...(c.lastFileFrom === "link" ? { lastFileFrom: "link" as const } : {}) } : chance;
-    out.set(id, { offers, ...(library ? { library } : {}), ...(c.link ? { linkStart: true as const } : {}) });
+    const library: FindLibraryChance | undefined = c.lastFile ? { ...(chance ?? { canStart: false, reason: "not-offered" }), lastFile: c.lastFile, ...(c.lastFileFrom ? { lastFileFrom: c.lastFileFrom } : {}) } : chance;
+    out.set(id, { offers, ...(library ? { library } : {}), ...(c.link ? { linkStart: true as const } : {}), ...(c.chance === "yes" && o.paired ? { browserStart: true as const } : {}) });
   }
   return out;
 }
@@ -343,7 +359,7 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     reply.header("Cache-Control", "no-store");
     const added = addedOf(q.entries.values());
     // F15 (R324 a, d): "Where to get it" and whether a start through the library is offered, for the resting entries.
-    const library = await libraryPartsOf(state.deps.appConfigDir, s, projectId, q.entries.values());
+    const library = await libraryPartsOf(state.deps.appConfigDir, s, projectId, q.entries.values(), { paired: ctx.pairing.list().length > 0 });
     return {
       entries: [...q.entries.values()].map((e) => entryView(e, added.get(e.id), library.get(e.id))),
       checkEverything: screen.checkEverything,

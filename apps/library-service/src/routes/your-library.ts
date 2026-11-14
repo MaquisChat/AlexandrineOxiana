@@ -11,6 +11,8 @@
  *   POST /projects/:id/find/:eid/library/start   no body → { url, ticket }
  *   POST /projects/:id/find/:eid/library/cancel  no body → FindEntryView
  *   POST /projects/:id/find/:eid/link/start      { url } → { url, ticket } (Task F18c, R345: one of the entry's links)
+ *   POST /projects/:id/find/:eid/browser/start   no body → { url } (Task F20a, R348 d: the library's start, in the
+ *                                                researcher's own browser; no ticket to the page)
  *
  * The pasted link is read and dropped: it is never stored, logged, put in an error, or repeated in an answer (only the
  * worked-out address's host — and a link resolver's path — and kind are said). The PUT never trusts the page: an address is accepted only in the form
@@ -28,6 +30,12 @@
  * It is here, beside the library's start, because it IS that start — the same caller checks, bounds, refusals' form
  * and `said` — with a body of exactly `{ url }`. The link is never logged, audited, put in an event or an error, or
  * repeated in a refusal; the answer gives it back as the service holds it, with the ticket (`no-store`).
+ *
+ * Task F20a (R348 d): "Get through my library in my own browser" — the library's start once more (the runner's
+ * `browserStart`, its third entry point), here for the same reason. It differs in two things: it is refused when no
+ * browser extension is paired (409 "browser-not-paired"; the route context's `pairing`, `list()` at the press), and
+ * its answer is the address ONLY: the ticket stays in the service, for the paired extension's list
+ * (routes/find-browser.ts). Its file is handed over by the extension's route, never by the shell's line.
  */
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { isId } from "@ao/core";
@@ -59,6 +67,7 @@ import {
   type YourLibrary as YourLibraryHere,
 } from "@ao/library";
 import {
+  FIND_BROWSER_TEXT,
   FIND_LIBRARY_TEXT,
   FIND_LINK_TEXT,
   FIND_ROUTE_TEXT,
@@ -70,6 +79,7 @@ import {
   YOUR_LIBRARY_TEST_DOI,
   YOUR_LIBRARY_TEXT,
   yourLibraryAddressSentence,
+  type FindBrowserStartResponse,
   type FindEntryView,
   type FindLibraryStartResponse,
   type LibraryAccess,
@@ -136,7 +146,9 @@ function linkShapeOk(url: string): boolean {
 }
 
 export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
-  const { state } = ctx;
+  const { state, pairing } = ctx;
+  /** F20a (R348 d, e): at least one browser extension is paired, now. */
+  const paired = () => pairing.list().length > 0;
   const limit = { bodyLimit: YOUR_LIBRARY_BODY_MAX_BYTES };
   const uiOnly = (req: FastifyRequest) => {
     if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", YOUR_LIBRARY_TEXT.uiOnly);
@@ -284,6 +296,25 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
     return { url: got.url, ticket: got.ticket };
   });
 
+  /**
+   * F20a (R348 d): "Get through my library in my own browser" — the library's start (every refusal of it), refused also
+   * when no extension is paired; the answer is the library's address for the work and nothing else (the ticket stays
+   * in the service). Every answer, its refusals included, is no-store.
+   */
+  app.post("/projects/:id/find/:eid/browser/start", limit, async (req, reply): Promise<FindBrowserStartResponse> => {
+    reply.header("Cache-Control", "no-store");
+    const { s, runner, projectId, entryId } = addressed(req);
+    if (!paired()) throw new ApiError(409, "CONFLICT", FIND_BROWSER_TEXT.notPaired, "browser-not-paired");
+    const { settings } = await readYourLibrary(state.deps.appConfigDir);
+    let got: { url: string };
+    try {
+      got = await runner.browserStart(projectId, entryId, settings.access);
+    } catch (err) {
+      throw said(s, projectId, err);
+    }
+    return { url: got.url };
+  });
+
   app.post("/projects/:id/find/:eid/library/cancel", limit, async (req, reply): Promise<FindEntryView> => {
     const { s, runner, projectId, entryId } = addressed(req);
     let back;
@@ -294,7 +325,7 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
     }
     reply.header("Cache-Control", "no-store");
     const q = await readFindQueueOf(s.repo, projectId).catch(() => null);
-    const parts = await libraryPartsOf(state.deps.appConfigDir, s, projectId, q ? q.entries.values() : [back]);
+    const parts = await libraryPartsOf(state.deps.appConfigDir, s, projectId, q ? q.entries.values() : [back], { paired: paired() });
     return entryView(back, undefined, parts.get(back.id));
   });
 }
@@ -311,7 +342,8 @@ export function libraryFileHandler(state: ServiceState): (g: FileGrant) => Promi
   return async (g) => {
     const inbox = inboxOf(state.deps.appConfigDir);
     const runner = state.session?.find;
-    const t = runner ? runner.libraryHandedOver(g.ticket) : null;
+    // F20a (R348 c): the shell's line hands over only a window's ticket; a browser's is answered as a wrong one (and stays open).
+    const t = runner ? runner.libraryHandedOver(g.ticket, "window") : null;
     if (!runner || !t) {
       await discardInboxFile(inbox, g.path);
       return;

@@ -3041,7 +3041,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   /**
    * F20a (R348 f ii, g): the tab's address a file from the browser is recorded with — https, no user name or password,
-   * at most FIND_BROWSER_PAGE_MAX as given — cleaned (no query or fragment); null for anything else.
+   * at most FIND_BROWSER_PAGE_MAX as given — cleaned (no query or fragment; "" when the cleaned address is over
+   * cleanAcquiredAddress's own bound, as for the window's); null for anything else.
    */
   function tabAddress(address: string): string | null {
     if (typeof address !== "string" || address.length > FIND_BROWSER_PAGE_MAX) return null;
@@ -3052,7 +3053,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       return null;
     }
     if (u.protocol !== "https:" || u.username !== "" || u.password !== "") return null;
-    return cleanAcquiredAddress(u.href) || null;
+    return cleanAcquiredAddress(u.href);
   }
 
   /** F17 (R329 g): why the rules refused the file at its hold, as the view says it. */
@@ -3095,7 +3096,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   ): Promise<FindHandOverEnd> {
     // F20a (R348 g): the address recorded — the window's kept one; the browser's the tab's, as the route validated it.
     const fromBrowser = mine.where === "browser";
-    let kept = mine.address;
+    let kept: string | null = mine.address;
     let held = false;
     let back: FindEntry | null = null;
     // At work until the end (R329 c): the entry stays in `handed` (`atWork`, Cancel and a resume see it there).
@@ -3112,12 +3113,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // body only, and how the path ended is said after the `finally`.)
     try {
       await (async (): Promise<void> => {
-        if (fromBrowser) kept = tabAddress(address) ?? "";
+        if (fromBrowser) kept = tabAddress(address);
         folder = join(repoLibrary(repo).root, ".tmp", folderName);
         release = holdFindTemp(folderName);
         // The address is the one this runner built at the start, never one the caller was told by anyone else. F20a
         // (R348 c, g): the side must be the one the hand-over was for; the browser's tab address must be an https one.
-        if (via !== (fromBrowser ? "browser-extension" : "sign-in-window") || (fromBrowser ? kept === "" : address !== kept)) {
+        if (via !== (fromBrowser ? "browser-extension" : "sign-in-window") || kept === null || (!fromBrowser && address !== kept)) {
           outcome = "unreadable";
           return;
         }
@@ -3172,7 +3173,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
             ...(ev.embeddedTitle ? { embeddedTitle: ev.embeddedTitle } : {}),
             ...(ev.textStart ? { textStart: ev.textStart } : {}),
             // F18c (R345 c): the method kept with the ticket — `free_copy` for a link's file (no `service`: none is known).
-            acquired: { method: mine.method, via, address: kept, at: stamp(), tool: { name: FIND_TOOL, version: VERSION }, access: "signed-in-session" },
+            acquired: { method: mine.method, via, address: kept ?? "", at: stamp(), tool: { name: FIND_TOOL, version: VERSION }, access: "signed-in-session" },
           };
           const next = fit(evolve(cur, { state: "needs-check", reason: { code: `file-${facts.why}` } }, ["returnTo", "nextTryAt", "offers"], stamp()));
           try {

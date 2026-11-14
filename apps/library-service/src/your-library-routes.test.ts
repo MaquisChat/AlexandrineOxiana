@@ -490,7 +490,7 @@ describe("the start (R324 a–c)", () => {
     expect(waiting.library).toBeUndefined();
     expect(waiting.reason).toBeUndefined();
     // The hand-over (Task F17's seam): the ticket ends, the pause starts.
-    expect(svc!.state.session!.find!.libraryHandedOver(ok.json.ticket)).toEqual({ projectId: startedP, entryId: startedE });
+    expect(svc!.state.session!.find!.libraryHandedOver(ok.json.ticket, "window")).toEqual({ projectId: startedP, entryId: startedE });
     const paused = await startFetch(p2, c.id);
     expect(paused.status).toBe(409);
     expect(paused.json.error).toMatchObject({ code: "CONFLICT", message: "Ready in 20 seconds.", reason: "library-pause" });
@@ -527,7 +527,7 @@ describe("the start (R324 a–c)", () => {
     const b = await resting(pid, { state: "no-open-copy" });
     const r = await startFetch(pid, a.id);
     expect(r.status).toBe(200);
-    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket)).toEqual({ projectId: pid, entryId: a.id });
+    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket, "window")).toEqual({ projectId: pid, entryId: a.id });
     expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
     const paused = await startFetch(pid, b.id);
@@ -561,7 +561,7 @@ describe("the start (R324 a–c)", () => {
     const honest = await until(async () => ((x) => (x.state !== "waiting-sign-in" ? x : undefined))(await view(pid, old.id)), "the old entry");
     expect(honest).toMatchObject({ state: "no-open-copy", reason: { code: "library-unfinished" } });
     expect(FIND_REASON_TEXT["library-unfinished"]).toBeTruthy();
-    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket)).toBeNull();
+    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket, "window")).toBeNull();
   });
 
   it("cancel: back to exactly what it was; a cancel of an entry not waiting is 409 in words", async () => {
@@ -576,7 +576,7 @@ describe("the start (R324 a–c)", () => {
     expect(c.status).toBe(200);
     expect(c.json).toMatchObject({ id: e.id, state: "no-open-copy", reason: { code: "copy-some-unreachable" }, library: { canStart: true } });
     expect(c.json.returnTo).toBeUndefined();
-    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket)).toBeNull();
+    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket, "window")).toBeNull();
     const again = await call({ method: "POST", url: `/projects/${pid}/find/${e.id}/library/cancel` });
     expect(again.status).toBe(409);
     expect(again.json.error).toMatchObject({ message: FIND_ROUTE_TEXT.entryState, reason: "entry-state" });
@@ -648,7 +648,7 @@ describe("the start (R324 a–c)", () => {
     const r = await startFetch(pid, e.id);
     expect(r.status).toBe(200);
     expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
-    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket)).toBeNull();
+    expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket, "window")).toBeNull();
     expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
     const back = await until(async () => ((x) => (x.state !== "waiting-sign-in" ? x : undefined))(await view(pid, e.id)), "the entry to come back");
     expect(back).toMatchObject({ state: "no-open-copy", reason: { code: "not-this-file" } });
@@ -670,7 +670,7 @@ describe("the start (R324 a–c)", () => {
     expect(s2.status).toBe(200);
     // The ticket's end: the clock moved past it; the seam finds it ended, and the entry comes back.
     vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + LIBRARY_TICKET_MS + 1000 });
-    expect(svc!.state.session!.find!.libraryHandedOver(s2.json.ticket)).toBeNull();
+    expect(svc!.state.session!.find!.libraryHandedOver(s2.json.ticket, "window")).toBeNull();
     vi.useRealTimers();
     await until(async () => ((x) => (x.state === "no-open-copy" ? x : undefined))(await view(pid, f.id)), "the entry to come back");
     // The events carried three fields each; the audit says a library fetch was started, with the method.
@@ -768,7 +768,7 @@ describe("F17 (R329): the file the shell hands over waits in the review queue", 
     const rec = await call({ url: `/projects/${pid}/sources/${e.sourceId}` });
     expect(rec.json.assets).toEqual([]);
     // The ticket ended at the hand-over, and the pause started.
-    expect(svc!.state.session!.find!.libraryHandedOver(ticket)).toBeNull();
+    expect(svc!.state.session!.find!.libraryHandedOver(ticket, "window")).toBeNull();
     const other = await resting(pid, { state: "no-open-copy" });
     expect((await startFetch(pid, other.id)).json.error.reason).toBe("library-pause");
     // The audit says the method of the hold; "Use this file" then attaches it with how it was got.
@@ -812,7 +812,7 @@ describe("F17 (R329): the file the shell hands over waits in the review queue", 
     expect(v.state).toBe("no-open-copy");
     expect(v.library).toEqual({ canStart: true, lastFile: "unreadable" });
     expect(await readFile(outside)).toEqual(before);
-    expect(svc!.state.session!.find!.libraryHandedOver(ticket)).toBeNull();
+    expect(svc!.state.session!.find!.libraryHandedOver(ticket, "window")).toBeNull();
     expect((await call({ url: `/projects/${pid}/review` })).json.items).toEqual([]);
     await nothingOfThePath();
   });
@@ -965,7 +965,7 @@ describe("F17 (R329): the file the shell hands over waits in the review queue", 
       // The existing cancel returns it exactly.
       const c = await call({ method: "POST", url: `/projects/${pid}/find/${e.id}/library/cancel` });
       expect(c.json).toMatchObject({ state: "no-open-copy", reason: { code: "not-this-file" } });
-      expect(svc!.state.session!.find!.libraryHandedOver(ok.json.ticket)).toBeNull();
+      expect(svc!.state.session!.find!.libraryHandedOver(ok.json.ticket, "window")).toBeNull();
       // An unknown entry: 404. The extension's token: 403.
       expect((await linkStart(pid, newId(), { url: PUBLISHER })).status).toBe(404);
       const token = await pairExtension();
@@ -991,7 +991,7 @@ describe("F17 (R329): the file the shell hands over waits in the review queue", 
       const f = await resting(pid, { state: "no-open-copy" });
       // The pause after a hand-over.
       const first = await linkStart(pid, e.id, { url: PUBLISHER });
-      expect(svc!.state.session!.find!.libraryHandedOver(first.json.ticket)).not.toBeNull();
+      expect(svc!.state.session!.find!.libraryHandedOver(first.json.ticket, "window")).not.toBeNull();
       const paused = await linkStart(pid, f.id, { url: PUBLISHER });
       expect(paused.json.error).toMatchObject({ message: "Ready in 20 seconds.", reason: "library-pause" });
       vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + LIBRARY_PAUSE_MS });

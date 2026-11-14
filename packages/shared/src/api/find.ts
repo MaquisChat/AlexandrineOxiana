@@ -782,6 +782,8 @@ export type FindBrowserRefusal = (typeof FIND_BROWSER_REFUSALS)[number];
 export const FIND_BROWSER_TEXT = {
   /** 409 "browser-not-paired" (the app's start). */
   notPaired: "No browser is paired with this app. Pair the browser extension first (Browser extension, in the settings). Nothing was changed.",
+  /** 403: the extension's routes reached with the desktop app's token. */
+  extensionOnly: "This is the browser extension's route.",
   /** 400: the list asked with anything but `{}`. */
   listBody: "This request takes an empty object ({}) and nothing else.",
   /** 404 "browser-not-waiting": the same answer for every wrong ticket. */
