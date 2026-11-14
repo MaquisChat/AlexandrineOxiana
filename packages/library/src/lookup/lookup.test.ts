@@ -13,7 +13,7 @@ import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary } from "../library.js";
 import { openTestRepo } from "../repo/testing.js";
-import { datePartsToEdtf } from "./crossref.js";
+import { datePartsToEdtf, mapCrossref } from "./crossref.js";
 import { mapLocMods } from "./loc.js";
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, HttpClient, LookupHttpError, USER_AGENT } from "./http.js";
 import { lookupContextFor, lookupDoi, lookupIsbn, searchTitle, type LookupContext } from "./index.js";
@@ -374,6 +374,14 @@ describe("cache and transport hardening", () => {
     expect(datePartsToEdtf([[2020, null, 5]])).toBe("2020");
     expect(datePartsToEdtf([[2020, 7, null]])).toBe("2020-07");
     expect(datePartsToEdtf([[null]])).toBeUndefined();
+  });
+
+  it("Crossref title and subtitle: a title ending in a colon, a question mark or an exclamation mark is joined with a space (R272)", () => {
+    const titleOf = (title: string, subtitle: string) => mapCrossref({ title: [title], subtitle: [subtitle] }, "10.1/x")?.title;
+    expect(titleOf("Deep Play:", "Notes on the Balinese Cockfight")).toBe("Deep Play: Notes on the Balinese Cockfight");
+    expect(titleOf("What Is History?", "A Reply")).toBe("What Is History? A Reply");
+    expect(titleOf("Stop!", "A Warning")).toBe("Stop! A Warning");
+    expect(titleOf("Deep Play", "Notes on the Balinese Cockfight")).toBe("Deep Play: Notes on the Balinese Cockfight");
   });
 });
 
