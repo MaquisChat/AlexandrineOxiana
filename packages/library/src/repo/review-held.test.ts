@@ -381,3 +381,101 @@ describe("backups (A2)", () => {
     expect(out.entry?.state).toBe("in-library");
   });
 });
+
+describe("Task F17 (R329 e, f): a file handed over through the researcher's library waits like a found copy", () => {
+  /** Free copies not allowed; the library allowed. */
+  const LIB_ONLY = `${OPEN_GOV}acquireMethods: [reference_lookup, library_access]\n`;
+  /** Free copies allowed; the library not. */
+  const FREE_ONLY = `${OPEN_GOV}acquireMethods: [reference_lookup, free_copy]\n`;
+  const LIB_ADDRESS = "https://ezproxy.lib.example.edu/login";
+  const viaLibrary: Partial<HeldFileFacts> = {
+    acquired: { method: "library_access", via: "sign-in-window", address: LIB_ADDRESS, at: NOW, tool: { name: "find-and-acquire", version: "0.1.0" }, access: "signed-in-session" },
+  };
+  async function worldUnder(gov: string): Promise<World> {
+    const p = await makeProject(kit, gov);
+    const sf = await addSource(kit, p, { title: TITLE, creators: [{ role: "author", family: "Okafor", given: "Amara" }] });
+    const entry: FindEntry = { id: newId(), projectId: p.id, typed: "Okafor, Rivers and Memory", state: "waiting-sign-in", returnTo: { state: "no-open-copy" }, createdAt: NOW, updatedAt: NOW, attempts: 0, sourceId: sf.source.id };
+    await appendFindEntries(coreOf(), p.id, [entry], "add");
+    const pdf = await scratchFile(kit, "lib.pdf", await buildPdf({ title: TITLE, lines: [TITLE, "Amara Okafor"] }));
+    return { p, sourceId: sf.source.id, entry, pdf };
+  }
+  const opOf = (e: { details?: unknown }) => (e.details as { op?: string } | undefined)?.op;
+  const setRules = async (p: Project, yaml: string) => {
+    const g = await kit.repo.getGovernance(p.id);
+    await kit.repo.setGovernance(p.id, yaml, { baseSha256: g.sha256, reason: "test: the rules changed meanwhile" });
+  };
+  const holdHanded = (w: World, extra: Partial<HeldFileFacts> = {}) =>
+    holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w, extra.why), sourceId: w.sourceId, fromPath: w.pdf, facts: facts({ ...viaLibrary, ...extra }), handedOver: true });
+
+  it("the hold evaluates library_access for a file the library gave (not free_copy), and the audit says the method", async () => {
+    const w = await worldUnder(LIB_ONLY);
+    await holdHanded(w);
+    expect(await heldFiles(w)).toHaveLength(1);
+    const ev = (await auditEvents(kit, w.p)).filter((e) => opOf(e) === "project.find.hold");
+    // One change: its capture (of library_access) and its store, each audited.
+    expect(ev.map((e) => e.action)).toEqual(["capture", "store"]);
+    for (const e of ev) expect(e.details).toMatchObject({ method: "library_access" });
+    expect(JSON.stringify(ev)).not.toContain("ezproxy");
+  });
+
+  it("a found free copy's hold says its method too (free_copy)", async () => {
+    const w = await world();
+    await hold(w);
+    const ev = (await auditEvents(kit, w.p)).filter((e) => opOf(e) === "project.find.hold");
+    expect(ev[0]!.details).toMatchObject({ method: "free_copy" });
+  });
+
+  it("rules that refuse library_access refuse the hold of the library's file, even where free copies are allowed; nothing is written", async () => {
+    const w = await worldUnder(FREE_ONLY);
+    await expect(holdHanded(w)).rejects.toMatchObject({ name: "PolicyDeniedError" });
+    expect(await heldFiles(w)).toEqual([]);
+    expect(await pending(w)).toEqual([]);
+    expect(await stateOf(w)).toBe("waiting-sign-in");
+  });
+
+  it("a found free copy is still asked as free_copy: refused where only the library is allowed", async () => {
+    const w = await worldUnder(LIB_ONLY);
+    await expect(hold(w)).rejects.toMatchObject({ name: "PolicyDeniedError" });
+    expect(await heldFiles(w)).toEqual([]);
+  });
+
+  it(`R329 f: with ${FIND_HELD_MAX} files waiting a handed-over file is still held (${FIND_HELD_MAX + 1}); a found copy is not`, async () => {
+    const w = await worldUnder(OPEN_GOV);
+    const entries: FindEntry[] = Array.from({ length: FIND_HELD_MAX + 1 }, () => ({ ...w.entry, id: newId(), state: "fetching" as const, returnTo: undefined }));
+    await appendFindEntries(coreOf(), w.p.id, entries, "add");
+    for (const e of entries.slice(0, FIND_HELD_MAX)) await holdMismatchedFile(coreOf(), w.p.id, { entry: { ...e, state: "needs-check" }, sourceId: w.sourceId, fromPath: w.pdf, facts: facts() });
+    await expect(holdMismatchedFile(coreOf(), w.p.id, { entry: { ...entries[FIND_HELD_MAX]!, state: "needs-check" }, sourceId: w.sourceId, fromPath: w.pdf, facts: facts() })).rejects.toBeInstanceOf(HeldFileLimitError);
+    await holdHanded(w);
+    expect(await heldWaitingCount(coreOf(), w.p.id)).toBe(FIND_HELD_MAX + 1);
+    expect(await stateOf(w)).toBe("needs-check");
+  });
+
+  it("Use this file on the library's file evaluates library_access again and records how it was got; the audit says the method", async () => {
+    const w = await worldUnder(LIB_ONLY);
+    const r = await holdHanded(w, LOOKS_RIGHT);
+    const out = await resolveHeldFile(coreOf(), w.p.id, r.reviewId, "attach");
+    expect(out.entry?.state).toBe("in-library");
+    const a = (await kit.repo.getSource(w.p.id, w.sourceId)).assets.find((x) => x.role === "original")!;
+    expect(a.acquired).toEqual({ ...viaLibrary.acquired, check: { result: "match", by: "title" } });
+    const ev = (await auditEvents(kit, w.p)).filter((e) => opOf(e) === "project.find.held-attach");
+    expect(ev[0]!.details).toMatchObject({ method: "library_access" });
+    expect(JSON.stringify(ev)).not.toContain("ezproxy");
+  });
+
+  it("Use this file is refused when the rules no longer allow library_access (allowing free copies does not help); nothing changes", async () => {
+    const w = await worldUnder(LIB_ONLY);
+    const r = await holdHanded(w);
+    await setRules(w.p, FREE_ONLY);
+    await expect(resolveHeldFile(coreOf(), w.p.id, r.reviewId, "attach")).rejects.toMatchObject({ name: "PolicyDeniedError" });
+    expect((await kit.repo.getSource(w.p.id, w.sourceId)).assets).toEqual([]);
+    expect(await pending(w)).toHaveLength(1);
+    expect(await heldFiles(w)).toHaveLength(1);
+  });
+
+  it("a held file whose record names a method the app does not know is never held", async () => {
+    const w = await worldUnder(OPEN_GOV);
+    const odd = { ...facts(), acquired: { ...facts().acquired, method: "shadow" as unknown as "free_copy" } };
+    await expect(holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w), sourceId: w.sourceId, fromPath: w.pdf, facts: odd })).rejects.toThrow(/how this file was got/u);
+    expect(await heldFiles(w)).toEqual([]);
+  });
+});
