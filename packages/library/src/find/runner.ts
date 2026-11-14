@@ -1560,7 +1560,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     else stop.addEventListener("abort", onStop, { once: true });
     const h = timers.setTimeout(() => ac.abort(new TimedOut()), FIND_DOWNLOAD_TIMEOUT_MS);
     try {
-      return await fetchFile(url, { maxBytes: FREE_COPY_MAX_BYTES, deadlineMs: FETCH_FILE_DEADLINE_MS, into, signal: ac.signal });
+      // R317: in test mode with the lookup-fixtures switch on, the lookup client's recorded file answers (else undefined).
+      return await fetchFile(url, { maxBytes: FREE_COPY_MAX_BYTES, deadlineMs: FETCH_FILE_DEADLINE_MS, into, signal: ac.signal, recorded: http.recordedFiles });
     } finally {
       timers.clearTimeout(h);
       stop.removeEventListener("abort", onStop);

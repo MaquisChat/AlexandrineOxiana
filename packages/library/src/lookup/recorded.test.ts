@@ -115,6 +115,36 @@ describe("lookup fixtures switch", () => {
     }
   });
 
+  it("the files map (Task F14, R317): a file answer or a redirect is accepted; anything else fails closed at start", async () => {
+    const at = (files: unknown) => writeFile(join(tmp, "answers.json"), JSON.stringify({ v: 1, answers: {}, files }));
+    await writeFile(join(tmp, "f-handbuilt.pdf"), "%PDF-1.4\n");
+    await at({ "https://arxiv.org/pdf/1": { status: 200, file: "f-handbuilt.pdf", headers: { "content-type": "application/pdf" } }, "https://arxiv.org/r": { status: 302, location: "/pdf/1" } });
+    const ok = recordedLookupsFromEnv({ NODE_ENV: "test", [LOOKUP_FIXTURES_ENV]: tmp });
+    expect(ok?.files).toBeDefined();
+    // A file answer is no lookup answer: the lookup at that address still has none.
+    expect(() => ok!.answer("https://arxiv.org/pdf/1")).toThrow(LookupHttpError);
+    const bad: Array<[unknown, RegExp]> = [
+      [[], /files/],
+      [{ "https://arxiv.org/pdf/1": { status: 200, file: "../f-handbuilt.pdf" } }, /file name/],
+      [{ "https://arxiv.org/pdf/1": { status: 200, file: "missing.pdf" } }, /missing\.pdf/],
+      [{ "https://arxiv.org/pdf/1": { status: 302 } }, /location/],
+      [{ "https://arxiv.org/pdf/1": { status: 302, location: 7 } }, /location/],
+      [{ "https://arxiv.org/pdf/1": { status: 404 } }, /status/],
+      [{ "https://arxiv.org/pdf/1": { status: 200, file: "f-handbuilt.pdf", headers: { "content-type": 1 } } }, /headers/],
+      [{ "https://arxiv.org/pdf/1": { status: 200, file: "f-handbuilt.pdf", headers: { "bad name": "x" } } }, /headers/],
+      [{ "not an address": { status: 200, file: "f-handbuilt.pdf" } }, /address/],
+    ];
+    for (const [files, re] of bad) {
+      await at(files);
+      expect(() => recordedLookupsFromEnv({ NODE_ENV: "test", [LOOKUP_FIXTURES_ENV]: tmp })).toThrow(re);
+    }
+  });
+
+  it("an answers file without a files map still loads, and records no file", async () => {
+    await writeFile(join(tmp, "answers.json"), JSON.stringify({ v: 1, answers: { [CR_URL]: { status: 404 } } }));
+    expect(recordedLookupsFromEnv({ NODE_ENV: "test", [LOOKUP_FIXTURES_ENV]: tmp })?.files).toBeDefined();
+  });
+
   it("drives a real DOI lookup: the title comes from the recorded Crossref answer", async () => {
     const http = client({ NODE_ENV: "test", [LOOKUP_FIXTURES_ENV]: FIX });
     const r = await lookupDoi(DOI, {
