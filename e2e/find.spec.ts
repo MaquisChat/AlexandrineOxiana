@@ -20,9 +20,11 @@
  *  - SURE_C, Vaisey's article with its year: sure as SURE_A (the next best scores 0.6).
  *
  * Every record the queue makes goes on to look for a free copy of its work (Task F11; R280 d). For each work the
- * scenarios complete, the answers record what the copy part asks, each saying that the service has NO copy to offer:
- * OpenAlex and Semantic Scholar by DOI answer 404; arXiv (by first author and title) an empty Atom feed and Europe PMC
- * (by DOI) an empty result, both built by hand in the services' shapes (`arxiv-query-empty-handbuilt.xml`,
+ * scenarios complete, the answers record what the copy part asks, each saying that the service has NO copy to offer.
+ * ALL of these answers are stand-ins built by hand, none is a recording (R313 j): the 404s given for OpenAlex and
+ * Semantic Scholar by DOI are the services' shape for "not found", but both services do know these works — the real
+ * answers would offer copies, which the harness cannot serve; arXiv (by first author and title) gets an empty Atom feed
+ * and Europe PMC (by DOI) an empty result, built in the services' shapes (`arxiv-query-empty-handbuilt.xml`,
  * `europepmc-search-empty-handbuilt.json`). DOAB and the Internet Archive are asked for books only, and these works are
  * articles and chapters. So every completed record ends "No open copy" with no reason and no "Try again": a missing
  * answer would show as "Some services could not be reached…" (or, with none answered, as the engine's waits). The harness
