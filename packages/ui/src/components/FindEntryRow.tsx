@@ -81,7 +81,7 @@ export const isAuthorEntry = (e: FindEntryView): boolean =>
  */
 export type FindAuthorOffer = { peopleCount: number; morePeople?: true };
 export function authorOfferOf(e: FindEntryView): FindAuthorOffer | undefined {
-  const o = (e as FindEntryView & { authorOffer?: unknown }).authorOffer;
+  const o: unknown = e.authorOffer;
   if (e.state !== "choose" || !o || typeof o !== "object") return undefined;
   const k = countOf((o as Record<string, unknown>).peopleCount);
   if (k === undefined) return undefined;
