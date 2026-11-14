@@ -65,8 +65,13 @@ use crate::grant::{GrantTarget, GRANT_LINE_MAX_BYTES, GRANT_PATH_MAX_BYTES};
 pub const LABEL: &str = "library";
 /// The only window whose page may ask anything of the sign-in window.
 pub const MAIN: &str = "main";
-/// The window's title (R325 a, R301: a fetched file waits for the researcher's check).
-pub const TITLE: &str = "Sign in to your library — open the PDF on this page and the app will fetch it for you to check";
+/// The window's title says where it is and what to do there (R347 b; R325 a, R301: a fetched file
+/// waits for the researcher's check): the host of the page shown (`title_host`), " — ", then these
+/// words for the kind of start (`window_title`). The shell alone sets it; a page cannot.
+pub const TITLE_LIBRARY: &str = "sign in to your library, then open the PDF and the app will fetch it for you to check";
+pub const TITLE_LINK: &str = "open the PDF on this page and the app will fetch it for you to check";
+/// A host longer than this is shown by its last characters (where its registered name is), after "…".
+pub const TITLE_HOST_MAX: usize = 64;
 pub const WIDTH: f64 = 1100.0;
 pub const HEIGHT: f64 = 800.0;
 /// The event sent to the main window.
@@ -89,8 +94,9 @@ pub const SNIFF_BYTES: usize = 1024;
 pub const COOKIE_HEADER_MAX: usize = 8192;
 /// The longest address the window is opened at.
 pub const WINDOW_URL_MAX: usize = 4096;
-/// The longest address handed to the researcher's browser (R325 f).
-pub const BROWSER_URL_MAX: usize = 2048;
+/// The longest address handed to the researcher's browser (R325 f; R356 f: as long as the window takes,
+/// the longest library address the service builds).
+pub const BROWSER_URL_MAX: usize = 4096;
 /// The inbox's folder name under the service's settings folder (AO_CONFIG_DIR).
 pub const INBOX: &str = "library-inbox";
 /// The device file's name under the app's data folder.
@@ -212,6 +218,77 @@ fn https_address(s: &str, max: usize) -> Option<Url> {
         return None;
     }
     Some(u)
+}
+
+/// The kind of start that opened the window (R347 a), kept with that window's ticket (`Inner::start`):
+/// "Get through my library" opens it at the library's sign-in address, where the host it was opened at
+/// is the library's sign-in host and is never fetched from; "Open it here and fetch the PDF" opens it
+/// at one of the entry's own links (a repository's or a publisher's page), where no host is a sign-in
+/// host. The path and query rules of `sign_in_address` hold for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Start {
+    #[default]
+    Library,
+    Link,
+}
+
+impl Start {
+    /// `from` as the page passes it to `open_library_window`: absent means "library" (the stricter
+    /// rule; Tauri gives a JSON null as absent too); exactly "library" or "link"; anything else —
+    /// another word, another case, white space, not text — is None, and the command is refused.
+    pub fn from_arg(from: Option<&serde_json::Value>) -> Option<Start> {
+        match from {
+            None => Some(Start::Library),
+            Some(v) => match v.as_str() {
+                Some("library") => Some(Start::Library),
+                Some("link") => Some(Start::Link),
+                _ => None,
+            },
+        }
+    }
+
+    /// The title's words for this kind of start.
+    pub fn words(self) -> &'static str {
+        match self {
+            Start::Library => TITLE_LIBRARY,
+            Start::Link => TITLE_LINK,
+        }
+    }
+}
+
+/// The host of the page shown, as the title begins (R347 b): its plain ASCII form (the URL parser
+/// gives an internationalised name in its `xn--` form, lower case; an IPv6 address in brackets),
+/// never a user name or password; the port only when it is not 443 (`:80` for a page that is not
+/// https); a `blob:` page by the page that made it; a page with no host (`about:blank`) as
+/// "no web address". Only printable ASCII is kept (anything else, which the parser does not let
+/// through, would become `?`), and a host longer than TITLE_HOST_MAX characters is shown as "…" and
+/// its last TITLE_HOST_MAX - 1 characters, so that the name it is registered under stays in sight.
+pub fn title_host(url: &Url) -> String {
+    let inner;
+    let url = if url.scheme() == "blob" {
+        match Url::parse(url.path()) {
+            Ok(u) if matches!(u.scheme(), "https" | "http") => {
+                inner = u;
+                &inner
+            }
+            _ => return "no web address".to_string(),
+        }
+    } else {
+        url
+    };
+    let Some(host) = url.host_str() else { return "no web address".to_string() };
+    let host: String = host.chars().map(|c| if c.is_ascii_graphic() { c.to_ascii_lowercase() } else { '?' }).collect();
+    let n = host.chars().count();
+    let host = if n > TITLE_HOST_MAX { format!("…{}", host.chars().skip(n - (TITLE_HOST_MAX - 1)).collect::<String>()) } else { host };
+    match url.port_or_known_default() {
+        Some(p) if p != 443 => format!("{host}:{p}"),
+        _ => host,
+    }
+}
+
+/// The window's title for the page at `url` in a window of this kind of start (R347 b).
+pub fn window_title(url: &Url, start: Start) -> String {
+    format!("{} — {}", title_host(url), start.words())
 }
 
 /// The address the window may be opened at (`open_library_window`).
@@ -1252,15 +1329,28 @@ impl Outcome {
             Outcome::HandOver(_) => State::Failed,
         }
     }
+
+    /// The reason the main window hears with the state: a hop of the shell's own fetch that reached a
+    /// sign-in address was not requested, and the row says so (`sign-in-address`), as it does when
+    /// the shell refuses such an address before any request.
+    fn reason(self) -> Option<Reason> {
+        match self {
+            Outcome::Fetch(FetchError::SignIn) => Some(Reason::SignIn),
+            _ => None,
+        }
+    }
 }
 
 /// What the controller needs of the app: the window, the event, the fetch's start, the store.
 /// `TauriHost` in the app; a stand-in in tests.
 pub trait Host: Send + Sync {
     fn window_exists(&self) -> bool;
-    /// Builds the window at `url` with the given store (macOS) or an ephemeral one (elsewhere).
-    fn create_window(&self, url: &Url, store: [u8; 16]) -> bool;
+    /// Builds the window at `url` with the given store (macOS) or an ephemeral one (elsewhere), under
+    /// `title`.
+    fn create_window(&self, url: &Url, store: [u8; 16], title: &str) -> bool;
     fn navigate(&self, url: &Url) -> bool;
+    /// Sets the window's title (R347 b: the shell's alone).
+    fn set_title(&self, title: &str);
     /// The window's current address.
     fn current_url(&self) -> Option<Url>;
     /// Asks the window to close (its closing then calls `Library::window_closed`).
@@ -1282,7 +1372,15 @@ pub trait Host: Send + Sync {
 #[derive(Default)]
 struct Inner {
     ticket: Option<String>,
+    /// The kind of start of the open ticket (R347 a), set with the ticket by `open` (for the window it
+    /// builds or re-uses) and put back to the default only when the window is gone (`window_closed`):
+    /// after a hand-over the window may stay without a ticket, and the next `open` sets both anew.
+    start: Start,
+    /// The library's sign-in host: the host the window was opened at for a library's start; None for a
+    /// link's start (no host is a sign-in host then) and when no window is open.
     proxy_host: Option<String>,
+    /// The window's title as last set (`page_shown`), set again when a page changes its own.
+    title: Option<String>,
     previous: Option<Url>,
     current: Option<Url>,
     fetching: Option<u64>,
@@ -1329,15 +1427,29 @@ impl Library {
         self.config.get()
     }
 
-    /// `open_library_window(ticket, url)`: from the main window only, with a 32 lower-case hex ticket
-    /// and an https address without user name or password of at most 4,096 characters, while no
-    /// ticket is open and the app is not closing. Re-uses the window when it exists (and goes to the
-    /// address), otherwise builds it. Anything else answers false and opens nothing.
-    pub fn open(&self, host: &dyn Host, caller: &str, ticket: &str, url: &str) -> bool {
+    /// `open_library_window(ticket, url, from)` as the page calls it (R347 a): `from` absent means
+    /// "library"; "library" or "link" exactly; anything else is refused like every other refusal of
+    /// the command (false, nothing opened, no event, the ticket not taken).
+    pub fn open_from(&self, host: &dyn Host, caller: &str, ticket: &str, url: &str, from: Option<&serde_json::Value>) -> bool {
+        match Start::from_arg(from) {
+            Some(start) => self.open(host, caller, ticket, url, start),
+            None => false,
+        }
+    }
+
+    /// `open_library_window`: from the main window only, with a 32 lower-case hex ticket and an https
+    /// address without user name or password of at most 4,096 characters, while no ticket is open and
+    /// the app is not closing. Re-uses the window when it exists (and goes to the address), otherwise
+    /// builds it; either way its title names the address's host and the kind of start. The kind of
+    /// start is the ticket's (R347 a): for a library's start the host the window is opened at is its
+    /// sign-in host and is never fetched from; for a link's start no host is. Anything else answers
+    /// false and opens nothing.
+    pub fn open(&self, host: &dyn Host, caller: &str, ticket: &str, url: &str, start: Start) -> bool {
         if caller != MAIN || !valid_ticket(ticket) || host.stopping() {
             return false;
         }
         let Some(url) = window_address(url) else { return false };
+        let title = window_title(&url, start);
         let store = {
             let mut g = self.lock();
             let Some(device) = g.device else { return false };
@@ -1345,12 +1457,25 @@ impl Library {
                 return false;
             }
             g.ticket = Some(ticket.to_string());
-            g.proxy_host = url.host_str().map(str::to_ascii_lowercase);
+            g.start = start;
+            g.proxy_host = match start {
+                Start::Library => url.host_str().map(str::to_ascii_lowercase),
+                Start::Link => None,
+            };
             g.previous = None;
             g.current = None;
+            g.title = Some(title.clone());
             device.store
         };
-        let shown = if host.window_exists() { host.navigate(&url) } else { host.create_window(&url, store) };
+        let shown = if host.window_exists() {
+            let moved = host.navigate(&url);
+            if moved {
+                host.set_title(&title);
+            }
+            moved
+        } else {
+            host.create_window(&url, store, &title)
+        };
         if !shown {
             let mut g = self.lock();
             if g.ticket.as_deref() == Some(ticket) {
@@ -1394,6 +1519,31 @@ impl Library {
     fn run(&self, host: &dyn Host, job: Job) {
         host.emit(&LibraryEvent::new(Some(&job.ticket), State::Fetching));
         host.start_fetch(job);
+    }
+
+    /// The window shows a new top page (its navigation committed, a server's redirects followed, or its
+    /// load finished; never a frame's): the title names that page's host and the ticket's kind of
+    /// start (R347 b). On the main thread: nothing here blocks.
+    pub fn page_shown(&self, host: &dyn Host, url: &Url) {
+        let title = {
+            let mut g = self.lock();
+            let t = window_title(url, g.start);
+            if g.title.as_deref() == Some(t.as_str()) {
+                return;
+            }
+            g.title = Some(t.clone());
+            t
+        };
+        host.set_title(&title);
+    }
+
+    /// A page changed its own title (`document.title`, `<title>`): the window keeps the shell's
+    /// (R347 b), set again in case the platform let the page's through.
+    pub fn page_retitled(&self, host: &dyn Host) {
+        let title = self.lock().title.clone();
+        if let Some(t) = title {
+            host.set_title(&t);
+        }
     }
 
     /// A page of the window finished loading (on the main thread: nothing here blocks). An address
@@ -1517,7 +1667,10 @@ impl Library {
                 g.last_handover = Some(now);
                 g.ticket = None;
             }
-            LibraryEvent::new(Some(ticket), outcome.state())
+            match outcome.reason() {
+                Some(r) => LibraryEvent::refused(Some(ticket), outcome.state(), r),
+                None => LibraryEvent::new(Some(ticket), outcome.state()),
+            }
         };
         host.emit(&event);
     }
@@ -1543,6 +1696,8 @@ impl Library {
             g.previous = None;
             g.current = None;
             g.proxy_host = None;
+            g.start = Start::default();
+            g.title = None;
             (g.ticket.take(), g.abort.take())
         };
         if let Some(abort) = abort {
@@ -1621,7 +1776,7 @@ impl Library {
 // The researcher's own browser (R325 f)
 
 /// `open_in_browser(url)`: from the main window only; an https address without user name or
-/// password, of at most 2,048 characters, handed to `opener` as ONE argument.
+/// password, of at most 4,096 characters, handed to `opener` as ONE argument.
 pub fn open_in_browser(caller: &str, url: &str, opener: &dyn Fn(&str) -> bool) -> bool {
     if caller != MAIN {
         return false;
@@ -1715,13 +1870,14 @@ impl Host for TauriHost {
         self.window().is_some()
     }
 
-    fn create_window(&self, url: &Url, store: [u8; 16]) -> bool {
+    fn create_window(&self, url: &Url, store: [u8; 16], title: &str) -> bool {
         use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
         let loaded = self.clone();
         let downloads = self.clone();
+        let retitled = self.clone();
         let opened = self.app.clone();
         let builder = tauri::WebviewWindowBuilder::new(&self.app, LABEL, tauri::WebviewUrl::External(url.clone()))
-            .title(TITLE)
+            .title(title)
             .inner_size(WIDTH, HEIGHT)
             .min_inner_size(600.0, 400.0)
             .user_agent(USER_AGENT)
@@ -1750,10 +1906,22 @@ impl Host for TauriHost {
                 }
                 NewWindowResponse::Deny
             })
+            // The top page only: wry reports the main frame's navigation committed (`Started`; after any
+            // server redirect, at the address the page is shown at — WebKitGTK's `load-changed`
+            // COMMITTED, WKWebView's `didCommitNavigation`) and its load finished, never a frame's. Each
+            // sets the title to the host shown (R347 b).
             .on_page_load(move |_w, p| {
+                loaded.library.page_shown(&loaded, p.url());
                 if p.event() == PageLoadEvent::Finished {
                     loaded.library.page_loaded(&loaded, p.url(), Instant::now());
                 }
+            })
+            // R347 b: a page cannot set the window's title. Neither tauri 2.12.5 nor wry 0.57.2 carries
+            // a page's title to the window on any platform (a page's title reaches only this handler,
+            // which the window would otherwise not have); the shell's own is set again whenever a page
+            // changes its own, so that no later version or platform could show the page's.
+            .on_document_title_changed(move |_w, _page_title| {
+                retitled.library.page_retitled(&retitled);
             })
             .devtools(cfg!(debug_assertions));
         // The launch check's probe (debug builds, test mode, its switch set; R343 b).
@@ -1774,6 +1942,12 @@ impl Host for TauriHost {
 
     fn navigate(&self, url: &Url) -> bool {
         self.window().is_some_and(|w| w.navigate(url.clone()).is_ok())
+    }
+
+    fn set_title(&self, title: &str) {
+        if let Some(w) = self.window() {
+            let _ = w.set_title(title);
+        }
     }
 
     fn current_url(&self) -> Option<Url> {
@@ -2723,6 +2897,7 @@ process.stdout.write(JSON.stringify({{
         create_ok: bool,
         created: Mutex<Vec<(Url, [u8; 16])>>,
         navigated: Mutex<Vec<Url>>,
+        titles: Mutex<Vec<String>>,
         current: Mutex<Option<Url>>,
         events: Mutex<Vec<LibraryEvent>>,
         jobs: Mutex<Vec<Job>>,
@@ -2740,6 +2915,7 @@ process.stdout.write(JSON.stringify({{
                 create_ok: true,
                 created: Mutex::default(),
                 navigated: Mutex::default(),
+                titles: Mutex::default(),
                 current: Mutex::default(),
                 events: Mutex::default(),
                 jobs: Mutex::default(),
@@ -2768,14 +2944,18 @@ process.stdout.write(JSON.stringify({{
         fn window_exists(&self) -> bool {
             self.exists.load(Ordering::SeqCst)
         }
-        fn create_window(&self, url: &Url, store: [u8; 16]) -> bool {
+        fn create_window(&self, url: &Url, store: [u8; 16], title: &str) -> bool {
             self.created.lock().unwrap().push((url.clone(), store));
+            self.titles.lock().unwrap().push(title.to_string());
             self.exists.store(self.create_ok, Ordering::SeqCst);
             self.create_ok
         }
         fn navigate(&self, url: &Url) -> bool {
             self.navigated.lock().unwrap().push(url.clone());
             true
+        }
+        fn set_title(&self, title: &str) {
+            self.titles.lock().unwrap().push(title.to_string());
         }
         fn current_url(&self) -> Option<Url> {
             self.current.lock().unwrap().clone()
@@ -2835,25 +3015,25 @@ process.stdout.write(JSON.stringify({{
             ("main", TICKET, "tauri://localhost/"),
             ("main", TICKET, &format!("https://h.test/{}", "a".repeat(5000))),
         ] {
-            assert!(!lib.open(&host, caller, ticket, url), "{caller} {url}");
+            assert!(!lib.open(&host, caller, ticket, url, Start::Library), "{caller} {url}");
         }
         assert!(host.created.lock().unwrap().is_empty());
         assert!(host.events().is_empty());
         // A good open builds the window once, with the store id of the device file.
-        assert!(lib.open(&host, "main", TICKET, START));
+        assert!(lib.open(&host, "main", TICKET, START, Start::Library));
         let created = host.created.lock().unwrap().clone();
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].0, u(START));
         assert_eq!(Some(created[0].1), read_device(&d.join(DEVICE_FILE)).map(|s| s.store));
         assert_eq!(host.last(), LibraryEvent::new(Some(TICKET), State::Opened));
         // A second open while a ticket is open is refused.
-        assert!(!lib.open(&host, "main", TICKET2, START));
-        assert!(!lib.open(&host, "main", TICKET, START));
+        assert!(!lib.open(&host, "main", TICKET2, START, Start::Library));
+        assert!(!lib.open(&host, "main", TICKET, START, Start::Library));
         assert_eq!(host.created.lock().unwrap().len(), 1);
         // The app closing: refused.
         let (lib2, host2, d2) = started("open-stopping");
         host2.stopping.store(true, Ordering::SeqCst);
-        assert!(!lib2.open(&host2, "main", TICKET, START));
+        assert!(!lib2.open(&host2, "main", TICKET, START, Start::Library));
         for x in [d, d2] {
             fs::remove_dir_all(x).unwrap();
         }
@@ -2866,9 +3046,9 @@ process.stdout.write(JSON.stringify({{
         host.create_ok = false;
         let lib = Library::default();
         lib.at_start(&host);
-        assert!(!lib.open(&host, "main", TICKET, START));
+        assert!(!lib.open(&host, "main", TICKET, START, Start::Library));
         host.create_ok = true;
-        assert!(lib.open(&host, "main", TICKET, START));
+        assert!(lib.open(&host, "main", TICKET, START, Start::Library));
         fs::remove_dir_all(d).unwrap();
     }
 
@@ -2876,7 +3056,7 @@ process.stdout.write(JSON.stringify({{
     fn a_page_reaching_three_pdf_addresses_fetches_once_and_one_file_per_ticket() {
         let (lib, host, d) = started("three");
         let t0 = Instant::now();
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         lib.page_loaded(&host, &u("https://www-jstor-org.ezproxy.lib.edu/stable/1"), t0);
         assert_eq!(host.jobs(), 0);
         for p in [PDF, "https://www-jstor-org.ezproxy.lib.edu/stable/pdf/2.pdf", "https://www-jstor-org.ezproxy.lib.edu/stable/pdf/3.pdf"] {
@@ -2899,7 +3079,7 @@ process.stdout.write(JSON.stringify({{
         assert!(!lib.take_pdf(&host, "main", t0 + Duration::from_secs(60)));
         assert_eq!(host.last(), LibraryEvent::refused(None, State::Failed, Reason::NoTicket));
         // A fetch that ended without a file leaves the ticket open for another try.
-        lib.open(&host, "main", TICKET2, START);
+        lib.open(&host, "main", TICKET2, START, Start::Library);
         lib.page_loaded(&host, &u(PDF), t0 + Duration::from_secs(60));
         let job = host.jobs.lock().unwrap().remove(0);
         lib.finish(&host, job.generation, TICKET2, Outcome::Fetch(FetchError::NotPdf), t0 + Duration::from_secs(61));
@@ -2912,12 +3092,12 @@ process.stdout.write(JSON.stringify({{
     fn an_open_for_a_new_ticket_reuses_the_window_and_goes_to_the_address() {
         let (lib, host, d) = started("reuse");
         let t0 = Instant::now();
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         lib.page_loaded(&host, &u(PDF), t0);
         let job = host.jobs.lock().unwrap().remove(0);
         lib.finish(&host, job.generation, TICKET, Outcome::HandedOver, t0);
         let next = "https://ezproxy.lib.edu/login?url=https://doi.org/10.2/y";
-        assert!(lib.open(&host, "main", TICKET2, next));
+        assert!(lib.open(&host, "main", TICKET2, next, Start::Library));
         assert_eq!(host.created.lock().unwrap().len(), 1);
         assert_eq!(host.navigated.lock().unwrap().clone(), vec![u(next)]);
         assert_eq!(host.last(), LibraryEvent::new(Some(TICKET2), State::Opened));
@@ -2941,11 +3121,11 @@ process.stdout.write(JSON.stringify({{
     fn a_fetch_within_20_s_of_the_last_hand_over_is_refused() {
         let (lib, host, d) = started("pause");
         let t0 = Instant::now();
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         lib.page_loaded(&host, &u(PDF), t0);
         let job = host.jobs.lock().unwrap().remove(0);
         lib.finish(&host, job.generation, TICKET, Outcome::HandedOver, t0);
-        lib.open(&host, "main", TICKET2, START);
+        lib.open(&host, "main", TICKET2, START, Start::Library);
         host.at(PDF);
         assert!(!lib.take_pdf(&host, "main", t0 + Duration::from_secs(10)));
         assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET2), State::Failed, Reason::Pause));
@@ -2960,7 +3140,7 @@ process.stdout.write(JSON.stringify({{
     #[test]
     fn a_second_fetch_while_one_runs_is_refused() {
         let (lib, host, d) = started("busy");
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         host.at(PDF);
         assert!(lib.take_pdf(&host, "main", Instant::now()));
         assert!(!lib.take_pdf(&host, "main", Instant::now()));
@@ -2972,7 +3152,7 @@ process.stdout.write(JSON.stringify({{
     #[test]
     fn a_sign_in_address_is_never_fetched_and_the_window_is_left_where_it_is() {
         let (lib, host, d) = started("signin");
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         for p in ["https://ezproxy.lib.edu/download/x.pdf", "https://idp.lib.edu/idp/profile/SAML2/Redirect/SSO.pdf", "https://p.test/login/file.pdf"] {
             lib.page_loaded(&host, &u(p), Instant::now());
             host.at(p);
@@ -2990,7 +3170,7 @@ process.stdout.write(JSON.stringify({{
     #[test]
     fn the_window_closing_ends_the_ticket_and_cancels_the_fetch() {
         let (lib, host, d) = started("close");
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         lib.page_loaded(&host, &u(PDF), Instant::now());
         let job = host.jobs.lock().unwrap().remove(0);
         let aborted = Arc::new(AtomicBool::new(false));
@@ -3008,7 +3188,7 @@ process.stdout.write(JSON.stringify({{
         assert!(!lib.take_pdf(&host, "main", Instant::now()));
         assert_eq!(host.last(), LibraryEvent::refused(None, State::Failed, Reason::NoTicket));
         // close_library_window asks the window to close; without a window it ends the ticket at once.
-        lib.open(&host, "main", TICKET2, START);
+        lib.open(&host, "main", TICKET2, START, Start::Library);
         lib.close(&host, "library");
         assert_eq!(host.close_asked.load(Ordering::SeqCst), 1);
         lib.close(&host, "main");
@@ -3023,7 +3203,7 @@ process.stdout.write(JSON.stringify({{
     fn a_window_closing_between_a_fetch_s_start_and_its_abort_still_cancels_it() {
         let (lib, host, d) = started("race");
         let t0 = Instant::now();
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         lib.page_loaded(&host, &u(PDF), t0);
         let job = host.jobs.lock().unwrap().remove(0);
         // The reviewer's interleaving: the fetch is started, the window closes, and only then is the
@@ -3039,7 +3219,7 @@ process.stdout.write(JSON.stringify({{
         lib.finish(&host, job.generation, TICKET, Outcome::HandedOver, t0);
         assert_eq!(host.events().len(), n);
         // A new ticket's fetch starts at once, the old one cancelled before it.
-        assert!(lib.open(&host, "main", TICKET2, START));
+        assert!(lib.open(&host, "main", TICKET2, START, Start::Library));
         lib.page_loaded(&host, &u(PDF), t0 + Duration::from_secs(1));
         assert_eq!(host.jobs(), 1);
         assert_eq!(host.last(), LibraryEvent::new(Some(TICKET2), State::Fetching));
@@ -3050,12 +3230,12 @@ process.stdout.write(JSON.stringify({{
     fn an_outcome_that_arrives_after_its_ticket_ended_hands_nothing_over() {
         let (lib, host, d) = started("late");
         let t0 = Instant::now();
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         lib.page_loaded(&host, &u(PDF), t0);
         let old = host.jobs.lock().unwrap().remove(0);
         lib.window_closed(&host);
         // A new ticket's fetch is running when the old fetch's file is complete.
-        lib.open(&host, "main", TICKET2, START);
+        lib.open(&host, "main", TICKET2, START, Start::Library);
         lib.page_loaded(&host, &u("https://www-jstor-org.ezproxy.lib.edu/stable/pdf/2.pdf"), t0);
         let new = host.jobs.lock().unwrap().remove(0);
         let inbox = prepare_inbox(&d).unwrap();
@@ -3096,7 +3276,7 @@ process.stdout.write(JSON.stringify({{
         lib.download_requested(&host, &u(dl), t0);
         assert_eq!(host.jobs(), 0);
         assert!(host.events().is_empty());
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         lib.page_loaded(&host, &u(page), t0);
         // Not https, a sign-in address, not a web address: nothing, and nothing said.
         let n = host.events().len();
@@ -3124,7 +3304,7 @@ process.stdout.write(JSON.stringify({{
         lib.download_requested(&host, &u(dl), t0 + Duration::from_secs(30));
         assert_eq!(host.jobs(), 0);
         // The next ticket waits for the pause, which is said.
-        lib.open(&host, "main", TICKET2, START);
+        lib.open(&host, "main", TICKET2, START, Start::Library);
         lib.download_requested(&host, &u(dl), t0 + Duration::from_secs(10));
         assert_eq!(host.jobs(), 0);
         assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET2), State::Failed, Reason::Pause));
@@ -3132,7 +3312,7 @@ process.stdout.write(JSON.stringify({{
         assert_eq!(host.jobs(), 1);
         // Nothing starts while the app closes.
         let (lib2, host2, d2) = started("download-stopping");
-        lib2.open(&host2, "main", TICKET, START);
+        lib2.open(&host2, "main", TICKET, START, Start::Library);
         host2.stopping.store(true, Ordering::SeqCst);
         lib2.download_requested(&host2, &u(dl), t0);
         assert_eq!(host2.jobs(), 0);
@@ -3144,12 +3324,12 @@ process.stdout.write(JSON.stringify({{
     #[test]
     fn the_commands_from_any_other_window_do_nothing() {
         let (lib, host, d) = started("callers");
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         host.at(PDF);
         let before = host.events().len();
         let removed = host.removed.load(Ordering::SeqCst);
         for caller in ["library", "", "Main", "main ", "anything"] {
-            assert!(!lib.open(&host, caller, TICKET2, START));
+            assert!(!lib.open(&host, caller, TICKET2, START, Start::Library));
             assert!(!lib.take_pdf(&host, caller, Instant::now()));
             lib.close(&host, caller);
             assert!(!lib.sign_out(&host, caller));
@@ -3166,7 +3346,7 @@ process.stdout.write(JSON.stringify({{
     #[test]
     fn nothing_starts_while_the_app_closes() {
         let (lib, host, d) = started("stopping");
-        lib.open(&host, "main", TICKET, START);
+        lib.open(&host, "main", TICKET, START, Start::Library);
         host.stopping.store(true, Ordering::SeqCst);
         host.at(PDF);
         lib.page_loaded(&host, &u(PDF), Instant::now());
@@ -3239,6 +3419,245 @@ process.stdout.write(JSON.stringify({{
         let long = format!("https://doi.org/{}", "a".repeat(BROWSER_URL_MAX));
         assert!(!open_in_browser("main", &long, &opener));
         assert_eq!(got.lock().unwrap().clone(), vec!["https://doi.org/10.1/x?a=b&c=d".to_string()]);
+    }
+
+    #[test]
+    fn the_browser_takes_an_address_as_long_as_the_window_does() {
+        // R356 f: 4,096 characters, the sign-in window's bound and the longest library address the
+        // service builds; one more is refused. Every other rule is `open_in_browser_takes_one_https_address`'s.
+        let opened = Mutex::new(0usize);
+        let opener = |_: &str| {
+            *opened.lock().unwrap() += 1;
+            true
+        };
+        let at = |n: usize| format!("https://doi.org/{}", "a".repeat(n - "https://doi.org/".len()));
+        assert_eq!(at(4096).chars().count(), 4096);
+        assert!(browser_address(&at(4096)).is_some());
+        assert!(browser_address(&at(4097)).is_none());
+        assert!(open_in_browser("main", &at(4096), &opener));
+        assert!(!open_in_browser("main", &at(4097), &opener));
+        assert_eq!(*opened.lock().unwrap(), 1);
+        assert_eq!(BROWSER_URL_MAX, WINDOW_URL_MAX);
+        assert!(window_address(&at(4096)).is_some() && window_address(&at(4097)).is_none());
+    }
+
+    // ----- the kind of start (R347 a) -----
+
+    const LINK: &str = "https://repository.example.org/handle/10/1?show=full";
+    const LINK_PDF: &str = "https://repository.example.org/bitstream/10/1/paper.pdf";
+
+    fn jobs_of(host: &FakeHost) -> Vec<Job> {
+        std::mem::take(&mut *host.jobs.lock().unwrap())
+    }
+
+    #[test]
+    fn the_kind_of_start_is_read_from_the_page_exactly() {
+        use serde_json::json;
+        assert_eq!(Start::from_arg(None), Some(Start::Library));
+        assert_eq!(Start::from_arg(Some(&json!("library"))), Some(Start::Library));
+        assert_eq!(Start::from_arg(Some(&json!("link"))), Some(Start::Link));
+        for bad in [json!("Link"), json!("LIBRARY"), json!(" link"), json!("link "), json!(""), json!("browser"), json!(null), json!(1), json!(true), json!(["link"]), json!({ "from": "link" })] {
+            assert_eq!(Start::from_arg(Some(&bad)), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_of_start_is_refused_and_takes_no_ticket() {
+        use serde_json::json;
+        let (lib, host, _d) = started("from-unknown");
+        for bad in [json!("Link"), json!("links"), json!(2), json!(null), json!(["library"])] {
+            assert!(!lib.open_from(&host, "main", TICKET, LINK, Some(&bad)), "{bad}");
+        }
+        assert!(host.created.lock().unwrap().is_empty());
+        assert!(host.events().is_empty());
+        // The same ticket then opens: nothing was taken. Absent means "library": the opened host is its sign-in host.
+        assert!(lib.open_from(&host, "main", TICKET, LINK, None));
+        assert_eq!(host.last(), LibraryEvent::new(Some(TICKET), State::Opened));
+        host.at(LINK_PDF);
+        assert!(!lib.take_pdf(&host, "main", Instant::now()));
+        assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET), State::NotAPdf, Reason::SignIn));
+        assert_eq!(host.titles.lock().unwrap().clone(), vec![format!("repository.example.org — {TITLE_LIBRARY}")]);
+    }
+
+    #[test]
+    fn a_link_s_window_fetches_a_pdf_on_the_host_it_was_opened_at() {
+        let (lib, host, _d) = started("link-own-host");
+        let t0 = Instant::now();
+        assert!(lib.open_from(&host, "main", TICKET, LINK, Some(&serde_json::json!("link"))));
+        lib.page_loaded(&host, &u(LINK), t0);
+        lib.page_loaded(&host, &u(LINK_PDF), t0);
+        let jobs = jobs_of(&host);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].input.url, u(LINK_PDF));
+        assert_eq!(jobs[0].input.proxy_host, None, "no host is a sign-in host for a link's window");
+        assert_eq!(host.last(), LibraryEvent::new(Some(TICKET), State::Fetching));
+        // "Add the PDF showing" on the opened host too.
+        lib.finish(&host, jobs[0].generation, TICKET, Outcome::Fetch(FetchError::NotPdf), t0);
+        host.at("https://repository.example.org/view/1");
+        assert!(lib.take_pdf(&host, "main", t0));
+        assert_eq!(jobs_of(&host).len(), 1);
+    }
+
+    #[test]
+    fn a_library_s_window_never_fetches_from_the_host_it_was_opened_at() {
+        let (lib, host, _d) = started("library-own-host");
+        assert!(lib.open_from(&host, "main", TICKET, LINK, Some(&serde_json::json!("library"))));
+        lib.page_loaded(&host, &u(LINK_PDF), Instant::now());
+        assert_eq!(host.jobs(), 0);
+        host.at(LINK_PDF);
+        assert!(!lib.take_pdf(&host, "main", Instant::now()));
+        assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET), State::NotAPdf, Reason::SignIn));
+        assert_eq!(host.jobs(), 0);
+        // Another host is fetched from, as before.
+        host.at("https://www.publisher.example/pdf/1.pdf");
+        assert!(lib.take_pdf(&host, "main", Instant::now()));
+        assert_eq!(jobs_of(&host)[0].input.proxy_host.as_deref(), Some("repository.example.org"));
+    }
+
+    #[test]
+    fn a_link_s_window_never_fetches_a_sign_in_path_on_any_host() {
+        let (lib, host, _d) = started("link-paths");
+        assert!(lib.open(&host, "main", TICKET, LINK, Start::Link));
+        for p in [
+            "https://repository.example.org/login?next=/bitstream/1.pdf",
+            "https://any.example/login?url=x.pdf",
+            "https://any.example/Shibboleth.sso/x.pdf",
+            "https://any.example/x.pdf?SAMLart=1",
+            "https://any.example/x.pdf?ticket=ST-1",
+            "https://any.example/cb.pdf?code=1&state=2",
+        ] {
+            lib.page_loaded(&host, &u(p), Instant::now());
+            host.at(p);
+            assert!(!lib.take_pdf(&host, "main", Instant::now()), "{p}");
+            assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET), State::NotAPdf, Reason::SignIn), "{p}");
+        }
+        assert_eq!(host.jobs(), 0);
+    }
+
+    #[test]
+    fn the_kind_belongs_to_the_ticket_and_ends_with_the_window() {
+        let (lib, host, _d) = started("kind-ticket");
+        let t0 = Instant::now();
+        // A link's ticket; a retry of the same press while it is open changes nothing (the open is refused).
+        assert!(lib.open(&host, "main", TICKET, LINK, Start::Link));
+        assert!(!lib.open(&host, "main", TICKET, LINK, Start::Library));
+        assert!(!lib.open(&host, "main", TICKET2, LINK, Start::Library));
+        lib.page_loaded(&host, &u(LINK_PDF), t0);
+        let job = jobs_of(&host).remove(0);
+        assert_eq!(job.input.proxy_host, None);
+        lib.finish(&host, job.generation, TICKET, Outcome::HandedOver, t0);
+        // The window stays without a ticket; a library's start re-uses it under the library's rule.
+        assert!(lib.open(&host, "main", TICKET2, LINK, Start::Library));
+        let later = t0 + Duration::from_secs(30);
+        lib.page_loaded(&host, &u(LINK_PDF), later);
+        assert_eq!(host.jobs(), 0);
+        host.at(LINK_PDF);
+        assert!(!lib.take_pdf(&host, "main", later));
+        assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET2), State::NotAPdf, Reason::SignIn));
+        // The window closes: its ticket and kind end. A link's start then has no sign-in host again.
+        lib.window_closed(&host);
+        host.exists.store(false, Ordering::SeqCst);
+        let t3 = "0123456789abcdef0123456789abcde3";
+        assert!(lib.open(&host, "main", t3, LINK, Start::Link));
+        lib.page_loaded(&host, &u(LINK_PDF), later);
+        assert_eq!(jobs_of(&host)[0].input.proxy_host, None);
+        // And the reverse: a library's window, then a link's start at the library's host.
+        lib.window_closed(&host);
+        let t4 = "0123456789abcdef0123456789abcde4";
+        assert!(lib.open(&host, "main", t4, START, Start::Library));
+        lib.window_closed(&host);
+        let t5 = "0123456789abcdef0123456789abcde5";
+        assert!(lib.open(&host, "main", t5, START, Start::Link));
+        host.at("https://ezproxy.lib.edu/files/1.pdf");
+        assert!(lib.take_pdf(&host, "main", later));
+    }
+
+    #[test]
+    fn a_sign_in_hop_of_the_shell_s_own_fetch_says_why() {
+        let (lib, host, _d) = started("hop-reason");
+        let t0 = Instant::now();
+        lib.open(&host, "main", TICKET, START, Start::Library);
+        lib.page_loaded(&host, &u(PDF), t0);
+        let job = jobs_of(&host).remove(0);
+        lib.finish(&host, job.generation, TICKET, Outcome::Fetch(FetchError::SignIn), t0);
+        assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET), State::NotAPdf, Reason::SignIn));
+        assert_eq!(host.last().to_json(), serde_json::json!({ "ticket": TICKET, "state": "not-a-pdf", "reason": "sign-in-address" }));
+        // A page that is not a PDF still says no reason.
+        host.at(PDF);
+        assert!(lib.take_pdf(&host, "main", t0));
+        let job = jobs_of(&host).remove(0);
+        lib.finish(&host, job.generation, TICKET, Outcome::Fetch(FetchError::NotPdf), t0);
+        assert_eq!(host.last(), LibraryEvent::new(Some(TICKET), State::NotAPdf));
+    }
+
+    // ----- the title (R347 b) -----
+
+    #[test]
+    fn the_title_names_the_host_shown_and_the_kind() {
+        let lib_words = "sign in to your library, then open the PDF and the app will fetch it for you to check";
+        let link_words = "open the PDF on this page and the app will fetch it for you to check";
+        assert_eq!(window_title(&u("https://ezproxy.lib.edu/login?url=https://doi.org/10.1/x"), Start::Library), format!("ezproxy.lib.edu — {lib_words}"));
+        assert_eq!(window_title(&u("https://repository.example.org/handle/1"), Start::Link), format!("repository.example.org — {link_words}"));
+        for (url, host) in [
+            ("https://EZProxy.Lib.EDU/x", "ezproxy.lib.edu"),
+            ("https://reader:secret@h.test/x", "h.test"),
+            ("https://h.test:443/x", "h.test"),
+            ("https://h.test:8443/x", "h.test:8443"),
+            ("http://h.test/x", "h.test:80"),
+            ("https://bücher.example/x", "xn--bcher-kva.example"),
+            ("https://93.184.216.34/x", "93.184.216.34"),
+            ("https://[2606:4700::1111]:8443/x", "[2606:4700::1111]:8443"),
+            ("blob:https://p.test/1-2", "p.test"),
+            ("about:blank", "no web address"),
+            ("https://h.test./x", "h.test."),
+        ] {
+            assert_eq!(title_host(&u(url)), host, "{url}");
+        }
+        // A right-to-left name: its xn-- form, ASCII only.
+        let rtl = title_host(&u("https://مثال.إختبار/"));
+        assert!(rtl.starts_with("xn--") && rtl.contains(".xn--") && rtl.is_ascii(), "{rtl}");
+        // A very long host keeps its end (the name it is registered under) in sight, bounded.
+        let long = format!("https://www.library.example.edu.{}.evil.example/", "a".repeat(60));
+        let shown = title_host(&u(&long));
+        assert_eq!(shown.chars().count(), TITLE_HOST_MAX);
+        assert!(shown.starts_with('…') && shown.ends_with(".evil.example"), "{shown}");
+        let huge = format!("https://{}x.test/", "a".repeat(5000));
+        if let Ok(parsed) = Url::parse(&huge) {
+            assert!(title_host(&parsed).chars().count() <= TITLE_HOST_MAX);
+        }
+        // Nothing but printable ASCII from the address (no line end, control or bidirectional character).
+        for url in ["https://xn--ls8h.la/", "https://a\u{202e}b.test/", "https://a%2eb.test/", "https://A-B_c.test/", "https://a\u{200b}b.test/"] {
+            if let Ok(parsed) = Url::parse(url) {
+                let h = title_host(&parsed);
+                assert!(h.chars().all(|c| c.is_ascii_graphic()), "{url}: {h:?}");
+                assert!(!window_title(&parsed, Start::Link).chars().any(|c| c.is_control()));
+            }
+        }
+    }
+
+    #[test]
+    fn the_title_follows_the_top_page_and_the_page_cannot_set_it() {
+        let (lib, host, _d) = started("title");
+        let titles = || host.titles.lock().unwrap().clone();
+        assert!(lib.open(&host, "main", TICKET, START, Start::Library));
+        // Before the first page has loaded: the host of the address asked for.
+        assert_eq!(titles(), vec![format!("ezproxy.lib.edu — {TITLE_LIBRARY}")]);
+        // A navigation (a server's redirect included) to another host: that host.
+        lib.page_shown(&host, &u(PDF));
+        assert_eq!(titles().last().unwrap(), &format!("www-jstor-org.ezproxy.lib.edu — {TITLE_LIBRARY}"));
+        // The page changing its own title: the shell's is set again, unchanged.
+        let n = titles().len();
+        lib.page_retitled(&host);
+        assert_eq!(titles().len(), n + 1);
+        assert_eq!(titles().last().unwrap(), &format!("www-jstor-org.ezproxy.lib.edu — {TITLE_LIBRARY}"));
+        lib.page_loaded(&host, &u(PDF), Instant::now());
+        let job = jobs_of(&host).remove(0);
+        lib.finish(&host, job.generation, TICKET, Outcome::HandedOver, Instant::now());
+        // The window re-used for a link's start: at once the asked host and the link's words.
+        assert!(lib.open(&host, "main", TICKET2, LINK, Start::Link));
+        assert_eq!(titles().last().unwrap(), &format!("repository.example.org — {TITLE_LINK}"));
+        lib.page_shown(&host, &u("https://cdn.example.net/x"));
+        assert_eq!(titles().last().unwrap(), &format!("cdn.example.net — {TITLE_LINK}"));
     }
 
     // ----- the fetch, against a local https test server -----
@@ -3497,6 +3916,41 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         assert_eq!(tauri::async_runtime::block_on(fetch_pdf(i, read, &rules(), resolver(), &mut Vec::new())), Err(FetchError::SignIn));
         assert_eq!(fetch(input(s.url("a.test", "/login/paper.pdf"), None), &rules(), &mut Vec::new()), Err(FetchError::SignIn));
         assert_eq!(s.paths(), vec!["a.test/redirect"]);
+    }
+
+    /// R347 a, end to end through the controller and the one request path: the job a link's window
+    /// makes for a PDF on its own host is fetched; a library's window makes none, and its sign-in host
+    /// is never asked; a sign-in path is refused for both kinds.
+    #[test]
+    fn the_kind_of_start_decides_the_opened_host_and_nothing_else() {
+        let s = Server::start("kind");
+        let landing = s.url("a.test", "/landing");
+        let pdf = s.url("a.test", "/paper.pdf");
+        let run = |input: FetchInput| {
+            let read: Box<dyn FnOnce() -> Vec<Cookie<'static>> + Send> = Box::new(jar);
+            tauri::async_runtime::block_on(fetch_pdf(input, read, &rules(), resolver(), &mut Vec::new()))
+        };
+        // A link's window opened at a.test: the PDF on a.test is fetched.
+        let (lib, host, _d) = started("kind-link-fetch");
+        assert!(lib.open(&host, "main", TICKET, landing.as_str(), Start::Link));
+        lib.page_loaded(&host, &pdf, Instant::now());
+        let job = std::mem::take(&mut *host.jobs.lock().unwrap()).remove(0);
+        assert_eq!(run(job.input), Ok(3009));
+        assert_eq!(s.paths(), vec!["a.test/paper.pdf"]);
+        // A library's window opened at a.test: no job; and were a.test reached by a hop, it is not asked.
+        let (lib2, host2, _d2) = started("kind-library-fetch");
+        assert!(lib2.open(&host2, "main", TICKET, landing.as_str(), Start::Library));
+        lib2.page_loaded(&host2, &pdf, Instant::now());
+        assert_eq!(host2.jobs(), 0);
+        let mut i = input(s.url("b.test", &format!("/redirect?to={}", urlencode(pdf.as_str()))), None);
+        i.proxy_host = Some("a.test".into());
+        assert_eq!(run(i), Err(FetchError::SignIn));
+        assert_eq!(s.paths(), vec!["a.test/paper.pdf", "b.test/redirect"]);
+        // A sign-in path, for a link's fetch too (no sign-in host): nothing requested.
+        let mut i = input(s.url("a.test", "/login/paper.pdf"), None);
+        i.proxy_host = None;
+        assert_eq!(run(i), Err(FetchError::SignIn));
+        assert_eq!(s.paths().len(), 2);
     }
 
     /// The client uses no proxy even where the environment names one. Run in a child process of
