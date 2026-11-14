@@ -426,6 +426,22 @@ describe("the start (R324 a–c)", () => {
     expect((await view(p2, c.id)).state).toBe("waiting-sign-in");
   });
 
+  it("R328 d: a waiting entry whose line keeps the copy services' links carries none in its view; back, it has them again", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    await setLibrary();
+    const free = { label: "A free copy may be at" as const, url: "https://repository.example.org/a.pdf", host: "repository.example.org" };
+    const e = await resting(pid, { state: "no-open-copy", offers: [free] });
+    expect((await view(pid, e.id)).offers!.map((o) => o.url)).toContain(free.url);
+    expect((await startFetch(pid, e.id)).status).toBe(200);
+    const waiting = await view(pid, e.id);
+    expect(waiting.state).toBe("waiting-sign-in");
+    expect(waiting.offers).toBeUndefined();
+    // The links are kept on the line for the return.
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${e.id}/library/cancel` })).json.offers.map((o: { url: string }) => o.url)).toContain(free.url);
+  });
+
   it("waiting entries return to what they were at start, and the ticket is gone (R324 b replaces 'No open copy')", async () => {
     await start();
     const path = await openNewLibrary();
