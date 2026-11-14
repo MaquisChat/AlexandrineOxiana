@@ -432,21 +432,24 @@ describe("fetchFile: one download at a time per host, two in all, across callers
     const run = (u: string, n: string) => fetchFile(u, { maxBytes: FREE_COPY_MAX_BYTES, deadlineMs: 180_000, into: target(n) });
     const ps = [run("https://arxiv.org/1", "1"), run("https://arxiv.org/2", "2"), run("https://archive.org/3", "3"), run("https://europepmc.org/4", "4")];
     ps.forEach((p) => p.catch(() => {}));
+    const keys = () => held.map((h) => `${h.origin}${h.path}`).sort();
+    const of = (key: string) => held.find((h) => `${h.origin}${h.path}` === key)!;
     await settle(() => held.length >= 2);
     await settle();
     // arxiv.org/2 waits for its host; europepmc waits for an overall place.
-    expect(held.map((h) => `${h.origin}${h.path}`)).toEqual(["https://arxiv.org/1", "https://archive.org/3"]);
-    held[0]!.respond(200, {}, [PDF], true);
+    expect(keys()).toEqual(["https://archive.org/3", "https://arxiv.org/1"]);
+    of("https://arxiv.org/1").respond(200, {}, [PDF], true);
     await ps[0];
     await settle(() => held.length >= 3);
     await settle();
-    expect(held.map((h) => `${h.origin}${h.path}`)).toEqual(["https://arxiv.org/1", "https://archive.org/3", "https://arxiv.org/2"]);
-    held[1]!.respond(404, {}, [], true);
+    // The freed place goes to the first waiter that can start: arxiv.org/2 (its host is free now), not europepmc.
+    expect(keys()).toEqual(["https://archive.org/3", "https://arxiv.org/1", "https://arxiv.org/2"]);
+    of("https://archive.org/3").respond(404, {}, [], true);
     await refusal(ps[2]!);
     await settle(() => held.length >= 4);
-    expect(held[3]!.origin).toBe("https://europepmc.org");
-    held[2]!.respond(200, {}, [PDF], true);
-    held[3]!.respond(200, {}, [PDF], true);
+    expect(keys()).toContain("https://europepmc.org/4");
+    of("https://arxiv.org/2").respond(200, {}, [PDF], true);
+    of("https://europepmc.org/4").respond(200, {}, [PDF], true);
     await Promise.all([ps[1], ps[3]]);
   });
 
