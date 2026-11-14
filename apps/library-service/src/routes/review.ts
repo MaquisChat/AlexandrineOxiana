@@ -155,7 +155,7 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     } catch (err) {
       if (err instanceof FindRunnerClosedError) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed);
       if (err instanceof FindProjectStoppedError) throw new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.projectStopped);
-      if (err instanceof HeldFileSourceGoneError) throw new ApiError(409, "CONFLICT", err.message);
+      if (err instanceof HeldFileSourceGoneError) throw new ApiError(409, "CONFLICT", err.message, "source-gone");
       throw err;
     }
     state.publishState();

@@ -25,6 +25,10 @@
  * choosing a value through the source screen's own badge and confirm (FieldCheck, R149). A locked
  * project's entries are neither listed nor decided, and nothing about them is shown; answers for
  * another project, after a lock or after the screen closed are dropped.
+ *
+ * "Files found for records" (Find and acquire, F11, R277 d): a file found for a record that did not clearly match it
+ * is held in the project. Its entry shows the record's title, what the check found (all of it outside text, through
+ * UserText) and "Use this file" / "Not this file" — one request per decision, through the service's own route.
  */
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
 import { ApiClientError, type ApiClient } from "../../api/client";
@@ -43,7 +47,16 @@ import {
   type SourceListItem,
   type Tag,
 } from "../../api/import";
-import { PROJECT_REVIEW_PAGE_MAX, reviewGroup } from "@ao/shared";
+import {
+  HELD_FILE_REVIEW_TEXT,
+  HELD_FILE_WHY_TEXT,
+  PROJECT_REVIEW_PAGE_MAX,
+  reviewGroup,
+  type HeldFileDecision,
+  type HeldFileDecisionRequest,
+  type HeldFileDecisionResponse,
+  type ReviewHeldFile,
+} from "@ao/shared";
 import { isProjectLocked, libraryApi } from "../../api/library";
 import { verificationApi, type FieldReview } from "../../api/verification";
 import { CodeSwatch } from "../../components/CodeSwatch";
@@ -133,8 +146,12 @@ const groupOf = (i: ReviewItem): ReviewGroup => i.group ?? reviewGroup(i);
 const GROUP_TITLES: Record<Exclude<ReviewGroup, "import">, string> = {
   attach: "Added by hand",
   capture: "From captures",
+  "found-file": "Files found for records",
   withdrawal: "After a consent withdrawal",
 };
+
+/** An entry of the project's queue as the service sends it, with what the check found about a held file (F11). */
+type HeldItem = ReviewItem & { heldFile?: ReviewHeldFile };
 
 const DATE = new Intl.DateTimeFormat("en", { dateStyle: "medium" });
 
@@ -157,6 +174,7 @@ function groupsOf(items: ReviewItem[], batches: BatchSummary[]): Group[] {
   const rest: Record<Exclude<ReviewGroup, "import">, Group> = {
     attach: { key: "attach", title: GROUP_TITLES.attach, items: [] },
     capture: { key: "capture", title: GROUP_TITLES.capture, items: [] },
+    "found-file": { key: "found-file", title: GROUP_TITLES["found-file"], items: [] },
     withdrawal: { key: "withdrawal", title: GROUP_TITLES.withdrawal, items: [] },
   };
   items.forEach((item, at) => {
@@ -168,7 +186,7 @@ function groupsOf(items: ReviewItem[], batches: BatchSummary[]): Group[] {
       grp.items.push({ item, n: at + 1 });
     } else rest[g].items.push({ item, n: at + 1 });
   });
-  return [...imports.values(), rest.attach, rest.capture, rest.withdrawal].filter((g) => g.items.length > 0);
+  return [...imports.values(), rest.attach, rest.capture, rest["found-file"], rest.withdrawal].filter((g) => g.items.length > 0);
 }
 
 export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = PROJECT_PAGE }: ReviewQueueProps) {
@@ -486,6 +504,40 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     }
   };
 
+  /**
+   * "Use this file" / "Not this file" on a held file (F11): one request per decision, however often it is pressed.
+   * Decided, the entry leaves the view (focus to the next entry, or the heading). A refusal is said in the service's
+   * own sentence and the entry stays; one already decided elsewhere leaves the view.
+   */
+  const [heldError, setHeldError] = useState<{ id: string; text: string } | null>(null);
+  const decideHeld = async (item: ReviewItem, decision: HeldFileDecision) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    const g = gen.current;
+    setBusy(true);
+    setHeldError(null);
+    try {
+      const body: HeldFileDecisionRequest = { projectId, decision };
+      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body });
+      if (g !== gen.current) return;
+      leave([item.id], (n) => `${decision === "attach" ? "File added to its record" : "File removed; the record keeps no file"}: ${titleFor(item, n)}`);
+    } catch (e) {
+      if (g !== gen.current) return;
+      if (isProjectLocked(e)) {
+        forget();
+        return;
+      }
+      if (e instanceof ApiClientError && e.code === "CONFLICT" && e.reason !== "source-gone") {
+        leave([item.id], (n) => `This entry had already been decided, so it left the queue: ${titleFor(item, n)}`);
+        return;
+      }
+      setHeldError({ id: item.id, text: e instanceof ApiClientError && e.message ? e.message : errorText(e) });
+    } finally {
+      busyRef.current = false;
+      if (g === gen.current) setBusy(false);
+    }
+  };
+
   const bulk = async (patch: ReviewPatch, done: string) => {
     if (!selected.length || busyRef.current) return;
     busyRef.current = true;
@@ -640,7 +692,17 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               onConfirm={(field, value) => confirmField(item, field, value)}
             />
           )}
-          {item && item.kind !== "import" && (
+          {item && groupOf(item) === "found-file" && (
+            <HeldFilePanel
+              key={item.id}
+              item={item as HeldItem}
+              recordTitle={titleOf(shownSource) || item.title || ""}
+              busy={busy}
+              error={heldError?.id === item.id ? heldError.text : null}
+              onDecide={(d) => void decideHeld(item, d)}
+            />
+          )}
+          {item && item.kind !== "import" && groupOf(item) !== "found-file" && (
             <VerificationPanel
               key={item.id}
               item={item}
@@ -784,6 +846,94 @@ function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm, onRev
                 }} />}
           </Section>
         )}
+      </Section>
+    </div>
+  );
+}
+
+/** A file's size in words: "2.3 MB", "640 KB". */
+function sizeText(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+interface HeldFilePanelProps {
+  item: HeldItem;
+  /** The record's title (its source's, as loaded or as sent with the entry). */
+  recordTitle: string;
+  busy: boolean;
+  /** The service's sentence when the last decision was refused. */
+  error: string | null;
+  onDecide(decision: HeldFileDecision): void;
+}
+
+/**
+ * A file Find and acquire found for a record, held because it did not clearly match (F11, R277 d): the record's title,
+ * the sentence, and what the check found so the researcher can judge — the reason in words, the DOI the file names,
+ * its embedded title, the start of its text, its kind and size. Everything from the file is outside text (UserText).
+ * Opening the file itself is not offered here yet.
+ */
+function HeldFilePanel({ item, recordTitle, busy, error, onDecide }: HeldFilePanelProps) {
+  const h = item.heldFile;
+  const named = recordTitle || "this record";
+  return (
+    <div className="ao-review__panel">
+      <Section title="File found for this record" level={2} className="ao-review__record">
+        <UserText as="p" className="ao-review__title">
+          {recordTitle || "Untitled"}
+        </UserText>
+        <p>{HELD_FILE_REVIEW_TEXT}</p>
+        <Section title="What the check found" level={3}>
+          {h ? (
+            <dl className="ao-review__fields">
+              <dt>Why</dt>
+              <dd>{HELD_FILE_WHY_TEXT[h.why] ?? "The file did not clearly match its record."}</dd>
+              {h.fileDoi && (
+                <>
+                  <dt>DOI the file names</dt>
+                  <dd>
+                    <UserText>{h.fileDoi}</UserText>
+                  </dd>
+                </>
+              )}
+              {h.embeddedTitle && (
+                <>
+                  <dt>Title in the file</dt>
+                  <dd>
+                    <UserText>{h.embeddedTitle}</UserText>
+                  </dd>
+                </>
+              )}
+              {h.textStart && (
+                <>
+                  <dt>Start of the file's text</dt>
+                  <dd>
+                    <UserText>{h.textStart}</UserText>
+                  </dd>
+                </>
+              )}
+              <dt>File</dt>
+              <dd>{`${h.kind === "epub" ? "EPUB" : "PDF"}, ${sizeText(h.bytes)}`}</dd>
+            </dl>
+          ) : (
+            <p>Nothing more is known about this file.</p>
+          )}
+        </Section>
+        {error && (
+          <p role="alert" className="ao-error">
+            The decision was not recorded. {error}
+          </p>
+        )}
+        <div className="ao-import__actions">
+          <button type="button" className="ao-import__primary" disabled={busy} aria-label={`Use this file for ${named}`} onClick={() => onDecide("attach")}>
+            Use this file
+          </button>
+          <button type="button" disabled={busy} aria-label={`Not this file for ${named}`} onClick={() => onDecide("discard")}>
+            Not this file
+          </button>
+        </div>
+        <p className="ao-import__hint">“Use this file” adds it to the record, saying that you accepted it after the check. “Not this file” removes it.</p>
       </Section>
     </div>
   );

@@ -483,3 +483,88 @@ describe("Review queue: the file under review (Task 57, R135)", () => {
     expect(await within(preview).findByText(/The picture could not be shown/)).toBeTruthy();
   });
 });
+
+describe("a file found for a record that did not clearly match it (F11, R277 d)", () => {
+  const RECORD = "Rivers and Memory in Upland Villages";
+  const heldItem = (n: number, extra: Partial<ReviewItem> = {}): ReviewItem =>
+    ({
+      ...item(n, { kind: "verification", batchId: undefined, method: undefined, confidence: undefined, group: "found-file", cause: { kind: "acquired-file-mismatch", findEntryId: `e${n}` }, reasons: ["A file was found for this record, but it did not clearly match."], title: RECORD }),
+      heldFile: { why: "other-doi", kind: "pdf", bytes: 2_400_000, fileDoi: "10.5555/ao.f11.other", embeddedTitle: "<b>A Different Paper</b> ‮Entirely", textStart: "A Different Paper Entirely. Abstract. <img src=x onerror=alert(1)>" },
+      ...extra,
+    }) as ReviewItem;
+  const project = (handlers: ServiceSetup["extra"] = []): ServiceSetup => ({
+    projectReview: { [P1]: [heldItem(7), heldItem(8, { sourceId: "s8", title: "A Second Record" })] },
+    sources: { s7: source(7, RECORD), s8: source(8, "A Second Record") },
+    extra: [
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        (heldCalls as Array<{ id: string; body: unknown }>).push({ id: params.itemId as string, body: await request.json() });
+        return HttpResponse.json({ decided: true });
+      }),
+      ...handlers,
+    ],
+  });
+  let heldCalls: Array<{ id: string; body: unknown }> = [];
+  beforeEach(() => {
+    heldCalls = [];
+  });
+  const open = (o: ServiceSetup) => {
+    const m = mockService(o);
+    const user = userEvent.setup();
+    render(<ReviewQueue client={m.client} projectId={P1} />);
+    return { m, user };
+  };
+
+  it("has its own group, and shows the record's title, the sentence and what the check found, as text only", async () => {
+    open(project());
+    expect(await screen.findByRole("heading", { name: "Files found for records" })).toBeTruthy();
+    const panel = await screen.findByRole("region", { name: "File found for this record" });
+    expect(within(panel).getByText(RECORD)).toBeTruthy();
+    expect(within(panel).getByText("A file was found for this record, but it did not clearly match.")).toBeTruthy();
+    expect(within(panel).getByText("The file names another DOI as its own.")).toBeTruthy();
+    expect(within(panel).getByText("10.5555/ao.f11.other")).toBeTruthy();
+    // Outside text, never markup: shown as typed, with bidi isolation (UserText).
+    expect(within(panel).getByText(/<b>A Different Paper<\/b>/u)).toBeTruthy();
+    expect(within(panel).getByText(/<img src=x onerror=alert\(1\)>/u)).toBeTruthy();
+    expect(panel.querySelector("b, img")).toBeNull();
+    expect(within(panel).getByText(/PDF, 2\.3 MB/u)).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: `Not this file for ${RECORD}` })).toBeTruthy();
+  });
+
+  it("Use this file sends one decision, and the entry leaves; focus goes to the next entry", async () => {
+    const { user } = open(project());
+    const use = await screen.findByRole("button", { name: `Use this file for ${RECORD}` });
+    await user.dblClick(use);
+    await waitFor(() => expect(screen.queryByRole("button", { name: `Use this file for ${RECORD}` })).toBeNull());
+    expect(heldCalls).toEqual([{ id: "r7", body: { projectId: P1, decision: "attach" } }]);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Show A Second Record" })));
+    expect(screen.getByRole("status").textContent).toMatch(/File added to its record: Rivers and Memory/u);
+  });
+
+  it("Not this file sends its decision; with nothing left, focus goes to the queue's heading", async () => {
+    const o = project();
+    o.projectReview = { [P1]: [heldItem(7)] };
+    const { user } = open(o);
+    await user.click(await screen.findByRole("button", { name: `Not this file for ${RECORD}` }));
+    await waitFor(() => expect(screen.getByText("Nothing is waiting for review in this project.")).toBeTruthy());
+    expect(heldCalls).toEqual([{ id: "r7", body: { projectId: P1, decision: "discard" } }]);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Review queue" }));
+    expect(screen.getByRole("status").textContent).toMatch(/File removed/u);
+  });
+
+  it("a refusal shows the service's sentence, and the entry stays", async () => {
+    const refuse = http.post(`${SERVICE}/review/:itemId/held-file`, () =>
+      HttpResponse.json(
+        { error: { code: "CONFLICT", message: "The record this file was found for is no longer in the library, so the file cannot be added to it. Choose “Not this file” to remove it. Nothing was changed.", reason: "source-gone" } },
+        { status: 409 },
+      ),
+    );
+    const o = project();
+    o.extra = [refuse];
+    const { user } = open(o);
+    await user.click(await screen.findByRole("button", { name: `Use this file for ${RECORD}` }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/no longer in the library, so the file cannot be added to it/u);
+    expect(screen.getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
+  });
+});
