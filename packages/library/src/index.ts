@@ -229,6 +229,7 @@ export {
   ZOTERO_SYNC_MAX_LINKS,
   ZOTERO_SYNC_NEWER_SENTENCE,
   ZOTERO_SYNC_REASONS,
+  ZoteroSyncFileBusyError,
   ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
   pauseAllZoteroSyncLinks,
@@ -237,6 +238,7 @@ export {
   readZoteroSyncSettings,
   updateZoteroSyncSettings,
   writeZoteroSyncSettings,
+  zoteroHistoryBackoff,
 } from "./import/zotero-sync-settings.js";
 export type {
   ZoteroSyncCounts,

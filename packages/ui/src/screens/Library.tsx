@@ -24,6 +24,7 @@ import { StatusBanner, bannersFor, useNoticeDismiss, volumeOf } from "../compone
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
 import { findHref } from "../api/find";
+import { zoteroSyncEventOf } from "../api/zoteroSync";
 import { watchedFoldersHref } from "../api/watchedFolders";
 import "../components/library.css";
 import { navigate as goTo, PATHS } from "../navigation";
@@ -33,6 +34,7 @@ import { madeSince, NewProject, type UnresolvedCreate } from "./NewProject";
 import { NewRecoveryCode } from "./NewRecoveryCode";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
+import { LibraryZotero, type ZoteroEvents } from "./LibraryZotero";
 
 /** Where "needs review" outcomes send the researcher (the import review queue, Task 35). */
 export const REVIEW_QUEUE_PATH = PATHS.reviewQueue;
@@ -139,6 +141,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [unresolved, setUnresolved] = useState<{ create: UnresolvedCreate; state: "unknown" | "still-unknown" | "checking" | "not-created" | { found: ProjectSummary } } | null>(null);
   /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
   const [stateSeq, setStateSeq] = useState(0);
+  /** What the Zotero sync's events said (Task Z12: the lines under the header read again after a finished one), and whether the library is still open. */
+  const [zoteroEvents, setZoteroEvents] = useState<ZoteroEvents>({ n: 0, finished: 0 });
+  const [libraryOpen, setLibraryOpen] = useState(true);
 
   const readOnly = state.mode !== "read-write";
   const project = projects?.find((p) => p.id === projectId);
@@ -222,6 +227,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           if (e.type === "library.state" && e.data && typeof e.data === "object") {
             const d = e.data as LibraryState;
             if (d.open === false) {
+              setLibraryOpen(false);
               clearPendingFind();
               // A new project's recovery code on screen is never taken away (R134 I2): the dialog
               // says the library closed, and the library is left once the code is confirmed.
@@ -229,9 +235,15 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               else closedRef.current?.();
               continue;
             }
+            setLibraryOpen(true);
             // Each event is the whole state: a reason, lock holder or index state it no longer names is gone.
             setState(({ readOnlyReason: _r, lockedBy: _l, index: _i, ...s }) => ({ ...s, ...d }));
             setStateSeq((n) => n + 1);
+          }
+          const zotero = zoteroSyncEventOf(e);
+          if (zotero) {
+            const done = zotero.state === "finished";
+            setZoteroEvents((z) => ({ n: z.n + 1, finished: z.finished + (done ? 1 : 0), ...(done ? {} : { run: { ref: zotero.ref, done: zotero.done ?? 0, total: zotero.total ?? 0 } }) }));
           }
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
@@ -584,6 +596,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           )}
         </div>
       </header>
+      <LibraryZotero api={api} projectId={project?.id} open={libraryOpen && !closedUnder} events={zoteroEvents} />
       {recovering && (
         <NewRecoveryCode
           api={api}

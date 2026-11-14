@@ -12,7 +12,7 @@ import { Writable } from "node:stream";
 // The service has no undici of its own: the library's (the one its Web import uses) sets the global dispatcher.
 import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { deviceDeps, type Deps, type ZoteroSyncLink, type ZoteroSyncRun, type ZoteroSyncSettings } from "@ao/library";
+import { ZOTERO_SYNC_HISTORY_MAX, deviceDeps, readZoteroSyncHistory, type Deps, type ZoteroSyncLink, type ZoteroSyncRun, type ZoteroSyncSettings } from "@ao/library";
 import { useMemorySecrets } from "../../../packages/library/src/secrets-testing.js";
 import { _setSecretBackend, setSecret } from "../../../packages/library/src/secrets.js";
 import { FakeZotero, guardNetwork } from "../../../packages/library/tests/zotero/fake-zotero.js";
@@ -227,6 +227,30 @@ describe("the scheduler alone (fake timers, the fake clock)", () => {
     expect(starts).toHaveLength(1);
     await minutes(1);
     expect(starts.map((s) => s.at)).toEqual([T0.getTime() + 2 * MIN, T0.getTime() + 32 * MIN]);
+  });
+
+  it("R299 f (M5): a link whose every run the project's rules refuse: one record failed / rules-denied per interval, nothing between, over many intervals", async () => {
+    outcome = "failed";
+    settings!.everyMinutes = 30;
+    make({
+      run: async (l, trigger) => {
+        expect(trigger).toBe("automatic");
+        starts.push({ ref: l.ref, at: Date.now() });
+        const rec = record(l, Date.now(), { trigger: "automatic", outcome: "failed", reason: "rules-denied" });
+        records.unshift(rec);
+        return rec;
+      },
+    }).start();
+    await minutes(2);
+    for (let i = 1; i <= 24; i++) {
+      await minutes(29);
+      expect(starts, `interval ${i}`).toHaveLength(i);
+      await minutes(1);
+      expect(starts, `interval ${i}`).toHaveLength(i + 1);
+    }
+    expect(starts.map((s) => s.at)).toEqual(Array.from({ length: 25 }, (_, i) => T0.getTime() + 2 * MIN + i * 30 * MIN));
+    expect(records.every((r) => r.outcome === "failed" && r.reason === "rules-denied" && r.trigger === "automatic")).toBe(true);
+    expect(records).toHaveLength(25);
   });
 
   it("back-off holds every link until its time", async () => {
@@ -1044,6 +1068,40 @@ describe("the scheduler in the service", () => {
     expect(finished()).toEqual([]);
     expect(z.requests).toEqual([]);
   }, 120_000);
+
+  it("R299 f (M5): a link whose every run the rules refuse, through the real runner: one record failed / rules-denied per interval, nothing between, the history bounded by its limit", async () => {
+    await openLibrary();
+    const made = await call({ method: "POST", url: "/projects", body: { name: "Denied", governanceYaml: `${GOV}captureMethods: [downloader]\n`, encryption: { enabled: false } } });
+    expect(made.status, made.body).toBe(200);
+    const pid = made.json.project.id as string;
+    addItems(U, 2);
+    // The history already holds all but two of its limit for this link: older runs the rules refused.
+    const libId = svc.state.session!.lib.id;
+    const old = Array.from({ length: ZOTERO_SYNC_HISTORY_MAX - 2 }, (_, i): ZoteroSyncRun => {
+      const t = Date.now() - (ZOTERO_SYNC_HISTORY_MAX - i) * HOUR;
+      return { id: `old-${i}`, ref: U, projectId: pid, trigger: "automatic", startedAt: new Date(t - MIN).toISOString(), finishedAt: new Date(t).toISOString(), outcome: "failed", reason: "rules-denied" };
+    }).reverse();
+    await writeFile(join(deps.appConfigDir, "zotero-sync-history.json"), JSON.stringify({ v: 1, libraries: { [libId]: old } }), { mode: 0o600 });
+    await saveSettings([linkOf(U, pid)], { everyMinutes: 30 });
+    const fresh = async () => (await readZoteroSyncHistory(deps.appConfigDir, libId)).filter((r) => !r.id.startsWith("old-"));
+    await ticks(2);
+    expect(await fresh()).toHaveLength(1);
+    for (let i = 1; i <= 3; i++) {
+      await ticks(29);
+      expect(await fresh(), `interval ${i}: nothing between`).toHaveLength(i);
+      await ticks(1);
+      expect(await fresh(), `interval ${i}`).toHaveLength(i + 1);
+    }
+    const runs = await readZoteroSyncHistory(deps.appConfigDir, libId);
+    // Bounded: the newest ZOTERO_SYNC_HISTORY_MAX are kept, the four new ones first.
+    expect(runs).toHaveLength(ZOTERO_SYNC_HISTORY_MAX);
+    expect(runs.slice(0, 4).map((r) => [r.trigger, r.outcome, r.reason])).toEqual(Array.from({ length: 4 }, () => ["automatic", "failed", "rules-denied"]));
+    expect(runs.slice(0, 4).every((r) => !r.id.startsWith("old-"))).toBe(true);
+    expect(runs.filter((r) => r.id.startsWith("old-"))).toHaveLength(ZOTERO_SYNC_HISTORY_MAX - 4);
+    // Nothing came in, and nothing was asked of Zotero's items after a refusal.
+    expect(await sourceCount(pid)).toBe(0);
+    expect(z.requests.filter((r) => /\/items/u.test(r.path))).toEqual([]);
+  }, 180_000);
 
   it("the key is never read by the scheduler (R78): passes that start nothing ask the password store nothing", async () => {
     await openLibrary();
