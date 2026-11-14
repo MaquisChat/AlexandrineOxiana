@@ -82,6 +82,8 @@ export interface ServiceOptions {
   watchLocationEnv?: LocationEnv;
   /** Test seam (NODE_ENV=test or VITEST only, R47): the watched-folder routes' time limit for a folder's file calls. */
   watchFsTimeoutMs?: number;
+  /** Test seam: the tick of the automatic Zotero sync's scheduler (StateOptions.zoteroTickMs). main.ts passes AO_ZOTERO_TICK_MS, honoured under NODE_ENV=test only (Task Z11, R289). */
+  zoteroTickMs?: number;
 }
 
 export interface LibraryService {
@@ -158,6 +160,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     ...(opts.closeGraceMs !== undefined ? { closeGraceMs: opts.closeGraceMs } : {}),
     ...(opts.rebuildIndexIfNeeded ? { rebuildIndexIfNeeded: opts.rebuildIndexIfNeeded } : {}),
     ...(opts.startupTimer ? { startupTimer: opts.startupTimer } : {}),
+    ...(opts.zoteroTickMs !== undefined ? { zoteroTickMs: opts.zoteroTickMs } : {}),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);
