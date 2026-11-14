@@ -24,6 +24,9 @@ import {
   decidePerson,
   fetchWork,
   fitAuthorEntry,
+  fitPeople,
+  hasInitial,
+  titleCovered,
   peopleSearchUrl,
   peopleSearchWanted,
   sameWork,
@@ -34,7 +37,7 @@ import {
 } from "./people.js";
 import { sanitizeEntry } from "./queue-store.js";
 import { parseReference, type Reference } from "./reference.js";
-import { openAlexSearchPausedUntil } from "./search.js";
+import { decideMatch, openAlexSearchPausedUntil, scoreCandidate } from "./search.js";
 import { FIND_LINE_MAX_BYTES, type FindEntry, type PersonCandidate } from "./types.js";
 
 const OA = "https://api.openalex.org";
@@ -117,11 +120,21 @@ afterEach(async () => {
   await rm(tmp, { recursive: true, force: true });
 });
 
-describe("when the people search is asked (R267 d)", () => {
-  it("a line with a clear title makes no people request", () => {
-    // A work candidate covers 0.6 or more of its title: a title is plainly meant.
-    expect(peopleSearchWanted(ref("Hochschild, The Managed Heart"), [cand("The Managed Heart")])).toBe(false);
-    expect(peopleSearchWanted(ref("Hochschild Managed Heart Feeling"), [cand("The Managed Heart: Commercialization of Human Feeling")])).toBe(false);
+describe("when the people search is asked (R267 d, as changed by R279 a)", () => {
+  it("a line the works rule is sure of makes no people request", () => {
+    const sure = [cand("Zorblatt Grammar of Habitus", "Quillfeather")];
+    const line = ref("Quillfeather, Zorblatt Grammar of Habitus");
+    // A guard: the works rule is sure of it.
+    expect(decideMatch(line, sure).kind).toBe("sure");
+    expect(peopleSearchWanted(line, sure)).toBe(false);
+  });
+  it("R279 a: a work whose title is covered by what was typed no longer stops it when the works rule is not sure", () => {
+    // A short title typed without its author.
+    const short = [cand("Lanterns of the Estuary", "Brackwater")];
+    expect(scoreCandidate(ref("Lanterns of the Estuary"), short[0]!).titleCover).toBeGreaterThanOrEqual(0.6);
+    expect(peopleSearchWanted(ref("Lanterns of the Estuary"), short)).toBe(true);
+    // A name that a reference work holds an entry TITLED with.
+    expect(peopleSearchWanted(ref("Ottoline Brackwater"), [cand("Ottoline Brackwater", "Editors")])).toBe(true);
   });
   it("a digit (a year, a DOI, an ISBN) or more than 6 words: no people request", () => {
     expect(peopleSearchWanted(ref("Arlie Hochschild 1983"), [])).toBe(false);
@@ -233,6 +246,19 @@ describe("decidePerson (the Global Constraint's rule)", () => {
     expect(decidePerson(ref("Arlie Hochschild"), [p("A3", "Adam Hochschild")], [])).toEqual({ kind: "none" });
     expect(decidePerson(ref("Hochschild Second Shift"), [p("A1", "Arlie Hochschild")], [cand("The Second Shift")])).toEqual({ kind: "none" });
     expect(decidePerson(ref("Arlie Hochschild"), [], [])).toEqual({ kind: "none" });
+  });
+  it("R279: the name rule alone (fitPeople) holds whatever the works found; titleCovered says whether a work's title is covered", () => {
+    const found = [p("A1", "Ottoline Brackwater"), p("A2", "Ottoline Brackwell")];
+    const titled = [cand("Ottoline Brackwater", "Editors")];
+    expect(titleCovered(ref("Ottoline Brackwater"), titled)).toBe(true);
+    expect(titleCovered(ref("Ottoline Brackwater"), [cand("Lanterns of the Estuary", "Brackwater")])).toBe(false);
+    // decidePerson as built: a covered title means none …
+    expect(decidePerson(ref("Ottoline Brackwater"), found, titled)).toEqual({ kind: "none" });
+    // … the name rule alone still finds the person (the app then asks, and offers both).
+    expect(fitPeople(ref("Ottoline Brackwater"), found)).toEqual({ kind: "one", person: found[0], byInitial: false });
+    expect(fitPeople(ref("O. Brackwater"), found)).toEqual({ kind: "one", person: found[0], byInitial: true });
+    expect(hasInitial(ref("O. Brackwater"))).toBe(true);
+    expect(hasInitial(ref("Ottoline Brackwater"))).toBe(false);
   });
 });
 

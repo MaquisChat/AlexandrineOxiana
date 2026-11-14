@@ -71,7 +71,7 @@ import {
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
 import type { WorkCandidate } from "./candidates.js";
-import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, childTyped, decidePerson, fetchWork, fitAuthorEntry, isPersonId, isWorkId, peopleSearchWanted, sameWork, searchPeople, worksOf } from "./people.js";
+import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, authorOfferProbe, childTyped, fetchWork, fitAuthorEntry, fitPeople, hasInitial, isPersonId, isWorkId, peopleSearchWanted, sameWork, searchPeople, titleCovered, worksOf } from "./people.js";
 import { FindQueueUnreadableError, sanitizeEntry } from "./queue-store.js";
 import { parseReference, type Reference } from "./reference.js";
 import { decideMatch, openAlexSearchPausedUntil, scoreCandidate, searchWorks, type SearchSource } from "./search.js";
@@ -167,6 +167,14 @@ export class FindUnknownOptionError extends Error {
   }
 }
 
+/** Task F8b (R279 c): `asAuthor` on an entry that is not in "choose" with an author offer. Nothing was changed. */
+export class FindNoAuthorError extends Error {
+  override name = "FindNoAuthorError";
+  constructor() {
+    super("This entry has no author to show.");
+  }
+}
+
 /** Task F8: a work already added from this entry, named by its position in the request only. Nothing was added. */
 export class FindAlreadyAddedError extends Error {
   override name = "FindAlreadyAddedError";
@@ -246,6 +254,15 @@ export interface FindRunner {
    * then made from a fresh request for that one work by its id, through the duplicate check, as a chosen candidate.
    */
   chooseWorks(projectId: string, entryId: string, workIds: string[]): Promise<{ added: FindEntry[]; parent: FindEntry }>;
+  /**
+   * Task F8b (R279 c): for an entry in "choose" that carries an author offer (people stored beside its candidates)
+   * only — else FindNoAuthorError, nothing changed. Turns it into the author's flow with the people ALREADY stored (no
+   * new people search), its work candidates dropped in the same one governed write: "choose-person" when more than one
+   * person is stored, a single letter was typed (an initial), or more people exist than are stored; otherwise
+   * "looking-up" with that one person chosen, whose works the runner then fetches (as after `choosePerson`) to make it
+   * "choose-works". Refused after `stop` or `stopAll` (R245).
+   */
+  asAuthor(projectId: string, entryId: string): Promise<FindEntry>;
   remove(projectId: string, entryId: string): Promise<void>;
   /** At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry (nothing else). */
   resume(projectId: string): void;
@@ -329,18 +346,22 @@ function boundCandidate(c: WorkCandidate): WorkCandidate {
  * runner could have known.
  */
 function fit(given: FindEntry): FindEntry {
+  // F8b (R279 c): an entry asking among works that also carries an author offer (people beside its candidates): the
+  // candidates are fitted first, leaving room for at least one person (`authorOfferProbe`), then the people that fit.
+  const offer = !!given.people?.length && !!given.candidates && !given.works;
   // An author's entry (F8): its people and works bounded so that the line fits by construction.
-  const e = given.people || given.works ? fitAuthorEntry(given) : given;
+  const e = (given.people || given.works) && !offer ? fitAuthorEntry(given) : given;
   if (!e.candidates) return e;
   let candidates = e.candidates.slice(0, CANDIDATES_KEPT).map(boundCandidate);
-  const size = (cs: WorkCandidate[]) => Buffer.byteLength(JSON.stringify({ ...e, candidates: cs }), "utf8");
+  const base = offer ? authorOfferProbe(e) : e;
+  const size = (cs: WorkCandidate[]) => Buffer.byteLength(JSON.stringify({ ...base, candidates: cs }), "utf8");
   while (size(candidates) > FIND_LINE_MAX_BYTES && candidates.length > 1) {
     const i = candidates.map((c) => c.id !== e.chosen).lastIndexOf(true);
     candidates = candidates.filter((_, j) => j !== (i < 0 ? candidates.length - 1 : i));
   }
   if (size(candidates) > FIND_LINE_MAX_BYTES) candidates = candidates.map((c) => ({ ...c, creators: c.creators.slice(0, 10) }));
-  const out = { ...e, candidates };
-  return sanitizeEntry(out) ? out : evolve(e, {}, ["candidates"], e.updatedAt);
+  const out = offer ? fitAuthorEntry({ ...e, candidates }) : { ...e, candidates };
+  return sanitizeEntry(out) ? out : evolve(out, {}, ["candidates"], e.updatedAt);
 }
 
 /** The duplicate keys of a work candidate. */
@@ -850,7 +871,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // waits for this turn (R247 d), and a lock in between is healed at `resume` (R247 e).
     const settle = async (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = [], force = false) => {
       if (!force && !live()) return null;
-      const [w] = await write(pid, [evolve(cur, { ...keep, ...patch }, ["reason", "nextTryAt", ...drop], at)], "update");
+      // F8b: an author offer the entry carried goes in this same write (a work was taken, R279 c).
+      const [w] = await write(pid, [evolve(cur, { ...keep, ...patch }, ["reason", "nextTryAt", "people", "morePeople", ...drop], at)], "update");
       return w!;
     };
 
@@ -1181,9 +1203,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // A late answer (after a stop or a lock) is not acted on.
     if (!live()) return;
 
-    // Task F8 (R267 d): an author alone? The people search is asked only when it can change the outcome (the exact
-    // condition is `peopleSearchWanted`: no digit, at most 6 words, no work candidate covering 0.6 of its title), and
-    // only when OpenAlex is on and allowed. A failure or the spent allowance: the retries or the wait, never a guess.
+    // Task F8 (R267 d, as changed by R279 a): an author alone? The people search is asked for a line that may be a
+    // name and that the works rule is not sure of (the exact condition is `peopleSearchWanted`: no digit, at most 6
+    // words, not sure), and only when OpenAlex is on and allowed. A failure or the spent allowance: the retries or the
+    // wait, never a guess.
+    /** R279 c: people that fit while a work's title is covered too — offered beside the works' "choose". */
+    let offer: Partial<FindEntry> = {};
     if (sources.includes("openalex") && peopleSearchWanted(ref, res.candidates)) {
       let found: Awaited<ReturnType<typeof searchPeople>>;
       try {
@@ -1193,7 +1218,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         throw err;
       }
       if (!live()) return;
-      const who = decidePerson(ref, found.people, res.candidates);
+      const fits = fitPeople(ref, found.people);
+      // R279 b, c: a person fits and no work's title is covered: the author's flow as built (below). A person fits AND a
+      // work's title is covered: the works' outcome as built, carrying the people as an offer (never a guess either way).
+      const who = titleCovered(ref, res.candidates) ? { kind: "none" as const } : fits;
+      if (fits.kind !== "none" && who.kind === "none") offer = { people: fits.kind === "one" ? [fits.person] : fits.people, ...(found.more ? { morePeople: true as const } : {}) };
       const more = found.more ? { morePeople: true as const } : {};
       const drop: Array<keyof FindEntry> = ["nextTryAt", "reason", "candidates", "chosen", "works", "morePeople", "moreWorks", "match"];
       // More people than the 20 read may fit as well: the one that fitted is offered, never chosen in silence.
@@ -1244,7 +1273,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const byId = new Map(res.candidates.map((c) => [c.id, c]));
       const ids = decision.kind === "choose" ? decision.ids : res.candidates.map((c) => c.id);
       const candidates = ids.map((id) => byId.get(id)!).filter(Boolean);
-      await finish({ state: "choose", candidates }, ["nextTryAt", "reason"]);
+      // F8b: with the author offer, if any (the people found; R279 c).
+      await finish({ state: "choose", candidates, ...offer }, ["nextTryAt", "reason", "people", "morePeople"]);
       return;
     }
     const cand = res.candidates.find((c) => c.id === decision.id)!;
@@ -1328,7 +1358,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         throw new FindEntryStateError();
       }
       if (candidateId === null) {
-        const [w] = await write(projectId, [evolve(cur, { state: "not-found" }, ["chosen", "reason", "nextTryAt"], stamp())], "update");
+        // F8b: "None of these" ends an author offer too (R279 c).
+        const [w] = await write(projectId, [evolve(cur, { state: "not-found" }, ["chosen", "reason", "nextTryAt", "people", "morePeople"], stamp())], "update");
         return w!;
       }
       const cand = cur.candidates?.find((c) => c.id === candidateId);
@@ -1392,7 +1423,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // nothing to compare with, the work is asked about again.
       const keepCandidates = workOfAdded(cur) !== undefined && cur.state === "failed" && cur.candidates?.some((c) => c.id === workOfAdded(cur));
       const keepChosen = isPersonId(cur.chosen) && !!cur.people?.some((x) => x.id === cur.chosen);
-      const drop: Array<keyof FindEntry> = ["reason", "nextTryAt", "duplicateOf", "elsewhere", "match", ...(keepCandidates ? [] : (["candidates"] as const)), ...(keepChosen ? [] : (["chosen"] as const))];
+      // F8b: otherwise it starts afresh — people stored for an author offer are not kept (R279 c).
+      const drop: Array<keyof FindEntry> = ["reason", "nextTryAt", "duplicateOf", "elsewhere", "match", ...(keepCandidates ? [] : (["candidates"] as const)), ...(keepChosen ? [] : (["chosen", "people", "morePeople"] as const))];
       const [next] = await write(projectId, [evolve(cur, { state: "looking-up", attempts: 0 }, drop, stamp())], "update");
       return next!;
     });
@@ -1486,7 +1518,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           const cur = await current(projectId, e.id);
           if (!sid || !cur || cur.sourceId || !sameVersion(cur, e)) return;
           const how = madeHow.get(e.id);
-          await write(projectId, [evolve(cur, { state: "record-complete", sourceId: sid, ...(how ? { match: how } : {}) }, ["reason", "nextTryAt", "duplicateOf", "elsewhere"], stamp())], "update");
+          await write(projectId, [evolve(cur, { state: "record-complete", sourceId: sid, ...(how ? { match: how } : {}) }, ["reason", "nextTryAt", "duplicateOf", "elsewhere", "people", "morePeople"], stamp())], "update");
         });
         if (!alive(projectId, gen)) return;
       }
@@ -1625,5 +1657,32 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return done;
   }
 
-  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks };
+  async function asAuthor(projectId: string, entryId: string): Promise<FindEntry> {
+    assertOpen();
+    assertId(entryId);
+    const w = await act(projectId, async () => {
+      const cur = await current(projectId, entryId);
+      if (!cur) throw new NotFoundError("Queue entry", entryId);
+      // Only an entry asking among works that carries an author offer: any other state, a second press, or an entry
+      // whose work was chosen meanwhile (its people went in that write) changes nothing.
+      if (cur.state !== "choose" || !cur.people?.length) throw new FindNoAuthorError();
+      cancelLater(projectId, entryId);
+      const ref = parseReference(cur.typed);
+      // F8's own conditions for going straight to a person's works: exactly one fits, no initial typed (R270 d, R273
+      // M10), and no more people than those stored. Otherwise the researcher says which person is meant.
+      const ask = cur.people.length > 1 || cur.morePeople === true || !ref || hasInitial(ref);
+      const drop: Array<keyof FindEntry> = ["candidates", "chosen", "match", "reason", "nextTryAt", "works", "moreWorks", "duplicateOf", "elsewhere"];
+      const next = ask
+        ? evolve(cur, { state: "choose-person", attempts: 0 }, drop, stamp())
+        : evolve(cur, { state: "looking-up", chosen: cur.people[0]!.id, attempts: 0 }, [...drop, "morePeople"], stamp());
+      const [written] = await write(projectId, [next], "update");
+      return written!;
+    });
+    // The one person's works are asked by the runner's own work, as after `choosePerson` (time-limited, retried,
+    // waiting for the allowance).
+    if (w.state === "looking-up") enqueue(projectId, entryId);
+    return w;
+  }
+
+  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks, asAuthor };
 }
