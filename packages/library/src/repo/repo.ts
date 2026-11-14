@@ -985,10 +985,11 @@ export function addCapturedOriginal(
   sourceId: string,
   input: OriginalAssetInput,
   captureMethod: Provenance["captureMethod"],
-  opts: { hasLocation?: boolean; refuse?: RefuseHook; pendingProxies?: (asset: Asset) => PendingProxy[]; platform?: string } = {},
+  opts: { hasLocation?: boolean; refuse?: RefuseHook; pendingProxies?: (asset: Asset) => PendingProxy[]; platform?: string; onlyWithoutFile?: boolean } = {},
 ): Promise<Asset> {
   return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, {
     captureMethod,
+    ...(opts.onlyWithoutFile ? { onlyWithoutFile: true } : {}),
     ...(opts.platform ? { capturePlatform: opts.platform } : {}),
     hasLocation: opts.hasLocation === true,
     ...(opts.refuse ? { refuse: opts.refuse } : {}),

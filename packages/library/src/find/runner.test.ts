@@ -17,7 +17,7 @@ import { findSourceBy } from "../index/db.js";
 import { HttpClient } from "../lookup/http.js";
 import { serialStore } from "../import/project-queue.js";
 import { InvalidInputError, ReadOnlyLibraryError } from "../repo/errors.js";
-import { recoveryPendingProjects, type Repo } from "../repo/repo.js";
+import { addCapturedOriginal, recoveryPendingProjects, type Repo } from "../repo/repo.js";
 import type { RepoCore } from "../repo/state.js";
 import { SimulatedCrash, openTestRepo, seams } from "../repo/testing.js";
 import { parseReference } from "./reference.js";
@@ -33,6 +33,7 @@ import {
   FIND_TOOL,
   FIND_INDEX_WAIT_MS,
   FIND_DOWNLOAD_TIMEOUT_MS,
+  FIND_SOURCE_WATCH_MS,
   cleanAcquiredAddress,
   FindAlreadyAddedError,
   FindEntryStateError,
@@ -2554,6 +2555,8 @@ describe("F11: the free copy of a record the queue completed", () => {
   let copyRequests: string[];
   let fileAgent: MockAgent;
   let saved: Dispatcher;
+  /** R282 e: OpenAlex's free-copy answers fail (503). */
+  let oaDown: boolean;
 
   const COPY_ONLY_OPENALEX = (): SearchSettings => ({ ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" })) });
   /** Ordinary text of a first page, so that a made-up file has readable text (the file check asks for 200 characters, R282). */
@@ -2599,6 +2602,7 @@ describe("F11: the free copy of a record the queue completed", () => {
       .reply((o) => {
         const doi = decodeURIComponent(String(o.path).slice("/works/doi:".length));
         copyRequests.push(String(o.path));
+        if (oaDown) return { statusCode: 503, data: "unavailable" };
         const urls = oaCopies.get(doi) ?? [];
         const [best, ...rest] = urls;
         return {
@@ -2631,6 +2635,7 @@ describe("F11: the free copy of a record the queue completed", () => {
     heldFiles = [];
     fileRequests = [];
     copyRequests = [];
+    oaDown = false;
     settings = COPY_ONLY_OPENALEX();
     mockCopies();
   });
@@ -2963,5 +2968,196 @@ describe("F11: the free copy of a record the queue completed", () => {
     await copyDone(p, eid);
     expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", offers: [{ host: "arxiv.org" }] });
     expect(await exists(folderOf(eid))).toBe(false);
+  });
+
+  // ------------------------------------------------------------------------------------------------------------
+  // Round 2 (R282 d–g)
+
+  it("R282 e: every free-copy service asked failing is not 'no open copy': the entry waits and is tried again like an unreachable lookup, then failed with Try again", async () => {
+    oaDown = true;
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    const { p, r, eid } = await recordMade();
+    await until(async () => !!(await entryOf(p, eid))?.nextTryAt, "the wait");
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "looking-for-copy", attempts: 1 });
+    for (const [i, d] of FIND_RETRY_DELAYS_MS.entries()) {
+      const before = copyRequests.length;
+      await until(() => timers.pending.size > 0, "the retry's timer");
+      timers.advance(d);
+      await until(() => copyRequests.length > before, `try ${i + 2}`);
+      await until(async () => (await entryOf(p, eid))!.attempts === i + 2, `attempt ${i + 2} written`);
+    }
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "failed", reason: { code: "unreachable" } });
+    // The services are back: Try again looks for a copy again.
+    oaDown = false;
+    expect((await r.retry(p.id, eid)).state).toBe("looking-for-copy");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+  });
+
+  it("R282 e: some services failing and no offer: no open copy saying so, and Try again is accepted", async () => {
+    // Semantic Scholar has no answer in this world (the request fails); OpenAlex answers that it knows no copy.
+    settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" || c.id === "semanticscholar" })) };
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", reason: { code: "copy-some-unreachable" } });
+    // Semantic Scholar answers now, with a copy.
+    agent
+      .get("https://api.semanticscholar.org")
+      .intercept({ path: (q: string) => q.startsWith("/graph/v1/paper/DOI:"), method: "GET" })
+      .reply(200, JSON.stringify({ openAccessPdf: { url: "https://arxiv.org/pdf/2101.00001" } }), { headers: { "content-type": "application/json" } });
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    expect((await r.retry(p.id, eid)).state).toBe("looking-for-copy");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+  });
+
+  it("R282 e: a plain no open copy (every service answered) is not retried", async () => {
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("no-open-copy");
+    expect((await entryOf(p, eid))!.reason).toBeUndefined();
+    await expect(r.retry(p.id, eid)).rejects.toBeInstanceOf(FindEntryStateError);
+  });
+
+  it("R282 f: Try again on an entry the rules stopped evaluates the rules again: still refused, it says so; allowed, it goes on", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    const { p, r, eid } = await recordMade({ gov: GOV("acquireMethods: [reference_lookup]") });
+    await until(async () => (await entryOf(p, eid))?.reason?.code === "copy-not-allowed", "the refusal");
+    // Still refused: said again, nothing asked.
+    await r.retry(p.id, eid);
+    await until(async () => (await entryOf(p, eid))?.reason?.code === "copy-not-allowed", "the refusal again");
+    expect(copyRequests).toEqual([]);
+    const { sha256 } = await repo.getGovernance(p.id);
+    await repo.setGovernance(p.id, GOV("acquireMethods: [reference_lookup, free_copy]"), { baseSha256: sha256, reason: "free copies allowed" });
+    expect((await r.retry(p.id, eid)).state).toBe("looking-for-copy");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+  });
+
+  it("R282 f: the rules saved to allow free copies, resume goes on with the entry they had stopped (no restart)", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await good());
+    const { p, r, eid } = await recordMade({ gov: GOV("acquireMethods: [reference_lookup]") });
+    await until(async () => (await entryOf(p, eid))?.reason?.code === "copy-not-allowed", "the refusal");
+    const { sha256 } = await repo.getGovernance(p.id);
+    await repo.setGovernance(p.id, GOV("acquireMethods: [reference_lookup, free_copy]"), { baseSha256: sha256, reason: "free copies allowed" });
+    r.resume(p.id);
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+  });
+
+  it("R282 g (M1): the source deleted while its file is held: the held file and its review entry go, and the entry says the record was removed, in the deletion's change; only its removal is offered", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    files.set("https://arxiv.org/pdf/2101.00001", await other(1));
+    const { p, r, eid, sid } = await recordMade();
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("needs-check");
+    await repo.deleteSource(p.id, sid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", reason: { code: "record-removed" } });
+    expect(await readdir(heldDirOf(p))).toEqual([]);
+    expect(await pendingReviews(p)).toEqual([]);
+    await expect(r.retry(p.id, eid)).rejects.toBeInstanceOf(FindEntryStateError);
+    await r.remove(p.id, eid);
+    expect(await entryOf(p, eid)).toBeUndefined();
+  });
+
+  it("R282 g (M1): the source deleted during a download: the download is aborted and dropped, the entry says the record was removed, nothing is left", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    holdFiles.add("https://arxiv.org/pdf/2101.00001");
+    const { p, eid, sid } = await recordMade();
+    await until(() => heldFiles.length === 1, "the download to start");
+    await repo.deleteSource(p.id, sid);
+    timers.advance(FIND_SOURCE_WATCH_MS);
+    await until(() => heldFiles[0]!.aborted, "the download to be aborted");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", reason: { code: "record-removed" } });
+    expect((await entryOf(p, eid))!.offers).toBeUndefined();
+    expect(await exists(folderOf(eid))).toBe(false);
+    expect(await exists(heldDirOf(p))).toBe(false);
+  });
+
+  for (const file of ["matching", "mismatched"] as const) {
+    it(`R282 g (M1): the source deleted before a ${file} file is stored (the watch not yet run): nothing is attached or held; the record was removed`, async () => {
+      oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+      holdFiles.add("https://arxiv.org/pdf/2101.00001");
+      const { p, eid, sid } = await recordMade();
+      await until(() => heldFiles.length === 1, "the download to start");
+      await repo.deleteSource(p.id, sid);
+      heldFiles[0]!.respond(200, file === "matching" ? await good() : await other(1));
+      await copyDone(p, eid);
+      expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", reason: { code: "record-removed" } });
+      expect(await exists(heldDirOf(p))).toBe(false);
+      expect(await pendingReviews(p)).toEqual([]);
+    });
+  }
+
+  it("R282 g (M2): removing an entry aborts its download; nothing is left", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    holdFiles.add("https://arxiv.org/pdf/2101.00001");
+    const { p, r, eid } = await recordMade();
+    await until(() => heldFiles.length === 1, "the download to start");
+    await r.remove(p.id, eid);
+    await until(() => heldFiles[0]!.aborted, "the download to be aborted");
+    await until(async () => !activeTemp.has(`find-${eid}`) && !(await exists(folderOf(eid))), "its folder to go");
+    expect(await entryOf(p, eid)).toBeUndefined();
+  });
+
+  it("R282 g (M5): a source that gained a readable file meanwhile is not given a second one by the runner; the entry is in the library", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    holdFiles.add("https://arxiv.org/pdf/2101.00001");
+    const { p, eid, sid } = await recordMade();
+    await until(() => heldFiles.length === 1, "the download to start");
+    // The researcher attaches a file by hand meanwhile.
+    const mine = join(tmp, "mine.pdf");
+    await writeFile(mine, await good());
+    await addCapturedOriginal(repo, p.id, sid, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+    heldFiles[0]!.respond(200, await good());
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+    const assets = (await repo.getSource(p.id, sid)).assets;
+    expect(assets).toHaveLength(1);
+    expect(assets[0]!.acquired).toBeUndefined();
+  });
+
+  const IDENT = (basis: boolean) => `identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+encryption:
+  atRest: optional
+consent:
+  requireLegalBasis: ${basis}
+processing:
+  metadata_lookup: [crossref, openalex]
+`;
+
+  it("R282 g (M8): the rules' store part refusing the file at attach is said as such (a missing legal basis), not as the free-copy rule", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    holdFiles.add("https://arxiv.org/pdf/2101.00001");
+    const { p, eid, sid } = await recordMade({ gov: IDENT(false) });
+    expect((await repo.getSourceRecord(p.id, sid)).provenance.identifiable).toBe(true);
+    await until(() => heldFiles.length === 1, "the download to start");
+    const { sha256 } = await repo.getGovernance(p.id);
+    await repo.setGovernance(p.id, IDENT(true), { baseSha256: sha256 });
+    heldFiles[0]!.respond(200, await good());
+    await until(async () => (await entryOf(p, eid))?.reason?.code === "copy-no-legal-basis", "the store refusal");
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "record-complete", reason: { code: "copy-no-legal-basis", by: "rules" } });
+    expect((await repo.getSource(p.id, sid)).assets).toEqual([]);
+    await until(async () => !(await exists(folderOf(eid))), "the folder to go");
+  });
+
+  it("R282 g (M8): rules whose store part refuses: nothing is asked; the entry says why", async () => {
+    settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: false })) };
+    const { p, r, eid } = await recordMade({ gov: IDENT(false) });
+    await until(() => changes.some((c) => c.entryId === eid && c.state === "record-complete"), "the record");
+    const { sha256 } = await repo.getGovernance(p.id);
+    await repo.setGovernance(p.id, IDENT(true), { baseSha256: sha256 });
+    settings = COPY_ONLY_OPENALEX();
+    r.resume(p.id);
+    await until(async () => (await entryOf(p, eid))?.reason?.code === "copy-no-legal-basis", "the store refusal");
+    expect(copyRequests).toEqual([]);
+    expect(fileRequests).toEqual([]);
   });
 });

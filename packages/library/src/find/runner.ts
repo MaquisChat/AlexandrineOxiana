@@ -76,6 +76,7 @@ import type { AcquiredFrom, SourceFile } from "@ao/core";
 import { kindFor, mimeFor } from "../repo/io.js";
 import { addCapturedOriginal, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
 import { HeldFileEntryGoneError, HeldFileLimitError, type HeldFileFacts } from "../repo/review.js";
+import { SourceHasFileError } from "../repo/assets.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
 import { checkFileAgainstRecord, type FileCheckResult } from "./file-check.js";
@@ -135,6 +136,11 @@ const CANDIDATES_KEPT = 10;
 export const FIND_DOWNLOAD_TIMEOUT_MS = 60_000 + FETCH_FILE_DEADLINE_MS;
 /** Task F11: the file check of one file (the library's extraction, in this process) may take this long; past it the file "needs a check" ("no-text"). */
 export const FIND_CHECK_TIMEOUT_MS = 60_000;
+/**
+ * R282 g (M1): while an entry's file is downloaded and checked, whether its record is still in the library is looked at
+ * this often (an in-memory read); a record removed meanwhile aborts the download.
+ */
+export const FIND_SOURCE_WATCH_MS = 2_000;
 /** Task F11: the label of a free copy's file name in the source's `original/` folder (with the date). */
 const FREE_COPY_LABEL = "free copy";
 
@@ -1355,6 +1361,31 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return d.result !== "deny";
   }
   const COPY_RULES: FindReason = { code: "copy-not-allowed", by: "rules" };
+  /** R282 g (M8): the rules' STORE part refuses the file (or a legal basis is missing), said as such. */
+  const COPY_STORE: FindReason = { code: "copy-store-not-allowed", by: "rules" };
+  const COPY_NO_BASIS: FindReason = { code: "copy-no-legal-basis", by: "rules" };
+  /** The reasons of an entry the rules stopped (R282 f: woken when the rules are saved; "Try again" accepted). */
+  const STOPPED_BY_RULES: ReadonlySet<string> = new Set([COPY_RULES.code, COPY_STORE.code, COPY_NO_BASIS.code]);
+  const RECORD_REMOVED: FindReason = { code: "record-removed" };
+  /** Why the rules refused a free copy's file at attach or hold (M8): the capture of `free_copy`, or its store. */
+  async function copyRefusal(pid: string, err: PolicyDeniedError, prov: Provenance): Promise<FindReason> {
+    if (err.action !== "store") return COPY_RULES;
+    return (await refusalOf(pid, err, { identifiable: prov.identifiable, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) })) === NO_LEGAL_BASIS ? COPY_NO_BASIS : COPY_STORE;
+  }
+  /** Whether the rules' store part refuses a file for the record now (asked before ANY free-copy service, M8). */
+  async function storeRefusal(ctx: LookupContext, pid: string, prov: Provenance): Promise<FindReason | null> {
+    const d = evaluate(ctx.policy!, {
+      action: "store",
+      projectId: ctx.projectId,
+      actor: ctx.actor,
+      now: (ctx.clock?.() ?? new Date()).toISOString(),
+      ...(ctx.tz ? { tz: ctx.tz } : {}),
+      store: { identifiable: prov.identifiable, hasLocation: false, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) },
+    });
+    return d.result === "deny" ? copyRefusal(pid, new PolicyDeniedError(d.reason ?? "", "store"), prov) : null;
+  }
+  /** Entry → the abort of its download in flight (R282 g, M2: removing the entry aborts it). */
+  const downloads = new Map<string, AbortController>();
 
   /** The free-copy services the settings switch on, in the plan's order (F12's settings; until then its defaults). */
   function copySources(s: SearchSettings): FreeCopySource[] {
@@ -1449,8 +1480,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       sf = await guard(r, repo.getSource(pid, sid));
     } catch (err) {
       if (!(err instanceof NotFoundError)) throw err;
-      // The record is no longer in the library: no file will be fetched for it.
-      if (entry.state !== "record-complete") await finish({ state: "no-open-copy" }, ["nextTryAt", "reason", "offers"]);
+      // The record is no longer in the library: no file will be fetched for it; the entry says so (R282 g).
+      await finish({ state: "no-open-copy", reason: RECORD_REMOVED }, ["nextTryAt", "offers"]);
       return;
     }
     if (!live()) return;
@@ -1465,9 +1496,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       block(pid, "rules-unreadable");
       return;
     }
-    if (!copyAllowed(ctx)) {
-      // Said in words on the entry; not tried again until the rules change (the next open or unlock looks again).
-      if (!(entry.state === "record-complete" && entry.reason?.code === COPY_RULES.code)) await finish({ state: "record-complete", reason: COPY_RULES }, ["nextTryAt"]);
+    // Said in words on the entry; not tried again until the rules change (their save, "Try again", the next open or
+    // unlock: R282 f). The store part too, before anything is asked (M8).
+    const refused = copyAllowed(ctx) ? await storeRefusal(ctx, pid, sf.source.provenance) : COPY_RULES;
+    if (refused) {
+      if (!(entry.state === "record-complete" && entry.reason?.code === refused.code)) await finish({ state: "record-complete", reason: refused }, ["nextTryAt"]);
       return;
     }
     let s: SearchSettings;
@@ -1505,8 +1538,16 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     if (!live()) return;
     if (!found.offers.length) {
+      // R282 e: every service asked failed: "could not be reached", tried again by the ordinary retries. Some failed:
+      // "no open copy", saying that a copy may still exist ("Try again" is accepted). Unpaywall is asked only with an e-mail.
+      const asked = sources.filter((x) => x !== "unpaywall" || email);
+      if (found.failed.length && found.failed.length >= asked.length) {
+        debug("find: no free-copy service could be reached");
+        await tryLater("unreachable");
+        return;
+      }
       const links = linksOf(found.elsewhere);
-      await finish({ state: "no-open-copy", ...(links?.length ? { offers: links } : {}) }, ["nextTryAt", "reason", "offers"]);
+      await finish({ state: "no-open-copy", ...(found.failed.length ? { reason: { code: "copy-some-unreachable" } } : {}), ...(links?.length ? { offers: links } : {}) }, ["nextTryAt", "reason", "offers"]);
       return;
     }
     if (!(await finish({ state: "fetching" }, ["nextTryAt", "reason", "offers"]))) return;
@@ -1518,6 +1559,21 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     const release = holdFindTemp(folderName);
     const stop = new AbortController();
     void r.stopSignal.then(() => stop.abort(new Abandoned()));
+    // R282 g: removing the entry (M2), or its record (M1, looked at every FIND_SOURCE_WATCH_MS), aborts the download.
+    const dk = keyOfRun(pid, eid);
+    downloads.set(dk, stop);
+    let gone = false;
+    let watch: unknown;
+    const look = () => {
+      watch = timers.setTimeout(() => {
+        if (stop.signal.aborted) return;
+        if (liveIds(pid).has(sid)) return look();
+        gone = true;
+        stop.abort(new Abandoned());
+      }, FIND_SOURCE_WATCH_MS);
+    };
+    look();
+    const removedRecord = () => finish({ state: "no-open-copy", reason: RECORD_REMOVED }, ["nextTryAt", "offers"]);
     let held: { path: string; offer: CopyOffer; check: FileCheckResult & { match: false } } | undefined;
     try {
       let n = 0;
@@ -1528,7 +1584,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         try {
           got = await download(offer.url, into, stop.signal);
         } catch (err) {
-          if (!live() || stop.signal.aborted) return;
+          if (!live()) return;
+          if (stop.signal.aborted) {
+            if (gone) await removedRecord();
+            return;
+          }
           // Refused or failed (its sentence names no address): the next offer is tried.
           debug(`find: a free copy could not be downloaded (${err instanceof FetchFileError ? err.code : errName(err)})`);
           continue;
@@ -1542,9 +1602,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           debug("find: the file check did not end in time");
           check = { match: false, why: "no-text", evidence: { kind: offer.kind, bytes: got.bytes } };
         }
-        if (!live()) return;
+        if (!live() || stop.signal.aborted) {
+          if (live() && gone) await removedRecord();
+          return;
+        }
         if (check.match) {
-          await attach(pid, eid, r, live, version, sid, got, offer, check.by);
+          await attach(pid, eid, r, live, version, sid, sf.source.provenance, got, offer, check.by);
           return;
         }
         // A file that fails the check is dropped — except the first, kept until every offer was tried (R277 b).
@@ -1553,13 +1616,15 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       }
       if (!live()) return;
       if (held) {
-        await holdOne(pid, eid, r, live, version, sid, held);
+        await holdOne(pid, eid, r, live, version, sid, sf.source.provenance, held);
         return;
       }
       // Nothing could be downloaded: no open copy here; the addresses stay as links for the researcher.
       const links = linksOf(found.elsewhere, found.offers);
       await finish({ state: "no-open-copy", ...(links?.length ? { offers: links } : {}) }, ["nextTryAt", "reason", "offers"]);
     } finally {
+      timers.clearTimeout(watch);
+      if (downloads.get(dk) === stop) downloads.delete(dk);
       stop.abort(new Abandoned());
       release();
       // The folder is removed when the entry is done (also at a stop or a close, while stopAll waits for the work in
@@ -1576,6 +1641,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     live: () => boolean,
     version: { get(): FindEntry; set(e: FindEntry): void },
     sid: string,
+    prov: Provenance,
     got: Awaited<ReturnType<typeof fetchFile>>,
     offer: CopyOffer,
     by: "doi" | "title",
@@ -1591,10 +1657,13 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           sid,
           { fromPath: got.path, kind: kindFor(offer.kind), ext: offer.kind, mime: mimeFor(offer.kind), label: `${FREE_COPY_LABEL} ${stamp().slice(0, 10)}`, acquired: { ...acquiredFor(offer), check: { result: "match", by } } },
           "free_copy",
+          // R282 g (M5): never a second file by itself — a source that gained one meanwhile is refused inside the change.
+          { onlyWithoutFile: true },
         );
       } catch (err) {
-        if (!(err instanceof PolicyDeniedError)) throw err;
-        const [w] = await write(pid, [evolve(cur, { state: "record-complete", reason: COPY_RULES }, ["nextTryAt", "offers"], stamp())], "update");
+        const said = await copyEnded(pid, err, prov);
+        if (!said) throw err;
+        const [w] = await write(pid, [evolve(cur, said, ["nextTryAt", "reason", "offers"], stamp())], "update");
         if (w) version.set(w);
         return;
       }
@@ -1602,6 +1671,17 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const [w] = await write(pid, [evolve(cur, { state: "in-library" }, ["nextTryAt", "reason", "offers"], stamp())], "update");
       if (w) version.set(w);
     });
+  }
+
+  /**
+   * What the entry says when a file could not be attached or held (R282 g), or null for an error not foreseen: the
+   * record removed meanwhile (M1); a readable file gained meanwhile ("in-library", M5); the rules (M8).
+   */
+  async function copyEnded(pid: string, err: unknown, prov: Provenance): Promise<Partial<FindEntry> | null> {
+    if (err instanceof NotFoundError) return { state: "no-open-copy", reason: RECORD_REMOVED };
+    if (err instanceof SourceHasFileError) return { state: "in-library" };
+    if (err instanceof PolicyDeniedError) return { state: "record-complete", reason: await copyRefusal(pid, err, prov) };
+    return null;
   }
 
   /** The first file that failed the check, held for the researcher: the file, its review entry and the entry's line in ONE change. */
@@ -1612,6 +1692,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     live: () => boolean,
     version: { get(): FindEntry; set(e: FindEntry): void },
     sid: string,
+    prov: Provenance,
     held: { path: string; offer: CopyOffer; check: FileCheckResult & { match: false } },
   ): Promise<void> {
     await inTurn(r, pid, live, async () => {
@@ -1638,12 +1719,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           if (w) version.set(w);
           return;
         }
-        if (err instanceof PolicyDeniedError) {
-          const [w] = await write(pid, [evolve(cur, { state: "record-complete", reason: COPY_RULES }, ["nextTryAt", "offers"], stamp())], "update");
-          if (w) version.set(w);
-          return;
-        }
-        throw err;
+        const said = await copyEnded(pid, err, prov);
+        if (!said) throw err;
+        const [w] = await write(pid, [evolve(cur, said, ["nextTryAt", "reason", "offers"], stamp())], "update");
+        if (w) version.set(w);
+        return;
       }
       version.set(next);
       notify(pid, eid, "needs-check");
@@ -1770,11 +1850,15 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       const waiting = (cur.state === "looking-up" || cur.state === "looking-for-copy") && !!cur.nextTryAt;
-      if (cur.state !== "failed" && cur.state !== "not-found" && !waiting) throw new FindEntryStateError();
+      // R282 e, f: "no open copy" because some services could not be reached, and an entry the rules stopped (their
+      // free-copy or store part: the rules are evaluated again), look for a copy again.
+      const copyAgain =
+        !!cur.sourceId && ((cur.state === "no-open-copy" && cur.reason?.code === "copy-some-unreachable") || (cur.state === "record-complete" && STOPPED_BY_RULES.has(cur.reason?.code ?? "")));
+      if (cur.state !== "failed" && cur.state !== "not-found" && !waiting && !copyAgain) throw new FindEntryStateError();
       cancelLater(projectId, entryId);
       // F11: an entry whose record is made failed in the free copy's part ("held-full", the services unreachable, …):
       // it looks for a copy again, never for its record.
-      if (cur.sourceId && (cur.state === "failed" || cur.state === "looking-for-copy")) {
+      if (cur.sourceId && (cur.state === "failed" || cur.state === "looking-for-copy" || copyAgain)) {
         const [next] = await write(projectId, [evolve(cur, { state: "looking-for-copy", attempts: 0 }, ["reason", "nextTryAt", "offers"], stamp())], "update");
         return next!;
       }
@@ -1807,6 +1891,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       if (cur.state === "needs-check") await removeFindEntryIn(repo, projectId, cur);
       else await write(projectId, [cur], "remove");
     });
+    // R282 g (M2): its download in flight is aborted (its folder removed and given up as the work ends).
+    downloads.get(keyOfRun(projectId, entryId))?.abort(new Abandoned());
   }
 
   async function resolveHeld(projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<FindEntry | null> {

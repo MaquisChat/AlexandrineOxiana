@@ -316,7 +316,11 @@ export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sour
   for (const e of pending) {
     if (e.sourceId !== sourceId || e.id === opts.keep) continue;
     // A file held for this source's check goes with the source, in the same change: nothing is left orphaned (F11).
-    if (e.cause?.kind === "acquired-file-mismatch") await destroyHeld(tx, e.cause.held);
+    // Its queue entry says, in the same change, that the record was removed: it offers only its removal (R282 g).
+    if (e.cause?.kind === "acquired-file-mismatch") {
+      await destroyHeld(tx, e.cause.held);
+      await recordRemovedLine(core, tx, e.cause.findEntryId);
+    }
     await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: opts.decision ?? "source-removed" });
     done.push(e.id);
   }
@@ -325,6 +329,20 @@ export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sour
     pending.filter((e) => !done.includes(e.id)),
   );
   return done;
+}
+
+/**
+ * R282 g (M1): inside the change that removes a source, the line of the queue entry a file was held for: "no-open-copy",
+ * reason "record-removed". A queue that cannot be read never stops the source's removal (its line then stays).
+ */
+async function recordRemovedLine(core: RepoCore, tx: Tx, entryId: string): Promise<void> {
+  let next: FindEntry | null;
+  try {
+    next = await entryLine(core, tx.projectId, entryId, { state: "no-open-copy", reason: { code: "record-removed" } }, ["nextTryAt", "offers"], tx.at);
+  } catch {
+    return;
+  }
+  if (next && !next.removed) await appendFindLinesInTx(core, tx, "update", [next]);
 }
 
 /** What a caller queues; the entry's id, project, status and time are filled in. */

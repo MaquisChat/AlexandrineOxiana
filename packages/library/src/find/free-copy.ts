@@ -513,16 +513,19 @@ const rank = (v: CopyOffer["version"]) => (v ? RANK[v]! : 3);
 /**
  * Where free copies of `work` are, from the services in `sources` (asked in parallel; offers in the plan's order).
  * `email` is sent to Unpaywall only, and Unpaywall is not asked without one. Never rejects: a service that fails is
- * skipped (a debug note names the service and an HTTP status, never an address or the e-mail).
+ * skipped (a debug note names the service and an HTTP status, never an address or the e-mail), and named in `failed`
+ * (R282 e: its request failed, timed out, was refused or answered something unreadable — never a service that
+ * answered "nothing", nor one that was not asked).
  */
 export async function findFreeCopies(
   work: WorkCandidate,
   ctx: LookupContext,
   sources: FreeCopySource[],
   email?: string,
-): Promise<{ offers: CopyOffer[]; elsewhere: Array<{ host: string; url: string }> }> {
+): Promise<{ offers: CopyOffer[]; elsewhere: Array<{ host: string; url: string }>; failed: FreeCopySource[] }> {
   const wanted = new Set(Array.isArray(sources) ? sources : []);
   const order = FREE_COPY_SOURCES.filter((s) => wanted.has(s));
+  const failedSet = new Set<FreeCopySource>();
   const askOne = async (s: FreeCopySource): Promise<Raw[]> => {
     try {
       switch (s) {
@@ -545,6 +548,7 @@ export async function findFreeCopies(
       const why =
         e instanceof Throttled ? "it asked the app to slow down (left alone for now)" : e instanceof BadAnswer ? "its answer was not of the expected shape" : e instanceof LookupHttpError && e.status ? `HTTP ${e.status}` : "it could not be reached";
       ctx.debug?.(`free copy via ${s} skipped: ${why}`);
+      failedSet.add(s);
       return [];
     }
   };
@@ -584,5 +588,5 @@ export async function findFreeCopies(
       offered.add(o.url);
     }
   });
-  return { offers, elsewhere };
+  return { offers, elsewhere, failed: order.filter((s) => failedSet.has(s)) };
 }

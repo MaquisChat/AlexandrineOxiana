@@ -84,7 +84,14 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "file-no-text",
       "file-other-version",
       "file-other-kind",
+      // R282 e–g: some free-copy services could not be reached; the record removed; the rules' store part refused.
+      "copy-some-unreachable",
+      "record-removed",
+      "copy-store-not-allowed",
+      "copy-no-legal-basis",
     ]);
+    expect(FIND_REASON_TEXT["copy-some-unreachable"]).toBe("Some services could not be reached, so a free copy may still exist. “Try again” looks again.");
+    expect(FIND_REASON_TEXT["record-removed"]).toBe("The record was removed from the library.");
     // Exhaustive by type (Record<FindReasonCode, string>) and checked here at run time: one plain sentence each.
     expect(Object.keys(FIND_REASON_TEXT).sort()).toEqual([...FIND_REASON_CODES].sort());
     // One plain sentence each (the plan's sentence for held files starts with its number).

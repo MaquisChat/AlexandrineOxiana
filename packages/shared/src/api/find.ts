@@ -75,6 +75,13 @@ export const FIND_REASON_CODES = [
   "file-no-text",
   "file-other-version",
   "file-other-kind",
+  // R282 e: no offer, and some free-copy services could not be reached ("no-open-copy", with "Try again"). R282 g: the
+  // record was removed from the library ("no-open-copy", removal only); the rules' STORE part (or a missing legal
+  // basis) refused the file (the entry stays "record-complete", woken when the rules are saved, and "Try again").
+  "copy-some-unreachable",
+  "record-removed",
+  "copy-store-not-allowed",
+  "copy-no-legal-basis",
 ] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
@@ -97,6 +104,10 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "file-no-text": "The file has no text that could be read (a scan, or a damaged file).",
   "file-other-version": "The file seems to be another volume, part or edition of this work.",
   "file-other-kind": "The file looks like another kind of document (a review, a reply, a correction or a supplement), not the work itself.",
+  "copy-some-unreachable": "Some services could not be reached, so a free copy may still exist. “Try again” looks again.",
+  "record-removed": "The record was removed from the library.",
+  "copy-store-not-allowed": "This project's rules do not allow storing the file found for this record.",
+  "copy-no-legal-basis": "This project's rules need a legal basis to store the file found for this record, and the record has none.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */

@@ -80,7 +80,14 @@ export type FindReasonCode =
   | "file-title-absent"
   | "file-no-text"
   | "file-other-version"
-  | "file-other-kind";
+  | "file-other-kind"
+  // R282 e: no offer, and some free-copy services could not be reached ("no-open-copy", with "Try again"). R282 g:
+  // the record was removed from the library ("no-open-copy", removal only); the rules' store part, or a missing
+  // legal basis, refused the file ("record-complete", like "copy-not-allowed").
+  | "copy-some-unreachable"
+  | "record-removed"
+  | "copy-store-not-allowed"
+  | "copy-no-legal-basis";
 
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 

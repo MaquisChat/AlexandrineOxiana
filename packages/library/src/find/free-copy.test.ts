@@ -271,7 +271,7 @@ describe("findFreeCopies: the services", () => {
 
   it("OpenAlex denied by the project's rules is not asked", async () => {
     const got = await findFreeCopies(ARTICLE, ctx(client(), ["crossref"]), ["openalex"]);
-    expect(got).toEqual({ offers: [], elsewhere: [] });
+    expect(got).toEqual({ offers: [], elsewhere: [], failed: [] });
     expect(requests).toEqual([]);
   });
 
@@ -289,8 +289,8 @@ describe("findFreeCopies: the services", () => {
   });
 
   it("Unpaywall is not asked without an e-mail; the e-mail never reaches the cache or a log", async () => {
-    expect(await findFreeCopies(ARTICLE, ctx(), ["unpaywall"])).toEqual({ offers: [], elsewhere: [] });
-    expect(await findFreeCopies(ARTICLE, ctx(), ["unpaywall"], "not an address")).toEqual({ offers: [], elsewhere: [] });
+    expect(await findFreeCopies(ARTICLE, ctx(), ["unpaywall"])).toEqual({ offers: [], elsewhere: [], failed: [] });
+    expect(await findFreeCopies(ARTICLE, ctx(), ["unpaywall"], "not an address")).toEqual({ offers: [], elsewhere: [], failed: [] });
     expect(requests).toEqual([]);
     unpaywall({ doi: DOI, is_oa: true, best_oa_location: { url_for_pdf: "https://arxiv.org/pdf/2101.00001", version: "publishedVersion" } });
     const http = client();
@@ -488,7 +488,7 @@ describe("findFreeCopies: the Internet Archive", () => {
   it("an Internet Archive file name with a slash is dropped", async () => {
     iaSearch(Q, ["slashy"]);
     iaMeta("slashy", openIaItem("slashy", {}, [{ name: "../other/x.pdf" }, { name: "a\\b.pdf" }, { name: `${"n".repeat(201)}.pdf` }, { name: "x.pdf.exe" }, { name: 7 }]));
-    expect(await findFreeCopies(BOOK, ctx(), ["internetarchive"])).toEqual({ offers: [], elsewhere: [] });
+    expect(await findFreeCopies(BOOK, ctx(), ["internetarchive"])).toEqual({ offers: [], elsewhere: [], failed: [] });
   });
 
   it("a title search's different work is not offered", async () => {
@@ -496,7 +496,7 @@ describe("findFreeCopies: the Internet Archive", () => {
     iaMeta("otherwork", openIaItem("otherwork", { title: "The Lantern Keepers of Ostrava: Volume Two of the Northern Cycle" }));
     iaMeta("otherauthor", openIaItem("otherauthor", { creator: ["Brook, Tamsin"] }));
     arxiv(`au:halloway AND ti:"${BOOK_TITLE}"`, atom([{ id: "2202.00002", title: "Lantern Keepers", authors: ["Mira Halloway"] }]));
-    expect(await findFreeCopies(BOOK, ctx(), ["internetarchive", "arxiv"])).toEqual({ offers: [], elsewhere: [] });
+    expect(await findFreeCopies(BOOK, ctx(), ["internetarchive", "arxiv"])).toEqual({ offers: [], elsewhere: [], failed: [] });
   });
 });
 
@@ -545,7 +545,7 @@ describe("findFreeCopies: bounds, failures and order", () => {
       ],
     });
     const got = await findFreeCopies(ARTICLE, ctx(), ["openalex"]);
-    expect(got).toEqual({ offers: [], elsewhere: [{ host: "repo.example.org", url: "https://repo.example.org/ok.pdf" }] });
+    expect(got).toEqual({ offers: [], elsewhere: [{ host: "repo.example.org", url: "https://repo.example.org/ok.pdf" }], failed: [] });
   });
 
   it("one failing source does not stop the others", async () => {
@@ -557,6 +557,20 @@ describe("findFreeCopies: bounds, failures and order", () => {
     const got = await findFreeCopies(ARTICLE, ctx(), ALL, EMAIL);
     expect(got.offers).toEqual([{ source: "unpaywall", url: "https://europepmc.org/articles/PMC3?pdf=render", kind: "pdf", version: "published" }]);
     expect(notes.length).toBeGreaterThan(0);
+  });
+
+  it("R282 e: the result says which services failed (unreachable, refused, timed out or broken), never one that answered nothing", async () => {
+    agent.get("https://api.openalex.org").intercept({ path: `/works/doi:${DOI}`, method: "GET" }).reply(500, "down");
+    agent.get("https://export.arxiv.org").intercept({ path: (p) => p.startsWith("/api/query"), method: "GET" }).replyWithError(new Error("connection reset"));
+    agent.get("https://api.semanticscholar.org").intercept({ path: (p) => p.startsWith("/graph/"), method: "GET" }).reply(429, "slow down");
+    // Europe PMC answers "nothing" (404): not a failure.
+    agent.get("https://www.ebi.ac.uk").intercept({ path: (p) => p.startsWith("/europepmc/"), method: "GET" }).reply(404, "{}");
+    const got = await findFreeCopies(ARTICLE, ctx(), ["openalex", "arxiv", "europepmc", "semanticscholar"]);
+    expect(got.offers).toEqual([]);
+    expect(got.failed).toEqual(["openalex", "arxiv", "semanticscholar"]);
+    // Every service answered (with nothing): none failed.
+    epmc({ resultList: { result: [] } });
+    expect((await findFreeCopies(ARTICLE, ctx(), ["europepmc"])).failed).toEqual([]);
   });
 
   it("a 429 from a source leaves it alone for this call (asked once, no retries)", async () => {
@@ -577,7 +591,7 @@ describe("findFreeCopies: bounds, failures and order", () => {
     arxiv(ARTICLE_TITLE_Q, `<!DOCTYPE feed [<!ENTITY a "aaaaaaaaaa">]><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>&a;</id></entry></feed>`);
     unpaywall({ oa_locations: { length: 1e9 } });
     const got = await findFreeCopies(ARTICLE, ctx(), ALL, EMAIL);
-    expect(got).toEqual({ offers: [{ source: "openalex", url: "https://arxiv.org/pdf/3", kind: "pdf" }], elsewhere: [] });
+    expect(got).toEqual({ offers: [{ source: "openalex", url: "https://arxiv.org/pdf/3", kind: "pdf" }], elsewhere: [], failed: ["arxiv", "europepmc"] });
   });
 
   it("an answer over the client's 5 MB limit is refused and the source skipped", async () => {
@@ -627,14 +641,14 @@ describe("round 2 (R256, R257)", () => {
     iaSearch(LONG_Q, titles.map(([id]) => id));
     for (const [id, title] of titles) iaMeta(id, openIaItem(id, { title }));
     const got = await findFreeCopies(LONG, ctx(), ["internetarchive"]);
-    expect(got).toEqual({ offers: [{ source: "internetarchive", url: "https://archive.org/download/same/same.pdf", kind: "pdf" }], elsewhere: [] });
+    expect(got).toEqual({ offers: [{ source: "internetarchive", url: "https://archive.org/download/same/same.pdf", kind: "pdf" }], elsewhere: [], failed: [] });
   });
 
   it("a subtitle on the record's side only is not the same title either", async () => {
     const withSub = { ...BOOK, title: "The Lantern Keepers of Ostrava: Night Work in a Mining Town" };
     iaSearch(`title:("the lantern keepers of ostrava night work in a mining town") AND creator:(halloway) AND mediatype:texts`, ["nosub"]);
     iaMeta("nosub", openIaItem("nosub"));
-    expect(await findFreeCopies(withSub, ctx(), ["internetarchive"])).toEqual({ offers: [], elsewhere: [] });
+    expect(await findFreeCopies(withSub, ctx(), ["internetarchive"])).toEqual({ offers: [], elsewhere: [], failed: [] });
   });
 
   it("a near match is not made an elsewhere link either (DOAB)", async () => {
@@ -645,7 +659,7 @@ describe("round 2 (R256, R257)", () => {
         bitstreams: [{ name: "v2.pdf", mimeType: "application/pdf", retrieveLink: "https://mirror.example.org/v2.pdf" }],
       },
     ]);
-    expect(await findFreeCopies(LONG, ctx(), ["doab"])).toEqual({ offers: [], elsewhere: [] });
+    expect(await findFreeCopies(LONG, ctx(), ["doab"])).toEqual({ offers: [], elsewhere: [], failed: [] });
   });
 
   it("the Internet Archive's file is chosen by its format, never an encrypted one", async () => {
@@ -666,7 +680,7 @@ describe("round 2 (R256, R257)", () => {
 
   it("an Internet Archive identifier starts with a letter or digit", async () => {
     iaSearch(Q2, ["..", ".", "-x", "_x", ".hidden"]);
-    expect(await findFreeCopies(BOOK, ctx(), ["internetarchive"])).toEqual({ offers: [], elsewhere: [] });
+    expect(await findFreeCopies(BOOK, ctx(), ["internetarchive"])).toEqual({ offers: [], elsewhere: [], failed: [] });
     expect(requests.filter((r) => r.path.startsWith("/metadata"))).toEqual([]);
   });
 
@@ -772,6 +786,6 @@ describe("round 2 (R256, R257)", () => {
 
   it("an arXiv answer that is not well-formed gives nothing and throws nothing", async () => {
     arxiv(ARTICLE_TITLE_Q, "<feed><entry><id>http://arxiv.org/abs/2101.00009</id>");
-    expect(await findFreeCopies(ARTICLE, ctx(), ["arxiv"])).toEqual({ offers: [], elsewhere: [] });
+    expect(await findFreeCopies(ARTICLE, ctx(), ["arxiv"])).toEqual({ offers: [], elsewhere: [], failed: ["arxiv"] });
   });
 });

@@ -277,6 +277,17 @@ export async function updatePendingProxies(
  * snapshot is a new, dated original next to the first one). Named `<source> - <label>.<ext>` in
  * `original/`, governed and audited like any change to the source.
  */
+/**
+ * R282 g (M5): the source already has a readable original, and the caller asked that none be added then (Find and
+ * acquire attaching a file by itself). Checked inside the change; nothing was written.
+ */
+export class SourceHasFileError extends Error {
+  override name = "SourceHasFileError";
+  constructor() {
+    super("This record already has a file. Nothing was changed.");
+  }
+}
+
 export async function addOriginalAsset(
   core: RepoCore,
   projectId: string,
@@ -291,6 +302,8 @@ export async function addOriginalAsset(
     refuse?: RefuseHook;
     /** Viewing proxies to queue for the new original (R83), written to source.json in the same change. */
     pendingProxies?: (asset: Asset) => PendingProxy[];
+    /** R282 g (M5): refuse (SourceHasFileError), inside the change, when the source already has a readable original. */
+    onlyWithoutFile?: boolean;
   } = {},
 ): Promise<Asset> {
   core.assertWritable();
@@ -305,7 +318,10 @@ export async function addOriginalAsset(
     core,
     projectId,
     reqs,
-    (tx) => addOriginalInTx(core, tx, sourceId, input, internal.pendingProxies),
+    async (tx) => {
+      if (internal.onlyWithoutFile && (await readSourceFile(core, tx.state, sourceId)).assets.some((a) => a.role === "original" && a.status !== "destroyed")) throw new SourceHasFileError();
+      return addOriginalInTx(core, tx, sourceId, input, internal.pendingProxies);
+    },
     { op: "asset.add-original", entity: { type: "source", id: sourceId }, ...(internal.refuse ? { refuse: internal.refuse } : {}) },
   );
 }
