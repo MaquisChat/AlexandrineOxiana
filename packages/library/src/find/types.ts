@@ -94,7 +94,9 @@ export type FindReasonCode =
   | "copy-some-unreachable"
   | "record-removed"
   | "copy-store-not-allowed"
-  | "copy-no-legal-basis";
+  | "copy-no-legal-basis"
+  // Task F15 (R324 b): found "waiting-sign-in" at start-up with nothing kept to return to ("no-open-copy").
+  | "library-unfinished";
 
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 
@@ -137,9 +139,18 @@ export interface FindEntry {
    * entries that carry it, never stored on the author's entry.
    */
   work?: string;
+  /**
+   * Task F15 (R324 b): on an entry "waiting-sign-in" only — the state and reason it rested in when the researcher
+   * started a fetch through the library, and returns to unless a file is handed over (cancel, the ticket running out,
+   * start-up, a lock or a close). Never sent to the screen. A build before F15 drops it on reading (an unknown field).
+   */
+  returnTo?: FindReturnTo;
   /** Only ever on the line that takes an entry out of the queue (written by the "remove" operation). */
   removed?: true;
 }
+
+/** Task F15: what a "waiting-sign-in" entry returns to (R324 a: only these two resting states start a library fetch). */
+export type FindReturnTo = { state: "no-open-copy" | "record-complete"; reason?: FindReason };
 
 /** Each project has at most this many entries that are not removed. */
 export const FIND_QUEUE_MAX = 500;
@@ -188,4 +199,10 @@ export const FIND_QUEUE_OPS = {
   update: "project.find.update",
   remove: "project.find.remove",
   compact: "project.find.compact",
+  /**
+   * Task F15 (R324 c): the entry's line "waiting-sign-in" — a fetch through the library started on the researcher's
+   * press. Governed with the capture of `library_access` besides the queue's own store request; audited with the
+   * entry's id, the counts and `method: "library_access"`, and nothing of the address.
+   */
+  "library-start": "project.find.library-start",
 } as const;
