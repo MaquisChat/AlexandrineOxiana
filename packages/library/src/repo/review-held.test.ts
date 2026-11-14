@@ -519,3 +519,26 @@ describe("Task F17 (R329 e, f): a file handed over through the researcher's libr
     expect(await heldFiles(w)).toEqual([]);
   });
 });
+
+describe("R347 c: the label of a used file (in its file's name, `<source> - <label>.pdf`) says how it was got", () => {
+  const labelAfterUse = async (acquired: HeldFileFacts["acquired"]) => {
+    const w = await world();
+    const r = await holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w, "looks-right"), sourceId: w.sourceId, fromPath: w.pdf, facts: facts({ ...LOOKS_RIGHT, acquired }), ...(acquired.via === "sign-in-window" ? { handedOver: true as const } : {}) });
+    await resolveHeldFile(coreOf(), w.p.id, r.reviewId, "attach");
+    const a = (await kit.repo.getSource(w.p.id, w.sourceId)).assets.find((x) => x.role === "original")!;
+    expect(a.acquired).toMatchObject({ method: acquired.method, via: acquired.via });
+    return a.path.slice(a.path.lastIndexOf("/") + 1);
+  };
+  const window_ = { via: "sign-in-window" as const, address: "https://repository.example.edu/handle/1/2", at: NOW, tool: { name: "find-and-acquire", version: "0.1.0" }, access: "signed-in-session" as const };
+
+  it("a free copy fetched in the app's own window is a \"fetched copy <date>\", never a \"free copy\"", async () => {
+    const name = await labelAfterUse({ method: "free_copy", ...window_ });
+    expect(name).toMatch(/ - fetched copy \d{4}-\d{2}-\d{2}\.pdf$/u);
+    expect(name).not.toContain("free copy");
+  });
+
+  it("a service's free copy stays a \"free copy <date>\"; the library's file a \"library copy <date>\"", async () => {
+    expect(await labelAfterUse(facts().acquired)).toMatch(/ - free copy \d{4}-\d{2}-\d{2}\.pdf$/u);
+    expect(await labelAfterUse({ method: "library_access", ...window_, address: "https://ezproxy.lib.example.edu/x.pdf" })).toMatch(/ - library copy \d{4}-\d{2}-\d{2}\.pdf$/u);
+  });
+});

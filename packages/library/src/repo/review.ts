@@ -724,7 +724,8 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
           kind: kindFor(kind),
           ext: kind,
           mime: mimeFor(kind),
-          label: `${method === "library_access" ? "library copy" : "free copy"} ${tx.at.slice(0, 10)}`,
+          // R347 c: a free copy fetched in the app's own window is a "fetched copy" (no service gave it).
+          label: `${method === "library_access" ? "library copy" : e.heldFile.acquired.via === "sign-in-window" ? "fetched copy" : "free copy"} ${tx.at.slice(0, 10)}`,
           acquired: { ...e.heldFile.acquired, check: checkOf(e.heldFile) },
         });
         await tx.trash(rel);
