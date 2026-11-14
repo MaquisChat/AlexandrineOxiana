@@ -710,7 +710,7 @@ describe("SourceDetail: how a file was got (F18b; R340 e)", () => {
     expect(how(file("free-doab"))).toBe(`A free copy from library.oapen.org, found through Directory of Open Access Books. ${ADDED}`);
     expect(how(file("library-doubt"))).toBe(`Fetched through your library (www.publisher.example). ${ADDED} You used it although the app's check had a doubt: The file names another DOI as its own.`);
     expect(how(file("library-title"))).toBe(`Fetched through your library (www.publisher.example). ${ADDED} You used it although the app's check had a doubt: The file does not show this record's title with its author.`);
-    expect(how(file("later-method"))).toBe(`Added by Find and acquire. ${ADDED}`);
+    expect(how(file("later-method"))).toBe(`Got through Find and acquire. ${ADDED}`);
     // A file without such a record shows nothing new.
     expect(how(file("plain"))).toBeUndefined();
     expect(file("plain").textContent).toBe("plain.pdf pdf · 1 KB");

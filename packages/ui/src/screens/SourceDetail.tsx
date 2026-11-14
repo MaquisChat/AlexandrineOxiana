@@ -119,7 +119,7 @@ export function acquiredWords(a: Asset): AcquiredWords | undefined {
     out.push(".");
   } else if (method === "library_access") {
     out.push(...(host ? ["Fetched through your library (", { user: host }, ")."] : ["Fetched through your library."]));
-  } else out.push("Added by Find and acquire.");
+  } else out.push("Got through Find and acquire.");
   const when = typeof at === "string" ? new Date(at) : undefined;
   if (when && !Number.isNaN(when.getTime())) out.push(" Fetched on ", { user: ACQUIRED_DATE.format(when) }, ".");
   const c = check && typeof check === "object" ? (check as Record<string, unknown>) : undefined;
