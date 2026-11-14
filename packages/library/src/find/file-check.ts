@@ -16,15 +16,18 @@
  *     (also when the extraction fails, or the file is encrypted or damaged).
  *  2. **No sign of another kind of document** in the *title zone*: the embedded title, and the text from the top of
  *     the first page to three lines after the title block (5b) — when no block is found, the first 1,000 characters.
- *     A sign is one of OTHER_KIND_PHRASES as whole words, in any case, or a line that is only one of
- *     OTHER_KIND_LINES (a section label). A label the record's own title holds is not a sign; the bare word "review"
- *     (a journal's name) is not one. Otherwise "other-kind".
- *  3. **No other version:** no volume, part, book or edition number (digits, ordinals, roman numerals after a volume
- *     word; "second edition"; a line that is only a roman numeral or an ordinal) that the record's title lacks, in
- *     the embedded title, on the title block's lines and the three lines after it, or on a line of the three before
- *     it that holds nothing but such a number. Without a block: on the lines of the title's in-order occurrence and
- *     the three after (5a), or in the whole title zone (an embedded title with its words in the text, 5b).
- *     Otherwise "other-version".
+ *     A sign is one of OTHER_KIND_PHRASES as whole words, in any case, anywhere in the zone; or one of ABOUT_LABELS
+ *     ("review of", "reply to", "notes on", …) followed directly by the record's title (its first six words) or its
+ *     first author's family name ("the", colons, quotes and line breaks may stand between: R284 a); or a line that is
+ *     only one of OTHER_KIND_LINES (a section label, "Editorial" among them). A label the record's own title holds is
+ *     not a sign; a journal's name ("Review of Economic Studies", "Editorial Board") is not one. Otherwise "other-kind".
+ *  3. **No other version** (R284 a): in the embedded title, a volume, part, book or edition number the record's title
+ *     lacks; in the text, a short line of its own (at most eight words) that begins with volume, vol., part or book and
+ *     a number, or with an edition form ("Second edition", "2nd ed.", "Revised edition") — or is the record's title
+ *     followed by one — whose phrase the record's title lacks, and that is not a journal's citation line ("no.", "pp.",
+ *     "issue" or a page range). Such a line counts within three lines before or after the title block; without a
+ *     block, on the lines of the title's in-order occurrence and the three after (5a), or in the whole title zone (an
+ *     embedded title with its words in the text, 5b). Otherwise "other-version".
  *  4. **No other DOI presented as the document's own:** when the record has a DOI, a *labelled* DOI (`doi:`, `DOI`,
  *     `https://doi.org/…`, `dx.doi.org/…`) in the file's metadata or the first 2,000 characters that is not the
  *     record's means "other-doi" — unless the record's DOI is also labelled there and comes first (the metadata's
@@ -33,7 +36,8 @@
  *     starts in lower case or with a digit, or the DOI ends with a hyphen, slash or underscore); a DOI that is only
  *     a prefix of another is a different DOI.
  *  5a. **With the record's DOI** labelled (as in 4): at least 90% of the title's content words (all of them under
- *     three) in order within the first 2,000 characters — in a stretch of at most 2n + 4 content words, so the
+ *     three) in order within the first 2,000 characters, BEGINNING on a line that starts within the first 800
+ *     characters (a paper that only cites the record does so lower down: R284 b) — in a stretch of at most 2n + 4 content words, so the
  *     title is not put together from words scattered over the page — AND the first author's family name within the
  *     first 2,000 characters or in the file's author metadata. `by: "doi"`.
  *  5b. **Without it:** the record's title as a *title block* in the first 2,000 characters — one to four
@@ -44,6 +48,9 @@
  *     content words occur in order (as in 5a) within the first 2,000 characters; AND, either way, the first
  *     author's family name within the 600 characters after the title (after the block's last line; after the
  *     occurrence's last word: the rest of its line, then 600 characters) or in the file's author metadata. `by: "title"`.
+ * Whatever the evidence, an embedded title of three or more content words that is not the record's title — nor the
+ * record's title with a subtitle, nor its main title when the record's title holds a subtitle — is another document's:
+ * "title-absent" (R284 b). An embedded title that names a file ("Microsoft Word - …", "….pdf", "untitled") is ignored.
  * Anything else is "title-absent". When several reasons apply, the first of: no-text, other-doi, other-kind,
  * other-version, title-absent.
  *
@@ -73,6 +80,12 @@ const ZONE_CHARS = 1000;
 const AUTHOR_AFTER_CHARS = 600;
 /** A title block is at most this many lines. */
 const BLOCK_LINES_MAX = 4;
+/** With the record's DOI, the title's words must begin within this many characters of the text (R284 b). */
+const DOI_TITLE_START_CHARS = 800;
+/** An embedded title that names a file, not a work: ignored when telling another document (R284 b). */
+const FILE_NAME_TITLE = /^(?:untitled|microsoft word\s*-.*|.*\.(?:pdf|docx?|tex|indd|rtf|odt|txt|epub))$/iu;
+/** A title's main title: what comes before its first subtitle mark. */
+const mainTitle = (s: string): string => s.split(/\s*[:;\u2013\u2014]\s*|\s+-\s+|\.\s+/u)[0] ?? s;
 /** The lines after (and before) the title looked at for a sign or a version. */
 const LINES_AROUND = 3;
 /** The longest title compared (in content words); a longer title is compared on its first words. */
@@ -99,28 +112,26 @@ const OTHER_KIND_PHRASES: readonly string[] = [
   "reviewed work",
   "reviewed works",
   "reviewed by",
-  "review of",
   "erratum",
   "errata",
   "corrigendum",
   "corrigenda",
-  "correction to",
   "retraction",
   "retracted",
-  "comment on",
-  "commentary on",
-  "reply to",
-  "response to",
   "rejoinder",
   "addendum",
   "supplement to",
   "supplementary material for",
   "supplementary materials for",
   "supporting information for",
-  "editorial",
   "obituary",
   "letter to the editor",
 ];
+/**
+ * Labels of a document ABOUT a work (R284 a): a sign only when the record's title (its first six words) or its first
+ * author's family name follows directly — a colon, quotation marks, "the" and a line break may stand between.
+ */
+const ABOUT_LABELS: readonly string[] = ["review of", "comment on", "comments on", "commentary on", "reply to", "response to", "correction to", "notes on", "summary of", "introduction to"];
 /** A line that is only one of these words is a section label: another kind of document. */
 const OTHER_KIND_LINES: ReadonlySet<string> = new Set(["review", "reviews", "comment", "comments", "reply", "correction", "corrections", "erratum", "editorial", "supplement"]);
 
@@ -153,7 +164,7 @@ const containsRun = (hay: readonly string[], run: readonly string[]): boolean =>
 const sameWords = (a: readonly string[], b: readonly string[]): boolean => a.length > 0 && a.length === b.length && a.every((x, i) => x === b[i]);
 
 /** A non-empty line of the text, with where it ends (in the text). */
-type Line = { text: string; end: number };
+type Line = { text: string; start: number; end: number };
 /** A word with the line it ends on. */
 type Word = { w: string; line: number };
 
@@ -166,7 +177,7 @@ function linesOf(text: string): Line[] {
   let at = 0;
   for (const raw of text.split("\n")) {
     const t = raw.trim();
-    if (t) out.push({ text: t, end: at + raw.length });
+    if (t) out.push({ text: t, start: at, end: at + raw.length });
     at += raw.length + 1;
   }
   return out;
@@ -260,10 +271,23 @@ function marksOf(words: readonly string[]): Set<string> {
   }
   return out;
 }
-/** A line that is only a number of a volume: "II", "2nd", "Volume II", "Part 2", "Second Edition". */
-function onlyVolume(words: readonly string[]): boolean {
-  if (words.length === 1) return !/^\d+$/u.test(words[0]!) && numberValue(words[0]!, undefined) !== undefined;
-  return words.length === 2 && marksOf(words).size > 0;
+const NUMBER_WORDS: ReadonlySet<string> = new Set(["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]);
+const EDITION_WORDS: ReadonlySet<string> = new Set(["revised", "new", "expanded", "enlarged", "updated", "abridged", "corrected"]);
+/**
+ * A sign of another version (R284 a): a short line of its own — at most eight words — that begins with volume, vol.,
+ * part or book and a number, or with an edition form ("Second edition", "2nd ed.", "Revised edition", "Edition 2"),
+ * whose phrase the record's title does not hold; never a journal's citation line (it also holds "no.", "pp.", "issue"
+ * or a page range).
+ */
+function versionLine(ws: readonly string[], line: string, recAll: readonly string[]): boolean {
+  if (!ws.length || ws.length > 8 || ws.some((w) => w === "no" || w === "pp" || w === "issue") || /\d\s*[-\u2013\u2014]\s*\d/u.test(line)) return false;
+  const [a, b] = ws as [string, string | undefined];
+  if (b === undefined) return false;
+  const head =
+    (["volume", "vol", "part", "book"].includes(a) && (numberValue(b, a) !== undefined || NUMBER_WORDS.has(b))) ||
+    ((a === "edition" || a === "ed") && numberValue(b, a) !== undefined) ||
+    ((b === "edition" || b === "ed") && (ORDINAL_WORDS[a] !== undefined || /^\d{1,3}(?:st|nd|rd|th)$/u.test(a) || EDITION_WORDS.has(a)));
+  return head && !containsRun(recAll, [a, b]);
 }
 
 /** The first author's family name as words (an organisation: its name), or null. */
@@ -368,42 +392,71 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   const embeddedSame = !!embedded && rec.length > 0 && sameTitle(embedded, record.title);
   const allSpans = titleSpans(rec, content, rec.length);
   const span = allSpans.find((s) => authorAfterWord(s.to)) ?? allSpans[0];
-  const doiSpan = titleSpans(rec, content, rec.length < 3 ? rec.length : Math.ceil(rec.length * 0.9))[0];
+  const doiSpan = titleSpans(rec, content, rec.length < 3 ? rec.length : Math.ceil(rec.length * 0.9)).find((sp) => lines[content[sp.from]!.line]!.start < DOI_TITLE_START_CHARS);
 
   // 2. No sign of another kind of document in the title zone.
   const zoneLines = block ? lines.slice(0, block.last + 1 + LINES_AROUND).map((l) => l.text) : linesOf(text.slice(0, ZONE_CHARS)).map((l) => l.text);
+  const textZoneWords = plainWords(zoneLines.join("\n"));
   if (embedded) zoneLines.push(embedded);
   const zoneWords = plainWords(zoneLines.join("\n"));
+  const recHead = (recAll[0] === "the" ? recAll.slice(1) : recAll).slice(0, 6);
+  /** A label of a document about a work, followed directly by the record's title or its first author's family name. */
+  const aboutIn = (ws: readonly string[]) =>
+    ABOUT_LABELS.some((p) => {
+      const pw = plainWords(p);
+      if (containsRun(recAll, pw)) return false;
+      for (let k = 0; k + pw.length <= ws.length; k++) {
+        if (!pw.every((w, i) => ws[k + i] === w)) continue;
+        let j = k + pw.length;
+        while (ws[j] === "the") j++;
+        const after = ws.slice(j);
+        if (recHead.length && recHead.every((w, i) => after[i] === w)) return true;
+        if (family && family.every((w, i) => after[i] === w || (i === family.length - 1 && after[i] === `${w}s`))) return true;
+      }
+      return false;
+    });
   const sign =
     OTHER_KIND_PHRASES.some((p) => {
       const pw = plainWords(p);
       return containsRun(zoneWords, pw) && !containsRun(recAll, pw);
     }) ||
+    aboutIn(textZoneWords) ||
+    (!!embedded && aboutIn(plainWords(embedded))) ||
     zoneLines.some((l) => {
       const lw = plainWords(l);
       return lw.length === 1 && OTHER_KIND_LINES.has(lw[0]!) && !recAll.includes(lw[0]!);
     });
   if (sign) return no("other-kind");
 
-  // 3. No other version beside the title.
+  // 3. No other version beside the title: in the embedded title, or a short line of its own (R284 a). A line that is
+  // the record's title followed by such a phrase ("CAPITAL Volume II") is one too.
   const recMarks = marksOf(recAll);
   const versionIn = (ws: readonly string[]) => [...marksOf(ws)].some((m) => !recMarks.has(m));
-  const loneNumber = (ls: readonly string[]) => ls.some((l) => onlyVolume(plainWords(l)) && !plainWords(l).every((w) => recAll.includes(w)));
+  const versionAt = (ls: readonly string[]) =>
+    ls.some((l) => {
+      const ws = plainWords(l);
+      const rest = recAll.length && recAll.every((w, i) => ws[i] === w) ? ws.slice(recAll.length) : null;
+      return versionLine(ws, l, recAll) || (!!rest && versionLine(rest, l, recAll));
+    });
   const ew = embedded ? plainWords(embedded) : [];
   const ec = ew.filter((w) => !STOP_WORDS.has(w));
   let version = versionIn(ew) || (ec.length > rec.length && rec.length > 0 && rec.every((w, i) => ec[i] === w) && ec.slice(rec.length).some((w) => numberValue(w, undefined) !== undefined && !recAll.includes(w)));
   if (block) {
-    const beside = lines.slice(block.first, block.last + 1 + LINES_AROUND).map((l) => l.text);
+    const after = lines.slice(block.last + 1, block.last + 1 + LINES_AROUND).map((l) => l.text);
     const before = lines.slice(Math.max(0, block.first - LINES_AROUND), block.first).map((l) => l.text);
-    version ||= versionIn(plainWords(beside.join("\n"))) || loneNumber(beside.slice(block.last - block.first + 1)) || before.some((l) => onlyVolume(plainWords(l)) && versionIn(plainWords(l))) || loneNumber(before);
+    version ||= versionAt(after) || versionAt(before);
   } else if (withDoi && doiSpan) {
     const from = content[doiSpan.from]!.line;
-    const beside = lines.slice(from, content[doiSpan.to]!.line + 1 + LINES_AROUND).map((l) => l.text);
-    version ||= versionIn(plainWords(beside.join("\n"))) || loneNumber(beside);
+    version ||= versionAt(lines.slice(from, content[doiSpan.to]!.line + 1 + LINES_AROUND).map((l) => l.text));
   } else if (embeddedSame && span) {
-    version ||= versionIn(zoneWords) || loneNumber(zoneLines);
+    version ||= versionAt(zoneLines);
   }
   if (version) return no("other-version");
+
+  // An embedded title of three or more content words that is not the record's title (nor it with a subtitle, nor its
+  // main title) is another document's, whatever the other evidence (R284 b). A file name is not a title.
+  const et = embedded.trim();
+  if (et && !FILE_NAME_TITLE.test(et) && contentWords(et).length >= 3 && !sameTitle(et, record.title) && !sameTitle(mainTitle(et), record.title) && !sameTitle(et, mainTitle(record.title))) return no("title-absent");
 
   // 5a. With the record's DOI: the title's words in order and the first author.
   if (withDoi && doiSpan && family && (inMeta || containsRun(words.map((x) => x.w), family))) return { match: true, by: "doi", evidence };
