@@ -365,3 +365,85 @@ describe("whereToGetIt: one list, https only, bounded (R324 d)", () => {
     expect(decodeURIComponent(new URL(l!.url).pathname.slice(1))).toBe("10.5555/x#y?z&w");
   });
 });
+
+describe("Round 2 (R328 a): the hyphenated-proxy form only on a host that reads as a proxy's", () => {
+  it("the reviewer's four rows are not through a library", () => {
+    for (const host of ["www-cs.stanford.edu", "a-bc.co.uk", "x-co.github.io", "www-jstor-org.evil.com"]) {
+      expect(deriveLibraryAccessWhy(`https://${host}/stable/1`), host).toEqual({ refused: "not-library" });
+    }
+  });
+  it("a proxy's host of three or four labels after the first stands", () => {
+    expect(deriveLibraryAccess("https://www-jstor-org.ezproxy.lib.edu/stable/1")).toEqual({ kind: "ezproxy-login", base: "https://ezproxy.lib.edu/login?url=" });
+    expect(deriveLibraryAccess("https://onlinelibrary-wiley-com.ezproxy.uni.ac.uk/doi/10.1/x")).toEqual({ kind: "ezproxy-login", base: "https://ezproxy.uni.ac.uk/login?url=" });
+  });
+});
+
+describe("Round 2 (R328 c): a DOI with a dot segment", () => {
+  it("gives no library address and no publisher's page", () => {
+    for (const doi of ["10.1000/../../../evil", "10.1000/./x", "10.1000/x/..", "10.1000/a/./b"]) {
+      for (const a of [EZ, OA, OU]) expect(libraryAddressFor(a, work({ doi })), `${a.kind} ${doi}`).toBeNull();
+      expect(whereToGetIt(work({ doi }), null).map((l) => l.label), doi).not.toContain("Publisher's page");
+    }
+    // Dots inside a segment are an ordinary DOI.
+    expect(libraryAddressFor(EZ, work({ doi: "10.1000/a..b" }))).toBe("https://ezproxy.lib.example.edu/login?url=https://doi.org/10.1000/a..b");
+  });
+});
+
+describe("Round 2 (R328 h): localhost and port 0; the length before the trim", () => {
+  it("localhost and every name under it are refused everywhere", () => {
+    for (const host of ["foo.localhost", "ezproxy.lib.localhost", "LOCALHOST", "a.LocalHost"]) {
+      expect(deriveLibraryAccessWhy(`https://${host}/login?url=x`), host).toEqual({ refused: "bad-host" });
+      expect(isLibraryAccess({ kind: "ezproxy-login", base: `https://${host.toLowerCase()}/login?url=` }), host).toBe(false);
+      expect(catalogueTemplateOk(`https://${host}/s?q={query}`), host).toBe(false);
+      const offer: OfferLink = { label: "A free copy may be at", url: `https://${host}/a.pdf`, host: "x" };
+      expect(whereToGetIt(work(), null, [offer]), host).toEqual([]);
+    }
+    // A name that merely holds the word is a host like any other.
+    expect(deriveLibraryAccess("https://localhost.example.edu/login?url=x")).toEqual({ kind: "ezproxy-login", base: "https://localhost.example.edu/login?url=" });
+  });
+  it("port 0 is refused everywhere", () => {
+    expect(deriveLibraryAccessWhy("https://ezproxy.lib.example.edu:0/login?url=x")).toEqual({ refused: "bad-host" });
+    expect(deriveLibraryAccessWhy("https://www-jstor-org.ezproxy.lib.example.edu:0/stable/1")).toEqual({ refused: "bad-host" });
+    expect(isLibraryAccess({ kind: "ezproxy-login", base: "https://ezproxy.lib.example.edu:0/login?url=" })).toBe(false);
+    expect(catalogueTemplateOk("https://catalogue.example.edu:0/s?q={query}")).toBe(false);
+    expect(whereToGetIt(work(), null, [{ label: "A free copy may be at", url: "https://repository.example.edu:0/a.pdf", host: "x" }])).toEqual([]);
+  });
+  it("the length is checked before anything is trimmed", () => {
+    const at = "https://ezproxy.lib.example.edu/login?url=x";
+    expect(deriveLibraryAccessWhy(`${" ".repeat(LIBRARY_LINK_MAX)}${at}`)).toEqual({ refused: "too-long" });
+    expect(deriveLibraryAccessWhy(`a${" ".repeat(16_000)}a`)).toEqual({ refused: "too-long" });
+    // Within the bound, the trim is linear: an inner run of spaces costs no more than its length.
+    const t0 = performance.now();
+    for (let i = 0; i < 20; i++) expect(deriveLibraryAccessWhy(`a${" ".repeat(LIBRARY_LINK_MAX - 2)}a`)).toEqual({ refused: "unreadable" });
+    expect(performance.now() - t0).toBeLessThan(200);
+  });
+});
+
+describe("Round 2 (R328 i): Where to get it — the app's host rule, and one address however it is escaped", () => {
+  it("an offer on a host the app refuses (a number, a single word) is not passed on", () => {
+    const offers: OfferLink[] = [
+      { label: "A free copy may be at", url: "https://127.0.0.1/x.pdf", host: "x" },
+      { label: "A free copy may be at", url: "https://[::1]/x.pdf", host: "x" },
+      { label: "A free copy may be at", url: "https://intranet/x.pdf", host: "x" },
+      { label: "A free copy may be at", url: "https://repository.example.edu./x.pdf", host: "x" },
+      { label: "A free copy may be at", url: "https://repository.example.edu/x.pdf", host: "x" },
+    ];
+    expect(whereToGetIt(work(), null, offers).map((l) => l.url)).toEqual(["https://repository.example.edu/x.pdf"]);
+  });
+  it("escapes of unreserved characters are one with the characters; escapes of reserved ones are kept", () => {
+    const offers: OfferLink[] = [
+      { label: "A free copy may be at", url: "https://doi.org/10.1000/%78", host: "x" },
+      { label: "A free copy may be at", url: "https://doi.org/10.1000/x", host: "x" },
+      { label: "A free copy may be at", url: "https://repository.example.edu/%7Ea%2D%5fb%2e", host: "x" },
+      { label: "A free copy may be at", url: "https://repository.example.edu/~a-_b.", host: "x" },
+      { label: "A free copy may be at", url: "https://repository.example.edu/a%2Fb?q=%26", host: "x" },
+      { label: "A free copy may be at", url: "https://repository.example.edu/a/b?q=&", host: "x" },
+    ];
+    expect(whereToGetIt(work(), null, offers).map((l) => l.url)).toEqual([
+      "https://doi.org/10.1000/x",
+      "https://repository.example.edu/~a-_b.",
+      "https://repository.example.edu/a%2Fb?q=%26",
+      "https://repository.example.edu/a/b?q=&",
+    ]);
+  });
+});

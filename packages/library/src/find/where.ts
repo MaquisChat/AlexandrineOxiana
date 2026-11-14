@@ -5,15 +5,17 @@
  *
  * Working out the library's address from ONE pasted link (`deriveLibraryAccess`). The forms, in this order:
  *   1. a path `/login` with a `url=` or `qurl=` parameter (EZproxy's starting point) → `https://<host>/login?url=`;
- *   2. a host whose first label holds hyphens and reads as a host with dots, as `www-jstor-org.ezproxy.lib.edu`
- *      (EZproxy "HttpsHyphens"; `--` stands for a hyphen of the original host) → `https://<the rest>/login?url=`;
+ *   2. a host whose first label holds hyphens and reads as a host with dots, and whose rest has at least three
+ *      labels (R328 a), as `www-jstor-org.ezproxy.lib.edu` (EZproxy "HttpsHyphens"; `--` stands for a hyphen of the
+ *      original host) → `https://<the rest>/login?url=`;
  *   3. `go.openathens.net/redirector/<domain>?url=` (UNVERIFIED against a real institution) → that redirector;
  *   4. a query with `url_ver=Z39.88-2004`, `ctx_ver=`, `rft_id=` or an `rft.` key (an OpenURL resolver) → its origin
  *      and path (a `;jsessionid=…` in the path is cut).
  * A link is refused, with a code the service says in words (`YOUR_LIBRARY_DERIVE_TEXT`), when it is over
  * LIBRARY_LINK_MAX characters, holds a control character or a space (outside the spaces and line ends around it, which
  * a paste brings), cannot be read as an address, is not https, holds a user name or password, or names its host by a
- * number (IPv4, IPv6), a single label or a name ending in a dot. Anything else is "not a library link".
+ * number (IPv4, IPv6), a single label, a name ending in a dot or `localhost` (or a name under it), or gives port 0.
+ * Anything else is "not a library link".
  * The link itself is NEVER kept, returned, logged or put in an error: only the `base` built here, which holds nothing
  * of the link's query but the name of its target parameter (`url=`), and nothing of its path but `/login` (forms 1, 2),
  * the redirector's domain (form 3) or the resolver's path (form 4). Only https addresses are ever produced.
@@ -66,14 +68,21 @@ const TLDS: ReadonlySet<string> = new Set(["com", "org", "net", "edu", "gov", "i
 
 const DOI_TARGET = "https://doi.org/";
 
-/** A host name the app accepts (already lower-cased and punycoded by URL): at least two labels, no number, no trailing dot. */
+/**
+ * A host name the app accepts (already lower-cased and punycoded by URL): at least two labels, no number, no trailing
+ * dot, and neither `localhost` nor any name under it (R328 h: a loopback name).
+ */
 function hostOk(hostname: string): boolean {
   if (!hostname || hostname.length > 253 || hostname.endsWith(".") || hostname.startsWith("[")) return false;
   const labels = hostname.split(".");
   if (labels.length < 2 || !labels.every((l) => LABEL.test(l))) return false;
+  if (labels[labels.length - 1] === "localhost") return false;
   // An IPv4 address (or anything whose last label is all digits) is not a host name.
   return !/^\d+$/u.test(labels[labels.length - 1]!);
 }
+
+/** A parsed address's host and port as the app accepts them: `hostOk`, and never port 0 (R328 h). */
+const addressOk = (u: URL): boolean => hostOk(u.hostname) && u.port !== "0";
 
 /** `https://<host>` as URL keeps it: lower case, punycode, a port only when not 443. */
 const authorityOf = (u: URL): string => u.host;
@@ -87,11 +96,24 @@ function hyphenHost(label: string): string[] | null {
   return /^[a-z]{2}$/u.test(tld) || TLDS.has(tld) ? parts : null;
 }
 
+/** A space, line end or control character a paste may bring around a link. */
+const AROUND = /^[\s\u0000-\u001f]$/u;
+
+/** `s` without the spaces, line ends and control characters around it: by indexes, linear in its length (R328 h). */
+function trimAround(s: string): string {
+  let a = 0;
+  let b = s.length;
+  while (a < b && AROUND.test(s[a]!)) a++;
+  while (b > a && AROUND.test(s[b - 1]!)) b--;
+  return s.slice(a, b);
+}
+
 /** The link parsed, or why it cannot be read. Never throws; never keeps the link. */
 function parseLink(link: unknown): URL | DeriveRefusal {
   if (typeof link !== "string") return "unreadable";
-  const t = link.replace(/^[\s\u0000-\u001f]+|[\s\u0000-\u001f]+$/gu, "");
-  if (t.length > LIBRARY_LINK_MAX) return "too-long";
+  // R328 h: the length first, before anything is done with the link (no input costs more than its size).
+  if (link.length > LIBRARY_LINK_MAX) return "too-long";
+  const t = trimAround(link);
   if (t === "" || CONTROL_OR_SPACE.test(t)) return "unreadable";
   let u: URL;
   try {
@@ -101,7 +123,7 @@ function parseLink(link: unknown): URL | DeriveRefusal {
   }
   if (u.protocol !== "https:") return "not-https";
   if (u.username !== "" || u.password !== "") return "userinfo";
-  if (!hostOk(u.hostname)) return "bad-host";
+  if (!addressOk(u)) return "bad-host";
   return u;
 }
 
@@ -113,9 +135,10 @@ export function deriveLibraryAccessWhy(link: unknown): { access: LibraryAccess }
   const keys = [...q.keys()];
   // 1. EZproxy's starting point.
   if (u.pathname.toLowerCase() === "/login" && (q.has("url") || q.has("qurl"))) return { access: { kind: "ezproxy-login", base: `https://${authorityOf(u)}/login?url=` } };
-  // 2. EZproxy's hyphenated host: the rest must itself be a host of at least two labels.
+  // 2. EZproxy's hyphenated host (R328 a): the rest must itself be a host of at least THREE labels (more than a
+  // registrable name such as `stanford.edu`, `co.uk` or `github.io`), and the first label must read as a host.
   const [first, ...rest] = u.hostname.split(".");
-  if (first && rest.length >= 2 && hyphenHost(first) && hostOk(rest.join("."))) {
+  if (first && rest.length >= 3 && hyphenHost(first) && hostOk(rest.join("."))) {
     return { access: { kind: "ezproxy-login", base: `https://${rest.join(".")}${u.port ? `:${u.port}` : ""}/login?url=` } };
   }
   // 3. OpenAthens' redirector (UNVERIFIED form).
@@ -158,7 +181,7 @@ export function isLibraryAccess(v: unknown): v is LibraryAccess {
   } catch {
     return false;
   }
-  if (u.protocol !== "https:" || u.username !== "" || u.password !== "" || !hostOk(u.hostname) || u.href !== base) return false;
+  if (u.protocol !== "https:" || u.username !== "" || u.password !== "" || !addressOk(u) || u.href !== base) return false;
   switch (o.kind) {
     case "ezproxy-login":
       return base === `https://${authorityOf(u)}/login?url=`;
@@ -187,9 +210,14 @@ const strictEncode = (s: string): string => encodeURIComponent(s).replace(/[!'()
 /** A DOI as one path of doi.org: every character encoded but its slashes. */
 const doiPath = (doi: string): string => strictEncode(doi).replace(/%2F/gu, "/");
 
-/** The work's DOI of the accepted shape, and its first ISBN that is one (as ISBN-13): what a library address is built from. */
+/**
+ * The work's DOI of the accepted shape, and its first ISBN that is one (as ISBN-13): what a library address is built
+ * from. A DOI one of whose `/`-separated segments is `.` or `..` is not used (R328 c): appended to an address it would
+ * no longer read back as itself.
+ */
 export function idsOf(w: WorkCandidate): { doi?: string; isbn?: string } {
-  const doi = canonDoi(w.identifiers?.doi);
+  const canon = canonDoi(w.identifiers?.doi);
+  const doi = canon && !canon.split("/").some((seg) => seg === "." || seg === "..") ? canon : undefined;
   let isbn: string | undefined;
   for (const i of w.identifiers?.isbn ?? []) {
     isbn = typeof i === "string" && i.length <= 40 ? normalizeIsbn13(i) : undefined;
@@ -244,19 +272,33 @@ export function catalogueTemplateOk(v: unknown): v is string {
   } catch {
     return false;
   }
-  return u.protocol === "https:" && u.username === "" && u.password === "" && hostOk(u.hostname);
+  return u.protocol === "https:" && u.username === "" && u.password === "" && addressOk(u);
 }
 
-/** A link as "Where to get it" gives it, or null: https, no user name or password, at most WHERE_URL_MAX, its host parsed from it. */
+/** RFC 3986's unreserved characters: an escape of one of them is the character itself. */
+const UNRESERVED = /^[A-Za-z0-9\-._~]$/u;
+/** `href` with every escape of an unreserved character replaced by the character; every other escape left as it is (R328 i). */
+const unescapeUnreserved = (href: string): string =>
+  href.replace(/%([0-9A-Fa-f]{2})/gu, (m, hex: string) => {
+    const c = String.fromCharCode(parseInt(hex, 16));
+    return UNRESERVED.test(c) ? c : m;
+  });
+
+/**
+ * A link as "Where to get it" gives it, or null: https, no user name or password, a host and port the app's own rule
+ * accepts (R328 i: never a number or a single word), at most WHERE_URL_MAX, its host parsed from it; escapes of
+ * unreserved characters written as the characters, so that two ways of writing one address are one.
+ */
 function linkOf(label: OfferLink["label"], url: unknown): OfferLink | null {
   if (typeof url !== "string" || url.length > WHERE_URL_MAX || CONTROL_OR_SPACE.test(url)) return null;
   let u: URL;
   try {
     u = new URL(url);
+    u = new URL(unescapeUnreserved(u.href));
   } catch {
     return null;
   }
-  if (u.protocol !== "https:" || u.username !== "" || u.password !== "" || !u.hostname || u.href.length > WHERE_URL_MAX) return null;
+  if (u.protocol !== "https:" || u.username !== "" || u.password !== "" || !addressOk(u) || u.href.length > WHERE_URL_MAX) return null;
   return { label, url: u.href, host: u.hostname };
 }
 
