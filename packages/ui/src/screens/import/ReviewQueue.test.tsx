@@ -5,6 +5,7 @@ import type { ImportApi, ReviewItem, SourceFile } from "../../api/import";
 import { http, HttpResponse } from "msw";
 import { BASE as SERVICE, mockService, PSEUDONYMISING_GOVERNANCE, server, type ServiceSetup, B1, P1 } from "../../test/importService";
 import { renderToStaticMarkup } from "react-dom/server";
+import { HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { FilePreview } from "./FilePreview";
 import { ReviewQueue } from "./ReviewQueue";
 
@@ -484,14 +485,21 @@ describe("Review queue: the file under review (Task 57, R135)", () => {
   });
 });
 
-describe("a file found for a record that did not clearly match it (F11, R277 d)", () => {
+describe("files found for records (F11; R277 d, R296 b, R303)", () => {
   const RECORD = "Rivers and Memory in Upland Villages";
+  const DOUBTED = "A file was found for this record, but it did not clearly match.";
+  /** Words that doubt a file, and words that approve of one: neither may be said of the other kind. */
+  const DOUBT = /did not clearly match|not match|mismatch|doubt|another DOI|does not show|accepted it after/iu;
+  const APPROVAL = /looks? (like )?(the )?right|right file|matches its record/iu;
   const heldItem = (n: number, extra: Partial<ReviewItem> = {}): ReviewItem =>
     ({
-      ...item(n, { kind: "verification", batchId: undefined, method: undefined, confidence: undefined, group: "found-file", cause: { kind: "acquired-file-mismatch", findEntryId: `e${n}` }, reasons: ["A file was found for this record, but it did not clearly match."], title: RECORD }),
+      ...item(n, { kind: "verification", batchId: undefined, method: undefined, confidence: undefined, group: "found-file", cause: { kind: "acquired-file-mismatch", findEntryId: `e${n}` }, reasons: [DOUBTED], title: RECORD }),
       heldFile: { why: "other-doi", kind: "pdf", bytes: 2_400_000, fileDoi: "10.5555/ao.f11.other", embeddedTitle: "<b>A Different Paper</b> ‮Entirely", textStart: "A Different Paper Entirely. Abstract. <img src=x onerror=alert(1)>" },
       ...extra,
     }) as ReviewItem;
+  /** A file the check matched (R296 b): the service's own sentence and advice. */
+  const rightItem = (n: number, title: string): ReviewItem =>
+    heldItem(n, { sourceId: `s${n}`, title, reasons: [HELD_FILE_LOOKS_RIGHT_TEXT], heldFile: { why: "looks-right", kind: "pdf", bytes: 900_000, embeddedTitle: title, textStart: `${title}. Ann Smith.` } } as Partial<ReviewItem>);
   const project = (handlers: ServiceSetup["extra"] = []): ServiceSetup => ({
     projectReview: { [P1]: [heldItem(7), heldItem(8, { sourceId: "s8", title: "A Second Record" })] },
     sources: { s7: source(7, RECORD), s8: source(8, "A Second Record") },
@@ -503,6 +511,12 @@ describe("a file found for a record that did not clearly match it (F11, R277 d)"
       ...handlers,
     ],
   });
+  /** Two files that look right and two that the check doubts, listed by the service in this order: 7 (doubted), 8 (right), 9 (doubted), 10 (right). */
+  const mixed = (handlers: ServiceSetup["extra"] = []): ServiceSetup => ({
+    ...project(handlers),
+    projectReview: { [P1]: [heldItem(7), rightItem(8, "Right One"), heldItem(9, { sourceId: "s9", title: "Doubted Two" }), rightItem(10, "Right Two")] },
+    sources: { s7: source(7, RECORD), s8: source(8, "Right One"), s9: source(9, "Doubted Two"), s10: source(10, "Right Two") },
+  });
   let heldCalls: Array<{ id: string; body: unknown }> = [];
   beforeEach(() => {
     heldCalls = [];
@@ -513,59 +527,186 @@ describe("a file found for a record that did not clearly match it (F11, R277 d)"
     render(<ReviewQueue client={m.client} projectId={P1} />);
     return { m, user };
   };
+  const group = (name: RegExp) => screen.getByRole("list", { name });
+  const card = (title: string) => {
+    const li = screen.getAllByRole("listitem").find((x) => x.querySelector("h4")?.textContent === title);
+    if (!li) throw new Error(`no card for ${title}`);
+    return li;
+  };
+  const use = (title: string) => screen.getByRole("button", { name: `Use this file for ${title}` });
 
-  it("has its own group, and shows the record's title, the sentence and what the check found, as text only", async () => {
+  it("has its own group, and shows the record (title, creators, year), the entry's sentence and what the check found, as text only", async () => {
     open(project());
     expect(await screen.findByRole("heading", { name: "Files found for records" })).toBeTruthy();
-    const panel = await screen.findByRole("region", { name: "File found for this record" });
-    expect(within(panel).getByText(RECORD)).toBeTruthy();
-    expect(within(panel).getByText("A file was found for this record, but it did not clearly match.")).toBeTruthy();
-    expect(within(panel).getByText("The file names another DOI as its own.")).toBeTruthy();
-    expect(within(panel).getByText("10.5555/ao.f11.other")).toBeTruthy();
+    const c = await waitFor(() => card(RECORD));
+    expect(within(c).getByText(DOUBTED)).toBeTruthy();
+    expect(within(c).getByText(HELD_FILE_WHY_TEXT["other-doi"])).toBeTruthy();
+    expect(within(c).getByText("10.5555/ao.f11.other")).toBeTruthy();
+    // The record it was found for, from its source (labelled in words).
+    await waitFor(() => expect(within(c).getByText("Ann Smith")).toBeTruthy());
+    expect(within(c).getByText("2020")).toBeTruthy();
+    for (const label of ["Creators", "Year", "What the app's check says", "DOI the file names", "Title in the file", "Start of the file's text", "File"]) expect(within(c).getByText(label)).toBeTruthy();
     // Outside text, never markup: shown as typed, with bidi isolation (UserText).
-    expect(within(panel).getByText(/<b>A Different Paper<\/b>/u)).toBeTruthy();
-    expect(within(panel).getByText(/<img src=x onerror=alert\(1\)>/u)).toBeTruthy();
-    expect(panel.querySelector("b, img")).toBeNull();
-    expect(within(panel).getByText(/PDF, 2\.3 MB/u)).toBeTruthy();
-    expect(within(panel).getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
-    expect(within(panel).getByRole("button", { name: `Not this file for ${RECORD}` })).toBeTruthy();
+    expect(within(c).getByText(/<b>A Different Paper<\/b>/u)).toBeTruthy();
+    expect(within(c).getByText(/<img src=x onerror=alert\(1\)>/u)).toBeTruthy();
+    expect(within(c).getByText(/<b>A Different Paper<\/b>/u).closest("[dir=auto]")).toBeTruthy();
+    expect(c.querySelector("b, img")).toBeNull();
+    expect(within(c).getByText(/PDF, 2\.3 MB/u)).toBeTruthy();
+    expect(within(c).getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
+    expect(within(c).getByRole("button", { name: `Not this file for ${RECORD}` })).toBeTruthy();
   });
 
-  it("Use this file sends one decision, and the entry leaves; focus goes to the next entry", async () => {
-    const { user } = open(project());
-    const use = await screen.findByRole("button", { name: `Use this file for ${RECORD}` });
-    await user.dblClick(use);
-    await waitFor(() => expect(screen.queryByRole("button", { name: `Use this file for ${RECORD}` })).toBeNull());
-    expect(heldCalls).toEqual([{ id: "r7", body: { projectId: P1, decision: "attach" } }]);
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Show A Second Record" })));
-    expect(screen.getByRole("status").textContent).toMatch(/File added to its record: Rivers and Memory/u);
-  });
-
-  it("Not this file sends its decision; with nothing left, focus goes to the queue's heading", async () => {
+  it("a file that looks right is shown with the service's sentence and advice, never with words of doubt", async () => {
     const o = project();
-    o.projectReview = { [P1]: [heldItem(7)] };
-    const { user } = open(o);
-    await user.click(await screen.findByRole("button", { name: `Not this file for ${RECORD}` }));
-    await waitFor(() => expect(screen.getByText("Nothing is waiting for review in this project.")).toBeTruthy());
-    expect(heldCalls).toEqual([{ id: "r7", body: { projectId: P1, decision: "discard" } }]);
-    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Review queue" }));
-    expect(screen.getByRole("status").textContent).toMatch(/File removed/u);
+    o.projectReview = { [P1]: [rightItem(8, "Right One")] };
+    o.sources = { s8: source(8, "Right One") };
+    open(o);
+    const c = await waitFor(() => card("Right One"));
+    expect(within(c).getByText(HELD_FILE_LOOKS_RIGHT_TEXT)).toBeTruthy();
+    expect(within(c).getByText(HELD_FILE_WHY_TEXT["looks-right"])).toBeTruthy();
+    await waitFor(() => expect(within(c).getByText("Ann Smith")).toBeTruthy());
+    expect(c.textContent).not.toMatch(DOUBT);
+    // Nor anywhere else in the section.
+    expect(screen.getByRole("region", { name: "Files found for records" }).textContent).not.toMatch(DOUBT);
   });
 
-  it("a refusal shows the service's sentence, and the entry stays", async () => {
-    const refuse = http.post(`${SERVICE}/review/:itemId/held-file`, () =>
-      HttpResponse.json(
-        { error: { code: "CONFLICT", message: "The record this file was found for is no longer in the library, so the file cannot be added to it. Choose “Not this file” to remove it. Nothing was changed.", reason: "source-gone" } },
-        { status: 409 },
-      ),
-    );
+  it("a doubted file is shown with its reason, never with words of approval", async () => {
     const o = project();
-    o.extra = [refuse];
+    o.projectReview = { [P1]: [heldItem(7), heldItem(9, { sourceId: "s9", title: "Doubted Two", heldFile: { why: "no-text", kind: "epub", bytes: 4096 } } as Partial<ReviewItem>)] };
+    o.sources = { s7: source(7, RECORD), s9: source(9, "Doubted Two") };
+    open(o);
+    const c = await waitFor(() => card("Doubted Two"));
+    expect(within(c).getByText(DOUBTED)).toBeTruthy();
+    expect(within(c).getByText(HELD_FILE_WHY_TEXT["no-text"])).toBeTruthy();
+    expect(within(c).getByText(/EPUB, 4 KB/u)).toBeTruthy();
+    for (const t of [RECORD, "Doubted Two"]) expect(card(t).textContent).not.toMatch(APPROVAL);
+    expect(screen.getByRole("region", { name: "Files found for records" }).textContent).not.toMatch(APPROVAL);
+  });
+
+  it("the files that look right are gathered first, each group with its number, an empty group not shown", async () => {
+    open(mixed());
+    const right = await waitFor(() => group(/^Files that look right/u));
+    const other = group(/^Other files found/u);
+    expect(screen.getByRole("heading", { name: "Files that look right (2)" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Other files found (2)" })).toBeTruthy();
+    expect(within(right).getAllByRole("listitem").map((li) => li.querySelector("h4")?.textContent)).toEqual(["Right One", "Right Two"]);
+    expect(within(other).getAllByRole("listitem").map((li) => li.querySelector("h4")?.textContent)).toEqual([RECORD, "Doubted Two"]);
+    // First: the group of files that look right comes before the other.
+    expect(right.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    cleanup();
+    // Only doubted files: no heading for files that look right.
+    open(project());
+    await waitFor(() => card(RECORD));
+    expect(screen.queryByRole("heading", { name: /^Files that look right/u })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Other files found (2)" })).toBeTruthy();
+  });
+
+  it("every file has its own two controls, named with its record; nothing decides several at once", async () => {
+    const { user } = open(mixed());
+    await waitFor(() => card("Right Two"));
+    const section = screen.getByRole("region", { name: "Files found for records" });
+    for (const t of ["Right One", "Right Two", RECORD, "Doubted Two"]) {
+      const buttons = within(card(t)).getAllByRole("button");
+      expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([`Use this file for ${t}`, `Not this file for ${t}`]);
+    }
+    // No control in the section is about more than one file.
+    for (const el of within(section).queryAllByRole("button")) expect(el.getAttribute("aria-label") ?? el.textContent).not.toMatch(/\ball\b|every|selected/iu);
+    expect(within(section).queryAllByRole("checkbox")).toHaveLength(0);
+    // One request per press, one file per request.
+    await user.dblClick(use("Right One"));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Use this file for Right One" })).toBeNull());
+    await user.click(screen.getByRole("button", { name: "Not this file for Doubted Two" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Not this file for Doubted Two" })).toBeNull());
+    expect(heldCalls).toEqual([
+      { id: "r8", body: { projectId: P1, decision: "attach" } },
+      { id: "r9", body: { projectId: P1, decision: "discard" } },
+    ]);
+    // The other two still wait, each with its own controls.
+    expect(use("Right Two")).toBeTruthy();
+    expect(use(RECORD)).toBeTruthy();
+  });
+
+  it("after Use this file focus goes to the next waiting file; after the last, to the heading or the empty message", async () => {
+    const { user } = open(mixed());
+    await waitFor(() => card("Right Two"));
+    // The next in the same group.
+    await user.click(use("Right One"));
+    await waitFor(() => expect(document.activeElement).toBe(use("Right Two")));
+    expect(screen.getByRole("status").textContent).toBe("File added to its record: Right One");
+    // The last of its group: the first file of the other group.
+    await user.click(use("Right Two"));
+    await waitFor(() => expect(document.activeElement).toBe(use(RECORD)));
+    expect(screen.queryByRole("heading", { name: /^Files that look right/u })).toBeNull();
+    // Not this file moves on the same way.
+    await user.click(screen.getByRole("button", { name: `Not this file for ${RECORD}` }));
+    await waitFor(() => expect(document.activeElement).toBe(use("Doubted Two")));
+    expect(screen.getByRole("status").textContent).toBe(`File removed; the record keeps no file: ${RECORD}`);
+    // The last file of all: the message that says nothing is waiting.
+    await user.click(use("Doubted Two"));
+    const empty = await screen.findByText("Nothing is waiting for review in this project.");
+    await waitFor(() => expect(document.activeElement).toBe(empty));
+    expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10", "r7", "r9"]);
+  });
+
+  it("after the last found file, with other entries still waiting, focus goes to the queue's heading", async () => {
+    const o = project();
+    o.projectReview = { [P1]: [item(1, { batchId: undefined, title: "Dropped file" }), rightItem(8, "Right One")] };
+    o.sources = { s1: source(1, "Dropped file"), s8: source(8, "Right One") };
     const { user } = open(o);
-    await user.click(await screen.findByRole("button", { name: `Use this file for ${RECORD}` }));
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/no longer in the library, so the file cannot be added to it/u);
-    expect(screen.getByRole("button", { name: `Use this file for ${RECORD}` })).toBeTruthy();
+    await waitFor(() => card("Right One"));
+    await user.click(use("Right One"));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Review queue" })));
+    expect(screen.queryByRole("region", { name: "Files found for records" })).toBeNull();
+    expect(screen.getByRole("button", { name: /Show Dropped file/u })).toBeTruthy();
+  });
+
+  it("one file's decision under way leaves the others usable", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const o = mixed([]);
+    o.extra = [
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        if (params.itemId === "r8") await gate;
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    const { user } = open(o);
+    await waitFor(() => card("Right Two"));
+    await user.click(use("Right One"));
+    await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+    // Its two buttons are busy and cannot be pressed again; focus stays on the one pressed.
+    const one = within(card("Right One"));
+    expect(one.getByRole("button", { name: "Use this file for Right One" }).getAttribute("aria-disabled")).toBe("true");
+    expect(one.getByRole("button", { name: "Use this file for Right One" }).getAttribute("aria-busy")).toBe("true");
+    expect(one.getByRole("button", { name: "Not this file for Right One" }).getAttribute("aria-disabled")).toBe("true");
+    expect(document.activeElement).toBe(use("Right One"));
+    await user.click(use("Right One"));
+    await user.click(screen.getByRole("button", { name: "Not this file for Right One" }));
+    // Another file is decided meanwhile.
+    expect(use("Right Two").getAttribute("aria-disabled")).toBeNull();
+    await user.click(use("Right Two"));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Use this file for Right Two" })).toBeNull());
+    expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
+    release();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Use this file for Right One" })).toBeNull());
+    expect(heldCalls.map((c) => c.id)).toEqual(["r8", "r10"]);
+  });
+
+  it("a refusal keeps the entry, shows the service's sentence and keeps focus on the control", async () => {
+    const GONE = "The record this file was found for is no longer in the library, so the file cannot be added to it. Choose “Not this file” to remove it. Nothing was changed.";
+    const o = project();
+    o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => HttpResponse.json({ error: { code: "CONFLICT", message: GONE, reason: "source-gone" } }, { status: 409 }))];
+    const { user } = open(o);
+    await waitFor(() => card(RECORD));
+    await user.click(use(RECORD));
+    const alert = await within(card(RECORD)).findByRole("alert");
+    expect(alert.textContent).toContain(GONE);
+    expect(use(RECORD)).toBeTruthy();
+    expect(use(RECORD).getAttribute("aria-disabled")).toBeNull();
+    expect(document.activeElement).toBe(use(RECORD));
+    // Only the file decided shows it.
+    expect(within(card("A Second Record")).queryByRole("alert")).toBeNull();
   });
 
   it("R282 d: a 409 because Find and acquire is paused is NOT 'already decided': its sentence is shown and the entry stays", async () => {
@@ -587,5 +728,6 @@ describe("a file found for a record that did not clearly match it (F11, R277 d)"
     await user.click(await screen.findByRole("button", { name: `Use this file for ${RECORD}` }));
     await waitFor(() => expect(screen.queryByRole("button", { name: `Use this file for ${RECORD}` })).toBeNull());
     expect(screen.getByRole("status").textContent).toMatch(/had already been decided, so it left the queue: Rivers and Memory/u);
+    await waitFor(() => expect(document.activeElement).toBe(use("A Second Record")));
   });
 });

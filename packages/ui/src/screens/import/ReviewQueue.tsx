@@ -26,9 +26,15 @@
  * project's entries are neither listed nor decided, and nothing about them is shown; answers for
  * another project, after a lock or after the screen closed are dropped.
  *
- * "Files found for records" (Find and acquire, F11, R277 d): a file found for a record that did not clearly match it
- * is held in the project. Its entry shows the record's title, what the check found (all of it outside text, through
- * UserText) and "Use this file" / "Not this file" — one request per decision, through the service's own route.
+ * "Files found for records" (Find and acquire, F11; R296, R301, R303): every file found for a record is held in the
+ * project and waits for the researcher, the app's check only advice. Each waiting file is shown in full in its own
+ * place — the record it was found for (title, creators, year), the entry's own sentence (`reasons[0]`), what the app's
+ * check says (HELD_FILE_WHY_TEXT) and the file's facts, all outside text through UserText — with its own "Use this
+ * file" and "Not this file": one request per press, one file per request; nothing decides several files at once
+ * (R303 a). The files that look right are gathered first ("Files that look right (N)"), the others after them ("Other
+ * files found (N)"); a group with no file is not shown. One file's decision under way leaves the others usable. After
+ * a decision focus goes to the next waiting file's "Use this file" (in the same group, else the first of the other
+ * group), else to the queue's heading, or to the message that nothing is waiting.
  */
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
 import { ApiClientError, type ApiClient } from "../../api/client";
@@ -48,7 +54,6 @@ import {
   type Tag,
 } from "../../api/import";
 import {
-  HELD_FILE_REVIEW_TEXT,
   HELD_FILE_WHY_TEXT,
   PROJECT_REVIEW_PAGE_MAX,
   reviewGroup,
@@ -60,6 +65,7 @@ import {
 } from "@ao/shared";
 import { isProjectLocked, libraryApi } from "../../api/library";
 import { verificationApi, type FieldReview } from "../../api/verification";
+import { yearOf } from "../../api/find";
 import { CodeSwatch } from "../../components/CodeSwatch";
 import { DialogShell } from "../../components/ReasonDialog";
 import { UserText } from "../../components/UserText";
@@ -154,6 +160,11 @@ const GROUP_TITLES: Record<Exclude<ReviewGroup, "import">, string> = {
 /** An entry of the project's queue as the service sends it, with what the check found about a held file (F11). */
 type HeldItem = ReviewItem & { heldFile?: ReviewHeldFile };
 
+/** A waiting file is listed in its own section, not in the list beside the panel (R303 b). */
+const isFound = (i: ReviewItem): boolean => groupOf(i) === "found-file";
+/** The app's check says the file looks right (R296 b): advice only — it still waits for the researcher. */
+const looksRight = (i: ReviewItem): boolean => (i as HeldItem).heldFile?.why === "looks-right";
+
 const DATE = new Intl.DateTimeFormat("en", { dateStyle: "medium" });
 
 function importTitle(batchId: string | undefined, batches: BatchSummary[]): string {
@@ -211,6 +222,12 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState("");
   const [focusId, setFocusId] = useState<{ id: string | null } | null>(null);
+  /** Waiting files (F11, R303): the decision under way on each, the service's sentence for a refused one, where focus goes after one. */
+  const [heldBusy, setHeldBusy] = useState<Readonly<Record<string, HeldFileDecision>>>({});
+  const heldBusyRef = useRef(new Set<string>());
+  const [heldErrors, setHeldErrors] = useState<Readonly<Record<string, string>>>({});
+  const [fileFocus, setFileFocus] = useState<{ to: string } | null>(null);
+
   /** The project's queue is locked (PROJECT_LOCKED): nothing of it is shown until it is unlocked here. */
   const [locked, setLocked] = useState(false);
   const [projectName, setProjectName] = useState("This project");
@@ -220,6 +237,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const gen = useRef(0);
   const showButtons = useRef(new Map<string, HTMLButtonElement>());
   const title = useRef<HTMLHeadingElement>(null);
+  /** Each waiting file's "Use this file" and its card (R303 b: focus moves between them). */
+  const useButtons = useRef(new Map<string, HTMLButtonElement>());
+  const fileCards = useRef(new Map<string, HTMLElement>());
+  /** The message that nothing is waiting: focus goes there after the last decision. */
+  const emptyNote = useRef<HTMLParagraphElement>(null);
 
   // ---- source loading: a queue served by SOURCE_POOL workers, the current item first ----
   const pool = useRef({ queue: [] as string[], active: 0, live: true, asked: new Set<string>() });
@@ -284,6 +306,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     setSelected([]);
     setStatus("");
     setError(null);
+    setHeldBusy({});
+    setHeldErrors({});
     setStore(recordStore());
     setLocked(true);
   }, []);
@@ -312,9 +336,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       (list) => {
         if (!ok()) return;
         setItems(list);
-        setCurrent(list[0]?.id ?? null);
-        // Titles come with the items; only items sent without one need their record for the list.
-        p.queue = list.flatMap((i) => (i.sourceId && !i.title ? [i.sourceId] : []));
+        // A waiting file is shown in full in its own section; the panel shows the first of the others.
+        setCurrent(list.find((i) => !isFound(i))?.id ?? null);
+        // Titles come with the items; only items sent without one need their record for the list. A waiting file's
+        // record is read for its creators and year (the record it was found for, R303).
+        p.queue = list.flatMap((i) => (i.sourceId && (!i.title || isFound(i)) ? [i.sourceId] : []));
         pump();
       },
       (e: unknown) => {
@@ -398,7 +424,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const rest = list.filter((x) => !gone.has(x.id));
     const shown = currentRef.current;
     const shownGone = !!shown && gone.has(shown);
-    const next = shownGone ? (rest[Math.min(at, rest.length - 1)]?.id ?? null) : shown;
+    // The next entry beside the panel (a waiting file is not shown there).
+    const listed = list.filter((x) => !isFound(x));
+    const restListed = listed.filter((x) => !gone.has(x.id));
+    const lat = Math.max(0, listed.findIndex((x) => gone.has(x.id)));
+    const next = shownGone ? (restListed[Math.min(lat, restListed.length - 1)]?.id ?? null) : shown;
     itemsRef.current = rest;
     currentRef.current = next;
     setItems(rest);
@@ -506,22 +536,55 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   };
 
   /**
-   * "Use this file" / "Not this file" on a held file (F11): one request per decision, however often it is pressed.
-   * Decided, the entry leaves the view (focus to the next entry, or the heading). A refusal is said in the service's
-   * own sentence and the entry stays; one the service says was already decided elsewhere leaves the view.
+   * "Use this file" / "Not this file" on a waiting file (F11; R303): one request per press, one file per request. Each
+   * file has its own decision under way: its two buttons are busy while it is out, and the other files stay usable.
+   * Decided, the file leaves the view and focus goes to the next waiting file (R303 b). A refusal is said in the
+   * service's own sentence beside that file and the entry stays, focus where it was; only a refusal the service says
+   * was already decided takes it away (R282 d).
    */
-  const [heldError, setHeldError] = useState<{ id: string; text: string } | null>(null);
+  const withoutKey = <T,>(rec: Readonly<Record<string, T>>, id: string): Record<string, T> => {
+    const { [id]: _drop, ...rest } = rec;
+    return rest;
+  };
+  /** A waiting file left the queue: the next waiting file (the same group, else the other), else the heading or the empty message. */
+  const fileLeft = (item: ReviewItem, said: (n: number) => string) => {
+    const list = itemsRef.current ?? [];
+    const at = list.findIndex((x) => x.id === item.id);
+    if (at < 0) return;
+    // Focus moves only when it was on this file (or nowhere): a researcher already at another file keeps their place.
+    const active = document.activeElement;
+    const card = fileCards.current.get(item.id);
+    const hadFocus = !active || active === document.body || (!!card && card.contains(active));
+    const found = list.filter(isFound);
+    const mine = found.filter((x) => looksRight(x) === looksRight(item));
+    const theirs = found.filter((x) => looksRight(x) !== looksRight(item));
+    const k = mine.findIndex((x) => x.id === item.id);
+    const restMine = mine.filter((x) => x.id !== item.id);
+    const next = restMine[Math.min(k, restMine.length - 1)] ?? theirs[0];
+    const rest = list.filter((x) => x.id !== item.id);
+    itemsRef.current = rest;
+    setItems(rest);
+    setSelected((s) => s.filter((x) => x !== item.id));
+    setStatus(said(at + 1));
+    if (hadFocus) setFileFocus({ to: next ? next.id : rest.length ? ":title" : ":empty" });
+  };
+  useEffect(() => {
+    if (!fileFocus) return;
+    const t = fileFocus.to;
+    const el = t === ":empty" ? emptyNote.current : t === ":title" ? title.current : (useButtons.current.get(t) ?? title.current);
+    el?.focus();
+  }, [fileFocus]);
   const decideHeld = async (item: ReviewItem, decision: HeldFileDecision) => {
-    if (busyRef.current) return;
-    busyRef.current = true;
+    if (heldBusyRef.current.has(item.id)) return;
+    heldBusyRef.current.add(item.id);
     const g = gen.current;
-    setBusy(true);
-    setHeldError(null);
+    setHeldBusy((cur) => ({ ...cur, [item.id]: decision }));
+    setHeldErrors((cur) => withoutKey(cur, item.id));
     try {
       const body: HeldFileDecisionRequest = { projectId, decision };
       await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body });
       if (g !== gen.current) return;
-      leave([item.id], (n) => `${decision === "attach" ? "File added to its record" : "File removed; the record keeps no file"}: ${titleFor(item, n)}`);
+      fileLeft(item, (n) => `${decision === "attach" ? "File added to its record" : "File removed; the record keeps no file"}: ${titleFor(item, n)}`);
     } catch (e) {
       if (g !== gen.current) return;
       if (isProjectLocked(e)) {
@@ -531,15 +594,23 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       // R282 d: the entry leaves only when the service says it was already decided; any other refusal (paused, the
       // record gone, …) is said in the service's sentence and the entry stays.
       if (e instanceof ApiClientError && e.code === "CONFLICT" && e.reason === ("already-decided" satisfies HeldFileRefusalReason)) {
-        leave([item.id], (n) => `This entry had already been decided, so it left the queue: ${titleFor(item, n)}`);
+        fileLeft(item, (n) => `This entry had already been decided, so it left the queue: ${titleFor(item, n)}`);
         return;
       }
-      setHeldError({ id: item.id, text: e instanceof ApiClientError && e.message ? e.message : errorText(e) });
+      setHeldErrors((cur) => ({ ...cur, [item.id]: e instanceof ApiClientError && e.message ? e.message : errorText(e) }));
     } finally {
-      busyRef.current = false;
-      if (g === gen.current) setBusy(false);
+      heldBusyRef.current.delete(item.id);
+      if (g === gen.current) setHeldBusy((cur) => withoutKey(cur, item.id));
     }
   };
+  const useRefFor = useCallback((id: string, el: HTMLButtonElement | null) => {
+    if (el) useButtons.current.set(id, el);
+    else useButtons.current.delete(id);
+  }, []);
+  const cardRefFor = useCallback((id: string, el: HTMLElement | null) => {
+    if (el) fileCards.current.set(id, el);
+    else fileCards.current.delete(id);
+  }, []);
 
   const bulk = async (patch: ReviewPatch, done: string) => {
     if (!selected.length || busyRef.current) return;
@@ -580,9 +651,12 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   };
 
   const item = currentItem;
+  /** The entries listed beside the panel, and the waiting files, shown in their own section (R303 b). */
+  const listed = useMemo(() => (projectWide ? (items ?? []).filter((i) => !isFound(i)) : (items ?? [])), [items, projectWide]);
+  const found = useMemo(() => (projectWide ? ((items ?? []).filter(isFound) as HeldItem[]) : []), [items, projectWide]);
   const flagging = policy?.pseudonymizeNames === true;
   /** Only import entries can be edited together (the library's bulk edit takes import items). */
-  const selectable = useMemo(() => (items ?? []).filter((i) => i.kind === "import"), [items]);
+  const selectable = useMemo(() => listed.filter((i) => i.kind === "import"), [listed]);
   const libApi = useMemo(() => libraryApi(client), [client]);
   const itemBatch = (i: ReviewItem) => (batchId ? batch : batches.find((b) => b.batchId === i.batchId));
 
@@ -640,12 +714,18 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       )}
       {!locked && items === null && !error && <p role="status">Loading…</p>}
       {!locked && items !== null && items.length === 0 && (
-        <p>{batchId ? "Nothing is waiting for review in this import." : sourceId ? "Nothing is waiting for review for this source." : "Nothing is waiting for review in this project."}</p>
+        <p ref={emptyNote} tabIndex={-1}>
+          {batchId ? "Nothing is waiting for review in this import." : sourceId ? "Nothing is waiting for review for this source." : "Nothing is waiting for review in this project."}
+        </p>
       )}
-      {!locked && items !== null && items.length > 0 && (
+      {!locked && items !== null && items.length > 0 && projectWide && (
+        <p>
+          {items.length === 1 ? "1 entry is waiting" : `${fmt(items.length)} entries are waiting`} in this project{sourceId ? " for this source" : ""}.
+        </p>
+      )}
+      {!locked && items !== null && listed.length > 0 && (
         <div className="ao-review__layout">
           <div className="ao-review__list-col">
-            {projectWide && <p>{items.length === 1 ? "1 entry is waiting" : `${fmt(items.length)} entries are waiting`} in this project{sourceId ? " for this source" : ""}.</p>}
             <BulkBar count={selected.length} collections={collections} tags={tags} busy={busy} onBulk={(p, d) => void bulk(p, d)} />
             {selectable.length > 0 && (
               <label className="ao-import__choice">
@@ -661,7 +741,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               </label>
             )}
             {projectWide ? (
-              groupsOf(items, batches).map((g) => (
+              groupsOf(listed, batches).map((g) => (
                 <section key={g.key} className="ao-review__group" aria-labelledby={`ao-review-g-${g.key}`}>
                   <h2 id={`ao-review-g-${g.key}`} className="ao-review__group-title">
                     {g.title}
@@ -695,17 +775,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               onConfirm={(field, value) => confirmField(item, field, value)}
             />
           )}
-          {item && groupOf(item) === "found-file" && (
-            <HeldFilePanel
-              key={item.id}
-              item={item as HeldItem}
-              recordTitle={titleOf(shownSource) || item.title || ""}
-              busy={busy}
-              error={heldError?.id === item.id ? heldError.text : null}
-              onDecide={(d) => void decideHeld(item, d)}
-            />
-          )}
-          {item && item.kind !== "import" && groupOf(item) !== "found-file" && (
+          {item && item.kind !== "import" && !isFound(item) && (
             <VerificationPanel
               key={item.id}
               item={item}
@@ -718,6 +788,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
             />
           )}
         </div>
+      )}
+      {!locked && items !== null && found.length > 0 && (
+        <FoundFiles items={found} store={store} busy={heldBusy} errors={heldErrors} useRef={useRefFor} cardRef={cardRefFor} onDecide={(i, d) => void decideHeld(i, d)} />
       )}
     </main>
   );
@@ -861,86 +934,174 @@ function sizeText(bytes: number): string {
   return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
-interface HeldFilePanelProps {
-  item: HeldItem;
-  /** The record's title (its source's, as loaded or as sent with the entry). */
-  recordTitle: string;
-  busy: boolean;
-  /** The service's sentence when the last decision was refused. */
-  error: string | null;
-  onDecide(decision: HeldFileDecision): void;
+export const FOUND_FILES_TEXT = {
+  section: "Files found for records",
+  right: (k: number) => `Files that look right (${fmt(k)})`,
+  other: (k: number) => `Other files found (${fmt(k)})`,
+  intro: "Each file waits for your decision. “Use this file” adds it to its record; “Not this file” removes it.",
+} as const;
+
+interface FoundFilesProps {
+  items: HeldItem[];
+  store: RecordStore;
+  busy: Readonly<Record<string, HeldFileDecision>>;
+  errors: Readonly<Record<string, string>>;
+  useRef(id: string, el: HTMLButtonElement | null): void;
+  cardRef(id: string, el: HTMLElement | null): void;
+  onDecide(item: HeldItem, decision: HeldFileDecision): void;
 }
 
 /**
- * A file Find and acquire found for a record, held because it did not clearly match (F11, R277 d): the record's title,
- * the sentence, and what the check found so the researcher can judge — the reason in words, the DOI the file names,
- * its embedded title, the start of its text, its kind and size. Everything from the file is outside text (UserText).
- * Opening the file itself is not offered here yet.
+ * The waiting files (F11; R296 b, R303): those the app's check says look right gathered first, the others after them,
+ * each group under its heading with its number; a group with no file is not shown. No control here decides more than
+ * one file.
  */
-function HeldFilePanel({ item, recordTitle, busy, error, onDecide }: HeldFilePanelProps) {
-  const h = item.heldFile;
-  const named = recordTitle || "this record";
+function FoundFiles({ items, store, busy, errors, useRef: useRefFor, cardRef, onDecide }: FoundFilesProps) {
+  const right = items.filter(looksRight);
+  const other = items.filter((i) => !looksRight(i));
+  const id = useId();
+  const group = (key: string, heading: string, list: HeldItem[]) =>
+    list.length > 0 && (
+      <section className="ao-review__group" aria-labelledby={`${id}-${key}`}>
+        <h3 id={`${id}-${key}`} className="ao-review__group-title">
+          {heading}
+        </h3>
+        <ul className="ao-review__files" aria-label={heading}>
+          {list.map((i) => (
+            <FileCard key={i.id} item={i} store={store} busy={busy[i.id]} error={errors[i.id]} useRef={useRefFor} cardRef={cardRef} onDecide={onDecide} />
+          ))}
+        </ul>
+      </section>
+    );
   return (
-    <div className="ao-review__panel">
-      <Section title="File found for this record" level={2} className="ao-review__record">
-        <UserText as="p" className="ao-review__title">
-          {recordTitle || "Untitled"}
-        </UserText>
-        <p>{HELD_FILE_REVIEW_TEXT}</p>
-        <Section title="What the check found" level={3}>
-          {h ? (
-            <dl className="ao-review__fields">
-              <dt>Why</dt>
-              <dd>{HELD_FILE_WHY_TEXT[h.why] ?? "The file did not clearly match its record."}</dd>
-              {h.fileDoi && (
-                <>
-                  <dt>DOI the file names</dt>
-                  <dd>
-                    <UserText>{h.fileDoi}</UserText>
-                  </dd>
-                </>
-              )}
-              {h.embeddedTitle && (
-                <>
-                  <dt>Title in the file</dt>
-                  <dd>
-                    <UserText>{h.embeddedTitle}</UserText>
-                  </dd>
-                </>
-              )}
-              {h.textStart && (
-                <>
-                  <dt>Start of the file's text</dt>
-                  <dd>
-                    <UserText>{h.textStart}</UserText>
-                  </dd>
-                </>
-              )}
-              <dt>File</dt>
-              <dd>{`${h.kind === "epub" ? "EPUB" : "PDF"}, ${sizeText(h.bytes)}`}</dd>
-            </dl>
-          ) : (
-            <p>Nothing more is known about this file.</p>
-          )}
-        </Section>
-        {error && (
-          <p role="alert" className="ao-error">
-            The decision was not recorded. {error}
-          </p>
-        )}
-        <div className="ao-import__actions">
-          <button type="button" className="ao-import__primary" disabled={busy} aria-label={`Use this file for ${named}`} onClick={() => onDecide("attach")}>
-            Use this file
-          </button>
-          <button type="button" disabled={busy} aria-label={`Not this file for ${named}`} onClick={() => onDecide("discard")}>
-            Not this file
-          </button>
-        </div>
-        <p className="ao-import__hint">“Use this file” adds it to the record, saying that you accepted it after the check. “Not this file” removes it.</p>
-      </Section>
-    </div>
+    <section className="ao-review__found" aria-labelledby={`${id}-t`}>
+      <h2 id={`${id}-t`}>{FOUND_FILES_TEXT.section}</h2>
+      <p className="ao-import__hint">{FOUND_FILES_TEXT.intro}</p>
+      {group("right", FOUND_FILES_TEXT.right(right.length), right)}
+      {group("other", FOUND_FILES_TEXT.other(other.length), other)}
+    </section>
   );
 }
+
+interface FileCardProps {
+  item: HeldItem;
+  store: RecordStore;
+  /** The decision under way on this file. */
+  busy: HeldFileDecision | undefined;
+  /** The service's sentence when the last decision on this file was refused. */
+  error: string | undefined;
+  useRef(id: string, el: HTMLButtonElement | null): void;
+  cardRef(id: string, el: HTMLElement | null): void;
+  onDecide(item: HeldItem, decision: HeldFileDecision): void;
+}
+
+/**
+ * One waiting file: the record it was found for (title, creators, year — its source's, once read), the entry's own
+ * sentence, what the app's check says (the service's words for its `why`; nothing when this build does not know it),
+ * and the file's facts. Everything from the record, the file or the service is outside text (UserText). Its two
+ * buttons are named with the record's title; while its decision is out they are busy (never disabled, so focus stays)
+ * and a second press does nothing.
+ */
+const FileCard = memo(function FileCard({ item, store, busy, error, useRef: useRefFor, cardRef, onDecide }: FileCardProps) {
+  const h = item.heldFile;
+  const record = useRecord(store, item.sourceId);
+  const s = record?.source;
+  const recordTitle = titleOf(record) || item.title || "";
+  const named = recordTitle || "this record";
+  const creators = s ? creatorsText(s.creators) : "";
+  const year = typeof s?.issued === "string" ? yearOf(s.issued) : undefined;
+  const advice = h ? (HELD_FILE_WHY_TEXT as Partial<Record<string, string>>)[h.why] : undefined;
+  const press = (d: HeldFileDecision) => () => {
+    if (!busy) onDecide(item, d);
+  };
+  return (
+    <li className="ao-review__file" ref={(el) => cardRef(item.id, el)}>
+      <h4 className="ao-review__title">
+        <UserText>{recordTitle || "Untitled"}</UserText>
+      </h4>
+      {(creators || year) && (
+        <dl className="ao-review__fields">
+          {creators && (
+            <>
+              <dt>Creators</dt>
+              <dd>
+                <UserText>{creators}</UserText>
+              </dd>
+            </>
+          )}
+          {year && (
+            <>
+              <dt>Year</dt>
+              <dd>
+                <UserText>{year}</UserText>
+              </dd>
+            </>
+          )}
+        </dl>
+      )}
+      {item.reasons[0] && <UserText as="p">{item.reasons[0]}</UserText>}
+      <dl className="ao-review__fields">
+        {advice && (
+          <>
+            <dt>What the app's check says</dt>
+            <dd>{advice}</dd>
+          </>
+        )}
+        {h?.fileDoi && (
+          <>
+            <dt>DOI the file names</dt>
+            <dd>
+              <UserText>{h.fileDoi}</UserText>
+            </dd>
+          </>
+        )}
+        {h?.embeddedTitle && (
+          <>
+            <dt>Title in the file</dt>
+            <dd>
+              <UserText>{h.embeddedTitle}</UserText>
+            </dd>
+          </>
+        )}
+        {h?.textStart && (
+          <>
+            <dt>Start of the file's text</dt>
+            <dd>
+              <UserText>{h.textStart}</UserText>
+            </dd>
+          </>
+        )}
+        {h && (
+          <>
+            <dt>File</dt>
+            <dd>{`${h.kind === "epub" ? "EPUB" : "PDF"}, ${sizeText(h.bytes)}`}</dd>
+          </>
+        )}
+      </dl>
+      {error && (
+        <p role="alert" className="ao-error">
+          The decision was not recorded. <UserText>{error}</UserText>
+        </p>
+      )}
+      <div className="ao-import__actions">
+        <button
+          type="button"
+          className="ao-import__primary"
+          ref={(el) => useRefFor(item.id, el)}
+          aria-label={`Use this file for ${named}`}
+          aria-disabled={busy ? true : undefined}
+          aria-busy={busy === "attach" || undefined}
+          onClick={press("attach")}
+        >
+          Use this file
+        </button>
+        <button type="button" aria-label={`Not this file for ${named}`} aria-disabled={busy ? true : undefined} aria-busy={busy === "discard" || undefined} onClick={press("discard")}>
+          Not this file
+        </button>
+      </div>
+    </li>
+  );
+});
 
 /**
  * The reason for "Reviewed after the withdrawal" (R176 2) on the shared dialog shell (R145: focus in,

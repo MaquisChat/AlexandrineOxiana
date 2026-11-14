@@ -512,3 +512,23 @@ span.ao-import__hint {
   margin: var(--space-1) 0;
   overflow-wrap: anywhere;
 }
+
+/* Files found for records (F11, R303): each waiting file in full, with its own two buttons. */
+.ao-review__found {
+  margin-top: var(--space-3);
+}
+
+.ao-review__files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.ao-review__file {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
