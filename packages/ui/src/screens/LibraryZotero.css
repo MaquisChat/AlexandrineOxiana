@@ -1,0 +1,13 @@
+/* The Zotero lines under the Library screen's header (Task Z12). Colours from theme tokens only. They span the grid
+   like the status banners; group names and the service's sentences can be long or right-to-left: they wrap anywhere. */
+.ao-library__zotero {
+  grid-column: 1 / -1;
+  padding: var(--space-1) var(--space-3);
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.ao-library__zotero p {
+  margin: var(--space-1) 0;
+}

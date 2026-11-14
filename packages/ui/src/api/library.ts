@@ -12,6 +12,7 @@ import type { DeviceNotice, DeviceNoticeDismissRequest, DeviceNoticeKind, Projec
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
 import { watchedFoldersApi } from "./watchedFolders";
+import { zoteroSyncApi } from "./zoteroSync";
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -398,6 +399,8 @@ export function libraryApi(client: ApiClient) {
     verification: verificationApi(client),
     /** Where a source came from, and the two acts on it (Task W9, api/watchedFolders.ts). */
     watchedFolders: watchedFoldersApi(client),
+    /** The Zotero sync's state, read for the lines under a project's header (Task Z12; only `state` is used here). */
+    zotero: zoteroSyncApi(client),
     citations: {
       styles: async (q?: string, opts: { signal?: AbortSignal } = {}) =>
         (await r<{ styles: StyleEntry[] }>("GET", "/styles", { query: { q: q || undefined }, ...(opts.signal ? { signal: opts.signal } : {}) })).styles,
