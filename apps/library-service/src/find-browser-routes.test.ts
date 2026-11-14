@@ -1172,6 +1172,32 @@ describe("R353: F20a's round 2", () => {
     expect(svc!.state.session!.find!.libraryHandedOver(w.json.ticket, "window")).toEqual({ projectId: pid, entryId: e.id });
   });
 
+  it("R354: the settings' reset of the pairings file (no extension left paired) ends a browser wait as the removal of the last pairing does; a reset of fonts or appearance leaves it as it is", async () => {
+    const { pid, e, ticket } = await ready({ started: true });
+    const reset = async (file: string, name: string) => {
+      await writeFile(join(deps.appConfigDir, name), "garbage{");
+      const r = await call({ method: "POST", url: "/settings/reset", body: { file, confirm: true } });
+      expect([r.status, r.json.reset], r.body).toEqual([200, true]);
+    };
+    // fonts and appearance: the browser wait as it is.
+    await reset("fonts", "fonts.json");
+    await reset("appearance", "appearance.json");
+    await sleep(100);
+    expect((await view(pid, e.id)).waitingIn).toBe("browser");
+    expect((await waitingList()).json.waiting).toEqual([{ ticket, label: TITLE }]);
+    // extension-pairings: no extension left paired — the entry back at its rest, the ticket ended.
+    await reset("extension-pairings", "extension-pairings.json");
+    expect(await pairingIds()).toEqual([]);
+    await until(async () => (await view(pid, e.id)).state === "no-open-copy", "the entry to come back");
+    expect(await view(pid, e.id)).not.toHaveProperty("waitingIn");
+    extToken = await pairExtension(OTHER_EXT);
+    expect((await waitingList({ origin: OTHER_EXT })).json).toEqual({ waiting: [] });
+    const old = await sendFile(ticket!, await goodPdf(), { origin: OTHER_EXT });
+    expect([old.status, old.json.error.reason]).toEqual([404, "browser-not-waiting"]);
+    expect(await inboxFiles()).toEqual([]);
+    expect(logs).not.toMatch(/could not be put back/u);
+  });
+
   it("(e) M5: a window's ticket given to the file route with a slowly sent body — the 404 of a wrong ticket, and the body is NOT taken: the inbox stays empty throughout", async () => {
     const { pid, e } = await ready();
     const w = await windowStart(pid, e.id);
