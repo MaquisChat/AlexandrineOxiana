@@ -125,7 +125,9 @@ export class ZoteroSyncHolder {
    * Claims the Zotero library `ref` for one import or sync of the session's library: the function that gives it up,
    * or undefined when it is taken. Synchronous: no wait comes between the check and the claim.
    */
-  claim(ref: string, session: Session): (() => void) | undefined {
+  claim(given: string, session: Session): (() => void) | undefined {
+    // Canonical: `user:042` and `user:42` are one library (a stored ref may be older than the canonical form).
+    const ref = given.replace(/^(user|group):0*(\d+)$/u, (_m, type: string, id: string) => `${type}:${id}`);
     const held = this.claims.get(ref);
     if (held && held.session === session) return undefined;
     const token = {};
@@ -349,6 +351,11 @@ async function readSettings(dir: string, libraryId: string): Promise<ZoteroSyncS
     throw fileError(err);
   }
 }
+/** The record of the run in progress: the newest unfinished one of its ref (an older one was left by an earlier process). */
+function inProgressId(runs: LibraryRun[], ref: string | undefined): string | undefined {
+  if (ref === undefined) return undefined;
+  return runs.filter((r) => r.finishedAt === undefined && r.ref === ref).sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0]?.id;
+}
 async function readHistory(dir: string, libraryId: string): Promise<LibraryRun[]> {
   try {
     return await readZoteroSyncHistory(dir, libraryId);
@@ -410,10 +417,11 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
   async function stateOf(s: Session): Promise<ZoteroSyncStateResponse> {
     const [settings, history, stored] = await Promise.all([readSettings(dir(), s.lib.id), readHistory(dir(), s.lib.id), keyStored()]);
     const running = holder.running;
+    const current = inProgressId(history, running?.ref);
     const links: ZoteroSyncStateResponse["links"] = [];
     for (const l of settings.links) {
       // The record of the run going on now is not the last run.
-      const last = history.find((r) => r.ref === l.ref && r.projectId === l.projectId && !(r.finishedAt === undefined && running?.ref === l.ref));
+      const last = history.find((r) => r.ref === l.ref && r.projectId === l.projectId && r.id !== current);
       const lastRun = last ? await withCounts(s, last) : undefined;
       const waitingFor = l.paused ? ("paused" as const) : lockedNow(s, l.projectId) ? ("project-locked" as const) : undefined;
       links.push({
@@ -572,8 +580,9 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     uiOnly(req.caller);
     const s = state.requireSession();
     // R250 b: the run in progress is left out (the state's `running` and the events say it).
-    const running = holder.running;
-    const runs = (await readHistory(dir(), s.lib.id)).filter((r) => !(r.finishedAt === undefined && running?.ref === r.ref));
+    const all = await readHistory(dir(), s.lib.id);
+    const current = inProgressId(all, holder.running?.ref);
+    const runs = all.filter((r) => r.id !== current);
     // An encrypted project's counts come from its batch while it is unlocked: for the newest 20 (what the screen shows).
     const out: ZoteroSyncRun[] = [];
     for (const [i, r] of runs.entries()) out.push(await withCounts(s, r, i < 20));

@@ -17,7 +17,7 @@ import { Writable } from "node:stream";
 // The service has no undici of its own: the library's (the one its Web import uses) sets the global dispatcher.
 import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { ZOTERO_SYNC_REASONS, deviceDeps, type Deps } from "@ao/library";
+import { ZOTERO_SYNC_REASONS, deviceDeps, proxyQueueFor, startZoteroWebImport, type Deps } from "@ao/library";
 import { ZOTERO_SYNC_REASON_TEXT, ZOTERO_SYNC_SENTENCES } from "@ao/shared";
 import { useMemorySecrets, useNoSecretStore } from "../../../packages/library/src/secrets-testing.js";
 import { setSecret } from "../../../packages/library/src/secrets.js";
@@ -620,6 +620,30 @@ describe("running (Accept 3–5)", () => {
     expect((await call({ url: "/zotero/sync/history" })).json.runs).toHaveLength(2);
   });
 
+  it("during a run, an older unfinished record of the same Zotero library stays in the history (as stopped), and only the run in progress is left out", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    addItems(U, 3);
+    await saveSettings([linkOf(U, pid)]);
+    const [first] = await runAndWait();
+    // A record left by an earlier process: started, never finished.
+    const hist = await historyFile();
+    const key = Object.keys(hist.libraries)[0]!;
+    const { finishedAt: _f, counts: _c, batchId: _b, ...bare } = first;
+    const older = { ...bare, outcome: "stopped", reason: "app-closed", id: "00000000-0000-4000-8000-000000000001", startedAt: "2000-01-01T00:00:00.000Z" };
+    hist.libraries[key].push(older);
+    await writeFile(join(deps.appConfigDir, "zotero-sync-history.json"), JSON.stringify(hist));
+    addItems(U, 8, "More");
+    const held = holdSync();
+    await call({ method: "POST", url: "/zotero/sync/run", body: {} });
+    await held;
+    const ids = ((await call({ url: "/zotero/sync/history" })).json.runs as Array<{ id: string }>).map((r) => r.id);
+    expect(ids).toContain(older.id);
+    expect(ids).toContain(first.id);
+    expect(ids).toHaveLength(2);
+    await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
+  });
+
   it("R250 j: a run that throws still ends with a finished event, a failed record with reason error", async () => {
     await openLibrary();
     const pid = await newProject();
@@ -773,6 +797,28 @@ describe("a manual import and a sync of one Zotero library never run together (A
     expect((await call({ method: "POST", url: `/projects/${sealed}/lock` })).status).toBe(200);
     expect((await importOf(sealed)).status).toBe(423);
     expect((await importOf(x)).status).toBe(200);
+    await svc.state.idle();
+  });
+
+  it("a batch whose stored ref is user:042 cannot be resumed while a sync of user:42 runs", async () => {
+    await openLibrary();
+    const pid = await newProject();
+    const x = await newProject(false, "X");
+    addItems(U, 10);
+    const s = svc.state.session!;
+    const h = await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index!, proxies: proxyQueueFor(s.repo) }, x, { libraryType: "user", libraryId: "042" }, {});
+    h.cancel();
+    await h.done.catch(() => undefined);
+    await svc.state.idle();
+    const batches = (await call({ url: `/projects/${x}/imports` })).json.batches as Array<{ batchId: string; ref?: string }>;
+    expect(batches[0]?.ref).toBe("user:042");
+    await saveSettings([linkOf(U, pid)]);
+    const held = holdSync();
+    await call({ method: "POST", url: "/zotero/sync/run", body: {} });
+    await held;
+    const resume = await call({ method: "POST", url: `/imports/${batches[0]!.batchId}/resume` });
+    expect([resume.status, resume.json.error?.message]).toEqual([409, "Another import from this Zotero library is running."]);
+    await call({ method: "POST", url: "/zotero/sync/stop", body: {} });
     await svc.state.idle();
   });
 
