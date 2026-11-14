@@ -119,6 +119,53 @@ created or modified. Its results are in `pnpm report` under
   bring in packages under licences other than MIT, Apache-2.0 and BSD. Playwright (`@playwright/test`
   1.63.0, Apache-2.0) is only the test runner; no browser of its own is started.
 
+### The library scenarios (Task F19): the sign-in window in the real shell
+
+`e2e/library-window.e2e.ts` runs the real app in the shell's own test mode (a debug build with
+NODE_ENV=test, which lets the shell's request reach the loopback address; the shell does not pass it to
+the service) against a stand-in library and publisher (`e2e/library-standin.ts`): one https server on
+127.0.0.1 answering at made-up names under `ao-library-standin.test` (an EZproxy-like sign-in with a
+session cookie for the proxy's domain, a SAML-like path that fails the run if asked twice or by the
+shell, publisher pages with and without `citation_pdf_url`, a PDF sent as a download, a redirect to a
+third host). Six scenarios: the marked page fetched by the shell and waiting in the review queue until
+"Use this file"; a page without the mark and "Add the PDF showing in the sign-in window"; a download;
+the redirect to a third host (no cookie of the proxy reaches it); the window closed while the entry
+waits; a quit and a new start (no cookie at the first request). The sign-in window is typed into with
+xdotool (WebDriver does not reach it: it is a web view of its own ephemeral context).
+
+**They change this machine for the length of the run, and only when asked:**
+
+```sh
+AO_E2E_SYSTEM_SETUP=1 pnpm --filter @ao/desktop run e2e     # as root
+```
+
+With the switch (`e2e/system-setup.ts`), before the scenarios: a throw-away certificate authority and a
+certificate for the stand-in's names are made with `openssl` in a private temporary folder (valid one
+day); the authority is added to the system's store (`/usr/local/share/ca-certificates/
+ao-e2e-library-standin-<run>.crt`, then `update-ca-certificates` with an empty hooks folder, so no other
+store such as Java's is touched); and a marked block mapping the names to 127.0.0.1 is appended to
+`/etc/hosts`. Both the web view (GnuTLS) and the shell's request (OpenSSL) then trust the stand-in as
+they trust any site; nothing in the product is relaxed. After the scenarios — also when one fails, and
+on SIGINT, SIGTERM, SIGHUP and the process's exit — the hosts file's bytes, mode, owner and times are
+written back, the authority's file and its two links are removed, `update-ca-certificates` runs again,
+and both are compared with what they were (every entry of `/etc/ssl/certs` and of the local authorities'
+folder by name, kind, target or content and mode): any difference fails the run. Before anything, the
+set-up refuses (the scenarios are then NOT RUN, with the reason) when not on Linux or not root, when
+`/etc/hosts` is not a plain file, when an earlier run's block or authority is still there, or when the
+store is not what `update-ca-certificates` itself makes of it (tried first on a copy), since then it
+could not be put back exactly.
+
+Without the switch the six scenarios are skipped and the run's last lines say so: "6 library scenarios
+NOT RUN (skipped), not passed — not run: AO_E2E_SYSTEM_SETUP=1 is not set …".
+
+**If such a run was killed outright** (SIGKILL), its block and authority stay. The next run refuses to
+start, naming them. Remove them by hand (as root): delete the lines from `# ao-e2e-library-standin <run>
+begin` to `# ao-e2e-library-standin <run> end` in `/etc/hosts` (the original is kept as
+`$TMPDIR/ao-e2e-system-setup-<run>-*/hosts.orig`), then
+`rm /usr/local/share/ca-certificates/ao-e2e-library-standin-*.crt /etc/ssl/certs/ao-e2e-library-standin-*.pem`,
+remove the hash link that pointed to that `.pem` (`find /etc/ssl/certs -xtype l`), and run
+`update-ca-certificates`.
+
 It needs, besides the built app (Ubuntu 24.04 package names):
 
 ```sh
