@@ -46,7 +46,8 @@ export interface FixtureServer {
 /**
  * A made-up publisher on its own host (Find and acquire, R348 i): `/sign-in` sets a session cookie (Secure, HttpOnly);
  * `/article.pdf` serves `pdf` as application/pdf ONLY to a request carrying that cookie (else 403, an HTML page);
- * `/notes.html` is a page that is not a PDF.
+ * `/notes.html` is a page that is not a PDF; `/once.pdf` serves `pdf` to the first signed-in request only and an HTML
+ * page (status 200) to every later one — a site that does not give the PDF a second time (R357 f).
  */
 export interface Publisher {
   host: string;
@@ -60,6 +61,7 @@ export async function startFixtureServer(host: string, publisher?: Publisher): P
   const requests: string[] = [];
   const publisherRequests: Array<{ path: string; signedIn: boolean }> = [];
   const session = randomBytes(16).toString("hex");
+  let onceServed = false;
   const server = https.createServer({ key: readFileSync(join(dir, "key.pem")), cert: readFileSync(join(dir, "cert.pem")) }, (req, res) => {
     const path = (req.url ?? "").split("?")[0] ?? "";
     if (publisher && (req.headers.host ?? "").split(":")[0] === publisher.host) {
@@ -77,6 +79,16 @@ export async function startFixtureServer(host: string, publisher?: Publisher): P
           res.setHeader("content-type", "text/html; charset=utf-8");
           return res.end("<!doctype html><title>Sign in</title><p>Sign in through your library first.</p>");
         }
+        res.setHeader("content-type", "application/pdf");
+        res.setHeader("content-length", String(publisher.pdf.length));
+        return res.end(publisher.pdf);
+      }
+      if (path === "/once.pdf" && signedIn) {
+        if (onceServed) {
+          res.setHeader("content-type", "text/html; charset=utf-8");
+          return res.end("<!doctype html><title>Article</title><p>This link has been used. Read the article online.</p>");
+        }
+        onceServed = true;
         res.setHeader("content-type", "application/pdf");
         res.setHeader("content-length", String(publisher.pdf.length));
         return res.end(publisher.pdf);

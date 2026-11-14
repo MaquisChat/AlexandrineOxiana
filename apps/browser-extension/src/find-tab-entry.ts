@@ -4,12 +4,10 @@
  * extension's isolated world and reads `location.href` and `document.contentType`, nothing else (find-tab.ts). It
  * defines no global and leaves no listener behind once it has ended.
  */
-import type { PortLike } from "./find-protocol.js";
-import { readTabPdf } from "./find-tab.js";
+import { extensionRuntime, readTabPdf } from "./find-tab.js";
 
-type Runtime = { connect(info: { name: string }): PortLike };
-const g = globalThis as unknown as { browser?: { runtime?: Runtime }; chrome?: { runtime?: Runtime } };
-const runtime = g.browser?.runtime ?? g.chrome?.runtime;
+// chrome.runtime first, then browser.runtime, and only one with a connect function (R357 g); else nothing is done.
+const runtime = extensionRuntime(globalThis);
 
 if (runtime) {
   void readTabPdf({

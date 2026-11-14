@@ -45,10 +45,8 @@ describe("manifest.json (R110)", () => {
     expect(Object.keys(manifest).sort()).toEqual(["action", "background", "browser_specific_settings", "content_security_policy", "description", "host_permissions", "incognito", "manifest_version", "minimum_chrome_version", "name", "permissions", "short_name", "version"]);
   });
 
-  it("the description says both uses, within the stores' 132 characters, and never that a file is added (R301)", () => {
-    expect(manifest.description).toMatch(/capture/i);
-    expect(manifest.description).toMatch(/PDF/);
-    expect(manifest.description).toMatch(/review queue/);
+  it("the description is R357 j's, word for word: both uses, on this computer, within the stores' 132 characters, and never that a file is added (R301)", () => {
+    expect(manifest.description).toBe("Capture the page you are viewing, or send a PDF tab the app is waiting for, to Alexandrine Oxiana on this computer.");
     expect(manifest.description).not.toMatch(/\badd(ed|s)?\b/i);
     expect(manifest.description.length).toBeLessThanOrEqual(132);
   });

@@ -231,7 +231,7 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
     /**
      * R348 f 2: ONE POST of the PDF for the waiting work — the ticket in the path (as the service's route has it), the
      * token in the Authorization header only, `Content-Type: application/pdf` (the only type the route takes), the
-     * tab's address in `x-ao-page`, the bytes as the body. The 200 answer as it came (find.ts's parseFileAnswer reads it).
+     * tab's address (without its query and fragment, R357 e: find.ts pageToSend) in `x-ao-page`, the bytes as the body. The 200 answer as it came (find.ts's parseFileAnswer reads it).
      */
     sendFindPdf(ticket: string, page: string, body: Blob, opts: { signal?: AbortSignal } = {}): Promise<unknown> {
       if (!/^[0-9a-f]{32}$/.test(ticket)) return Promise.reject(new ApiError("BAD_PATH", "Internal error: bad request path."));

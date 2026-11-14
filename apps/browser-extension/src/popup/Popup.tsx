@@ -13,12 +13,14 @@
  * Find and acquire, the browser's fallback (R348 i): at its opening the popup asks the background for the works
  * waiting for a PDF from this browser. When one waits, the popup's FIRST section, "Find and acquire", says "Waiting for
  * a PDF: <label>" (the label as text) with "Send this tab's PDF"; the background does the sending (find.ts), so a popup
- * closed meanwhile does not stop it, and its sentence is shown at the next opening, once. Nothing waiting, or the list
- * not readable: the popup is exactly as before.
+ * closed meanwhile does not stop it, and its sentence is shown at the next opening, once — only where it is true
+ * (R357 a): in its work's section if that work still waits, alone if nothing waits, and not at all (dropped) if a
+ * different work waits; it is removed only when shown or dropped (R357 b). After a press the focus goes to the result's
+ * sentence (R357 d). Nothing waiting, or the list not readable: the popup is exactly as before.
  */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiError, type Api, type LocalStorageArea, type Pairing } from "../api.js";
-import { FIND_TEXT, FIND_TICKET, parseFindReply, parseFindResult, parseWaitingRead, sentenceAfterNoAnswer, type Waiting } from "../find.js";
+import { FIND_TEXT, FIND_TICKET, parseFindReply, parseFindResult, parseWaitingRead, placeOfKept, sentenceAfterNoAnswer, ticketHash, type FindResult, type Waiting } from "../find.js";
 import type { PendingByProject } from "../pending.js";
 import type { BackgroundRequest, CaptureReply, ProfileStatus, ProjectChoice } from "../types.js";
 
@@ -93,6 +95,9 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   const [findWatching, setFindWatching] = useState(false);
   const [findSaid, setFindSaid] = useState("");
   const findBusy = useRef(false);
+  /** The result's sentence: focused after a press in this popup (R357 d), never at a mere opening. */
+  const findSaidLine = useRef<HTMLParagraphElement>(null);
+  const [findFocus, setFindFocus] = useState(0);
 
   useEffect(() => {
     alive.current = true;
@@ -172,22 +177,38 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
     },
     [bridge],
   );
+  /** The kept result is removed once shown or dropped — that one only (its hash and its time), never a newer one. */
+  const forget = useCallback(
+    async (kept: FindResult): Promise<void> => {
+      try {
+        await bridge.send<unknown>({ type: "find-result-forget", work: kept.work, at: kept.at });
+      } catch {
+        /* the background went: the next opening decides again */
+      }
+    },
+    [bridge],
+  );
   const sendingOf = (v: unknown): string | null => {
     const s = (v as { sending?: unknown } | null | undefined)?.sending;
     return typeof s === "string" && FIND_TICKET.test(s) ? s : null;
   };
 
-  // At the opening: a sending under way (watched until it ends), else the last result kept while the popup was closed
-  // (taken once), and the list.
+  // At the opening: a sending under way (watched until it ends), else the last result kept while the popup was closed,
+  // and the list. The kept result is only looked at; it is removed when it is shown here or dropped (a different work
+  // waits) — an opening that ends before that leaves it for the next one (R357 a, b).
   useEffect(() => {
     let current = true;
     void (async () => {
       const sending = sendingOf(await ask("find-status"));
       const kept = sending ? undefined : parseFindResult(await ask("find-result"));
       const read = parseWaitingRead(await ask("find-waiting"));
+      const place = kept ? await placeOfKept(kept, read.waiting) : undefined;
       if (!current) return;
       setFindWaiting(read.waiting);
-      if (kept) setFindSaid(kept.sentence);
+      if (kept) {
+        if (place !== "drop") setFindSaid(kept.sentence);
+        void forget(kept);
+      }
       if (sending && !findBusy.current) {
         findBusy.current = true;
         setFindSending(sending);
@@ -197,7 +218,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
     return () => {
       current = false;
     };
-  }, [ask]);
+  }, [ask, forget]);
 
   // A sending this opening did not start: asked once a second until it ends (it has its own limits), then its result.
   useEffect(() => {
@@ -213,9 +234,11 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
           clearInterval(t);
           const kept = parseFindResult(await ask("find-result"));
           const read = parseWaitingRead(await ask("find-waiting"));
+          const place = kept ? await placeOfKept(kept, read.waiting) : undefined;
           if (!current) return;
           setFindWaiting(read.waiting);
-          setFindSaid(kept?.sentence ?? "");
+          setFindSaid(kept && place !== "drop" ? kept.sentence : "");
+          if (kept) void forget(kept);
           setFindSending(null);
           setFindWatching(false);
           findBusy.current = false;
@@ -228,7 +251,12 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
       current = false;
       clearInterval(t);
     };
-  }, [findWatching, ask]);
+  }, [findWatching, ask, forget]);
+
+  // After a press in this popup, the result's sentence takes the focus (the pressed button is gone or was disabled).
+  useEffect(() => {
+    if (findFocus > 0) findSaidLine.current?.focus();
+  }, [findFocus]);
 
   /** "Send this tab's PDF": one sending at a time; the background does it; the service's sentence is shown as it is. */
   async function sendPdf(ticket: string) {
@@ -242,14 +270,19 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
     } catch {
       reply = undefined;
     }
-    // Said here: the copy kept for a next opening is taken, so it is not said twice.
-    if (reply) await ask("find-result");
-    // The list again: whether the work still waits decides the button; with no answer, it decides what is said.
+    // Said here: the copy kept for a next opening (this work's) is removed, so it is not said twice.
+    if (reply) {
+      const kept = parseFindResult(await ask("find-result"));
+      if (kept && kept.work === (await ticketHash(ticket))) await forget(kept);
+    }
+    // The list again: whether the work still waits decides the button; with no answer, it decides what is said — a list
+    // not read or not understood is a failed read (R357 c).
     const read = parseWaitingRead(await ask("find-waiting"));
     if (!alive.current) return;
     setFindWaiting(read.waiting);
     setFindSaid(reply ? reply.sentence : sentenceAfterNoAnswer(ticket, read));
     setFindSending(null);
+    setFindFocus((n) => n + 1);
     findBusy.current = false;
   }
 
@@ -403,7 +436,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
               </button>
             </div>
           ))}
-          <p className="find-said" aria-live="polite" aria-atomic="true">
+          <p className="find-said" aria-live="polite" aria-atomic="true" tabIndex={-1} ref={findSaidLine}>
             {findSaid}
           </p>
         </section>

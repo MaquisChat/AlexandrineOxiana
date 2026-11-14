@@ -2,23 +2,31 @@
  * Find and acquire, the browser's fallback (R348 i, with f and a): the researcher signed in to their library in THIS
  * browser and opened the work's PDF; the app made the work wait for it ("Get through my library in my own browser").
  * On the researcher's click on "Send this tab's PDF" in the popup — and only then (R110) — the background:
- *   1. checks the active tab's address is https (else FIND_TEXT.notHttps; an address the service would refuse gets the
- *      service's own sentence) — BEFORE anything is injected;
+ *   1. checks the active tab's address — https, no user name or password, at most 2,048 characters once its query
+ *      and fragment are removed (what will be sent, R357 e), each refusal in the extension's own words — BEFORE
+ *      anything is injected;
  *   2. injects the small tab script (find-tab.js) into that tab (`scripting.executeScript` under `activeTab`, the
  *      default isolated world). The script reads `location.href` and `document.contentType` and nothing else, connects
  *      ONE port to the background and, if the tab shows a PDF, fetches `location.href` with the browser's session
  *      (`credentials: "include"`) and passes the bytes in pieces (find-protocol.ts);
  *   3. accepts that port only from its own extension, from the tab it injected into for this sending, from the tab's
  *      top frame, and only one; anything of another shape ends the reading;
- *   4. checks the first five bytes are `%PDF-` and stops past FIND_PDF_MAX_BYTES (both with the service's sentences),
+ *   4. checks the first five bytes are `%PDF-` (else FIND_TEXT.notGivenAgain: the tab shows a PDF, so bytes that are
+ *      not one are the site's answer to a second request, R357 f) and stops past FIND_PDF_MAX_BYTES (the service's
+ *      sentence),
  *      keeping each piece as a Blob (the bytes leave the worker's memory piece by piece; never in storage, never logged);
  *   5. makes ONE `POST /find/browser/file/<ticket>` (api.ts) with the PDF, `Content-Type: application/pdf` and
- *      `x-ao-page: <the tab's address>`, and says the service's sentence as it is.
+ *      `x-ao-page: <the tab's address without its query and fragment>` (R357 e: the file itself is fetched from the
+ *      full address), and says the service's sentence as it is.
  * The ticket and the token stay in the extension: the tab's script receives only `{ t: "more" }`.
  *
  * Every wait has an end (FIND_WAITS). A POST that brings no answer (the service may close the connection on a refusal
  * before the body's end, or the worker was stopped) claims no result: the list is read again and the sentence says
- * truly whether the work still waits (`sentenceAfterNoAnswer`).
+ * truly whether the work still waits (`sentenceAfterNoAnswer`); a read that failed or was not understood says so
+ * (FIND_TEXT.unknown), never "no longer waiting" (R357 c).
+ *
+ * The sentence of a sending is kept in storage.session for the popup's next opening with its time and a SHA-256 of its
+ * ticket (never the ticket, never the title), so that it is shown only where it is true (R357 a, b; `placeOfKept`).
  *
  * R301: a file sent to the app is never "added": it waits in the app's review queue for the researcher's own decision.
  */
@@ -54,6 +62,9 @@ export const FIND_TEXT = {
   button: "Send this tab's PDF",
   sending: "Sending the PDF…",
   notHttps: "This tab's address is not https, so its file cannot be sent.",
+  userInfo: "This tab's address holds a user name or password, so its file cannot be sent.",
+  tooLong: "This tab's address is too long for the app, so its file cannot be sent.",
+  notGivenAgain: "The site did not give the PDF a second time, so nothing was sent. Download the PDF and add it to the record in the app instead.",
   notShowingPdf: "This tab is not showing a PDF. Open the PDF itself, then try again.",
   notAllowed: "This browser does not let the extension read this tab, so its PDF cannot be sent.",
   couldNotRead: "The PDF could not be read from this tab, so nothing was sent. Try again.",
@@ -65,12 +76,11 @@ export const FIND_TEXT = {
 } as const;
 
 /**
- * The service's own sentences (packages/shared FIND_BROWSER_TEXT, pinned by a test) for the three cases the extension
- * finds itself before it sends anything — so that the researcher reads the same words whichever side found it.
+ * The service's own sentence (packages/shared FIND_BROWSER_TEXT, pinned by a test) for the one case the extension finds
+ * itself before it sends anything in the service's words — the limit. The address and a second answer that is not a
+ * PDF have the extension's own words (R357 e, f).
  */
 export const FIND_SERVICE_TEXT = {
-  page: "This tab's address is not an https address, so the app does not take a file from it. The work is still waiting.",
-  notPdf: "That tab's file is not a PDF. The work is still waiting.",
   tooLarge: "That PDF is larger than 200 MB, so the app does not take it. The work is still waiting.",
 } as const;
 
@@ -87,17 +97,22 @@ const codePoints = (s: string) => {
   return n;
 };
 
-/** The list's answer: exactly `{ waiting: [{ ticket, label }] }`, else nothing waits. */
-export function parseWaiting(v: unknown): Waiting[] {
-  if (!isPlainObject(v) || !keysAre(v, "waiting") || !Array.isArray(v.waiting) || v.waiting.length > LIST_MAX) return [];
+/** The list's answer: exactly `{ waiting: [{ ticket, label }] }`, else undefined (not understood). */
+function waitingOf(v: unknown): Waiting[] | undefined {
+  if (!isPlainObject(v) || !keysAre(v, "waiting") || !Array.isArray(v.waiting) || v.waiting.length > LIST_MAX) return undefined;
   const out: Waiting[] = [];
   for (const item of v.waiting as unknown[]) {
-    if (!isPlainObject(item) || !keysAre(item, "label,ticket")) return [];
+    if (!isPlainObject(item) || !keysAre(item, "label,ticket")) return undefined;
     const { ticket, label } = item;
-    if (typeof ticket !== "string" || !FIND_TICKET.test(ticket) || typeof label !== "string" || label.length === 0 || codePoints(label) > LABEL_MAX) return [];
+    if (typeof ticket !== "string" || !FIND_TICKET.test(ticket) || typeof label !== "string" || label.length === 0 || codePoints(label) > LABEL_MAX) return undefined;
     out.push({ ticket, label });
   }
   return out;
+}
+
+/** The list's answer: exactly `{ waiting: [{ ticket, label }] }`, else nothing waits. */
+export function parseWaiting(v: unknown): Waiting[] {
+  return waitingOf(v) ?? [];
 }
 
 export type FileAnswer = { outcome: "held" | "not-kept" | "gone"; sentence: string };
@@ -127,13 +142,27 @@ export interface WaitingRead {
   failed?: true;
 }
 
-/** The popup's copy of a read, as the background sent it (anything else: nothing waits). */
+/**
+ * The background's read of the list (`list`: api.findWaiting): what waits; the app not answering (its sentence); or a
+ * failure — an error, or an answer that is not understood — told apart from a real `{ waiting: [] }` (R357 c).
+ */
+export async function readWaitingWith(list: () => Promise<unknown>): Promise<WaitingRead> {
+  try {
+    const waiting = waitingOf(await list());
+    return waiting ? { waiting } : { waiting: [], failed: true };
+  } catch (e) {
+    if (e instanceof ApiError && e.code === "UNREACHABLE") return { waiting: [], unreachable: e.message };
+    return { waiting: [], failed: true };
+  }
+}
+
+/** The popup's copy of a read, as the background sent it; no answer, or one not understood, is a failed read (R357 c). */
 export function parseWaitingRead(v: unknown): WaitingRead {
-  if (!isPlainObject(v)) return { waiting: [] };
-  const waiting = parseWaiting({ waiting: v.waiting });
-  const out: WaitingRead = { waiting };
+  if (!isPlainObject(v)) return { waiting: [], failed: true };
+  const waiting = waitingOf({ waiting: v.waiting });
+  const out: WaitingRead = { waiting: waiting ?? [] };
   if (typeof v.unreachable === "string" && v.unreachable.length <= SENTENCE_MAX) out.unreachable = v.unreachable;
-  if (v.failed === true) out.failed = true;
+  if (v.failed === true || waiting === undefined) out.failed = true;
   return out;
 }
 
@@ -152,31 +181,99 @@ export function parseFindReply(v: unknown): FindReply | undefined {
   return isPlainObject(v) && typeof v.sentence === "string" && v.sentence.length > 0 && v.sentence.length <= SENTENCE_MAX ? { sentence: v.sentence } : undefined;
 }
 
-/** What storage.session keeps of the last sending, for the popup's next opening: its sentence and its time, nothing else. */
+/**
+ * What storage.session keeps of the last sending, for the popup's next opening: its sentence, its time and `work`, a
+ * SHA-256 (hex) of its ticket — never the ticket, never the title (R357 a) — nothing else.
+ */
 export interface FindResult {
   sentence: string;
   at: number;
+  work: string;
 }
 export const FIND_RESULT_KEY = "findResult";
+const HASH = /^[0-9a-f]{64}$/;
+/** A kept result; one of the old shape (no hash) or of any other shape is not one. */
 export function parseFindResult(v: unknown): FindResult | undefined {
-  return isPlainObject(v) && keysAre(v, "at,sentence") && typeof v.sentence === "string" && v.sentence.length > 0 && v.sentence.length <= SENTENCE_MAX && typeof v.at === "number" && Number.isFinite(v.at) ? { sentence: v.sentence, at: v.at } : undefined;
+  return isPlainObject(v) && keysAre(v, "at,sentence,work") && typeof v.sentence === "string" && v.sentence.length > 0 && v.sentence.length <= SENTENCE_MAX && typeof v.at === "number" && Number.isFinite(v.at) && typeof v.work === "string" && HASH.test(v.work)
+    ? { sentence: v.sentence, at: v.at, work: v.work }
+    : undefined;
+}
+
+/** SHA-256 of a ticket's text, as lower-case hex: what ties a kept result to its work without keeping the ticket. */
+export async function ticketHash(ticket: string): Promise<string> {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(ticket)));
+  return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /**
- * Whether the background may send a file from this address, and if not, what is said: not https (the extension's
- * sentence), or an https address the service refuses (the service's own sentence).
+ * Where a kept result is shown at an opening (R357 a): in its work's section when that work still waits ("work");
+ * alone in the section, without a button, when nothing waits ("alone"); and when a DIFFERENT work waits, nowhere — it is
+ * dropped unseen ("drop"; the app's own row says what became of the earlier work).
  */
-export function pageRefusal(address: string | undefined): string | undefined {
-  if (address === undefined || address === "") return FIND_TEXT.notAllowed;
+export async function placeOfKept(kept: FindResult, waiting: readonly Waiting[]): Promise<"work" | "alone" | "drop"> {
+  if (waiting.length === 0) return "alone";
+  for (const w of waiting) if ((await ticketHash(w.ticket)) === kept.work) return "work";
+  return "drop";
+}
+
+/** The popup's request to remove the kept result it has shown or dropped: `{ type: "find-result-forget", work, at }`. */
+export function parseResultForget(v: unknown): { work: string; at: number } | undefined {
+  if (!isPlainObject(v) || v.type !== "find-result-forget") return undefined;
+  const { work, at } = v;
+  return typeof work === "string" && HASH.test(work) && typeof at === "number" && Number.isFinite(at) ? { work, at } : undefined;
+}
+
+/** The part of storage.session the kept result uses. */
+export interface SessionArea {
+  get(key: string): Promise<Record<string, unknown>>;
+  set(items: Record<string, unknown>): Promise<void>;
+  remove(key: string): Promise<void>;
+}
+
+/**
+ * The kept result in storage.session (the background's side). `peek` looks without taking (R357 b: it is removed only
+ * when the popup has shown it or deliberately dropped it — `forget` — so a popup closed during its opening, or a second
+ * popup, cannot lose it); a value of the old shape, or any other, is removed at the first look and never shown;
+ * `forget` removes only the same result (its hash and its time), never a newer one saved meanwhile.
+ */
+export function createResultStore(area: SessionArea) {
+  async function peek(): Promise<FindResult | undefined> {
+    const raw = (await area.get(FIND_RESULT_KEY))[FIND_RESULT_KEY];
+    if (raw === undefined) return undefined;
+    const v = parseFindResult(raw);
+    if (!v) await area.remove(FIND_RESULT_KEY);
+    return v;
+  }
+  return {
+    save: (r: FindResult): Promise<void> => area.set({ [FIND_RESULT_KEY]: { sentence: r.sentence, at: r.at, work: r.work } }),
+    peek,
+    async forget(which: { work: string; at: number }): Promise<boolean> {
+      const v = await peek();
+      if (!v || v.work !== which.work || v.at !== which.at) return false;
+      await area.remove(FIND_RESULT_KEY);
+      return true;
+    },
+  };
+}
+
+/**
+ * What is sent of the tab's address (R357 e): the address without its query and fragment (origin and path — the service
+ * records only the cleaned address, and a publisher's signed address can be very long), or the sentence that refuses
+ * it: not https; a user name or password in it; still longer than the service's 2,048 characters.
+ */
+export function pageToSend(address: string | undefined): { page: string } | { refused: string } {
+  if (address === undefined || address === "") return { refused: FIND_TEXT.notAllowed };
   let u: URL;
   try {
     u = new URL(address);
   } catch {
-    return FIND_TEXT.notHttps;
+    return { refused: FIND_TEXT.notHttps };
   }
-  if (u.protocol !== "https:") return FIND_TEXT.notHttps;
-  if (u.username !== "" || u.password !== "" || address.length > PAGE_MAX) return FIND_SERVICE_TEXT.page;
-  return undefined;
+  if (u.protocol !== "https:") return { refused: FIND_TEXT.notHttps };
+  if (u.username !== "" || u.password !== "") return { refused: FIND_TEXT.userInfo };
+  const page = `${u.origin}${u.pathname}`;
+  if (page.length > PAGE_MAX) return { refused: FIND_TEXT.tooLong };
+  return { page };
 }
 
 // ---- the sending ------------------------------------------------------------------------------------------------
@@ -192,8 +289,8 @@ export interface FinderDeps {
   post(ticket: string, page: string, body: Blob, signal: AbortSignal): Promise<unknown>;
   /** A fresh read of the list. */
   waiting(): Promise<WaitingRead>;
-  /** Keeps the sentence (and its time) for the popup's next opening (storage.session). */
-  saveResult(sentence: string): Promise<void>;
+  /** Keeps the result for the popup's next opening (storage.session): its sentence, its time, its ticket's hash. */
+  saveResult(result: FindResult): Promise<void>;
   /** Called every `waits.keepAlive` while a sending runs: a cheap call to the browser, so the worker is not stopped as idle. */
   keepAlive(): void;
   waits?: Partial<typeof FIND_WAITS>;
@@ -320,8 +417,8 @@ export function createFinder(deps: FinderDeps) {
     } catch {
       return FIND_TEXT.notAllowed;
     }
-    const refused = pageRefusal(address);
-    if (refused) return refused;
+    const before = pageToSend(address);
+    if ("refused" in before) return before.refused;
 
     // 2. The script, and its port (expected before the injection: the script may connect before it resolves).
     const connected = new Promise<Connected>((resolve) => (c.expect = resolve));
@@ -332,9 +429,10 @@ export function createFinder(deps: FinderDeps) {
       const head = await r.next(waits.connect, FIND_TEXT.notAllowed);
       if (head.t !== "head") return FIND_TEXT.couldNotRead;
       if (!head.pdf) return FIND_TEXT.notShowingPdf;
-      const page = head.href;
-      const refusedNow = pageRefusal(page);
-      if (refusedNow) return refusedNow === FIND_TEXT.notAllowed ? FIND_TEXT.couldNotRead : refusedNow;
+      // Checked again on the script's own address (the tab may have moved), on what will be sent.
+      const now = pageToSend(head.href);
+      if ("refused" in now) return now.refused === FIND_TEXT.notAllowed ? FIND_TEXT.couldNotRead : now.refused;
+      const page = now.page;
 
       // 4. The pieces: the first five bytes, the limit, each piece kept as a Blob.
       const parts: Blob[] = [];
@@ -359,10 +457,11 @@ export function createFinder(deps: FinderDeps) {
         total += bytes.length;
         if (total > FIND_PDF_MAX_BYTES) return FIND_SERVICE_TEXT.tooLarge;
         for (let i = 0; head5.length < PDF_MAGIC.length && i < bytes.length; i++) head5.push(bytes[i]!);
-        if (head5.length === PDF_MAGIC.length && head5.some((b, i) => b !== PDF_MAGIC[i])) return FIND_SERVICE_TEXT.notPdf;
+        // The tab shows a PDF (its head said so): bytes that are not one are the site's answer to a second request (R357 f).
+        if (head5.length === PDF_MAGIC.length && head5.some((b, i) => b !== PDF_MAGIC[i])) return FIND_TEXT.notGivenAgain;
         parts.push(new Blob([bytes as Uint8Array<ArrayBuffer>]));
       }
-      if (head5.length < PDF_MAGIC.length) return FIND_SERVICE_TEXT.notPdf;
+      if (head5.length < PDF_MAGIC.length) return FIND_TEXT.notGivenAgain;
       r.close();
       try {
         port.disconnect();
@@ -424,7 +523,9 @@ export function createFinder(deps: FinderDeps) {
       }
       current = undefined;
     }
-    await deps.saveResult(sentence).catch(() => undefined);
+    await ticketHash(ticket)
+      .then((work) => deps.saveResult({ sentence, at: Date.now(), work }))
+      .catch(() => undefined);
     return { sentence };
   }
 

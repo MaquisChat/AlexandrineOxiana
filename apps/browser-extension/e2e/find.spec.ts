@@ -6,14 +6,16 @@
  *
  *  - "a PDF tab is sent for the waiting work": the researcher signs in, opens the PDF — Chromium shows it in its own
  *    PDF viewer — and presses "Send this tab's PDF" in the popup: the stub receives exactly the PDF's bytes, with
- *    `Content-Type: application/pdf`, `x-ao-page` equal to the tab's address and the extension's Origin, and the popup
- *    shows the stub's sentence;
+ *    `Content-Type: application/pdf`, `x-ao-page` equal to the tab's address without its query and fragment (R357 e;
+ *    the PDF's address has a query) and the extension's Origin, and the popup shows the stub's sentence;
  *  - "a tab that is not a PDF": the sentence, nothing sent;
+ *  - "a PDF the site does not give a second time" (R357 f): the sentence, nothing sent;
  *  - "nothing waiting": the popup as before.
  *
  * As in extension.spec.ts, the toolbar button's click (which grants activeTab) is Extensions.triggerAction through
  * the DevTools protocol, and the popup is driven through the protocol.
  */
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,7 +31,10 @@ const DIST = process.env.AO_E2E_EXTENSION_DIR || fileURLToPath(new URL("../dist"
 const IG = "www.instagram.com";
 const PUB = "pdfs.publisher.example";
 const SIGN_IN = `https://${PUB}/sign-in`;
-const PDF_URL = `https://${PUB}/article.pdf`;
+/** With a query, as a publisher's signed address has (R357 e): what is sent of it is the address without it. */
+const PDF_URL = `https://${PUB}/article.pdf?accessToken=${"t".repeat(40)}&expires=1`;
+const PDF_URL_SENT = `https://${PUB}/article.pdf`;
+const ONCE_URL = `https://${PUB}/once.pdf`;
 const NOTES_URL = `https://${PUB}/notes.html`;
 const TICKET = "0123456789abcdef0123456789abcdef";
 const LABEL = "Quillbrook Ledger of Habits";
@@ -171,7 +176,8 @@ test("a PDF tab is sent for the waiting work: exactly the PDF's bytes, applicati
   expect(f.bytes.length).toBe(pdf.length);
   expect(f.bytes.equals(pdf)).toBe(true);
   expect(f.headers["content-type"]).toBe("application/pdf");
-  expect(f.headers["x-ao-page"]).toBe(PDF_URL);
+  expect(f.headers["x-ao-page"]).toBe(PDF_URL_SENT);
+  expect(f.headers["x-ao-page"]).not.toMatch(/[?#]/);
   expect(f.headers.origin).toBe(`chrome-extension://${extensionId}`);
   expect(f.headers.authorization).toBe(`Bearer ${stub.token()}`);
   expect(f.headers.cookie).toBeUndefined();
@@ -186,7 +192,7 @@ test("a PDF tab is sent for the waiting work: exactly the PDF's bytes, applicati
   // The token and the ticket never in an address; nothing refused.
   for (const r of stub.requests) expect(r.url).not.toContain(stub.token()!);
   expect(stub.refusals).toEqual([]);
-  // Nothing of the result but its sentence is kept (taken by the popup once said).
+  // Nothing of the result but its sentence, its time and its ticket's hash is kept (removed by the popup once said).
   const session = (await worker.evaluate(() => (globalThis as unknown as { chrome: { storage: { session: { get(k: null): Promise<Record<string, unknown>> } } } }).chrome.storage.session.get(null))) as Record<string, unknown>;
   expect(JSON.stringify(session)).not.toContain(TICKET);
   expect(JSON.stringify(session)).not.toContain(PUB);
@@ -223,10 +229,17 @@ test("the popup closed while the PDF is sent: the sending goes on in the backgro
   await expect.poll(() => stub.files.length, { timeout: 60_000 }).toBe(sent + 1);
   expect(stub.files.at(-1)!.ticket).toBe(ticket);
   expect(stub.files.at(-1)!.bytes.equals(pdf)).toBe(true);
-  // The result waits in storage.session: its sentence and its time, nothing else.
+  // The result waits in storage.session: its sentence, its time and its ticket's hash (R357 a), nothing else — not the
+  // ticket, not the title, not the tab's address.
   const readSession = async () => (await worker.evaluate(() => (globalThis as unknown as { chrome: { storage: { session: { get(k: null): Promise<Record<string, unknown>> } } } }).chrome.storage.session.get(null))) as Record<string, unknown>;
-  await expect.poll(async () => Object.keys(((await readSession()).findResult ?? {}) as object).sort(), { timeout: 15_000 }).toEqual(["at", "sentence"]);
-  expect(((await readSession()).findResult as { sentence: string }).sentence).toBe(HELD);
+  await expect.poll(async () => Object.keys(((await readSession()).findResult ?? {}) as object).sort(), { timeout: 15_000 }).toEqual(["at", "sentence", "work"]);
+  const kept = (await readSession()).findResult as { sentence: string; work: string };
+  expect(kept.sentence).toBe(HELD);
+  expect(kept.work).toBe(createHash("sha256").update(ticket).digest("hex"));
+  expect(Object.keys(await readSession())).toEqual(["findResult"]);
+  expect(JSON.stringify(await readSession())).not.toContain(ticket);
+  expect(JSON.stringify(await readSession())).not.toContain(LABEL);
+  expect(JSON.stringify(await readSession())).not.toContain(PUB);
   // The next opening says it; the one after does not.
   const again = await openPopupOn(PDF_URL);
   await expect.poll(() => again(said), { timeout: 15_000 }).toBe(HELD);
@@ -235,6 +248,28 @@ test("the popup closed while the PDF is sent: the sending goes on in the backgro
   const third = await openPopupOn(PDF_URL);
   await expect.poll(() => third(enabled("Capture this page")), { timeout: 15_000 }).toBe(true);
   expect(await third(`document.body.textContent.includes("Find and acquire")`)).toBe(false);
+  expect(stub.refusals).toEqual([]);
+  await page.close();
+});
+
+test("a PDF the site does not give a second time (a one-time address): R357 f's sentence, nothing sent", async () => {
+  stub.waiting = [{ ticket: TICKET, label: LABEL }];
+  const sent = stub.files.length;
+  const page = await view(ONCE_URL);
+  // Chromium shows the PDF (the site's first answer) in its own viewer.
+  await expect.poll(async () => (await targets()).some((t) => t.type === "tab" && t.url === ONCE_URL), { timeout: 15_000 }).toBe(true);
+  await expect.poll(() => fixtures.publisherRequests.filter((r) => r.path === "/once.pdf").length, { timeout: 15_000 }).toBe(1);
+  const inPopup = await openPopupOn(ONCE_URL);
+  await expect.poll(() => inPopup(enabled("Send this tab's PDF")), { timeout: 15_000 }).toBe(true);
+  await inPopup(`${button("Send this tab's PDF")}.click()`);
+  await expect.poll(() => inPopup(said), { timeout: 15_000 }).toBe("The site did not give the PDF a second time, so nothing was sent. Download the PDF and add it to the record in the app instead.");
+  expect(fixtures.publisherRequests.filter((r) => r.path === "/once.pdf")).toEqual([
+    { path: "/once.pdf", signedIn: true },
+    { path: "/once.pdf", signedIn: true },
+  ]);
+  // The work still waits: the button is offered again; nothing reached the app.
+  await expect.poll(() => inPopup(enabled("Send this tab's PDF"))).toBe(true);
+  expect(stub.files.length).toBe(sent);
   expect(stub.refusals).toEqual([]);
   await page.close();
 });

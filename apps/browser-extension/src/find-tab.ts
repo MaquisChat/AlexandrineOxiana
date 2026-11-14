@@ -20,6 +20,24 @@ export interface TabEnv {
   connect(name: string): PortLike;
 }
 
+/** The extension's runtime, as far as the tab's script needs it. */
+export interface TabRuntime {
+  connect(info: { name: string }): PortLike;
+}
+
+/**
+ * The extension's runtime in the tab's isolated world (R357 g): `chrome.runtime` first, then `browser.runtime`, and only
+ * one whose `connect` is a function. In Chrome the isolated world has no `browser` global, and a page's element with
+ * the id "browser" (named access on `window`) must not stand in for it; with none, the script does nothing.
+ */
+export function extensionRuntime(g: unknown): TabRuntime | undefined {
+  const o = g as { chrome?: { runtime?: unknown }; browser?: { runtime?: unknown } } | undefined;
+  for (const candidate of [o?.chrome?.runtime, o?.browser?.runtime]) {
+    if (typeof candidate === "object" && candidate !== null && typeof (candidate as { connect?: unknown }).connect === "function") return candidate as TabRuntime;
+  }
+  return undefined;
+}
+
 /** How long the script waits for the background's next "more" before it gives up (the background's own waits are shorter). */
 export const TAB_ASK_MS = 120_000;
 

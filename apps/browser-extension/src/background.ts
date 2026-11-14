@@ -14,7 +14,7 @@ import { fitCaptureBody } from "./body-size.js";
 import type { ContentApi } from "./content/index.js";
 import { bytesToBase64, captureFullPage, createCaptureLimiter } from "./content/screenshot.js";
 import { validateSelectors, type SelectorsConfig } from "./content/selectors-schema.js";
-import { FIND_RESULT_KEY, FIND_WAITS, createFinder, parseFindResult, parseFindSend, parseWaiting, type WaitingRead } from "./find.js";
+import { FIND_WAITS, createFinder, createResultStore, parseFindSend, parseResultForget, readWaitingWith, type WaitingRead } from "./find.js";
 import type { PortLike } from "./find-protocol.js";
 import { afterSend, parsePending, removePending, sendInChunks } from "./pending.js";
 import type { BackgroundRequest, CaptureReply, ProfileStatus } from "./types.js";
@@ -23,15 +23,14 @@ const api = createApi({ fetch: (input, init) => fetch(input, init), storage: bro
 
 // ---- Find and acquire: a tab's PDF for the work waiting in this browser (R348 i; find.ts) ----
 
-/** The list of works waiting for a PDF from this browser; a failure is said only as what it was (never shown at the opening). */
-async function readWaiting(): Promise<WaitingRead> {
-  try {
-    return { waiting: parseWaiting(await api.findWaiting({ signal: AbortSignal.timeout(FIND_WAITS.list) })) };
-  } catch (e) {
-    if (e instanceof ApiError && e.code === "UNREACHABLE") return { waiting: [], unreachable: e.message };
-    return { waiting: [], failed: true };
-  }
-}
+/**
+ * The list of works waiting for a PDF from this browser; a failure — or an answer not understood — is said only as what
+ * it was, never as an empty list (R357 c; never shown at the opening).
+ */
+const readWaiting = (): Promise<WaitingRead> => readWaitingWith(() => api.findWaiting({ signal: AbortSignal.timeout(FIND_WAITS.list) }));
+
+/** The last sending's result for the popup's next opening: its sentence, its time and its ticket's hash (R357 a, b). */
+const results = createResultStore(browser.storage.session);
 
 const finder = createFinder({
   extensionId: browser.runtime.id,
@@ -41,18 +40,11 @@ const finder = createFinder({
   inject: async (tabId) => void (await browser.scripting.executeScript({ target: { tabId }, files: ["find-tab.js"] })),
   post: (ticket, page, body, signal) => api.sendFindPdf(ticket, page, body, { signal }),
   waiting: readWaiting,
-  // For the popup's next opening, if it was closed meanwhile: the sentence and its time, nothing else.
-  saveResult: (sentence) => browser.storage.session.set({ [FIND_RESULT_KEY]: { sentence, at: Date.now() } }),
+  // For the popup's next opening, if it was closed meanwhile: the sentence, its time and its ticket's hash, nothing else.
+  saveResult: (result) => results.save(result),
   // A call to the browser resets the idle worker's timer while a sending runs.
   keepAlive: () => void browser.runtime.getPlatformInfo().catch(() => undefined),
 });
-
-/** The last sending's sentence, taken once. */
-async function takeFindResult(): Promise<{ sentence: string; at: number } | null> {
-  const v = parseFindResult((await browser.storage.session.get(FIND_RESULT_KEY))[FIND_RESULT_KEY]);
-  await browser.storage.session.remove(FIND_RESULT_KEY);
-  return v ?? null;
-}
 
 /** captureVisibleTab allows two calls a second for the whole extension: one limiter for all captures. */
 const captureSlot = createCaptureLimiter();
@@ -316,7 +308,12 @@ async function handle(msg: BackgroundRequest, sender: Runtime.MessageSender): Pr
     case "find-status":
       return { sending: finder.sending() ?? null };
     case "find-result":
-      return takeFindResult();
+      // Looked at, not taken: the popup removes it when it shows it or drops it (find-result-forget).
+      return (await results.peek()) ?? null;
+    case "find-result-forget": {
+      const r = parseResultForget(msg);
+      return r ? results.forget(r) : undefined;
+    }
     case "find-send": {
       const r = parseFindSend(msg);
       return r ? finder.send(r.tabId, r.ticket) : undefined;

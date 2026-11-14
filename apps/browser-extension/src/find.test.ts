@@ -14,20 +14,31 @@ import {
   FIND_PAGE_HEADER,
   FIND_SERVICE_TEXT,
   FIND_TEXT,
+  FIND_RESULT_KEY,
   createFinder,
+  createResultStore,
   parseFileAnswer,
+  parseFindResult,
   parseFindSend,
+  parseResultForget,
   parseWaiting,
+  parseWaitingRead,
+  placeOfKept,
+  readWaitingWith,
   sentenceAfterNoAnswer,
+  ticketHash,
+  type FindResult,
   type FinderDeps,
   type WaitingRead,
 } from "./find.js";
 import { FIND_PDF_MAX_BYTES, FIND_PIECE_BYTES, FIND_PORT, parseTabMessage, type PortLike } from "./find-protocol.js";
-import { readTabPdf } from "./find-tab.js";
+import { extensionRuntime, readTabPdf } from "./find-tab.js";
 
 const EXT_ID = "abcdefghijklmnopabcdefghijklmnop";
 const TICKET = "0123456789abcdef0123456789abcdef";
 const PAGE = "https://pdfs.publisher.example/content/article.pdf?token=tabsecret#page=3";
+/** What is sent of PAGE (R357 e): its address without the query and the fragment. */
+const PAGE_SENT = "https://pdfs.publisher.example/content/article.pdf";
 const HELD = { outcome: "held", sentence: FIND_BROWSER_TEXT.held };
 
 // ---- an in-memory port pair, messages copied through JSON (as Chrome's are) -------------------------------------
@@ -134,6 +145,8 @@ interface Rig {
   fetches: Array<{ url: string; init: RequestInit | undefined }>;
   posts: Array<{ ticket: string; page: string; bytes: Uint8Array; type: string }>;
   saved: string[];
+  /** What saveResult was given whole (R357 a: the sentence, the time and the ticket's hash). */
+  kept: FindResult[];
   keepAlives: number;
   tabPorts: FakePort[];
   bgPorts: FakePort[];
@@ -142,7 +155,7 @@ interface Rig {
 }
 
 function rig(tabs: Record<number, FakeTab>, o: { post?: FinderDeps["post"]; waiting?: () => Promise<WaitingRead>; waits?: FinderDeps["waits"]; tabStall?: number } = {}): Rig {
-  const r: Rig = { injected: [], fetches: [], posts: [], saved: [], keepAlives: 0, tabPorts: [], bgPorts: [], scripts: [], streams: [] } as unknown as Rig;
+  const r: Rig = { injected: [], fetches: [], posts: [], saved: [], kept: [], keepAlives: 0, tabPorts: [], bgPorts: [], scripts: [], streams: [] } as unknown as Rig;
   r.deps = {
     extensionId: EXT_ID,
     tabUrl: async (tabId) => tabs[tabId]?.url,
@@ -188,7 +201,10 @@ function rig(tabs: Record<number, FakeTab>, o: { post?: FinderDeps["post"]; wait
         return HELD;
       }),
     waiting: o.waiting ?? (async () => ({ waiting: [{ ticket: TICKET, label: "A work" }] })),
-    saveResult: async (sentence) => void r.saved.push(sentence),
+    saveResult: async (result) => {
+      r.saved.push(result.sentence);
+      r.kept.push(result);
+    },
     keepAlive: () => void r.keepAlives++,
     ...(o.waits ? { waits: o.waits } : {}),
   };
@@ -213,8 +229,16 @@ describe("the extension's numbers and the service's sentences are the service's 
     expect(FIND_BROWSER_PAGE_MAX).toBe(2048);
   });
 
-  it("the three cases the extension finds before sending say the service's own sentences", () => {
-    expect(FIND_SERVICE_TEXT).toEqual({ page: FIND_BROWSER_TEXT.page, notPdf: FIND_BROWSER_TEXT.notPdf, tooLarge: FIND_BROWSER_TEXT.tooLarge });
+  it("the one case the extension finds before sending in the service's words is the limit (R357 e, f: the address and a second answer that is not a PDF have the extension's own words)", () => {
+    expect(FIND_SERVICE_TEXT).toEqual({ tooLarge: FIND_BROWSER_TEXT.tooLarge });
+  });
+
+  it("R357's own sentences, exactly", () => {
+    expect(FIND_TEXT.userInfo).toBe("This tab's address holds a user name or password, so its file cannot be sent.");
+    expect(FIND_TEXT.tooLong).toBe("This tab's address is too long for the app, so its file cannot be sent.");
+    expect(FIND_TEXT.notGivenAgain).toBe("The site did not give the PDF a second time, so nothing was sent. Download the PDF and add it to the record in the app instead.");
+    expect(FIND_TEXT.noAnswer).toBe("The app's answer did not arrive, and the work is no longer waiting for a PDF from this browser. The app shows what became of it.");
+    expect(FIND_TEXT.unknown).toBe("The app's answer did not arrive, and whether the work is still waiting could not be read. Open this popup again to see.");
   });
 
   it("the extension's own sentences are R348's and the dispatch's; none says a file was added (R301)", () => {
@@ -222,7 +246,8 @@ describe("the extension's numbers and the service's sentences are the service's 
     expect(FIND_TEXT.notShowingPdf).toBe("This tab is not showing a PDF. Open the PDF itself, then try again.");
     expect(FIND_TEXT.notAllowed).toBe("This browser does not let the extension read this tab, so its PDF cannot be sent.");
     expect(FIND_TEXT.couldNotSend).toBe("The PDF could not be sent. The work is still waiting — try again.");
-    for (const s of [...Object.values(FIND_TEXT), ...Object.values(FIND_SERVICE_TEXT)]) expect(s).not.toMatch(/\badd(ed|s)?\b/i);
+    // "Add it to the record" (R357 f) asks the researcher to do it; no sentence says a file WAS added.
+    for (const s of [...Object.values(FIND_TEXT), ...Object.values(FIND_SERVICE_TEXT)]) expect(s).not.toMatch(/\badded\b|\badds\b|\bwas add/i);
   });
 });
 
@@ -259,6 +284,100 @@ describe("the list (POST /find/browser/waiting): anything but { waiting: [{ tick
     ["more than twenty items", { waiting: Array.from({ length: 21 }, () => item) }],
   ])("%s → nothing waiting", (_what, v) => {
     expect(parseWaiting(v)).toEqual([]);
+  });
+});
+
+describe("a read of the list that failed or was not understood is told apart from a real { waiting: [] } (R357 c)", () => {
+  const item = { ticket: TICKET, label: "x" };
+  it("the background's read: the service's answer, a failure, an answer of another shape, the app not answering", async () => {
+    expect(await readWaitingWith(async () => ({ waiting: [] }))).toEqual({ waiting: [] });
+    expect(await readWaitingWith(async () => ({ waiting: [item] }))).toEqual({ waiting: [item] });
+    expect(await readWaitingWith(async () => ({ waiting: "yes" }))).toEqual({ waiting: [], failed: true });
+    expect(await readWaitingWith(async () => undefined)).toEqual({ waiting: [], failed: true });
+    expect(await readWaitingWith(async () => ({ waiting: [{ ticket: "x", label: "y" }] }))).toEqual({ waiting: [], failed: true });
+    expect(await readWaitingWith(async () => Promise.reject(new ApiError("BAD_REPLY", "x", 200)))).toEqual({ waiting: [], failed: true });
+    expect(await readWaitingWith(async () => Promise.reject(new ApiError("UNREACHABLE", unreachable(48123))))).toEqual({ waiting: [], unreachable: unreachable(48123) });
+  });
+  it("the popup's copy: no answer, or a list it does not understand, is a failed read", () => {
+    expect(parseWaitingRead(undefined)).toEqual({ waiting: [], failed: true });
+    expect(parseWaitingRead(null)).toEqual({ waiting: [], failed: true });
+    expect(parseWaitingRead({ waiting: "yes" })).toEqual({ waiting: [], failed: true });
+    expect(parseWaitingRead({ waiting: [] })).toEqual({ waiting: [] });
+    expect(parseWaitingRead({ waiting: [item] })).toEqual({ waiting: [item] });
+    expect(parseWaitingRead({ waiting: [], failed: true })).toEqual({ waiting: [], failed: true });
+    expect(sentenceAfterNoAnswer(TICKET, parseWaitingRead(undefined))).toBe(FIND_TEXT.unknown);
+  });
+});
+
+describe("the kept result belongs to its work: a SHA-256 of its ticket, never the ticket (R357 a, b)", () => {
+  const T2 = "fedcba9876543210fedcba9876543210";
+  it("the hash is 64 lower-case hex, the same for the same ticket, not the ticket", async () => {
+    const h = await ticketHash(TICKET);
+    expect(h).toMatch(/^[0-9a-f]{64}$/);
+    expect(await ticketHash(TICKET)).toBe(h);
+    expect(await ticketHash(T2)).not.toBe(h);
+    expect(h).not.toContain(TICKET);
+    // SHA-256 of the ticket's text, as crypto.subtle gives it.
+    expect(h).toBe(Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(TICKET))).toString("hex"));
+  });
+  it("its place at an opening: in its work's section; alone when nothing waits; dropped when a DIFFERENT work waits", async () => {
+    const kept = { sentence: "s", at: 1, work: await ticketHash(TICKET) };
+    expect(await placeOfKept(kept, [{ ticket: TICKET, label: "A" }])).toBe("work");
+    expect(await placeOfKept(kept, [{ ticket: T2, label: "B" }, { ticket: TICKET, label: "A" }])).toBe("work");
+    expect(await placeOfKept(kept, [])).toBe("alone");
+    expect(await placeOfKept(kept, [{ ticket: T2, label: "B" }])).toBe("drop");
+  });
+  it("a kept result of the old shape (no hash), or of any other shape, is not one", async () => {
+    const work = await ticketHash(TICKET);
+    expect(parseFindResult({ sentence: "s", at: 1, work })).toEqual({ sentence: "s", at: 1, work });
+    for (const bad of [{ sentence: "s", at: 1 }, { sentence: "s", at: 1, work: TICKET }, { sentence: "s", at: 1, work, ticket: TICKET }, { sentence: "s", at: 1, work: work.toUpperCase() }, null]) expect(parseFindResult(bad)).toBeUndefined();
+  });
+  it("the store: saved whole; looked at without being taken; an old shape dropped; removed only when it is the same result", async () => {
+    const data: Record<string, unknown> = {};
+    const area = {
+      get: async (k: string) => (k in data ? { [k]: data[k] } : {}),
+      set: async (o: Record<string, unknown>) => void Object.assign(data, JSON.parse(JSON.stringify(o))),
+      remove: async (k: string) => void delete data[k],
+    };
+    const store = createResultStore(area);
+    expect(await store.peek()).toBeUndefined();
+    const work = await ticketHash(TICKET);
+    await store.save({ sentence: "s", at: 5, work });
+    expect(Object.keys(data[FIND_RESULT_KEY] as object).sort()).toEqual(["at", "sentence", "work"]);
+    expect(JSON.stringify(data)).not.toContain(TICKET);
+    // Looked at twice: still there (a popup closed during its opening takes nothing).
+    expect(await store.peek()).toEqual({ sentence: "s", at: 5, work });
+    expect(await store.peek()).toEqual({ sentence: "s", at: 5, work });
+    // Another result (an older time, another work) is not removed in its place.
+    expect(await store.forget({ work, at: 4 })).toBe(false);
+    expect(await store.forget({ work: await ticketHash(T2), at: 5 })).toBe(false);
+    expect(data[FIND_RESULT_KEY]).toBeDefined();
+    expect(await store.forget({ work, at: 5 })).toBe(true);
+    expect(data[FIND_RESULT_KEY]).toBeUndefined();
+    // The old shape: dropped at the first look, never shown.
+    data[FIND_RESULT_KEY] = { sentence: "Sent. The file waits for your check in the app's review queue.", at: 1 };
+    expect(await store.peek()).toBeUndefined();
+    expect(FIND_RESULT_KEY in data).toBe(false);
+  });
+  it("the popup's request to remove it: a hash and a time, nothing else", async () => {
+    const work = await ticketHash(TICKET);
+    expect(parseResultForget({ type: "find-result-forget", work, at: 5 })).toEqual({ work, at: 5 });
+    for (const bad of [{ type: "find-result-forget", work: TICKET, at: 5 }, { type: "find-result-forget", work }, { type: "find-result-forget", work, at: "5" }, { type: "find-result", work, at: 5 }, null]) expect(parseResultForget(bad)).toBeUndefined();
+  });
+});
+
+describe("the tab script takes the extension's runtime, not a page's element of that name (R357 g)", () => {
+  const port = {} as PortLike;
+  const real = { connect: () => port };
+  it("chrome.runtime first, then browser.runtime; only with a connect function", () => {
+    expect(extensionRuntime({ chrome: { runtime: real } })).toBe(real);
+    expect(extensionRuntime({ browser: { runtime: real } })).toBe(real);
+    // A page's <form id="browser"><input name="runtime"></form> in Chrome's shared named access: not taken.
+    const clobbered = { runtime: { tagName: "INPUT", name: "runtime" } };
+    expect(extensionRuntime({ browser: clobbered, chrome: { runtime: real } })).toBe(real);
+    expect(extensionRuntime({ browser: clobbered })).toBeUndefined();
+    expect(extensionRuntime({ chrome: { runtime: { connect: "no" } } })).toBeUndefined();
+    expect(extensionRuntime({})).toBeUndefined();
   });
 });
 
@@ -304,7 +423,8 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
     expect(reply).toEqual({ sentence: FIND_BROWSER_TEXT.held });
     expect(r.posts).toHaveLength(1);
     expect(r.posts[0]!.ticket).toBe(TICKET);
-    expect(r.posts[0]!.page).toBe(PAGE);
+    // The tab's address without its query and fragment (R357 e); the file itself fetched from the full address.
+    expect(r.posts[0]!.page).toBe(PAGE_SENT);
     expect(r.posts[0]!.type).toBe("application/pdf");
     expect(Buffer.from(r.posts[0]!.bytes).equals(Buffer.from(file))).toBe(true);
     // The tab read its own address, with the browser's session, and nothing else.
@@ -316,8 +436,11 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
     // Nothing of the ticket reached the tab's side: the tab received only "more".
     expect(JSON.stringify(r.bgPorts[0]!.sent)).not.toContain(TICKET);
     expect(new Set(r.bgPorts[0]!.sent.map((m) => JSON.stringify(m)))).toEqual(new Set([JSON.stringify({ t: "more" })]));
-    // The result is kept for the next opening: its sentence only.
+    // The result is kept for the next opening: its sentence, its time and its ticket's hash — never the ticket (R357 a).
     expect(r.saved).toEqual([FIND_BROWSER_TEXT.held]);
+    expect(Object.keys(r.kept[0]!).sort()).toEqual(["at", "sentence", "work"]);
+    expect(r.kept[0]!.work).toBe(await ticketHash(TICKET));
+    expect(JSON.stringify(r.kept)).not.toContain(TICKET);
     // Nothing is left listening in the tab; the port is closed.
     expect(r.tabPorts[0]!.messages.size).toBe(0);
     expect(r.tabPorts[0]!.gone.size).toBe(0);
@@ -345,12 +468,41 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
     }
   });
 
-  it("an https address the service would refuse (a user name, longer than 2,048): the service's sentence, nothing injected", async () => {
-    for (const url of ["https://someone:pw@pdfs.publisher.example/a.pdf", `https://pdfs.publisher.example/${"a".repeat(2049)}`]) {
+  it("an address with a user name or password, or still longer than 2,048 without its query: the extension's own words, nothing injected (R357 e)", async () => {
+    for (const [url, sentence] of [
+      ["https://someone:pw@pdfs.publisher.example/a.pdf", FIND_TEXT.userInfo],
+      ["https://someone@pdfs.publisher.example/a.pdf", FIND_TEXT.userInfo],
+      [`https://pdfs.publisher.example/${"a".repeat(2049)}`, FIND_TEXT.tooLong],
+      [`https://pdfs.publisher.example/${"a".repeat(2049)}?q=1`, FIND_TEXT.tooLong],
+    ] as const) {
       const r = rig({ 7: { url, contentType: "application/pdf", file: pdfBytes(100) } });
-      expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_SERVICE_TEXT.page });
+      expect(await r.finder.send(7, TICKET)).toEqual({ sentence });
       expect(r.injected).toEqual([]);
+      expect(r.posts).toEqual([]);
     }
+  });
+
+  it("an address with a 3,000-character query is sent: x-ao-page holds no query and no fragment; the file is fetched from the full address (R357 e)", async () => {
+    const url = `https://pdfs.publisher.example/content/signed.pdf?Signature=${"s".repeat(3000)}&Expires=1#page=2`;
+    const file = pdfBytes(5000);
+    const r = rig({ 7: { url, contentType: "application/pdf", file } });
+    expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_BROWSER_TEXT.held });
+    await Promise.all(r.scripts);
+    expect(r.posts).toHaveLength(1);
+    expect(r.posts[0]!.page).toBe("https://pdfs.publisher.example/content/signed.pdf");
+    expect(r.posts[0]!.page).not.toMatch(/[?#]/);
+    expect(r.fetches.map((f) => f.url)).toEqual([url]);
+  });
+
+  it("the script's own address is checked on what will be sent: a user name there is refused in the extension's words", async () => {
+    const r = rig({ 7: { url: PAGE, contentType: "application/pdf", silent: true } });
+    const done = r.finder.send(7, TICKET);
+    await new Promise((res) => setTimeout(res, 5));
+    const pair = portPair(FIND_PORT, { id: EXT_ID, tab: { id: 7 }, frameId: 0 });
+    r.finder.connect(pair.bg);
+    pair.tab.postMessage({ t: "head", href: "https://someone@pdfs.publisher.example/a.pdf", pdf: true });
+    expect(await done).toEqual({ sentence: FIND_TEXT.userInfo });
+    expect(r.posts).toEqual([]);
   });
 
   it("the browser does not tell the extension the tab's address, or refuses the script, or the script never answers: R348's sentence, never an unhandled error", async () => {
@@ -372,10 +524,10 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
     expect(r.tabPorts[0]!.messages.size).toBe(0);
   });
 
-  it("a file that does not begin with %PDF-: the service's sentence; reading stops at the first piece; nothing sent", async () => {
+  it("a tab that shows a PDF whose bytes, read again, do not begin with %PDF- (a page the second time): R357 f's sentence; reading stops at the first piece; nothing sent", async () => {
     const file = new Uint8Array(5 * 1024 * 1024).fill(0x3c);
     const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file } });
-    expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_SERVICE_TEXT.notPdf });
+    expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_TEXT.notGivenAgain });
     await Promise.all(r.scripts);
     expect(pieces(r.tabPorts[0]!)).toHaveLength(1);
     expect(r.streams[0]!.pulled).toBeLessThan(file.length);
@@ -383,10 +535,18 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
     expect(r.posts).toEqual([]);
   });
 
-  it("an empty file, or one shorter than five bytes: not a PDF", async () => {
+  it("a site that answers the second request with a page (HTML, status 200): R357 f's sentence, not \"not a PDF\"", async () => {
+    const page = new TextEncoder().encode("<!doctype html><title>Article</title><p>Read the article online.</p>");
+    const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file: () => new Response(page, { status: 200, headers: { "content-type": "text/html" } }) } });
+    expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_TEXT.notGivenAgain });
+    await Promise.all(r.scripts);
+    expect(r.posts).toEqual([]);
+  });
+
+  it("an empty file, or one shorter than five bytes, read again from a tab showing a PDF: R357 f's sentence", async () => {
     for (const file of [new Uint8Array(0), new TextEncoder().encode("%PDF")]) {
       const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file } });
-      expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_SERVICE_TEXT.notPdf });
+      expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_TEXT.notGivenAgain });
       await Promise.all(r.scripts);
       expect(r.posts).toEqual([]);
     }
@@ -600,8 +760,9 @@ describe("the POST's refusals and failures", () => {
     [409, "browser-busy", FIND_BROWSER_TEXT.busy],
     [413, "browser-too-large", FIND_BROWSER_TEXT.tooLarge],
     [400, "browser-not-pdf", FIND_BROWSER_TEXT.notPdf],
+    [503, "browser-inbox", FIND_BROWSER_TEXT.inbox],
   ])("%i %s: the service's sentence, as it is", async (status, reason, message) => {
-    const code = status === 404 ? "NOT_FOUND" : status === 409 ? "CONFLICT" : status === 413 ? "PAYLOAD_TOO_LARGE" : "VALIDATION";
+    const code = status === 404 ? "NOT_FOUND" : status === 409 ? "CONFLICT" : status === 413 ? "PAYLOAD_TOO_LARGE" : status === 503 ? "UNAVAILABLE" : "VALIDATION";
     const r = rig(tabs(), {
       post: async () => {
         throw new ApiError(code, message, status, reason, true);
@@ -625,6 +786,7 @@ describe("the POST's refusals and failures", () => {
     ["still waiting", { waiting: [{ ticket: TICKET, label: "x" }] }, FIND_TEXT.couldNotSend],
     ["no longer waiting", { waiting: [] }, FIND_TEXT.noAnswer],
     ["the app not answering", { waiting: [], unreachable: unreachable(48123) }, unreachable(48123)],
+    ["the list not read", { waiting: [], failed: true }, FIND_TEXT.unknown],
   ])("no answer (the connection closed while the browser was still sending): the list is read again — %s", async (_what, read, sentence) => {
     let reads = 0;
     const r = rig(tabs(), {
@@ -636,6 +798,27 @@ describe("the POST's refusals and failures", () => {
     expect(await r.finder.send(7, TICKET)).toEqual({ sentence });
     expect(reads).toBe(1);
     expect(r.saved).toEqual([sentence]);
+    await Promise.all(r.scripts);
+  });
+
+  it("no answer, and the list's answer then not understood (the background's own read): unknown, never \"no longer waiting\" (R357 c)", async () => {
+    for (const list of [{ waiting: "yes" }, { waiting: [{ ticket: TICKET }] }, "<html>", null]) {
+      const r = rig(tabs(), {
+        post: async () => {
+          throw new ApiError("UNREACHABLE", unreachable(48123));
+        },
+        waiting: () => readWaitingWith(async () => list),
+      });
+      expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_TEXT.unknown });
+      await Promise.all(r.scripts);
+    }
+    const r = rig(tabs(), {
+      post: async () => {
+        throw new ApiError("UNREACHABLE", unreachable(48123));
+      },
+      waiting: () => readWaitingWith(async () => ({ waiting: [] })),
+    });
+    expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_TEXT.noAnswer });
     await Promise.all(r.scripts);
   });
 

@@ -8,6 +8,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApi, unreachable, type LocalStorageArea } from "../api.js";
+import { ticketHash, type FindResult } from "../find.js";
 import type { BackgroundRequest } from "../types.js";
 import { Popup, type PopupBridge } from "./Popup.js";
 
@@ -513,31 +514,42 @@ describe("Find and acquire: a work waiting for a PDF from this browser (R348 i)"
   }
 
   /** A stand-in for the background's answers to the popup's find-* messages. */
-  function fakeBackground(init: { waiting?: Array<{ ticket: string; label: string }>; read?: unknown; status?: string | null; result?: { sentence: string; at: number } | null } = {}) {
+  /** A kept result as the background saves it (R357 a): the sentence, the time, the ticket's hash. */
+  const keptFor = async (ticket: string, sentence: string, at = Date.now()): Promise<FindResult> => ({ sentence, at, work: await ticketHash(ticket) });
+
+  function fakeBackground(init: { waiting?: Array<{ ticket: string; label: string }>; read?: unknown; status?: string | null; result?: unknown } = {}) {
     const bg = {
       waiting: init.waiting ?? [],
       read: init.read,
       status: init.status ?? null,
-      result: init.result ?? null,
+      result: (init.result ?? null) as unknown,
       sent: [] as BackgroundRequest[],
       replies: [] as Array<ReturnType<typeof deferred<unknown>>>,
+      /** When set, the list's answer waits for it. */
+      waitingGate: undefined as Promise<void> | undefined,
       waitingReads: 0,
       resultTakes: 0,
+      forgets: 0,
     };
     const send = async <T,>(msg: BackgroundRequest): Promise<T> => {
       bg.sent.push(msg);
       switch (msg.type) {
         case "find-waiting":
           bg.waitingReads++;
+          if (bg.waitingGate) await bg.waitingGate;
           if (bg.read instanceof Error) throw bg.read;
           return (bg.read ?? { waiting: bg.waiting }) as T;
         case "find-status":
           return { sending: bg.status } as T;
-        case "find-result": {
+        // As the background's store (find.ts createResultStore): looked at, not taken; removed only when the same one.
+        case "find-result":
           bg.resultTakes++;
-          const r = bg.result;
-          bg.result = null;
-          return r as T;
+          return bg.result as T;
+        case "find-result-forget": {
+          bg.forgets++;
+          const r = bg.result as { work?: string; at?: number } | null;
+          if (r && r.work === msg.work && r.at === msg.at) bg.result = null;
+          return true as T;
         }
         case "find-send": {
           const d = deferred<unknown>();
@@ -655,16 +667,17 @@ describe("Find and acquire: a work waiting for a PDF from this browser (R348 i)"
     expect(busy.disabled).toBe(true);
     await click(busy);
     expect(findSends(bg.sent)).toHaveLength(1);
-    // The service held it: the work no longer waits.
+    // The service held it: the work no longer waits; the background kept the result for a next opening.
     bg.waiting = [];
+    bg.result = await keptFor(TICKET, HELD_SENTENCE);
     await act(async () => bg.replies[0]!.resolve({ sentence: HELD_SENTENCE }));
     await settle();
     expect(live()).toBe(HELD_SENTENCE);
     expect(section()!.querySelector("h2")?.textContent).toBe("Find and acquire");
     expect(section()!.querySelector("button")).toBeNull();
     expect(host.textContent!.split(HELD_SENTENCE)).toHaveLength(2);
-    // The result kept for a next opening was taken: it will not be said again.
-    expect(bg.resultTakes).toBeGreaterThanOrEqual(2);
+    // The result kept for a next opening was removed: it will not be said again.
+    expect(bg.result).toBeNull();
     expect(host.textContent).not.toMatch(/\badded\b/i);
   });
 
@@ -699,6 +712,10 @@ describe("Find and acquire: a work waiting for a PDF from this browser (R348 i)"
     ["still waiting", [{ ticket: TICKET, label: LABEL }], undefined, "The PDF could not be sent. The work is still waiting — try again."],
     ["no longer waiting", [], undefined, "The app's answer did not arrive, and the work is no longer waiting for a PDF from this browser. The app shows what became of it."],
     ["the app not answering", [], { waiting: [], unreachable: unreachable(OLD) }, unreachable(OLD)],
+    // R357 c: the list not read, or not understood — unknown, never "no longer waiting".
+    ["the list not read (the background's ask throws)", [], new Error("Could not establish connection. Receiving end does not exist."), "The app's answer did not arrive, and whether the work is still waiting could not be read. Open this popup again to see."],
+    ["the list not understood", [], { waiting: "yes" }, "The app's answer did not arrive, and whether the work is still waiting could not be read. Open this popup again to see."],
+    ["the background's read failed", [], { waiting: [], failed: true }, "The app's answer did not arrive, and whether the work is still waiting could not be read. Open this popup again to see."],
   ])("the background did not answer (stopped mid-way): the list is read again and the popup claims no result — %s", async (_what, after, read, sentence) => {
     const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }] });
     await mountWith(send);
@@ -710,15 +727,94 @@ describe("Find and acquire: a work waiting for a PDF from this browser (R348 i)"
     expect(live()).toBe(sentence);
   });
 
-  it("the popup closed meanwhile: the result is shown at the next opening, once", async () => {
-    const { bg, send } = fakeBackground({ result: { sentence: HELD_SENTENCE, at: Date.now() } });
+  it("the popup closed meanwhile, nothing waits now: the result is shown at the next opening in the section without a button, once", async () => {
+    const { bg, send } = fakeBackground({ result: await keptFor(TICKET, HELD_SENTENCE) });
     await mountWith(send);
     expect(section()!.querySelector("h2")?.textContent).toBe("Find and acquire");
     expect(live()).toBe(HELD_SENTENCE);
+    expect(section()!.querySelector("button")).toBeNull();
     expect(bg.result).toBeNull();
+    // A mere opening does not move the focus (R357 d).
+    expect(document.activeElement).toBe(document.body);
     await remount(send);
     expect(host.textContent).not.toContain(HELD_SENTENCE);
     expect(host.textContent).not.toContain("Find and acquire");
+  });
+
+  it("the kept result of the work that still waits: shown in that work's section, with its line and button, once (R357 a)", async () => {
+    const refusal = "The PDF did not arrive whole. The work is still waiting. Try again.";
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }], result: await keptFor(TICKET, refusal) });
+    await mountWith(send);
+    expect(section()!.textContent).toContain(`Waiting for a PDF: ${LABEL}`);
+    expect(live()).toBe(refusal);
+    expect(button("Send this tab's PDF")?.disabled).toBe(false);
+    expect(bg.result).toBeNull();
+  });
+
+  it("the kept result of ANOTHER work while a different work waits: dropped unseen — shown nowhere, removed (R357 a)", async () => {
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: T2, label: "Second work" }], result: await keptFor(TICKET, HELD_SENTENCE) });
+    await mountWith(send);
+    expect(section()!.textContent).toContain("Waiting for a PDF: Second work");
+    expect(host.textContent).not.toContain(HELD_SENTENCE);
+    expect(live()).toBe("");
+    expect(bg.result).toBeNull();
+    await remount(send);
+    expect(host.textContent).not.toContain(HELD_SENTENCE);
+  });
+
+  it("a kept result of the old shape (no hash) is not shown (the background drops it, find.test.ts)", async () => {
+    const { send } = fakeBackground({ waiting: [], result: { sentence: HELD_SENTENCE, at: Date.now() } });
+    await mountWith(send);
+    expect(host.textContent).not.toContain(HELD_SENTENCE);
+    expect(host.textContent).not.toContain("Find and acquire");
+  });
+
+  it("an opening that ends before the list's answer takes nothing: the result is there for the next opening (R357 b)", async () => {
+    const { bg, send } = fakeBackground({ result: await keptFor(TICKET, HELD_SENTENCE) });
+    let release!: () => void;
+    bg.waitingGate = new Promise<void>((r) => (release = r));
+    await mountWith(send);
+    expect(bg.resultTakes).toBe(1);
+    // The popup closes before the list's answer.
+    act(() => root?.unmount());
+    root = undefined;
+    host.replaceChildren();
+    release();
+    bg.waitingGate = undefined;
+    await settle();
+    expect(bg.forgets).toBe(0);
+    expect(bg.result).not.toBeNull();
+    // The next opening shows it.
+    await mountWith(send);
+    expect(live()).toBe(HELD_SENTENCE);
+    expect(bg.result).toBeNull();
+  });
+
+  it("after a press, the focus is on the result's sentence (R357 d)", async () => {
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }] });
+    await mountWith(send);
+    const b = button("Send this tab's PDF")!;
+    b.focus();
+    expect(document.activeElement).toBe(b);
+    await click(b);
+    bg.waiting = [];
+    await act(async () => bg.replies[0]!.resolve({ sentence: HELD_SENTENCE }));
+    await settle();
+    const said = section()!.querySelector(".find-said") as HTMLElement;
+    expect(said.textContent).toBe(HELD_SENTENCE);
+    expect(said.getAttribute("tabindex")).toBe("-1");
+    expect(document.activeElement).toBe(said);
+  });
+
+  it("after a refusal that leaves the work waiting, the focus is on the sentence too; the button is usable again", async () => {
+    const refusal = "The PDF did not arrive whole. The work is still waiting. Try again.";
+    const { bg, send } = fakeBackground({ waiting: [{ ticket: TICKET, label: LABEL }] });
+    await mountWith(send);
+    await click(button("Send this tab's PDF"));
+    await act(async () => bg.replies[0]!.resolve({ sentence: refusal }));
+    await settle();
+    expect(document.activeElement).toBe(section()!.querySelector(".find-said"));
+    expect(button("Send this tab's PDF")?.disabled).toBe(false);
   });
 
   it("opened while a sending runs: its button is busy until it ends, then its result is shown", async () => {
@@ -730,11 +826,12 @@ describe("Find and acquire: a work waiting for a PDF from this browser (R348 i)"
     expect(bg.resultTakes).toBe(0);
     bg.status = null;
     bg.waiting = [];
-    bg.result = { sentence: HELD_SENTENCE, at: Date.now() };
+    bg.result = await keptFor(TICKET, HELD_SENTENCE);
     await act(async () => void (await new Promise((r) => setTimeout(r, 1300))));
     await settle();
     expect(live()).toBe(HELD_SENTENCE);
     expect(section()!.querySelector("button")).toBeNull();
+    expect(bg.result).toBeNull();
   });
 
   it("no active tab known: the button cannot be pressed", async () => {

@@ -3,7 +3,7 @@
   "name": "Alexandrine Oxiana capture",
   "short_name": "AO capture",
   "version": "0.1.0",
-  "description": "Capture the page you are viewing into your Alexandrine Oxiana library, and send a PDF tab to the app's review queue for your check.",
+  "description": "Capture the page you are viewing, or send a PDF tab the app is waiting for, to Alexandrine Oxiana on this computer.",
   "minimum_chrome_version": "121",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
