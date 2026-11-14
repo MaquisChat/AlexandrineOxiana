@@ -18,7 +18,8 @@
  * serde_json makes), so a duplicated key, extra spaces, a leading byte-order mark or an unusual
  * escape is not a grant. The one tolerance is upstream: the line reader (startup-token.ts
  * `InputLines`) removes one `\r` before the line end, so `<grant>\r\n` is a grant. Every
- * other line is discarded, never interpreted (R98, R155, as changed by R207 for this one shape).
+ * other line is discarded, never interpreted (R98, R155, as changed by R207 for this one shape and by
+ * ruling 1 of Find and acquire for one more: the file grant, file-grants.ts `parseFileGrantLine`, Task F17).
  */
 import { isAbsolute } from "node:path";
 

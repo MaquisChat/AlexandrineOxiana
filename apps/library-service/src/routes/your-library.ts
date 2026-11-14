@@ -45,6 +45,7 @@ import {
   yourLibraryNameOk,
   type DeriveRefusal,
   type FindRunner,
+  type HandedFile,
   type LibraryAccess as LibraryAccessHere,
   type YourLibrary as YourLibraryHere,
 } from "@ao/library";
@@ -66,7 +67,8 @@ import {
   type YourLibraryResponse,
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
-import type { Session } from "../state.js";
+import type { ServiceState, Session } from "../state.js";
+import { discardInboxFile, inboxOf, takeInboxFile, type FileGrant } from "../file-grants.js";
 import { entryView, libraryPartsOf } from "./find.js";
 import { paramsOf, type Ctx, type Obj, type Same } from "./util.js";
 
@@ -212,4 +214,32 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
     const parts = await libraryPartsOf(state.deps.appConfigDir, s, projectId, q ? q.entries.values() : [back]);
     return entryView(back, undefined, parts.get(back.id));
   });
+}
+
+/**
+ * Task F17 (R329): what the service does with a file grant from the shell (main.ts hands every one to this, at once).
+ * The ticket ends FIRST (the runner's seam, before anything of the file is looked at): the pause starts whatever
+ * becomes of the file. No open ticket — a wrong, used or expired one, a closed library, a locked project (its lock
+ * ended the ticket) — and the file is deleted if it is inside the inbox, and nothing else happens. Otherwise the runner
+ * takes it through the inbox's checks (file-grants.ts) and holds it for the researcher's check, with the starting
+ * address it kept with the ticket. Nothing of the line, the path or the address is logged, answered or thrown.
+ */
+export function libraryFileHandler(state: ServiceState): (g: FileGrant) => Promise<void> {
+  return async (g) => {
+    const inbox = inboxOf(state.deps.appConfigDir);
+    const runner = state.session?.find;
+    const t = runner ? runner.libraryHandedOver(g.ticket) : null;
+    if (!runner || !t) {
+      await discardInboxFile(inbox, g.path);
+      return;
+    }
+    const file: HandedFile = {
+      take: async (path, to, maxBytes) => {
+        const r = await takeInboxFile(inbox, { id: g.id, path }, to, { maxBytes });
+        return r.ok ? r : { ok: false, why: r.why === "too-large" ? "too-large" : "unreadable" };
+      },
+      discard: (path) => discardInboxFile(inbox, path),
+    };
+    await runner.acceptLibraryFile(t.projectId, t.entryId, g.path, "sign-in-window", runner.libraryAddressOf(t.projectId, t.entryId) ?? "", file);
+  };
 }

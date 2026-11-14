@@ -13,6 +13,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LIBRARY_FILE_MAX_BYTES } from "@ao/shared";
 import { FolderGrants } from "./folder-grants.js";
+import { libraryFileHandler } from "./routes/your-library.js";
+import type { ServiceState } from "./state.js";
 import { LIBRARY_INBOX, discardInboxFile, inboxOf, inputLineHandler, parseFileGrantLine, takeInboxFile, type InboxFs } from "./file-grants.js";
 
 const ID = "0123456789abcdef0123456789abcdef";
@@ -362,6 +364,22 @@ describe("takeInboxFile: the path's checks", () => {
     expect(await takeInboxFile(inbox, { id: ID, path: f }, to)).toEqual({ ok: false, why: "unreadable" });
     expect(await readFile(to, "utf8")).toBe("theirs");
     expect(await there(f)).toBe(false);
+  });
+
+  it("a grant without an open ticket deletes its file (inside the inbox only), and nothing else happens", async () => {
+    const f = await put(inInbox());
+    const kept = await put(join(outside, `${ID}.pdf`));
+    let accepted = 0;
+    const runner = { libraryHandedOver: () => null, acceptLibraryFile: async () => void accepted++ };
+    for (const session of [undefined, { find: undefined }, { find: runner }]) {
+      const state = { deps: { appConfigDir: config }, session } as unknown as ServiceState;
+      await put(f);
+      await libraryFileHandler(state)({ id: ID, ticket: TICKET, path: f });
+      expect(await there(f)).toBe(false);
+      await libraryFileHandler(state)({ id: ID, ticket: TICKET, path: kept });
+      expect(await readFile(kept)).toEqual(PDF);
+    }
+    expect(accepted).toBe(0);
   });
 
   it("no such file: refused as unreadable; nothing else touched", async () => {
