@@ -56,13 +56,19 @@ import {
   rebuildIndexIfNeeded,
   rememberLastOpenLibrary,
   type RebuildResult,
+  createFindRunner,
+  DEFAULT_SEARCH_SETTINGS,
+  type FindRunner,
+  type IndexDb,
 } from "@ao/library";
-import type { CaptureQueueProgressEvent, CaptureStartedBy, DeviceNotice } from "@ao/shared";
+import type { CaptureQueueProgressEvent, CaptureStartedBy, DeviceNotice, FindProgressEvent } from "@ao/shared";
 import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
+import { ZoteroSyncHolder } from "./routes/zotero-sync.js";
+import { readFindScreen } from "./find-screen.js";
 import { Transcriptions } from "./transcriptions.js";
 
 /** A running media worker, shared by every library the service opens. */
@@ -133,6 +139,10 @@ export interface Session {
    * Rm4): e.g. this computer's watched folders could not be read at open, so none run now.
    */
   sessionWarnings?: Array<{ kind: string; detail: string }>;
+  /** Find and acquire's runner (Task F5): one per open read-write library, made at `activate`; see "Find and acquire" below. */
+  find?: FindRunner;
+  /** The index errors already seen when the index was last known good (Task F5): a new one means it cannot be trusted. */
+  findIndexErrors?: number;
 }
 
 /**
@@ -224,6 +234,8 @@ export class ServiceState {
   readonly media = new MediaTickets(() => this.opts.now().getTime());
   /** Transcriptions as jobs (Task 62): live state over the projects' job journals. */
   readonly transcriptions = new Transcriptions(this);
+  /** Zotero account sync (Task Z8): the one run in progress, its abort and the back-off; stopped (with its record) before batches are suspended at a close or move. */
+  readonly zoteroSync = new ZoteroSyncHolder();
   private worker: ServiceWorker | undefined;
   private workerStarting: Promise<ServiceWorker> | undefined;
   private readonly tasks = new Set<Promise<unknown>>();
@@ -667,6 +679,7 @@ export class ServiceState {
           s.indexStatus = undefined;
           if (r?.errors.length) this.opts.log.warn({ errors: r.errors.length }, "index rebuild: some folders could not be read");
           if (wasShown || r) this.publishState();
+          s.findIndexErrors = this.findIndexErrorCount(s);
         }
         return r;
       } catch (err) {
@@ -833,6 +846,8 @@ export class ServiceState {
         await this.runScheduledBackups();
       });
     }
+    s.http.setDiskCache(true); // in use again (after a move that was not made)
+    this.startFind(s);
     if (this.worker) this.attachWorker(s, this.worker);
     else if (this.opts.autoStartWorker && this.opts.worker) this.track(this.ensureWorker(), "starting the media helper");
     this.startBackupScheduler();
@@ -949,6 +964,7 @@ export class ServiceState {
     this.media.revokeAll();
     // An index rebuild stops between sources (the library at its new place checks its index again).
     await this.stopIndexRebuild(s);
+    await this.zoteroSync.stop("library-closed");
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
     if (!(await this.drainWork(ms))) {
@@ -979,6 +995,10 @@ export class ServiceState {
       await this.stopWatches(s);
       await disposeProxyQueue(s.repo);
       await disposeOcrQueue(s.repo);
+      // Last, so that a rollback above leaves the queue running (R247 M6); `stopAll` always settles, never throws.
+      await this.endFind(s);
+      // Nothing is written into the folder being copied, the lookup cache included (R247 c).
+      s.http.setDiskCache(false);
     } catch (err) {
       this.activate(s);
       this.resumeBatches(paused);
@@ -1003,11 +1023,16 @@ export class ServiceState {
       if (!s.repo.listProjects().some((p) => p.id === b.projectId)) continue;
       this.startWork("resume-import", async () => {
         // A Zotero Web batch finishes as every Web resume does: it records the library version (Z2, A5).
-        const kind = (await bulk.listBatches(b.projectId)).find((x) => x.batchId === b.batchId)?.kind;
-        const h =
-          kind === "zotero-web"
-            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index, proxies: proxyQueueFor(s.repo) }, b.projectId, b.batchId)
-            : await bulk.resumeBatch(b.projectId, b.batchId);
+        const listed = (await bulk.listBatches(b.projectId)).find((x) => x.batchId === b.batchId);
+        const kind = listed?.kind;
+        // R252: its Zotero library claimed in this same step; taken (or the batch is a sync's own), it stays paused.
+        const release = listed?.ref ? (listed.origin === "zotero-sync" ? undefined : this.zoteroSync.claim(listed.ref, s)) : () => {};
+        if (!release) return;
+        const h = await (kind === "zotero-web"
+          ? resumeZoteroWebImport({ repo: s.repo, http: s.http, index, proxies: proxyQueueFor(s.repo) }, b.projectId, b.batchId)
+          : bulk.resumeBatch(b.projectId, b.batchId)
+        ).catch((err: unknown) => (release(), Promise.reject(err)));
+        void h.done.then(release, release);
         this.followBatch(s, b.projectId, h);
       });
     }
@@ -1042,6 +1067,10 @@ export class ServiceState {
     this.session = undefined;
     // An encrypted project's capture queues go with its key (R30, R50); a plain project's stay readable.
     for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.endCaptures(p.id, "close");
+    // Find and acquire stops for good, awaited (bounded): its own work and the researcher's acts already in their store
+    // turn end first, and any act still waiting for its turn is refused by the runner (R245). So none of its writes
+    // lands after the lock is released.
+    await this.endFind(s);
     this.stopBackupScheduler();
     // N-5: the rerun of interrupted jobs starts no further job, and a transcription is asked to stop
     // too; what is still running when the grace period ends is abandoned below.
@@ -1050,6 +1079,8 @@ export class ServiceState {
     // A live transcription is resumable: abandoned at once rather than after the grace period (M7).
     for (const w of stoppable) if (w.kind === "transcription") w.ctl.interrupt?.();
     await this.stopIndexRebuild(s);
+    // A Zotero sync stops first, with its record, its batch suspended (Task Z8): nothing of it is written after the lock goes.
+    await this.zoteroSync.stop(this.shuttingDown ? "app-closed" : "library-closed");
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).
     const { stuck } = await this.suspendBatches(s).catch(() => ({ paused: [], stuck: [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b })) }));
@@ -1079,9 +1110,101 @@ export class ServiceState {
       // already closed
     }
     s.http.purgeSensitive();
+    // No late lookup answer writes into this library once its lock is released (R247 c).
+    s.http.setDiskCache(false);
     s.ring.clear();
     await s.lib.close().catch(() => {});
     this.publishState();
+  }
+
+  // ---- Find and acquire (Task F5; R237, A3) ---------------------------------------------
+  //
+  // One runner per open read-write library, made at `activate`. `resume(projectId)` for each unlocked project at open
+  // and at unlock, whatever the index's state (R247 a): while the index is not ready the runner itself starts no entry
+  // and makes no record, and goes on by itself once it is; `stop(projectId)` at an encrypted project's lock, before
+  // its key is dropped (routes/projects.ts);
+  // `stopAll()` awaited (it is bounded) at close, at a library switch (both `closeLibrary`), before a move and at
+  // quiesce (R106, `quiesce`), so that no write of the runner lands after the library's lock is released.
+
+  /** "Check everything I have", as remembered on this computer (`find-screen.json`): read at open, set by PUT /find/screen. */
+  findCheckEverything = false;
+
+  private findIndexErrorCount(s: Session): number {
+    // A compaction's note is not an index error (the queue store leaves its notes there too).
+    return s.repo.indexErrors.filter((e) => e.op !== "project.find.compact").length;
+  }
+
+  /**
+   * Whether the index can be trusted for Find and acquire's duplicate check: open, its check after the open has run,
+   * no rebuild running or failed, and no change that could not be indexed since it was last known good.
+   */
+  findIndexReady(s: Session): boolean {
+    return this.findIndexState(s) === "ready";
+  }
+
+  /**
+   * The index as Find and acquire sees it (R247 b): "rebuilding" while a rebuild (or the check after an open) really
+   * runs; "needs-rebuild" when it cannot be trusted and nothing runs: a change could not be indexed since it was last
+   * known good, or a rebuild failed. The index errors carry no project (`repo.indexErrors` holds an operation and an
+   * error only), so they are counted for the whole library.
+   */
+  findIndexState(s: Session): "ready" | "rebuilding" | "needs-rebuild" {
+    if (this.session !== s || !s.index || !s.index.isOpen) return "needs-rebuild";
+    if (s.stampHold.on || s.indexRebuild || s.indexStatus?.state === "rebuilding") return "rebuilding";
+    if (s.indexStatus !== undefined || this.findIndexErrorCount(s) > (s.findIndexErrors ?? 0)) return "needs-rebuild";
+    return "ready";
+  }
+
+  /** Makes the open library's runner (once) and resumes what may run now. */
+  private startFind(s: Session): void {
+    if (s.lib.mode !== "read-write" || !s.index || s.find) return;
+    void readFindScreen(this.deps.appConfigDir).then((v) => {
+      if (this.session === s) this.findCheckEverything = v.checkEverything;
+    });
+    const handle = s.index;
+    // Always the index's live connection: a rebuild swaps it.
+    const index = new Proxy({} as IndexDb, {
+      get: (_t, k) => {
+        const db = handle.db;
+        const v: unknown = Reflect.get(db, k, db);
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(db) : v;
+      },
+    });
+    s.findIndexErrors = this.findIndexErrorCount(s);
+    s.find = createFindRunner({
+      repo: s.repo,
+      index,
+      http: s.http,
+      // Task F12's "Search sources" settings do not exist yet: until then, its defaults (every service on but Elicit).
+      settings: async () => DEFAULT_SEARCH_SETTINGS,
+      checkEverything: () => this.findCheckEverything,
+      onChange: (e) => {
+        if (this.session === s) this.events.publish("find.progress", { projectId: e.projectId, entryId: e.entryId, state: e.state } satisfies FindProgressEvent);
+      },
+      indexReady: () => this.findIndexReady(s),
+      // Error kinds only (never what was typed, never an error's text: the runner's promise).
+      debug: (note) => this.opts.log.info({ note }, "find and acquire"),
+    });
+    this.resumeFind(s);
+  }
+
+  /** Resumes the queue of every unlocked project (or of `projectId`), whatever the index's state (R247 a). */
+  resumeFind(s: Session, projectId?: string): void {
+    const r = s.find;
+    if (!r || this.moving) return;
+    for (const p of s.repo.listProjects()) if ((projectId === undefined || p.id === projectId) && s.repo.isUnlocked(p.id)) r.resume(p.id);
+  }
+
+  /** At an encrypted project's lock, before its key is dropped: nothing more is written for it until `resumeFind`. */
+  stopFind(s: Session, projectId: string): void {
+    s.find?.stop(projectId);
+  }
+
+  /** Stops the runner for good and waits for it (bounded: FIND_STOP_SETTLE_MS); `activate` makes a new one. */
+  private async endFind(s: Session): Promise<void> {
+    const r = s.find;
+    s.find = undefined;
+    await r?.stopAll();
   }
 
   // ---- the media worker --------------------------------------------------------------
