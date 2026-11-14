@@ -38,7 +38,8 @@
  *
  * **Waits (R173).** Every wait is for something the SCREEN shows (a state in words, a card, a label, a count) with a
  * generous limit, except scenario 6's timed presses (a rhythm is what it proves: `waitForTimeout(700)` between presses
- * at one spot). What the service holds (a source's files, the queue) and what is on disk is read only AFTER the screen
+ * at one spot) and, only after a card has SAID a press was not taken because the list had just changed, a 700 ms wait
+ * before pressing again (the product's 600 ms quiet, which the screen does not show ending: `decide`). What the service holds (a source's files, the queue) and what is on disk is read only AFTER the screen
  * has shown the state it follows.
  *
  * **Pressing a found file's control by mouse (R322, R323).** The screen takes a mouse press only where the pointer
@@ -152,7 +153,6 @@ const WORDS = {
   /** SearchSources */
   copiesGroup: "Finding a free copy",
   copyServices: ["OpenAlex", "Unpaywall", "arXiv", "Europe PMC", "Semantic Scholar", "Directory of Open Access Books", "Internet Archive"],
-  saved: "Saved.",
 };
 
 /** A row control's accessible name: "<Act>: “<typed, cut at 80 characters + …>”" (FindEntryRow.tsx shortTyped). */
