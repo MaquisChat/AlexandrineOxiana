@@ -72,7 +72,7 @@ import {
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { FIND_LIBRARY_TEXT, FIND_LINK_TEXT, LIBRARY_FILE_MAX_BYTES, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn, type FindLibraryFileOutcome, type FindWindowStart } from "@ao/shared";
+import { FIND_BROWSER_PAGE_MAX, FIND_LIBRARY_TEXT, FIND_LINK_TEXT, LIBRARY_FILE_MAX_BYTES, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn, type FindLibraryFileOutcome, type FindWaitingIn, type FindWindowStart } from "@ao/shared";
 import { idsOf, libraryAddressFor, whereToGetIt, WHERE_URL_MAX, type LibraryAccess } from "./where.js";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
@@ -101,8 +101,18 @@ import {
   type SearchSettings,
 } from "./types.js";
 
-/** F17 (R329 g): what became of the last file of an entry that could not be held; F18c (R345 e): and how the window was opened for it. */
-type LastFile = { outcome: FindLibraryFileOutcome; start: FindWindowStart };
+/**
+ * F17 (R329 g): what became of the last file of an entry that could not be held; F18c (R345 e): and how the window was
+ * opened for it; F20a (R348 e): and where the work waited for it (the window or the researcher's browser).
+ */
+type LastFile = { outcome: FindLibraryFileOutcome; start: FindWindowStart; where: FindWaitingIn };
+
+/**
+ * F20a (R348 f vi): how the path of a handed-over file ended, as `acceptLibraryFile` resolves — "held" (it waits for the
+ * researcher's check), "not-kept" (destroyed; the entry is back at rest and its view says `why`), or "gone" (the entry or
+ * its record removed, the project locked or the library closed, the record already has a file: nothing said on a row).
+ */
+export type FindHandOverEnd = { outcome: "held" } | { outcome: "not-kept"; why: FindLibraryFileOutcome } | { outcome: "gone" };
 
 /** At most this many entries are worked on at once, for the whole open library. */
 export const FIND_CONCURRENCY = 2;
@@ -339,8 +349,8 @@ export type FindLibraryChanceOf = {
    */
   link?: true;
   lastFile?: FindLibraryFileOutcome;
-  /** F18c (R345 e): with `lastFile`, the file was fetched at one of the entry's links. */
-  lastFileFrom?: "link";
+  /** F18c (R345 e): with `lastFile`, the file was fetched at one of the entry's links; F20a (R348 e): or sent from the browser. */
+  lastFileFrom?: "link" | "browser";
 };
 
 /**
@@ -674,6 +684,28 @@ export interface FindRunner {
    */
   libraryStart(projectId: string, entryId: string, access: LibraryAccess | null): Promise<{ url: string; ticket: string; entry: FindEntry }>;
   /**
+   * Task F20a (R348 b): the researcher's press "Get through my library in my own browser" — the third entry point into
+   * the same start as `libraryStart`, with everything of it (the conditions, the one ticket for every kind, the pause,
+   * the limit of waiting files, "waiting-sign-in" with `returnTo`, the ways back, the governed change and its audit with
+   * `library_access`). The only difference: the ticket is kept as the browser's (`waitingIn` "browser"), so that only
+   * the extension's route can hand a file over for it (`libraryHandedOver(ticket, "browser")`), and the record's title
+   * as the start read it is kept with it, for the extension's list (`browserWaiting`). Returns what `libraryStart` does;
+   * the service gives the page the address only.
+   */
+  browserStart(projectId: string, entryId: string, access: LibraryAccess | null): Promise<{ url: string; ticket: string; entry: FindEntry }>;
+  /** Task F20a (R348 e): where the work of an entry whose ticket is open or whose file is being taken waits; null for any other entry. In memory only. */
+  waitingIn(projectId: string, entryId: string): FindWaitingIn | null;
+  /**
+   * Task F20a (R348 f 1): the open ticket when it is the browser's and before its end — with its project, entry and the
+   * record's title as the start read it — else null. Nothing is ended or changed.
+   */
+  browserWaiting(): { ticket: string; projectId: string; entryId: string; title: string } | null;
+  /**
+   * Task F20a (R348 f 2 i): whether `ticket` is the open browser's ticket before its end (32 lower-case hex, compared in
+   * constant time). Nothing is ended or changed: the seam does that, after the file has arrived.
+   */
+  browserTicketWaits(ticket: unknown): boolean;
+  /**
    * Task F18c (R345): the researcher's press "Open it here and fetch the PDF" on one of an entry's links — the second
    * entry point into the same start as `libraryStart` (one ticket for both, the pause, the limit of waiting files, the
    * same "waiting-sign-in", `returnTo` and ways back, the same governed change and audit). What differs: `url` must be
@@ -702,8 +734,10 @@ export interface FindRunner {
    * (LIBRARY_PAUSE_MS from now), returning the project and entry it was for. The entry is left "waiting-sign-in" for F17
    * to write its outcome (R324 h: the file waits for the researcher's check). For anything else — a wrong, used, expired
    * or malformed ticket, or a closed runner — null, the same null whatever the cause (compared in constant time). Synchronous.
+   * F20a (R348 c): `where` is the side handing over — "window" (the shell's line) or "browser" (the extension's route);
+   * a ticket opened for the other side is answered as a wrong ticket and STAYS open, untouched, for its own side.
    */
-  libraryHandedOver(ticket: unknown): { projectId: string; entryId: string } | null;
+  libraryHandedOver(ticket: unknown, where: FindWaitingIn): { projectId: string; entryId: string } | null;
   /**
    * Task F17 (R329 d): the library's starting address this runner built at the entry's start and kept with its ticket
    * (in memory only), without user name, password, query or fragment — for an entry handed over through the seam and
@@ -728,8 +762,14 @@ export interface FindRunner {
    *  - the record gained a file meanwhile: nothing is held, "in-library".
    * Called without a hand-over for the entry, or with an address other than the one kept (`libraryAddressOf`), the
    * file is discarded and nothing is taken. Never rejects; nothing of the path or the address is logged or audited.
+   * F20a (R348 c, f v, g): `via` must be the side the hand-over was for ("sign-in-window" for the window,
+   * "browser-extension" for the browser), else the file is not read ("unreadable"). For the browser `address` is the
+   * TAB's address as the extension's route validated it — https, no user name or password, at most
+   * FIND_BROWSER_PAGE_MAX — and the record keeps it cleaned (`cleanAcquiredAddress`); anything else is "unreadable".
+   * For the window nothing changes (the kept address; any other is "unreadable"). Resolves with how the path ended
+   * (FindHandOverEnd).
    */
-  acceptLibraryFile(projectId: string, entryId: string, path: string, via: "sign-in-window" | "browser-extension", address: string, file: HandedFile): Promise<void>;
+  acceptLibraryFile(projectId: string, entryId: string, path: string, via: "sign-in-window" | "browser-extension", address: string, file: HandedFile): Promise<FindHandOverEnd>;
   /** Task F15: whether the runner is working on the entry, or has it queued or waiting for a retry (no start is offered then). */
   atWork(projectId: string, entryId: string): boolean;
   /**
@@ -950,7 +990,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   let serveSeq = 0;
   const runs = new Map<string, Run>();
   const running = new Set<string>();
-  const inflight = new Set<Promise<void>>();
+  const inflight = new Set<Promise<unknown>>();
   /**
    * What is inside a store turn now: a researcher's act past its check, an add writing its entries, the runner's own
    * work that has started its turn (R247 d). `stopAll` waits for these without a time limit, like every governed write
@@ -2762,9 +2802,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   /**
    * What a ticket keeps besides its entry (F18c, R345 c): how the window was opened (`start`), the method the file it
-   * gives is held and asked for, and the address its record keeps (`cleanAcquiredAddress`).
+   * gives is held and asked for, and the address its record keeps (`cleanAcquiredAddress`). F20a (R348 b): where the
+   * work waits ("window" or "browser": which side may hand its file over) and the record's title as the start read it
+   * (for the extension's list).
    */
-  type Kept = { start: FindWindowStart; method: FindStartMethod; address: string };
+  type Kept = { start: FindWindowStart; method: FindStartMethod; address: string; where: FindWaitingIn; title: string };
   /** The open ticket (at most one). */
   let libTicket: ({ ticket: string; projectId: string; entryId: string; expires: number; timer: unknown } & Kept) | undefined;
   /**
@@ -2805,6 +2847,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       if (last) {
         c.lastFile = last.outcome;
         if (last.start === "link") c.lastFileFrom = "link";
+        else if (last.where === "browser") c.lastFileFrom = "browser";
       }
     }
     // Closed or the project locked while it was read: what was read is not kept.
@@ -2819,10 +2862,14 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return running.has(k) || handed.has(k) || !!r?.pending.includes(entryId) || !!r?.timers.has(entryId);
   }
 
-  /** How a start is made: through the library (its access), or at one of the entry's links (F18c, R345). */
-  type StartHow = { start: "library"; access: LibraryAccess | null } | { start: "link"; url: unknown; settings: { catalogueSearch?: string } | null };
+  /**
+   * How a start is made: through the library (its access) — in the sign-in window, or (F20a, R348) in the researcher's
+   * own browser —, or at one of the entry's links (F18c, R345).
+   */
+  type StartHow = { start: "library"; access: LibraryAccess | null; where: FindWaitingIn } | { start: "link"; url: unknown; settings: { catalogueSearch?: string } | null };
 
-  const libraryStart = (projectId: string, entryId: string, access: LibraryAccess | null) => startWindow(projectId, entryId, { start: "library", access });
+  const libraryStart = (projectId: string, entryId: string, access: LibraryAccess | null) => startWindow(projectId, entryId, { start: "library", access, where: "window" });
+  const browserStart = (projectId: string, entryId: string, access: LibraryAccess | null) => startWindow(projectId, entryId, { start: "library", access, where: "browser" });
   const linkStart = (projectId: string, entryId: string, url: string, settings: { catalogueSearch?: string } | null) => startWindow(projectId, entryId, { start: "link", url, settings });
 
   /**
@@ -2841,9 +2888,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   }
 
   /**
-   * The one start through the sign-in window (F15's `libraryStart`; F18c's `linkStart` is its second entry point). What
-   * differs by `how`: where the address comes from, which method the rules are asked for, and what is kept with the
-   * ticket.
+   * The one start through the sign-in window (F15's `libraryStart`; F18c's `linkStart` is its second entry point; F20a's
+   * `browserStart` its third). What differs by `how`: where the address comes from, which method the rules are asked
+   * for, and what is kept with the ticket (F20a: where the work waits).
    */
   async function startWindow(projectId: string, entryId: string, how: StartHow): Promise<{ url: string; ticket: string; entry: FindEntry }> {
     assertOpen();
@@ -2895,7 +2942,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         // F17 (R329 d): the address a file got this way records — this start's own, without its query (so without
         // the work's DOI) or any user name, password or fragment; in memory only, with the ticket. F18c (R345 c): with
         // the kind of start and the method.
-        libTicket = { ticket, projectId, entryId, expires: now().getTime() + LIBRARY_TICKET_MS, timer, start: how.start, method, address: cleanAcquiredAddress(url) };
+        // F20a (R348 b): where the work waits, and the record's title as read here (the extension's list's label).
+        const where: FindWaitingIn = how.start === "library" ? how.where : "window";
+        libTicket = { ticket, projectId, entryId, expires: now().getTime() + LIBRARY_TICKET_MS, timer, start: how.start, method, address: cleanAcquiredAddress(url), where, title: ch?.work.title ?? "" };
         return { url, ticket, entry: entry! };
       });
     } finally {
@@ -2906,6 +2955,29 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   function windowStartOf(projectId: string, entryId: string): FindWindowStart | null {
     if (libTicket && ticketFor(projectId, entryId)) return libTicket.start;
     return handed.get(keyOfRun(projectId, entryId))?.start ?? null;
+  }
+
+  function waitingIn(projectId: string, entryId: string): FindWaitingIn | null {
+    if (libTicket && ticketFor(projectId, entryId)) return libTicket.where;
+    return handed.get(keyOfRun(projectId, entryId))?.where ?? null;
+  }
+
+  /** The open ticket, if it is `ticket` (32 lower-case hex, compared in constant time), else undefined. Nothing changes. */
+  function openTicketIs(ticket: unknown): typeof libTicket {
+    const t = libTicket;
+    if (closed || !t || typeof ticket !== "string" || !/^[0-9a-f]{32}$/u.test(ticket)) return undefined;
+    return timingSafeEqual(Buffer.from(ticket, "utf8"), Buffer.from(t.ticket, "utf8")) ? t : undefined;
+  }
+
+  function browserTicketWaits(ticket: unknown): boolean {
+    const t = openTicketIs(ticket);
+    return !!t && t.where === "browser" && now().getTime() < t.expires;
+  }
+
+  function browserWaiting(): { ticket: string; projectId: string; entryId: string; title: string } | null {
+    const t = libTicket;
+    if (closed || !t || t.where !== "browser" || now().getTime() >= t.expires || !repo.isUnlocked(t.projectId)) return null;
+    return { ticket: t.ticket, projectId: t.projectId, entryId: t.entryId, title: t.title };
   }
 
   /**
@@ -2947,10 +3019,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     });
   }
 
-  function libraryHandedOver(ticket: unknown): { projectId: string; entryId: string } | null {
-    const t = libTicket;
-    if (closed || !t || typeof ticket !== "string" || !/^[0-9a-f]{32}$/u.test(ticket)) return null;
-    if (!timingSafeEqual(Buffer.from(ticket, "utf8"), Buffer.from(t.ticket, "utf8"))) return null;
+  function libraryHandedOver(ticket: unknown, where: FindWaitingIn): { projectId: string; entryId: string } | null {
+    const t = openTicketIs(ticket);
+    // F20a (R348 c): a ticket serves only where it was opened for; the other side's stays open, untouched.
+    if (!t || t.where !== where) return null;
     const at = now().getTime();
     if (at >= t.expires) {
       void ticketEnded(t.ticket);
@@ -2959,12 +3031,28 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     dropTicket();
     handOver.set(at);
     // F17 (R329 c): from this answer until its outcome is written, the entry is at work.
-    handed.set(keyOfRun(t.projectId, t.entryId), { start: t.start, method: t.method, address: t.address });
+    handed.set(keyOfRun(t.projectId, t.entryId), { start: t.start, method: t.method, address: t.address, where: t.where, title: t.title });
     return { projectId: t.projectId, entryId: t.entryId };
   }
 
   function libraryAddressOf(projectId: string, entryId: string): string | null {
     return handed.get(keyOfRun(projectId, entryId))?.address ?? null;
+  }
+
+  /**
+   * F20a (R348 f ii, g): the tab's address a file from the browser is recorded with — https, no user name or password,
+   * at most FIND_BROWSER_PAGE_MAX as given — cleaned (no query or fragment); null for anything else.
+   */
+  function tabAddress(address: string): string | null {
+    if (typeof address !== "string" || address.length > FIND_BROWSER_PAGE_MAX) return null;
+    let u: URL;
+    try {
+      u = new URL(address);
+    } catch {
+      return null;
+    }
+    if (u.protocol !== "https:" || u.username !== "" || u.password !== "") return null;
+    return cleanAcquiredAddress(u.href) || null;
   }
 
   /** F17 (R329 g): why the rules refused the file at its hold, as the view says it. */
@@ -2973,10 +3061,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return (await refusalOf(pid, err, { identifiable: prov.identifiable, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) })) === NO_LEGAL_BASIS ? "rules-legal-basis" : "rules-store";
   }
 
-  function acceptLibraryFile(projectId: string, entryId: string, path: string, via: "sign-in-window" | "browser-extension", address: string, file: HandedFile): Promise<void> {
+  function acceptLibraryFile(projectId: string, entryId: string, path: string, via: "sign-in-window" | "browser-extension", address: string, file: HandedFile): Promise<FindHandOverEnd> {
     const k = keyOfRun(projectId, entryId);
     const mine = handed.get(k);
-    const drop = () => file.discard(path).catch(() => undefined);
+    const gone: FindHandOverEnd = { outcome: "gone" };
+    const drop = () => file.discard(path).then(() => gone, () => gone);
     if (!mine || mine.taking || closed) {
       // Not handed over through the seam (or already being taken): nothing is read; the file goes. A closed runner
       // clears the mark of the hand-over it will never take (R338 f).
@@ -2985,8 +3074,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     // Taken once: a second call for the same hand-over is refused like one without a hand-over.
     mine.taking = true;
-    const p = takeLibraryFile(projectId, entryId, path, via, address, mine, file, k).catch((err: unknown) => {
+    const p = takeLibraryFile(projectId, entryId, path, via, address, mine, file, k).catch((err: unknown): FindHandOverEnd => {
       debug(`find: a file from the library could not be kept (${errName(err)})`);
+      return gone;
     });
     inflight.add(p);
     void p.finally(() => inflight.delete(p));
@@ -3002,8 +3092,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     mine: Kept,
     file: HandedFile,
     k: string,
-  ): Promise<void> {
-    const kept = mine.address;
+  ): Promise<FindHandOverEnd> {
+    // F20a (R348 g): the address recorded — the window's kept one; the browser's the tab's, as the route validated it.
+    const fromBrowser = mine.where === "browser";
+    let kept = mine.address;
+    let held = false;
+    let back: FindEntry | null = null;
     // At work until the end (R329 c): the entry stays in `handed` (`atWork`, Cancel and a resume see it there).
     let taken = false;
     let written = false;
@@ -3014,87 +3108,93 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // R338 h: the check stops when the project is locked or the library closed, as the copy part's does.
     const r = runOf(projectId);
     // R338 f: every statement after the seam's mark is inside this `try`; the outer `finally` clears the mark and
-    // discards the handed file whatever was thrown.
+    // discards the handed file whatever was thrown. (F20a: its body is one closure, so that its early returns end the
+    // body only, and how the path ended is said after the `finally`.)
     try {
-      folder = join(repoLibrary(repo).root, ".tmp", folderName);
-      release = holdFindTemp(folderName);
-      // The address is the one this runner built at the start, never one the caller was told by anyone else.
-      if (address !== kept) {
-        outcome = "unreadable";
-        return;
-      }
-      // The entry as it is now (the version the outcome is written against) and its record.
-      const first = await act(projectId, () => current(projectId, entryId));
-      if (!first || first.state !== "waiting-sign-in" || !first.sourceId) return;
-      let sf: SourceFile;
-      try {
-        sf = await repo.getSource(projectId, first.sourceId);
-      } catch (err) {
-        if (err instanceof NotFoundError) return; // the record was deleted: nothing is held
-        throw err;
-      }
-      await fsp.mkdir(folder, { recursive: true, mode: 0o700 });
-      const st = await fsp.lstat(folder);
-      if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("not a folder");
-      const into = join(folder, "handed-over");
-      taken = true;
-      const got = await file.take(path, into, LIBRARY_FILE_MAX_BYTES);
-      if (!got.ok) {
-        outcome = got.why;
-        return;
-      }
-      // The type by the complete file's bytes, as for a downloaded copy: a file the shell called a PDF may be refused.
-      const mime = await fileTypeByBytes(into).catch(() => undefined);
-      if (!mime) {
-        outcome = "not-pdf";
-        return;
-      }
-      const kind = mime === "application/pdf" ? "pdf" : "epub";
-      const fromPath = join(folder, `handed-over.${kind}`);
-      await fsp.rename(into, fromPath);
-      const record = { title: primary(sf.source.title) ?? "", creators: sf.source.creators, ...(sf.source.identifiers.doi ? { doi: sf.source.identifiers.doi } : {}), ...(sf.source.container && primary(sf.source.container) ? { container: primary(sf.source.container)! } : {}) };
-      let check: FileCheckResult;
-      try {
-        check = await guard(r, checkFileAgainstRecord(fromPath, record), FIND_CHECK_TIMEOUT_MS);
-      } catch (err) {
-        if (!(err instanceof TimedOut)) throw err;
-        debug("find: the file check did not end in time");
-        check = { match: false, why: "no-text", evidence: { kind, bytes: got.bytes } };
-      }
-      const ev = check.evidence;
-      await act(projectId, async () => {
-        const cur = await current(projectId, entryId);
-        // R329 c: only if the entry is still the one that waited.
-        if (!cur || cur.state !== "waiting-sign-in" || !sameVersion(cur, first)) return;
-        const facts: HeldFileFacts = {
-          ...(check.match ? { why: "looks-right", by: check.by } : { why: check.why }),
-          kind: ev.kind,
-          bytes: ev.bytes,
-          ...(ev.fileDoi ? { fileDoi: ev.fileDoi } : {}),
-          ...(ev.embeddedTitle ? { embeddedTitle: ev.embeddedTitle } : {}),
-          ...(ev.textStart ? { textStart: ev.textStart } : {}),
-          // F18c (R345 c): the method kept with the ticket — `free_copy` for a link's file (no `service`: none is known).
-          acquired: { method: mine.method, via, address: kept, at: stamp(), tool: { name: FIND_TOOL, version: VERSION }, access: "signed-in-session" },
-        };
-        const next = fit(evolve(cur, { state: "needs-check", reason: { code: `file-${facts.why}` } }, ["returnTo", "nextTryAt", "offers"], stamp()));
+      await (async (): Promise<void> => {
+        if (fromBrowser) kept = tabAddress(address) ?? "";
+        folder = join(repoLibrary(repo).root, ".tmp", folderName);
+        release = holdFindTemp(folderName);
+        // The address is the one this runner built at the start, never one the caller was told by anyone else. F20a
+        // (R348 c, g): the side must be the one the hand-over was for; the browser's tab address must be an https one.
+        if (via !== (fromBrowser ? "browser-extension" : "sign-in-window") || (fromBrowser ? kept === "" : address !== kept)) {
+          outcome = "unreadable";
+          return;
+        }
+        // The entry as it is now (the version the outcome is written against) and its record.
+        const first = await act(projectId, () => current(projectId, entryId));
+        if (!first || first.state !== "waiting-sign-in" || !first.sourceId) return;
+        let sf: SourceFile;
         try {
-          await holdMismatchedFileIn(repo, projectId, { entry: next, sourceId: cur.sourceId!, fromPath, facts, handedOver: true });
+          sf = await repo.getSource(projectId, first.sourceId);
         } catch (err) {
-          if (err instanceof HeldFileEntryGoneError || err instanceof NotFoundError) return;
-          if (err instanceof HeldFileSourceHasFileError) {
-            await write(projectId, [evolve(cur, { state: "in-library" }, ["returnTo", "reason", "nextTryAt", "offers"], stamp())], "update");
-            written = true;
-            return;
-          }
-          if (err instanceof PolicyDeniedError) {
-            outcome = await heldRefusal(projectId, err, sf.source.provenance);
-            return;
-          }
+          if (err instanceof NotFoundError) return; // the record was deleted: nothing is held
           throw err;
         }
-        written = true;
-        notify(projectId, entryId, "needs-check");
-      });
+        await fsp.mkdir(folder, { recursive: true, mode: 0o700 });
+        const st = await fsp.lstat(folder);
+        if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("not a folder");
+        const into = join(folder, "handed-over");
+        taken = true;
+        const got = await file.take(path, into, LIBRARY_FILE_MAX_BYTES);
+        if (!got.ok) {
+          outcome = got.why;
+          return;
+        }
+        // The type by the complete file's bytes, as for a downloaded copy: a file the shell called a PDF may be refused.
+        const mime = await fileTypeByBytes(into).catch(() => undefined);
+        if (!mime) {
+          outcome = "not-pdf";
+          return;
+        }
+        const kind = mime === "application/pdf" ? "pdf" : "epub";
+        const fromPath = join(folder, `handed-over.${kind}`);
+        await fsp.rename(into, fromPath);
+        const record = { title: primary(sf.source.title) ?? "", creators: sf.source.creators, ...(sf.source.identifiers.doi ? { doi: sf.source.identifiers.doi } : {}), ...(sf.source.container && primary(sf.source.container) ? { container: primary(sf.source.container)! } : {}) };
+        let check: FileCheckResult;
+        try {
+          check = await guard(r, checkFileAgainstRecord(fromPath, record), FIND_CHECK_TIMEOUT_MS);
+        } catch (err) {
+          if (!(err instanceof TimedOut)) throw err;
+          debug("find: the file check did not end in time");
+          check = { match: false, why: "no-text", evidence: { kind, bytes: got.bytes } };
+        }
+        const ev = check.evidence;
+        await act(projectId, async () => {
+          const cur = await current(projectId, entryId);
+          // R329 c: only if the entry is still the one that waited.
+          if (!cur || cur.state !== "waiting-sign-in" || !sameVersion(cur, first)) return;
+          const facts: HeldFileFacts = {
+            ...(check.match ? { why: "looks-right", by: check.by } : { why: check.why }),
+            kind: ev.kind,
+            bytes: ev.bytes,
+            ...(ev.fileDoi ? { fileDoi: ev.fileDoi } : {}),
+            ...(ev.embeddedTitle ? { embeddedTitle: ev.embeddedTitle } : {}),
+            ...(ev.textStart ? { textStart: ev.textStart } : {}),
+            // F18c (R345 c): the method kept with the ticket — `free_copy` for a link's file (no `service`: none is known).
+            acquired: { method: mine.method, via, address: kept, at: stamp(), tool: { name: FIND_TOOL, version: VERSION }, access: "signed-in-session" },
+          };
+          const next = fit(evolve(cur, { state: "needs-check", reason: { code: `file-${facts.why}` } }, ["returnTo", "nextTryAt", "offers"], stamp()));
+          try {
+            await holdMismatchedFileIn(repo, projectId, { entry: next, sourceId: cur.sourceId!, fromPath, facts, handedOver: true });
+          } catch (err) {
+            if (err instanceof HeldFileEntryGoneError || err instanceof NotFoundError) return;
+            if (err instanceof HeldFileSourceHasFileError) {
+              await write(projectId, [evolve(cur, { state: "in-library" }, ["returnTo", "reason", "nextTryAt", "offers"], stamp())], "update");
+              written = true;
+              return;
+            }
+            if (err instanceof PolicyDeniedError) {
+              outcome = await heldRefusal(projectId, err, sf.source.provenance);
+              return;
+            }
+            throw err;
+          }
+          written = true;
+          held = true;
+          notify(projectId, entryId, "needs-check");
+        });
+      })();
     } catch (err) {
       // R338 g: a file taken and not kept is always said — any failure not foreseen above gives "could not be read"
       // (shown only if the entry is written back: not after a lock or a close, which write nothing).
@@ -3115,10 +3215,15 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // unless the project is stopped or the runner closed (then at the unlock's or the next open's resume, as F15
       // built it).
       if (!written && !closed && !runs.get(projectId)?.stopped) {
-        const back = await bringBack(projectId, entryId, outcome ? { outcome, start: mine.start } : undefined).catch(() => null);
+        back = await bringBack(projectId, entryId, outcome ? { outcome, start: mine.start, where: mine.where } : undefined).catch(() => null);
         if (back && inCopyPart(back)) enqueue(projectId, back.id);
       }
     }
+    // F20a (R348 f vi): how it ended. "not-kept" only when the entry was written back saying why; otherwise (removed,
+    // its record deleted, the record already has a file, a lock or a close) "gone".
+    if (held) return { outcome: "held" };
+    if (outcome && back) return { outcome: "not-kept", why: outcome };
+    return { outcome: "gone" };
   }
 
   return {
@@ -3143,7 +3248,11 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     asAuthor,
     libraryStart,
     linkStart,
+    browserStart,
     windowStartOf,
+    waitingIn,
+    browserWaiting,
+    browserTicketWaits,
     libraryCancel,
     libraryHandedOver,
     atWork,

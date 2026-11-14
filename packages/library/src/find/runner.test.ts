@@ -4795,7 +4795,7 @@ describe("F15: a fetch through the researcher's library", () => {
         const back = await r.libraryCancel(p.id, e.id);
         sameRest(back, rest);
         sameRest(await entryOf(p, e.id), rest);
-        expect(r.libraryHandedOver(ticket)).toBeNull();
+        expect(r.libraryHandedOver(ticket, "window")).toBeNull();
         await r.stopAll();
       }
       // 2. The ticket runs out (30 minutes).
@@ -4809,7 +4809,7 @@ describe("F15: a fetch through the researcher's library", () => {
         timers.advance(1);
         await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
         sameRest(await entryOf(p, e.id), rest);
-        expect(r.libraryHandedOver(ticket)).toBeNull();
+        expect(r.libraryHandedOver(ticket, "window")).toBeNull();
         await r.stopAll();
       }
       // 3. Start-up: a new runner (the ticket was in memory only) returns it at resume.
@@ -4820,7 +4820,7 @@ describe("F15: a fetch through the researcher's library", () => {
         const { ticket } = await r.libraryStart(p.id, e.id, EZ);
         // The process "died": nothing more of this runner (its ticket went with it).
         const r2 = runner();
-        expect(r2.libraryHandedOver(ticket)).toBeNull();
+        expect(r2.libraryHandedOver(ticket, "window")).toBeNull();
         r2.resume(p.id);
         await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
         sameRest(await entryOf(p, e.id), rest);
@@ -4835,7 +4835,7 @@ describe("F15: a fetch through the researcher's library", () => {
         const { ticket } = await r.libraryStart(p.id, e.id, EZ);
         r.stop(p.id);
         repo.lockProject(p.id);
-        expect(r.libraryHandedOver(ticket)).toBeNull();
+        expect(r.libraryHandedOver(ticket, "window")).toBeNull();
         await repo.unlockProject(p.id, "pw");
         r.resume(p.id);
         await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
@@ -4849,7 +4849,7 @@ describe("F15: a fetch through the researcher's library", () => {
         const r = runner();
         const { ticket } = await r.libraryStart(p.id, e.id, EZ);
         await r.stopAll();
-        expect(r.libraryHandedOver(ticket)).toBeNull();
+        expect(r.libraryHandedOver(ticket, "window")).toBeNull();
         const r2 = runner();
         r2.resume(p.id);
         await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
@@ -4878,7 +4878,7 @@ describe("F15: a fetch through the researcher's library", () => {
     r.resume(p.id);
     await new Promise((res) => setTimeout(res, 100));
     expect((await entryOf(p, e.id))!.state).toBe("waiting-sign-in");
-    expect(r.libraryHandedOver(ticket)).toEqual({ projectId: p.id, entryId: e.id });
+    expect(r.libraryHandedOver(ticket, "window")).toEqual({ projectId: p.id, entryId: e.id });
   });
 
   it("R324 c: one ticket at a time for the whole service — two starts at the same moment, in two projects, give exactly one", async () => {
@@ -4904,11 +4904,11 @@ describe("F15: a fetch through the researcher's library", () => {
     const r = runner();
     const { ticket } = await r.libraryStart(p.id, a.id, EZ);
     // A wrong, a used and a malformed ticket are told apart from nothing: null.
-    expect(r.libraryHandedOver("0".repeat(32))).toBeNull();
-    expect(r.libraryHandedOver(ticket.toUpperCase())).toBeNull();
-    expect(r.libraryHandedOver(42)).toBeNull();
-    expect(r.libraryHandedOver(ticket)).toEqual({ projectId: p.id, entryId: a.id });
-    expect(r.libraryHandedOver(ticket)).toBeNull();
+    expect(r.libraryHandedOver("0".repeat(32), "window")).toBeNull();
+    expect(r.libraryHandedOver(ticket.toUpperCase(), "window")).toBeNull();
+    expect(r.libraryHandedOver(42, "window")).toBeNull();
+    expect(r.libraryHandedOver(ticket, "window")).toEqual({ projectId: p.id, entryId: a.id });
+    expect(r.libraryHandedOver(ticket, "window")).toBeNull();
     // The handed-over entry waits for the file's check (F17's): it is not returned by the seam.
     expect((await entryOf(p, a.id))!.state).toBe("waiting-sign-in");
     const first = await refusal(r.libraryStart(p.id, b.id, EZ));
@@ -4934,7 +4934,7 @@ describe("F15: a fetch through the researcher's library", () => {
     const handOver = { get: () => kept, set: (at: number) => void (kept = at) };
     const r1 = runner({ libraryHandOver: handOver });
     const { ticket } = await r1.libraryStart(p.id, a.id, EZ);
-    expect(r1.libraryHandedOver(ticket)).toEqual({ projectId: p.id, entryId: a.id });
+    expect(r1.libraryHandedOver(ticket, "window")).toEqual({ projectId: p.id, entryId: a.id });
     expect(kept).toBe(timers.now);
     await r1.stopAll();
     // The library closed and opened again: a new runner, the same pause.
@@ -5035,7 +5035,7 @@ describe("F15: a fetch through the researcher's library", () => {
     const r = runner();
     const { ticket } = await r.libraryStart(p.id, e.id, EZ);
     timers.now += LIBRARY_TICKET_MS; // the clock has passed the end, whether or not its timer has run yet
-    expect(r.libraryHandedOver(ticket)).toBeNull();
+    expect(r.libraryHandedOver(ticket, "window")).toBeNull();
     await until(async () => (await entryOf(p, e.id))!.state === "no-open-copy", "the entry to come back");
   });
 
@@ -5063,7 +5063,7 @@ describe("F15: a fetch through the researcher's library", () => {
     const r = runner();
     const { ticket } = await r.libraryStart(p.id, e.id, EZ);
     await r.remove(p.id, e.id);
-    expect(r.libraryHandedOver(ticket)).toBeNull();
+    expect(r.libraryHandedOver(ticket, "window")).toBeNull();
     const other = await resting(p, RESTING[0]!);
     await expect(appendFindEntries(coreOf(), p.id, [{ ...other, state: "no-open-copy" }], "library-start")).rejects.toBeInstanceOf(InvalidInputError);
   });
@@ -5112,7 +5112,7 @@ describe("F15: a fetch through the researcher's library", () => {
       const e = await resting(p, o.rest ?? RESTING[0]!);
       const r = runner();
       const { ticket } = await r.libraryStart(p.id, e.id, EZ);
-      const t = r.libraryHandedOver(ticket);
+      const t = r.libraryHandedOver(ticket, "window");
       expect(t).toEqual({ projectId: p.id, entryId: e.id });
       return { p, e, r, ticket };
     }
@@ -5532,7 +5532,7 @@ describe("F15: a fetch through the researcher's library", () => {
         const e = await restingWithLink(p);
         const r = runner();
         const got = await r.linkStart(p.id, e.id, REPO_LINK, null);
-        expect(r.libraryHandedOver(got.ticket)).toEqual({ projectId: p.id, entryId: e.id });
+        expect(r.libraryHandedOver(got.ticket, "window")).toEqual({ projectId: p.id, entryId: e.id });
         return { p, e, r, got };
       }
 
@@ -5685,7 +5685,7 @@ describe("F15: a fetch through the researcher's library", () => {
         expect([busy.code, busy.message]).toEqual(["busy", FIND_LIBRARY_TEXT.busy]);
         const open = (both.find((x) => x.status === "fulfilled") as PromiseFulfilledResult<{ ticket: string }>).value;
         // The hand-over starts the pause for both kinds.
-        expect(r.libraryHandedOver(open.ticket)).not.toBeNull();
+        expect(r.libraryHandedOver(open.ticket, "window")).not.toBeNull();
         const c = await restingWithLink(p, RESTING[0]!, await record(p, { doi: "10.5555/ao.f18c.c" }));
         const paused = await refusal(r.linkStart(p.id, c.id, REPO_LINK, null));
         expect([paused.code, paused.message]).toEqual(["pause", libraryReadyIn(20)]);
@@ -5711,11 +5711,11 @@ describe("F15: a fetch through the researcher's library", () => {
         timers.advance(LIBRARY_TICKET_MS);
         await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
         sameRest(await entryOf(p, e.id), RESTING[2]!);
-        expect(r.libraryHandedOver(ticket)).toBeNull();
+        expect(r.libraryHandedOver(ticket, "window")).toBeNull();
         expect(r.windowStartOf(p.id, e.id)).toBeNull();
         const second = await r.linkStart(p.id, e.id, REPO_LINK, null);
         r.stop(p.id);
-        expect(r.libraryHandedOver(second.ticket)).toBeNull();
+        expect(r.libraryHandedOver(second.ticket, "window")).toBeNull();
         r.resume(p.id);
         await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back at the resume");
         sameRest(await entryOf(p, e.id), RESTING[2]!);
@@ -5767,7 +5767,7 @@ describe("F15: a fetch through the researcher's library", () => {
         const q = await project();
         const f = await restingWithLink(q);
         const got = await h.r.linkStart(q.id, f.id, REPO_LINK, null);
-        expect(h.r.libraryHandedOver(got.ticket)).not.toBeNull();
+        expect(h.r.libraryHandedOver(got.ticket, "window")).not.toBeNull();
         await h.r.acceptLibraryFile(q.id, f.id, INBOX_PATH, "sign-in-window", REPO_KEPT, handedFile(Buffer.from("<html>sign in</html>")).file);
         sameRest(await entryOf(q, f.id), RESTING[0]!);
         const fv = (await h.r.libraryChances(q.id, (await queue(q)).values(), null)).get(f.id)!;
@@ -5782,6 +5782,264 @@ describe("F15: a fetch through the researcher's library", () => {
         expect(await reviewsOf(p)).toEqual([]);
         const seen = [await auditText(p), notes.join("\n"), JSON.stringify(changes)].join("\n");
         for (const s of ["repository.zorblatt-f18c", "isAllowed", got.ticket]) expect(seen).not.toContain(s);
+      });
+    });
+
+    describe("F20a (R348): the library's start in the researcher's own browser", () => {
+      /** The tab's address as the extension gives it: a query and a fragment the record must not keep. */
+      const TAB = "https://pdfs.publisher-f20a.example.com/content/zorblatt.pdf?token=s3cr3t-f20a#page=3";
+      const TAB_KEPT = "https://pdfs.publisher-f20a.example.com/content/zorblatt.pdf";
+      /** A resting entry started in the browser and handed over through the seam as the browser's. */
+      async function browserHandedOver(o: { gov?: string; rest?: Rest } = {}) {
+        const p = await project({ gov: o.gov ?? NO_FREE });
+        const e = await resting(p, o.rest ?? RESTING[0]!);
+        const r = runner();
+        const got = await r.browserStart(p.id, e.id, EZ);
+        expect(r.libraryHandedOver(got.ticket, "browser")).toEqual({ projectId: p.id, entryId: e.id });
+        return { p, e, r, got };
+      }
+
+      it("R348 b: a third entry point into the one start — the same waiting state, returnTo, governed change and audit; the library's address and a ticket kept as the browser's", async () => {
+        const p = await project();
+        const e = await resting(p, RESTING[3]!);
+        const r = runner();
+        const n = changes.length;
+        const got = await r.browserStart(p.id, e.id, EZ);
+        expect(got.url).toBe(`${EZ.base}https://doi.org/${DOI}`);
+        expect(got.ticket).toMatch(/^[0-9a-f]{32}$/u);
+        const w = (await entryOf(p, e.id))!;
+        expect(w.state).toBe("waiting-sign-in");
+        expect(w.reason).toBeUndefined();
+        expect(w.returnTo).toEqual({ state: "record-complete", reason: { code: "copy-not-allowed", by: "rules" } });
+        expect(got.entry).toEqual(w);
+        expect(changes.slice(n)).toEqual([{ projectId: p.id, entryId: e.id, state: "waiting-sign-in" }]);
+        // Where it waits (memory only): the browser. A browser start is a library start: windowStartOf says "library".
+        expect(r.waitingIn(p.id, e.id)).toBe("browser");
+        expect(r.windowStartOf(p.id, e.id)).toBe("library");
+        expect(r.browserTicketWaits(got.ticket)).toBe(true);
+        expect(r.browserWaiting()).toEqual({ ticket: got.ticket, projectId: p.id, entryId: e.id, title: ZORBLATT.title });
+        const audit = await auditText(p);
+        expect(audit).toContain('"op":"project.find.library-start"');
+        expect(audit).toContain('"method":"library_access"');
+        for (const secret of [got.ticket, "ezproxy", "lib-f15", DOI, "browser"]) expect(audit).not.toContain(secret);
+        const qfile = await readFile(join(lib.root, p.folder, "find", "queue.jsonl"), "utf8");
+        for (const secret of [got.ticket, "ezproxy", "browser"]) expect(qfile).not.toContain(secret);
+        for (const secret of [got.ticket, "lib-f15", DOI]) expect(notes.join("\n")).not.toContain(secret);
+        // A window's start says "window", and the browser's list is then empty.
+        await r.libraryCancel(p.id, e.id);
+        expect([r.waitingIn(p.id, e.id), r.browserWaiting(), r.browserTicketWaits(got.ticket)]).toEqual([null, null, false]);
+        const win = await r.libraryStart(p.id, e.id, EZ);
+        expect(r.waitingIn(p.id, e.id)).toBe("window");
+        expect(r.browserWaiting()).toBeNull();
+        expect(r.browserTicketWaits(win.ticket)).toBe(false);
+        expect(r.waitingIn(p.id, newId())).toBeNull();
+      });
+
+      it("R348 b: refused exactly as the library's start — one ticket for every kind, the pause, the limit, not offered, no library, an unknown entry", async () => {
+        const p = await project({ gov: NO_FREE });
+        const a = await resting(p, RESTING[0]!);
+        const b = await resting(p, RESTING[0]!, await record(p, { doi: "10.5555/ao.f20a.b" }));
+        const r = runner();
+        // Two presses at once, a browser's and a window's: one ticket, one "busy".
+        const both = await Promise.allSettled([r.browserStart(p.id, a.id, EZ), r.libraryStart(p.id, b.id, EZ)]);
+        expect(both.map((x) => x.status).sort()).toEqual(["fulfilled", "rejected"]);
+        expect(((both.find((x) => x.status === "rejected") as PromiseRejectedResult).reason as FindLibraryRefusedError).code).toBe("busy");
+        const browserFirst = both[0]!.status === "fulfilled";
+        const busy = await refusal(browserFirst ? r.libraryStart(p.id, b.id, EZ) : r.browserStart(p.id, a.id, EZ));
+        expect([busy.code, busy.message]).toEqual(["busy", FIND_LIBRARY_TEXT.busy]);
+        expect(busy.message).toBe("Another work is waiting for its file, in the sign-in window or in your browser. Finish or cancel it first.");
+        const open = (both.find((x) => x.status === "fulfilled") as PromiseFulfilledResult<{ ticket: string }>).value;
+        // The hand-over (of either kind, at its own side) starts the pause for every kind.
+        expect(r.libraryHandedOver(open.ticket, browserFirst ? "browser" : "window")).not.toBeNull();
+        const c = await resting(p, RESTING[0]!, await record(p, { doi: "10.5555/ao.f20a.c" }));
+        const paused = await refusal(r.browserStart(p.id, c.id, EZ));
+        expect([paused.code, paused.message]).toEqual(["pause", libraryReadyIn(20)]);
+        timers.now += LIBRARY_PAUSE_MS;
+        await expect(r.browserStart(p.id, newId(), EZ)).rejects.toBeInstanceOf(NotFoundError);
+        expect((await refusal(r.browserStart(p.id, c.id, null))).code).toBe("no-library");
+        const bare = await resting(p, RESTING[0]!, await record(p, { doi: null }));
+        expect((await refusal(r.browserStart(p.id, bare.id, EZ))).code).toBe("not-offered");
+        const q = await project();
+        const f = await resting(q, RESTING[0]!);
+        await fillHeld(q, FIND_HELD_MAX);
+        const full = await refusal(r.browserStart(q.id, f.id, EZ));
+        expect([full.code, full.message]).toEqual(["held-full", FIND_LIBRARY_TEXT.heldFull]);
+        for (const x of [c, bare]) expect((await entryOf(p, x.id))!.state).toBe("no-open-copy");
+        expect((await entryOf(q, f.id))!.state).toBe("no-open-copy");
+      });
+
+      it("R348 c: a ticket serves only where it was opened for — the other side's is answered as a wrong ticket and STAYS open for its own side", async () => {
+        const p = await project({ gov: NO_FREE });
+        const e = await resting(p, RESTING[0]!);
+        const r = runner();
+        const got = await r.browserStart(p.id, e.id, EZ);
+        // The shell's line with a browser's ticket: null, nothing ended, no pause, the entry not at work.
+        expect(r.libraryHandedOver(got.ticket, "window")).toBeNull();
+        expect(r.libraryHandedOver(got.ticket, "elsewhere" as never)).toBeNull();
+        expect([r.browserTicketWaits(got.ticket), r.waitingIn(p.id, e.id), r.atWork(p.id, e.id)]).toEqual([true, "browser", false]);
+        expect(r.libraryAddressOf(p.id, e.id)).toBeNull();
+        // Its own side then takes it.
+        expect(r.libraryHandedOver(got.ticket, "browser")).toEqual({ projectId: p.id, entryId: e.id });
+        expect(r.browserTicketWaits(got.ticket)).toBe(false);
+        expect(r.libraryHandedOver(got.ticket, "browser")).toBeNull();
+        await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, handedFile(await goodPdf()).file);
+        // The other way round: a window's ticket given to the extension's side.
+        timers.now += LIBRARY_PAUSE_MS;
+        const f = await resting(p, RESTING[0]!, await record(p, { doi: "10.5555/ao.f20a.w" }));
+        const win = await r.libraryStart(p.id, f.id, EZ);
+        expect(r.browserTicketWaits(win.ticket)).toBe(false);
+        expect(r.libraryHandedOver(win.ticket, "browser")).toBeNull();
+        expect(r.waitingIn(p.id, f.id)).toBe("window");
+        expect(r.libraryHandedOver(win.ticket, "window")).toEqual({ projectId: p.id, entryId: f.id });
+        // A wrong, malformed or used ticket: none waits.
+        for (const t of ["0".repeat(32), got.ticket.toUpperCase(), 42, undefined, win.ticket]) expect(r.browserTicketWaits(t)).toBe(false);
+      });
+
+      it("R348 b: the ways back are the library start's — cancel, the ticket's end, a lock (nothing listed meanwhile) and its resume, a close", async () => {
+        const p = await project({ gov: NO_FREE });
+        const e = await resting(p, RESTING[2]!);
+        const r = runner();
+        await r.browserStart(p.id, e.id, EZ);
+        sameRest(await r.libraryCancel(p.id, e.id), RESTING[2]!);
+        expect(r.browserWaiting()).toBeNull();
+        const { ticket } = await r.browserStart(p.id, e.id, EZ);
+        timers.advance(LIBRARY_TICKET_MS);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back");
+        sameRest(await entryOf(p, e.id), RESTING[2]!);
+        expect([r.browserTicketWaits(ticket), r.browserWaiting(), r.libraryHandedOver(ticket, "browser")]).toEqual([false, null, null]);
+        // A lock ends the ticket at once: nothing is listed for the browser; the entry comes back at the unlock's resume.
+        const second = await r.browserStart(p.id, e.id, EZ);
+        r.stop(p.id);
+        expect([r.browserWaiting(), r.browserTicketWaits(second.ticket), r.libraryHandedOver(second.ticket, "browser")]).toEqual([null, false, null]);
+        r.resume(p.id);
+        await until(async () => (await entryOf(p, e.id))!.state !== "waiting-sign-in", "the entry to come back at the resume");
+        sameRest(await entryOf(p, e.id), RESTING[2]!);
+        // A close ends it too.
+        const third = await r.browserStart(p.id, e.id, EZ);
+        await r.stopAll();
+        expect([r.browserWaiting(), r.browserTicketWaits(third.ticket), r.libraryHandedOver(third.ticket, "browser")]).toEqual([null, false, null]);
+      });
+
+      it("R348 f v, g: the browser's file waits — via browser-extension, the TAB's address cleaned, a signed-in session, library_access; the path resolves \"held\"; only \"Use this file\" attaches it", async () => {
+        const { p, e, r } = await browserHandedOver();
+        expect(r.waitingIn(p.id, e.id)).toBe("browser");
+        expect(r.atWork(p.id, e.id)).toBe(true);
+        const { file, log } = handedFile(await goodPdf());
+        const end = await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, file);
+        expect(end).toEqual({ outcome: "held" });
+        expect(log).toEqual({ took: 1, discarded: 0, paths: [INBOX_PATH] });
+        expect((await entryOf(p, e.id))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+        expect(r.waitingIn(p.id, e.id)).toBeNull();
+        const [rev] = await reviewsOf(p);
+        expect(rev!.heldFile!.acquired).toEqual({ method: "library_access", via: "browser-extension", address: TAB_KEPT, at: expect.any(String), tool: { name: FIND_TOOL, version: expect.any(String) }, access: "signed-in-session" });
+        // R301: nothing attached before the researcher's decision.
+        expect((await repo.getSource(p.id, e.sourceId!)).assets).toEqual([]);
+        await r.resolveHeld(p.id, rev!.id, "attach");
+        const a = (await repo.getSource(p.id, e.sourceId!)).assets.find((x) => x.role === "original")!;
+        expect(a.acquired).toMatchObject({ method: "library_access", via: "browser-extension", address: TAB_KEPT, access: "signed-in-session" });
+        const seen = [await auditText(p), notes.join("\n"), JSON.stringify(changes)].join("\n");
+        for (const s of ["publisher-f20a", "s3cr3t-f20a", ZORBLATT.title]) expect(seen).not.toContain(s);
+      });
+
+      it("R348 f vi: a window's hand-over resolves with its outcome too (held), and its record is unchanged: the kept address, via the sign-in window", async () => {
+        const { p, e, r } = await handedOver();
+        expect(r.waitingIn(p.id, e.id)).toBe("window");
+        const end = await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(await goodPdf()).file);
+        expect(end).toEqual({ outcome: "held" });
+        expect((await reviewsOf(p))[0]!.heldFile!.acquired).toMatchObject({ via: "sign-in-window", address: KEPT });
+      });
+
+      for (const c of [
+        { what: "not a PDF or EPUB", bytes: Buffer.from("<html>sign in</html>"), why: "not-pdf" as const },
+        { what: "too large", bytes: null, take: "too-large" as const, why: "too-large" as const },
+        { what: "unreadable", bytes: null, take: "unreadable" as const, why: "unreadable" as const },
+      ]) {
+        it(`R348 f vi, g: a file ${c.what} — "not-kept" (${c.why}); the entry exactly as it was; the view says it came from the browser`, async () => {
+          const { p, e, r } = await browserHandedOver();
+          const end = await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, handedFile(c.bytes, c.take ? { why: c.take } : {}).file);
+          expect(end).toEqual({ outcome: "not-kept", why: c.why });
+          sameRest(await entryOf(p, e.id), RESTING[0]!);
+          expect(await reviewsOf(p)).toEqual([]);
+          const v = (await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!;
+          expect([v.lastFile, v.lastFileFrom]).toEqual([c.why, "browser"]);
+        });
+      }
+
+      it("R348 g: the rules no longer allow library_access, or keeping the file — \"not-kept\" with the rules' cause", async () => {
+        const { p, e, r } = await browserHandedOver({ gov: GOV() });
+        const g = await repo.getGovernance(p.id);
+        await repo.setGovernance(p.id, GOV("acquireMethods: [reference_lookup, free_copy]"), { baseSha256: g.sha256, reason: "test" });
+        expect(await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, handedFile(await goodPdf()).file)).toEqual({ outcome: "not-kept", why: "rules-method" });
+        expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!.lastFileFrom).toBe("browser");
+      });
+
+      it("R348 f vi: \"gone\" — the entry removed, its record deleted, the record gained a file, the project locked, the runner closed", async () => {
+        {
+          const { p, e, r } = await browserHandedOver();
+          const d = deferred();
+          const done = r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, handedFile(await goodPdf(), { gate: d.gate }).file);
+          await r.remove(p.id, e.id);
+          d.open();
+          expect(await done).toEqual({ outcome: "gone" });
+        }
+        {
+          const { p, e, r } = await browserHandedOver();
+          const d = deferred();
+          const done = r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, handedFile(await goodPdf(), { gate: d.gate }).file);
+          await repo.deleteSource(p.id, e.sourceId!);
+          d.open();
+          expect(await done).toEqual({ outcome: "gone" });
+        }
+        {
+          const { p, e, r } = await browserHandedOver();
+          const mine = join(tmp, "f20a-mine.pdf");
+          await writeFile(mine, await buildPdf({ title: "Mine", lines: ["Mine"] }));
+          await addCapturedOriginal(repo, p.id, e.sourceId!, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+          expect(await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, handedFile(await goodPdf()).file)).toEqual({ outcome: "gone" });
+          expect((await entryOf(p, e.id))!.state).toBe("in-library");
+        }
+        {
+          const { p, e, r } = await browserHandedOver();
+          const d = deferred();
+          const done = r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, handedFile(await goodPdf(), { gate: d.gate }).file);
+          r.stop(p.id);
+          d.open();
+          expect(await done).toEqual({ outcome: "gone" });
+          expect((await entryOf(p, e.id))!.state).toBe("waiting-sign-in");
+        }
+        {
+          const { p, e, r } = await browserHandedOver();
+          await r.stopAll();
+          const { file, log } = handedFile(await goodPdf());
+          expect(await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, file)).toEqual({ outcome: "gone" });
+          expect(log).toEqual({ took: 0, discarded: 1, paths: [INBOX_PATH] });
+        }
+      });
+
+      it("the side and the address are checked again at the hand-over: a browser's hand-over as the window's (or the other way), or a tab address that is not https without user info, is not read (unreadable)", async () => {
+        {
+          const { p, e, r } = await browserHandedOver();
+          const { file, log } = handedFile(await goodPdf());
+          expect(await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file)).toEqual({ outcome: "not-kept", why: "unreadable" });
+          expect(log.took).toBe(0);
+          expect(log.discarded).toBe(1);
+        }
+        {
+          const { p, e, r } = await handedOver();
+          const { file, log } = handedFile(await goodPdf());
+          expect(await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", TAB, file)).toEqual({ outcome: "not-kept", why: "unreadable" });
+          expect(log.took).toBe(0);
+          // A window's file says nothing of the browser.
+          expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!).not.toHaveProperty("lastFileFrom");
+        }
+        for (const bad of ["http://pdfs.publisher-f20a.example.com/a.pdf", "https://reader:pw@pdfs.publisher-f20a.example.com/a.pdf", "not an address", "", `https://pdfs.publisher-f20a.example.com/${"a".repeat(2100)}`]) {
+          timers.now += LIBRARY_PAUSE_MS;
+          const { p, e, r } = await browserHandedOver();
+          const { file, log } = handedFile(await goodPdf());
+          expect(await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "browser-extension", bad, file), bad.slice(0, 40)).toEqual({ outcome: "not-kept", why: "unreadable" });
+          expect(log.took).toBe(0);
+          expect(await reviewsOf(p)).toEqual([]);
+        }
       });
     });
   });
