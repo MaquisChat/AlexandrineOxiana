@@ -142,6 +142,8 @@ export const FIND_TEXT = {
     "Sign in to your library in your browser and open the PDF. Then press the Alexandrine Oxiana button in the browser's toolbar and choose “Send this tab's PDF”. The file will wait for your check here.",
   /** The shell could not open the browser: the wait was cancelled (the counterpart of `windowNotOpened`). */
   browserNotOpened: "Your browser could not be opened, so nothing is waiting. Try again.",
+  /** R356 c: the shell could not open the browser AND the cancel of the wait failed: the work still waits. */
+  browserNotOpenedStillWaiting: "Your browser could not be opened. The work is still waiting — use “Cancel”.",
 } as const;
 
 /** Reasons on "record-complete" that "Try again" takes (F11: the rules, the store part, the waiting files' limit; R326 adds "switched off" by the settings in `actionsOf`). */

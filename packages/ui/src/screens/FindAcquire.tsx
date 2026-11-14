@@ -1049,9 +1049,11 @@ function ProjectQueue(props: {
    * R340 a, b: the ticket of the window this page opened, for the row that waits in it — in memory only, while it waits.
    * `handedOver`: the shell handed the file over (its ticket ended there; a later close is not a cancel). `seen`: the
    * row has been seen waiting — from then on its leaving the wait ends the ticket here (R342 a: the window is closed
-   * unless the file was handed over).
+   * unless the file was handed over). `after` (R356 b): the read clock when the shell said the window opened (after the
+   * start's answer) — a read started later that shows the row not waiting ends the ticket too, seen or not; an older
+   * read arriving late never does.
    */
-  const libTicket = useRef<{ entryId: string; ticket: string; handedOver?: boolean; seen?: boolean } | null>(null);
+  const libTicket = useRef<{ entryId: string; ticket: string; handedOver?: boolean; seen?: boolean; after?: number } | null>(null);
   /**
    * R342 a, d: tickets whose window this page closed (or gave up on) while the shell may still hold them — kept, in
    * memory only, until the shell reports that window closed, so that none of its events is taken for another row.
@@ -1552,16 +1554,18 @@ function ProjectQueue(props: {
   };
   // The ticket is held only while its row waits. Once the row was seen waiting and no longer does (the service returned
   // it: the ticket's end, a lock, a save of the rules), or it is gone (removed here), the window is closed — unless the
-  // shell handed the file over, which ended the ticket there (R342 a).
+  // shell handed the file over, which ended the ticket there (R342 a). R356 b: a row never seen waiting is left alone
+  // only until a read started after the window opened shows it: if that read shows it not waiting, the same holds.
   useEffect(() => {
     const t = libTicket.current;
     if (!t) return;
-    const v = held.current.get(t.entryId)?.view;
+    const h = held.current.get(t.entryId);
+    const v = h?.view;
     if (v?.state === "waiting-sign-in") {
       t.seen = true;
       return;
     }
-    if (v && !t.seen) return;
+    if (v && !t.seen && !(t.after !== undefined && h!.from === "read" && h!.n > t.after)) return;
     if (t.handedOver) endTicketOf(t.entryId);
     else endWindow(t.ticket);
   });
@@ -1659,6 +1663,8 @@ function ProjectQueue(props: {
         if (live() && ticket && address) {
           libTicket.current = { entryId: e.id, ticket };
           opened = await openWindow(ticket, address, how.kind, live);
+          // R356 b: from here on, a read started now or later is one asked after the start's answer.
+          if (opened && libTicket.current?.ticket === ticket) libTicket.current.after = clock.current;
         }
       }
       if (opened) {
@@ -1684,7 +1690,12 @@ function ProjectQueue(props: {
         readSoon();
       } catch (err) {
         // The cancel itself failed: the row shows what the service then says of the entry.
-        if (live() && !refused(err)) readSoon();
+        if (!live() || refused(err)) return;
+        readSoon();
+        // R356 c: the browser did not open and its wait is still there — the row says so, and its "Cancel" ends it (the
+        // note goes when the row leaves the wait). Not when the service says the entry no longer waits, or is gone.
+        const ended = err instanceof ApiClientError && (err.status === 404 || (err.status === 409 && err.reason === "entry-state"));
+        if (how.kind === "browser" && !ended) setNoteFor(e.id, { text: FIND_TEXT.browserNotOpenedStillWaiting, whileWaiting: true });
       }
     } finally {
       acting.current.delete(e.id);
