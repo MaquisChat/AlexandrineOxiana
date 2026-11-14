@@ -33,7 +33,7 @@ import {
   type FindScreenSettings,
 } from "@ao/shared";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
-import { ApiClientError, type ApiClient } from "../api/client";
+import { ApiClientError, type ApiClient, type ServiceEvent } from "../api/client";
 import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { isValidId } from "../api/import";
 import { isProjectLocked, libraryApi, type Collection, type LibraryApi, type LibraryState, type ProjectSummary } from "../api/library";
@@ -53,6 +53,7 @@ export const FIND_SCREEN_TEXT = {
   noProject: "This library has no project yet. Create one in the library, then come back here.",
   noLibrary: "No library is open. Open one from the library to use Find and acquire.",
   projectsUnreadable: "The projects could not be read.",
+  screenUnreadable: "This computer's Find and acquire settings could not be read.",
 } as const;
 
 const RECONNECT_MS = 2000;
@@ -60,6 +61,8 @@ const RECONNECT_MS = 2000;
 const PLACE_CONCURRENCY = 4;
 /** Events that arrive this close together make one read. */
 const EVENT_COALESCE_MS = 50;
+/** While events keep coming, coalesced reads of the queue start at least this far apart (R258 M7). */
+const READ_GAP_MS = 400;
 
 /** The service's own sentence for a refusal (plain words, never what was typed), or a fallback. */
 const sentenceOf = (err: unknown, fallback: string): string => (err instanceof ApiClientError && err.message ? err.message : fallback);
@@ -80,6 +83,9 @@ interface Said {
   n: number;
 }
 
+/** What is said about one entry's state: “typed”: words. */
+const saidOf = (v: FindEntryView, stopped: boolean): Words => ["“", { user: typeof v.typed === "string" ? v.typed : "" }, "”: ", ...stateWords(v, { stopped }), "."];
+
 const byCreated = (a: FindEntryView, b: FindEntryView) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 const same = (a: FindEntryView, b: FindEntryView) => a === b || JSON.stringify(a) === JSON.stringify(b);
 const isElsewhere = (e: FindEntryView) => !!e.elsewhere && (e.state === "already" || e.state === "maybe-duplicate");
@@ -87,14 +93,22 @@ const isElsewhere = (e: FindEntryView) => !!e.elsewhere && (e.state === "already
 // ---------------------------------------------------------------------------------------------
 // The screen: project, collection, the switch; the queue of the chosen project below
 
+/** What the screen passes on to the queue from the one event stream it listens to. */
+type QueueSignal = { kind: "event"; ev: ServiceEvent } | { kind: "refresh" };
+interface QueueBus {
+  subscribe(fn: (s: QueueSignal) => void): () => void;
+}
+
 export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocation }) {
   const api = useMemo(() => findApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
   const ids = useId();
   const [projects, setProjects] = useState<ProjectSummary[] | undefined>();
   const [projectsError, setProjectsError] = useState<string | undefined>();
-  /** What this computer remembers, as the service last confirmed it. */
+  /** What this computer remembers, as the service last confirmed it (the controls show this). */
   const [remembered, setRemembered] = useState<FindScreenSettings | undefined>();
+  /** The remembered settings could not be read: the service's sentence, said once (R258 M3). */
+  const [screenError, setScreenError] = useState<string | undefined>();
   /** The switch while its change is being sent. */
   const [checkSending, setCheckSending] = useState<boolean | undefined>();
   const [switchError, setSwitchError] = useState<string | undefined>();
@@ -103,14 +117,38 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   const [chosen, setChosen] = useState<string | undefined>();
   const [collections, setCollections] = useState<Collection[] | undefined>();
   const [collectionId, setCollectionId] = useState("");
-  /** What is in the box: kept when the project changes. */
+  /** What is in the box: the researcher's, kept when the project or the library changes. */
   const [text, setText] = useState("");
   /** Bumped after the switch changed: the queue is read again (its locked count, its matches elsewhere). */
   const [switchVersion, setSwitchVersion] = useState(0);
+  /** Moves on when another library opens: everything below starts afresh (R258 I1). */
+  const [epoch, setEpoch] = useState(0);
+  const [noLibrary, setNoLibrary] = useState(false);
   const alive = useRef(true);
   const switchBusy = useRef(false);
-  /** The settings every PUT sends (the handler takes the whole object). */
-  const desired = useRef<FindScreenSettings>({ checkEverything: false });
+  /** The last answer of the service about the remembered settings; every PUT is built from it plus its own change (R258 M2). */
+  const confirmed = useRef<FindScreenSettings>({ checkEverything: false });
+  /** The PUTs, one at a time. */
+  const putChain = useRef<Promise<void>>(Promise.resolve());
+  /** GET /find/screen failed and nothing has been confirmed since: the queue's answer says what is stored (M3). */
+  const screenUnread = useRef(false);
+  /** Moves on with the library: an answer about the library that went is dropped. */
+  const libGen = useRef(0);
+  const listeners = useRef(new Set<(s: QueueSignal) => void>());
+  const bus = useMemo<QueueBus>(
+    () => ({
+      subscribe(fn) {
+        listeners.current.add(fn);
+        return () => {
+          listeners.current.delete(fn);
+        };
+      },
+    }),
+    [],
+  );
+  const emit = (s: QueueSignal) => {
+    for (const fn of [...listeners.current]) fn(s);
+  };
 
   useEffect(() => {
     alive.current = true;
@@ -119,24 +157,141 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     };
   }, []);
 
+  /** The project list, read again when the service says the library changed; one read at a time, one more after it. */
+  const projectsRead = useRef<{ again: boolean } | null>(null);
+  const readProjects = useCallback(() => {
+    if (projectsRead.current) {
+      projectsRead.current.again = true;
+      return;
+    }
+    const mark = { again: false };
+    projectsRead.current = mark;
+    const g = libGen.current;
+    void (async () => {
+      try {
+        do {
+          mark.again = false;
+          try {
+            const r = await lib.projects.list();
+            if (!alive.current || g !== libGen.current) return;
+            setProjects(r.projects);
+            setProjectsError(undefined);
+          } catch (err) {
+            if (!alive.current || g !== libGen.current) return;
+            setProjects((cur) => cur ?? []);
+            setProjectsError(sentenceOf(err, FIND_SCREEN_TEXT.projectsUnreadable));
+          }
+        } while (mark.again && alive.current && g === libGen.current);
+      } finally {
+        if (projectsRead.current === mark) projectsRead.current = null;
+      }
+    })();
+  }, [lib]);
+
+  // ---- at load, and afresh for each library ----
   useEffect(() => {
-    lib.projects.list().then(
-      (r) => alive.current && setProjects(r.projects),
-      (err: unknown) => {
-        if (!alive.current) return;
-        setProjects([]);
-        setProjectsError(sentenceOf(err, FIND_SCREEN_TEXT.projectsUnreadable));
-      },
-    );
+    const g = libGen.current;
+    readProjects();
     api.screen().then(
       (s) => {
-        if (!alive.current) return;
-        desired.current = { ...s };
+        if (!alive.current || g !== libGen.current) return;
+        confirmed.current = { ...s };
+        screenUnread.current = false;
         setRemembered(s);
       },
-      () => alive.current && setRemembered({ checkEverything: false }),
+      (err: unknown) => {
+        if (!alive.current || g !== libGen.current) return;
+        confirmed.current = { checkEverything: false };
+        screenUnread.current = true;
+        setScreenError(sentenceOf(err, FIND_SCREEN_TEXT.screenUnreadable));
+        setRemembered({ checkEverything: false });
+      },
     );
-  }, [api, lib]);
+  }, [api, readProjects, epoch]);
+
+  /** Another library (or none): nothing of the old one is kept — lists, settings, answers still out (R258 I1). */
+  const forgetLibrary = useCallback(() => {
+    libGen.current++;
+    projectsRead.current = null;
+    putChain.current = Promise.resolve();
+    switchBusy.current = false;
+    confirmed.current = { checkEverything: false };
+    screenUnread.current = false;
+    setProjects(undefined);
+    setProjectsError(undefined);
+    setRemembered(undefined);
+    setScreenError(undefined);
+    setCheckSending(undefined);
+    setSwitchError(undefined);
+    setSettingsError(undefined);
+    setChosen(undefined);
+    setCollections(undefined);
+    setCollectionId("");
+    setEpoch((e) => e + 1);
+  }, []);
+
+  // ---- the one event stream: the library's state here, the queue's events passed on ----
+  const noLibraryRef = useRef(false);
+  noLibraryRef.current = noLibrary;
+  useEffect(() => {
+    const ac = new AbortController();
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let opened = false;
+    let known: string | undefined;
+    const listen = async () => {
+      try {
+        const onOpen = () => {
+          // After a lost stream, what happened meanwhile is read.
+          if (opened) {
+            readProjects();
+            emit({ kind: "refresh" });
+          }
+          opened = true;
+        };
+        for await (const ev of client.events({ signal: ac.signal, onOpen })) {
+          if (!alive.current) return;
+          if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
+            const d = ev.data as LibraryState;
+            if (d.open === false) {
+              known = undefined;
+              forgetLibrary();
+              setNoLibrary(true);
+              continue;
+            }
+            if (d.libraryId && known !== undefined && d.libraryId !== known) {
+              // Another library opened in its place, as on the Watched folders screen.
+              known = d.libraryId;
+              forgetLibrary();
+              setNoLibrary(false);
+              continue;
+            }
+            if (d.libraryId && known === undefined) {
+              known = d.libraryId;
+              if (noLibraryRef.current) {
+                forgetLibrary();
+                setNoLibrary(false);
+              }
+              continue;
+            }
+            // The same library: a project may have been locked, unlocked, created or removed, or the mode changed (M8).
+            readProjects();
+            emit({ kind: "refresh" });
+            continue;
+          }
+          emit({ kind: "event", ev });
+        }
+      } catch {
+        // the stream dropped: listen again shortly
+      }
+      if (!ac.signal.aborted) retry = setTimeout(() => void listen(), RECONNECT_MS);
+    };
+    void listen();
+    return () => {
+      ac.abort();
+      clearTimeout(retry);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, readProjects, forgetLibrary]);
 
   const asked = projectInQuery(loc.search);
   // A project named in the address again (a link) takes over from the one chosen here.
@@ -157,7 +312,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
       (r) => {
         if (!live) return;
         setCollections(r.collections);
-        const want = desired.current.projectId === projectId ? desired.current.collectionId : undefined;
+        const want = confirmed.current.projectId === projectId ? confirmed.current.collectionId : undefined;
         if (want && r.collections.some((c) => c.id === want)) setCollectionId(want);
       },
       () => live && setCollections([]),
@@ -165,57 +320,94 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     return () => {
       live = false;
     };
-  }, [lib, projectId]);
+  }, [lib, projectId, epoch]);
 
-  /** Remembers the project and collection on this computer; a failure is said and changes nothing here. */
-  const remember = async () => {
-    setSettingsError(undefined);
-    try {
-      const s = await api.putScreen(desired.current);
-      if (!alive.current) return;
-      setRemembered((cur) => ({ ...s, checkEverything: cur?.checkEverything ?? s.checkEverything }));
-    } catch (err) {
-      if (alive.current) setSettingsError(`This computer could not remember the choice. ${sentenceOf(err, "")}`.trim());
-    }
+  /**
+   * One PUT of the remembered settings, after those before it: built from the last CONFIRMED answer plus its own
+   * change. On success that answer is the new confirmed one; on a failure the controls show the confirmed one (M2).
+   */
+  const put = (change: (base: FindScreenSettings) => FindScreenSettings, h: { done?: (s: FindScreenSettings) => void; failed: (err: unknown) => void; always?: () => void }) => {
+    const g = libGen.current;
+    const run = async () => {
+      if (!alive.current || g !== libGen.current) return;
+      try {
+        const s = await api.putScreen(change(confirmed.current));
+        if (!alive.current || g !== libGen.current) return;
+        confirmed.current = { ...s };
+        screenUnread.current = false;
+        setRemembered(s);
+        h.done?.(s);
+      } catch (err) {
+        if (!alive.current || g !== libGen.current) return;
+        setRemembered({ ...confirmed.current });
+        h.failed(err);
+      } finally {
+        if (alive.current && g === libGen.current) h.always?.();
+      }
+    };
+    putChain.current = putChain.current.then(run, run);
+  };
+
+  /** After a refused change of a select: both selects show what the service last confirmed. */
+  const selectsBack = () => {
+    const c = confirmed.current;
+    setChosen(c.projectId);
+    if (c.projectId) navigate(findHref(c.projectId), { replace: true });
+    setCollectionId(c.collectionId && collections?.some((x) => x.id === c.collectionId) ? c.collectionId : "");
+  };
+  const rememberFailed = (err: unknown) => {
+    setSettingsError(`This computer could not remember the choice. ${sentenceOf(err, "")}`.trim());
+    selectsBack();
   };
 
   const pickProject = (pid: string) => {
     if (!holds(pid) || pid === projectId) return;
     setChosen(pid);
-    desired.current = { checkEverything: desired.current.checkEverything, projectId: pid };
+    setSettingsError(undefined);
     navigate(findHref(pid), { replace: true });
-    void remember();
+    put((b) => ({ checkEverything: b.checkEverything, projectId: pid }), { failed: rememberFailed });
   };
   const pickCollection = (cid: string) => {
     setCollectionId(cid);
-    desired.current = { checkEverything: desired.current.checkEverything, ...(projectId ? { projectId } : {}), ...(cid ? { collectionId: cid } : {}) };
-    void remember();
+    setSettingsError(undefined);
+    const pid = projectId;
+    put((b) => ({ checkEverything: b.checkEverything, ...(pid ? { projectId: pid } : {}), ...(cid ? { collectionId: cid } : {}) }), { failed: rememberFailed });
   };
 
   const confirmedCheck = remembered?.checkEverything ?? false;
   const shownCheck = checkSending ?? confirmedCheck;
-  const toggle = async () => {
+  const toggle = () => {
     if (switchBusy.current || !remembered) return;
     switchBusy.current = true;
     const next = !shownCheck;
     setCheckSending(next);
     setSwitchError(undefined);
-    desired.current = { ...desired.current, checkEverything: next };
-    try {
-      const s = await api.putScreen(desired.current);
-      if (!alive.current) return;
-      setRemembered(s);
-      setSwitchVersion((v) => v + 1);
-    } catch (err) {
-      if (!alive.current) return;
+    put((b) => ({ ...b, checkEverything: next }), {
+      done: () => setSwitchVersion((v) => v + 1),
       // Back to what the service stores, and why.
-      desired.current = { ...desired.current, checkEverything: confirmedCheck };
-      setSwitchError(`“Check everything I have” could not be changed. ${sentenceOf(err, "")}`.trim());
-    } finally {
-      switchBusy.current = false;
-      if (alive.current) setCheckSending(undefined);
-    }
+      failed: (err) => setSwitchError(`“Check everything I have” could not be changed. ${sentenceOf(err, "")}`.trim()),
+      always: () => {
+        switchBusy.current = false;
+        setCheckSending(undefined);
+      },
+    });
   };
+
+  /** The queue's answer says what is stored; used only while the remembered settings could not be read (M3). */
+  const onStoredCheck = useCallback((v: boolean) => {
+    if (!screenUnread.current || confirmed.current.checkEverything === v) return;
+    confirmed.current = { ...confirmed.current, checkEverything: v };
+    setRemembered((r) => (r ? { ...r, checkEverything: v } : r));
+  }, []);
+
+  if (noLibrary) {
+    return (
+      <main className="ao-page ao-find" aria-labelledby={`${ids}-h`}>
+        <h1 id={`${ids}-h`}>Find and acquire</h1>
+        <p role="status">{FIND_SCREEN_TEXT.noLibrary}</p>
+      </main>
+    );
+  }
 
   return (
     <main className="ao-page ao-find" aria-labelledby={`${ids}-h`}>
@@ -250,31 +442,36 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
             checked={shownCheck}
             aria-busy={checkSending !== undefined || undefined}
             aria-disabled={checkSending !== undefined || !remembered || undefined}
-            onChange={() => void toggle()}
+            onChange={toggle}
           />
           Check everything I have
         </label>
       </div>
+      {screenError && (
+        <p role="alert" className="ao-error">
+          <UserText>{screenError}</UserText>
+        </p>
+      )}
       {switchError && (
         <p role="alert" className="ao-error">
-          {switchError}
+          <UserText>{switchError}</UserText>
         </p>
       )}
       {settingsError && (
         <p role="alert" className="ao-error">
-          {settingsError}
+          <UserText>{settingsError}</UserText>
         </p>
       )}
       {projectsError && (
         <p role="alert" className="ao-error">
-          {projectsError}
+          <UserText>{projectsError}</UserText>
         </p>
       )}
       {projects && remembered && !projectId && !projectsError && <p>{FIND_SCREEN_TEXT.noProject}</p>}
       {projectId && project && (
         <ProjectQueue
-          key={projectId}
-          client={client}
+          key={`${epoch}\u0000${projectId}`}
+          bus={bus}
           api={api}
           lib={lib}
           project={project}
@@ -283,6 +480,8 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           setText={setText}
           checkEverything={confirmedCheck}
           switchVersion={switchVersion}
+          onStoredCheck={onStoredCheck}
+          onUnlocked={readProjects}
         />
       )}
     </main>
@@ -342,7 +541,7 @@ const Rows = memo(function Rows(props: {
 });
 
 function ProjectQueue(props: {
-  client: ApiClient;
+  bus: QueueBus;
   api: FindApi;
   lib: LibraryApi;
   project: ProjectSummary;
@@ -351,8 +550,12 @@ function ProjectQueue(props: {
   setText: (t: string) => void;
   checkEverything: boolean;
   switchVersion: number;
+  /** The queue's answer says what is stored for the switch. */
+  onStoredCheck: (v: boolean) => void;
+  /** The project was unlocked here: the project list is read again. */
+  onUnlocked: () => void;
 }) {
-  const { client, api, lib, project, collectionId, text, setText, checkEverything, switchVersion } = props;
+  const { bus, api, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked } = props;
   const projectId = project.id;
   const ids = useId();
 
@@ -362,7 +565,8 @@ function ProjectQueue(props: {
   /** The queue cannot be read at all (409): the service's sentence in its place. */
   const [unreadable, setUnreadable] = useState<string | undefined>();
   const [loadError, setLoadError] = useState<string | undefined>();
-  const [noLibrary, setNoLibrary] = useState(false);
+  /** The library cannot be reached (503 LIBRARY_OFFLINE): the service's sentence (R258 M4). */
+  const [offline, setOffline] = useState<string | undefined>();
   const [busy, setBusyState] = useState<Record<string, FindActKind>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [places, setPlaces] = useState<Record<string, FindPlace>>({});
@@ -396,9 +600,8 @@ function ProjectQueue(props: {
   const listRef = useRef<HTMLUListElement>(null);
   const lastFocus = useRef<{ el: HTMLElement; entryId: string | undefined } | null>(null);
   const sourceRef = useRef<HTMLElement>(null);
-  const noLibraryRef = useRef(false);
-  noLibraryRef.current = noLibrary;
-  const libraryKnown = useRef<{ libraryId?: string; mode?: string }>({});
+  /** When the last coalesced read started (R258 M7). */
+  const lastSoon = useRef(0);
 
   useEffect(() => {
     alive.current = true;
@@ -483,15 +686,18 @@ function ProjectQueue(props: {
     [pumpPlaces],
   );
 
-  /** One entry from an act's answer: newer than anything read before the answer arrived. */
+  /**
+   * One entry from an act's answer, in its place in the order: `seq` was drawn when the act was SENT, so a read that
+   * started after it wins (R258 M1). Returns the entry as now shown.
+   */
   const takeOne = useCallback(
-    (v: FindEntryView) => {
-      const seq = ++clock.current;
+    (v: FindEntryView, seq: number): FindEntryView => {
       const cur = held.current.get(v.id);
+      if ((gone.current.get(v.id) ?? -1) >= seq || (cur && cur.seq > seq)) return cur?.view ?? v;
       held.current.set(v.id, { view: cur && same(cur.view, v) ? cur.view : v, seq });
-      gone.current.delete(v.id);
       commit();
       askPlaces([v]);
+      return v;
     },
     [commit, askPlaces],
   );
@@ -502,6 +708,7 @@ function ProjectQueue(props: {
       const before = new Map([...held.current].map(([id, h]) => [id, h.view] as const));
       const present = new Set<string>();
       for (const v of r.entries) {
+        if (!v || typeof v !== "object" || typeof v.id !== "string") continue;
         present.add(v.id);
         if ((gone.current.get(v.id) ?? -1) >= start) continue;
         const cur = held.current.get(v.id);
@@ -516,6 +723,8 @@ function ProjectQueue(props: {
       if (start > metaSeq.current) {
         metaSeq.current = start;
         setMeta({ readOnly: r.readOnly, ...(r.stopped ? { stopped: r.stopped } : {}), unreadableLines: r.unreadableLines, lockedProjectsNotChecked: r.lockedProjectsNotChecked });
+        if (typeof r.checkEverything === "boolean") onStoredCheck(r.checkEverything);
+        setOffline(undefined);
         setUnreadable(undefined);
         setLoadError(undefined);
         setLocked(false);
@@ -534,10 +743,10 @@ function ProjectQueue(props: {
       });
       if (changed.length === 1) {
         const v = changed[0]!;
-        say(["“", { user: v.typed }, "”: ", ...stateWords(v, { stopped: !!r.stopped }), "."]);
+        say(saidOf(v, !!r.stopped));
       } else if (changed.length > 1) say([`${changed.length} entries in the queue changed.`]);
     },
-    [commit, askPlaces, say],
+    [commit, askPlaces, say, onStoredCheck],
   );
 
   const markLocked = useCallback(() => {
@@ -560,7 +769,6 @@ function ProjectQueue(props: {
     try {
       const r = await api.queue(projectId);
       if (!alive.current || g !== gen.current) return;
-      setNoLibrary(false);
       applyQueue(r, start);
     } catch (err) {
       if (!alive.current || g !== gen.current || start < metaSeq.current) return;
@@ -576,7 +784,7 @@ function ProjectQueue(props: {
         return;
       }
       if (err instanceof ApiClientError && err.code === "LIBRARY_OFFLINE") {
-        setNoLibrary(true);
+        setOffline(sentenceOf(err, FIND_SCREEN_TEXT.noLibrary));
         return;
       }
       setLoadError(sentenceOf(err, "The queue could not be read."));
@@ -586,7 +794,8 @@ function ProjectQueue(props: {
   const readNow = useCallback(() => void readOnce(), [readOnce]);
   /**
    * A read asked for by an event (or after an act), coalesced: it starts EVENT_COALESCE_MS after the first ask (asks
-   * meanwhile join it), and asks while it is out make ONE more read after it — however many asks.
+   * meanwhile join it), and asks while it is out make ONE more read after it — however many asks. While asks keep
+   * coming, reads start at least READ_GAP_MS apart (R258 M7); the last ask is always followed by a read.
    */
   const readSoon = useCallback(() => {
     if (soon.current) {
@@ -598,10 +807,12 @@ function ProjectQueue(props: {
     const g = gen.current;
     void (async () => {
       try {
-        await new Promise((r) => setTimeout(r, EVENT_COALESCE_MS));
-        if (!alive.current || g !== gen.current || soon.current !== mark) return;
         do {
+          const wait = Math.max(EVENT_COALESCE_MS, lastSoon.current + READ_GAP_MS - Date.now());
+          await new Promise((r) => setTimeout(r, wait));
+          if (!alive.current || g !== gen.current || soon.current !== mark) return;
           mark.again = false;
+          lastSoon.current = Date.now();
           await readOnce();
         } while (mark.again && alive.current && g === gen.current && soon.current === mark);
       } finally {
@@ -622,62 +833,15 @@ function ProjectQueue(props: {
     readNow();
   }, [readNow, switchVersion]);
 
-  // ---- live updates ----
-  useEffect(() => {
-    const ac = new AbortController();
-    let retry: ReturnType<typeof setTimeout> | undefined;
-    let opened = false;
-    const listen = async () => {
-      try {
-        const onOpen = () => {
-          // After a lost stream, what happened meanwhile is read.
-          if (opened) readSoon();
-          opened = true;
-        };
-        for await (const ev of client.events({ signal: ac.signal, onOpen })) {
-          if (!alive.current) return;
-          if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
-            const d = ev.data as LibraryState;
-            const k = libraryKnown.current;
-            if (d.open === false) {
-              gen.current++;
-              soon.current = null;
-              held.current.clear();
-              setEntries(undefined);
-              setDialog(null);
-              setOpenSource(null);
-              setNoLibrary(true);
-              libraryKnown.current = {};
-              continue;
-            }
-            const changed = (d.libraryId !== undefined && k.libraryId !== undefined && d.libraryId !== k.libraryId) || (d.mode !== undefined && k.mode !== undefined && d.mode !== k.mode);
-            const reopened = d.libraryId !== undefined && k.libraryId === undefined && noLibraryRef.current;
-            libraryKnown.current = { libraryId: d.libraryId ?? k.libraryId, mode: d.mode ?? k.mode };
-            if (changed || reopened) {
-              if (d.libraryId !== k.libraryId) {
-                gen.current++;
-                soon.current = null;
-                held.current.clear();
-                gone.current.clear();
-                firstRead.current = true;
-              }
-              readSoon();
-            }
-            continue;
-          }
-          if (findProgressOf(ev, projectId)) readSoon();
-        }
-      } catch {
-        // the stream dropped: listen again shortly
-      }
-      if (!ac.signal.aborted) retry = setTimeout(() => void listen(), RECONNECT_MS);
-    };
-    void listen();
-    return () => {
-      ac.abort();
-      clearTimeout(retry);
-    };
-  }, [client, projectId, readSoon, setDialog]);
+  // ---- live updates: the screen's one stream passes on the queue's events and asks to read again ----
+  useEffect(
+    () =>
+      bus.subscribe((sig) => {
+        if (!alive.current) return;
+        if (sig.kind === "refresh" || findProgressOf(sig.ev, projectId)) readSoon();
+      }),
+    [bus, projectId, readSoon],
+  );
   useEffect(() => {
     if (openSource) sourceRef.current?.focus();
   }, [openSource]);
@@ -706,7 +870,7 @@ function ProjectQueue(props: {
 
   // ---- acts ----
   const readOnly = !!meta?.readOnly;
-  const boxDisabled = readOnly || locked || !!unreadable || noLibrary;
+  const boxDisabled = readOnly || locked || !!unreadable || !!offline;
 
   /** A refusal of an act: locked → the unlock; gone or changed → the queue again. */
   const refused = (err: unknown): boolean => {
@@ -724,11 +888,11 @@ function ProjectQueue(props: {
     acting.current.add(e.id);
     setErrorFor(e.id, undefined);
     const g = gen.current;
+    const seq = ++clock.current;
     try {
       const v = await call();
       if (!alive.current || g !== gen.current) return;
-      takeOne(v);
-      say(["“", { user: v.typed }, "”: ", ...stateWords(v, { stopped: !!meta?.stopped }), "."]);
+      say(saidOf(takeOne(v, seq), !!meta?.stopped));
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current || refused(err)) return;
@@ -826,12 +990,13 @@ function ProjectQueue(props: {
     setDialog({ ...d, busy: true, error: undefined });
     acting.current.add(e.id);
     const g = gen.current;
+    const seq = ++clock.current;
     try {
       const v = await api.choose(projectId, e.id, candidateId);
       if (!alive.current || g !== gen.current) return;
-      takeOne(v);
+      const shown = takeOne(v, seq);
       setDialog(null);
-      say(["“", { user: v.typed }, "”: ", ...stateWords(v, { stopped: !!meta?.stopped }), "."]);
+      say(saidOf(shown, !!meta?.stopped));
       readSoon();
     } catch (err) {
       if (!alive.current || g !== gen.current) return;
@@ -859,10 +1024,12 @@ function ProjectQueue(props: {
     setAddBusyState(true);
     setAddError(undefined);
     const g = gen.current;
+    const seq = ++clock.current;
     try {
       const r = await api.add(projectId, { lines: kept.map((k) => k.line), ...(collectionId ? { collectionId } : {}) });
       if (!alive.current || g !== gen.current) return;
-      for (const v of r.added) takeOne(v);
+      for (const v of r.added) takeOne(v, seq);
+      // The box was read-only while the add was out, so it holds exactly what was sent (R258 I2).
       setText("");
       boxRef.current?.focus();
       say([addedText(r)]);
@@ -882,7 +1049,10 @@ function ProjectQueue(props: {
       if (err instanceof ApiClientError && err.code === "READ_ONLY") readSoon();
     } finally {
       addBusyRef.current = false;
-      if (alive.current) setAddBusyState(false);
+      if (alive.current) {
+        setAddBusyState(false);
+        boxRef.current?.focus();
+      }
     }
   };
   const onBoxKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -895,11 +1065,11 @@ function ProjectQueue(props: {
   // ---- the page ----
   const stopped = meta?.stopped;
   const reasonId = `${ids}-reason`;
-  const reasonText = locked ? FIND_ROUTE_TEXT.locked : unreadable ? unreadable : noLibrary ? FIND_SCREEN_TEXT.noLibrary : readOnly ? (stopped?.text ?? FIND_ROUTE_TEXT.readOnly) : undefined;
+  const reasonText = locked ? FIND_ROUTE_TEXT.locked : unreadable ? unreadable : offline ? offline : readOnly ? (stopped?.text ?? FIND_ROUTE_TEXT.readOnly) : undefined;
   const describedBy = [`${ids}-hint`, boxDisabled && reasonText ? reasonId : undefined, addError ? `${ids}-adderr` : undefined].filter(Boolean).join(" ");
   const showLocked = checkEverything && !!meta && meta.lockedProjectsNotChecked > 0 && !locked && !unreadable;
   /** The sentence above the queue: why nothing runs now (once), unless it is the box's reason already. */
-  const stoppedLine = stopped && !locked && !unreadable && !noLibrary ? stopped.text : undefined;
+  const stoppedLine = stopped && !locked && !unreadable && !offline ? stopped.text : undefined;
   /** Read-only: the service's stopped sentence is the box's reason too, said once. */
   const reasonIsStopped = readOnly && !!stoppedLine;
 
@@ -920,8 +1090,12 @@ function ProjectQueue(props: {
           className="ao-find__box"
           value={text}
           disabled={boxDisabled}
+          readOnly={addBusy}
+          aria-busy={addBusy || undefined}
           aria-describedby={describedBy}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            if (!addBusyRef.current) setText(e.target.value);
+          }}
           onKeyDown={onBoxKey}
         />
         <p id={`${ids}-hint`} className="ao-muted">
@@ -961,6 +1135,7 @@ function ProjectQueue(props: {
           onUnlocked={() => {
             setLocked(false);
             readNow();
+            onUnlocked();
           }}
         />
       )}
@@ -971,7 +1146,7 @@ function ProjectQueue(props: {
           <UserText>{loadError}</UserText>
         </p>
       )}
-      {!locked && !unreadable && !noLibrary && (
+      {!locked && !unreadable && !offline && (
         <>
           {!entries && !loadError && <p>{FIND_SCREEN_TEXT.loading}</p>}
           <ul ref={listRef} className="ao-find__queue" aria-labelledby={`${ids}-queue`} data-count={entries?.length ?? 0}>

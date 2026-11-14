@@ -14,7 +14,7 @@
  * entry has a record), and no control of a later slice.
  */
 import { FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
-import { memo } from "react";
+import { Component, memo, type ReactNode } from "react";
 import { creatorsText, isKnownState, kindWords, yearOf } from "../api/find";
 import { UserText } from "./UserText";
 
@@ -47,7 +47,13 @@ export const FIND_TEXT = {
   notNow: "Not being looked up now",
   elsewhereLoading: "Already in another of your projects",
   elsewhereLocked: "Already in another project that is locked now.",
+  maybeElsewhereLocked: "Possibly already in another project that is locked now.",
+  noMatches: "No possible matches.",
 } as const;
+
+/** An entry this build can show: a known state and text that was typed (else "needs a newer version", R258 M6). */
+export const entryKnown = (e: FindEntryView): boolean => isKnownState(e.state) && typeof e.typed === "string";
+const candidatesOf = (e: FindEntryView) => (Array.isArray(e.candidates) ? e.candidates : []);
 
 /** The plan's words for each state (Accept 3), and the design's for the states of later slices. */
 const STATE_WORDS = {
@@ -76,12 +82,13 @@ export const reasonSentence = (e: FindEntryView): string | undefined => (knownRe
 
 /** Where the entry stands, in words. `stopped`: nothing is looked up for the project now (said once above). */
 export function stateWords(e: FindEntryView, ctx: { stopped?: boolean; place?: FindPlace | undefined } = {}): Words {
-  if (!isKnownState(e.state)) return [FIND_TEXT.newerVersion];
+  if (!entryKnown(e)) return [FIND_TEXT.newerVersion];
   switch (e.state) {
     case "looking-up":
       return [ctx.stopped ? FIND_TEXT.notNow : STATE_WORDS["looking-up"]];
     case "choose": {
-      const k = e.candidates?.length ?? 0;
+      const k = candidatesOf(e).length;
+      if (k === 0) return [FIND_TEXT.noMatches];
       return [k === 1 ? "1 possible match" : `${k} possible matches`];
     }
     case "failed": {
@@ -93,7 +100,7 @@ export function stateWords(e: FindEntryView, ctx: { stopped?: boolean; place?: F
       if (!e.elsewhere) return [STATE_WORDS[e.state]];
       const lead = e.state === "already" ? "Already in your project " : "Possibly already in your project ";
       if (ctx.place?.status === "known") return [lead, { user: ctx.place.projectName }];
-      if (ctx.place?.status === "locked") return [FIND_TEXT.elsewhereLocked];
+      if (ctx.place?.status === "locked") return [e.state === "already" ? FIND_TEXT.elsewhereLocked : FIND_TEXT.maybeElsewhereLocked];
       return [e.state === "already" ? FIND_TEXT.elsewhereLoading : "Possibly already in another of your projects"];
     }
     default:
@@ -102,21 +109,23 @@ export function stateWords(e: FindEntryView, ctx: { stopped?: boolean; place?: F
 }
 
 /** The name's form of what was typed: at most 80 characters, then an ellipsis. */
-export function shortTyped(typed: string): string {
+export function shortTyped(typed: unknown): string {
+  if (typeof typed !== "string") return "";
   const chars = Array.from(typed);
   return chars.length > 80 ? `${chars.slice(0, 80).join("")}…` : typed;
 }
 
 /** The candidate the entry was matched to, if any. */
-export const matchedWork = (e: FindEntryView): FindWorkCandidate | undefined => (e.chosen ? e.candidates?.find((c) => c.id === e.chosen) : undefined);
+export const matchedWork = (e: FindEntryView): FindWorkCandidate | undefined => (e.chosen ? candidatesOf(e).find((c) => c && c.id === e.chosen) : undefined);
 
 /** The acts a row offers, in order. Slice 1 only. */
 export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
-  if (!isKnownState(e.state)) return ["remove"];
+  if (!entryKnown(e)) return ["remove"];
   const out: FindActKind[] = [];
   switch (e.state) {
     case "choose":
-      out.push("choose");
+      // Nothing to choose from: no dialog (R258 M5).
+      if (candidatesOf(e).length > 0) out.push("choose");
       break;
     case "maybe-duplicate":
       out.push("same", "different");
@@ -197,8 +206,8 @@ function Matched({ c }: { c: FindWorkCandidate }) {
 }
 
 function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, stopped = false, error }: FindEntryRowProps) {
-  const q = `“${shortTyped(e.typed)}”`;
-  const known = isKnownState(e.state);
+  const short = shortTyped(e.typed);
+  const known = entryKnown(e);
   const words = stateWords(e, { stopped, place });
   const work = known ? matchedWork(e) : undefined;
   const reason = known && e.state !== "failed" ? reasonSentence(e) : undefined;
@@ -207,7 +216,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
     <li className="ao-find__entry" data-entry-id={e.id}>
       <p className="ao-find__typed">
         <span tabIndex={-1} data-entry-text="" className="ao-find__typed-text">
-          <UserText>{e.typed}</UserText>
+          {typeof e.typed === "string" && <UserText>{e.typed}</UserText>}
         </span>
       </p>
       {work && <Matched c={work} />}
@@ -237,7 +246,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
               key={kind}
               type="button"
               className={kind === "remove" ? "ao-find__remove" : undefined}
-              aria-label={`${text}: ${q}`}
+              aria-label={short ? `${text}: “${short}”` : text}
               disabled={readOnly && !READS.has(kind)}
               aria-disabled={working || waiting || undefined}
               aria-busy={working || undefined}
@@ -255,5 +264,40 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
   );
 }
 
+/**
+ * A row that fails to render (a later build's entry this one cannot read) is shown as needing a newer version, with
+ * "Remove from the queue": one entry never blanks the screen (R258 M6).
+ */
+class RowGuard extends Component<FindEntryRowProps & { children: ReactNode }, { failed: boolean }> {
+  override state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  override render() {
+    if (!this.state.failed) return this.props.children;
+    const { entry, onAction, readOnly } = this.props;
+    return (
+      <li className="ao-find__entry" data-entry-id={typeof entry.id === "string" ? entry.id : undefined}>
+        <p className="ao-find__status">
+          <span className="ao-find__state">{FIND_TEXT.newerVersion}</span>
+        </p>
+        <div className="ao-actions ao-find__actions">
+          <button type="button" className="ao-find__remove" aria-label="Remove from the queue" disabled={readOnly} onClick={() => onAction({ kind: "remove", entry })}>
+            Remove from the queue
+          </button>
+        </div>
+      </li>
+    );
+  }
+}
+
+function GuardedRow(props: FindEntryRowProps) {
+  return (
+    <RowGuard {...props}>
+      <FindEntryRowImpl {...props} />
+    </RowGuard>
+  );
+}
+
 /** A row re-renders only when its own props change (a 500-entry queue stays responsive). */
-export const FindEntryRow = memo(FindEntryRowImpl);
+export const FindEntryRow = memo(GuardedRow);
