@@ -13,6 +13,7 @@ import {
   type FindCreator,
   type FindElsewhereResponse,
   type FindEntryView,
+  type FindOptionsResponse,
   type FindProgressEvent,
   type FindQueueResponse,
   type FindRemoveResponse,
@@ -20,6 +21,7 @@ import {
   type FindSourceType,
   type FindState,
   type FindWorkCandidate,
+  type FindWorksResponse,
 } from "@ao/shared";
 import { PATHS } from "../navigation";
 import { isValidId } from "./import";
@@ -56,6 +58,12 @@ export function findApi(client: ApiClient) {
     remove: (pid: string, eid: string) => r<FindRemoveResponse>("DELETE", entryPath(pid, eid)),
     /** GET …/:eid/elsewhere: where a match in another project is, worked out now; null when not known now. */
     elsewhere: (pid: string, eid: string) => r<FindElsewhereResponse>("GET", `${entryPath(pid, eid)}/elsewhere`),
+    /** GET …/:eid/options (Task F8, R267 b): the entry's lists for its dialog — people, works (each marked when added), the person. */
+    options: (pid: string, eid: string) => r<FindOptionsResponse>("GET", `${entryPath(pid, eid)}/options`),
+    /** POST …/:eid/person: the person meant (one of the entry's own people); answered at once with the entry "looking-up". */
+    person: (pid: string, eid: string, personId: string) => r<FindEntryView>("POST", `${entryPath(pid, eid)}/person`, { body: { personId } }),
+    /** POST …/:eid/works: the works ticked (1 to 50): an entry for each, and the author's entry as it now is. */
+    works: (pid: string, eid: string, workIds: string[]) => r<FindWorksResponse>("POST", `${entryPath(pid, eid)}/works`, { body: { workIds: [...workIds] } }),
     /** GET /find/screen: this computer's remembered switch, project and collection. */
     screen: () => r<FindScreenSettings>("GET", "/find/screen"),
     /** PUT /find/screen: the whole settings (the handler refuses any other key). */
