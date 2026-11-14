@@ -214,7 +214,7 @@ describe("the queue in the project (Task F3)", () => {
   it("in an encrypted project every line is sealed, and no typed word, title or name is in any file in the clear (raw bytes)", async () => {
     const p = await project(true);
     const a = entry(p, { candidates: [candidate()], offers: [{ label: "Publisher's page", url: "https://doi.org/10.9999/zorblatt", host: "doi.org" }] });
-    const b = entry(p, { typed: "Mirabel Quillfeather", people: [{ id: "A123", name: "Mirabel Quillfeather", affiliation: "Zorblatt University", worksCount: 3, sampleTitles: ["Zorblatt Grammar"] }] });
+    const b = entry(p, { typed: "Mirabel Quillfeather", people: [{ id: "A123", name: "Mirabel Quillfeather", affiliation: "Zorblatt University", worksCount: 3, subjects: ["Zorblatt Grammar"] }] });
     await append(p, [a, b], "add"); // add
     await append(p, [{ ...a, state: "choose", updatedAt: "2026-11-13T10:01:00.000Z" }], "update"); // update
     await append(p, [b], "remove"); // remove
@@ -779,7 +779,7 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
       ["name", { candidates: [candidate({ creators: [{ role: "author", family: "f".repeat(201) }] })] }],
       ["creators", { candidates: [candidate({ creators: Array.from({ length: 101 }, () => ({ role: "author" as const, family: "F" })) })] }],
       ["candidates", { candidates: Array.from({ length: 11 }, (_, i) => candidate({ id: `c${i}` })) }],
-      ["people", { people: Array.from({ length: 21 }, (_, i) => ({ id: `A${i}`, name: "N", worksCount: 1, sampleTitles: [] })) }],
+      ["people", { people: Array.from({ length: 21 }, (_, i) => ({ id: `A${i}`, name: "N", worksCount: 1, subjects: [] })) }],
       ["works", { works: Array.from({ length: 201 }, (_, i) => candidate({ id: `w${i}` })) }],
       ["type", { candidates: [candidate({ type: "spaceship" as never })] }],
     ];
@@ -794,7 +794,7 @@ describe("fix round 1 (R226): nothing unreadable is destroyed, a caller cannot c
     const exact = entry(p, {
       state: "choose-person",
       candidates: [{ ...candidate({ title: "t".repeat(1000), creators: Array.from({ length: 100 }, () => ({ role: "author" as const, family: "f".repeat(200) })) }), secret: "Quillfeather's diary" } as WorkCandidate],
-      people: [{ id: "A1", name: "n".repeat(200), worksCount: 3, sampleTitles: ["a", "b", "c"], hidden: "x" } as never],
+      people: [{ id: "A1", name: "n".repeat(200), worksCount: 3, subjects: ["a", "b", "c"], hidden: "x" } as never],
     });
     await append(p, [exact]);
     const raw = await readFile(queueFile(p), "utf8");
@@ -1080,28 +1080,36 @@ describe("Task F8 (R267): an author's entry, and works added from it with the en
   };
   const work = (n: number): WorkCandidate => ({ id: `W${n}`, title: `Invented Work ${n}`, creators: [], type: "article-journal", identifiers: {}, providers: ["openalex"] });
 
-  it("morePeople, moreWorks and the ids added are kept; anything else of theirs is refused", async () => {
+  it("morePeople, moreWorks and the work an entry was made from are kept; anything else of theirs is refused; a round-1 list of added works is not read", async () => {
     const p = await project();
-    const parent = entry(p, { state: "choose-works", works: [work(1), work(2)], moreWorks: true, morePeople: true, added: ["W1"] });
-    await append(p, [parent]);
+    const parent = entry(p, { state: "choose-works", works: [work(1), work(2)], moreWorks: true, morePeople: true });
+    const kid = entry(p, { parentId: parent.id, work: "W1" });
+    await append(p, [parent, kid]);
     expect((await read(p)).get(parent.id)).toEqual(parent);
+    expect((await read(p)).get(kid.id)).toEqual(kid);
     await expect(append(p, [entry(p, { morePeople: false as unknown as true })])).rejects.toBeInstanceOf(InvalidInputError);
-    await expect(append(p, [entry(p, { added: Array.from({ length: 201 }, (_, i) => `W${i}`) })])).rejects.toBeInstanceOf(InvalidInputError);
-    await expect(append(p, [entry(p, { added: [12 as unknown as string] })])).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(append(p, [entry(p, { work: "W".repeat(41) })])).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(append(p, [entry(p, { work: 12 as unknown as string })])).rejects.toBeInstanceOf(InvalidInputError);
+    // A line written in round 1 with a list of added works, and a person with sample titles: read without them.
+    const old = { ...entry(p, { state: "choose-person" }), added: ["W1"], people: [{ id: "A1", name: "Ann", worksCount: 1, sampleTitles: ["T"] }] };
+    await rawAppend(p, [old as unknown as FindEntry]);
+    const got = (await read(p)).get(old.id)!;
+    expect(got).not.toHaveProperty("added");
+    expect(got.people).toEqual([{ id: "A1", name: "Ann", worksCount: 1, subjects: [] }]);
   });
 
   it("an add with the parent's own line is ONE change: one audit entry with ids and counts only", async () => {
     const p = await project();
     const parent = entry(p, { state: "choose-works", works: [work(1), work(2)] });
     await append(p, [parent]);
-    const kids = [entry(p, { parentId: parent.id, chosen: "W1" }), entry(p, { parentId: parent.id, chosen: "W2" })];
+    const kids = [entry(p, { parentId: parent.id, work: "W1" }), entry(p, { parentId: parent.id, work: "W2" })];
     const before = (await findEvents(p)).length;
-    await appendFindEntries(coreOf(), p.id, kids, "add", [{ ...parent, added: ["W1", "W2"], updatedAt: "2026-11-13T10:00:01.000Z" }]);
+    await appendFindEntries(coreOf(), p.id, kids, "add", [{ ...parent, moreWorks: true, updatedAt: "2026-11-13T10:00:01.000Z" }]);
     const evs = await findEvents(p);
     expect(evs.length).toBe(before + 1);
     expect(evs.at(-1)!.details).toMatchObject({ op: FIND_QUEUE_OPS.add, entries: [...kids.map((k) => k.id), parent.id], count: 3 });
     const q = await read(p);
-    expect(q.get(parent.id)!.added).toEqual(["W1", "W2"]);
+    expect(q.get(parent.id)!.moreWorks).toBe(true);
     expect(q.get(kids[1]!.id)!.parentId).toBe(parent.id);
     expect(await auditText(p)).not.toContain("Invented Work");
   });
@@ -1112,13 +1120,13 @@ describe("Task F8 (R267): an author's entry, and works added from it with the en
     await append(p, [parent]);
     await append(p, [parent], "remove");
     const before = await readFile(queueFile(p));
-    await expect(appendFindEntries(coreOf(), p.id, [entry(p, { parentId: parent.id })], "add", [{ ...parent, added: ["W1"] }])).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(appendFindEntries(coreOf(), p.id, [entry(p, { parentId: parent.id })], "add", [{ ...parent, moreWorks: true }])).rejects.toBeInstanceOf(InvalidInputError);
     expect(await readFile(queueFile(p))).toEqual(before);
     const q = await project();
     const qp = entry(q, { state: "choose-works", works: [work(1)] });
     await append(q, [qp, ...Array.from({ length: FIND_QUEUE_MAX - 1 }, () => entry(q))]);
-    await expect(appendFindEntries(coreOf(), q.id, [entry(q, { parentId: qp.id })], "add", [{ ...qp, added: ["W1"] }])).rejects.toBeInstanceOf(FindQueueFullError);
-    expect((await read(q)).get(qp.id)!.added).toBeUndefined();
+    await expect(appendFindEntries(coreOf(), q.id, [entry(q, { parentId: qp.id })], "add", [{ ...qp, moreWorks: true }])).rejects.toBeInstanceOf(FindQueueFullError);
+    expect((await read(q)).get(qp.id)!.moreWorks).toBeUndefined();
     // Only with an add.
     await expect(appendFindEntries(coreOf(), q.id, [qp], "update", [qp])).rejects.toBeInstanceOf(InvalidInputError);
   });
@@ -1130,17 +1138,17 @@ describe("Task F8 (R267): an author's entry, and works added from it with the en
         const parent = entry(p, { state: "choose-works", works: [work(1), work(2), work(3)] });
         await append(p, [parent]);
         const before = await readFile(queueFile(p));
-        const kids = [1, 2, 3].map((n) => entry(p, { parentId: parent.id, chosen: `W${n}` }));
+        const kids = [1, 2, 3].map((n) => entry(p, { parentId: parent.id, work: `W${n}` }));
         seams.crashAt = point;
-        await expect(appendFindEntries(coreOf(), p.id, kids, "add", [{ ...parent, added: ["W1", "W2", "W3"] }])).rejects.toBeInstanceOf(SimulatedCrash);
+        await expect(appendFindEntries(coreOf(), p.id, kids, "add", [{ ...parent, moreWorks: true }])).rejects.toBeInstanceOf(SimulatedCrash);
         await reopen(p, encrypted);
         const q = await read(p);
         if (point === "before-marker-delete") {
           expect(kids.every((k) => q.has(k.id))).toBe(true);
-          expect(q.get(parent.id)!.added).toEqual(["W1", "W2", "W3"]);
+          expect(q.get(parent.id)!.moreWorks).toBe(true);
         } else {
           expect(kids.some((k) => q.has(k.id))).toBe(false);
-          expect(q.get(parent.id)!.added).toBeUndefined();
+          expect(q.get(parent.id)!.moreWorks).toBeUndefined();
           expect(await readFile(queueFile(p))).toEqual(before);
         }
         expect(await txnMarkers()).toEqual([]);

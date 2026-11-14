@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HttpClient } from "../lookup/http.js";
 import type { LookupContext } from "../lookup/context.js";
 import { InvalidInputError } from "../repo/errors.js";
+import { mapOpenAlex } from "../lookup/openalex.js";
 import type { WorkCandidate } from "./candidates.js";
 import {
   FIND_PEOPLE_MAX,
@@ -25,6 +26,7 @@ import {
   fitAuthorEntry,
   peopleSearchUrl,
   peopleSearchWanted,
+  sameWork,
   personWorksUrl,
   searchPeople,
   workUrl,
@@ -140,7 +142,7 @@ describe("searchPeople", () => {
     answer(pathOf(peopleSearchUrl("Arlie Hochschild")), people([person({ n: 1, name: "Arlie Hochschild", aff: "University of Invented Studies" })]));
     const r = await searchPeople(ref("Arlie Hochschild"), ctx());
     expect(seen).toEqual([pathOf(peopleSearchUrl("Arlie Hochschild"))]);
-    expect(r).toEqual({ people: [{ id: "A5001", name: "Arlie Hochschild", affiliation: "University of Invented Studies", worksCount: 12, sampleTitles: [] }], more: false });
+    expect(r).toEqual({ people: [{ id: "A5001", name: "Arlie Hochschild", affiliation: "University of Invented Studies", worksCount: 12, subjects: [] }], more: false });
   });
 
   it("forty people named Smith: Choose the person lists 20, says more exist, and nothing is added", async () => {
@@ -176,7 +178,7 @@ describe("searchPeople", () => {
     expect(a.affiliation!.length).toBe(200);
     expect(a.affiliation!.startsWith("Institute")).toBe(true);
     expect(a.worksCount).toBe(0);
-    expect(b).toEqual({ id: "A9", name: "Bea Smith", affiliation: "College of Made-up Things", worksCount: 0, sampleTitles: [] });
+    expect(b).toEqual({ id: "A9", name: "Bea Smith", affiliation: "College of Made-up Things", worksCount: 0, subjects: [] });
   });
 
   it("the daily allowance spent: the search is paused for every OpenAlex search, and nothing is guessed", async () => {
@@ -205,11 +207,11 @@ describe("searchPeople", () => {
 });
 
 describe("decidePerson (the Global Constraint's rule)", () => {
-  const p = (id: string, name: string): PersonCandidate => ({ id, name, worksCount: 3, sampleTitles: [] });
+  const p = (id: string, name: string): PersonCandidate => ({ id, name, worksCount: 3, subjects: [] });
   it("one Arlie Hochschild goes straight to Choose works, newest first", async () => {
     const found = [p("A1", "Arlie Russell Hochschild"), p("A2", "Adam Hochschild"), p("A3", "Arlie Hochstein")];
     const d = decidePerson(ref("Arlie Hochschild"), found, [cand("The Second Shift")]);
-    expect(d).toEqual({ kind: "one", person: found[0] });
+    expect(d).toEqual({ kind: "one", person: found[0], byInitial: false });
     // That person's works, newest first, whatever order they arrive in; two pages of 100 at most.
     const first = Array.from({ length: 100 }, (_, i) => oaWork({ n: i, title: `Invented Essay ${i}`, date: `${1980 + (i % 40)}-0${1 + (i % 9)}-15` }));
     const second = Array.from({ length: 30 }, (_, i) => oaWork({ n: 100 + i, title: `Invented Note ${i}`, date: `1979-01-${String(1 + (i % 28)).padStart(2, "0")}` }));
@@ -293,9 +295,9 @@ describe("worksOf and fetchWork", () => {
     expect(seen).toEqual(["/works/W101"]);
     expect(c).toMatchObject({ id: "W101", issued: "1999-05-01", identifiers: { doi: "10.5555/ao.f8.full" }, providers: ["openalex"], creators: [{ family: "Hochschild", given: "Arlie" }] });
     expect(c!.title.length).toBe(1000);
-    // An answer for another work is not taken; a missing work is null.
+    // An answer for another work is not taken: nothing found (R271 M3), as for a missing work.
     answer("/works/W102", oaWork({ n: 9, title: "Another", date: "2000-01-01" }));
-    await expect(fetchWork("W102", ctx())).rejects.toMatchObject({ code: "failed" });
+    expect(await fetchWork("W102", ctx())).toBeNull();
     answer("/works/W103", { error: "not found" }, 404);
     expect(await fetchWork("W103", ctx())).toBeNull();
   });
@@ -335,12 +337,12 @@ describe("what is stored fits by construction (A2: the store refuses, never cuts
         name: ch.repeat(200),
         affiliation: ch.repeat(1000),
         worksCount: 1_000_000,
-        sampleTitles: [ch.repeat(1000), ch.repeat(1000), ch.repeat(1000)],
+        subjects: [ch.repeat(1000), ch.repeat(1000), ch.repeat(1000)],
       }));
       const fitted = fitAuthorEntry(entry(works, ppl));
       expect(sanitizeEntry(fitted)).not.toBeNull();
-      // With every kept work added, the line still fits.
-      const full = { ...fitted, added: fitted.works!.map((w) => w.id), morePeople: true, moreWorks: true };
+      // With a reason, a time to try again and both flags (what a later line may add), the line still fits.
+      const full = { ...fitted, reason: { code: "no-legal-basis" as const, by: "settings" as const }, nextTryAt: "2026-11-14T00:00:00.000Z", morePeople: true as const, moreWorks: true as const };
       expect(Buffer.byteLength(JSON.stringify(sanitizeEntry(full)), "utf8")).toBeLessThanOrEqual(FIND_LINE_MAX_BYTES);
       expect(fitted.works!.length).toBeGreaterThan(0);
       expect(fitted.works!.length).toBeLessThan(200);
@@ -356,13 +358,13 @@ describe("what is stored fits by construction (A2: the store refuses, never cuts
       for (const p of fitted.people!) {
         expect(p.name.length).toBeLessThanOrEqual(200);
         expect((p.affiliation ?? "").length).toBeLessThanOrEqual(200);
-        expect(p.sampleTitles.length).toBeLessThanOrEqual(3);
-        for (const t of p.sampleTitles) expect(t.length).toBeLessThanOrEqual(200);
+        expect(p.subjects.length).toBeLessThanOrEqual(3);
+        for (const t of p.subjects) expect(t.length).toBeLessThanOrEqual(100);
       }
     });
   }
   it("20 people with long affiliations alone fit (Choose the person)", () => {
-    const ppl: PersonCandidate[] = Array.from({ length: 20 }, (_, i) => ({ id: `A${i + 1}`, name: "長".repeat(200), affiliation: "長".repeat(200), worksCount: 9, sampleTitles: ["長".repeat(200), "長".repeat(200), "長".repeat(200)] }));
+    const ppl: PersonCandidate[] = Array.from({ length: 20 }, (_, i) => ({ id: `A${i + 1}`, name: "長".repeat(200), affiliation: "長".repeat(200), worksCount: 9, subjects: ["長".repeat(100), "長".repeat(100), "長".repeat(100)] }));
     const e = { ...entry([], ppl), state: "choose-person" as const };
     delete (e as Partial<FindEntry>).works;
     delete (e as Partial<FindEntry>).chosen;
@@ -385,5 +387,150 @@ describe("the line typed for a work added from a person", () => {
     expect(Array.from(long).length).toBeLessThanOrEqual(500);
     // A one-character title with no author is still a line the queue keeps.
     expect(parseReference(childTyped({ ...w, title: "X", creators: [] }))).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 2 (R270 d, e; R271)
+
+describe("round 2: an initial counts, but always asks (R270 d)", () => {
+  const p = (id: string, name: string): PersonCandidate => ({ id, name, worksCount: 3, subjects: [] });
+  it("J. Smith against John Smith and Jane Smith: both fit, several", () => {
+    const found = [p("A1", "John Smith"), p("A2", "Jane Smith"), p("A3", "Adam Smith")];
+    expect(decidePerson(ref("J. Smith"), found, [])).toEqual({ kind: "several", people: [found[0], found[1]] });
+    expect(decidePerson(ref("J Smith"), found, [])).toEqual({ kind: "several", people: [found[0], found[1]] });
+  });
+  it("P. Bourdieu with one Pierre Bourdieu: one, matched by an initial (the runner asks)", () => {
+    const found = [p("A1", "Pierre Bourdieu"), p("A2", "Marie-Claire Bourdieu")];
+    expect(decidePerson(ref("P. Bourdieu"), found, [])).toEqual({ kind: "one", person: found[0], byInitial: true });
+  });
+  it("Pierre Bourdieu with one: one, not by an initial (straight to works as before)", () => {
+    expect(decidePerson(ref("Pierre Bourdieu"), [p("A1", "Pierre Bourdieu")], [])).toEqual({ kind: "one", person: p("A1", "Pierre Bourdieu"), byInitial: false });
+  });
+  it("a typed word of two letters or more is never an initial", () => {
+    expect(decidePerson(ref("Pi Bourdieu"), [p("A1", "Pierre Bourdieu")], [])).toEqual({ kind: "none" });
+  });
+});
+
+describe("round 2: subjects in place of sample titles (R270 e)", () => {
+  it("up to three subject names from the same answer: topics, else x_concepts; cleaned and cut to 100; nothing else asked", async () => {
+    answer(
+      pathOf(peopleSearchUrl("Smith")),
+      people([
+        { ...person({ n: 1, name: "Ann Smith" }), topics: [{ display_name: "Emotional Labour" }, { display_name: `Care\u0007 Work ${"x".repeat(300)}` }, { display_name: "Family Time" }, { display_name: "Fourth" }] },
+        { ...person({ n: 2, name: "Bea Smith" }), x_concepts: [{ display_name: "Sociology" }, { display_name: 12 }, null, { display_name: "Gender" }] },
+        { ...person({ n: 3, name: "Cy Smith" }), topics: [], x_concepts: [{ display_name: "Economics" }] },
+        { ...person({ n: 4, name: "Di Smith" }), topics: "not a list", x_concepts: { display_name: "nope" } },
+        { ...person({ n: 5, name: "Ed Smith" }), topics: [{ display_name: { nested: true } }, "Plain string"] },
+      ]),
+    );
+    const r = await searchPeople(ref("Smith"), ctx());
+    expect(seen).toHaveLength(1);
+    const [a, b, c, d, e] = r.people as PersonCandidate[];
+    expect(a!.subjects).toHaveLength(3);
+    expect(a!.subjects[0]).toBe("Emotional Labour");
+    expect(a!.subjects[1]!.startsWith("Care Work")).toBe(true);
+    expect(a!.subjects[1]!.length).toBe(100);
+    expect(b!.subjects).toEqual(["Sociology", "Gender"]);
+    expect(c!.subjects).toEqual(["Economics"]);
+    expect(d!.subjects).toEqual([]);
+    expect(e!.subjects).toEqual([]);
+  });
+});
+
+describe("round 2: hostile kinds of work (R271 M1)", () => {
+  it("a type such as constructor, __proto__ or toString is kind other, and the page's other works are kept", async () => {
+    const list = [
+      oaWork({ n: 1, title: "First Work", date: "2003-01-01" }),
+      oaWork({ n: 2, title: "Second Work", date: "2002-01-01", type: "constructor" }),
+      oaWork({ n: 3, title: "Third Work", date: "2001-01-01", type: "__proto__" }),
+      oaWork({ n: 4, title: "Fourth Work", date: "2000-01-01", type: "toString" }),
+      { id: "https://openalex.org/W105", title: "Fifth Work", publication_year: 1999, type: { not: "a string" } },
+    ];
+    answer(pathOf(personWorksUrl("A1", 1)), page(list, 5));
+    const r = await worksOf("A1", ctx());
+    expect(r.works.map((w) => w.id)).toEqual(["W101", "W102", "W103", "W104", "W105"]);
+    expect(r.works.map((w) => w.type)).toEqual(["article-journal", "other", "other", "other", "other"]);
+    // The entry that keeps them is one the store takes.
+    const e: FindEntry = { id: "01a1d5de-c95e-7508-a8a2-ace1aaa9259a", projectId: "P1", typed: "Arlie Hochschild", state: "choose-works", createdAt: "x", updatedAt: "x", attempts: 0, works: r.works };
+    expect(sanitizeEntry(e)).not.toBeNull();
+  });
+  it("a single work with such a type is kind other (the shared OpenAlex reader too)", async () => {
+    answer("/works/W101", oaWork({ n: 1, title: "A Work", date: "2001-01-01", type: "constructor" }));
+    expect((await fetchWork("W101", ctx()))!.type).toBe("other");
+    for (const t of ["constructor", "__proto__", "toString", "hasOwnProperty"]) expect(mapOpenAlex({ title: "x", type: t })!.type).toBe("other");
+  });
+});
+
+describe("round 2: a full page with no count means more (R271 M2)", () => {
+  it("20 people with no meta.count: more", async () => {
+    answer(pathOf(peopleSearchUrl("Smith")), { results: Array.from({ length: 20 }, (_, i) => person({ n: i, name: `Person${i} Smith` })) });
+    expect((await searchPeople(ref("Smith"), ctx())).more).toBe(true);
+  });
+  it("fewer than 20 people with no meta.count: no more", async () => {
+    answer(pathOf(peopleSearchUrl("Smith")), { results: [person({ n: 1, name: "Ann Smith" })] });
+    expect((await searchPeople(ref("Smith"), ctx())).more).toBe(false);
+  });
+  it("100 works with no count: the second page is asked; 200 with no count: more", async () => {
+    const all = Array.from({ length: 200 }, (_, i) => oaWork({ n: i, title: `Work ${i}`, date: "2001-01-01" }));
+    answer(pathOf(personWorksUrl("A1", 1)), { results: all.slice(0, 100) });
+    answer(pathOf(personWorksUrl("A1", 2)), { results: all.slice(100) });
+    const r = await worksOf("A1", ctx());
+    expect(seen).toHaveLength(2);
+    expect(r.works).toHaveLength(200);
+    expect(r.more).toBe(true);
+  });
+  it("100 then 30 with no count: two pages, no more", async () => {
+    const all = Array.from({ length: 130 }, (_, i) => oaWork({ n: i, title: `Work ${i}`, date: "2001-01-01" }));
+    answer(pathOf(personWorksUrl("A1", 1)), { results: all.slice(0, 100) });
+    answer(pathOf(personWorksUrl("A1", 2)), { results: all.slice(100) });
+    const r = await worksOf("A1", ctx());
+    expect(seen).toHaveLength(2);
+    expect(r).toMatchObject({ more: false });
+    expect(r.works).toHaveLength(130);
+  });
+});
+
+describe("round 2: a single work (R271 M3, M4)", () => {
+  it("a 429 that shows the allowance spent is the budget, not a failure", async () => {
+    answer("/works/W101", { error: "Rate limit exceeded", message: "You have exceeded your daily budget." }, 429);
+    await expect(fetchWork("W101", ctx())).rejects.toMatchObject({ name: "FindPeopleError", code: "budget" });
+  });
+  it("sameWork: the DOI kept must be the fresh one's; the title kept must begin the fresh one's (compared on the kept length)", () => {
+    const kept: WorkCandidate = { id: "W1", title: "The Managed Heart", creators: [], type: "book", identifiers: { doi: "10.5555/ao.f8.mh" }, providers: ["openalex"] };
+    const fresh: WorkCandidate = { ...kept, title: "The Managed Heart", creators: [{ family: "Hochschild", role: "author" }] };
+    expect(sameWork(kept, fresh)).toBe(true);
+    expect(sameWork(kept, { ...fresh, identifiers: { doi: "10.5555/other" } })).toBe(false);
+    expect(sameWork(kept, { ...fresh, identifiers: {} })).toBe(false);
+    expect(sameWork(kept, { ...fresh, title: "Something Else Entirely" })).toBe(false);
+    expect(sameWork({ ...kept, identifiers: {} }, { ...fresh, identifiers: { doi: "10.5555/x" } })).toBe(true);
+    // A kept title cut at 300 characters (mid-word) is the beginning of the fresh, longer one.
+    const long = `The Managed Heart ${"commercialization of human feeling ".repeat(20)}`.trim();
+    const cutKept = long.slice(0, 300).trimEnd();
+    expect(sameWork({ ...kept, title: cutKept }, { ...fresh, title: long })).toBe(true);
+    expect(sameWork({ ...kept, title: cutKept }, { ...fresh, title: `Another Title ${long}` })).toBe(false);
+    // Punctuation and case are not a difference.
+    expect(sameWork(kept, { ...fresh, title: "the managed heart." })).toBe(true);
+  });
+  it("once a person is chosen, morePeople is dropped (R271 M6)", () => {
+    const e: FindEntry = {
+      id: "01a1d5de-c95e-7508-a8a2-ace1aaa9259a",
+      projectId: "P1",
+      typed: "Smith",
+      state: "looking-up",
+      createdAt: "x",
+      updatedAt: "x",
+      attempts: 0,
+      chosen: "A2",
+      morePeople: true,
+      people: [
+        { id: "A1", name: "Ann Smith", worksCount: 1, subjects: [] },
+        { id: "A2", name: "Bea Smith", worksCount: 1, subjects: [] },
+      ],
+    };
+    const f = fitAuthorEntry(e);
+    expect(f.people!.map((x) => x.id)).toEqual(["A2"]);
+    expect(f.morePeople).toBeUndefined();
+    expect(fitAuthorEntry({ ...e, state: "choose-person" }).morePeople).toBe(true);
   });
 });

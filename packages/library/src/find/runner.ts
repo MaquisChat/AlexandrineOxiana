@@ -71,7 +71,7 @@ import {
 } from "../repo/repo.js";
 import { libraryVersion } from "../resources.js";
 import type { WorkCandidate } from "./candidates.js";
-import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, childTyped, decidePerson, fetchWork, fitAuthorEntry, isPersonId, isWorkId, peopleSearchWanted, searchPeople, worksOf } from "./people.js";
+import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, childTyped, decidePerson, fetchWork, fitAuthorEntry, isPersonId, isWorkId, peopleSearchWanted, sameWork, searchPeople, worksOf } from "./people.js";
 import { FindQueueUnreadableError, sanitizeEntry } from "./queue-store.js";
 import { parseReference, type Reference } from "./reference.js";
 import { decideMatch, openAlexSearchPausedUntil, scoreCandidate, searchWorks, type SearchSource } from "./search.js";
@@ -398,6 +398,31 @@ function matchOf(e: FindEntry, cand: WorkCandidate): FindMatch {
   if (e.match) return e.match;
   const ref = parseReference(e.typed);
   return { method: "find-match", confidence: ref ? scoreCandidate(ref, cand).score : 0 };
+}
+
+/**
+ * Task F8: the OpenAlex work an entry was made from, when it was made from an author's entry (`parentId`): its `work`
+ * (or, on a line written before R271, its `chosen` if that is a work's id).
+ */
+function workOfAdded(e: FindEntry): string | undefined {
+  if (e.parentId === undefined) return undefined;
+  if (isWorkId(e.work)) return e.work;
+  return isWorkId(e.chosen) ? e.chosen : undefined;
+}
+
+/**
+ * R271 M5: the works counted as added from the author's entry `parentId` — those of the LIVE entries made from it
+ * (`readFindQueue` gives live entries only). Worked out at each use, never stored: an entry the researcher removed
+ * frees its work to be added again. Used by `chooseWorks`, and by the service for `addedCount` and `options`.
+ */
+export function worksAddedFrom(entries: Iterable<FindEntry>, parentId: string): Set<string> {
+  const out = new Set<string>();
+  for (const e of entries) {
+    if (e.parentId !== parentId || e.removed) continue;
+    const w = workOfAdded(e);
+    if (w) out.add(w);
+  }
+  return out;
 }
 
 /** The time (ms since the epoch) a UUIDv7 was made: its first 48 bits. */
@@ -797,6 +822,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   interface CompleteOpts {
     match: FindMatch;
+    /** F8: the candidate is a fresh record that replaces the entry's candidates. */
+    fresh?: boolean;
     /** The entry must be as this says (else nothing is done and null returned). */
     expect: (e: FindEntry) => boolean;
     /** A likely duplicate does not stop it (the researcher said it is not the same work). */
@@ -816,7 +843,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     // The candidate as the queue keeps it: what is checked, stored and made is one and the same (M2).
     const cand = boundCandidate(given);
     const at = stamp();
-    const keep = { candidates: cur.candidates?.some((c) => c.id === cand.id) ? cur.candidates : [cand], chosen: cand.id, match: o.match };
+    // A work added from an author's entry (F8) keeps its fresh record as its one candidate: anything made from it later
+    // (a duplicate answered, "add it here as well") is made from the fresh record, never from the line kept for choosing.
+    const keep = { candidates: !o.fresh && cur.candidates?.some((c) => c.id === cand.id) ? cur.candidates : [cand], chosen: cand.id, match: o.match };
     // Once the record is made, its entry's line is written whatever happened meanwhile (`force`): a stop or a close
     // waits for this turn (R247 d), and a lock in between is healed at `resume` (R247 e).
     const settle = async (patch: Partial<FindEntry>, drop: Array<keyof FindEntry> = [], force = false) => {
@@ -1073,7 +1102,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
 
     // Task F8: a work added from a person's list, or a person chosen. Both are OpenAlex's alone.
-    const addedWork = entry.parentId !== undefined && isWorkId(entry.chosen);
+    const addedWork = workOfAdded(entry);
     const chosenPerson = !addedWork && isPersonId(entry.chosen) && !!entry.people?.some((x) => x.id === entry.chosen);
     if (addedWork || chosenPerson) {
       if (!on.includes("openalex")) {
@@ -1091,19 +1120,28 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // duplicate check and the record, exactly as for a chosen candidate.
       let got: WorkCandidate | null;
       try {
-        got = await guard(r, fetchWork(entry.chosen!, ctx), FIND_LOOKUP_TIMEOUT_MS);
+        got = await guard(r, fetchWork(addedWork, ctx), FIND_LOOKUP_TIMEOUT_MS);
       } catch (err) {
         if (await notHad(err)) return;
         throw err;
       }
       if (!live()) return;
       if (!got) {
+        // No such work, or OpenAlex answered for another one (R271 M3): nothing found, never "could not be reached".
         await finish({ state: "not-found" }, ["nextTryAt", "reason"]);
         return;
       }
       const work = got;
+      // R271 M4: the fresh record must BE the work ticked (the DOI and the title kept for choosing). Otherwise — or
+      // when nothing was kept to compare with — the researcher is asked, with that one fresh candidate; nothing is
+      // made by itself.
+      const kept = entry.candidates?.find((c) => c.id === addedWork);
+      if (!kept || !sameWork(kept, work)) {
+        await finish({ state: "choose", candidates: [work] }, ["nextTryAt", "reason", "chosen", "match"]);
+        return;
+      }
       try {
-        await inTurn(r, pid, live, () => completeIn(pid, eid, work, { match: { method: "find-chosen", confidence: 1 }, expect: (cur) => sameVersion(cur, entry), live }));
+        await inTurn(r, pid, live, () => completeIn(pid, eid, work, { match: { method: "find-chosen", confidence: 1 }, expect: (cur) => sameVersion(cur, entry), live, fresh: true }));
       } catch (err) {
         if (!(err instanceof FindIndexNotReadyError)) throw err;
         enqueue(pid, eid);
@@ -1159,7 +1197,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const more = found.more ? { morePeople: true as const } : {};
       const drop: Array<keyof FindEntry> = ["nextTryAt", "reason", "candidates", "chosen", "works", "morePeople", "moreWorks", "match"];
       // More people than the 20 read may fit as well: the one that fitted is offered, never chosen in silence.
-      if (who.kind === "several" || (who.kind === "one" && found.more)) {
+      // Nor when the one that fitted did so only through a typed initial (R270 d).
+      if (who.kind === "several" || (who.kind === "one" && (found.more || who.byInitial))) {
         await finish({ state: "choose-person", people: who.kind === "one" ? [who.person] : who.people, ...more }, drop);
         return;
       }
@@ -1348,8 +1387,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       cancelLater(projectId, entryId);
       // F8: a work added from a person's list keeps its work (it is asked again by its id, never searched by text),
       // and an author's entry keeps the person whose works did not come.
-      const keepChosen = (cur.parentId !== undefined && isWorkId(cur.chosen)) || (isPersonId(cur.chosen) && !!cur.people?.some((x) => x.id === cur.chosen));
-      const drop: Array<keyof FindEntry> = ["reason", "nextTryAt", "candidates", "duplicateOf", "elsewhere", "match", ...(keepChosen ? [] : (["chosen"] as const))];
+      // An added work keeps `work` (never dropped); the line kept for choosing (its candidate) is kept only when no fresh
+      // record replaced it — a "failed" entry — so that a researcher's "None of these" is never undone by a retry: with
+      // nothing to compare with, the work is asked about again.
+      const keepCandidates = workOfAdded(cur) !== undefined && cur.state === "failed" && cur.candidates?.some((c) => c.id === workOfAdded(cur));
+      const keepChosen = isPersonId(cur.chosen) && !!cur.people?.some((x) => x.id === cur.chosen);
+      const drop: Array<keyof FindEntry> = ["reason", "nextTryAt", "duplicateOf", "elsewhere", "match", ...(keepCandidates ? [] : (["candidates"] as const)), ...(keepChosen ? [] : (["chosen"] as const))];
       const [next] = await write(projectId, [evolve(cur, { state: "looking-up", attempts: 0 }, drop, stamp())], "update");
       return next!;
     });
@@ -1525,7 +1568,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // One of THAT entry's people: no request can make the app fetch an arbitrary author (R267 e).
       if (!cur.people?.some((x) => x.id === personId)) throw new FindUnknownOptionError("person");
       cancelLater(projectId, entryId);
-      const [next] = await write(projectId, [evolve(cur, { state: "looking-up", chosen: personId, attempts: 0 }, ["reason", "nextTryAt", "works", "moreWorks"], stamp())], "update");
+      // "More people have this name" is no longer said once a person is chosen (R271 M6).
+      const [next] = await write(projectId, [evolve(cur, { state: "looking-up", chosen: personId, attempts: 0 }, ["reason", "nextTryAt", "works", "moreWorks", "morePeople"], stamp())], "update");
       return next!;
     });
     // The person's works are asked by the runner's own work, like every lookup (time-limited, retried, waiting for the allowance).
@@ -1548,7 +1592,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       if (cur.state !== "choose-works") throw new FindEntryStateError();
       const offered = new Map((cur.works ?? []).map((x) => [x.id, x]));
-      const already = new Set(cur.added ?? []);
+      // R271 M5: what was added is worked out from the queue's live entries (in this turn, so two calls at once add a
+      // work once); an entry the researcher removed frees its work to be added again.
+      const already = worksAddedFrom((await readFindQueueIn(repo, projectId)).values(), entryId);
       workIds.forEach((id, i) => {
         // One of THAT entry's works (R267 e), and not one already added from it (named by its position only).
         if (!offered.has(id)) throw new FindUnknownOptionError("work");
@@ -1565,11 +1611,14 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         updatedAt: at,
         attempts: 0,
         parentId: entryId,
-        chosen: id,
+        // The work it is made from (set once), and the line kept for choosing, which its fresh record must match (M4).
+        work: id,
+        candidates: [offered.get(id)!],
       }));
-      // The new entries and the parent's own new line in ONE governed change: a crash leaves all of it or none. The
-      // parent stays "choose-works" (more of that person's works can be added later; it ends when it is removed).
-      const written = await write(projectId, kids, "add", [evolve(cur, { added: [...(cur.added ?? []), ...ids] }, [], at)]);
+      // The new entries and the parent's own new line in ONE governed change: a crash leaves all of it or none, and a
+      // parent removed meanwhile refuses the whole. The parent stays "choose-works" (more of that person's works can be
+      // added later; it ends when it is removed).
+      const written = await write(projectId, kids, "add", [evolve(cur, {}, [], at)]);
       return { added: written.slice(0, kids.length), parent: written[kids.length]! };
     });
     for (const k of done.added) enqueue(projectId, k.id);

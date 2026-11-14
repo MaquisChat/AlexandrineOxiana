@@ -14,6 +14,7 @@
  * list; both count against the daily allowance and both stop while it is paused (the works search's pause, shared:
  * `openAlexSearchPaused`). A single work by its id is free and is asked whatever the pause.
  */
+import { SourceType, normalizeTitle } from "@ao/core";
 import { InvalidInputError } from "../repo/errors.js";
 import { parseName } from "../extract/names.js";
 import { isSensitive, providerAllowed, type LookupContext } from "../lookup/context.js";
@@ -37,8 +38,9 @@ export const FIND_PERSON_VENUE_MAX = 100;
 export const FIND_PERSON_NAME_MAX = 200;
 /** A work's first author kept for choosing (and for the line typed for it) is cut to this many characters. */
 const FIRST_AUTHOR_MAX = 100;
-/** At most this many sample titles per person, each cut to FIND_PERSON_NAME_MAX. */
-export const FIND_PERSON_SAMPLE_TITLES = 3;
+/** At most this many subject names per person (R270 e), each cut to FIND_PERSON_SUBJECT_MAX. */
+export const FIND_PERSON_SUBJECTS = 3;
+export const FIND_PERSON_SUBJECT_MAX = 100;
 /** The people search is asked only for a line of at most this many words … */
 export const FIND_PEOPLE_WORDS_MAX = 6;
 /** … and only when no work candidate covers this much of its title (a title is then plainly meant). */
@@ -51,6 +53,8 @@ const TYPED_MAX = 500;
 const RAW_MAX = 4000;
 const SEARCH_TTL_DAYS = 7;
 
+/** The kinds of work the library knows: a work of any other kind is never kept (R271 M1). */
+const SOURCE_TYPES: readonly string[] = SourceType.options;
 const PERSON_ID = /^A\d{1,12}$/u;
 const WORK_ID = /^W\d{1,12}$/u;
 const PERSON_URI = /^https:\/\/openalex\.org\/(A\d{1,12})$/u;
@@ -118,8 +122,28 @@ function personOf(v: unknown): PersonCandidate | null {
   const affiliation = text(inst?.display_name, FIND_PERSON_NAME_MAX);
   const wc = v.works_count;
   const worksCount = typeof wc === "number" && Number.isSafeInteger(wc) && wc >= 0 ? wc : 0;
-  // OpenAlex's author carries no work titles, and asking for them would cost a request per person: none are kept.
-  return { id, name, ...(affiliation ? { affiliation } : {}), worksCount, sampleTitles: [] };
+  // R270 e: no sample titles (a request per person); up to three subject names from this same answer instead.
+  return { id, name, ...(affiliation ? { affiliation } : {}), worksCount, subjects: subjectsOf(v) };
+}
+
+/**
+ * Up to FIND_PERSON_SUBJECTS subject names of a person, from the same answer: `topics[].display_name`, else
+ * `x_concepts[].display_name` (UNVERIFIED shapes: anything else gives none, never an error); each cleaned and cut to
+ * FIND_PERSON_SUBJECT_MAX.
+ */
+function subjectsOf(v: Record<string, unknown>): string[] {
+  const names = (list: unknown): string[] => {
+    if (!Array.isArray(list)) return [];
+    const out: string[] = [];
+    for (const item of list.slice(0, 20)) {
+      const name = isRecord(item) ? text(item.display_name, FIND_PERSON_SUBJECT_MAX) : undefined;
+      if (name && !out.includes(name)) out.push(name);
+      if (out.length >= FIND_PERSON_SUBJECTS) break;
+    }
+    return out;
+  };
+  const topics = names(v.topics);
+  return topics.length ? topics : names(v.x_concepts);
 }
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
@@ -172,22 +196,39 @@ export function peopleSearchWanted(ref: Reference, candidates: WorkCandidate[]):
   return candidates.every((c) => scoreCandidate(ref, c).titleCover < FIND_PEOPLE_TITLE_COVER);
 }
 
-export type PersonDecision = { kind: "one"; person: PersonCandidate } | { kind: "several"; people: PersonCandidate[] } | { kind: "none" };
+export type PersonDecision = { kind: "one"; person: PersonCandidate; byInitial: boolean } | { kind: "several"; people: PersonCandidate[] } | { kind: "none" };
 
 /**
  * The Global Constraint's person rule, exactly: a person fits when the tokens of their name (`normalizeTitle` words, as
  * the typed tokens) cover EVERY typed token, and no work candidate has `titleCover` ≥ 0.6. Exactly one person fits:
  * "one" (the runner goes to that person's works); more than one: "several", those that fit, in OpenAlex's order (never
  * a silent choice among them); none: "none" (the entry stays whatever the works search made it).
+ * R270 d: a typed single letter is covered by a name token that begins with it ("J. Smith", "P. Bourdieu"); "one"
+ * then says `byInitial`, and the runner asks which person is meant even though only one fits.
  */
 export function decidePerson(ref: Reference, people: PersonCandidate[], works: WorkCandidate[]): PersonDecision {
   if (!ref.tokens.length) return { kind: "none" };
   if (works.some((c) => scoreCandidate(ref, c).titleCover >= FIND_PEOPLE_TITLE_COVER)) return { kind: "none" };
-  const fits = people.filter((p) => {
-    const named = new Set(tokensOf(cut(p.name, FIND_PERSON_NAME_MAX)));
-    return ref.tokens.every((t) => named.has(t));
-  });
-  if (fits.length === 1) return { kind: "one", person: fits[0]! };
+  // R270 d: a typed single letter (with or without a full stop: "J." is the token "j") is covered by a name token that
+  // begins with it. A person who fits only because a typed word matched as an initial is never chosen in silence.
+  const isInitial = (t: string) => Array.from(t).length === 1 && /^\p{L}$/u.test(t);
+  const fitOf = (p: PersonCandidate): { fits: boolean; byInitial: boolean } => {
+    const named = tokensOf(cut(p.name, FIND_PERSON_NAME_MAX));
+    const set = new Set(named);
+    let byInitial = false;
+    for (const t of ref.tokens) {
+      if (set.has(t)) continue;
+      if (isInitial(t) && named.some((n) => n.startsWith(t))) {
+        byInitial = true;
+        continue;
+      }
+      return { fits: false, byInitial };
+    }
+    return { fits: true, byInitial };
+  };
+  const judged = people.map((p) => ({ p, ...fitOf(p) })).filter((x) => x.fits);
+  const fits = judged.map((x) => x.p);
+  if (fits.length === 1) return { kind: "one", person: fits[0]!, byInitial: judged[0]!.byInitial };
   if (fits.length > 1) return { kind: "several", people: fits };
   return { kind: "none" };
 }
@@ -239,7 +280,9 @@ export async function searchPeople(ref: Reference, ctx: LookupContext): Promise<
     const p = personOf(item);
     if (p && !people.some((x) => x.id === p.id)) people.push(p);
   }
-  return { people, more: (count ?? 0) > FIND_PEOPLE_MAX || items.length > FIND_PEOPLE_MAX };
+  // R271 M2: with no count, a full page means more may exist (so the app asks rather than choose in silence).
+  const more = count === undefined ? items.length >= FIND_PEOPLE_MAX : count > FIND_PEOPLE_MAX || items.length > FIND_PEOPLE_MAX;
+  return { people, more };
 }
 
 /**
@@ -253,15 +296,26 @@ export async function worksOf(personId: string, ctx: LookupContext): Promise<{ w
   if (!providerAllowed(ctx, "openalex")) return { works: [], more: false };
   const first = await askListed(ctx, personWorksUrl(personId, 1), `find:openalex:person-works:${personId}:1`);
   let items = first.items.slice(0, FIND_PERSON_WORKS_PAGE);
-  const count = first.count ?? items.length;
-  if (items.length >= FIND_PERSON_WORKS_PAGE && count > FIND_PERSON_WORKS_PAGE) {
+  // R271 M2: an answer with no count is taken as "more may exist" when its page is full.
+  const count = first.count;
+  const firstFull = items.length >= FIND_PERSON_WORKS_PAGE;
+  let lastFull = firstFull;
+  if (firstFull && (count === undefined || count > FIND_PERSON_WORKS_PAGE)) {
     const second = await askListed(ctx, personWorksUrl(personId, 2), `find:openalex:person-works:${personId}:2`);
-    items = [...items, ...second.items.slice(0, FIND_PERSON_WORKS_PAGE)];
+    const more = second.items.slice(0, FIND_PERSON_WORKS_PAGE);
+    lastFull = more.length >= FIND_PERSON_WORKS_PAGE;
+    items = [...items, ...more];
   }
   const works: WorkCandidate[] = [];
   for (const item of items) {
-    const w = personWorkOf(item);
-    if (w && !works.some((x) => x.id === w.id)) works.push(w);
+    // One bad item is skipped, never the whole list (R271 M1).
+    let w: WorkCandidate | null = null;
+    try {
+      w = personWorkOf(item);
+    } catch {
+      w = null;
+    }
+    if (w && SOURCE_TYPES.includes(w.type) && !works.some((x) => x.id === w.id)) works.push(w);
   }
   // Newest first whatever order they came in (a date or a year; undated last), keeping OpenAlex's order otherwise.
   const kept = works
@@ -269,7 +323,7 @@ export async function worksOf(personId: string, ctx: LookupContext): Promise<{ w
     .sort((a, b) => (b.w.issued ?? "").localeCompare(a.w.issued ?? "") || a.i - b.i)
     .map((x) => x.w)
     .slice(0, FIND_PERSON_WORKS_MAX);
-  return { works: kept, more: count > kept.length };
+  return { works: kept, more: count === undefined ? lastFull : count > kept.length };
 }
 
 /**
@@ -281,6 +335,7 @@ export async function fetchWork(workId: string, ctx: LookupContext): Promise<Wor
   if (!isWorkId(workId)) throw new InvalidInputError("That is not a work's id that OpenAlex gives.");
   if (!providerAllowed(ctx, "openalex")) return null;
   let found: WorkCandidate | null = null;
+  let other = false;
   const check = (body: string) => {
     let json: unknown;
     try {
@@ -288,16 +343,41 @@ export async function fetchWork(workId: string, ctx: LookupContext): Promise<Wor
     } catch {
       throw new BadAnswer();
     }
-    // The answer must be the work asked for, and a work with a title.
-    if (!isRecord(json) || typeof json.id !== "string" || (WORK_URI.exec(json.id)?.[1] ?? json.id) !== workId) throw new BadAnswer();
-    found = openAlexCandidate(json);
+    if (!isRecord(json) || typeof json.id !== "string") throw new BadAnswer();
+    // An answer for ANOTHER work (a merged work, say) is not this work: nothing found (R271 M3), never a retry.
+    if ((WORK_URI.exec(json.id)?.[1] ?? json.id) !== workId) {
+      other = true;
+      return;
+    }
+    // A work with a title; one bad field (a hostile kind, say) never throws out of here (R271 M1).
+    try {
+      found = openAlexCandidate(json);
+    } catch {
+      found = null;
+    }
     if (!found) throw new BadAnswer();
   };
   try {
-    const body = await ctx.http.getText(workUrl(workId), { cacheKey: `find:openalex:work:${workId}`, ttlDays: SEARCH_TTL_DAYS, sensitive: isSensitive(ctx), validate: check });
+    const body = await ctx.http.getText(workUrl(workId), {
+      cacheKey: `find:openalex:work:${workId}`,
+      ttlDays: SEARCH_TTL_DAYS,
+      sensitive: isSensitive(ctx),
+      validate: check,
+      final429: (a) => isOpenAlexBudgetSpent(a, nowOf(ctx)),
+    });
     if (body === null) return null;
-    if (!found) check(body);
+    if (!found && !other) check(body);
+    if (other) {
+      ctx.debug?.("a single work via openalex answered for another work: not found");
+      return null;
+    }
   } catch (e) {
+    // A 429 that shows the daily allowance spent: the wait, as for every OpenAlex request (R271 M3).
+    if (e instanceof LookupHttpError && e.status === 429 && e.rateLimit?.final) {
+      pauseOpenAlexSearches(ctx, e.rateLimit.reset);
+      ctx.debug?.("a single work via openalex: its free daily allowance is used up");
+      throw new FindPeopleError("budget");
+    }
     const status = e instanceof LookupHttpError && e.status ? ` (HTTP ${e.status})` : e instanceof BadAnswer ? " (an answer of another shape)" : "";
     ctx.debug?.(`a single work via openalex failed${status}`);
     throw new FindPeopleError("failed");
@@ -311,7 +391,7 @@ export async function fetchWork(workId: string, ctx: LookupContext): Promise<Wor
 function boundPerson(p: PersonCandidate): PersonCandidate {
   const name = cut(p.name, FIND_PERSON_NAME_MAX);
   const affiliation = p.affiliation === undefined ? undefined : cut(p.affiliation, FIND_PERSON_NAME_MAX);
-  return { id: p.id, name, ...(affiliation ? { affiliation } : {}), worksCount: p.worksCount, sampleTitles: p.sampleTitles.slice(0, FIND_PERSON_SAMPLE_TITLES).map((t) => cut(t, FIND_PERSON_NAME_MAX)) };
+  return { id: p.id, name, ...(affiliation ? { affiliation } : {}), worksCount: p.worksCount, subjects: (p.subjects ?? []).slice(0, FIND_PERSON_SUBJECTS).map((t) => cut(t, FIND_PERSON_SUBJECT_MAX)) };
 }
 
 function boundWork(w: WorkCandidate): WorkCandidate {
@@ -343,8 +423,8 @@ const bytes = (v: unknown) => Buffer.byteLength(JSON.stringify(v), "utf8");
  * An author's entry (people, works) as the queue keeps it, so that its line fits FIND_LINE_MAX_BYTES by construction
  * (A2: the store refuses a longer line and never cuts it). Every person and work is bounded (a name and an affiliation
  * 200, a work's title 300 and where published 100, its first author only); once a person is chosen only that person
- * is kept beside the works. The size is measured as if every kept work were already added (`added` with all their ids)
- * and both "more" flags were set, so that no later line of this entry can grow past the bound. When it would not fit,
+ * is kept beside the works (and `morePeople` is dropped). The size is measured as if a reason, a time to try again and
+ * both "more" flags were set, so that no later line of this entry can grow past the bound. When it would not fit,
  * fewer works are kept — the newest — and `moreWorks` is set; failing that, fewer people, and `morePeople` is set.
  */
 export function fitAuthorEntry(e: FindEntry): FindEntry {
@@ -353,7 +433,11 @@ export function fitAuthorEntry(e: FindEntry): FindEntry {
   const works = e.works?.slice(0, FIND_PERSON_WORKS_MAX).map(boundWork);
   let morePeople = e.morePeople === true || (e.people?.length ?? 0) > FIND_PEOPLE_MAX;
   let moreWorks = e.moreWorks === true || (e.works?.length ?? 0) > FIND_PERSON_WORKS_MAX;
-  if (people && e.state !== "choose-person" && e.chosen && people.some((p) => p.id === e.chosen)) people = people.filter((p) => p.id === e.chosen);
+  if (people && e.state !== "choose-person" && e.chosen && people.some((p) => p.id === e.chosen)) {
+    // Once a person is chosen only that person is kept, and "more people have this name" is no longer said (R271 M6).
+    people = people.filter((p) => p.id === e.chosen);
+    morePeople = false;
+  }
   const build = (ps: PersonCandidate[] | undefined, n: number, probe: boolean): FindEntry => {
     const out: Record<string, unknown> = { ...e };
     delete out.people;
@@ -364,7 +448,11 @@ export function fitAuthorEntry(e: FindEntry): FindEntry {
     if (ps) out.people = ps;
     if (kept) out.works = kept;
     if (probe) {
-      out.added = [...new Set([...(e.added ?? []), ...(kept ?? []).map((w) => w.id)])];
+      // Room for what a later line of this entry may add (a reason and a time to try again, R271 M5: no list of
+      // works added is stored any more).
+      out.reason = { code: "no-legal-basis", by: "settings" };
+      out.nextTryAt = "2026-11-14T00:00:00.000Z";
+      out.attempts = Number.MAX_SAFE_INTEGER;
       out.morePeople = true;
       out.moreWorks = true;
     } else {
@@ -376,7 +464,7 @@ export function fitAuthorEntry(e: FindEntry): FindEntry {
   const fits = (ps: PersonCandidate[] | undefined, n: number) => bytes(build(ps, n, true)) <= FIND_LINE_MAX_BYTES;
   // People first (they must fit with no works), dropping sample titles, then the last people.
   if (people && !fits(people, 0)) {
-    people = people.map((p) => ({ ...p, sampleTitles: [] }));
+    people = people.map((p) => ({ ...p, subjects: [] }));
     while (people.length > 1 && !fits(people, 0)) {
       people = people.slice(0, -1);
       morePeople = true;
@@ -403,6 +491,22 @@ export function fitAuthorEntry(e: FindEntry): FindEntry {
  * family name; cut to 100) — "The Managed Heart, Hochschild" — or the title alone when it has no author. At most 402
  * characters, so within a typed line's 2–500; a line that would be shorter than 2 characters gets the work's id after it.
  */
+/**
+ * R271 M4: whether the fresh record of a ticked work (`fresh`, from `works/<id>`) IS the work kept for choosing (`kept`):
+ *  - when a DOI was kept, the fresh one has that same DOI;
+ *  - the title's normalised words agree on the kept length: the fresh title is cut to the kept title's length (the
+ *    kept one was cut there from the same text, so a word cut in the middle is cut alike in both).
+ * Otherwise the entry asks ("choose", with that one fresh candidate) and nothing is made by itself.
+ */
+export function sameWork(kept: WorkCandidate, fresh: WorkCandidate): boolean {
+  const keptDoi = kept.identifiers.doi?.toLowerCase();
+  if (keptDoi && fresh.identifiers.doi?.toLowerCase() !== keptDoi) return false;
+  const words = (s: string) => normalizeTitle(s.replace(/[^\p{L}\p{N}\p{M}]+/gu, " ")).split(" ").filter(Boolean).join(" ");
+  const keptTitle = cleanText(kept.title);
+  const a = words(keptTitle);
+  return a !== "" && a === words(cleanText(fresh.title).slice(0, keptTitle.length));
+}
+
 export function childTyped(w: WorkCandidate): string {
   const title = cut(cleanText(w.title), FIND_PERSON_TITLE_MAX);
   const first = w.creators[0];

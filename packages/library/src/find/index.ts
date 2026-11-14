@@ -17,6 +17,7 @@ export {
   FindProjectStoppedError,
   FindRunnerClosedError,
   FindUnknownOptionError,
+  worksAddedFrom,
   createFindRunner,
   readFindQueueOf,
 } from "./runner.js";
@@ -50,6 +51,7 @@ export {
   isPersonId,
   isWorkId,
   peopleSearchWanted,
+  sameWork,
 } from "./people.js";
 export type { PersonDecision } from "./people.js";
 // Task F10: where a free copy is, and its bounded download (used by the runner in F11).

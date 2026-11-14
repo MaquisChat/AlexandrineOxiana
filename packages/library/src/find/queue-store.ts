@@ -177,7 +177,8 @@ function personOf(x: unknown): PersonCandidate {
   let out: Record<string, unknown> = { id: str(p.id, 64, 1), name: str(p.name, NAME_MAX) };
   out = put(out, "affiliation", opt(p.affiliation, (v) => str(v, TITLE_MAX)));
   out.worksCount = wc;
-  out.sampleTitles = list(p.sampleTitles, 3, (t) => str(t, TITLE_MAX));
+  // R270 e: subject names in place of sample titles. A line written before (with `sampleTitles`, never released) reads with none.
+  out.subjects = p.subjects === undefined ? [] : list(p.subjects, 3, (t) => str(t, 100));
   return out as unknown as PersonCandidate;
 }
 
@@ -242,10 +243,12 @@ export function sanitizeEntry(x: unknown): FindEntry | null {
     out = put(out, "nextTryAt", opt(e.nextTryAt, (v) => str(v, 64)));
     out = put(out, "parentId", opt(e.parentId, id));
     out = put(out, "offers", opt(e.offers, (v) => list(v, 20, offerOf)));
-    // Task F8 (R267): an author's entry says whether more people or works exist than are kept, and which works were added.
+    // Task F8 (R267): an author's entry says whether more people or works exist than are kept; an entry made from it
+    // names the work it was made from (R271 M5: what was added is worked out from these, never stored; a round-1
+    // line's `added` list is not read).
     out = put(out, "morePeople", e.morePeople);
     out = put(out, "moreWorks", e.moreWorks);
-    out = put(out, "added", opt(e.added, (v) => list(v, WORKS_MAX, (w) => str(w, 40, 1))));
+    out = put(out, "work", opt(e.work, (v) => str(v, 40, 1)));
     out = put(out, "removed", e.removed);
     return out as unknown as FindEntry;
   } catch (err) {
