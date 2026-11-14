@@ -454,13 +454,19 @@ async function stopService(child: ChildProcess): Promise<string[]> {
   return problems;
 }
 
-export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl: boolean; shellStub: boolean }>({
+export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl: boolean; shellStub: boolean; serviceEnv: Record<string, string> }>({
   /** `test.use({ fakeControl: true })`: the test tells the fakes what to answer (app.fakes, FakeControl). */
   fakeControl: [false, { option: true }],
   /** `test.use({ shellStub: true })`: the page believes it runs in the desktop app, whose folder chooser is `app.chooser` (ShellChooser). */
   shellStub: [false, { option: true }],
+  /**
+   * Task Z11: more environment for every service this test starts (a restart included), on top of the harness's own,
+   * e.g. the test-only switches AO_SECRETS, AO_ZOTERO_API_ORIGIN and AO_ZOTERO_TICK_MS (honoured only under
+   * NODE_ENV=test, which the harness sets). A spec may override it with a fixture that depends on its own (a stand-in's port).
+   */
+  serviceEnv: [{}, { option: true }],
 
-  app: async ({ fakeControl, shellStub }, use, testInfo) => {
+  app: async ({ fakeControl, shellStub, serviceEnv }, use, testInfo) => {
     const root = await mkdtemp(join(tmpdir(), "ao-e2e-"));
     const configDir = join(root, "config");
     const librariesDir = join(root, "libraries");
@@ -471,7 +477,7 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl
     const restartListeners: Array<() => Promise<void>> = [];
     const spawned = new SpawnedServices();
     let fakes: Awaited<ReturnType<typeof fakeControlFor>> | undefined;
-    const start = () => startService(root, { onSpawn: (c) => spawned.track(c), ...(fakes ? { env: fakes.env } : {}) });
+    const start = () => startService(root, { onSpawn: (c) => spawned.track(c), ...(fakes || Object.keys(serviceEnv).length ? { env: { ...fakes?.env, ...serviceEnv } } : {}) });
     try {
       await Promise.all([configDir, librariesDir, join(root, "tools"), join(root, "models")].map((d) => mkdir(d, { recursive: true })));
       if (fakeControl) fakes = await fakeControlFor(root);
