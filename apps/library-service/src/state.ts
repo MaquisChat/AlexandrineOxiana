@@ -1371,6 +1371,18 @@ export class ServiceState {
     for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) void r.wakeAllowance(p.id);
   }
 
+  /**
+   * R326: the researcher's "Search sources" were saved — in every unlocked project of the open library, the entries
+   * resting "switched off" by the settings go on if the settings now allow it (the runner's `wakeSettings`: only those;
+   * nothing in flight is touched). The save does not wait for it.
+   */
+  wakeFindSettings(): void {
+    const s = this.session;
+    const r = s?.find;
+    if (!s || !r || this.moving) return;
+    for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) void r.wakeSettings(p.id);
+  }
+
   /** At an encrypted project's lock, before its key is dropped: nothing more is written for it until `resumeFind`. */
   stopFind(s: Session, projectId: string): void {
     s.find?.stop(projectId);
