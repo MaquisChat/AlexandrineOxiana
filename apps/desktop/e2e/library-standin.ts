@@ -25,6 +25,9 @@
  *      `/article/redirect`    a page WITH the mark → `/pdf/redirect.pdf`, which redirects to the third host.
  *  - `cdn.ao-library-standin.test` — a third host, NOT under the proxy's domain: `/<slug>.pdf` (inline);
  *    records which cookies it is sent.
+ * No page's path holds what the shell takes for a PDF's address (`/download`, `/pdf/`, `.pdf`, …;
+ * library_window.rs `looks_like_pdf_address`) except where a PDF is meant to be seen there: the shell
+ * would fetch such a page as soon as it loaded.
  *
  * Every request is recorded (`requests()`): when, host, method, path, who made it, and the NAMES of the
  * cookies it carried — never their values, and nothing of it is printed. Who: the shell's own request
