@@ -630,9 +630,9 @@ describe("whether a changed file's new version is on this computer (R251, Task W
     expect(r.status, r.body).toBe(200);
     return r.json.origins[0] as { state: string; presence: string } & Record<string, unknown>;
   }
-  async function cameIn(name: string, title: string) {
+  async function cameIn(name: string, title: string, encrypted = false) {
     await openNewLibrary();
-    const pid = await newProject();
+    const pid = await newProject(encrypted);
     const dir = await folder(name);
     const file = join(dir, "paper.pdf");
     await pdf(file, title);
@@ -660,6 +660,7 @@ describe("whether a changed file's new version is on this computer (R251, Task W
     const bring = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "bring-in-new-version" } });
     expect([bring.status, bring.json.error.code]).toEqual([409, "CONFLICT"]);
     expect((await repo.getSource(pid, sid)).assets.length).toBe(assets);
+    expect((await originOf(pid, sid)).presence).toBe("not-downloaded"); // the press's own judgement is kept (R264 b)
     expect((await lstat(file, { bigint: true })).atimeNs).toBe(BigInt(LONG_AGO) * 1_000_000_000n); // never opened
     await download(file, v2);
     await until(async () => (await originOf(pid, sid)).presence === "local", 20_000, "local again");
@@ -690,6 +691,34 @@ describe("whether a changed file's new version is on this computer (R251, Task W
     expect(await originOf(pid, sid)).toMatchObject({ state: "changed", presence: "unknown", folderRemoved: false });
   }, 120_000);
 
+  it("R264 e: while the folder cannot be reached the answer is unknown; when it is back, the engine's judgement again", async () => {
+    const { pid, wid, dir, file, sid } = await cameIn("Away", "A Paper In A Folder That Goes Away");
+    await replace(file, "Its Second Version, Then Away");
+    await until(async () => (await originOf(pid, sid)).presence === "local", 30_000, "changed and local");
+    await evict(file);
+    await until(async () => (await originOf(pid, sid)).presence === "not-downloaded", 30_000, "not downloaded");
+    const aside = join(tmp, "away-aside");
+    await rename(dir, aside);
+    await until(async () => (await summary(pid, wid)).state === "unreachable", 30_000, "unreachable");
+    expect(await originOf(pid, sid)).toMatchObject({ state: "changed", presence: "unknown" });
+    await rename(aside, dir);
+    await until(async () => (await summary(pid, wid)).state === "watching", 30_000, "watching again");
+    await until(async () => (await originOf(pid, sid)).presence === "not-downloaded", 30_000, "judged again");
+  }, 120_000);
+
+  it("R264 e: a locked project tells nothing (423); once unlocked, the file is judged again in the walk that follows", async () => {
+    const { pid, file, sid } = await cameIn("Sealed folder", "A Sealed Paper", true);
+    await replace(file, "The Sealed Paper Rewritten");
+    await until(async () => (await originOf(pid, sid)).presence === "local", 30_000, "changed and local");
+    await evict(file);
+    await until(async () => (await originOf(pid, sid)).presence === "not-downloaded", 30_000, "not downloaded");
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    const locked = await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` });
+    expect([locked.status, locked.json.error.code]).toEqual([423, "PROJECT_LOCKED"]);
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    await until(async () => (await originOf(pid, sid)).presence === "not-downloaded", 30_000, "judged again after the unlock");
+  }, 120_000);
+
   it("a file of another state: may-have-changed gives the engine's judgement; gone is unknown", async () => {
     const { pid, wid, file, sid } = await cameIn("Others", "A Paper Of Many States");
     // Replaced by a version that is not on this computer: its content cannot be read, so "may-have-changed".
@@ -703,8 +732,16 @@ describe("whether a changed file's new version is on this computer (R251, Task W
       return o.state === "may-have-changed" ? o : undefined;
     }, 30_000, "may-have-changed");
     expect(mhc).toMatchObject({ newBytes: 90_000, presence: "not-downloaded" });
+    // Paused: the engine cannot say.
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { paused: true } })).status).toBe(200);
+    expect(await originOf(pid, sid)).toMatchObject({ state: "may-have-changed", presence: "unknown" });
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/watched-folders/${wid}`, body: { paused: false } })).status).toBe(200);
+    await until(async () => (await originOf(pid, sid)).presence === "not-downloaded", 30_000, "not downloaded after the resume");
     // Gone: there is no file to judge.
     await rm(file);
+    // The engine forgets a file that is no longer there at once; the register says "gone" only after a complete listing.
+    await until(async () => (await originOf(pid, sid)).presence === "unknown", 30_000, "forgotten");
+    expect((await originOf(pid, sid)).state).toBe("may-have-changed");
     // A file is noted gone after a complete listing: the restart of the watch makes one at once.
     expect((await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` })).status).toBe(200);
     await until(async () => (await originOf(pid, sid)).state === "gone", 30_000, "gone");
