@@ -721,6 +721,16 @@ fn hop_client(url: &Url, addr: SocketAddr, rules: &FetchRules, user_agent: &str,
     b.build().map_err(|_| FetchError::Network)
 }
 
+/// Sends a hop's request and takes the answer only from `addr`, the address that was checked: an
+/// answer that came from any other address is refused.
+async fn send_to(req: reqwest::RequestBuilder, addr: SocketAddr) -> Result<reqwest::Response, FetchError> {
+    let resp = req.send().await.map_err(net)?;
+    if resp.remote_addr() != Some(addr) {
+        return Err(FetchError::Refused);
+    }
+    Ok(resp)
+}
+
 /// `Referer`: the previous page reduced to its origin and path (never its query, which may hold a
 /// session's ticket), and to its origin alone for another origin; none from a page that was not https.
 fn referer_for(previous: Option<&Url>, target: &Url) -> Option<String> {
@@ -811,10 +821,7 @@ pub async fn fetch_pdf(
         if let Some(c) = cookie_header(&jar, &url, SystemTime::now()) {
             req = req.header(COOKIE, c);
         }
-        let mut resp = req.send().await.map_err(net)?;
-        if resp.remote_addr() != Some(addr) {
-            return Err(FetchError::Refused);
-        }
+        let mut resp = send_to(req, addr).await?;
         let status = resp.status().as_u16();
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if redirects >= rules.max_redirects {
@@ -2897,7 +2904,7 @@ process.stdout.write(JSON.stringify({{
             let d = tmp("cert");
             let (key, cert) = (d.join("key.pem"), d.join("cert.pem"));
             let out = std::process::Command::new("openssl")
-                .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=a.test", "-addext", "subjectAltName=DNS:a.test,DNS:b.test,DNS:c.test"])
+                .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=a.test", "-addext", "subjectAltName=DNS:a.test,DNS:b.test,DNS:c.test,DNS:localhost"])
                 .arg("-keyout")
                 .arg(&key)
                 .arg("-out")
@@ -3136,6 +3143,71 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         assert_eq!(tauri::async_runtime::block_on(fetch_pdf(i, read, &rules(), resolver(), &mut Vec::new())), Err(FetchError::SignIn));
         assert_eq!(fetch(input(s.url("a.test", "/login/paper.pdf"), None), &rules(), &mut Vec::new()), Err(FetchError::SignIn));
         assert_eq!(s.paths(), vec!["a.test/redirect"]);
+    }
+
+    /// The client uses no proxy even where the environment names one. Run in a child process of
+    /// this test program whose environment alone names the proxy (a local listener that must see no
+    /// connection): the variables never reach this process or any other test, and reqwest reads them
+    /// once per process, so no other test can be affected or affect this one.
+    #[test]
+    fn the_client_uses_no_proxy_even_when_one_is_set() {
+        const CHILD: &str = "AO_LIBRARY_WINDOW_PROXY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let s = Server::start("proxy-child");
+            let mut r = rules();
+            r.idle = Duration::from_secs(3);
+            r.total = Duration::from_secs(6);
+            let mut sink = Vec::new();
+            assert_eq!(fetch(input(s.url("a.test", "/small.pdf"), None), &r, &mut sink), Ok(13));
+            assert_eq!(s.paths(), vec!["a.test/small.pdf"]);
+            return;
+        }
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let at = format!("http://127.0.0.1:{}", proxy.local_addr().unwrap().port());
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "library_window::tests::the_client_uses_no_proxy_even_when_one_is_set", "--nocapture", "--test-threads=1"]).env(CHILD, "1");
+        for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            child.env(k, &at);
+        }
+        child.env_remove("NO_PROXY").env_remove("no_proxy");
+        let out = child.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("test result: ok. 1 passed"), "{text}");
+        assert_eq!(proxy.accept().map(|_| ()).map_err(|e| e.kind()), Err(io::ErrorKind::WouldBlock), "the proxy was connected to");
+    }
+
+    #[test]
+    fn a_host_with_no_checked_address_is_never_looked_up() {
+        let s = Server::start("nolookup");
+        let checked = SocketAddr::new("127.0.0.1".parse().unwrap(), s.port);
+        let client = hop_client(&s.url("a.test", "/"), checked, &rules(), USER_AGENT, Duration::from_secs(10)).unwrap();
+        tauri::async_runtime::block_on(async {
+            // The checked host is reached at its checked address.
+            let ok = client.get(s.url("a.test", "/small.pdf")).send().await.unwrap();
+            assert_eq!(ok.status().as_u16(), 200);
+            // A name the client was not given an address for is not looked up: the request fails
+            // before any connection. (`localhost` is in the system's hosts file and in the test
+            // certificate, so a client that looked it up would reach the test server; nothing outside
+            // is asked.)
+            assert!(client.get(s.url("localhost", "/small.pdf")).send().await.is_err());
+        });
+        assert_eq!(s.paths(), vec!["a.test/small.pdf"]);
+    }
+
+    #[test]
+    fn an_answer_from_another_address_than_the_checked_one_is_refused() {
+        let s = Server::start("remote");
+        let url = s.url("a.test", "/small.pdf");
+        let real = SocketAddr::new("127.0.0.1".parse().unwrap(), s.port);
+        let client = hop_client(&url, real, &rules(), USER_AGENT, Duration::from_secs(10)).unwrap();
+        // The connection went to `real`; the address that was checked is another one.
+        for checked in [SocketAddr::new("127.0.0.2".parse().unwrap(), s.port), SocketAddr::new("::ffff:127.0.0.1".parse().unwrap(), s.port), SocketAddr::new(real.ip(), s.port + 1)] {
+            let got = tauri::async_runtime::block_on(send_to(client.get(url.clone()), checked));
+            assert_eq!(got.err(), Some(FetchError::Refused), "{checked}");
+        }
+        // The answer from the checked address is taken.
+        assert!(tauri::async_runtime::block_on(send_to(client.get(url), real)).is_ok());
     }
 
     fn urlencode(s: &str) -> String {
