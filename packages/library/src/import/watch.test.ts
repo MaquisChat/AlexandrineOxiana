@@ -3617,6 +3617,62 @@ describe("R251 (Task W11): whether a changed file's new version is on this compu
     console.info(`R251 call count: one rescan of ${names.length} registered files made ${scan.filter(([k]) => k === "lstat").length} lstat, ${scan.filter(([k]) => k === "readdir").length} readdir, ${scan.filter(([k]) => k === "stat").length} stat, ${scan.filter(([k]) => k === "open").length} open`);
   }, 90_000);
 
+  it("N1: a changed or may-have-changed file whose source was removed costs one lstat per scan, over three scans, and no open", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const first = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder" });
+    await first.w.ready;
+    const sid = await cameIn(p, wid, fake.tell, "real.pdf", await buildPdf({ title: "The real one N1", extra: "n1-e1" }), first.events);
+    await first.w.stop();
+    await unlink(join(inbox, "real.pdf"));
+    // Four groups of 6 files, all unchanged on disk: in the library; changed; changed, source missing; may-have-changed, source missing.
+    const groups = [
+      { tag: "a", state: "in-library", sid },
+      { tag: "b", state: "changed", sid },
+      { tag: "c", state: "changed", sid: newId() },
+      { tag: "d", state: "may-have-changed", sid: newId() },
+    ] as const;
+    const byGroup = new Map<string, string[]>();
+    const lines: string[] = [];
+    for (const g of groups) {
+      const ns = Array.from({ length: 6 }, (_, i) => `${g.tag}${String(i).padStart(2, "0")}.txt`);
+      byGroup.set(g.tag, ns);
+      for (const n of ns) {
+        await writeFile(join(inbox, n), "0123456789");
+        await utimes(join(inbox, n), T1, T1);
+        lines.push(JSON.stringify({ key: n, file: n, sourceId: g.sid, sha256: sha256(`old ${n}`), size: 10, mtimeNs: `${T1}000000000`, state: g.state, ...(g.state === "changed" ? { newSha256: sha256(`new ${n}`), newSize: 10 } : {}), at: new Date().toISOString() }));
+      }
+    }
+    await fsp.writeFile(join(lib.root, p.folder, "watched", `${wid}.jsonl`), lines.join("\n") + "\n", { mode: 0o600 });
+    const real = await realpath(inbox);
+    const log: Array<[string, string]> = [];
+    const counted: Partial<WatchFs> = {
+      lstat: (q) => (log.push(["lstat", q]), fsp.lstat(q, { bigint: true })),
+      readdir: (q) => (log.push(["readdir", q]), fsp.readdir(q, { withFileTypes: true })),
+      stat: (q) => (log.push(["stat", q]), fsp.stat(q)),
+      realpath: (q) => (log.push(["realpath", q]), fsp.realpath(q)),
+      open: (q, f) => (log.push(["open", q]), realFspOpen(q, f)),
+    };
+    const { w } = start(p, { ...W, watchId: wid, fsWatch: fakeWatch().fn, watcherForm: "per-folder", rescanMs: 400, fs: counted });
+    await w.ready;
+    await until(() => byGroup.get("b")!.every((n) => w.presence(n) === "local") && !w.status().scanning, LONG);
+    const listingsAt = (i: number) => log.slice(0, i + 1).filter(([k, q]) => k === "readdir" && q === real).length;
+    const mark = listingsAt(log.length - 1);
+    await until(() => listingsAt(log.length - 1) >= mark + 4, LONG); // three whole rescans lie between these listings
+    const all = [...byGroup.values()].flat();
+    for (let s = 1; s <= 3; s++) {
+      const from = log.findIndex((_, i) => listingsAt(i) === mark + s);
+      const to = log.findIndex((_, i) => listingsAt(i) === mark + s + 1);
+      const scan = log.slice(from, to);
+      const perFile = new Map<string, number>();
+      for (const [k, q] of scan) if (k === "lstat") perFile.set(q, (perFile.get(q) ?? 0) + 1);
+      expect([...perFile.keys()].sort()).toEqual(all.map((n) => join(real, n)).sort());
+      for (const [tag, ns] of byGroup) expect({ tag, counts: ns.map((n) => perFile.get(join(real, n))) }).toEqual({ tag, counts: ns.map(() => 1) });
+      expect(scan.filter(([k]) => k === "open" || k === "realpath")).toEqual([]);
+    }
+  }, 90_000);
+
   it("a not-downloaded file's access time is unchanged after the engine's looks", async () => {
     const p = await project();
     const wid = newId();

@@ -887,11 +887,17 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   /** Of those, the ones not judged local: asked again with the files not downloaded (`recheck`), so that a download is seen. */
   const presenceRecheck = new Set<string>();
   const presenceKept = (e: WatchRegisterEntry | undefined) => !!e && (e.state === "changed" || e.state === "may-have-changed");
-  /** A registered file whose state keeps a judgement and which has none in memory now (R264 a). */
+  /**
+   * A registered file whose state keeps a judgement and which has none in memory now (R264 a). An entry whose source was
+   * removed is never unjudged: the judgement is shown only on its source's page, and that source is gone. Any path that
+   * settles a changed or may-have-changed file without storing a judgement must be excluded here too, or the walk
+   * forces that file on every scan (a second `lstat` each time).
+   */
   const unjudged = (rel: string): boolean => {
     if (!regReady) return false;
     const key = fileKey(rel);
-    return presenceKept(reg?.get(key)) && !judgedPresence.has(key);
+    const e = reg?.get(key);
+    return presenceKept(e) && !sourceRemoved(e!) && !judgedPresence.has(key);
   };
   function forgetPresence(key: string) {
     judgedPresence.delete(key);
