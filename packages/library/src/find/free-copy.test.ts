@@ -498,6 +498,34 @@ describe("findFreeCopies: the Internet Archive", () => {
     arxiv(`au:halloway AND ti:"${BOOK_TITLE}"`, atom([{ id: "2202.00002", title: "Lantern Keepers", authors: ["Mira Halloway"] }]));
     expect(await findFreeCopies(BOOK, ctx(), ["internetarchive", "arxiv"])).toEqual({ offers: [], elsewhere: [], failed: [] });
   });
+
+  // M11 (R292): the search answered, but an item's details could not be had and nothing was offered: the service failed
+  // (an outage reads as "some services could not be reached", with Try again). A 404 for an item is not a failure.
+  it("M11: an Internet Archive item failure counts as failed; a 404 does not", async () => {
+    const failing: Array<[string, (id: string) => void]> = [
+      ["refused", (id) => agent.get("https://archive.org").intercept({ path: `/metadata/${id}`, method: "GET" }).replyWithError(new Error("connection reset"))],
+      ["5xx", (id) => agent.get("https://archive.org").intercept({ path: `/metadata/${id}`, method: "GET" }).reply(503, "busy")],
+      ["unreadable", (id) => agent.get("https://archive.org").intercept({ path: `/metadata/${id}`, method: "GET" }).reply(200, "<html>not json</html>", JSON_H)],
+      ["throttled", (id) => agent.get("https://archive.org").intercept({ path: `/metadata/${id}`, method: "GET" }).reply(429, "")],
+    ];
+    for (const [i, [how, reply]] of failing.entries()) {
+      iaSearch(Q, [`f${i}`]);
+      reply(`f${i}`);
+      const got = await findFreeCopies(BOOK, ctx(client({ libraryRoot: join(tmp, `Lib-m11-${i}`) })), ["internetarchive"]);
+      expect(got, how).toEqual({ offers: [], elsewhere: [], failed: ["internetarchive"] });
+    }
+    // A 404 for the item: nothing there, not a failure.
+    iaSearch(Q, ["gone"]);
+    json("https://archive.org", "/metadata/gone", "{}", 404);
+    expect(await findFreeCopies(BOOK, ctx(client({ libraryRoot: join(tmp, "Lib-m11-404") })), ["internetarchive"])).toEqual({ offers: [], elsewhere: [], failed: [] });
+    // One item failed, another offered a copy: the service answered.
+    iaSearch(Q, ["bad", "lanternkeepers00hall"]);
+    agent.get("https://archive.org").intercept({ path: "/metadata/bad", method: "GET" }).reply(503, "busy");
+    iaMeta("lanternkeepers00hall", openIaItem("lanternkeepers00hall"));
+    const mixed = await findFreeCopies(BOOK, ctx(client({ libraryRoot: join(tmp, "Lib-m11-mixed") })), ["internetarchive"]);
+    expect(mixed.failed).toEqual([]);
+    expect(mixed.offers).toHaveLength(1);
+  });
 });
 
 describe("findFreeCopies: bounds, failures and order", () => {

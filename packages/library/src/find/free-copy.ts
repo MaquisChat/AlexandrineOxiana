@@ -482,12 +482,15 @@ async function fromInternetArchive(w: WorkCandidate, ctx: LookupContext): Promis
     return j.response.docs.slice(0, RESULTS_READ).flatMap((d) => (isRecord(d) && typeof d.identifier === "string" && IA_ID.test(d.identifier) ? [d.identifier] : []));
   });
   const out: Raw[] = [];
+  // M11 (R292): an item whose details could not be had (refused, 5xx, timed out, unreadable; a 404 is not that).
+  let itemFailed: unknown;
   for (const id of ids ?? []) {
     if (out.length >= FREE_COPY_OFFERS_PER_SOURCE) break;
     let item: Record<string, unknown> | null;
     try {
       item = await ask(ctx, `https://archive.org/metadata/${id}`, `free-copy:internetarchive:metadata:${id}`, recordOf);
     } catch (e) {
+      itemFailed = e;
       // A failed item never throws away what the earlier items found (R256 a); a 429 stops asking for more.
       if (e instanceof Throttled) {
         ctx.debug?.("free copy via internetarchive: it asked the app to slow down; no more items asked");
@@ -502,6 +505,8 @@ async function fromInternetArchive(w: WorkCandidate, ctx: LookupContext): Promis
     if (pdf) out.push({ url: `https://archive.org/download/${id}/${encodeURIComponent(pdf)}`, kind: "pdf", built: true });
     if (epub) out.push({ url: `https://archive.org/download/${id}/${encodeURIComponent(epub)}`, kind: "epub", built: true });
   }
+  // M11: the search answered but an item failed and no offer came of it: the service counts as failed (R282 e).
+  if (itemFailed !== undefined && !out.length) throw itemFailed;
   return out;
 }
 
