@@ -245,7 +245,8 @@ describe("the settings", () => {
     await start();
     expect((await call({ url: "/settings/your-library" })).json).toEqual({ name: "", access: null, staySignedIn: false });
     const saved = await setLibrary({ name: "  Zorblatt University  ", access: EZ, catalogueSearch: "https://catalogue.example.edu/search?q={query}" });
-    expect(saved).toEqual({ name: "Zorblatt University", access: EZ, catalogueSearch: "https://catalogue.example.edu/search?q={query}", staySignedIn: false });
+    // R336 i: the answer carries the service's own sentence for the stored address (the derive's words for it).
+    expect(saved).toEqual({ name: "Zorblatt University", access: EZ, catalogueSearch: "https://catalogue.example.edu/search?q={query}", staySignedIn: false, addressSentence: `Your library's address: ${LIB_HOST} (EZproxy)` });
     expect((await call({ url: "/settings/your-library" })).json).toEqual(saved);
     expect((await setLibrary({ name: "", access: null, staySignedIn: true })).staySignedIn).toBe(true);
     // The file is the app's, beside search-sources.json, 0600.
@@ -724,6 +725,10 @@ describe("the test's address (R334 b)", () => {
     const newer = await testAddress();
     expect(newer.status).toBe(409);
     expect(newer.json.error.message).toBe(YOUR_LIBRARY_TEXT.newer);
+    // R336 f: every answer of the route, its refusals included, is no-store.
+    for (const r of [none, unreadable, newer]) expect(r.headers["cache-control"]).toBe("no-store");
+    const withBody = await call({ method: "POST", url: "/settings/your-library/test", body: { doi: "10.5555/x" } });
+    expect(withBody.headers["cache-control"]).toBe("no-store");
     // The extension's token: refused before the route runs, as on every Your library route.
     await openNewLibrary();
     const token = await pairExtension();
@@ -755,5 +760,22 @@ describe("the test's address (R334 b)", () => {
     }
     // A test writes nothing: no audit entry names it.
     expect(audit).not.toContain("your-library/test");
+  });
+});
+
+describe("R336 i: the answers name the stored address in the service's own words", () => {
+  it("GET and PUT carry `addressSentence` — the derive's sentence for that address (a resolver: host and path) — and none when no library is set", async () => {
+    await start();
+    expect((await call({ url: "/settings/your-library" })).json.addressSentence).toBeUndefined();
+    const derived = await call({ method: "POST", url: "/settings/your-library/derive", body: { link: LINK } });
+    const put = await setLibrary({ name: "", access: derived.json.access });
+    expect(put.addressSentence).toBe(derived.json.sentence);
+    expect((await call({ url: "/settings/your-library" })).json.addressSentence).toBe(derived.json.sentence);
+    const ou = await call({ method: "POST", url: "/settings/your-library/derive", body: { link: "https://resolver.example.edu/openurl?url_ver=Z39.88-2004&rft_id=x" } });
+    expect((await setLibrary({ name: "", access: ou.json.access })).addressSentence).toBe("Your library's address: resolver.example.edu/openurl (link resolver)");
+    expect((await setLibrary({ name: "", access: null })).addressSentence).toBeUndefined();
+    // A file that cannot be used names no address.
+    await writeFile(join(deps.appConfigDir, "your-library.json"), JSON.stringify({ v: 2, name: "x", access: EZ, staySignedIn: false }));
+    expect((await call({ url: "/settings/your-library" })).json.addressSentence).toBeUndefined();
   });
 });

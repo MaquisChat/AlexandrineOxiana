@@ -492,6 +492,11 @@ export interface YourLibrary {
   staySignedIn: boolean;
 }
 export interface YourLibraryResponse extends YourLibrary {
+  /**
+   * R336 i: the service's own sentence for the stored address — the same words "derive" gives for it ("Your library's
+   * address: <host> (EZproxy)"; a resolver: "<host><path>") — absent when no library is set. The screen makes none.
+   */
+  addressSentence?: string;
   /** The file could not be used: shown as not set ("unreadable", replaced by the next save) or read-only ("newer"). */
   problem?: { code: "unreadable" | "newer"; text: string };
 }

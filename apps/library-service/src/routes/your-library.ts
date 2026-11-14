@@ -93,6 +93,8 @@ function objectBody(req: FastifyRequest, sentence: string): Obj {
 
 const responseOf = (s: YourLibraryHere, problem?: "unreadable" | "newer"): YourLibraryResponse => ({
   ...s,
+  // R336 i: the stored address named in the derive's own words (none when no library is set).
+  ...(s.access ? { addressSentence: yourLibraryAddressSentence(libraryAccessPlace(s.access), s.access.kind) } : {}),
   ...(problem ? { problem: { code: problem, text: problem === "newer" ? YOUR_LIBRARY_TEXT.newer : YOUR_LIBRARY_TEXT.unreadable } } : {}),
 });
 
@@ -162,6 +164,8 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
    */
   app.post("/settings/your-library/test", limit, async (req, reply): Promise<YourLibraryTestResponse> => {
     uiOnly(req);
+    // R336 f: every answer of this route, its refusals included, is no-store.
+    reply.header("Cache-Control", "no-store");
     if (Object.keys(objectBody(req, YOUR_LIBRARY_TEXT.noBody)).length) throw badRequest(YOUR_LIBRARY_TEXT.noBody);
     const r = await readYourLibrary(state.deps.appConfigDir);
     if (r.problem === "newer") throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.newer);
@@ -169,7 +173,6 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
     if (!r.settings.access) throw new ApiError(409, "CONFLICT", FIND_LIBRARY_TEXT.noLibrary, "no-library");
     const url = libraryAddressFor(r.settings.access, { id: "your-library-test", title: "", creators: [], type: "article-journal", identifiers: { doi: YOUR_LIBRARY_TEST_DOI }, providers: [] });
     if (!url) throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.testNoAddress);
-    reply.header("Cache-Control", "no-store");
     return { url };
   });
 
