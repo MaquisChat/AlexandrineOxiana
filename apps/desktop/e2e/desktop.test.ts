@@ -57,6 +57,13 @@ describe("desktopEnv", () => {
       ["AO_DESKTOP_NODE", "AO_DESKTOP_SERVICE_DIR", "AO_DESKTOP_WORKER_BIN", "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "HOME", "LANG", "PATH", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME"].sort(),
     );
   });
+
+  it("the library scenarios (Task F19) add the shell's test mode, NODE_ENV=test, and nothing else: no probe, no proxy", () => {
+    const p = { display: ":42", bus: "unix:path=/tmp/bus", workerBin: "/tmp/w", nodeBin: "/usr/bin/node", serviceDir: "/svc", path: "/usr/bin:/bin" };
+    const test = desktopEnv("/tmp/ao-desktop-e2e-x", p, { testMode: true });
+    expect(test).toEqual({ ...env, NODE_ENV: "test" });
+    expect(desktopEnv("/tmp/ao-desktop-e2e-x", p, { testMode: false })).toEqual(env);
+  });
 });
 
 describe("displayEnv (Xvfb, the D-Bus session bus and what it starts, xdotool)", () => {

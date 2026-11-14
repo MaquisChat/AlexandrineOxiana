@@ -22,6 +22,8 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   outputDir: "test-results",
   // `pnpm e2e` sets PLAYWRIGHT_JSON_OUTPUT_NAME (reports/playwright-desktop.json) for `pnpm report`.
-  reporter: process.env.PLAYWRIGHT_JSON_OUTPUT_NAME ? [["list"], ["json"]] : "list",
+  // The last reporter says how many library scenarios were NOT RUN for want of the machine's set-up,
+  // and why (Task F19, R343 a): its lines come last.
+  reporter: [["list"], ...(process.env.PLAYWRIGHT_JSON_OUTPUT_NAME ? [["json"] as ["json"]] : []), ["./system-setup.ts"]],
   projects: [{ name: "linux-webkitgtk" }],
 });

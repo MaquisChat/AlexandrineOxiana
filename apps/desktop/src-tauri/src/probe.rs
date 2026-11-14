@@ -13,11 +13,15 @@ pub fn script(dir: &Path) -> String {
         let p = dir.join(name);
         p.is_file().then(|| p.to_string_lossy().into_owned())
     };
+    // Task F19: with the sign-in window's probe asked for (test mode is given: this script is only
+    // added in test mode), the main window's probe opens that window once, at the check's address.
+    let library_open = crate::library_window::library_probe::from_env(true).map(|r| crate::library_window::library_probe::open_address(&r));
     let cfg = serde_json::json!({
         "libraryDir": dir.join("library").to_string_lossy(),
         "png": file("probe.png"),
         "wav": file("probe.wav"),
         "mp4": file("probe.mp4"),
+        "libraryOpen": library_open,
     });
     PROBE_JS.replace("__PROBE_CONFIG__", &cfg.to_string())
 }

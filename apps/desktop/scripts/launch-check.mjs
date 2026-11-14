@@ -77,6 +77,9 @@ export function parseShellLine(line) {
   if (line === "AO_SHELL_CLOSING") return { kind: "closing" };
   if (line === "AO_SHELL_RELAUNCH_REQUESTED") return { kind: "relaunch-requested" };
   if (line === "AO_SHELL_RELAUNCHING") return { kind: "relaunching" };
+  m = /^AO_SHELL_LIBRARY (opened|fetching|handed-over|not-a-pdf|failed|closed)$/.exec(line);
+  if (m) return { kind: "library", state: m[1] };
+  if (line === "AO_SHELL_BROWSER_OPENED") return { kind: "browser-opened" };
   return null;
 }
 
@@ -92,19 +95,107 @@ export const EXPECTED_IPC = {
   "app.version": "denied",
   "event.emit": "denied",
   "watch.pick": "allowed",
+  // The sign-in window's six (Task F16; F19): granted to the main window, not probed (below).
+  "library.open": "allowed",
+  "library.take": "allowed",
+  "library.close": "allowed",
+  "library.signOut": "allowed",
+  "library.stay": "allowed",
+  "browser.open": "allowed",
 };
 
 /**
  * Commands of the table the probe does not call, with the permission that grants them: the
- * watched-folder chooser (Task W6, R207) would open a dialog and wait for a person. They are judged
- * from the capability file instead (`capabilityProblems`).
+ * watched-folder chooser (Task W6, R207) would open a dialog and wait for a person, and the sign-in
+ * window's six (Task F16) would open that window, fetch, sign out or start the researcher's browser.
+ * They are judged from the capability file instead (`capabilityProblems`). (The main window's probe
+ * does open the sign-in window once, for the sign-in window's own probe: `libraryWindowOpened`.)
  */
-export const NOT_PROBED_IPC = { "watch.pick": "allow-pick-watch-folder" };
+export const NOT_PROBED_IPC = {
+  "watch.pick": "allow-pick-watch-folder",
+  "library.open": "allow-open-library-window",
+  "library.take": "allow-library-window-take-pdf",
+  "library.close": "allow-close-library-window",
+  "library.signOut": "allow-sign-out-of-library",
+  "library.stay": "allow-set-stay-signed-in",
+  "browser.open": "allow-open-in-browser",
+};
+
+/**
+ * What a page in the sign-in window may call (Task F19, R343 b): nothing. Every command of the app
+ * (the main window's table above, the six library commands among them), the event system's listen,
+ * unlisten, emit and emit-to, the file and folder choosers, the dialog's ask and confirm, and one
+ * command each of the image, resources, menu and tray families; the sign-in window's probe
+ * (`src-tauri/src/library_probe.js`) tries each and reports what happened. Each must be refused.
+ */
+export const EXPECTED_LIBRARY_WINDOW_IPC = Object.fromEntries(
+  [
+    "library.open",
+    "library.take",
+    "library.close",
+    "library.signOut",
+    "library.stay",
+    "browser.open",
+    "watch.pick",
+    "event.listen",
+    "event.unlisten",
+    "event.emit",
+    "event.emitTo",
+    "dialog.open",
+    "dialog.save",
+    "dialog.message",
+    "fs.readFile",
+    "path.resolveDirectory",
+    "window.close",
+    "webview.print",
+    "app.version",
+    // One command of each core family the main window is not granted either, and the dialog's other
+    // two (R346 h).
+    "image.new",
+    "resources.close",
+    "menu.new",
+    "tray.new",
+    "dialog.ask",
+    "dialog.confirm",
+  ].map((k) => [k, "denied"]),
+);
+
+/** The sign-in window's probe as compiled into debug builds (the commands it tries are checked against the table). */
+export const LIBRARY_PROBE_JS = readFileSync(join(REPO, "apps", "desktop", "src-tauri", "src", "library_probe.js"), "utf8");
+
+/** What is wrong with the sign-in window's probe report (empty when everything was refused). */
+export function libraryProbeProblems(r) {
+  if (!r || typeof r !== "object") return ["the sign-in window's probe reported nothing"];
+  const out = [];
+  if (r.probe !== "library") out.push("the report is not the sign-in window's probe");
+  if (!/^https?:\/\//.test(String(r.origin))) out.push(`the probe ran in ${r.origin}, not in an outside page`);
+  // Without Tauri's IPC object in the page nothing can be called at all: each command is "no IPC".
+  const want = r.internals === true ? "denied" : "no IPC";
+  for (const cmd of Object.keys(EXPECTED_LIBRARY_WINDOW_IPC)) {
+    const got = r.ipc?.[cmd];
+    if (got !== want) out.push(`the sign-in window's command ${cmd} is ${got ?? "not reported"}, expected ${want}`);
+  }
+  if (!r.raw || typeof r.raw !== "object") out.push("the raw entry points were not tried");
+  else for (const [k, v] of Object.entries(r.raw)) if (v === "allowed") out.push(`the raw entry point ${k} was allowed`);
+  if (r.error) out.push(`the probe failed: ${r.error}`);
+  return out;
+}
+
+/** The report in a request to the check's report address (`/report?r=<json>`): null when unreadable, undefined for any other address. */
+export function libraryReportFrom(path) {
+  const u = new URL(path, "http://127.0.0.1");
+  if (u.pathname !== "/report") return undefined;
+  try {
+    return JSON.parse(u.searchParams.get("r") ?? "");
+  } catch {
+    return null;
+  }
+}
 
 export const CAPABILITIES_DIR = join(REPO, "apps", "desktop", "src-tauri", "capabilities");
 export const TAURI_CONF = join(REPO, "apps", "desktop", "src-tauri", "tauri.conf.json");
 /** Exactly what the main window is granted, in this order (the last six: the library sign-in window, Task F16). */
-const MAIN_WINDOW_PERMISSIONS = [
+export const MAIN_WINDOW_PERMISSIONS = [
   "core:event:allow-listen",
   "core:event:allow-unlisten",
   "dialog:allow-open",
@@ -495,6 +586,34 @@ function report(label, ok, detail = "") {
   return ok;
 }
 
+/**
+ * The sign-in window's probe reports here (Task F19): plain HTTP on the loopback address. `/page` is
+ * an outside page for the probe to run in; `/report?r=<json>` is its report (the first one is kept).
+ * Anything else, the window's first https address included (a TLS greeting this server cannot
+ * read), gets no page.
+ */
+async function startReportServer() {
+  const { createServer } = await import("node:http");
+  let got;
+  const server = createServer((req, res) => {
+    const r = libraryReportFrom(req.url ?? "/");
+    if (r !== undefined && got === undefined) got = r;
+    const page = r !== undefined ? "Reported." : new URL(req.url ?? "/", "http://127.0.0.1").pathname === "/page" ? "An outside page." : null;
+    res.writeHead(page ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
+    res.end(page ? `<!doctype html><title>Library probe</title><p>${page}</p>` : "");
+  });
+  await new Promise((done) => server.listen(0, "127.0.0.1", done));
+  return {
+    address: `http://127.0.0.1:${server.address().port}/report`,
+    report: () => got,
+    close: () =>
+      new Promise((done) => {
+        server.close(() => done());
+        server.closeAllConnections();
+      }),
+  };
+}
+
 /** Starts the shell and waits for the service, the window and the probe's result; returns the helpers' pids. */
 async function upAndProbed(run, media, problems) {
   const svc = await until("the service's ready report", 120_000, async () => {
@@ -671,12 +790,26 @@ async function main() {
       return { dir, env: shellEnv(dir, { DBUS_SESSION_BUS_ADDRESS: address, AO_DESKTOP_WORKER_BIN: worker.bin, AO_SHELL_PROBE_DIR: probe }) };
     };
 
-    // A. Normal close, with the checks of the page, the helpers' environment and a second launch.
+    // A. Normal close, with the checks of the page, the helpers' environment and a second launch;
+    //    and (Task F19) the sign-in window, opened once by the page, may call nothing of the app.
     {
       const { dir, env } = scenario("a");
+      const reports = await startReportServer();
+      env.AO_SHELL_LIBRARY_PROBE = reports.address;
       const run = startShell(env, "A (closed normally)");
       try {
         const { svc, helpers } = await upAndProbed(run, media, problems);
+        const opened = run.find("probe")?.result?.libraryWindowOpened;
+        report(`${run.label}: the page opened the sign-in window`, opened === "ok", String(opened)) || problems.push("the sign-in window was not opened");
+        const libraryReport = await until("the sign-in window's probe report", 120_000, async () => reports.report() !== undefined).then(
+          () => reports.report(),
+          () => null,
+        );
+        const lp = libraryProbeProblems(libraryReport);
+        report(`${run.label}: a page in the sign-in window can call nothing of the app (${Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).length} commands and events, and the raw entry points; origin ${libraryReport?.origin})`, lp.length === 0, lp.length ? lp.join("; ") : `IPC object ${libraryReport.internals ? "present, every command refused" : "absent"}; raw ${JSON.stringify(libraryReport.raw)}`) || problems.push(...lp);
+        // What the raw attempts would have done is printed by the shell in test mode: nothing may be.
+        const effects = [...(run.find("browser-opened") ? ["the researcher's browser would have been started"] : []), ...run.all("library").filter((e) => e.state !== "opened").map((e) => `the sign-in window said ${e.state}`), ...(run.all("library").length !== 1 ? [`the sign-in window was opened ${run.all("library").filter((e) => e.state === "opened").length} times`] : [])];
+        report(`${run.label}: the sign-in window's attempts changed nothing (no browser started, no fetch, the window still open)`, effects.length === 0, effects.join("; ")) || problems.push(...effects);
         const envProblems = helperEnvProblems(svc.pid, helpers);
         report(`${run.label}: the helpers got an allow-listed environment and no token outside standard input`, envProblems.length === 0, envProblems.join("; ")) || problems.push(...envProblems);
         report(`${run.label}: the service runs with the 512 MB ceiling`, /--max-old-space-size=512/.test(cmdline(svc.pid))) || problems.push("memory ceiling");
@@ -692,6 +825,7 @@ async function main() {
         await assertGone(run.label, helpers, dir, problems, 10_000);
       } finally {
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
+        await reports.close();
       }
     }
 

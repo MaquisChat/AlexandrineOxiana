@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appProcesses, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, helperProblems, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appProcesses, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, libraryProbeProblems, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -67,18 +67,18 @@ describe("what the page may ask of the shell (capabilities/main-window.json; Tas
     // The expected table changes by exactly this one entry.
     assert.equal(EXPECTED_IPC["watch.pick"], "allowed");
     assert.deepEqual(
-      Object.keys(EXPECTED_IPC).sort(),
+      Object.keys(EXPECTED_IPC).filter((k) => !LIBRARY_SIX.includes(k)).sort(),
       ["app.version", "dialog.message", "dialog.save", "event.emit", "event.listen", "fs.readFile", "path.resolveDirectory", "watch.pick", "webview.print", "window.close"],
     );
     // The probe does not call it (it would open the chooser); the capability file is read instead.
-    assert.deepEqual(NOT_PROBED_IPC, { "watch.pick": "allow-pick-watch-folder" });
+    assert.equal(NOT_PROBED_IPC["watch.pick"], "allow-pick-watch-folder");
     const { files, capability, conf } = read();
     assert.deepEqual(capabilityProblems({ files, capability, conf }), []);
     assert.deepEqual(capability.permissions.slice(0, 4), ["core:event:allow-listen", "core:event:allow-unlisten", "dialog:allow-open", "allow-pick-watch-folder"]);
     // Task F16: the library sign-in window's six commands, and nothing else.
     assert.deepEqual(capability.permissions.slice(4), ["allow-open-library-window", "allow-library-window-take-pdf", "allow-close-library-window", "allow-sign-out-of-library", "allow-set-stay-signed-in", "allow-open-in-browser"]);
 
-    const { "watch.pick": _w, ...probed } = EXPECTED_IPC;
+    const probed = Object.fromEntries(Object.entries(EXPECTED_IPC).filter(([k]) => !(k in NOT_PROBED_IPC)));
     assert.deepEqual(probeProblems({ ...GOOD, ipc: probed }, { media: true }), []);
     // Should a probe ever report it, its answer must still be the expected one.
     assert.match(probeProblems({ ...GOOD, ipc: { ...EXPECTED_IPC, "watch.pick": "denied" } }, { media: true }).join("\n"), /watch\.pick is denied, expected allowed/);
@@ -116,6 +116,119 @@ describe("what the page may ask of the shell (capabilities/main-window.json; Tas
     assert.match(check([{ name: "tauri.linux.conf.json", conf: { app: { security: { capabilities: [] } } } }]).join("\n"), /tauri\.linux\.conf\.json/);
     // A platform file that cannot be read as JSON cannot be checked: it fails.
     assert.match(check([{ name: "tauri.windows.conf.toml", conf: null }]).join("\n"), /tauri\.windows\.conf\.toml could not be checked/);
+  });
+});
+
+/** The sign-in window's six commands (Task F16) as the main window's table names them. */
+const LIBRARY_SIX = ["library.open", "library.take", "library.close", "library.signOut", "library.stay", "browser.open"];
+
+describe("the main window gains exactly six permissions (Task F19)", () => {
+  it("the six library commands are allowed and judged from the capability file, not probed", () => {
+    for (const k of LIBRARY_SIX) assert.equal(EXPECTED_IPC[k], "allowed", k);
+    assert.deepEqual(NOT_PROBED_IPC, {
+      "watch.pick": "allow-pick-watch-folder",
+      "library.open": "allow-open-library-window",
+      "library.take": "allow-library-window-take-pdf",
+      "library.close": "allow-close-library-window",
+      "library.signOut": "allow-sign-out-of-library",
+      "library.stay": "allow-set-stay-signed-in",
+      "browser.open": "allow-open-in-browser",
+    });
+    // Exactly the four the main window had before Task F16, and these six.
+    assert.deepEqual(MAIN_WINDOW_PERMISSIONS, ["core:event:allow-listen", "core:event:allow-unlisten", "dialog:allow-open", ...Object.values(NOT_PROBED_IPC)]);
+    // Not reported by the probe: no problem; reported, it must be what the table says.
+    const probed = Object.fromEntries(Object.entries(EXPECTED_IPC).filter(([k]) => !(k in NOT_PROBED_IPC)));
+    assert.deepEqual(probeProblems({ ...GOOD, ipc: probed }, { media: true }), []);
+    assert.match(probeProblems({ ...GOOD, ipc: { ...EXPECTED_IPC, "library.take": "denied" } }, { media: true }).join("\n"), /library\.take is denied, expected allowed/);
+  });
+});
+
+/** A sign-in window's report in which everything was refused, as the probe sends it. */
+const LIBRARY_GOOD = {
+  probe: "library",
+  origin: "http://127.0.0.1:40125",
+  internals: true,
+  ipc: { ...EXPECTED_LIBRARY_WINDOW_IPC },
+  raw: { "ipc.postMessage": "sent", "fetch.ipc": "refused" },
+};
+
+describe("the library window may call nothing (Task F19, R343 b)", () => {
+  it("every command of the app, the event system, the folder chooser and one command of each other core family (image, resources, menu, tray) and of the dialog's ask and confirm is expected to be denied there (R346 h)", () => {
+    assert.deepEqual(Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).sort(), [
+      "app.version",
+      "browser.open",
+      "dialog.ask",
+      "dialog.confirm",
+      "dialog.message",
+      "dialog.open",
+      "dialog.save",
+      "event.emit",
+      "event.emitTo",
+      "event.listen",
+      "event.unlisten",
+      "fs.readFile",
+      "image.new",
+      "library.close",
+      "library.open",
+      "library.signOut",
+      "library.stay",
+      "library.take",
+      "menu.new",
+      "path.resolveDirectory",
+      "resources.close",
+      "tray.new",
+      "watch.pick",
+      "webview.print",
+      "window.close",
+    ]);
+    for (const [k, v] of Object.entries(EXPECTED_LIBRARY_WINDOW_IPC)) assert.equal(v, "denied", k);
+    // Every command of the main window's table is in it, the six library ones included.
+    for (const k of Object.keys(EXPECTED_IPC)) assert.ok(k in EXPECTED_LIBRARY_WINDOW_IPC, k);
+  });
+
+  it("the probe in the sign-in window tries exactly the commands of the table", () => {
+    const tried = [...LIBRARY_PROBE_JS.matchAll(/\btry_\("([^"]+)"/g)].map((m) => m[1]).sort();
+    assert.deepEqual(tried, Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).sort());
+  });
+
+  it("accepts a report in which everything was refused", () => {
+    assert.deepEqual(libraryProbeProblems(LIBRARY_GOOD), []);
+    // Without __TAURI_INTERNALS__ nothing can be called at all: refused as well.
+    const none = Object.fromEntries(Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).map((k) => [k, "no IPC"]));
+    assert.deepEqual(libraryProbeProblems({ ...LIBRARY_GOOD, internals: false, ipc: none }), []);
+  });
+
+  it("fails when the probe reported nothing, ran in the app's own page, or anything was allowed or not answered", () => {
+    assert.deepEqual(libraryProbeProblems(null), ["the sign-in window's probe reported nothing"]);
+    assert.deepEqual(libraryProbeProblems(undefined), ["the sign-in window's probe reported nothing"]);
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, probe: "main" }).join("\n"), /not the sign-in window's probe/);
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, origin: "tauri://localhost" }).join("\n"), /ran in tauri:\/\/localhost/);
+    const p = libraryProbeProblems({ ...LIBRARY_GOOD, ipc: { ...EXPECTED_LIBRARY_WINDOW_IPC, "library.take": "allowed", "event.listen": "no answer", "watch.pick": "error: x" } });
+    assert.equal(p.length, 3, p.join("\n"));
+    assert.match(p.join("\n"), /library\.take is allowed, expected denied/);
+    assert.match(p.join("\n"), /event\.listen is no answer, expected denied/);
+    assert.match(p.join("\n"), /watch\.pick is error: x, expected denied/);
+    const { "browser.open": _b, ...missing } = EXPECTED_LIBRARY_WINDOW_IPC;
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, ipc: missing }).join("\n"), /browser\.open is not reported/);
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, internals: false }).join("\n"), /library\.open is denied, expected no IPC/);
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, raw: { ...LIBRARY_GOOD.raw, "fetch.ipc": "allowed" } }).join("\n"), /fetch\.ipc was allowed/);
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, raw: undefined }).join("\n"), /raw entry points were not tried/);
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, error: "boom" }).join("\n"), /the probe failed: boom/);
+  });
+
+  it("reads the report from the address the probe went to, and nothing else", () => {
+    const r = encodeURIComponent(JSON.stringify(LIBRARY_GOOD));
+    assert.deepEqual(libraryReportFrom(`/report?r=${r}`), LIBRARY_GOOD);
+    assert.equal(libraryReportFrom("/report?r=%7Bbroken"), null);
+    assert.equal(libraryReportFrom("/report"), null);
+    assert.equal(libraryReportFrom("/page"), undefined);
+  });
+
+  it("reads the sign-in window's state lines", () => {
+    assert.deepEqual(parseShellLine("AO_SHELL_LIBRARY opened"), { kind: "library", state: "opened" });
+    assert.deepEqual(parseShellLine("AO_SHELL_LIBRARY closed"), { kind: "library", state: "closed" });
+    assert.deepEqual(parseShellLine("AO_SHELL_BROWSER_OPENED"), { kind: "browser-opened" });
+    assert.equal(parseShellLine("AO_SHELL_LIBRARY https://x"), null);
   });
 });
 
