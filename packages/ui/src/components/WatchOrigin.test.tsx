@@ -292,27 +292,48 @@ describe("WatchOrigin", () => {
     expect(region.textContent).not.toContain(CANNOT_TELL);
   });
 
-  it("R251: presence \"not-downloaded\" says R235's sentence exactly, with no bring-in button; keeping is still offered", async () => {
+  it("R251/R259: presence \"not-downloaded\" says R235's sentence exactly, and both buttons stay", async () => {
     service([origin({ presence: "not-downloaded" })]);
     render(ui());
     const region = await screen.findByRole("region", { name: "Watched folder" });
     expect(region.textContent).toContain(CHANGED);
     expect(within(region).getByText(NOT_HERE).textContent).toBe(NOT_HERE);
-    expect(within(region).queryByRole("button", { name: new RegExp(`^${BRING}`) })).toBeNull();
+    expect((within(region).getByRole("button", { name: new RegExp(`^${BRING}`) }) as HTMLButtonElement).disabled).toBe(false);
     expect(within(region).getByRole("button", { name: new RegExp(`^${KEEP}`) })).toBeTruthy();
     expect(region.textContent).not.toContain(CANNOT_TELL);
   });
 
-  it("R251: presence \"unknown\" says the app cannot tell, with no bring-in button; keeping is still offered", async () => {
+  it("R251/R259: presence \"unknown\" says the app cannot tell, links to Watched folders, and both buttons stay", async () => {
     service([origin({ presence: "unknown" })]);
     render(ui());
     const region = await screen.findByRole("region", { name: "Watched folder" });
     expect(region.textContent).toContain(CHANGED);
-    expect(within(region).getByText(CANNOT_TELL).textContent).toBe(CANNOT_TELL);
-    expect(within(region).queryByRole("button", { name: new RegExp(`^${BRING}`) })).toBeNull();
+    expect(region.textContent).toContain(CANNOT_TELL);
+    const link = within(region).getByRole("link", { name: "Watched folders" });
+    expect(link.getAttribute("href")).toBe("/settings/watched-folders?project=p1");
+    expect(link.closest("p")!.textContent).toBe(CANNOT_TELL);
+    expect((within(region).getByRole("button", { name: new RegExp(`^${BRING}`) }) as HTMLButtonElement).disabled).toBe(false);
     expect(within(region).getByRole("button", { name: new RegExp(`^${KEEP}`) })).toBeTruthy();
     expect(region.textContent).not.toContain("not downloaded to this Mac (");
   });
+
+  for (const presence of ["not-downloaded", "unknown"] as const) {
+    it(`R259: a press with presence "${presence}" that the service refuses shows the service's sentence and adds nothing`, async () => {
+      const svc = service([origin({ presence })]);
+      svc.acting(() => serviceError(409, "CONFLICT", "That file is not downloaded to this Mac, so it was not read."));
+      const changed = vi.fn();
+      const user = userEvent.setup();
+      render(ui({ onChanged: changed }));
+      await user.click(await screen.findByRole("button", { name: new RegExp(`^${BRING}`) }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toBe("That file is not downloaded to this Mac, so it was not read.");
+      expect(svc.seen.acts).toEqual([{ watchId: "w1", action: "bring-in-new-version" }]);
+      expect(svc.seen.reads).toBe(1);
+      expect(changed).not.toHaveBeenCalled();
+      expect(screen.queryByRole("status")?.textContent ?? "").toBe("");
+      expect(screen.getByRole("button", { name: new RegExp(`^${BRING}`) })).toBeTruthy();
+    });
+  }
 
   it("a changed file judged on this Mac whose hint is out of date: the press shows the service's 409 sentence and changes nothing", async () => {
     const svc = service([origin({ presence: "local" })]);

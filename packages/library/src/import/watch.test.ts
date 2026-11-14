@@ -3484,6 +3484,32 @@ describe("R251 (Task W11): whether a changed file's new version is on this compu
     expect(await stateOf(p, wid, "notes.pdf")).toBe("changed");
   }, 60_000);
 
+  it("a may-have-changed file downloaded with the SAME content as the library's copy is in the library again: no change noted, no judgement kept", async () => {
+    const p = await project();
+    const wid = newId();
+    const fake = fakeWatch();
+    const { w, events } = start(p, { ...W, watchId: wid, fsWatch: fake.fn, watcherForm: "per-folder", recheckMs: 300 });
+    await w.ready;
+    const v1 = await buildPdf({ title: "Same one", extra: "r251-s1" });
+    const sid = await cameIn(p, wid, fake.tell, "same.pdf", v1, events);
+    await putNotLocal("same.pdf", v1.length, T2); // replaced (a new time) by a version not on this computer
+    fake.tell("same.pdf");
+    await untilAsync(async () => (await stateOf(p, wid, "same.pdf")) === "may-have-changed");
+    expect(w.presence("same.pdf")).toBe("not-downloaded");
+    // Downloaded with no event: the re-check finds it, it is read through the whole order, and its content is the
+    // library's copy.
+    await download("same.pdf", v1);
+    await untilAsync(async () => (await stateOf(p, wid, "same.pdf")) === "in-library", 10_000);
+    const e = (await regOf(p, wid)).get("same.pdf")!;
+    expect(e).toMatchObject({ sourceId: sid, sha256: sha256(v1), size: v1.length, mtimeNs: `${T2}000000000` });
+    expect(e.newSha256).toBeUndefined();
+    expect(e.newSize).toBeUndefined();
+    expect(w.presence("same.pdf")).toBe("unknown"); // "in-library": no judgement is kept
+    expect(repo.listSourceIds(p.id)).toEqual([sid]);
+    expect((await repo.getSource(p.id, sid)).assets.map((a) => a.sha256)).toEqual([sha256(v1)]);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, changed: 0, notDownloaded: 0 });
+  }, 60_000);
+
   it("a check that cannot tell says unknown", async () => {
     const p = await project();
     const wid = newId();
