@@ -18,7 +18,9 @@
  * TOKEN_STDIN_TIMEOUT_MS, or if it is not 32–512 characters from `A–Z a–z 0–9 . _ ~ + / = -`. After
  * the one line, anything more on standard input is discarded — except a line that is exactly a
  * folder grant from the shell's folder chooser (R207; folder-grants.ts), which is kept in memory for
- * one use and never logged — and the END of standard input means
+ * one use and never logged, and a line that is exactly a file grant from the shell's library sign-in
+ * window (Task F17, R329; file-grants.ts), whose file is taken from the shell's inbox at once and
+ * held for the researcher's check (never logged) — and the END of standard input means
  * "shut down cleanly", exactly as SIGTERM does (R155): the launcher keeps its end open while it wants
  * the service, so a launcher that exits, crashes or is force-quit leaves no stray service. A plain
  * `printf ... | node ...` therefore stops the service again at once; keep the pipe open, e.g.
@@ -48,7 +50,9 @@
 import { openLibrary, useSecretsFromEnv, useZoteroApiOriginFromEnv } from "@ao/library";
 import { listenOnRememberedPort } from "./port-memory.js";
 import { createService } from "./server.js";
-import { FolderGrants, grantLineHandler } from "./folder-grants.js";
+import { FolderGrants } from "./folder-grants.js";
+import { inputLineHandler } from "./file-grants.js";
+import { libraryFileHandler } from "./routes/your-library.js";
 import { onInputLines, readStartupToken, startupErrorMessage } from "./startup-token.js";
 
 /** Exceeds the worst-case graceful close (R99): SUSPEND_TIMEOUT_MS for imports plus closing the rest. */
@@ -85,8 +89,9 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => stop("SIGTERM"));
   process.on("SIGINT", () => stop("SIGINT"));
   // R155: the launcher's end of standard input is gone (closed, crashed, force-quit): shut down.
-  // R207: a line that is exactly a folder grant is kept; every other line is dropped unread.
-  onInputLines(process.stdin, grantLineHandler(folderGrants), () => stop("end of standard input"));
+  // R207: a line that is exactly a folder grant is kept; F17 (R329 b): a line that is exactly a file grant is acted on
+  // at once; every other line is dropped unread.
+  onInputLines(process.stdin, inputLineHandler(folderGrants, libraryFileHandler(svc.state)), () => stop("end of standard input"));
 
   if (process.env.AO_LIBRARY) {
     const lib = await openLibrary(process.env.AO_LIBRARY, svc.state.deps, { onLockLost: () => svc.state.publishState() });

@@ -571,14 +571,31 @@ export interface HoldInput {
   /** The downloaded file (in the library's `.tmp/find-<entryId>/`). */
   fromPath: string;
   facts: HeldFileFacts;
+  /**
+   * Task F17 (R329 f): the file was handed over after a start the limit allowed (a fetch through the researcher's
+   * library, or later the extension): FIND_HELD_MAX does not refuse it — the start was refused while that many waited,
+   * and the file got since is held all the same (the copy part's own count includes it).
+   */
+  handedOver?: true;
+}
+
+/**
+ * Task F17 (R329 e): the acquiring method a held file was got by — the one the rules are asked about at its hold and
+ * again at "Use this file", and the one the audit names. Only a method a found or handed-over file can have; anything
+ * else in a held file's record refuses (fail closed: no other method is ever evaluated in its place).
+ */
+function heldMethodOf(h: HeldFileFacts): "free_copy" | "library_access" {
+  const m = (h.acquired as { method?: unknown } | undefined)?.method;
+  if (m === "free_copy" || m === "library_access") return m;
+  throw new InvalidInputError("The app does not know how this file was got, so it cannot be kept or used.");
 }
 
 /**
  * Holds a file found for a record (R277 b, c; R296 a: every found file, whatever the check said — `facts.why` is
  * "looks-right" for a file the check matched, else why it did not clearly match): the file copied to `find/held/<entryId>.<ext>`
  * (`tx.copyFile`: encrypted in an encrypted project, 0600), its review entry (cause "acquired-file-mismatch", with
- * what the check found) and the queue entry's new line, in ONE governed change (capture `free_copy` and `store`
- * evaluated and audited, `project.find.hold` with ids and counts only): a crash leaves all of it or none.
+ * what the check found) and the queue entry's new line, in ONE governed change (capture of the file's own method —
+ * `free_copy`, or `library_access` for a file the library gave (R329 e) — and `store` evaluated and audited, `project.find.hold` with ids and counts only): a crash leaves all of it or none.
  * Refuses, writing nothing: FIND_HELD_MAX files already waiting (HeldFileLimitError); the source already has a
  * readable original (HeldFileSourceHasFileError, R305 c); the entry no longer in the
  * queue (HeldFileEntryGoneError); the entry already holding a file (InvalidInputError: one per entry).
@@ -589,17 +606,18 @@ export async function holdMismatchedFile(core: RepoCore, projectId: string, inpu
   core.assertUnlocked(st);
   const sf = await readSourceFile(core, st, input.sourceId);
   const eid = input.entry.id;
+  const method = heldMethodOf(input.facts);
   const held = heldPath(eid, input.facts.kind, core.encrypted(st));
   let reviewId = "";
   let written: FindEntry[] = [];
   await runMutation(
     core,
     projectId,
-    [{ action: "capture", capture: { method: "free_copy" } }, storeRequest(sf.source.provenance)],
+    [{ action: "capture", capture: { method } }, storeRequest(sf.source.provenance)],
     async (tx) => {
       const pending = await pendingHeld(core, tx.state);
       if (pending.some((e) => e.cause.findEntryId === eid)) throw new InvalidInputError("This entry already holds a file for your check.");
-      if (pending.length >= FIND_HELD_MAX) throw new HeldFileLimitError();
+      if (pending.length >= FIND_HELD_MAX && input.handedOver !== true) throw new HeldFileLimitError();
       // R305 c: a source that has a readable original (as this change sees it, so a file added at the same moment is
       // either before it — refused here — or after it) gets no waiting file.
       if (sourceHasFile(await readSourceFile(core, tx.state, input.sourceId))) throw new HeldFileSourceHasFileError();
@@ -623,7 +641,7 @@ export async function holdMismatchedFile(core: RepoCore, projectId: string, inpu
     {
       op: FIND_HELD_OPS.hold,
       entity: { type: "source", id: input.sourceId },
-      auditDetails: () => ({ entries: written.map((x) => x.id), count: written.length, states: findStateCounts(written), reviewQueued: [reviewId], held: 1 }),
+      auditDetails: () => ({ entries: written.map((x) => x.id), count: written.length, states: findStateCounts(written), reviewQueued: [reviewId], held: 1, method }),
     },
   );
   return { reviewId, held };
@@ -664,10 +682,11 @@ async function entryLine(core: RepoCore, projectId: string, entryId: string, pat
 /**
  * The researcher's decision on a held file (R277; review queue "Use this file" / "Not this file"), ONE governed change
  * each, audited with ids and counts only:
- *  - "attach" (R301: the ONLY way a found file becomes a source's file): the held file becomes an original (method `free_copy`,
+ *  - "attach" (R301: the ONLY way a found file becomes a source's file): the held file becomes an original (its own method,
+ *    `free_copy` or `library_access` (R329 e);
  *    its `acquired` record), with the check's answer (`checkOf`: "match" for a file that looked right, R296 b, else
  *    `{ result: "accepted-after-mismatch", why }` — the researcher accepted it after the check failed); the held copy goes; the review entry is resolved ("file-attached"); the queue
- *    entry is "in-library". Capture `free_copy` and `store` are evaluated as for any added original. A source that is
+ *    entry is "in-library". Capture of that method and `store` are evaluated as for any added original. A source that is
  *    no longer there refuses (HeldFileSourceGoneError) and nothing changes.
  *  - "discard": the held copy is destroyed (overwritten, then removed); the review entry is resolved
  *    ("file-discarded"); the queue entry is "no-open-copy" with the reason that the researcher said the file was not
@@ -684,14 +703,18 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
   let asset: Asset | undefined;
   if (decision === "attach") {
     if (!st.sources.has(first.sourceId)) throw new HeldFileSourceGoneError();
+    // R329 e: the rules are asked about the method the held file itself records (a library's file: library_access).
+    const method = heldMethodOf(first.heldFile);
     const sf = await readSourceFile(core, st, first.sourceId);
     await runMutation(
       core,
       projectId,
-      [{ action: "capture", capture: { method: "free_copy" } }, storeRequest(sf.source.provenance)],
+      [{ action: "capture", capture: { method } }, storeRequest(sf.source.provenance)],
       async (tx) => {
         const e = await heldEntry(core, tx.state, reviewId);
         if (!tx.state.sources.has(e.sourceId)) throw new HeldFileSourceGoneError();
+        // The entry as this change sees it must name the method the rules were just asked about.
+        if (heldMethodOf(e.heldFile) !== method) throw new InvalidInputError("The app does not know how this file was got, so it cannot be kept or used.");
         const rel = `${tx.state.rel}/${e.cause.held}`;
         if (!(await tx.exists(rel))) throw new NotFoundError("Held file", reviewId);
         const kind = e.heldFile.kind;
@@ -701,7 +724,7 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
           kind: kindFor(kind),
           ext: kind,
           mime: mimeFor(kind),
-          label: `free copy ${tx.at.slice(0, 10)}`,
+          label: `${method === "library_access" ? "library copy" : "free copy"} ${tx.at.slice(0, 10)}`,
           acquired: { ...e.heldFile.acquired, check: checkOf(e.heldFile) },
         });
         await tx.trash(rel);
@@ -712,7 +735,7 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
       {
         op: FIND_HELD_OPS.attach,
         entity: { type: "source", id: first.sourceId },
-        auditDetails: () => ({ reviewEntry: reviewId, entries: [first.cause.findEntryId], count: line ? 1 : 0, ...(asset ? { asset: asset.id } : {}) }),
+        auditDetails: () => ({ reviewEntry: reviewId, entries: [first.cause.findEntryId], count: line ? 1 : 0, ...(asset ? { asset: asset.id } : {}), method }),
       },
     );
     return { entry: line, ...(asset ? { asset } : {}) };

@@ -13,11 +13,13 @@
  * crashed, or was force-quit) means "shut down cleanly" (R155).
  *
  * After the token line, R207 changes R98/R155's "discarded, never interpreted" for exactly ONE line
- * shape: a folder grant from the shell's folder chooser (folder-grants.ts `parseGrantLine`). Lines
+ * shape: a folder grant from the shell's folder chooser (folder-grants.ts `parseGrantLine`); Find and
+ * acquire's ruling 1 (R225, R329) for exactly one more: a file grant from the shell's library sign-in
+ * window (file-grants.ts `parseFileGrantLine`, Task F17). Lines
  * are cut at line ends with a bounded buffer (`InputLines`: a line longer than INPUT_LINE_MAX_BYTES
  * is dropped as it arrives, so a line that never ends cannot grow memory), lines that are not UTF-8
- * are dropped, and each remaining line is handed to the entry point's callback, which keeps it only
- * if it is exactly a grant. Nothing read after the token is logged, echoed or answered.
+ * are dropped, and each remaining line is handed to the entry point's callback, which acts on it only
+ * if it is exactly one of the two grants. Nothing read after the token is logged, echoed or answered.
  *
  * Refused, with a plain message that never repeats the token or any part of it:
  *  - a token variable (AO_SERVICE_TOKEN, in any letter case) present in the environment, even empty:
@@ -228,8 +230,8 @@ export class InputLines {
 }
 
 /**
- * After the token line: hands each complete line to `onLine` (see `InputLines`; the entry point keeps
- * only an exact folder grant and drops everything else uninterpreted, R207), and calls `onEnd` once
+ * After the token line: hands each complete line to `onLine` (see `InputLines`; the entry point acts
+ * only on an exact folder grant or file grant and drops everything else uninterpreted, R207, R329), and calls `onEnd` once
  * when standard input ends, closes or fails (R155: the launcher's end of the pipe is gone, so the
  * service shuts down cleanly; a launcher that crashed or was force-quit leaves no stray service). A
  * last line without a line end is not a line. If `onLine` throws, the line is dropped in silence.

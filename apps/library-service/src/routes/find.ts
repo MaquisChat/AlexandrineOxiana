@@ -184,7 +184,9 @@ export async function libraryPartsOf(appConfigDir: string, s: Session, projectId
   const byId = new Map(list.map((e) => [e.id, e]));
   for (const [id, c] of chances) {
     const offers = whereToGetIt(c.work, settings, byId.get(id)?.offers ?? []);
-    const library: FindLibraryChance | undefined = c.chance === "yes" ? { canStart: true } : c.chance === "no-library" ? { canStart: false, reason: "no-library" } : undefined;
+    const chance: FindLibraryChance | undefined = c.chance === "yes" ? { canStart: true } : c.chance === "no-library" ? { canStart: false, reason: "no-library" } : undefined;
+    // Task F17 (R329 g): what became of the last file handed over that could not be held (the runner's memory only).
+    const library: FindLibraryChance | undefined = c.lastFile ? { ...(chance ?? { canStart: false, reason: "not-offered" }), lastFile: c.lastFile } : chance;
     out.set(id, { offers, ...(library ? { library } : {}) });
   }
   return out;

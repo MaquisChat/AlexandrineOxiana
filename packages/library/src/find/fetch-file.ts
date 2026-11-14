@@ -265,6 +265,9 @@ async function typeOf(path: string): Promise<"application/pdf" | "application/ep
   }
 }
 
+/** Task F17 (R329 d): the same decision for a file handed over through the researcher's library. */
+export const fileTypeByBytes = typeOf;
+
 /**
  * Downloads one free copy to `into` under the limits above. Resolves only with a complete PDF or EPUB at `into`;
  * otherwise rejects with a FetchFileError (or the signal's reason when aborted) and leaves no part file.
