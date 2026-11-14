@@ -508,6 +508,17 @@ export class HeldFileEntryGoneError extends Error {
   }
 }
 
+/**
+ * R305 c: the record already has a readable file (the researcher's own, added while the copy was downloaded): there is
+ * nothing to ask the researcher about, so nothing is held. Checked inside the hold's change; nothing was written.
+ */
+export class HeldFileSourceHasFileError extends Error {
+  override name = "HeldFileSourceHasFileError";
+  constructor() {
+    super("This record already has a file. Nothing was changed.");
+  }
+}
+
 /** The record the held file was found for is no longer in the library: it cannot be attached. Nothing was changed. */
 export class HeldFileSourceGoneError extends Error {
   override name = "HeldFileSourceGoneError";
@@ -559,7 +570,8 @@ export interface HoldInput {
  * (`tx.copyFile`: encrypted in an encrypted project, 0600), its review entry (cause "acquired-file-mismatch", with
  * what the check found) and the queue entry's new line, in ONE governed change (capture `free_copy` and `store`
  * evaluated and audited, `project.find.hold` with ids and counts only): a crash leaves all of it or none.
- * Refuses, writing nothing: FIND_HELD_MAX files already waiting (HeldFileLimitError); the entry no longer in the
+ * Refuses, writing nothing: FIND_HELD_MAX files already waiting (HeldFileLimitError); the source already has a
+ * readable original (HeldFileSourceHasFileError, R305 c); the entry no longer in the
  * queue (HeldFileEntryGoneError); the entry already holding a file (InvalidInputError: one per entry).
  */
 export async function holdMismatchedFile(core: RepoCore, projectId: string, input: HoldInput): Promise<{ reviewId: string; held: string }> {
@@ -579,6 +591,9 @@ export async function holdMismatchedFile(core: RepoCore, projectId: string, inpu
       const pending = await pendingHeld(core, tx.state);
       if (pending.some((e) => e.cause.findEntryId === eid)) throw new InvalidInputError("This entry already holds a file for your check.");
       if (pending.length >= FIND_HELD_MAX) throw new HeldFileLimitError();
+      // R305 c: a source that has a readable original (as this change sees it, so a file added at the same moment is
+      // either before it — refused here — or after it) gets no waiting file.
+      if ((await readSourceFile(core, tx.state, input.sourceId)).assets.some((a) => a.role === "original" && a.status !== "destroyed")) throw new HeldFileSourceHasFileError();
       const rel = `${tx.state.rel}/${held}`;
       await tx.mkdir(`${tx.state.rel}/${FIND_HELD_DIR}`);
       await tx.copyFile(input.fromPath, rel, { encrypt: tx.encrypted, mode: CHANGE_LOG_MODE });
@@ -611,7 +626,8 @@ type HeldReview = ReviewEntry & { cause: HeldFileCause; sourceId: string; heldFi
  * What the asset's provenance records of the check when the researcher uses a held file: the check's own answer —
  * "match" (R296 b, a file that looked right; `@ao/core`'s model has no field for who decided: the review entry's
  * decision "file-attached" and the audit's `project.find.held-attach` say the researcher did), or
- * "accepted-after-mismatch" with why it did not clearly match.
+ * "accepted-after-mismatch" with why it did not clearly match. R305 a: since R301 only the researcher's decision writes
+ * this record, so it always means "the researcher used this file; this is what the app's check had said".
  */
 function checkOf(h: HeldFileFacts): NonNullable<AcquiredFrom["check"]> {
   return h.why === "looks-right" ? { result: "match", by: h.by ?? "title" } : { result: "accepted-after-mismatch", why: h.why };

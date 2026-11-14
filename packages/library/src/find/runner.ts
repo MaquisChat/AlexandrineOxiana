@@ -74,7 +74,7 @@ import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AcquiredFrom, SourceFile } from "@ao/core";
 import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
-import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, type HeldFileFacts } from "../repo/review.js";
+import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, type HeldFileFacts } from "../repo/review.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
 import { checkFileAgainstRecord, type FileCheckResult } from "./file-check.js";
@@ -316,6 +316,13 @@ export interface FindRunner {
    * "Not this file": "discard"), one governed change (refused after `stop` or `stopAll`, like every act).
    */
   resolveHeld(projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<FindEntry | null>;
+  /**
+   * R305 b: wakes ONLY the project's entries waiting for a place among the waiting files ("record-complete" with
+   * "held-full"); nothing in flight is touched (no download aborted or restarted, no service asked again for an entry
+   * already at work). `resolveHeld` calls it after each decision; the project-wide `resume` stays for a save of the
+   * rules, an opening and an unlocking. Does nothing for a project the runner is not running (stopped or never resumed).
+   */
+  wakeHeldFull(projectId: string): Promise<void>;
   /**
    * At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry, and (F11) every entry in the free
    * copy's part — "record-complete" (its source without a file), "looking-for-copy", and "fetching" (which resumes as
@@ -1518,10 +1525,13 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    *                                                                       file that did not is held, "file-<why>")
    *                                                    ──► record-complete / held-full (the hold found FIND_HELD_MAX
    *                                                                       files waiting meanwhile: the file is dropped)
+   *                                                    ──► in-library    (R305 c: the source gained a readable file
+   *                                                                       meanwhile: refused inside the hold's change,
+   *                                                                       nothing held, the file dropped)
    *                                                    ──► no-open-copy  (no offer could be downloaded: its links kept)
    *   record-complete / held-full (R296 d): FIND_HELD_MAX files already wait — looked at BEFORE any free-copy service
-   *   is asked or any file downloaded; the entry waits, asking nothing, until a decision on a waiting file (the service
-   *   resumes the project), "Try again", opening or unlocking wakes it.
+   *   is asked or any file downloaded; the entry waits, asking nothing, until a decision on a waiting file (`resolveHeld`
+   *   → `wakeHeldFull`, R305 b: only such entries), "Try again", opening or unlocking wakes it.
    *
    * Nothing is asked of any free-copy service, and nothing downloaded, unless the rules allow `free_copy` (else the
    * entry stays "record-complete" with the reason "copy-not-allowed", and is looked at again only at the next open or
@@ -1713,10 +1723,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   /**
    * What the entry says when a file could not be held (R282 g), or null for an error not foreseen: the record removed
-   * meanwhile (M1); the rules (M8).
+   * meanwhile (M1); the record gained a readable file meanwhile ("in-library", R305 c: refused inside the hold's change,
+   * nothing held, the download dropped with its folder); the rules (M8).
    */
   async function copyEnded(pid: string, err: unknown, prov: Provenance): Promise<Partial<FindEntry> | null> {
     if (err instanceof NotFoundError) return { state: "no-open-copy", reason: RECORD_REMOVED };
+    if (err instanceof HeldFileSourceHasFileError) return { state: "in-library" };
     if (err instanceof PolicyDeniedError) return { state: "record-complete", reason: await copyRefusal(pid, err, prov) };
     return null;
   }
@@ -1946,11 +1958,27 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   async function resolveHeld(projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<FindEntry | null> {
     assertOpen();
     if (typeof reviewId !== "string" || !isId(reviewId)) throw new NotFoundError("Review entry", "unknown");
-    return act(projectId, async () => {
+    const done = await act(projectId, async () => {
       const { entry } = await resolveHeldFileIn(repo, projectId, reviewId, decision);
       if (entry) notify(projectId, entry.id, entry.state);
       return entry;
     });
+    // R296 d, R305 b: the decision freed a place: the entries waiting for one go on (and nothing else is touched).
+    await wakeHeldFull(projectId);
+    return done;
+  }
+
+  async function wakeHeldFull(projectId: string): Promise<void> {
+    if (closed || readOnly()) return;
+    const r = runs.get(projectId);
+    if (!r || r.stopped) return;
+    let q: Map<string, FindEntry>;
+    try {
+      q = await readFindQueueIn(repo, projectId);
+    } catch {
+      return; // locked or unreadable meanwhile: the next open or unlock resumes the project
+    }
+    for (const e of q.values()) if (e.sourceId && e.state === "record-complete" && e.reason?.code === HELD_FULL.code) enqueue(projectId, e.id);
   }
 
   function resume(projectId: string): void {
@@ -2198,5 +2226,5 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return w;
   }
 
-  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resolveHeld, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks, asAuthor };
+  return { add, choose, confirmDuplicate, addHereAsWell, retry, remove, resolveHeld, wakeHeldFull, resume, stop, stopAll, elsewhere, lockedNotChecked, stoppedFor, choosePerson, chooseWorks, asAuthor };
 }

@@ -20,6 +20,7 @@ import {
   HELD_FILE_REASON,
   HeldFileEntryGoneError,
   HeldFileLimitError,
+  HeldFileSourceHasFileError,
   heldWaitingCount,
   holdMismatchedFile,
   readReviewEntries,
@@ -28,6 +29,7 @@ import {
   type HeldFileFacts,
 } from "./review.js";
 import { SimulatedCrash, seams, type CrashPoint } from "./testing.js";
+import { addCapturedOriginal } from "./repo.js";
 import { FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_REVIEW_TEXT } from "@ao/shared";
 import type { RepoCore } from "./state.js";
 
@@ -254,6 +256,57 @@ describe("the researcher's decision", () => {
   }
 });
 
+describe("R305 c: a source that has a readable file gets no waiting file", () => {
+  /** The researcher's own file, added to the record by hand. */
+  const mineFile = async () => scratchFile(kit, `mine-${newId()}.pdf`, await buildPdf({ title: TITLE, author: "Amara Okafor", lines: [TITLE, "Amara Okafor"] }));
+  const addFrom = (w: World, mine: string) => addCapturedOriginal(kit.repo, w.p.id, w.sourceId, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+  const addMine = async (w: World) => addFrom(w, await mineFile());
+  const opOf = (e: { details?: unknown }) => (e.details as { op?: string } | undefined)?.op;
+  const holdOps = async (w: World) => (await auditEvents(kit, w.p)).filter((e) => opOf(e) === "project.find.hold");
+
+  for (const [what, extra] of [["did not match", {}], ["looks right", LOOKS_RIGHT]] as const) {
+    it(`the hold is refused inside its change when the source already has a readable original; nothing is written (${what})`, async () => {
+      const w = await world();
+      await addMine(w);
+      await expect(hold(w, extra)).rejects.toBeInstanceOf(HeldFileSourceHasFileError);
+      expect(await heldFiles(w)).toEqual([]);
+      expect(await pending(w)).toEqual([]);
+      expect(await stateOf(w)).toBe("fetching");
+      expect(await holdOps(w)).toEqual([]);
+      expect((await kit.repo.getSource(w.p.id, w.sourceId)).assets).toHaveLength(1);
+    });
+  }
+
+  it("the file added and the hold at the same moment: either held (the source had no file when the hold's change began) or refused with nothing held — never both", async () => {
+    for (let i = 0; i < 6; i++) {
+      const w = await world();
+      const mine = await mineFile();
+      // Started in both orders, in the same tick: the two changes queue one behind the other, whichever comes first.
+      const [h, a] =
+        i % 2 === 0
+          ? await Promise.allSettled([hold(w, LOOKS_RIGHT), addFrom(w, mine)])
+          : await (async () => {
+              const added = addFrom(w, mine);
+              const held = hold(w, LOOKS_RIGHT);
+              const [x, y] = await Promise.allSettled([held, added]);
+              return [x, y] as const;
+            })();
+      expect(a.status).toBe("fulfilled");
+      const ops = (await auditEvents(kit, w.p)).map(opOf);
+      if (h.status === "fulfilled") {
+        // Held: the hold's change came first; the researcher's file after it.
+        expect(await heldFiles(w)).toHaveLength(1);
+        expect(ops.indexOf("project.find.hold")).toBeLessThan(ops.indexOf("asset.add-original"));
+      } else {
+        expect(h.reason).toBeInstanceOf(HeldFileSourceHasFileError);
+        expect(await heldFiles(w)).toEqual([]);
+        expect(await pending(w)).toEqual([]);
+        expect(ops).not.toContain("project.find.hold");
+      }
+    }
+  });
+});
+
 describe("nothing is ever left orphaned", () => {
   it("removing the entry discards its held file and closes its review entry, in one change", async () => {
     const w = await world();
@@ -291,13 +344,15 @@ describe("nothing is ever left orphaned", () => {
     const w = await world();
     const r = await hold(w);
     await resolveHeldFile(coreOf(), w.p.id, r.reviewId, "attach");
-    const w2 = { ...w, entry: { ...w.entry, id: newId() } };
+    // R305 c: the first record has its file now; the next holds are for a second record without one.
+    const second = (await addSource(kit, w.p, { title: TITLE, creators: [{ role: "author", family: "Okafor", given: "Amara" }] })).source.id;
+    const w2 = { ...w, sourceId: second, entry: { ...w.entry, id: newId(), sourceId: second } };
     await appendFindEntries(coreOf(), w.p.id, [w2.entry], "add");
-    const r2 = await holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w2), sourceId: w.sourceId, fromPath: w.pdf, facts: facts() });
+    const r2 = await holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w2), sourceId: second, fromPath: w.pdf, facts: facts() });
     await resolveHeldFile(coreOf(), w.p.id, r2.reviewId, "discard");
-    const w3 = { ...w, entry: { ...w.entry, id: newId() } };
+    const w3 = { ...w, sourceId: second, entry: { ...w.entry, id: newId(), sourceId: second } };
     await appendFindEntries(coreOf(), w.p.id, [w3.entry], "add");
-    await holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w3), sourceId: w.sourceId, fromPath: w.pdf, facts: facts() });
+    await holdMismatchedFile(coreOf(), w.p.id, { entry: needsCheck(w3), sourceId: second, fromPath: w.pdf, facts: facts() });
     await removeFindEntryWithHeld(coreOf(), w.p.id, needsCheck(w3));
     const text = JSON.stringify(await auditEvents(kit, w.p));
     for (const s of ["Different Paper", "arxiv.org", ADDRESS, "10.5555/ao.f11.other", "find/held", ".pdf", "Rivers and Memory"]) expect(text).not.toContain(s);

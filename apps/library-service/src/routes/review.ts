@@ -162,10 +162,9 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
       if (err instanceof HeldFileSourceGoneError) throw conflict(err.message, "source-gone");
       throw err;
     }
+    // R296 d, R305 b: the runner's `resolveHeld` itself wakes the project's entries waiting for a place (and only
+    // those: nothing in flight is restarted), so no project-wide resume here.
     state.publishState();
-    // R296 d: a decision frees a place among the files waiting for the researcher's check: the project's entries that
-    // wait for one are woken (the same resume a save of the rules calls; they look at the limit again before asking).
-    state.resumeFind(s, projectId);
     return { decided: true };
   });
 

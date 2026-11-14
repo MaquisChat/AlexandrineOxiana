@@ -646,6 +646,46 @@ describe("refusals", () => {
     expect(events.some((e) => e.type === "find.progress" && (e.data as { entryId?: string }).entryId === waiting.id && (e.data as { state?: string }).state === "looking-for-copy")).toBe(true);
   });
 
+  it("R305 b: fifty decisions in a row through the review route wake the waiting entry and touch nothing in flight (a lookup held open is asked once)", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const [a] = await add(pid, [LINE]);
+    const sid = (await until(async () => ((x) => (x?.state === "no-open-copy" && x.sourceId ? x : undefined))(await entry(pid, a!.id)), "the record")).sourceId!;
+    const repo = svc!.state.session!.repo;
+    const at = new Date().toISOString();
+    const pdf = join(tmp, "held.pdf");
+    await writeFile(pdf, await buildPdf({ title: "A Different Paper Entirely", lines: ["A Different Paper Entirely"] }));
+    const holds: FindEntry[] = Array.from({ length: 50 }, (_, i) => ({ id: newId(), projectId: pid, typed: `x y ${i}`, state: "fetching", createdAt: at, updatedAt: at, attempts: 0, sourceId: sid }));
+    const waiting: FindEntry = { id: newId(), projectId: pid, typed: "y z", state: "record-complete", reason: { code: "held-full" }, createdAt: at, updatedAt: at, attempts: 0, sourceId: sid };
+    await appendFindEntriesIn(repo, pid, [...holds, waiting], "add");
+    for (const h of holds) {
+      await holdMismatchedFileIn(repo, pid, {
+        entry: { ...h, state: "needs-check", reason: { code: "file-title-absent" } },
+        sourceId: sid,
+        fromPath: pdf,
+        facts: { why: "title-absent", kind: "pdf", bytes: 1, acquired: { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at, tool: { name: "find-and-acquire", version: "0" }, access: "public" } },
+      });
+    }
+    // An entry at work: its lookup held open.
+    const release = gated.hold(NOTHING);
+    const [busy] = await add(pid, [NOTHING]);
+    await until(async () => asked(NOTHING) === 1, "the lookup to be asked");
+    const items = ((await call({ url: `/projects/${pid}/review?limit=500` })).json.items as Array<{ id: string; group: string }>).filter((i) => i.group === "found-file");
+    expect(items).toHaveLength(50);
+    for (const item of items) {
+      const r = await call({ method: "POST", url: `/review/${item.id}/held-file`, body: { projectId: pid, decision: "discard" } });
+      expect(r.status, r.body).toBe(200);
+    }
+    expect((await until(async () => ((x) => (x?.state === "no-open-copy" ? x : undefined))(await entry(pid, waiting.id)), "the waiting entry to go on")).state).toBe("no-open-copy");
+    await sleep(100);
+    expect(asked(NOTHING)).toBe(1);
+    expect((await entry(pid, busy!.id))!.state).toBe("looking-up");
+    release();
+    await settled(pid, busy!.id);
+    expect(asked(NOTHING)).toBe(1);
+  });
+
   it("a typed line never appears in the log", async () => {
     await start();
     await openNewLibrary();

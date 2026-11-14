@@ -3400,7 +3400,7 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect((await entryOf(p, eid))!.state).toBe("no-open-copy");
   });
 
-  it(`R296 d: at the limit (${FIND_HELD_MAX} files waiting) nothing is asked and nothing downloaded; the entry waits with its sentence; woken while still at it, it asks nothing; a decision on a waiting file and the resume after it wake it`, async () => {
+  it(`R296 d: at the limit (${FIND_HELD_MAX} files waiting) nothing is asked and nothing downloaded; the entry waits with its sentence; woken while still at it, it asks nothing; a decision on a waiting file wakes it`, async () => {
     expect(FIND_HELD_MAX).toBe(50);
     oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
     files.set("https://arxiv.org/pdf/2101.00001", await good());
@@ -3431,14 +3431,48 @@ describe("F11: the free copy of a record the queue completed", () => {
     await until(waits, "the wait again");
     expect(copyRequests).toEqual([]);
     expect(fileRequests).toEqual([]);
-    // A decision on a waiting file ("Not this file"), and the resume the service calls after it: the entry goes on.
+    // R305 b: a decision on a waiting file ("Not this file") wakes it by itself: the entry goes on.
     const [first] = await pendingReviews(p);
     await r.resolveHeld(p.id, first!.id, "discard");
-    r.resume(p.id);
     await copyDone(p, eid);
     expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
     expect(copyRequests).toHaveLength(1);
     expect(await readdir(heldDirOf(p))).toHaveLength(FIND_HELD_MAX);
+  });
+
+  it("R305 b: decisions on waiting files wake only the entries waiting for the limit; a download under way is neither aborted nor requested again (fifty decisions in a row)", async () => {
+    const QUORVANE: Work = { doi: "10.5555/ao.f11.quorvane", title: "Quorvane Ledger of Tides", family: "Pellucid", year: 2003 };
+    const LINE_Q = "Pellucid, Quorvane Ledger of Tides, 2003";
+    const A_URL = "https://arxiv.org/pdf/2101.00001";
+    // Another host: downloads are one at a time per host (F10), and A holds arxiv.org's.
+    const B_URL = "https://europepmc.org/articles/PMC88?pdf=render";
+    oaCopies.set(ZORBLATT.doi!, [A_URL]);
+    oaCopies.set(QUORVANE.doi!, [B_URL]);
+    files.set(B_URL, await other(2));
+    holdFiles.add(A_URL);
+    know(LINE, cr(ZORBLATT));
+    know(LINE_Q, cr(QUORVANE));
+    const p = await project();
+    const otherSid = await otherRecord(p);
+    await fillHeld(p, otherSid, FIND_HELD_MAX - 1);
+    const r = runner();
+    // A: its download held open (one place was free when it looked).
+    const a = (await r.add(p.id, [LINE])).added[0]!.id;
+    await until(() => heldFiles.length === 1, "A's download to start");
+    // The last place is taken; B then finds the limit reached and waits.
+    await fillHeld(p, otherSid, 1);
+    const b = (await r.add(p.id, [LINE_Q])).added[0]!.id;
+    await until(async () => (await entryOf(p, b))?.reason?.code === "held-full", "B to wait");
+    const fills = (await pendingReviews(p)).filter((e) => e.sourceId === otherSid);
+    expect(fills).toHaveLength(FIND_HELD_MAX);
+    for (const e of fills) await r.resolveHeld(p.id, e.id, "discard");
+    // B went on by itself and its file waits; A's download was never aborted nor asked for again.
+    await copyDone(p, b);
+    expect((await entryOf(p, b))!.state).toBe("needs-check");
+    expect(heldFiles[0]!.aborted).toBe(false);
+    expect(fileRequests.filter((k) => k === A_URL)).toHaveLength(1);
+    expect(copyRequests.filter((k) => k.includes("zorblatt"))).toHaveLength(1);
+    expect((await entryOf(p, a))!.state).toBe("fetching");
   });
 
   it("R296 d: the hold's own refusal at the limit ends as a wait, the file dropped, nothing left in the temporary folder", async () => {
@@ -3495,7 +3529,7 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect(activeTemp.has(`find-${eid}`)).toBe(true);
     heldFiles[0]!.respond(200, await good());
     // Still held while the file is checked and stored (R301: held for the researcher); given up and removed once it is.
-    await until(async () => (await exists(heldDirOf(p))) || !activeTemp.has(`find-${eid}`), "the file to be stored");
+    await until(async () => (await readdir(heldDirOf(p)).catch(() => [] as string[])).includes(`${eid}.pdf`) || !activeTemp.has(`find-${eid}`), "the file to be stored");
     expect(await readdir(heldDirOf(p))).toEqual([`${eid}.pdf`]);
     await copyDone(p, eid);
     expect(activeTemp.has(`find-${eid}`)).toBe(false);
@@ -3776,9 +3810,8 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect(await entryOf(p, eid)).toBeUndefined();
   });
 
-  // R301: the runner never adds a file, so it can never add a second one; the file found meanwhile waits for the
-  // researcher's decision like any other (was: the entry ended "in-library" by the runner's own refusal at attach).
-  it("R282 g (M5): a source that gained a readable file meanwhile is not given a second one; the found file waits for the researcher", async () => {
+  // R305 c: there is nothing to ask the researcher about a record that has its file: no waiting file; in the library.
+  it("R282 g (M5), R305 c: a source that gained a readable file meanwhile gets no waiting file; the entry is in the library", async () => {
     oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
     holdFiles.add("https://arxiv.org/pdf/2101.00001");
     const { p, eid, sid } = await recordMade();
@@ -3789,10 +3822,14 @@ describe("F11: the free copy of a record the queue completed", () => {
     await addCapturedOriginal(repo, p.id, sid, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
     heldFiles[0]!.respond(200, await good());
     await copyDone(p, eid);
-    expect((await entryOf(p, eid))!.state).toBe("needs-check");
+    expect((await entryOf(p, eid))!.state).toBe("in-library");
+    expect((await entryOf(p, eid))!.reason).toBeUndefined();
     const assets = (await repo.getSource(p.id, sid)).assets;
     expect(assets).toHaveLength(1);
     expect(assets[0]!.acquired).toBeUndefined();
+    expect(await exists(heldDirOf(p))).toBe(false);
+    expect(await pendingReviews(p)).toEqual([]);
+    expect(await exists(folderOf(eid))).toBe(false);
   });
 
   const IDENT = (basis: boolean) => `identifiability:
