@@ -716,6 +716,30 @@ describe("SourceDetail: how a file was got (F18b; R340 e)", () => {
     expect(file("plain").textContent).toBe("plain.pdf pdf · 1 KB");
   });
 
+  it("R347 c: a free copy fetched in the app's own window says where the window was opened, never \"A free copy from <host>\"; other ways read as before", async () => {
+    const window_ = { method: "free_copy", via: "sign-in-window", at: AT, tool, access: "signed-in-session" };
+    const file = await filesWith([
+      asset("window-host", { ...window_, address: "https://repository.example.edu/handle/1/2", check: { result: "match", by: "title" } }),
+      asset("window-doubt", { ...window_, address: "https://doi.org/10.5555/x", check: { result: "accepted-after-mismatch", why: "other-doi" } }),
+      asset("window-no-host", { ...window_, address: "" }),
+      asset("service", { method: "free_copy", via: "service", service: "arxiv", address: "https://arxiv.org/pdf/2101.00001", at: AT, tool, access: "public" }),
+      asset("later-via", { method: "free_copy", via: "from-a-later-build", address: "https://files.example.org/a.pdf", at: AT, tool, access: "public" }),
+      asset("no-via", { method: "free_copy", address: "https://files.example.org/b.pdf", at: AT, tool, access: "public" }),
+      asset("library", { method: "library_access", via: "sign-in-window", address: "https://ezproxy.example.edu/x.pdf", at: AT, tool, access: "signed-in-session" }),
+    ]);
+    expect(how(file("window-host"))).toBe(`Fetched in the app's own window, opened at repository.example.edu. ${ADDED} The app's check had said it looked like the right file.`);
+    expect(how(file("window-doubt"))).toBe(`Fetched in the app's own window, opened at doi.org. ${ADDED} You used it although the app's check had a doubt: The file names another DOI as its own.`);
+    expect(how(file("window-no-host"))).toBe(`Fetched in the app's own window. ${ADDED}`);
+    for (const id of ["window-host", "window-doubt", "window-no-host"]) expect(how(file(id))).not.toMatch(/free copy|library/iu);
+    // A service's free copy, and a free copy whose way this build does not know: as before, no service invented.
+    expect(how(file("service"))).toBe(`A free copy from arxiv.org, found through arXiv. ${ADDED}`);
+    expect(how(file("later-via"))).toBe(`A free copy from files.example.org. ${ADDED}`);
+    expect(how(file("no-via"))).toBe(`A free copy from files.example.org. ${ADDED}`);
+    expect(how(file("library"))).toBe(`Fetched through your library (ezproxy.example.edu). ${ADDED}`);
+    // The host is the record's, shown through UserText.
+    expect([...file("window-host").querySelectorAll(".ao-source__acquired [dir=auto]")].map((p) => p.textContent)).toEqual(["repository.example.edu", `Nov ${new Date(AT).getDate()}, 2026`]);
+  });
+
   it("every service as the Search sources screen names it", async () => {
     const names = { openalex: "OpenAlex", unpaywall: "Unpaywall", arxiv: "arXiv", europepmc: "Europe PMC", semanticscholar: "Semantic Scholar", doab: "Directory of Open Access Books", internetarchive: "Internet Archive" };
     const file = await filesWith(Object.keys(names).map((s) => asset(s, { method: "free_copy", via: "service", service: s, address: "https://archive.org/download/x/x.pdf", at: AT, tool, access: "public" })));

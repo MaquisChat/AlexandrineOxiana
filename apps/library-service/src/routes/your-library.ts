@@ -10,6 +10,7 @@
  *   POST /settings/your-library/test             no body → { url } (Task F18a, R334 b: the address of one fixed work)
  *   POST /projects/:id/find/:eid/library/start   no body → { url, ticket }
  *   POST /projects/:id/find/:eid/library/cancel  no body → FindEntryView
+ *   POST /projects/:id/find/:eid/link/start      { url } → { url, ticket } (Task F18c, R345: one of the entry's links)
  *
  * The pasted link is read and dropped: it is never stored, logged, put in an error, or repeated in an answer (only the
  * worked-out address's host — and a link resolver's path — and kind are said). The PUT never trusts the page: an address is accepted only in the form
@@ -21,6 +22,12 @@
  * anything from the library: the answer is the address and the ticket, for the sign-in window (Task F16). Neither is in
  * any log line, audit entry, event, error or file; the answer is `Cache-Control: no-store`. The hand-over (Task F17)
  * ends the ticket through the runner's `libraryHandedOver`.
+ *
+ * Task F18c (R345): "Open it here and fetch the PDF" — the same start at one of the entry's own links (the runner's
+ * `linkStart`, its second entry point: the same ticket, pause, limit, waiting state, cancel, ways back and hand-over).
+ * It is here, beside the library's start, because it IS that start — the same caller checks, bounds, refusals' form
+ * and `said` — with a body of exactly `{ url }`. The link is never logged, audited, put in an event or an error, or
+ * repeated in a refusal; the answer gives it back as the service holds it, with the ticket (`no-store`).
  */
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { isId } from "@ao/core";
@@ -53,7 +60,9 @@ import {
 } from "@ao/library";
 import {
   FIND_LIBRARY_TEXT,
+  FIND_LINK_TEXT,
   FIND_ROUTE_TEXT,
+  WHERE_TO_GET_IT_URL_MAX,
   YOUR_LIBRARY_BODY_MAX_BYTES,
   YOUR_LIBRARY_DERIVE_TEXT,
   YOUR_LIBRARY_LINK_MAX,
@@ -107,7 +116,24 @@ const LIBRARY_REFUSAL: Record<FindLibraryRefusedError["code"], { reason: string;
   busy: { reason: "library-busy", message: FIND_LIBRARY_TEXT.busy },
   pause: { reason: "library-pause" },
   "held-full": { reason: "library-held-full", message: FIND_LIBRARY_TEXT.heldFull },
+  // F18c (R345): a link start's own refusals (the library's sentence would name the library untruly).
+  "link-not-offered": { reason: "link-not-offered", message: FIND_LINK_TEXT.notOffered },
+  "not-a-place": { reason: "link-not-a-place", message: FIND_LINK_TEXT.notAPlace },
 };
+
+/**
+ * F18c (R345 b): the link of a link start's body, or null when it cannot be one of an entry's links at all (not https,
+ * a user name or password, over the links' bound, not an address). Whether it IS one of the entry's is the runner's.
+ */
+function linkShapeOk(url: string): boolean {
+  if (url.length > WHERE_TO_GET_IT_URL_MAX) return false;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && u.username === "" && u.password === "";
+  } catch {
+    return false;
+  }
+}
 
 export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
@@ -181,21 +207,34 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
   // ------------------------------------------------------------------------------------------------------------
   // Starting and cancelling a fetch through the library (R324 a–c).
 
-  const addressed = (req: FastifyRequest): { s: Session; runner: FindRunner; projectId: string; entryId: string } => {
+  /**
+   * The caller, ids, body, library and project of a start or cancel. `takes` "nothing": no body (the library's routes);
+   * "url" (F18c's link start): a body of exactly `{ url }` with text — its link returned.
+   */
+  const addressed = (req: FastifyRequest, takes: "nothing" | "url" = "nothing"): { s: Session; runner: FindRunner; projectId: string; entryId: string; url: string } => {
     uiOnly(req);
     const p = paramsOf(req);
     const projectId = p.id ?? "";
     const entryId = p.eid ?? "";
     if (!isId(projectId)) throw badRequest("That is not a project's id.");
     if (!isId(entryId)) throw badRequest("That is not a queue entry's id.");
-    if (Object.keys(objectBody(req, YOUR_LIBRARY_TEXT.noBody)).length) throw badRequest(YOUR_LIBRARY_TEXT.noBody);
+    let url = "";
+    if (takes === "nothing") {
+      if (Object.keys(objectBody(req, YOUR_LIBRARY_TEXT.noBody)).length) throw badRequest(YOUR_LIBRARY_TEXT.noBody);
+    } else {
+      const b = objectBody(req, FIND_LINK_TEXT.body);
+      if (Object.keys(b).length !== 1 || typeof b.url !== "string") throw badRequest(FIND_LINK_TEXT.body);
+      url = b.url;
+      // Never repeated: a refusal is the fixed sentence.
+      if (!linkShapeOk(url)) throw new ApiError(400, "VALIDATION", FIND_LINK_TEXT.notAPlace, "link-not-a-place");
+    }
     const s = state.requireSession();
     if (!s.repo.listProjects().some((x) => x.id === projectId)) throw new ApiError(404, "NOT_FOUND", "That project was not found.");
     state.assertNotMoving();
     if (s.lib.mode === "read-only" || !s.index) throw new ApiError(409, "READ_ONLY", FIND_ROUTE_TEXT.readOnly, "read-only");
     if (!s.find || state.session !== s) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
     if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
-    return { s, runner: s.find, projectId, entryId };
+    return { s, runner: s.find, projectId, entryId, url };
   };
 
   /** A refusal of the runner in words (each its own status, as the find routes give them). Nothing else is passed on. */
@@ -224,6 +263,24 @@ export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
       throw said(s, projectId, err);
     }
     reply.header("Cache-Control", "no-store");
+    return { url: got.url, ticket: got.ticket };
+  });
+
+  /**
+   * F18c (R345): "Open it here and fetch the PDF" — the start at one of the entry's own links. "Your library" is read
+   * anew only for its catalogue's link (no library need be set); the runner compares the link with the entry's links as
+   * "Where to get it" gives them now. Every answer, its refusals included, is no-store.
+   */
+  app.post("/projects/:id/find/:eid/link/start", limit, async (req, reply): Promise<FindLibraryStartResponse> => {
+    reply.header("Cache-Control", "no-store");
+    const { s, runner, projectId, entryId, url } = addressed(req, "url");
+    const { settings } = await readYourLibrary(state.deps.appConfigDir);
+    let got: { url: string; ticket: string };
+    try {
+      got = await runner.linkStart(projectId, entryId, url, settings);
+    } catch (err) {
+      throw said(s, projectId, err);
+    }
     return { url: got.url, ticket: got.ticket };
   });
 

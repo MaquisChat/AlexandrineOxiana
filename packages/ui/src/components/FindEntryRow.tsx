@@ -32,8 +32,13 @@
  * (R342 i). The state's words are focusable from script (R342 c: the focus after a start). What the shell
  * reported for the row is the screen's `note`. "Where to get it" is WhereToGetIt, on every row whose view carries links
  * (never on a record removed from the library).
+ *
+ * Task F18c (R345): where the view says "Open it here and fetch the PDF" may start (`linkStart === true`; the row works
+ * out nothing), WhereToGetIt gives each link that control in the desktop app; a press is the act "link" with that
+ * link's address, which the screen starts as it starts the library's. A file of a link's start that was not kept is
+ * said in FIND_LINK_FILE_TEXT (`library.lastFileFrom === "link"`), never in the library's words.
  */
-import { FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, FIND_LIBRARY_TEXT, FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindLibraryFileOutcome, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
+import { FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, FIND_LIBRARY_TEXT, FIND_LINK_FILE_TEXT, FIND_MORE_PEOPLE_TEXT, FIND_REASON_CODES, FIND_REASON_TEXT, type FindEntryView, type FindLibraryFileOutcome, type FindReasonCode, type FindWorkCandidate } from "@ao/shared";
 import { Component, memo, useId, type ReactNode } from "react";
 import { creatorsText, isKnownState, kindWords, usableCandidates, yearOf } from "../api/find";
 import { inDesktopShell } from "../desktopShell";
@@ -55,12 +60,16 @@ export type FindActKind =
   // Task F18b (R340): through the researcher's library.
   | "library"
   | "library-take"
-  | "library-cancel";
+  | "library-cancel"
+  // Task F18c (R345): "Open it here and fetch the PDF" on one of the row's links.
+  | "link";
 
 /** What the researcher pressed on a row. */
 export interface FindAction {
   kind: FindActKind;
   entry: FindEntryView;
+  /** "link" only: the address of the link pressed, as "Where to get it" parsed it from the view's `offers`. */
+  url?: string;
 }
 
 /** Where a match in another project is, as the service said at request time (never stored). */
@@ -104,11 +113,17 @@ export const FIND_TEXT = {
   windowClosed: "The sign-in window was closed.",
   fetching: "Fetching the PDF…",
   notAPdf: "That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check.",
+  /** R347 d: the shell's `not-a-pdf` with `sign-in-address` — it refused a sign-in page. */
+  notAPdfSignIn: "That is a sign-in page, and the app never fetches from one. Open the PDF itself in the window.",
+  /** R347 d: the shell's `not-a-pdf` with `not-https` — it refused a page not served over https. */
+  notAPdfNotHttps: "That page is not served over https, so the app does not fetch from it.",
   fetchPause: "The sign-in window rests for a few seconds between files. Try again shortly.",
   fetchBusy: "The PDF is already being fetched.",
   fetchFailed: "The PDF could not be fetched. Try again in the sign-in window.",
   /** R342 e: the shell's `failed` with `no-ticket` — no window is open for this work (as after the page was loaded afresh). */
   noWindow: "The sign-in window is not open for this work. Cancel, then use “Get through my library” again.",
+  /** F18c (R345 e): the same for a window opened at one of the entry's links (`windowStart: "link"`). */
+  noWindowLink: "The sign-in window is not open for this work. Cancel, then use “Open it here and fetch the PDF” again.",
   handedOver: "The file was fetched and is being checked.",
   appSilent: "The app did not answer. Try again.",
 } as const;
@@ -137,6 +152,18 @@ const lastFileOf = (e: FindEntryView): FindLibraryFileOutcome | undefined => {
   const f = libraryOf(e)?.lastFile;
   return typeof f === "string" && (FIND_LIBRARY_FILE_OUTCOMES as readonly string[]).includes(f) ? (f as FindLibraryFileOutcome) : undefined;
 };
+/**
+ * R340 c, F18c (R345 e): the service's sentence for a file that was not kept — a link's in words that name no library,
+ * the library's as before; a kind of start this build does not know: none (it could not say whose file it was truly).
+ */
+const lastFileSentence = (e: FindEntryView): string | undefined => {
+  const f = lastFileOf(e);
+  if (!f) return undefined;
+  const from = libraryOf(e)?.lastFileFrom;
+  return from === undefined ? FIND_LIBRARY_FILE_TEXT[f] : from === "link" ? FIND_LINK_FILE_TEXT[f] : undefined;
+};
+/** F18c (R345 b): the service offers "Open it here and fetch the PDF" for this entry's links. */
+export const linkOffered = (e: FindEntryView): boolean => e.linkStart === true;
 /** The acts that need the desktop shell: outside it they are shown unavailable and do nothing (R340 a). */
 const SHELL_ACTS: ReadonlySet<FindActKind> = new Set(["library", "library-take"]);
 
@@ -344,6 +371,7 @@ const ACT_TEXT: Record<FindActKind, string> = {
   library: "Get through my library",
   "library-take": "Add the PDF showing in the sign-in window",
   "library-cancel": "Cancel",
+  link: "Open it here and fetch the PDF",
 };
 const BUSY_TEXT: Partial<Record<FindActKind, string>> = {
   choose: "Choosing…",
@@ -356,6 +384,7 @@ const BUSY_TEXT: Partial<Record<FindActKind, string>> = {
   library: "Opening the sign-in window…",
   "library-take": "Asking the sign-in window…",
   "library-cancel": "Cancelling…",
+  link: "Opening the sign-in window…",
 };
 /** Acts that only read: allowed in a read-only library. */
 const READS: ReadonlySet<FindActKind> = new Set(["open", "open-there"]);
@@ -423,7 +452,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
   // "Where to get it" (R340 d): wherever the view carries links — never on a record removed from the library (R282 g).
   const showOffers = known && !recordRemoved(e) && Array.isArray(e.offers);
   // R340 a, c: the service's sentences for the library part of the view (never one of the row's own).
-  const lastFile = known ? lastFileOf(e) : undefined;
+  const lastFile = known ? lastFileSentence(e) : undefined;
   const noLibrary = known && noLibrarySet(e);
   // Outside the desktop app the acts that need the shell are shown unavailable, with why (R340 a).
   const desktop = inDesktopShell();
@@ -490,7 +519,7 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
       {reason && <p className="ao-find__reason">{reason}</p>}
       {lastFile && (
         <p className="ao-find__library">
-          <span className="ao-find__library-text">{FIND_LIBRARY_FILE_TEXT[lastFile]}</span>
+          <span className="ao-find__library-text">{lastFile}</span>
         </p>
       )}
       {noLibrary && (
@@ -507,7 +536,14 @@ function FindEntryRowImpl({ entry: e, onAction, place, busy, readOnly = false, s
           <UserText>{error}</UserText>
         </p>
       )}
-      {showOffers && <WhereToGetIt offers={e.offers} {...(short ? { name: label } : {})} />}
+      {showOffers && (
+        <WhereToGetIt
+          offers={e.offers}
+          {...(short ? { name: label } : {})}
+          // F18c (R345 a): only where the service offers it, and only in the desktop app (WhereToGetIt shows it there).
+          {...(known && linkOffered(e) && desktop ? { onOpenHere: (url: string) => onAction({ kind: "link", entry: e, url }), openHereBusy: !!busy, openHereDisabled: readOnly } : {})}
+        />
+      )}
       <div className="ao-actions ao-find__actions">
         {offersCheck(e) && (
           <a href={reviewEntryHref(e)} onClick={inAppLink} data-act="check" aria-label={short ? `${FIND_TEXT.checkFile}: ${label}` : FIND_TEXT.checkFile}>

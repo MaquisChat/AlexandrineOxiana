@@ -535,7 +535,7 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       windowMayBeOpen.current = true;
       let opened = false;
       try {
-        opened = (await shell.openLibraryWindow(ticket, address)) === true;
+        opened = (await shell.openLibraryWindow(ticket, address, "library")) === true;
       } catch {
         opened = false;
       }

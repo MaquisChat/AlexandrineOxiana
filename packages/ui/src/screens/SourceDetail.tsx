@@ -97,12 +97,13 @@ type AcquiredWords = Array<string | { user: string }>;
 
 /**
  * How a file was got, in words (R340 e), from its `acquired` record read defensively; undefined for a file without one.
- * `<host>` is parsed from the recorded address, never taken from anything else in the record.
+ * `<host>` is parsed from the recorded address, never taken from anything else in the record. A free copy fetched in
+ * the app's own window (`via` "sign-in-window", R347 c) says where the window was opened, never "A free copy from".
  */
 export function acquiredWords(a: Asset): AcquiredWords | undefined {
   const r: unknown = a.acquired;
   if (!r || typeof r !== "object" || Array.isArray(r)) return undefined;
-  const { method, service, address, at, check } = r as Record<string, unknown>;
+  const { method, via, service, address, at, check } = r as Record<string, unknown>;
   let host: string | undefined;
   try {
     const u = new URL(typeof address === "string" ? address : "");
@@ -111,7 +112,10 @@ export function acquiredWords(a: Asset): AcquiredWords | undefined {
     host = undefined;
   }
   const out: AcquiredWords = [];
-  if (method === "free_copy") {
+  if (method === "free_copy" && via === "sign-in-window") {
+    // R347 c: a link opened in the app's own window — the host it was opened at, which need not have served the file.
+    out.push(...(host ? ["Fetched in the app's own window, opened at ", { user: host }, "."] : ["Fetched in the app's own window."]));
+  } else if (method === "free_copy") {
     const svc = typeof service === "string" && Object.hasOwn(COPY_NAME, service) ? COPY_NAME[service as keyof typeof COPY_NAME] : undefined;
     out.push("A free copy");
     if (host) out.push(" from ", { user: host });

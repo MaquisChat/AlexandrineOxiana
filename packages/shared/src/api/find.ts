@@ -132,7 +132,7 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "record-removed": "The record was removed from the library.",
   "copy-store-not-allowed": "This project's rules do not allow storing the file found for this record.",
   "copy-no-legal-basis": "This project's rules need a legal basis to store the file found for this record, and the record has none.",
-  "library-unfinished": "A fetch through your library was not finished, and what this entry said before could not be read back. Nothing was added.",
+  "library-unfinished": "A fetch in the app's window was not finished, and what this entry said before could not be read back. Nothing was added.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */
@@ -180,6 +180,9 @@ export const FIND_REFUSAL_REASONS = [
   "library-busy",
   "library-pause",
   "library-held-full",
+  // Task F18c (R345): "Open it here and fetch the PDF" refused — the sentences are FIND_LINK_TEXT.
+  "link-not-offered",
+  "link-not-a-place",
 ] as const;
 export type FindRefusalReason = (typeof FIND_REFUSAL_REASONS)[number];
 
@@ -354,6 +357,20 @@ export interface FindEntryView {
    * files): the route says why.
    */
   library?: FindLibraryChance;
+  /**
+   * Task F18c (R345 b): `true` when "Open it here and fetch the PDF" may start at this entry's links (every link of its
+   * `offers`) — worked out by the service, never by the screen: the entry rests as a library start needs it (its record
+   * there, no file, none waiting for the check, not at work), its view carries links, and the rules allow fetching free
+   * copies and keeping the file. No library need be set. Absent otherwise. A start can still be refused at the press
+   * (another ticket open, the pause, the limit of waiting files): the route says why.
+   */
+  linkStart?: true;
+  /**
+   * Task F18c (R345 e): on an entry waiting in the sign-in window that was opened at one of its links, "link" — so that
+   * the screen names that control, never the library. Absent for a start through the library, and when the service no
+   * longer knows (tickets are in memory only; after a restart the entry returns at once).
+   */
+  windowStart?: "link";
 }
 
 /** Task F8b (R279 c): an author of the typed name offered beside the works ("Show this author's works"). Counts only. */
@@ -539,6 +556,11 @@ export type FindLibraryChance = (
    * restart. Its sentence is FIND_LIBRARY_FILE_TEXT.
    */
   lastFile?: FindLibraryFileOutcome;
+  /**
+   * Task F18c (R345 e): with `lastFile`, "link" when that file was fetched at one of the entry's links (its sentence is
+   * then FIND_LINK_FILE_TEXT, which names no library). Absent for a file through the library.
+   */
+  lastFileFrom?: "link";
 };
 
 /** The longest link "derive" reads (a longer one is refused in words). */
@@ -626,4 +648,41 @@ export const FIND_LIBRARY_FILE_TEXT: Record<FindLibraryFileOutcome, string> = {
   "rules-method": "The file from your library was not kept: this project's rules do not allow fetching works through your library.",
   "rules-store": "The file from your library was not kept: this project's rules do not allow storing the file for this record.",
   "rules-legal-basis": "The file from your library was not kept: this project's rules need a legal basis to store the file for this record, and the record has none.",
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task F18c (R345): "Open it here and fetch the PDF" — one of an entry's own links opened in the sign-in window, on the
+// researcher's press. The same ticket, waiting state, window and hand-over as a start through the library; the file it
+// gives waits in the review queue for the researcher's check (R301), recorded as a free copy got in a signed-in window.
+//
+//   POST /projects/:id/find/:eid/link/start   FindLinkStartRequest → FindLibraryStartResponse (the link as the service
+//                                             holds it, and the one-time ticket). Cancelled by `…/library/cancel`.
+
+/** How the sign-in window was opened for an entry: through the library, or at one of the entry's links. */
+export const FIND_WINDOW_STARTS = ["library", "link"] as const;
+export type FindWindowStart = (typeof FIND_WINDOW_STARTS)[number];
+
+/** The body of a link start: the link pressed (one of the entry's `offers`, as the view gave it), and nothing else. */
+export interface FindLinkStartRequest {
+  url: string;
+}
+
+/** A link start refused: its own sentences, where the library's would name the library untruly. */
+export const FIND_LINK_TEXT = {
+  /** 400: a body that is not `{ url }` with a string. */
+  body: "Send the address to open, and nothing else. Nothing was changed.",
+  /** "link-not-a-place": not one of the entry's own links as the service gives them now (400 when not https, with a user name or password, or too long). */
+  notAPlace: "That address is not one of this entry's places. Nothing was changed.",
+  /** "link-not-offered": the entry is not one a link start is offered for now. */
+  notOffered: "A PDF cannot be fetched for this entry in the sign-in window now. Nothing was changed.",
+} as const;
+
+/** Why a file fetched at one of the entry's links was not held (the library's outcomes), in words that name no library. */
+export const FIND_LINK_FILE_TEXT: Record<FindLibraryFileOutcome, string> = {
+  "not-pdf": "The file fetched in the sign-in window was not kept: it is not a PDF or EPUB.",
+  "too-large": "The file fetched in the sign-in window was not kept: it is larger than 200 MB.",
+  unreadable: "The file fetched in the sign-in window could not be read, so it was not kept. Try again with “Open it here and fetch the PDF”.",
+  "rules-method": "The file fetched in the sign-in window was not kept: this project's rules do not allow fetching free copies of works.",
+  "rules-store": "The file fetched in the sign-in window was not kept: this project's rules do not allow storing the file for this record.",
+  "rules-legal-basis": "The file fetched in the sign-in window was not kept: this project's rules need a legal basis to store the file for this record, and the record has none.",
 };

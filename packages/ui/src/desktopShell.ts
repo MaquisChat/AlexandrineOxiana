@@ -43,10 +43,11 @@ export interface DesktopShell {
   /**
    * The library sign-in window (Task F16, R325): opens the ONE separate window at an https address
    * for a ticket the service gave (32 lower-case hex); the shell, never the page, then fetches the PDF
-   * the window reaches and hands it to the service. Only the ticket and the address are passed. False
-   * when the shell refused (a ticket already open, a bad ticket or address) or is not there.
+   * the window reaches and hands it to the service. Only the ticket, the address and the kind of start are passed
+   * (R347 a: `from` "library" for the library's start and the settings screen's Test, "link" for an entry's link).
+   * False when the shell refused (a ticket already open, a bad ticket or address) or is not there.
    */
-  openLibraryWindow(ticket: string, url: string): Promise<boolean>;
+  openLibraryWindow(ticket: string, url: string, from: LibraryWindowFrom): Promise<boolean>;
   /** "Add the PDF showing in the sign-in window": the shell fetches the window's current address. */
   libraryWindowTakePdf(): Promise<boolean>;
   /** Closes the sign-in window (its ticket ends). */
@@ -60,6 +61,9 @@ export interface DesktopShell {
   /** Hears the sign-in window's state. Returns the function that stops listening. */
   onLibraryWindow(handler: (e: LibraryWindowEvent) => void): Promise<() => void>;
 }
+
+/** Which kind of start opened the sign-in window (R347 a): the library's (or its Test), or one of an entry's links. */
+export type LibraryWindowFrom = "library" | "link";
 
 /** The sign-in window's states, as the shell sends them (event `library-window`, to the main window only). */
 export type LibraryWindowState = "opened" | "fetching" | "handed-over" | "not-a-pdf" | "failed" | "closed";
@@ -97,7 +101,7 @@ async function invokeYes(command: string, args: Record<string, unknown>): Promis
 }
 
 const libraryWindow = {
-  openLibraryWindow: (ticket: string, url: string) => invokeYes("open_library_window", { ticket, url }),
+  openLibraryWindow: (ticket: string, url: string, from: LibraryWindowFrom) => invokeYes("open_library_window", { ticket, url, from }),
   libraryWindowTakePdf: () => invokeYes("library_window_take_pdf", {}),
   closeLibraryWindow: async () => {
     await invokeYes("close_library_window", {});
@@ -122,8 +126,8 @@ const libraryWindow = {
 };
 
 /** Outside the desktop shell (a plain browser, tests, the end-to-end harness) none of these is available: they answer false and load nothing. */
-export async function openLibraryWindow(ticket: string, url: string): Promise<boolean> {
-  return inDesktopShell() ? libraryWindow.openLibraryWindow(ticket, url) : false;
+export async function openLibraryWindow(ticket: string, url: string, from: LibraryWindowFrom): Promise<boolean> {
+  return inDesktopShell() ? libraryWindow.openLibraryWindow(ticket, url, from) : false;
 }
 export async function libraryWindowTakePdf(): Promise<boolean> {
   return inDesktopShell() ? libraryWindow.libraryWindowTakePdf() : false;

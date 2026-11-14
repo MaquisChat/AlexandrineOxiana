@@ -19,6 +19,8 @@ import { deviceDeps, type Deps, type FindEntry } from "@ao/library";
 import {
   FIND_LIBRARY_FILE_TEXT,
   FIND_LIBRARY_TEXT,
+  FIND_LINK_FILE_TEXT,
+  FIND_LINK_TEXT,
   FIND_REASON_TEXT,
   FIND_ROUTE_TEXT,
   LIBRARY_PAUSE_MS,
@@ -870,6 +872,205 @@ describe("F17 (R329): the file the shell hands over waits in the review queue", 
     expect(v.library).toEqual({ canStart: false, reason: "not-offered", lastFile: "rules-method" });
     expect(await readdir(inbox)).toEqual([]);
     await nothingOfThePath();
+  });
+
+  // -------------------------------------------------------------------------------------------------------------
+  // Task F18c (R345): "Open it here and fetch the PDF" — `POST …/link/start` with `{ url }`, one of the entry's own links.
+
+  describe("F18c (R345): a link of the entry opened in the sign-in window", () => {
+    /** Free copies allowed, the library's method not: a link start is offered, a library start is not. */
+    const FREE_ONLY = GOV("acquireMethods: [reference_lookup, free_copy]\n");
+    /** The publisher's page: the entry's own link (the DOI is looked for in every log line, error, event, audit and queue file). */
+    const PUBLISHER = `https://doi.org/${DOI}`;
+    const linkStart = async (pid: string, eid: string, body: unknown, raw?: string) => {
+      const r = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/link/start`, ...(raw !== undefined ? { raw } : body !== undefined ? { body } : {}) });
+      if (r.status === 200) tickets.push(r.json.ticket);
+      return r;
+    };
+
+    it("R345 b: the view offers it (`linkStart`) exactly where a link start would pass — with no library set; never on a waiting entry, one with a file waiting, without links, or under rules forbidding free copies", async () => {
+      await start();
+      await openNewLibrary();
+      const pid = await newProject({ gov: FREE_ONLY });
+      const a = await resting(pid, { state: "no-open-copy" });
+      const b = await resting(pid, { state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+      const notRest = await resting(pid, { state: "record-complete", reason: { code: "held-full" } });
+      const noLinks = await resting(pid, { state: "no-open-copy" }, await record(pid, { doi: null }));
+      const sid = await record(pid, { doi: "10.5555/ao.f18c.waits" });
+      const waitsFor = await resting(pid, { state: "no-open-copy" }, sid);
+      await resting(pid, { state: "needs-check", reason: { code: "file-title-absent" } }, sid);
+      const va = await view(pid, a.id);
+      expect(va.linkStart).toBe(true);
+      expect(va.library).toBeUndefined(); // the library's own method is forbidden here
+      expect(va.offers!.map((o) => o.url)).toEqual([PUBLISHER]);
+      expect((await view(pid, b.id)).linkStart).toBe(true);
+      for (const e of [notRest, noLinks, waitsFor]) expect((await view(pid, e.id)).linkStart, e.id).toBeUndefined();
+      expect((await view(pid, noLinks.id)).offers).toBeUndefined();
+      // Rules forbidding free copies: none.
+      const nf = await newProject({ gov: NO_FREE });
+      const n = await resting(nf, { state: "no-open-copy" });
+      expect((await view(nf, n.id)).linkStart).toBeUndefined();
+      expect((await view(nf, n.id)).offers!.length).toBeGreaterThan(0);
+      // A waiting entry started at a link says so (`windowStart`); one started through the library does not.
+      expect((await linkStart(pid, a.id, { url: PUBLISHER })).status).toBe(200);
+      const w = await view(pid, a.id);
+      expect(w).toMatchObject({ state: "waiting-sign-in", windowStart: "link" });
+      expect(w.linkStart).toBeUndefined();
+      expect(w.offers).toBeUndefined();
+      expect((await call({ method: "POST", url: `/projects/${pid}/find/${a.id}/library/cancel` })).json).toMatchObject({ state: "no-open-copy", linkStart: true });
+      expect((await view(pid, a.id)).windowStart).toBeUndefined();
+      const lib = await newProject();
+      await setLibrary();
+      const l = await resting(lib, { state: "no-open-copy" });
+      expect((await startFetch(lib, l.id)).status).toBe(200);
+      expect((await view(lib, l.id)).windowStart).toBeUndefined();
+    });
+
+    it("the start: `{ url }` only, one of THAT entry's links as the service gives them now; `{ url, ticket }`, no-store; every refusal in words, with no-store, nothing changed", async () => {
+      await start();
+      await openNewLibrary();
+      const pid = await newProject({ gov: FREE_ONLY });
+      const e = await resting(pid, { state: "no-open-copy", reason: { code: "not-this-file" } });
+      const other = await resting(pid, { state: "no-open-copy" }, await record(pid, { doi: "10.5555/ao.f18c.other" }));
+      // The body: `{ url }` with text, and nothing else.
+      for (const [body, raw] of [[undefined], [{}], [{ url: 42 }], [{ url: PUBLISHER, extra: 1 }], [undefined, "[1]"]] as Array<[unknown, string?]>) {
+        const r = await linkStart(pid, e.id, body, raw);
+        expect(r.status, JSON.stringify(body ?? raw)).toBe(400);
+        expect(r.json.error.message).toBe(FIND_LINK_TEXT.body);
+        expect(r.headers["cache-control"]).toBe("no-store");
+      }
+      // Not https, a user name, over the bound, not an address: 400; another entry's link or a made-up one: 409.
+      for (const url of [PUBLISHER.replace("https:", "http:"), PUBLISHER.replace("https://", "https://u:p@"), `${PUBLISHER}?${"a".repeat(2100)}`, "not an address"]) {
+        const r = await linkStart(pid, e.id, { url });
+        expect(r.status).toBe(400);
+        expect(r.json.error).toMatchObject({ message: FIND_LINK_TEXT.notAPlace, reason: "link-not-a-place" });
+      }
+      for (const url of ["https://doi.org/10.5555/ao.f18c.other", "https://elsewhere.example.org/a.pdf"]) {
+        const r = await linkStart(pid, e.id, { url });
+        expect(r.status).toBe(409);
+        expect(r.json.error).toMatchObject({ code: "CONFLICT", message: FIND_LINK_TEXT.notAPlace, reason: "link-not-a-place" });
+        expect(r.headers["cache-control"]).toBe("no-store");
+      }
+      expect((await view(pid, e.id)).state).toBe("no-open-copy");
+      // Its own link (another spelling of it): the address as the service holds it, and a ticket; nothing else.
+      const ok = await linkStart(pid, e.id, { url: PUBLISHER.replace("doi.org", "DOI.ORG") });
+      expect(ok.status, ok.body).toBe(200);
+      expect(ok.json).toEqual({ url: PUBLISHER, ticket: expect.stringMatching(/^[0-9a-f]{32}$/u) });
+      expect(ok.headers["cache-control"]).toBe("no-store");
+      expect(await view(pid, e.id)).toMatchObject({ state: "waiting-sign-in", windowStart: "link" });
+      // One ticket for both kinds.
+      const busy = await linkStart(pid, other.id, { url: "https://doi.org/10.5555/ao.f18c.other" });
+      expect(busy.status).toBe(409);
+      expect(busy.json.error).toMatchObject({ message: FIND_LIBRARY_TEXT.busy, reason: "library-busy" });
+      // The existing cancel returns it exactly.
+      const c = await call({ method: "POST", url: `/projects/${pid}/find/${e.id}/library/cancel` });
+      expect(c.json).toMatchObject({ state: "no-open-copy", reason: { code: "not-this-file" } });
+      expect(svc!.state.session!.find!.libraryHandedOver(ok.json.ticket)).toBeNull();
+      // An unknown entry: 404. The extension's token: 403.
+      expect((await linkStart(pid, newId(), { url: PUBLISHER })).status).toBe(404);
+      const token = await pairExtension();
+      const ext = await svc!.app.inject({ method: "POST", url: `/projects/${pid}/find/${e.id}/link/start`, headers: { authorization: `Bearer ${token}`, origin: EXT, "content-type": "application/json" }, payload: JSON.stringify({ url: PUBLISHER }) });
+      expect(ext.statusCode).toBe(403);
+      errorBodies.push(ext.body);
+      // The audit: a start with the method free_copy (and nothing of the address).
+      const { audit } = await everything(tmp);
+      expect(audit).toContain('"op":"project.find.library-start"');
+      expect(audit).toContain('"method":"free_copy"');
+    });
+
+    it("refused like a library start: rules forbidding free copies (its own sentence), the pause, the waiting files' limit, a locked project, a read-only library", async () => {
+      await start();
+      const path = await openNewLibrary();
+      const nf = await newProject({ gov: NO_FREE });
+      const n = await resting(nf, { state: "no-open-copy" });
+      const no = await linkStart(nf, n.id, { url: PUBLISHER });
+      expect(no.status).toBe(409);
+      expect(no.json.error).toMatchObject({ message: FIND_LINK_TEXT.notOffered, reason: "link-not-offered" });
+      const pid = await newProject({ gov: GOV() });
+      const e = await resting(pid, { state: "no-open-copy" });
+      const f = await resting(pid, { state: "no-open-copy" });
+      // The pause after a hand-over.
+      const first = await linkStart(pid, e.id, { url: PUBLISHER });
+      expect(svc!.state.session!.find!.libraryHandedOver(first.json.ticket)).not.toBeNull();
+      const paused = await linkStart(pid, f.id, { url: PUBLISHER });
+      expect(paused.json.error).toMatchObject({ message: "Ready in 20 seconds.", reason: "library-pause" });
+      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + LIBRARY_PAUSE_MS });
+      // The limit of waiting files.
+      const otherSid = await record(pid, { doi: "10.5555/ao.f18c.held" });
+      const pdf = join(tmp, "held.pdf");
+      await writeFile(pdf, await buildPdf({ title: "A Different Paper", lines: ["A Different Paper"] }));
+      const at = new Date().toISOString();
+      const holds: FindEntry[] = Array.from({ length: 50 }, () => ({ id: newId(), projectId: pid, typed: "x y", state: "fetching", createdAt: at, updatedAt: at, attempts: 0, sourceId: otherSid }));
+      await appendFindEntriesIn(repo(), pid, holds, "add");
+      for (const h of holds) {
+        await holdMismatchedFileIn(repo(), pid, {
+          entry: { ...h, state: "needs-check", reason: { code: "file-title-absent" } },
+          sourceId: otherSid,
+          fromPath: pdf,
+          facts: { why: "title-absent", kind: "pdf", bytes: 1, acquired: { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at, tool: { name: "find-and-acquire", version: "0" }, access: "public" } },
+        });
+      }
+      const full = await linkStart(pid, f.id, { url: PUBLISHER });
+      expect(full.status).toBe(409);
+      expect(full.json.error).toMatchObject({ message: FIND_LIBRARY_TEXT.heldFull, reason: "library-held-full" });
+      expect((await view(pid, f.id)).state).toBe("no-open-copy");
+      // A locked project.
+      const locked = await newProject({ encrypted: true, gov: GOV() });
+      const le = await resting(locked, { state: "no-open-copy" });
+      expect((await call({ method: "POST", url: `/projects/${locked}/lock` })).status).toBe(200);
+      const l = await linkStart(locked, le.id, { url: PUBLISHER });
+      expect(l.status).toBe(423);
+      expect(l.json.error).toMatchObject({ code: "PROJECT_LOCKED", message: FIND_ROUTE_TEXT.locked });
+      // A read-only library.
+      expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+      const now = new Date().toISOString();
+      await writeFile(join(path, ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).json.mode).toBe("read-only");
+      const ro = await linkStart(pid, f.id, { url: PUBLISHER });
+      expect(ro.status).toBe(409);
+      expect(ro.json.error).toMatchObject({ code: "READ_ONLY", message: FIND_ROUTE_TEXT.readOnly });
+    });
+
+    it("R345 c: the file handed over waits; \"Use this file\" keeps it as a free copy got in the signed-in window at the link; a link's file not kept is said for the link", async () => {
+      await start();
+      await openNewLibrary();
+      const pid = await newProject({ gov: FREE_ONLY });
+      const e = await resting(pid, { state: "no-open-copy" });
+      const r = await linkStart(pid, e.id, { url: PUBLISHER });
+      expect(r.status, r.body).toBe(200);
+      await inboxReady();
+      const f = join(inbox, `${GRANT}.pdf`);
+      await writeFile(f, await goodPdf(), { mode: 0o600 });
+      const input = await pipe();
+      input.write(fileLine(r.json.ticket, f));
+      const v = await until(async () => ((x) => x.state !== "waiting-sign-in" && x)(await view(pid, e.id)), "the entry to leave the sign-in window");
+      expect(v.state).toBe("needs-check");
+      const q = await call({ url: `/projects/${pid}/review` });
+      const item = (q.json.items as Array<Record<string, any>>).find((x) => x.cause?.findEntryId === e.id)!;
+      expect(item).toMatchObject({ sourceId: e.sourceId, group: "found-file", heldFile: { why: "looks-right", kind: "pdf" } });
+      // R301: nothing attached until "Use this file"; then the file keeps how it was got.
+      expect((await call({ url: `/projects/${pid}/sources/${e.sourceId}` })).json.assets).toEqual([]);
+      const used = await call({ method: "POST", url: `/review/${item.id as string}/held-file`, body: { projectId: pid, decision: "attach" } });
+      expect(used.status, used.body).toBe(200);
+      const after = await repo().getSource(pid, e.sourceId!);
+      expect(after.assets[0]!.acquired).toMatchObject({ method: "free_copy", via: "sign-in-window", access: "signed-in-session", address: PUBLISHER, check: { result: "match", by: "title" } });
+      expect(after.assets[0]!.acquired).not.toHaveProperty("service");
+      expect((await view(pid, e.id)).state).toBe("in-library");
+      // A second entry, its file not a PDF: back, and the view says it of the link's file.
+      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + LIBRARY_PAUSE_MS });
+      const g = await resting(pid, { state: "no-open-copy" }, await record(pid, { doi: "10.5555/ao.f18c.second" }));
+      const s = await linkStart(pid, g.id, { url: "https://doi.org/10.5555/ao.f18c.second" });
+      expect(s.status, s.body).toBe(200);
+      const f2 = join(inbox, `${"cd".repeat(16)}.pdf`);
+      await writeFile(f2, "<html>Sign in</html>", { mode: 0o600 });
+      input.write(fileLine(s.json.ticket, f2, "cd".repeat(16)));
+      vi.useRealTimers();
+      const back = await until(async () => ((x) => x.state !== "waiting-sign-in" && x)(await view(pid, g.id)), "the entry to come back");
+      expect(back.state).toBe("no-open-copy");
+      expect(back.linkStart).toBe(true);
+      expect(back.library).toEqual({ canStart: false, reason: "not-offered", lastFile: "not-pdf", lastFileFrom: "link" });
+      expect(FIND_LINK_FILE_TEXT[back.library!.lastFile!]).toBe("The file fetched in the sign-in window was not kept: it is not a PDF or EPUB.");
+    });
   });
 });
 

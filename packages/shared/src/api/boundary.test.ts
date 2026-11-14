@@ -2,7 +2,7 @@
 // declared once here. The shapes themselves are checked by the compiler on both sides.
 import { describe, expect, it } from "vitest";
 import { YOUR_LIBRARY_TEST_DOI, type YourLibraryResponse, type YourLibraryTestResponse } from "../index.js";
-import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, FIND_LIBRARY_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, WHERE_TO_GET_IT_MAX, WHERE_TO_GET_IT_URL_MAX, YOUR_LIBRARY_DERIVE_REFUSALS, YOUR_LIBRARY_DERIVE_TEXT, YOUR_LIBRARY_LINK_MAX, YOUR_LIBRARY_NAME_MAX, YOUR_LIBRARY_TEXT, libraryReadyIn, yourLibraryAddressSentence, FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, LIBRARY_FILE_MAX_BYTES, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin, SEARCH_RECORD_SOURCES, SEARCH_COPY_SOURCES, SEARCH_SOURCE_GROUPS, SEARCH_SOURCE_INFO, SEARCH_KEY_SECRETS, SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI, SEARCH_TEST_TEXT, SEARCH_SETTINGS_TEXT, searchEmailRefusal, isSearchApiKeyShape, type SearchSourcesResponse, type SearchRecordRow } from "../index.js";
+import { ANNOTATION_ANCHORS_MAX, ANNOTATION_NOTE_MAX_CHARS, ANNOTATION_QUOTE_MAX_CHARS, ANNOTATION_RECTS_MAX, HIGHLIGHT_COLOUR_NAMES, SOURCE_ANNOTATIONS_MAX, SOURCE_ANNOTATION_TEXT_MAX, CAPTURE_BROWSERS, CAPTURE_CONTENT_TYPES, CAPTURE_ITEM_STATUSES, CAPTURE_LINKS_MAX, REVIEW_DECISION_ACTIONS, SERVICE_ERROR_CODES, WATCH_FILE_KINDS, WATCHED_FILE_LIST_KINDS, WATCHED_FILES_LIMIT_MAX, WATCHED_FILE_ACTION_DONE, FIND_ADD_LINES_MAX, FIND_BODY_MAX_BYTES, FIND_CANDIDATES_SENT, FIND_LINE_MAX_CHARS, FIND_LINE_MIN_CHARS, FIND_QUEUE_MAX, FIND_HELD_MAX, FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STATES, FIND_STOPPED_CODES, FIND_STOPPED_TEXT, findLineRefusal, FIND_PEOPLE_MAX, FIND_PERSON_WORKS_MAX, FIND_CHOOSE_WORKS_MAX, FIND_MORE_PEOPLE_TEXT, FIND_MORE_WORKS_TEXT, FIND_REFUSAL_REASONS, findAlreadyAddedRefusal, findWorkIdRefusal, type FindAuthorOffer, type FindEntryView, FIND_LIBRARY_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, WHERE_TO_GET_IT_MAX, WHERE_TO_GET_IT_URL_MAX, YOUR_LIBRARY_DERIVE_REFUSALS, YOUR_LIBRARY_DERIVE_TEXT, YOUR_LIBRARY_LINK_MAX, YOUR_LIBRARY_NAME_MAX, YOUR_LIBRARY_TEXT, libraryReadyIn, yourLibraryAddressSentence, FIND_LIBRARY_FILE_OUTCOMES, FIND_LIBRARY_FILE_TEXT, LIBRARY_FILE_MAX_BYTES, FIND_LINK_TEXT, FIND_LINK_FILE_TEXT, FIND_WINDOW_STARTS, type FindLinkStartRequest, ZOTERO_SYNC_EVERY_MINUTES, ZOTERO_SYNC_SENTENCES, type ZoteroSyncSettingsRequest, type ZoteroSyncStateResponse, WATCHED_FILE_PRESENCES, type WatchedSourceOrigin, SEARCH_RECORD_SOURCES, SEARCH_COPY_SOURCES, SEARCH_SOURCE_GROUPS, SEARCH_SOURCE_INFO, SEARCH_KEY_SECRETS, SEARCH_SOURCE_TEST_WORDS, SEARCH_SOURCE_TEST_DOI, SEARCH_TEST_TEXT, SEARCH_SETTINGS_TEXT, searchEmailRefusal, isSearchApiKeyShape, type SearchSourcesResponse, type SearchRecordRow } from "../index.js";
 
 describe("declarations shared by the service and the interface (Task 47)", () => {
   it("the service's error codes, each once", () => {
@@ -100,6 +100,8 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     ]);
     expect(FIND_REASON_TEXT["copy-some-unreachable"]).toBe("Some services could not be reached, so a free copy may still exist. “Try again” looks again.");
     expect(FIND_REASON_TEXT["record-removed"]).toBe("The record was removed from the library.");
+    // R347 e: after a link's start too — so it names no library.
+    expect(FIND_REASON_TEXT["library-unfinished"]).toBe("A fetch in the app's window was not finished, and what this entry said before could not be read back. Nothing was added.");
     // Exhaustive by type (Record<FindReasonCode, string>) and checked here at run time: one plain sentence each.
     expect(Object.keys(FIND_REASON_TEXT).sort()).toEqual([...FIND_REASON_CODES].sort());
     // One plain sentence each (the plan's sentence for held files starts with its number).
@@ -221,6 +223,28 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
     const after: FindEntryView["library"] = { canStart: true, lastFile: "not-pdf" };
     const only: FindEntryView["library"] = { canStart: false, reason: "not-offered", lastFile: "rules-store" };
     expect([after.lastFile, only.lastFile]).toEqual(["not-pdf", "rules-store"]);
+  });
+
+  it("Open it here and fetch the PDF (F18c, R345): the refusals' reasons and sentences, the link's file in words naming no library, the view's fields", () => {
+    for (const r of ["link-not-offered", "link-not-a-place"]) expect(FIND_REFUSAL_REASONS).toContain(r);
+    expect(FIND_LINK_TEXT).toEqual({
+      body: "Send the address to open, and nothing else. Nothing was changed.",
+      notAPlace: "That address is not one of this entry's places. Nothing was changed.",
+      notOffered: "A PDF cannot be fetched for this entry in the sign-in window now. Nothing was changed.",
+    });
+    expect(Object.keys(FIND_LINK_FILE_TEXT).sort()).toEqual([...FIND_LIBRARY_FILE_OUTCOMES].sort());
+    for (const t of Object.values(FIND_LINK_FILE_TEXT)) expect(t).toMatch(/^The file fetched in the sign-in window .*\.$/u);
+    // R345 e: nothing said of a link's file names the library, and nothing says the app adds a file (R301).
+    for (const t of [...Object.values(FIND_LINK_FILE_TEXT), ...Object.values(FIND_LINK_TEXT)]) {
+      expect(t).not.toMatch(/library/iu);
+      expect(t).not.toMatch(/\badd(s|ed)?\b/iu);
+    }
+    expect(FIND_LINK_FILE_TEXT["rules-method"]).toBe("The file fetched in the sign-in window was not kept: this project's rules do not allow fetching free copies of works.");
+    expect(FIND_LINK_FILE_TEXT.unreadable).toBe("The file fetched in the sign-in window could not be read, so it was not kept. Try again with “Open it here and fetch the PDF”.");
+    expect([...FIND_WINDOW_STARTS]).toEqual(["library", "link"]);
+    const v: Pick<FindEntryView, "linkStart" | "windowStart" | "library"> = { linkStart: true, windowStart: "link", library: { canStart: false, reason: "not-offered", lastFile: "not-pdf", lastFileFrom: "link" } };
+    const body: FindLinkStartRequest = { url: "https://repository.example.org/a.pdf" };
+    expect([v.linkStart, v.windowStart, v.library?.lastFileFrom, body.url]).toEqual([true, "link", "link", "https://repository.example.org/a.pdf"]);
   });
 
   it("Your library's Test (F18a, R334 b): one fixed, well-known work — the Search sources' tests' own — and its sentence", () => {
