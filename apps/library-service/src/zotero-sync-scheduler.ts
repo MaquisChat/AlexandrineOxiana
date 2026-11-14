@@ -153,6 +153,7 @@ export class ZoteroSyncScheduler {
         // Waits for the run to end, unless the scheduler is stopped meanwhile (the holder then stops the run).
         await Promise.race([ran, new Promise<void>((r) => (this.wake = r))]);
         this.wake = undefined;
+        if (this.stopped) return;
       }
     } catch {
       // The settings or the records could not be read: nothing is scheduled at this pass.

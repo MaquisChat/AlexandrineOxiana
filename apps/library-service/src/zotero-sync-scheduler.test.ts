@@ -766,7 +766,7 @@ describe("the scheduler in the service", () => {
   }, 180_000);
 
   it("nextRunAt: absent when automatic is off, when every link is paused, and on a read-only library", async () => {
-    await openLibrary();
+    const libPath = await openLibrary();
     const pid = await newProject();
     await saveSettings([linkOf(U, pid)], { automatic: false });
     expect((await state()).nextRunAt).toBeUndefined();
@@ -782,6 +782,18 @@ describe("the scheduler in the service", () => {
     expect((await state()).nextRunAt).toBeUndefined();
     await ticks(5);
     expect(finished()).toEqual([]);
+    // Read-only (another computer holds the library): automatic on, a link not paused, and still nothing.
+    for (const l of Object.values<any>(f.libraries)[0].links) delete l.paused;
+    await writeFile(settingsPath, JSON.stringify(f), { mode: 0o600 });
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const stamp = new Date().toISOString();
+    await writeFile(join(libPath, ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: stamp, heartbeatAt: stamp, user: "ana" }));
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).json.mode).toBe("read-only");
+    const st = await state();
+    expect([st.readOnly, st.automatic, st.links[0].paused, st.nextRunAt]).toEqual([true, true, undefined, undefined]);
+    await ticks(3 * 60);
+    expect(finished()).toEqual([]);
+    expect(z.requests).toEqual([]);
   }, 120_000);
 
   it("the key is never read by the scheduler (R78): passes that start nothing ask the password store nothing", async () => {
