@@ -49,10 +49,11 @@ import {
   runnerSeams,
   type FindRunner,
   type FindRunnerDeps,
+  type HandedFile,
 } from "./runner.js";
 import { DEFAULT_SEARCH_SETTINGS, FIND_QUEUE_MAX, type FindEntry, type FindState, type SearchSettings } from "./types.js";
 import { SEARCH_SOURCES_FILE, readSearchSettings, writeSearchSettings } from "./settings.js";
-import { FIND_LIBRARY_TEXT, FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
+import { FIND_LIBRARY_TEXT, FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, LIBRARY_FILE_MAX_BYTES, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
 import type { LibraryAccess } from "./where.js";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -5032,5 +5033,266 @@ describe("F15: a fetch through the researcher's library", () => {
     expect(r.libraryHandedOver(ticket)).toBeNull();
     const other = await resting(p, RESTING[0]!);
     await expect(appendFindEntries(coreOf(), p.id, [{ ...other, state: "no-open-copy" }], "library-start")).rejects.toBeInstanceOf(InvalidInputError);
+  });
+
+  // ------------------------------------------------------------------------------------------------------------
+  // Task F17 (R329): the file handed over. The runner never touches the shell's inbox: it is given a `HandedFile`
+  // (the service's, bound to the inbox) that copies the file into the runner's own temporary folder, or discards it.
+
+  describe("F17 (R329): the file handed over waits for the researcher's check", () => {
+    const FIRST_PAGE = [
+      ZORBLATT.title,
+      "Mirabel Quillfeather",
+      "Abstract. A grammar of habitus, invented for these tests, with enough words to be read as text.",
+      "The study reads how people speak of their habits over many years, drawing on letters and",
+      "interviews kept in family hands, and argues that the words they choose shape what they",
+      "are able to remember of the places they have lived in and of the work they have done there.",
+    ];
+    /** The address the runner built at the start, as it keeps it: without its query (so without the DOI). */
+    const KEPT = "https://ezproxy.lib-f15.example.edu/login";
+    const INBOX_PATH = "/inbox-of-the-shell/0123456789abcdef0123456789abcdef.pdf";
+    type Log = { took: number; discarded: number; paths: string[] };
+    /** A HandedFile over `bytes` (null: the service refuses with `why`); `gate` holds the take until released. */
+    function handedFile(bytes: Buffer | null, o: { why?: "too-large" | "unreadable"; gate?: Promise<void> } = {}): { file: HandedFile; log: Log } {
+      const log: Log = { took: 0, discarded: 0, paths: [] };
+      const file: HandedFile = {
+        async take(path, to, maxBytes) {
+          log.took++;
+          log.paths.push(path);
+          expect(maxBytes).toBe(LIBRARY_FILE_MAX_BYTES);
+          if (o.gate) await o.gate;
+          if (!bytes) return { ok: false, why: o.why ?? "unreadable" };
+          await writeFile(to, bytes, { flag: "wx", mode: 0o600 });
+          return { ok: true, bytes: bytes.length };
+        },
+        async discard(path) {
+          log.discarded++;
+          log.paths.push(path);
+        },
+      };
+      return { file, log };
+    }
+    const goodPdf = () => buildPdf({ title: ZORBLATT.title, author: "Mirabel Quillfeather", lines: FIRST_PAGE });
+    /** A resting entry started through the library and handed over: the runner, the entry and the seam's answer. */
+    async function handedOver(o: { gov?: string; rest?: Rest; encrypted?: boolean } = {}) {
+      const p = await project({ gov: o.gov ?? NO_FREE, ...(o.encrypted ? { encrypted: true } : {}) });
+      const e = await resting(p, o.rest ?? RESTING[0]!);
+      const r = runner();
+      const { ticket } = await r.libraryStart(p.id, e.id, EZ);
+      const t = r.libraryHandedOver(ticket);
+      expect(t).toEqual({ projectId: p.id, entryId: e.id });
+      return { p, e, r, ticket };
+    }
+    const tmpFolderOf = (eid: string) => join(lib.root, ".tmp", `find-${eid}`);
+    const exists = async (path: string) =>
+      readdir(path).then(
+        () => true,
+        () => false,
+      );
+    const reviewsOf = async (p: Project) => (await readReviewEntries(coreOf(), coreOf().state(p.id))).filter((x) => x.status === "pending");
+    const deferred = () => {
+      let open!: () => void;
+      const gate = new Promise<void>((res) => (open = res));
+      return { gate, open };
+    };
+
+    it("the seam keeps the starting address with the hand-over (without user name, password, query or fragment), and the entry is at work from then", async () => {
+      const { p, e, r } = await handedOver();
+      expect(r.libraryAddressOf(p.id, e.id)).toBe(KEPT);
+      expect(r.atWork(p.id, e.id)).toBe(true);
+      // An entry not handed over has none.
+      expect(r.libraryAddressOf(p.id, newId())).toBeNull();
+    });
+
+    it("accepted: the file waits in the review queue as a found copy does — nothing attached, method library_access, via the sign-in window", async () => {
+      const { p, e, r } = await handedOver();
+      const { file, log } = handedFile(await goodPdf());
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+      const after = (await entryOf(p, e.id))!;
+      expect(after).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+      expect(after.returnTo).toBeUndefined();
+      const [rev] = await reviewsOf(p);
+      expect(rev).toMatchObject({ sourceId: e.sourceId, kind: "verification", cause: { kind: "acquired-file-mismatch", findEntryId: e.id }, reasons: [HELD_FILE_LOOKS_RIGHT_TEXT] });
+      expect(rev!.heldFile).toMatchObject({ why: "looks-right", kind: "pdf", acquired: { method: "library_access", via: "sign-in-window", address: KEPT, access: "signed-in-session", tool: { name: FIND_TOOL } } });
+      expect(rev!.heldFile!.acquired).not.toHaveProperty("service");
+      // R301: nothing attached; the source has no file until the researcher's "Use this file".
+      expect((await repo.getSource(p.id, e.sourceId!)).assets).toEqual([]);
+      expect(log).toEqual({ took: 1, discarded: 0, paths: [INBOX_PATH] });
+      expect(await exists(tmpFolderOf(e.id))).toBe(false);
+      expect(r.atWork(p.id, e.id)).toBe(false);
+      expect(changes.some((c) => c.entryId === e.id && c.state === "needs-check")).toBe(true);
+      // "Use this file" then attaches it under the method it was got by.
+      await r.resolveHeld(p.id, rev!.id, "attach");
+      const a = (await repo.getSource(p.id, e.sourceId!)).assets.find((x) => x.role === "original")!;
+      expect(a.acquired).toMatchObject({ method: "library_access", via: "sign-in-window", address: KEPT, access: "signed-in-session", check: { result: "match", by: "title" } });
+      expect((await entryOf(p, e.id))!.state).toBe("in-library");
+    });
+
+    it("a file that does not clearly match waits too, with the check's reason", async () => {
+      const { p, e, r } = await handedOver();
+      const { file } = handedFile(await buildPdf({ title: "Another Paper", lines: ["Another Paper", "Someone Else", ...FIRST_PAGE.slice(2)] }));
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+      expect((await entryOf(p, e.id))!.state).toBe("needs-check");
+      expect((await entryOf(p, e.id))!.reason!.code).not.toBe("file-looks-right");
+      expect(await reviewsOf(p)).toHaveLength(1);
+    });
+
+    it("an encrypted project's waiting file is encrypted at rest", async () => {
+      const { p, e, r } = await handedOver({ encrypted: true });
+      const { file } = handedFile(await goodPdf());
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+      const [rev] = await reviewsOf(p);
+      const raw = await readFile(join(lib.root, repo.getProject(p.id).folder, (rev!.cause as { held: string }).held));
+      expect(raw.includes("%PDF-")).toBe(false);
+    });
+
+    it("without a hand-over through the seam (or with another address than the one kept) nothing is taken: the file is discarded", async () => {
+      const p = await project({ gov: NO_FREE });
+      const e = await resting(p, RESTING[0]!);
+      const r = runner();
+      const a = handedFile(await goodPdf());
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, a.file);
+      expect(a.log).toEqual({ took: 0, discarded: 1, paths: [INBOX_PATH] });
+      expect((await entryOf(p, e.id))!.state).toBe("no-open-copy");
+      const h = await handedOver();
+      const b = handedFile(await goodPdf());
+      await h.r.acceptLibraryFile(h.p.id, h.e.id, INBOX_PATH, "sign-in-window", "https://elsewhere.example.org/pdf", b.file);
+      expect(b.log.took).toBe(0);
+      expect(b.log.discarded).toBe(1);
+      expect(await reviewsOf(h.p)).toEqual([]);
+      // Refused like a file that could not be read: the entry is back where it was.
+      expect((await entryOf(h.p, h.e.id))!.state).toBe("no-open-copy");
+    });
+
+    it("R329 c: while the file is taken the entry is at work — Cancel is refused and a resume (a save of the rules, an unlock) leaves it", async () => {
+      const { p, e, r } = await handedOver();
+      const d = deferred();
+      const { file } = handedFile(await goodPdf(), { gate: d.gate });
+      const done = r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+      await expect(r.libraryCancel(p.id, e.id)).rejects.toBeInstanceOf(FindEntryStateError);
+      r.resume(p.id);
+      await new Promise((res) => setTimeout(res, 100));
+      expect((await entryOf(p, e.id))!.state).toBe("waiting-sign-in");
+      d.open();
+      await done;
+      expect((await entryOf(p, e.id))!.state).toBe("needs-check");
+    });
+
+    it("R329 c: the entry removed while its file is taken: nothing is held, nothing written about it, the file dropped", async () => {
+      const { p, e, r } = await handedOver();
+      const d = deferred();
+      const { file } = handedFile(await goodPdf(), { gate: d.gate });
+      const done = r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+      await r.remove(p.id, e.id);
+      d.open();
+      await done;
+      expect(await entryOf(p, e.id)).toBeUndefined();
+      expect(await reviewsOf(p)).toEqual([]);
+      expect(await exists(tmpFolderOf(e.id))).toBe(false);
+      expect(await readdir(join(lib.root, repo.getProject(p.id).folder, "find", "held")).catch(() => [])).toEqual([]);
+    });
+
+    it("R329 c: the record deleted while its file is taken: nothing is held; the entry comes back as it was", async () => {
+      const { p, e, r } = await handedOver();
+      const d = deferred();
+      const { file } = handedFile(await goodPdf(), { gate: d.gate });
+      const done = r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+      await repo.deleteSource(p.id, e.sourceId!);
+      d.open();
+      await done;
+      expect(await reviewsOf(p)).toEqual([]);
+      expect((await entryOf(p, e.id))!.state).not.toBe("needs-check");
+      expect(await exists(tmpFolderOf(e.id))).toBe(false);
+    });
+
+    it("R329 c: the project locked while the file is taken: the file is destroyed, nothing is written; the entry comes back at the unlock", async () => {
+      const { p, e, r } = await handedOver();
+      const d = deferred();
+      const { file } = handedFile(await goodPdf(), { gate: d.gate });
+      const done = r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+      r.stop(p.id);
+      d.open();
+      await done;
+      expect((await entryOf(p, e.id))!.state).toBe("waiting-sign-in");
+      expect(await reviewsOf(p)).toEqual([]);
+      expect(await exists(tmpFolderOf(e.id))).toBe(false);
+      r.resume(p.id);
+      await until(async () => (await entryOf(p, e.id))!.state === "no-open-copy", "the entry to come back");
+      sameRest(await entryOf(p, e.id), RESTING[0]!);
+    });
+
+    for (const rest of RESTING) {
+      it(`R329 g: a file that is not a PDF or EPUB by its bytes is not kept; the entry is back exactly as it was (${rest.state}${rest.reason ? `, ${rest.reason.code}` : ""}) and its view says why`, async () => {
+        const { p, e, r } = await handedOver({ rest });
+        const { file } = handedFile(Buffer.from("<html><body>Sign in again</body></html>"));
+        await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+        sameRest(await entryOf(p, e.id), rest);
+        expect(await reviewsOf(p)).toEqual([]);
+        expect(await exists(tmpFolderOf(e.id))).toBe(false);
+        const v = (await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id);
+        expect(v?.lastFile).toBe("not-pdf");
+      });
+    }
+
+    for (const why of ["too-large", "unreadable"] as const) {
+      it(`R329 g: a file the service could not take (${why}) is not kept; the view says so`, async () => {
+        const { p, e, r } = await handedOver();
+        const { file, log } = handedFile(null, { why });
+        await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, file);
+        sameRest(await entryOf(p, e.id), RESTING[0]!);
+        expect(log.took).toBe(1);
+        expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)?.lastFile).toBe(why);
+      });
+    }
+
+    it("R329 g: the view's outcome is dropped at the entry's next start (and is never written)", async () => {
+      const { p, e, r } = await handedOver();
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(Buffer.from("not a pdf")).file);
+      expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)?.lastFile).toBe("not-pdf");
+      expect(await readFile(join(lib.root, repo.getProject(p.id).folder, "find", "queue.jsonl"), "latin1")).not.toContain("not-pdf");
+      timers.now += LIBRARY_PAUSE_MS;
+      await r.libraryStart(p.id, e.id, EZ);
+      await r.libraryCancel(p.id, e.id);
+      expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)?.lastFile).toBeUndefined();
+    });
+
+    it("R329 g: the rules no longer allow library_access when the file arrives: not kept, said in the view; free copies allowed does not help", async () => {
+      const { p, e, r } = await handedOver({ gov: GOV() });
+      const g = await repo.getGovernance(p.id);
+      await repo.setGovernance(p.id, GOV("acquireMethods: [reference_lookup, free_copy]"), { baseSha256: g.sha256, reason: "test" });
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(await goodPdf()).file);
+      expect(await reviewsOf(p)).toEqual([]);
+      expect((await entryOf(p, e.id))!.state).not.toBe("needs-check");
+      expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)?.lastFile).toBe("rules-method");
+    });
+
+    it("R329 g: the record gained a file meanwhile: nothing held, the entry says In your library", async () => {
+      const { p, e, r } = await handedOver();
+      const mine = join(tmp, "f17-mine.pdf");
+      await writeFile(mine, await buildPdf({ title: "Mine", lines: ["Mine"] }));
+      await addCapturedOriginal(repo, p.id, e.sourceId!, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(await goodPdf()).file);
+      expect((await entryOf(p, e.id))!.state).toBe("in-library");
+      expect((await entryOf(p, e.id))!.returnTo).toBeUndefined();
+      expect(await reviewsOf(p)).toEqual([]);
+    });
+
+    it(`R329 f: ${FIND_HELD_MAX} files came to wait after the start: the handed-over file is held all the same (${FIND_HELD_MAX + 1})`, async () => {
+      const { p, e, r } = await handedOver({ gov: GOV() });
+      await fillHeld(p, FIND_HELD_MAX);
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(await goodPdf()).file);
+      expect((await entryOf(p, e.id))!.state).toBe("needs-check");
+      expect(await reviewsOf(p)).toHaveLength(FIND_HELD_MAX + 1);
+    });
+
+    it("nothing of the path or the address in the audit, the notes or the events", async () => {
+      const { p, e, r } = await handedOver();
+      await r.acceptLibraryFile(p.id, e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(await goodPdf()).file);
+      const h2 = await handedOver();
+      await h2.r.acceptLibraryFile(h2.p.id, h2.e.id, INBOX_PATH, "sign-in-window", KEPT, handedFile(Buffer.from("no")).file);
+      const seen = [await auditText(p), await auditText(h2.p), notes.join("\n"), JSON.stringify(changes)].join("\n");
+      for (const s of ["inbox-of-the-shell", "0123456789abcdef0123456789abcdef", "ezproxy", DOI]) expect(seen).not.toContain(s);
+      expect(await auditText(p)).toContain("library_access");
+    });
   });
 });
