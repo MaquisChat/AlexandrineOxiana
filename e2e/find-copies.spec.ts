@@ -64,6 +64,18 @@
  * "Try again" is offered on them. Scenario 7 proves it end to end: with every copy service off the row rests "Record
  * complete" with "Switched off in Search sources." and "Try again"; "Try again" while they are still off leaves it so,
  * with nothing asked; Europe PMC switched on and saved, the entry goes on with no further press and its file waits.
+ *
+ * **"Where to get it" on a resting row (Task F15; R324 a, R339 b).** The service's answer for the queue gives each
+ * resting entry its `offers`: any link a free-copy service offered, then for a work with a DOI the publisher's page at
+ * `https://doi.org/<doi>`, the library's catalogue when one is set (none here), and for a book or a work with an ISBN
+ * Open Library and WorldCat (these works are articles). A row resting "No open copy" (after "Not this file"; when the one
+ * service asked has no copy) shows them under "Where to get it" as links "<label> (<host>)": `expectWhereToGetIt` reads
+ * the entry's offers from the service's own answer and checks that the row shows exactly those, in the service's order,
+ * each named by the host parsed here from its address and opening that address, with the publisher's page at
+ * `https://doi.org/` + the work's made-up DOI among them (the DOI is the only thing written into the spec). A row resting
+ * "Record complete" — by the project's rules, or with every copy service off — is given the same offers by the service,
+ * but the screen shows "Where to get it" only on "No open copy" (FindEntryRow), so there `expectOffersNotShown` checks
+ * that the service gives them and that the row shows no "Where to get it" and no link.
  */
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -143,6 +155,7 @@ const WORDS = {
   recordComplete: "Record complete",
   checkFile: "Check the file",
   tryAgain: "Try again",
+  whereToGetIt: "Where to get it",
   /** FIND_REASON_TEXT */
   looksRight: "This looks like the right file. Check it, then use it.",
   notThisWork: "You said the file found was not this work.",
@@ -333,7 +346,7 @@ interface StoredSource {
   assets: StoredAsset[];
 }
 interface QueueView {
-  entries: Array<{ id: string; typed: string; state: string; updatedAt: string; sourceId?: string; reason?: { code: string; by?: string } }>;
+  entries: Array<{ id: string; typed: string; state: string; updatedAt: string; sourceId?: string; reason?: { code: string; by?: string }; offers?: Array<{ label: string; url: string; host: string }> }>;
 }
 
 async function queueOf(app: AppHarness, projectId: string): Promise<QueueView> {
@@ -351,6 +364,56 @@ async function stored(app: AppHarness, projectId: string, sourceId: string): Pro
   expect(r.status, JSON.stringify(r.body)).toBe(200);
   return r.body;
 }
+/**
+ * The links the service gives for `w`'s entry (its answer for the queue), checked to hold the publisher's page at
+ * `https://doi.org/<w's DOI>` exactly once; the entry must rest in `state`.
+ */
+async function offersOf(app: AppHarness, projectId: string, w: Work, state: string): Promise<Array<{ label: string; url: string }>> {
+  const e = await entryOf(app, projectId, w);
+  expect(e.state, `the service's answer holds “${w.typed}” resting in ${state}`).toBe(state);
+  const offers = e.offers ?? [];
+  expect(offers.length, "the service gives at least one place to get the work").toBeGreaterThan(0);
+  expect(offers.filter((o) => o.label === "Publisher's page").map((o) => o.url)).toEqual([`https://doi.org/${w.doi}`]);
+  return offers;
+}
+
+/**
+ * A row resting "No open copy" (R339 b): under "Where to get it" EXACTLY the links the service gives for its entry, in
+ * the service's order, each shown as "<label> (<host>)" — the host parsed here from the address, not taken from the
+ * service — with that address as its `href`, and no other link there. Called once the screen shows the state.
+ */
+async function expectWhereToGetIt(page: Page, app: AppHarness, projectId: string, w: Work): Promise<void> {
+  const row = rowOf(page, w);
+  await expect(row.locator(".ao-find__state")).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
+  const offers = await offersOf(app, projectId, w, "no-open-copy");
+  await expect(row.locator(".ao-find__where-title")).toHaveText(WORDS.whereToGetIt);
+  const where = row.getByRole("list", { name: /^Where to get it/ });
+  await expect(where).toBeVisible();
+  const links = where.getByRole("link");
+  await expect(links).toHaveCount(offers.length);
+  await expect(row.locator(".ao-find__where a")).toHaveCount(offers.length);
+  for (const [i, o] of offers.entries()) {
+    await expect(links.nth(i)).toHaveText(`${o.label} (${new URL(o.url).host})`);
+    await expect(links.nth(i)).toHaveAttribute("href", o.url);
+  }
+  test.info().annotations.push({ type: "where-to-get-it", description: `${w.doi} (no open copy): ${offers.map((o) => `${o.label} (${new URL(o.url).host})`).join("; ")}` });
+}
+
+/**
+ * A row resting "Record complete" by the rules or the settings: the service gives its entry the same kind of offers
+ * (the publisher's page among them), but the screen shows "Where to get it" only on "No open copy", so the row shows no
+ * "Where to get it" and no link at all.
+ */
+async function expectOffersNotShown(page: Page, app: AppHarness, projectId: string, w: Work): Promise<void> {
+  const row = rowOf(page, w);
+  await expect(row.locator(".ao-find__state")).toHaveText(WORDS.recordComplete, { timeout: STATE_TIMEOUT });
+  const offers = await offersOf(app, projectId, w, "record-complete");
+  await expect(row.locator(".ao-find__where")).toHaveCount(0);
+  await expect(row.getByText(WORDS.whereToGetIt)).toHaveCount(0);
+  await expect(row.getByRole("link")).toHaveCount(0);
+  test.info().annotations.push({ type: "where-to-get-it", description: `${w.doi} (record complete, given but not shown): ${offers.map((o) => `${o.label} (${new URL(o.url).host})`).join("; ")}` });
+}
+
 /** The live original files of the record made for `w`. */
 async function filesOfRecord(app: AppHarness, projectId: string, w: Work): Promise<StoredAsset[]> {
   const e = await entryOf(app, projectId, w);
@@ -594,11 +657,13 @@ test("a wrong file waits with its reason and is removed", async ({ page, app }) 
     await expect(foundSection(page).getByRole("heading", { level: 3, name: WORDS.other(0) })).toBeVisible();
   });
 
-  await test.step("the row says “No open copy” with the service's sentence for a file you refused", async () => {
+  await test.step("the row says “No open copy” with the service's sentence for a file you refused, and where to get the work", async () => {
     await openFind(page, projectId);
     await expect(stateOfRow(page, WRONG)).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
     await expect(reasonOfRow(page, WRONG)).toHaveText(WORDS.notThisWork);
     await expect(rowOf(page, WRONG).getByRole("button", { name: act(WORDS.tryAgain, WRONG.typed) })).toHaveCount(0);
+    // And where the work can be got: exactly the links the service gives for the entry (R339 b).
+    await expectWhereToGetIt(page, app, projectId, WRONG);
   });
 
   await test.step("the file is gone from the project's folder and the library's, and the source has no file", async () => {
@@ -770,6 +835,7 @@ test("the project's rules switch free copies off", async ({ page, app }) => {
     await expect(reasonOfRow(page, PAIR_A)).toHaveText(WORDS.copyNotAllowed, { timeout: STATE_TIMEOUT });
     await expect(rowOf(page, PAIR_A).getByRole("button", { name: act(WORDS.tryAgain, PAIR_A.typed) })).toBeVisible();
     expect(await entryOf(app, projectId, PAIR_A)).toMatchObject({ state: "record-complete", reason: { code: "copy-not-allowed" } });
+    await expectOffersNotShown(page, app, projectId, PAIR_A);
     expect(placesOf(libraryPath, fileBytes("PAIR_A"))).toEqual([]);
     expect(filesUnder(join(projectRoot, "find", "held"))).toEqual([]);
     expect(filesUnder(join(libraryPath, ".tmp")).filter((f) => f.startsWith("find-"))).toEqual([]);
@@ -870,7 +936,7 @@ test("a copy service switched off in Search sources is not asked; switched on ag
     await copiesOn(["Europe PMC"]);
   });
 
-  await test.step("a reference whose only copy is at Semantic Scholar (switched off) ends “No open copy”: nothing downloaded", async () => {
+  await test.step("a reference whose only copy is at Semantic Scholar (switched off) ends “No open copy”, with where to get it: nothing downloaded", async () => {
     await openFind(page, projectId);
     await addLines(page, [WRONG.typed]);
     await expect(stateOfRow(page, WRONG)).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
@@ -880,6 +946,8 @@ test("a copy service switched off in Search sources is not asked; switched on ag
     expect(placesOf(libraryPath, fileBytes("WRONG"))).toEqual([]);
     // By the lookup cache (see copyServicesAsked): Europe PMC, on, was asked; Semantic Scholar and OpenAlex, off, were not.
     expect(copyServicesAsked(libraryPath, WRONG)).toEqual({ openalex: false, europepmc: true, semanticscholar: false });
+    // Where the work can be got: exactly the links the service gives for the entry (R339 b).
+    await expectWhereToGetIt(page, app, projectId, WRONG);
   });
 
   await test.step("Semantic Scholar switched on and saved; a new reference whose copy is there: the file is found and waits", async () => {
@@ -899,6 +967,7 @@ test("a copy service switched off in Search sources is not asked; switched on ag
     await expect(reasonOfRow(page, RIGHT)).toHaveText(WORDS.switchedOff, { timeout: STATE_TIMEOUT });
     await expect(retryOf(RIGHT)).toBeVisible();
     expect(await entryOf(app, projectId, RIGHT)).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
+    await expectOffersNotShown(page, app, projectId, RIGHT);
     await nothingFetched();
   });
 
@@ -932,6 +1001,7 @@ test("a copy service switched off in Search sources is not asked; switched on ag
     expect(copyServicesAsked(libraryPath, RIGHT)).toEqual({ openalex: false, europepmc: true, semanticscholar: false });
     // The others are as they were: the first still has no open copy, PAIR_B's file still waits.
     await expect(stateOfRow(page, WRONG)).toHaveText(WORDS.noOpenCopy);
+    await expectWhereToGetIt(page, app, projectId, WRONG);
     await expect(stateOfRow(page, PAIR_B)).toHaveText(WORDS.needsCheck);
   });
 });
