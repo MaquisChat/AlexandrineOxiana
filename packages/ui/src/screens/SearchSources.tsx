@@ -107,6 +107,10 @@ const SECOND_PRESS_MS = 500;
 /** The screen's address, carrying the project it is opened for. */
 export const searchSourcesHref = (projectId?: string): string => (projectId ? `${PATHS.searchSources}?project=${encodeURIComponent(projectId)}` : PATHS.searchSources);
 
+/** A source named with its group (R314 c: OpenAlex is in both): "OpenAlex (free copies)". */
+const GROUP_WORDS: Record<SearchSourceGroup, string> = { record: "finding the record", copies: "free copies" };
+const testName = (group: SearchSourceGroup, id: string): string => `${nameOf(group, id)} (${GROUP_WORDS[group]})`;
+
 type KeyId = keyof typeof SEARCH_KEY_SECRETS;
 
 /** The typed calls of F12's routes (every path, method and body as its handler takes them). */
@@ -400,7 +404,7 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
     setTests((t) => ({ ...t, [slot]: { busy: false, result } }));
     say(
       <>
-        {nameOf(group, id)}: <UserText>{result.sentence}</UserText>
+        {testName(group, id)}: <UserText>{result.sentence}</UserText>
       </>,
     );
     // Elicit's row note may have changed with its answer (a refused key, the plan's cap, a pause).
@@ -491,7 +495,7 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
           aria-describedby={t?.result ? resultId : undefined}
           onClick={() => void runTest(group, id)}
         >
-          Test <span className="ao-visually-hidden">{nameOf(group, id)}</span>
+          Test <span className="ao-visually-hidden">{testName(group, id)}</span>
         </button>
         {t?.result && (
           <p id={resultId} className={t.result.ok ? "ao-search__result" : "ao-search__result ao-search__result--failed"}>
@@ -506,6 +510,16 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
     const base = `${ids}-${group}-${r.id}`;
     const name = nameOf(group, r.id);
     const info = group === "record" ? SEARCH_SOURCE_INFO.record[r.id as SearchRecordSource] : SEARCH_SOURCE_INFO.copies[r.id as SearchCopySource];
+    // R314 d: a source this build does not describe is shown by its name alone, and sent back unchanged in a save.
+    if (!info) {
+      return (
+        <li key={r.id} className="ao-search__row" data-source={r.id}>
+          <p className="ao-search__name">
+            <UserText>{r.id}</UserText>
+          </p>
+        </li>
+      );
+    }
     const note = group === "record" ? rowOf("record", r.id)?.note : undefined;
     const unpaywall = group === "copies" && r.id === "unpaywall";
     const lockedOff = unpaywall && !r.on && !unpaywallFilled;
@@ -529,7 +543,7 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
           </label>
         )}
         <p id={`${base}-info`} className="ao-search__note">
-          {info?.sends === "words" ? SEARCH_SOURCES_TEXT.sendsWords : SEARCH_SOURCES_TEXT.sendsDoi}. {info?.account ? SEARCH_SOURCES_TEXT.accountYes : SEARCH_SOURCES_TEXT.accountNo}.
+          {info.sends === "words" ? SEARCH_SOURCES_TEXT.sendsWords : SEARCH_SOURCES_TEXT.sendsDoi}. {info.account ? SEARCH_SOURCES_TEXT.accountYes : SEARCH_SOURCES_TEXT.accountNo}.
         </p>
         {lockedOff && !newer && (
           <p id={`${base}-why`} className="ao-search__note">

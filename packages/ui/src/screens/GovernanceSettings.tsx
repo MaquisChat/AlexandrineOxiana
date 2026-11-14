@@ -332,9 +332,12 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
           />
         </ControlCard>
 
-        <ControlCard violations={violations} title="How Find and acquire may get works" controls={["acquireMethods", `consent.defaultLegalBasis.${FIND_LEGAL_CATEGORY}`]}>
+        <ControlCard violations={violations} title="How Find and acquire may get works" controls={["acquireMethods", `consent.defaultLegalBasis.${FIND_LEGAL_CATEGORY}`, "processing.metadata_lookup"]}>
           <FindAcquireWays
             cfg={cfg}
+            savedVendors={savedCfg ? getPath(savedCfg, "vendors") : undefined}
+            violations={violations}
+            unsaved={text !== saved.yaml}
             disabled={off}
             {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})}
             cancelled={cancelled}
@@ -614,7 +617,7 @@ function editYaml(text: string, fn: (doc: Document) => void): string {
  * declared unless one is already (an existing declaration, with its agreements, is kept as it is). Taken out, nothing
  * else changes: the vendors stay byte for byte (a declared vendor that no operation names allows nothing).
  */
-function writeElicit(text: string, on: boolean, current: string[]): string {
+function writeElicit(text: string, on: boolean, current: string[], savedVendors: unknown): string {
   return editYaml(text, (doc) => {
     const path = ["processing", "metadata_lookup"];
     const list = doc.getIn(path, true);
@@ -626,14 +629,40 @@ function writeElicit(text: string, on: boolean, current: string[]): string {
       const rest = current.filter((x) => x !== ELICIT);
       doc.setIn(path, doc.createNode(on ? [...rest, ELICIT] : rest));
     }
-    if (!on) return;
     const vendors = doc.getIn(["vendors"], true);
+    if (!on) {
+      // R314 e: a vendor entry for Elicit that this draft added (the saved file had none) goes with the tick.
+      if (vendorDeclared(savedVendors) || !isSeq(vendors)) return;
+      vendors.items = vendors.items.filter((v) => !(isMap(v) && v.get("id") === ELICIT));
+      if (vendors.items.length === 0 && savedVendors === undefined) doc.deleteIn(["vendors"]);
+      return;
+    }
     if (isSeq(vendors)) {
       if (!vendors.items.some((v) => isMap(v) && v.get("id") === ELICIT)) vendors.add(doc.createNode({ id: ELICIT }));
     } else if (vendors === undefined || vendors === null || (isScalar(vendors) && vendors.value === null)) {
       doc.setIn(["vendors"], doc.createNode([{ id: ELICIT }]));
     }
   });
+}
+
+/** Whether a vendors list (as read) declares Elicit. */
+const vendorDeclared = (vendors: unknown): boolean =>
+  Array.isArray(vendors) && vendors.some((v) => typeof v === "object" && v !== null && (v as { id?: unknown }).id === ELICIT);
+
+/**
+ * Why the rules in force do not allow Elicit, from the service's own evaluation (R314 a): a violation of the saved rules
+ * for `processing.metadata_lookup` whose file names Elicit and whose effective list drops it. The service gives the
+ * profile that dropped it (core merge.ts: a vendor without the agreement the profile requires); its reason in words is
+ * R314's. Empty when the service reports no such violation.
+ */
+const ELICIT_DROPPED_BY: Partial<Record<Profile, string>> = {
+  gdpr: "under GDPR, a data processing agreement must be recorded for Elicit under vendors (dpa: true).",
+  hipaa: "under HIPAA, a business associate agreement must be recorded for Elicit under vendors (baa: true).",
+};
+function elicitRefusals(violations: Violation[]): string[] {
+  return violations
+    .filter((v) => v.control === "processing.metadata_lookup" && Array.isArray(v.actual) && v.actual.includes(ELICIT) && Array.isArray(v.required) && !v.required.includes(ELICIT))
+    .map((v) => ELICIT_DROPPED_BY[v.profile] ?? `the ${PROFILE_LABEL[v.profile] ?? v.profile} profile does not allow it.`);
 }
 
 /**
@@ -645,6 +674,9 @@ function writeElicit(text: string, on: boolean, current: string[]): string {
  */
 function FindAcquireWays({
   cfg,
+  savedVendors,
+  violations,
+  unsaved,
   disabled,
   whyId,
   cancelled,
@@ -652,6 +684,12 @@ function FindAcquireWays({
   onClearDefault,
 }: {
   cfg: Config | null;
+  /** The vendors of the saved rules (R314 e). */
+  savedVendors: unknown;
+  /** The service's violations of the saved rules (R314 a). */
+  violations: Violation[];
+  /** The form holds changes not yet saved: the service's verdict is about the saved rules only. */
+  unsaved: boolean;
   disabled: boolean;
   whyId?: string;
   cancelled: number;
@@ -671,13 +709,24 @@ function FindAcquireWays({
   const lookups = cfg?.processing.metadata_lookup ?? [];
   const elicitOn = lookups.includes(ELICIT);
   const vendors = cfg ? getPath(cfg, "vendors") : undefined;
-  const declared = Array.isArray(vendors) && vendors.some((v) => typeof v === "object" && v !== null && (v as { id?: unknown }).id === ELICIT);
+  const declared = vendorDeclared(vendors);
   const toggleElicit = (checked: boolean) => {
     if (!cfg) return;
     const next = checked ? [...lookups.filter((x) => x !== ELICIT), ELICIT] : lookups.filter((x) => x !== ELICIT);
-    onChange("processing.metadata_lookup", next, `${checked ? "Allowing" : "Not allowing"} Elicit`, (t) => writeElicit(t, checked, lookups));
+    onChange("processing.metadata_lookup", next, `${checked ? "Allowing" : "Not allowing"} Elicit`, (t) => writeElicit(t, checked, lookups, savedVendors));
   };
-  const profileNotes = (cfg?.profiles ?? []).flatMap((p) => (ELICIT_PROFILE_NOTE[p] ? [ELICIT_PROFILE_NOTE[p]!] : []));
+  // The general note on GDPR and HIPAA is said only while the box is unticked: once ticked, the verdict below says it.
+  const profileNotes = elicitOn ? [] : (cfg?.profiles ?? []).flatMap((p) => (ELICIT_PROFILE_NOTE[p] ? [ELICIT_PROFILE_NOTE[p]!] : []));
+  const refusals = elicitRefusals(violations);
+  const verdict: ReactNode = !elicitOn ? null : unsaved ? (
+    "What this project's rules allow for Elicit is said here once the changes are saved."
+  ) : refusals.length ? (
+    <>
+      <strong>Named, but NOT allowed:</strong> {refusals.join(" ")}
+    </>
+  ) : (
+    "Allowed by this project's rules."
+  );
   const basisPath = `consent.defaultLegalBasis.${FIND_LEGAL_CATEGORY}`;
   const basis = cfg?.consent.defaultLegalBasis?.[FIND_LEGAL_CATEGORY] ?? "";
   return (
@@ -699,11 +748,16 @@ function FindAcquireWays({
             type="checkbox"
             disabled={disabled || !cfg}
             checked={elicitOn}
-            aria-describedby={[`${id}-elicit`, profileNotes.length ? `${id}-elicit-profiles` : "", elicitOn && !declared ? `${id}-elicit-undeclared` : ""].filter(Boolean).join(" ")}
+            aria-describedby={[verdict ? `${id}-elicit-verdict` : "", `${id}-elicit`, profileNotes.length ? `${id}-elicit-profiles` : "", elicitOn && !declared ? `${id}-elicit-undeclared` : ""].filter(Boolean).join(" ")}
             onChange={(e) => toggleElicit(e.target.checked)}
           />
           {ELICIT_LABEL}
         </label>
+        {verdict ? (
+          <p id={`${id}-elicit-verdict`} className={refusals.length && !unsaved ? "ao-warning" : "ao-hint"}>
+            {verdict}
+          </p>
+        ) : null}
         <p id={`${id}-elicit`} className="ao-hint">
           The same setting as “elicit” in Metadata lookups under Processing location. Elicit is asked only when it is also switched on in Search sources and its key is saved there.
         </p>

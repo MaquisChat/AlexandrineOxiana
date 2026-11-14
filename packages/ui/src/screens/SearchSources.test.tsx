@@ -431,7 +431,7 @@ describe("Search sources: the settings file", () => {
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
     expect(screen.queryAllByRole("button", { name: /^Move/ })).toHaveLength(0);
     expect(screen.queryAllByRole("textbox")).toHaveLength(0);
-    expect(within(record_()).getByRole("button", { name: "Test Crossref" })).toBeTruthy();
+    expect(within(record_()).getByRole("button", { name: "Test Crossref (finding the record)" })).toBeTruthy();
     expect(screen.getByLabelText("Elicit API key, from your Elicit account; a Pro plan or higher")).toBeTruthy();
     // What is stored is still said, in words.
     expect(record_().querySelector('li[data-source="crossref"]')!.textContent).toContain("Switched on");
@@ -464,7 +464,7 @@ describe("Search sources: keys", () => {
     await user.click(box(record_(), "Elicit"));
     await user.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(liveText()).toBe("Saved."));
-    await user.click(within(record_()).getByRole("button", { name: "Test Elicit" }));
+    await user.click(within(record_()).getByRole("button", { name: "Test Elicit (finding the record)" }));
     await waitFor(() => expect(svc.count("POST", "/settings/search-sources/record/elicit/test")).toBe(1));
     await user.click(screen.getByRole("button", { name: "Remove the OpenAlex key" }));
     await screen.findByText("No OpenAlex key is saved on this computer.");
@@ -514,7 +514,7 @@ describe("Search sources: Test", () => {
       return HttpResponse.json({ ok: false, sentence: SEARCH_TEST_TEXT.unreachable });
     };
     const user = userEvent.setup();
-    const test = within(record_()).getByRole("button", { name: "Test Crossref" });
+    const test = within(record_()).getByRole("button", { name: "Test Crossref (finding the record)" });
     await user.dblClick(test);
     await waitFor(() => expect(svc.count("POST", "/settings/search-sources/record/crossref/test")).toBe(1));
     expect(test.getAttribute("aria-busy")).toBe("true");
@@ -524,7 +524,7 @@ describe("Search sources: Test", () => {
     });
     const row = record_().querySelector<HTMLElement>('li[data-source="crossref"]')!;
     await waitFor(() => expect(row.textContent).toContain(SEARCH_TEST_TEXT.unreachable));
-    expect(liveText()).toBe(`Crossref: ${SEARCH_TEST_TEXT.unreachable}`);
+    expect(liveText()).toBe(`Crossref (finding the record): ${SEARCH_TEST_TEXT.unreachable}`);
     expect(document.activeElement).toBe(test);
     expect(test.getAttribute("aria-busy")).toBeNull();
     expect(row.textContent).not.toMatch(/Answered|✓|✔/);
@@ -539,7 +539,7 @@ describe("Search sources: Test", () => {
     await show(svc);
     svc.onTest = async () => HttpResponse.json({ error: { code: "CONFLICT", message: SEARCH_SETTINGS_TEXT.testRunning } }, { status: 409 });
     const user = userEvent.setup();
-    await user.click(within(copies()).getByRole("button", { name: "Test OpenAlex" }));
+    await user.click(within(copies()).getByRole("button", { name: "Test OpenAlex (free copies)" }));
     await waitFor(() => expect(svc.count("POST", "/settings/search-sources/copies/openalex/test")).toBe(1));
     const row = copies().querySelector<HTMLElement>('li[data-source="openalex"]')!;
     await waitFor(() => expect(row.textContent).toContain(SEARCH_SETTINGS_TEXT.testRunning));
@@ -550,7 +550,7 @@ describe("Search sources: Test", () => {
     await show(svc);
     const user = userEvent.setup();
     await user.type(screen.getByLabelText("Your e-mail address (Unpaywall requires one with every request)"), "typed-only@example.invalid");
-    await user.click(within(copies()).getByRole("button", { name: "Test Unpaywall" }));
+    await user.click(within(copies()).getByRole("button", { name: "Test Unpaywall (free copies)" }));
     await waitFor(() => expect(svc.count("POST", "/settings/search-sources/copies/unpaywall/test")).toBe(1));
     for (const s of svc.sent.filter((x) => x.method === "POST")) {
       expect(s.url).not.toContain("typed-only");
@@ -631,8 +631,8 @@ describe("Search sources: the contract (each request exactly as F12's handler ta
     const svc = useSvc();
     await show(svc);
     const user = userEvent.setup();
-    await user.click(within(record_()).getByRole("button", { name: "Test OpenAlex" }));
-    await user.click(within(copies()).getByRole("button", { name: "Test arXiv" }));
+    await user.click(within(record_()).getByRole("button", { name: "Test OpenAlex (finding the record)" }));
+    await user.click(within(copies()).getByRole("button", { name: "Test arXiv (free copies)" }));
     await waitFor(() => expect(svc.sent.filter((s) => s.method === "POST").map((s) => s.path)).toEqual(["/settings/search-sources/record/openalex/test", "/settings/search-sources/copies/arxiv/test"]));
     for (const s of svc.sent.filter((x) => x.method === "POST")) {
       expect(s.body).toBe("");
@@ -670,6 +670,67 @@ describe("Search sources: the contract (each request exactly as F12's handler ta
     await user.click(screen.getByRole("button", { name: "Store the OpenAlex key" }));
     expect((await screen.findByText(SEARCH_SETTINGS_TEXT.keyShape)).textContent).toBe(SEARCH_SETTINGS_TEXT.keyShape);
     expect(svc.count("PUT", "/secrets/openalex-api-key")).toBe(0);
+  });
+});
+
+describe("Search sources: round 2 (R314)", () => {
+  it("R314 b: while a key is typed into either field, and after a shape refusal, no attribute holds it; after storing the field is empty", async () => {
+    const svc = useSvc();
+    await show(svc);
+    const user = userEvent.setup();
+    for (const [label, key, store] of [
+      ["Elicit API key, from your Elicit account; a Pro plan or higher", ELICIT_KEY, "Store the Elicit key"],
+      ["OpenAlex API key", OPENALEX_KEY, "Store the OpenAlex key"],
+    ] as const) {
+      const field = screen.getByLabelText(label) as HTMLInputElement;
+      await user.type(field, `${key} x`);
+      expect(field.value).toBe(`${key} x`);
+      expect(document.documentElement.outerHTML).not.toContain(key);
+      await user.click(screen.getByRole("button", { name: store }));
+      await screen.findByText(SEARCH_SETTINGS_TEXT.keyShape);
+      expect(field.value).toBe(`${key} x`);
+      expect(document.documentElement.outerHTML).not.toContain(key);
+      await user.clear(field);
+      await user.type(field, key);
+      expect(document.documentElement.outerHTML).not.toContain(key);
+      await user.click(screen.getByRole("button", { name: store }));
+      await waitFor(() => expect(svc.sent.filter((s) => s.method === "PUT" && s.path.startsWith("/secrets/") && s.body.includes(key))).toHaveLength(1));
+      expect(field.value).toBe("");
+      expect(document.documentElement.outerHTML).not.toContain(key);
+    }
+  });
+
+  it("R314 c: each Test is named by its group, and its result is announced so", async () => {
+    const svc = useSvc();
+    await show(svc);
+    const user = userEvent.setup();
+    expect(within(record_()).getByRole("button", { name: "Test OpenAlex (finding the record)" })).toBeTruthy();
+    await user.click(within(copies()).getByRole("button", { name: "Test OpenAlex (free copies)" }));
+    await waitFor(() => expect(liveText()).toBe(`OpenAlex (free copies): ${SEARCH_TEST_TEXT.answered}`));
+    expect(svc.count("POST", "/settings/search-sources/copies/openalex/test")).toBe(1);
+  });
+
+  it("R314 d: a source the screen does not know is shown by its name alone, with no description, and sent back unchanged", async () => {
+    const svc = useSvc({
+      settings: { ...DEFAULT, record: [DEFAULT.record[0]!, { id: "scopus" as never, on: true }, DEFAULT.record[1]!, DEFAULT.record[2]!] },
+    });
+    await show(svc);
+    const row = record_().querySelector<HTMLElement>('li[data-source="scopus"]')!;
+    expect(row.textContent).toContain("scopus");
+    expect(row.textContent).not.toMatch(/Sends:|Needs an account/);
+    expect(within(row).queryByRole("checkbox")).toBeNull();
+    expect(within(row).queryAllByRole("button")).toHaveLength(0);
+    const user = userEvent.setup();
+    await user.click(box(record_(), "Elicit"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(svc.count("PUT", "/settings/search-sources")).toBe(1));
+    const body = JSON.parse(svc.sent.find((s) => s.method === "PUT")!.body);
+    expect(body.record).toEqual([
+      { id: "crossref", on: true },
+      { id: "scopus", on: true },
+      { id: "openalex", on: true },
+      { id: "elicit", on: true },
+    ]);
   });
 });
 

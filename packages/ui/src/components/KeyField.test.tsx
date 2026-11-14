@@ -100,6 +100,28 @@ describe("KeyField", () => {
     expect(everything()).not.toContain(KEY);
   });
 
+  it("R314 b: while a key is typed, and after a shape refusal, no attribute of any element holds it; after storing the field is empty", async () => {
+    const a = api();
+    const user = userEvent.setup();
+    render(<KeyField label="Example API key" help="h" stored={a.stored} store={a.store} remove={a.remove} words={WORDS} shape={(v) => (v.endsWith("!") ? "Not a key." : null)} />);
+    await screen.findByText(WORDS.storedNo);
+    const field = screen.getByLabelText("Example API key") as HTMLInputElement;
+    await user.type(field, `${KEY}!`);
+    expect(field.value).toBe(`${KEY}!`);
+    expect(document.documentElement.outerHTML).not.toContain(KEY);
+    await user.click(screen.getByRole("button", { name: WORDS.store }));
+    expect((await screen.findByRole("alert")).textContent).toBe("Not a key.");
+    expect(field.value).toBe(`${KEY}!`);
+    expect(document.documentElement.outerHTML).not.toContain(KEY);
+    expect(a.store).not.toHaveBeenCalled();
+    await user.clear(field);
+    await user.type(field, `${KEY}{Enter}`);
+    await screen.findByText(WORDS.storedYes);
+    expect(a.store).toHaveBeenCalledWith(KEY);
+    expect(field.value).toBe("");
+    expect(everything()).not.toContain(KEY);
+  });
+
   it("Remove asks nothing more and removes once", async () => {
     const a = api({ stored: true });
     const user = userEvent.setup();

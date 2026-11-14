@@ -765,3 +765,104 @@ describe("How Find and acquire may get works (Find and acquire Task F13; R301, R
     expect((findCard().getByRole("textbox", { name: /Default legal basis/ }) as HTMLInputElement).disabled).toBe(true);
   });
 });
+
+describe("The Elicit box says what the rules in force say (R314 a, e, f)", () => {
+  const FIND = "How Find and acquire may get works";
+  const ELICIT = "Elicit (a commercial service; it receives the words you type and nothing about this project)";
+  const findCard = () => within(card(FIND));
+  const elicitBox = () => findCard().getByRole("checkbox", { name: ELICIT }) as HTMLInputElement;
+  const described = (el: HTMLElement) =>
+    (el.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .map((id) => document.getElementById(id)?.textContent ?? "")
+      .join(" | ");
+  const DEFAULT_LOOKUPS = ["crossref", "openalex", "openlibrary", "loc"];
+  /** The service's own violation for a vendor dropped by a profile (core merge.ts), as GET /governance gives it. */
+  const dropped = (profile: "gdpr" | "hipaa") => ({ control: "processing.metadata_lookup", required: DEFAULT_LOOKUPS, actual: [...DEFAULT_LOOKUPS, "elicit"], profile });
+  const file = (profile: string, agreement: string) =>
+    `profiles: [${profile}]\nprocessing:\n  metadata_lookup: [crossref, openalex, openlibrary, loc, elicit]\nvendors:\n  - id: elicit\n${agreement}`;
+  const NOT_ALLOWED = /Named, but NOT allowed:/;
+  const ALLOWED = "Allowed by this project's rules.";
+
+  it("GDPR, Elicit named without dpa: ticked, Named, but NOT allowed, with the reason, tied to the box; the violation is on this card too", async () => {
+    serve({ yaml: file("gdpr", ""), violations: [dropped("gdpr")] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(elicitBox().checked).toBe(true);
+    const said = described(elicitBox());
+    expect(said).toMatch(NOT_ALLOWED);
+    expect(said).toContain("Named, but NOT allowed: under GDPR, a data processing agreement must be recorded for Elicit under vendors (dpa: true).");
+    expect(said).not.toContain(ALLOWED);
+    expect(card(FIND).textContent).toMatch(/processing\.metadata_lookup: GDPR requires/);
+  });
+
+  it("GDPR with dpa: true: Allowed by this project's rules.", async () => {
+    serve({ yaml: file("gdpr", "    dpa: true\n"), violations: [] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(described(elicitBox())).toContain(ALLOWED);
+    expect(described(elicitBox())).not.toMatch(NOT_ALLOWED);
+  });
+
+  it("HIPAA without baa: not allowed, with its reason; with baa: true: allowed", async () => {
+    serve({ yaml: file("hipaa", ""), violations: [dropped("hipaa")] });
+    const view = render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(described(elicitBox())).toContain("Named, but NOT allowed: under HIPAA, a business associate agreement must be recorded for Elicit under vendors (baa: true).");
+    view.unmount();
+    serve({ yaml: file("hipaa", "    baa: true\n"), violations: [] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(described(elicitBox())).toContain(ALLOWED);
+  });
+
+  it("no profile: allowed; unticked: neither sentence", async () => {
+    serve({ yaml: file("", ""), violations: [] });
+    const view = render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(described(elicitBox())).toContain(ALLOWED);
+    view.unmount();
+    serve({ violations: [] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(elicitBox().checked).toBe(false);
+    expect(card(FIND).textContent).not.toContain(ALLOWED);
+    expect(card(FIND).textContent).not.toMatch(NOT_ALLOWED);
+  });
+
+  it("R314 e: ticking then unticking in one draft removes the vendor entry the draft added; one the saved file had stays byte for byte", async () => {
+    const cap = serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.click(elicitBox());
+    const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Reason" }), "Trying");
+    await user.type(within(dialog).getByRole("textbox", { name: "Approved by" }), "Dr Ana Souza");
+    await user.click(within(dialog).getByRole("button", { name: "Record reason" }));
+    await user.click(elicitBox());
+    await user.click(within(card("Protocol record")).getByRole("checkbox", { name: "A protocol record is required before capture" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    const saved = parse(cap.puts[0]!.body.yaml);
+    expect(saved.vendors).toBeUndefined();
+    expect(saved.processing.metadata_lookup).not.toContain("elicit");
+  });
+
+  it("R314 f: ways the rules file names that this version does not know are kept as written when a box is ticked or unticked", async () => {
+    const cap = serve({ yaml: "acquireMethods: [reference_lookup, a_later_way]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.click(findCard().getByRole("checkbox", { name: ACQUIRE_LABEL.reference_lookup }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await user.click(findCard().getByRole("checkbox", { name: ACQUIRE_LABEL.library_access }));
+    const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Reason" }), "Library access agreed");
+    await user.type(within(dialog).getByRole("textbox", { name: "Approved by" }), "Dr Ana Souza");
+    await user.click(within(dialog).getByRole("button", { name: "Record reason" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    expect(parse(cap.puts[0]!.body.yaml).acquireMethods).toEqual(["library_access", "a_later_way"]);
+  });
+});

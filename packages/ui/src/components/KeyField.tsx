@@ -2,8 +2,8 @@
  * A key field (Find and acquire Task F13; R78, R290 a, R302 e): the Zotero key field generalised, used for the Zotero,
  * Elicit and OpenAlex keys. A key is kept only by the service, in this computer's password store; this field hands it
  * to `store` once, empties itself as soon as it is sent (whatever the answer: it is typed again to retry), and shows
- * afterwards only whether a key is saved — the service never sends one back. The key is held only in the field's own
- * value while it is typed: never in a URL, an element's text or attribute after it is sent, storage, or a console call.
+ * afterwards only whether a key is saved — the service never sends one back. The field is uncontrolled (R314 b): the
+ * key is held only in the element's live value while it is typed (never in state, never in its `value` attribute): never in a URL, an element's text or attribute after it is sent, storage, or a console call.
  * One request at a time; answers after unmount are dropped. A service sentence (a 503 with no password store) is shown
  * as the service gives it.
  */
@@ -62,7 +62,8 @@ export function KeyField({ label, help, stored: readStored, store: storeKey, rem
   const w = { ...ZOTERO_KEY_WORDS, ...words };
   const id = useId();
   const [stored, setStored] = useState<boolean | null>(null);
-  const [value, setValue] = useState("");
+  /** The field is uncontrolled (R314 b): the key is read from it when stored and cleared on it directly, never kept in state or mirrored into an attribute. */
+  const input = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const live = useRef(true);
@@ -100,14 +101,16 @@ export function KeyField({ label, help, stored: readStored, store: storeKey, rem
   const store = (e: FormEvent) => {
     e.preventDefault();
     if (busyRef.current) return;
-    const key = value.trim();
+    const el = input.current;
+    if (!el) return;
+    const key = el.value.trim();
     const refused = shape?.(key) ?? null;
     if (refused !== null) {
       setError(refused);
       return;
     }
     // Once sent, the key leaves the page whatever the answer: it is typed again to retry.
-    setValue("");
+    el.value = "";
     void run(
       () => storeKey(key),
       () => {
@@ -133,7 +136,7 @@ export function KeyField({ label, help, stored: readStored, store: storeKey, rem
       <form className="ao-import__key-form" onSubmit={store}>
         <label className="ao-import__field">
           <span>{label}</span>
-          <input type="password" autoComplete="off" spellCheck={false} value={value} aria-describedby={`${id}-key-hint`} onChange={(e) => setValue(e.target.value)} />
+          <input type="password" autoComplete="off" spellCheck={false} ref={input} defaultValue="" aria-describedby={`${id}-key-hint`} />
         </label>
         <button type="submit" disabled={busy}>
           {stored ? w.replace : w.store}
