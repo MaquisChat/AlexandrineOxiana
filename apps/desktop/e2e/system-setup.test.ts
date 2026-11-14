@@ -269,6 +269,21 @@ describe.skipIf(!TOOLS)("the set-up in a sandbox (R346 a, e, g)", () => {
     }
   });
 
+  it("a hosts file whose mode is wider than 0644 is not changed at all: a record of it would be refused later (R350)", () => {
+    const { root, m } = sandbox();
+    try {
+      chmodSync(m.hosts, 0o664);
+      const before = look(m);
+      expect(() => SystemSetup.prepare(STANDIN_NAMES, m)).toThrow(/hosts file .* has mode 664, wider than 0644.*nothing was changed/);
+      expectAsBefore(m, before);
+      expect(statSync(m.hosts).mode & 0o7777).toBe(0o664);
+      expect(existsSync(join(m.state, "record.json"))).toBe(false);
+      expect(existsSync(join(m.state, "lock"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("a run killed outright is put back by the next run from its record, which then goes on (R346 a)", () => {
     const { root, m } = sandbox();
     try {

@@ -566,6 +566,10 @@ export class SystemSetup {
     const work = join(m.tmp, `ao-e2e-system-setup-${runId}`);
     const bundle = join(m.etcCerts, "ca-certificates.crt");
     const st = statSync(m.hosts);
+    // R350: a record is restored only when its hosts mode is no wider than 0644, so a machine whose
+    // hosts file is wider is not changed at all (a killed run there could not be put back from its record).
+    if (((st.mode & 0o7777) & ~0o644) !== 0)
+      throw new Error(`the hosts file ${m.hosts} has mode ${(st.mode & 0o7777).toString(8)}, wider than 0644: the set-up does not change such a machine; nothing was changed`);
     const hostsBytes = readFileSync(m.hosts);
     const record: SetupRecord = {
       v: 1,
