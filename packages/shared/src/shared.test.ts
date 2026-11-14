@@ -104,7 +104,7 @@ describe("font names a researcher's own file cannot take (Task 57 M5): one list"
   });
 
   it("a held file's reasons each have one plain sentence (F11, R277 d)", () => {
-    expect(Object.keys(HELD_FILE_WHY_TEXT).sort()).toEqual(["no-text", "other-doi", "other-version", "title-absent"]);
+    expect(Object.keys(HELD_FILE_WHY_TEXT).sort()).toEqual(["no-text", "other-doi", "other-kind", "other-version", "title-absent"]);
     for (const t of Object.values(HELD_FILE_WHY_TEXT)) expect(t).toMatch(/^[A-Z].*\.$/);
     expect(HELD_FILE_REVIEW_TEXT).toBe("A file was found for this record, but it did not clearly match.");
     expect(HELD_FILE_DECISIONS).toEqual(["attach", "discard"]);

@@ -36,7 +36,7 @@ export type ReviewCause =
 export type HeldFileCause = { kind: "acquired-file-mismatch"; findEntryId: string; held: string };
 
 /** Why a file did not clearly match its record (the file check's reasons, `find/file-check.ts`). */
-export type HeldFileWhy = "other-doi" | "title-absent" | "no-text" | "other-version";
+export type HeldFileWhy = "other-doi" | "title-absent" | "no-text" | "other-version" | "other-kind";
 
 /**
  * What the check found about a held file (R277 d), for the researcher to judge by: outside text, bounded by the check

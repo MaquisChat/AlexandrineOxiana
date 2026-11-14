@@ -196,7 +196,7 @@ function firstFamily(w: WorkCandidate): string | undefined {
 const contentWords = (t: string): string[] => segmentsOf(t.slice(0, 4000)).flatMap(segmentTokens).filter((x) => !STOP_WORDS.has(x));
 
 /** True when two titles have the same content words in the same order, nothing extra on either side (R257 a, R261). */
-function sameTitle(a: string, b: string): boolean {
+export function sameTitle(a: string, b: string): boolean {
   const A = contentWords(a);
   const B = contentWords(b);
   return A.length > 0 && A.length === B.length && A.every((x, i) => x === B[i]);

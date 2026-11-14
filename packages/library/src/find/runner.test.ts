@@ -2556,9 +2556,11 @@ describe("F11: the free copy of a record the queue completed", () => {
   let saved: Dispatcher;
 
   const COPY_ONLY_OPENALEX = (): SearchSettings => ({ ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" })) });
-  const GOOD_LINES = ["Journal of Invented Studies 4 (1999)", ZORBLATT.title, "Mirabel Quillfeather", `doi:${ZORBLATT.doi}`, "Abstract. A grammar of habitus, invented for these tests, with enough words."];
+  /** Ordinary text of a first page, so that a made-up file has readable text (the file check asks for 200 characters, R282). */
+  const PAGE = ["The study reads how people speak of their habits over many years, drawing on letters and", "interviews kept in family hands, and argues that the words they choose shape what they", "are able to remember of the places they have lived in and of the work they have done there."];
+  const GOOD_LINES = ["Journal of Invented Studies 4 (1999)", ZORBLATT.title, "Mirabel Quillfeather", `doi:${ZORBLATT.doi}`, "Abstract. A grammar of habitus, invented for these tests, with enough words.", ...PAGE];
   const good = () => buildPdf({ title: ZORBLATT.title, author: "Mirabel Quillfeather", lines: GOOD_LINES });
-  const other = (n: number) => buildPdf({ title: `Another Paper ${n}`, lines: [`doi:10.5555/ao.f11.other${n}`, `Another Paper ${n}`, "Someone Else", "Abstract. Nothing to do with the record at all, but long enough."] });
+  const other = (n: number) => buildPdf({ title: `Another Paper ${n}`, lines: [`doi:10.5555/ao.f11.other${n}`, `Another Paper ${n}`, "Someone Else", "Abstract. Nothing to do with the record at all, but long enough.", ...PAGE] });
 
   const interceptor: Dispatcher.DispatcherComposeInterceptor = (dispatch) => (opts, handler) => {
     const key = `${new URL(String(opts.origin)).origin}${opts.path}`;

@@ -74,6 +74,7 @@ export const FIND_REASON_CODES = [
   "file-title-absent",
   "file-no-text",
   "file-other-version",
+  "file-other-kind",
 ] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
@@ -94,7 +95,8 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "file-other-doi": "The file names another DOI as its own.",
   "file-title-absent": "The file does not show this record's title with its author.",
   "file-no-text": "The file has no text that could be read (a scan, or a damaged file).",
-  "file-other-version": "The file seems to be another volume, edition, a review or a correction of this work.",
+  "file-other-version": "The file seems to be another volume, part or edition of this work.",
+  "file-other-kind": "The file looks like another kind of document (a review, a reply, a correction or a supplement), not the work itself.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */

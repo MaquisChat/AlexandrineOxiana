@@ -83,6 +83,7 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "file-title-absent",
       "file-no-text",
       "file-other-version",
+      "file-other-kind",
     ]);
     // Exhaustive by type (Record<FindReasonCode, string>) and checked here at run time: one plain sentence each.
     expect(Object.keys(FIND_REASON_TEXT).sort()).toEqual([...FIND_REASON_CODES].sort());

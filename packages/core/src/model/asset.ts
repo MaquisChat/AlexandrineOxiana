@@ -19,7 +19,7 @@ export const AcquiredFrom = z.object({
   check: z
     .union([
       z.object({ result: z.literal("match"), by: z.enum(["doi", "title"]) }),
-      z.object({ result: z.literal("accepted-after-mismatch"), why: z.enum(["other-doi", "title-absent", "no-text", "other-version"]) }),
+      z.object({ result: z.literal("accepted-after-mismatch"), why: z.enum(["other-doi", "title-absent", "no-text", "other-version", "other-kind"]) }),
     ])
     .optional(),
 });

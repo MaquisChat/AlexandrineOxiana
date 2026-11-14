@@ -79,7 +79,8 @@ export type FindReasonCode =
   | "file-other-doi"
   | "file-title-absent"
   | "file-no-text"
-  | "file-other-version";
+  | "file-other-version"
+  | "file-other-kind";
 
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 

@@ -69,7 +69,7 @@ export interface ProjectReviewEntry {
 }
 
 /** Why a held file did not clearly match its record (the file check's reasons). */
-export type HeldFileWhy = "other-doi" | "title-absent" | "no-text" | "other-version";
+export type HeldFileWhy = "other-doi" | "title-absent" | "no-text" | "other-version" | "other-kind";
 
 /**
  * What the check found about a held file (R277 d). Every string is outside text (from the file), bounded by the
@@ -96,7 +96,8 @@ export const HELD_FILE_WHY_TEXT: Record<HeldFileWhy, string> = {
   "other-doi": "The file names another DOI as its own.",
   "title-absent": "The file does not show this record's title with its author.",
   "no-text": "The file has no text that could be read (a scan, or a damaged file).",
-  "other-version": "The file seems to be another volume, edition, a review or a correction of this work.",
+  "other-version": "The file seems to be another volume, part or edition of this work.",
+  "other-kind": "The file looks like another kind of document (a review, a reply, a correction or a supplement), not the work itself.",
 };
 
 /**
