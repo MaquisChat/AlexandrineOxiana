@@ -469,8 +469,12 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     return { automatic: d.automatic, everyMinutes: d.everyMinutes, links: out };
   };
 
-  /** A save: the answer is a reading of the state; a refusal that names a field is said there, with focus. */
-  const save = async (which: "draft" | "service") => {
+  /**
+   * A save: the answer is a reading of the state; a refusal that names a field is said there, with focus. "Save" sends
+   * the draft with no `resume` anywhere, so an undone library stays paused (R265). "Turn syncing on again" sends the
+   * service's last confirmed settings (never the unsaved draft) with `resume: true` on that one link.
+   */
+  const save = async (which: "draft" | { resume: string }) => {
     if (saveBusy.current || !state || state.readOnly) return;
     saveBusy.current = true;
     setSaving(true);
@@ -481,7 +485,10 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
       const body =
         which === "draft"
           ? await request({ automatic, everyMinutes, rows: rows.map((r) => ({ ref: r.ref, ...valueOf(r.ref) })) })
-          : await request({ automatic: state.automatic, everyMinutes: state.everyMinutes, rows: links.map((l) => ({ ref: l.ref, keep: true, projectId: l.projectId })) });
+          : await request({ automatic: state.automatic, everyMinutes: state.everyMinutes, rows: links.map((l) => ({ ref: l.ref, keep: true, projectId: l.projectId })) }).then((r) => ({
+              ...r,
+              links: r.links.map((l) => (l.ref === which.resume ? { ...l, resume: true as const } : l)),
+            }));
       if (!alive.current || g !== gen.current) return;
       const seq = ++readSeq.current;
       const ev = eventSeq.current;
@@ -635,7 +642,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
               busy={saving || checking}
               onKeep={(keep) => editRow(r.ref, { keep })}
               onProject={(projectId) => editRow(r.ref, { projectId })}
-              onResume={() => void save("service")}
+              onResume={() => void save({ resume: r.ref })}
               onCheck={() => void checkKey()}
             />
           ))}

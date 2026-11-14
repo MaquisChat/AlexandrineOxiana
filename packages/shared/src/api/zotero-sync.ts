@@ -124,7 +124,12 @@ export interface ZoteroSyncStateResponse {
 export interface ZoteroSyncSettingsRequest {
   automatic: boolean;
   everyMinutes: ZoteroSyncEveryMinutes;
-  links: Array<{ ref: string; projectId: string; structure: ZoteroSyncStructure; duplicates: ZoteroSyncDuplicates }>;
+  /**
+   * `resume: true` turns syncing of that link on again after an undo: its "undone" pause is cleared by this save
+   * (R265, D26). Without it an existing "undone" is kept, whatever else the save changes. "key-refused" and
+   * "library-gone" are never cleared by a save (a successful key check clears them).
+   */
+  links: Array<{ ref: string; projectId: string; structure: ZoteroSyncStructure; duplicates: ZoteroSyncDuplicates; resume?: true }>;
 }
 
 export interface ZoteroSyncRunRequest {

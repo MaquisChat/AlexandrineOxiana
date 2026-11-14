@@ -389,7 +389,7 @@ function settingsRequest(b: Obj, s: Session, stored: ZoteroSyncSettings): Zotero
     const f = (name: string) => `"links[${i}].${name}"`;
     if (!l || typeof l !== "object" || Array.isArray(l)) throw badRequest(`"links[${i}]" must be an object.`);
     const o = l as Obj;
-    for (const k of Object.keys(o)) if (!["ref", "projectId", "structure", "duplicates"].includes(k)) throw badRequest(`${f(k)} cannot be sent here.`);
+    for (const k of Object.keys(o)) if (!["ref", "projectId", "structure", "duplicates", "resume"].includes(k)) throw badRequest(`${f(k)} cannot be sent here.`);
     if (typeof o.ref !== "string" || !REF.test(o.ref)) throw badRequest(`${f("ref")} must be user:<number> or group:<number>.`);
     if (refs.has(o.ref)) throw badRequest(`${f("ref")}: each Zotero library can be linked to one project only.`);
     refs.add(o.ref);
@@ -399,7 +399,9 @@ function settingsRequest(b: Obj, s: Session, stored: ZoteroSyncSettings): Zotero
     if (!kept && lockedNow(s, o.projectId)) throw badRequest(`${f("projectId")}: the project is locked. Unlock it first.`);
     if (!(STRUCTURES as readonly unknown[]).includes(o.structure)) throw badRequest(`${f("structure")} must be collections, tags or none.`);
     if (!(DUPLICATES as readonly unknown[]).includes(o.duplicates)) throw badRequest(`${f("duplicates")} must be merge, skip or keep-both.`);
-    return { ref: o.ref, projectId: o.projectId, structure: o.structure as (typeof STRUCTURES)[number], duplicates: o.duplicates as (typeof DUPLICATES)[number] };
+    // R265 (D26): only `true`, and only for the link it names, turns syncing on again after an undo.
+    if ("resume" in o && o.resume !== true) throw badRequest(`${f("resume")} must be true, or left out.`);
+    return { ref: o.ref, projectId: o.projectId, structure: o.structure as (typeof STRUCTURES)[number], duplicates: o.duplicates as (typeof DUPLICATES)[number], ...(o.resume === true ? { resume: true as const } : {}) };
   });
   return { automatic: b.automatic, everyMinutes: b.everyMinutes as ZoteroSyncSettingsRequest["everyMinutes"], links };
 }
@@ -500,7 +502,7 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     if (access.backoffUntil !== undefined) holder.noteAsked(access.backoffUntil, now().getTime());
     // R248: a key that works again clears the pauses Zotero's refusals set, for every link of the open library at once
     // (one settings write): `key-refused` everywhere, `library-gone` where the key now reads the library. A failed
-    // check (above) clears nothing; `undone` is the researcher's own and only a settings save clears it.
+    // check (above) clears nothing; `undone` is the researcher's own: only a settings save that names the link with `resume: true` clears it (R265).
     const open = state.session;
     if (open && open.lib.mode === "read-write") await clearRefusals(open, access);
     const out: ZoteroKeyAccess = {
@@ -528,8 +530,11 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
         everyMinutes: r.everyMinutes,
         links: r.links.map((l) => {
           const was = cur.links.find((x) => x.ref === l.ref && x.projectId === l.projectId);
-          // A save clears `undone`; `key-refused` and `library-gone` are cleared only by a successful key check (R248).
-          const keep = was?.paused && was.paused !== "undone" ? was.paused : undefined;
+          // A pause belongs to the Zotero library while it stays linked, whatever else the save changes (its project
+          // included). R265 (D26): `undone` is cleared only for a link the request names with `resume: true`;
+          // `key-refused` and `library-gone` only by a successful key check (R248), never by a save.
+          const paused = cur.links.find((x) => x.ref === l.ref)?.paused;
+          const keep = paused && !(paused === "undone" && l.resume) ? paused : undefined;
           return { ref: l.ref, projectId: l.projectId, fullDone: was?.fullDone ?? false, options: { structure: l.structure, duplicates: l.duplicates }, ...(keep ? { paused: keep } : {}) };
         }),
       }));

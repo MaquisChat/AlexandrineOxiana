@@ -6,7 +6,8 @@
  *   state()          GET  /zotero/sync              no body
  *   checkKey()       POST /zotero/key-check         NO body: the service checks the key SAVED in this computer's
  *                                                   password store (R248); any body is refused there with 400
- *   saveSettings(r)  PUT  /zotero/sync/settings     the whole ZoteroSyncSettingsRequest (only its three keys)
+ *   saveSettings(r)  PUT  /zotero/sync/settings     the whole ZoteroSyncSettingsRequest (only its keys; a link's
+ *                                                   `resume: true` only where it is true, R265)
  *   run(ref?)        POST /zotero/sync/run          no body, or { ref } → 202 { started: true }
  *   stop()           POST /zotero/sync/stop         no body
  *   history()        GET  /zotero/sync/history      no body
@@ -35,7 +36,7 @@ export function zoteroSyncApi(client: ApiClient) {
     /** PUT /zotero/sync/settings: answers the state, as GET does. */
     saveSettings: (s: ZoteroSyncSettingsRequest) =>
       r<ZoteroSyncStateResponse>("PUT", "/zotero/sync/settings", {
-        body: { automatic: s.automatic, everyMinutes: s.everyMinutes, links: s.links.map((l) => ({ ref: l.ref, projectId: l.projectId, structure: l.structure, duplicates: l.duplicates })) },
+        body: { automatic: s.automatic, everyMinutes: s.everyMinutes, links: s.links.map((l) => ({ ref: l.ref, projectId: l.projectId, structure: l.structure, duplicates: l.duplicates, ...(l.resume === true ? { resume: true } : {}) })) },
       }),
     /** POST /zotero/sync/run: every linked library that is not paused, or the one named. */
     run: (ref?: string) => r<ZoteroSyncRunResponse>("POST", "/zotero/sync/run", ref === undefined ? {} : { body: { ref } }),

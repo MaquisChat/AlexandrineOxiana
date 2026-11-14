@@ -160,7 +160,8 @@ function useSvc(init: StateIn = {}, history: ZoteroSyncRun[] = []) {
       await rec(request);
       const body = (await request.clone().json()) as ZoteroSyncSettingsRequest;
       if (svc.onSave) return svc.onSave(body);
-      // As Z8 does: the device file takes the request, a save clears `undone` and keeps the other pauses.
+      // As the service does (R265): the device file takes the request; a pause stays with its Zotero library, and
+      // `undone` goes only for a link named with `resume: true`.
       const was = svc.state.links;
       svc.state = {
         ...svc.state,
@@ -168,8 +169,10 @@ function useSvc(init: StateIn = {}, history: ZoteroSyncRun[] = []) {
         everyMinutes: body.everyMinutes,
         links: body.links.map((l) => {
           const w = was.find((x) => x.ref === l.ref && x.projectId === l.projectId);
-          const paused = w?.paused && w.paused !== "undone" ? w.paused : undefined;
-          return { ...l, fullDone: w?.fullDone ?? false, status: w?.status ?? zoteroSyncStatusLine(undefined, new Date()), ...(w?.lastRun ? { lastRun: w.lastRun } : {}), ...(paused ? { paused, waitingFor: "paused" as const } : {}) };
+          const p = was.find((x) => x.ref === l.ref)?.paused;
+          const paused = p && !(p === "undone" && l.resume === true) ? p : undefined;
+          const { resume: _r, ...plain } = l;
+          return { ...plain, fullDone: w?.fullDone ?? false, status: w?.status ?? zoteroSyncStatusLine(undefined, new Date()), ...(w?.lastRun ? { lastRun: w.lastRun } : {}), ...(paused ? { paused, waitingFor: "paused" as const } : {}) };
         }),
       };
       return HttpResponse.json(svc.state);
@@ -248,10 +251,27 @@ describe("zoteroSyncApi: every request is exactly its handler's", () => {
   });
   it("saveSettings: PUT /zotero/sync/settings with the whole request and nothing else", async () => {
     const svc = useSvc();
-    const req = { automatic: true, everyMinutes: 240 as const, links: [{ ref: "group:7", projectId: P1, structure: "tags" as const, duplicates: "skip" as const, extra: 1 }] };
+    const req = {
+      automatic: true,
+      everyMinutes: 240 as const,
+      links: [
+        { ref: "group:7", projectId: P1, structure: "tags" as const, duplicates: "skip" as const, extra: 1 },
+        { ref: "user:42", projectId: P1, structure: "none" as const, duplicates: "merge" as const, resume: true as const },
+      ],
+    };
     await zoteroSyncApi(testClient()).saveSettings(req);
     expect(svc.calls.map((c) => [c.method, c.path, c.contentType])).toEqual([["PUT", "/zotero/sync/settings", "application/json"]]);
-    expect(JSON.parse(svc.calls[0]!.body)).toEqual({ automatic: true, everyMinutes: 240, links: [{ ref: "group:7", projectId: P1, structure: "tags", duplicates: "skip" }] });
+    // `resume` only where it is true (R265); nothing else.
+    expect(svc.calls[0]!.body).toBe(
+      JSON.stringify({
+        automatic: true,
+        everyMinutes: 240,
+        links: [
+          { ref: "group:7", projectId: P1, structure: "tags", duplicates: "skip" },
+          { ref: "user:42", projectId: P1, structure: "none", duplicates: "merge", resume: true },
+        ],
+      }),
+    );
   });
   it("run: POST /zotero/sync/run with no body, or { ref }, answered 202", async () => {
     const svc = useSvc();
@@ -508,7 +528,7 @@ describe("ZoteroSync", () => {
       automatic: false,
       everyMinutes: 60,
       links: [
-        { ref: "user:42", projectId: P1, structure: "collections", duplicates: "merge" },
+        { ref: "user:42", projectId: P1, structure: "collections", duplicates: "merge", resume: true },
         { ref: "group:7", projectId: P1, structure: "collections", duplicates: "merge" },
         { ref: "group:8", projectId: P3, structure: "collections", duplicates: "merge" },
         { ref: "group:9", projectId: P2, structure: "collections", duplicates: "merge" },
@@ -527,6 +547,56 @@ describe("ZoteroSync", () => {
     expect(svc.bodies("POST", "/zotero/key-check")).toEqual([""]);
     await waitFor(() => expect(within(row("Zotero group 7")).queryByText(ZOTERO_SYNC_REASON_TEXT["key-refused"])).toBeNull());
     expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("R265: Save sends the draft with no resume, and an undone row stays paused with its reason and its control", async () => {
+    const svc = useSvc({ links: [{ ref: "user:42", projectId: P1, paused: "undone", structure: "tags" }] });
+    await show(svc);
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByRole("combobox", { name: "How often" }), "240");
+    await user.click(screen.getByRole("checkbox", { name: "Sync automatically while the app is open" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(liveText()).toBe("Saved."));
+    expect(svc.bodies("PUT", "/zotero/sync/settings")).toEqual([
+      JSON.stringify({ automatic: true, everyMinutes: 240, links: [{ ref: "user:42", projectId: P1, structure: "tags", duplicates: "merge" }] }),
+    ]);
+    const r = row("Zotero library user:42");
+    expect(within(r).getByText(ZOTERO_SYNC_REASON_TEXT["sync-undone"])).toBeTruthy();
+    expect(within(r).getByRole("button", { name: "Turn syncing on again for “Zotero library user:42”" })).toBeTruthy();
+    expect(svc.state.links[0]!.paused).toBe("undone");
+  });
+
+  it("R265: of two undone rows, the one turned on again is resumed and the other stays paused; the draft survives", async () => {
+    const svc = useSvc({
+      links: [
+        { ref: "user:42", projectId: P1, paused: "undone" },
+        { ref: "group:7", projectId: P3, paused: "undone", duplicates: "skip" },
+      ],
+      everyMinutes: 30,
+    });
+    await show(svc);
+    const user = userEvent.setup();
+    // Unsaved: a new interval and group:7 unticked. "Turn syncing on again" must send neither.
+    await user.selectOptions(screen.getByRole("combobox", { name: "How often" }), "240");
+    await user.click(screen.getByRole("checkbox", { name: "Keep “Zotero group 7” in step" }));
+    await user.click(within(row("Zotero group 7")).getByRole("button", { name: "Turn syncing on again for “Zotero group 7”" }));
+    await waitFor(() => expect(svc.count("PUT", "/zotero/sync/settings")).toBe(1));
+    expect(svc.bodies("PUT", "/zotero/sync/settings")).toEqual([
+      JSON.stringify({
+        automatic: false,
+        everyMinutes: 30,
+        links: [
+          { ref: "user:42", projectId: P1, structure: "collections", duplicates: "merge" },
+          { ref: "group:7", projectId: P3, structure: "collections", duplicates: "skip", resume: true },
+        ],
+      }),
+    ]);
+    await waitFor(() => expect(within(row("Zotero group 7")).queryByText(ZOTERO_SYNC_REASON_TEXT["sync-undone"])).toBeNull());
+    expect(within(row("Zotero library user:42")).getByText(ZOTERO_SYNC_REASON_TEXT["sync-undone"])).toBeTruthy();
+    expect(within(row("Zotero library user:42")).getByRole("button", { name: "Turn syncing on again for “Zotero library user:42”" })).toBeTruthy();
+    // The draft is still as the researcher left it.
+    expect((screen.getByRole("combobox", { name: "How often" }) as HTMLSelectElement).value).toBe("240");
+    expect((screen.getByRole("checkbox", { name: "Keep “Zotero group 7” in step" }) as HTMLInputElement).checked).toBe(false);
   });
 
   it("Sync now becomes Stop syncing and focus stays on it", async () => {
