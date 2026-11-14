@@ -802,11 +802,11 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     for (const { watchId, entry } of await s.repo.watchOrigins(projectId, sid)) {
       const rec = recs.find((w) => w.id === watchId);
       const watch = rec?.dir ? watchOf(s, projectId, watchId) : undefined;
-      // `local`: from what the engine last judged — a running watch, a state that implies the content was read
-      // (the register's "in-library", "changed", "settled"), and the file not listed as not downloaded. The file is
-      // never looked at for this answer.
-      const listed = watch && !watch.stopped ? watch.problems({ kind: "not-downloaded", offset: 0, limit: PROBLEMS_ALL }).items.some((p) => p.file === entry.file) : true;
-      const local = !!watch && !watch.stopped && (entry.state === "in-library" || entry.state === "changed" || entry.state === "settled") && !listed;
+      // `presence` (R251): the engine's last judgement of the new version, from its memory — the file is never looked
+      // at for this answer. Kept for "changed" and "may-have-changed" only; "unknown" for every other state, and
+      // whenever the engine cannot say (no running watch here: stopped, removed, or no folder on this computer; the
+      // watch paused, locked or not reaching its folder; the file not judged yet; or its check could not tell).
+      const presence = watch && !watch.stopped && (entry.state === "changed" || entry.state === "may-have-changed") ? watch.presence(entry.key) : "unknown";
       origins.push({
         watchId,
         folderLabel: rec ? folderName(rec) : "",
@@ -814,7 +814,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
         file: entry.file,
         state: entry.state,
         ...(entry.newSize !== undefined ? { newBytes: entry.newSize } : {}),
-        local,
+        presence,
       });
     }
     return { origins };
