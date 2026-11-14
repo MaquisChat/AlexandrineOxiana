@@ -354,7 +354,6 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
       saveBusy.current = false;
       setSaving(false);
       setSaveError(SEARCH_SOURCES_TEXT.saveTimedOut);
-      say(SEARCH_SOURCES_TEXT.saveTimedOut);
     }, SAVE_TIMEOUT_MS);
     try {
       const r = await api.save(body);

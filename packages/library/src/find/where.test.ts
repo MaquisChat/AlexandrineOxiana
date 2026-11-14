@@ -471,6 +471,19 @@ describe("Round 2 (R328 b): a link resolver's path keeps no parameter and no ses
       expect(deriveLibraryAccessWhy(ou(path)), path).toEqual({ refused: "session-key" });
     }
   });
+  it("ASP.NET's cookieless forms in general are session-like (R333 b iii)", () => {
+    for (const seg of ["(S(abc123))", "(A(xyz)S(abc123))", "(F(qwe))", "(A(1)S(2)F(3))"]) {
+      expect(deriveLibraryAccessWhy(ou(`/${seg}/openurl`)), seg).toEqual({ refused: "session-key" });
+      expect(deriveLibraryAccessWhy(ou(`/openurl/${seg}`)), seg).toEqual({ refused: "session-key" });
+      expect(isLibraryAccess({ kind: "openurl", base: `https://resolver.example.edu/${seg}/openurl` }), seg).toBe(false);
+    }
+  });
+  it("what is not ASP.NET's cookieless form is not session-like by that rule", () => {
+    for (const seg of ["(S())", "(s(abc))", "(S(abc)", "S(abc)", "(SS(abc))", "(S(a(b)))", "x(S(abc))", "(S(abc))x", "(draft)"]) {
+      const r = deriveLibraryAccessWhy(ou(`/${seg}/openurl`));
+      expect(r, seg).not.toEqual({ refused: "session-key" });
+    }
+  });
   it("an ordinary resolver's path is kept", () => {
     for (const path of ["/openurl", "/sfxlcl41", "/discovery/openurl", "/openurl/44EX", "/sfx_local",
       "/primo_library/libweb/action/openurl", "/openurl/01ABC_INST/01ABC_INST:Services",
