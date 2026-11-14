@@ -125,13 +125,24 @@ created or modified. Its results are in `pnpm report` under
 NODE_ENV=test, which lets the shell's request reach the loopback address; the shell does not pass it to
 the service) against a stand-in library and publisher (`e2e/library-standin.ts`): one https server on
 127.0.0.1 answering at made-up names under `ao-library-standin.test` (an EZproxy-like sign-in with a
-session cookie for the proxy's domain, a SAML-like path that fails the run if asked twice or by the
-shell, publisher pages with and without `citation_pdf_url`, a PDF sent as a download, a redirect to a
+session cookie for the proxy's domain and a second cookie for the whole made-up domain, a SAML-like
+path that fails the run if asked twice or by the shell, publisher pages with and without
+`citation_pdf_url`, a PDF sent as a download, a PDF address that answers the shell with a redirect to a
 third host). Six scenarios: the marked page fetched by the shell and waiting in the review queue until
 "Use this file"; a page without the mark and "Add the PDF showing in the sign-in window"; a download;
-the redirect to a third host (no cookie of the proxy reaches it); the window closed while the entry
-waits; a quit and a new start (no cookie at the first request). The sign-in window is typed into with
-xdotool (WebDriver does not reach it: it is a web view of its own ephemeral context).
+the shell's own request redirected to a third host (its hop to the publisher carries the proxy's
+cookie, its hop to the third host does not — while the whole domain's cookie does — its `Referer` holds
+no query, and the file waits); the window closed while the entry waits; a quit and a new start (no
+cookie at the first request). The sign-in window is typed into with xdotool (WebDriver does not reach
+it: it is a web view of its own ephemeral context). The stand-in tells the shell's request from the
+window's by two marks that must agree — `Accept: application/pdf` alone, and no `Sec-Fetch-Mode` (which
+WebKitGTK sends with every request and the shell never does); a request where they disagree fails every
+scenario.
+
+**On Linux the quit scenario cannot fail:** the sign-in window is private there (an ephemeral store,
+which dies with the app's process), so "no cookie after a new start" holds whatever the shell does. It
+is kept for the Mac, where the window's store is kept by identifier and must be removed at quit (on the
+list for the owner's Mac check).
 
 **They change this machine for the length of the run, and only when asked:**
 
@@ -139,32 +150,87 @@ xdotool (WebDriver does not reach it: it is a web view of its own ephemeral cont
 AO_E2E_SYSTEM_SETUP=1 pnpm --filter @ao/desktop run e2e     # as root
 ```
 
-With the switch (`e2e/system-setup.ts`), before the scenarios: a throw-away certificate authority and a
-certificate for the stand-in's names are made with `openssl` in a private temporary folder (valid one
-day); the authority is added to the system's store (`/usr/local/share/ca-certificates/
-ao-e2e-library-standin-<run>.crt`, then `update-ca-certificates` with an empty hooks folder, so no other
-store such as Java's is touched); and a marked block mapping the names to 127.0.0.1 is appended to
-`/etc/hosts`. Both the web view (GnuTLS) and the shell's request (OpenSSL) then trust the stand-in as
-they trust any site; nothing in the product is relaxed. After the scenarios — also when one fails, and
-on SIGINT, SIGTERM, SIGHUP and the process's exit — the hosts file's bytes, mode, owner and times are
-written back, the authority's file and its two links are removed, `update-ca-certificates` runs again,
-and both are compared with what they were (every entry of `/etc/ssl/certs` and of the local authorities'
-folder by name, kind, target or content and mode): any difference fails the run. Before anything, the
-set-up refuses (the scenarios are then NOT RUN, with the reason) when not on Linux or not root, when
-`/etc/hosts` is not a plain file, when an earlier run's block or authority is still there, or when the
-store is not what `update-ca-certificates` itself makes of it (tried first on a copy), since then it
-could not be put back exactly.
+With the switch, the e2e command (`e2e/netns.mjs`) first runs itself again inside a **network namespace
+with only the loopback interface** (`unshare --net`), brings the loopback up (there is no `ip` or
+`ifconfig` on this kind of machine: a few lines of the machine's Python issue `SIOCSIFFLAGS` on `lo`)
+and gives it a second loopback address, 127.0.0.2/32 (the alias `lo:1`: no other interface, no route
+out) — without it no name resolves for the web view, because GLib asks glibc per address family with
+`AI_ADDRCONFIG`, which answers IPv4 names only when an IPv4 address other than 127.0.0.1 exists — and
+checks that an outside address (192.0.2.1) fails at once, the loopback answers and `localhost` resolves
+that way. Everything the
+scenarios start — the stand-in, the drivers, the virtual display, the shell, its service and worker —
+therefore **cannot reach any outside server**; the made-up names still resolve through the machine's
+hosts file. If the namespace cannot be made, the run fails.
 
-Without the switch the six scenarios are skipped and the run's last lines say so: "6 library scenarios
-NOT RUN (skipped), not passed — not run: AO_E2E_SYSTEM_SETUP=1 is not set …".
+Then, before the scenarios (`e2e/system-setup.ts`, in this order):
 
-**If such a run was killed outright** (SIGKILL), its block and authority stay. The next run refuses to
-start, naming them. Remove them by hand (as root): delete the lines from `# ao-e2e-library-standin <run>
-begin` to `# ao-e2e-library-standin <run> end` in `/etc/hosts` (the original is kept as
-`$TMPDIR/ao-e2e-system-setup-<run>-*/hosts.orig`), then
-`rm /usr/local/share/ca-certificates/ao-e2e-library-standin-*.crt /etc/ssl/certs/ao-e2e-library-standin-*.pem`,
-remove the hash link that pointed to that `.pem` (`find /etc/ssl/certs -xtype l`), and run
-`update-ca-certificates`.
+1. **One run at a time:** the lock `/var/lib/ao-e2e-library-standin/lock` (exclusive creation, holding
+   the run's id and process id). A second run meanwhile fails, naming the run that holds it. A lock
+   whose process is gone is taken over, and only together with step 2.
+2. **An earlier run's leftovers** (a run killed outright) are put back from that run's record
+   (`/var/lib/ao-e2e-library-standin/record.json` and `hosts.orig`): the hosts file exactly, the
+   authority's file and links removed and the store rebuilt with an empty hooks folder, the times, its
+   work folder. If that cannot be done exactly (the hosts file was changed by something else meanwhile,
+   say), the run fails and says what it found; leftovers with no record are refused, not guessed at.
+3. **The record** of what this run will change and how to put it back is written, before anything is
+   changed.
+4. A throw-away certificate authority is made with `openssl` in a private folder
+   (`$TMPDIR/ao-e2e-system-setup-<run>`), valid one day, that **can vouch only for names under
+   `ao-library-standin.test`** (a critical name constraint, `permitted;DNS:.ao-library-standin.test`:
+   a certificate for any other name signed by it does not verify), and a certificate for the stand-in's
+   names. **The authority's key is deleted as soon as that one certificate is signed**, before the
+   machine trusts the authority (the server's key is kept in memory only).
+5. The authority is added to the system's store (`/usr/local/share/ca-certificates/
+   ao-e2e-library-standin-<run>.crt`, then `update-ca-certificates` with an empty hooks folder, so no
+   other store such as Java's is touched), after checking on a copy that the store is what
+   `update-ca-certificates` itself makes of it (or it could not be put back exactly).
+6. A marked block mapping the names to 127.0.0.1 is appended to `/etc/hosts` (in place).
+
+Both the web view (GnuTLS) and the shell's request (OpenSSL) then trust the stand-in as they trust any
+site; nothing in the product is relaxed. After the scenarios — also when one fails, and on SIGINT,
+SIGTERM, SIGHUP and the process's exit — everything is put back from the record and compared with it:
+the hosts file's bytes, mode, owner and modification time; every entry of `/etc/ssl/certs` and of the
+local authorities' folder (name, kind, link target or content, mode); and the modification times of
+those two folders and of the bundle `ca-certificates.crt`. Any difference fails the run. **What cannot
+be put back:** the change times (ctime) of the hosts file, of the two folders and of the bundle, the
+bundle's inode (`update-ca-certificates` writes a new file), and the modification times of `/var/lib`
+and of the temporary folder (where the run's own folders are made and removed).
+
+It needs, as the machine's own tools (not dependencies of the project): `openssl`,
+`update-ca-certificates`, `touch` (coreutils, which puts times back to the nanosecond), `unshare`
+(util-linux) and `python3`. With the switch set, any obstacle — not Linux, not root, a tool missing, no
+namespace, another run holding the lock, leftovers that cannot be put back — **fails the run**, with
+the reason in its last lines ("FAILED: the library scenarios were asked for (AO_E2E_SYSTEM_SETUP=1) but
+the machine's set-up cannot be made: …"). Without the switch the six scenarios are skipped and the run's
+last lines say so: "6 library scenarios NOT RUN (skipped), not passed — not run: AO_E2E_SYSTEM_SETUP=1
+is not set …"; the exit is as before.
+
+**If such a run was killed outright** (SIGKILL), the next run with the switch puts the machine back
+from the record by itself. To do it by hand instead (as root, when no desktop test is running):
+
+```sh
+S=/var/lib/ao-e2e-library-standin
+# 0. what the record says: the run's id, and the times to put back (access and modification, to the nanosecond)
+python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print("run", r["runId"]); print(r["hosts"]["times"]["a"], r["hosts"]["times"]["m"], "/etc/hosts"); [print(t["a"], t["m"], p) for p, t in r["times"]]' $S/record.json
+# 1. the processes the killed run left — Xvfb, dbus-daemon and the session services it started (dconf,
+#    the portals), tauri-driver, WebKitWebDriver, the shell (with its sign-in window and WebKit's own
+#    processes), the library service and the media worker: stop them and remove the run folders exactly
+#    as "If a run was killed" above says. (The e2e command itself, `node e2e/netns.mjs` inside the
+#    namespace, and Playwright's runner end by themselves once their worker is gone; the namespace goes
+#    with the last of these processes.)
+# 2. the hosts file: its original bytes written back in place, then its two times
+cat $S/hosts.orig > /etc/hosts
+touch -a -d @<a> /etc/hosts; touch -m -d @<m> /etc/hosts
+# 3. the authority's file and its two links (the .pem link and the hash link to it), then the store
+#    rebuilt with an EMPTY hooks folder, as the set-up does (the default hooks rewrite Java's store)
+rm -f /usr/local/share/ca-certificates/ao-e2e-library-standin-<run>.crt
+find /etc/ssl/certs -maxdepth 1 -type l -lname '*ao-e2e-library-standin-<run>*' -delete
+mkdir -m 700 /tmp/no-hooks && update-ca-certificates --hooksdir /tmp/no-hooks; rmdir /tmp/no-hooks
+# 4. the two folders' and the bundle's times, each from the record (lines printed by step 0)
+touch -a -d @<a> <path>; touch -m -d @<m> <path>
+# 5. the run's work folder (it holds no key: the authority's key was deleted when it signed), and the record
+rm -rf "${TMPDIR:-/tmp}/ao-e2e-system-setup-<run>" $S
+```
 
 It needs, besides the built app (Ubuntu 24.04 package names):
 
