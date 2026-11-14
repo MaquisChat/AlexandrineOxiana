@@ -291,10 +291,15 @@ describe("the library sign-in window (Task F16): six commands and one event, thr
     for (const state of states) deliver!({ payload: { ticket: TICKET, state } });
     deliver!({ payload: { ticket: null, state: "failed", reason: "no-ticket" } });
     deliver!({ payload: { ticket: TICKET, state: "failed", reason: "pause" } });
+    // R347 d: the shell's two refusals of a page reach the row with their reason.
+    deliver!({ payload: { ticket: TICKET, state: "not-a-pdf", reason: "sign-in-address" } });
+    deliver!({ payload: { ticket: TICKET, state: "not-a-pdf", reason: "not-https" } });
     expect(handler.mock.calls.map((c) => c[0])).toEqual([
       ...states.map((state) => ({ ticket: TICKET, state })),
       { ticket: null, state: "failed", reason: "no-ticket" },
       { ticket: TICKET, state: "failed", reason: "pause" },
+      { ticket: TICKET, state: "not-a-pdf", reason: "sign-in-address" },
+      { ticket: TICKET, state: "not-a-pdf", reason: "not-https" },
     ]);
     handler.mockClear();
     for (const payload of [null, "opened", { state: "opened" }, { ticket: "x", state: "opened" }, { ticket: TICKET.toUpperCase(), state: "opened" }, { ticket: TICKET, state: "added" }, [TICKET, "opened"]]) {

@@ -113,6 +113,10 @@ export const FIND_TEXT = {
   windowClosed: "The sign-in window was closed.",
   fetching: "Fetching the PDF…",
   notAPdf: "That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check.",
+  /** R347 d: the shell's `not-a-pdf` with `sign-in-address` — it refused a sign-in page. */
+  notAPdfSignIn: "That is a sign-in page, and the app never fetches from one. Open the PDF itself in the window.",
+  /** R347 d: the shell's `not-a-pdf` with `not-https` — it refused a page not served over https. */
+  notAPdfNotHttps: "That page is not served over https, so the app does not fetch from it.",
   fetchPause: "The sign-in window rests for a few seconds between files. Try again shortly.",
   fetchBusy: "The PDF is already being fetched.",
   fetchFailed: "The PDF could not be fetched. Try again in the sign-in window.",

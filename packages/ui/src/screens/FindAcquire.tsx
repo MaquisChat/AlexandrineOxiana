@@ -209,7 +209,8 @@ function windowSentence(e: LibraryWindowEvent, v: FindEntryView): string | undef
     case "fetching":
       return FIND_TEXT.fetching;
     case "not-a-pdf":
-      return FIND_TEXT.notAPdf;
+      // R347 d: the true reason when the shell refused the page; "not a PDF" only when it looked and found none.
+      return e.reason === "sign-in-address" ? FIND_TEXT.notAPdfSignIn : e.reason === "not-https" ? FIND_TEXT.notAPdfNotHttps : FIND_TEXT.notAPdf;
     case "failed":
       // R342 e: no ticket is open in the shell — no window for this work.
       if (e.reason === "no-ticket") return v.windowStart === "link" ? FIND_TEXT.noWindowLink : FIND_TEXT.noWindow;

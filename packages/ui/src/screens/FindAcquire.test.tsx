@@ -3436,6 +3436,24 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       await waitFor(() => expect(live().textContent).toBe("“an html page”: That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check."));
     });
 
+    it("R347 d: the shell's refusal says its true reason — a sign-in page, a page not served over https; \"not a PDF\" only when it looked and found none", async () => {
+      await pressed("refused page");
+      const h = heard();
+      const EXPECTED: Array<[LibraryWindowEvent, string]> = [
+        [{ ticket: TICKET, state: "not-a-pdf", reason: "sign-in-address" }, "That is a sign-in page, and the app never fetches from one. Open the PDF itself in the window."],
+        [{ ticket: TICKET, state: "not-a-pdf", reason: "not-https" }, "That page is not served over https, so the app does not fetch from it."],
+        [{ ticket: TICKET, state: "not-a-pdf" }, "That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check."],
+      ];
+      for (const [ev, sentence] of EXPECTED) {
+        await say(ev);
+        await waitFor(() => expect(note("refused page")).toBe(sentence));
+        await waitFor(() => expect(h.said).toContain(`“refused page”: ${sentence}`));
+      }
+      for (const s of h.said) expect(s).not.toMatch(/\badd(s|ed)?\b/iu);
+      h.stop();
+      expect(posts("/library/cancel")).toHaveLength(0);
+    });
+
     it("an event for another ticket changes nothing", async () => {
       await pressed("mine");
       await say({ ticket: OTHER_TICKET, state: "not-a-pdf" });
@@ -4242,6 +4260,29 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       const SAID = "The sign-in window is not open for this work. Cancel, then use “Open it here and fetch the PDF” again.";
       await waitFor(() => expect(note("link waits")).toBe(SAID));
       await waitFor(() => expect(live().textContent).toBe(`“link waits”: ${SAID}`));
+    });
+
+    it("R347 d: for a link's start too, the shell's refusal says its true reason; \"not a PDF\" as round 1 chose it when it looked and found none", async () => {
+      waitsOnPress("link refused");
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await user.click(here("link refused"));
+      await waitFor(() => expect(row("link refused").querySelector(".ao-find__state")?.textContent).toBe("Waiting for you in the sign-in window"));
+      const h = heard();
+      const EXPECTED: Array<[LibraryWindowEvent, string]> = [
+        [{ ticket: TICKET, state: "not-a-pdf", reason: "not-https" }, "That page is not served over https, so the app does not fetch from it."],
+        [{ ticket: TICKET, state: "not-a-pdf", reason: "sign-in-address" }, "That is a sign-in page, and the app never fetches from one. Open the PDF itself in the window."],
+        [{ ticket: TICKET, state: "not-a-pdf" }, "That page is not a PDF. Open the PDF in the sign-in window and the app will fetch it for you to check."],
+      ];
+      for (const [ev, sentence] of EXPECTED) {
+        await say(ev);
+        await waitFor(() => expect(note("link refused")).toBe(sentence));
+        await waitFor(() => expect(h.said).toContain(`“link refused”: ${sentence}`));
+      }
+      for (const s of h.said) expect(s).not.toMatch(/\badd(s|ed)?\b|library/iu);
+      h.stop();
     });
 
     it("R345 e: a link's file not kept says so in words naming no library; a library's file as before", async () => {
