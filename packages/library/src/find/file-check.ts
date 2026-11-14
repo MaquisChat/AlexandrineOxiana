@@ -19,14 +19,17 @@
  *     record's title's content words in the same sequence (the first TITLE_WORDS_MAX of them) — no missing word, no
  *     extra word; joining words and punctuation do not count. A word hyphenated across a line end (the next line
  *     starting in lower case) is tried both joined and as two words.
- *  3. **The author line directly below:** the next line after the block is a line of names holding the first
- *     author's family name (`firstFamily`: the first creator with the role author, else the first creator). Commas,
- *     semicolons and full stops are left out, and so are affiliation marks glued to a name (NAME_MARKS: digits, *, †,
- *     ‡, §, ¶, superscripts); then every token must be a name of a creator of the record, a capitalised word, an
- *     initial, or one of NAME_JOINING_WORDS. A number standing by itself (a year among them), a price, "pp." or a web
- *     or e-mail address makes it not a line of names; so do more than NAME_LINE_TOKENS_MAX (30) tokens.
- *     A file with no place that satisfies 2 and 3 is "title-absent".
- *  4. **Nothing unexplained directly above:** the line directly above the block is none (the block opens the text); a
+ *  3. **The author line directly below:** the next line after the block (a line with no letter and no digit — a
+ *     rule, asterisks — counts as empty: R293 d) is a line of names holding the first author's family name
+ *     (`firstFamily`: the first creator with the role author, else the first creator). Commas, semicolons and full
+ *     stops are left out, and so are affiliation marks glued to a name (NAME_MARKS: digits, *, †, ‡, §, ¶,
+ *     superscripts) and a number of one or two digits standing by itself ("1", "1,2": R293 c); then every token must
+ *     be a name of a creator of the record, a capitalised word, an initial, or one of NAME_JOINING_WORDS. A number of
+ *     three or more digits (a year among them), a price, "pp.", a web or e-mail address, or one of NOT_NAME_WORDS
+ *     (volume, vol, part, book, edition, chapter, section, issue: R293 c) makes it not a line of names; so do more
+ *     than NAME_LINE_TOKENS_MAX (30) tokens.
+ *  4. **Nothing unexplained directly above:** the line directly above the block (a line with no letter and no digit
+ *     counts as empty: R293 d) is none (the block opens the text); a
  *     line holding a digit, a web address or an e-mail address; a line holding the record's container title (when
  *     the record has one); a line of RUNNING_TEXT_WORDS (8) or more words; or one of ORDINARY_LABELS as the whole
  *     line, in any case. Anything else ("Supporting Information", "Symposium", a journal's name the record does not
@@ -36,8 +39,8 @@
  *     OTHER_KIND_PHRASES as whole words anywhere in the zone; one of ABOUT_LABELS ("review of", "reply to", …)
  *     followed directly by the record's title (its first six words) or its first author's family name ("the",
  *     colons, quotes and line breaks may stand between); a line that is only one of OTHER_KIND_LINES; or a line that
- *     begins with one of ADDED_KIND_LABELS (R292). A label the record's own title holds is not a sign. Otherwise
- *     "other-kind".
+ *     begins with one of ADDED_KIND_LABELS of two or more words, or is a single-word one as the whole line (any
+ *     case, punctuation aside: R293 b). A label the record's own title holds is not a sign. Otherwise "other-kind".
  *  6. **No sign of another version or of a part:** from VERSION_LINES_ABOVE (3) lines above the block to
  *     VERSION_LINES_BELOW (12) lines below it, a short line of its own (at most eight words) that begins with volume,
  *     vol., part or book and a number, or with an edition form ("Second edition", "2nd ed.", "Revised edition") — or
@@ -61,6 +64,9 @@
  * one of them also satisfies 4–6, judged around THAT place; 1, 7 and 8 hold for the file as a whole. Otherwise the
  * reason is the first of no-text, other-doi, other-kind, other-version, title-absent among those that apply (to any
  * place). A match says `by: "title"` always: the asset's provenance records it (`AcquiredFrom.check.by`).
+ * **The reason when no place satisfies 2 and 3 (R293 e):** "other-kind" or "other-version" if a sign of clause 5 or
+ * 6 (the embedded title's included) stands on a line beginning within REASON_ZONE_CHARS (1,000) characters,
+ * otherwise "title-absent". It is worked out only after "no match" is decided, and never changes it.
  *
  * What the check found is returned for the review queue (R277 d), bounded and cleaned (invisible and control
  * characters removed): the first labelled DOI that is not the record's, the embedded title and the start of the
@@ -96,9 +102,15 @@ const ZONE_LINES_AFTER = 3;
 const VERSION_LINES_ABOVE = 3;
 /** Clause 6: … to this many lines below it (M10). */
 const VERSION_LINES_BELOW = 12;
+/** R293 e: with no place, a sign on a line beginning within this many characters gives the reason. */
+const REASON_ZONE_CHARS = 1000;
 
 /** Clause 3: the small words that join or begin names (any case). */
 const NAME_JOINING_WORDS: ReadonlySet<string> = new Set(["and", "&", "by", "with", "et", "al", "de", "del", "della", "der", "den", "di", "da", "dos", "du", "la", "le", "van", "von", "bin", "ibn", "al", "el", "y", "e", "i", "jr", "sr"]);
+/** Clause 3 (R293 c): a line holding one of these words (whole word, any case) is not a line of names. */
+const NOT_NAME_WORDS: ReadonlySet<string> = new Set(["volume", "vol", "part", "book", "edition", "chapter", "section", "issue"]);
+/** Clause 3 (R293 c): a number of one or two digits standing by itself is an affiliation mark ("1", "1,2", "¹"). */
+const AFFILIATION_NUMBER = /^[\d\u00B2\u00B3\u00B9\u2070-\u2079]{1,2}$/u;
 /** Clause 3: affiliation marks glued to the start or end of a name (digits, *, †, ‡, §, ¶, superscript characters). */
 const NAME_MARKS = /^[\p{Nd}*†‡§¶²³¹⁰-₟ᴬ-ᵪ]+|[\p{Nd}*†‡§¶²³¹⁰-₟ᴬ-ᵪ]+$/gu;
 /** Clause 4: the ordinary article labels, allowed as the whole line directly above the block (any case). */
@@ -132,7 +144,7 @@ const ORDINARY_LABELS: readonly string[] = [
   "version of record",
   "published version",
 ];
-/** Clause 5 (R292): the added labels of another kind, as a line's beginning or a line of their own. */
+/** Clause 5 (R292, R293 b): the added labels of another kind — of two or more words, as a line's beginning; of one word, only as the whole line. */
 const ADDED_KIND_LABELS: readonly string[] = [
   "supporting information",
   "supplementary information",
@@ -253,6 +265,9 @@ type Line = { text: string; start: number; end: number };
 const HYPHEN_END = /\p{L}[-­‐]$/u;
 const LOWER_START = /^\p{Ll}/u;
 
+/** R293 d: a line with no letter and no digit (a rule, asterisks) counts as empty in clauses 3 and 4. */
+const blankish = (l: Line | undefined): boolean => !!l && !/[\p{L}\p{N}]/u.test(l.text);
+
 function linesOf(text: string): Line[] {
   const out: Line[] = [];
   let at = 0;
@@ -294,18 +309,23 @@ const hasAddress = (s: string): boolean => s.split(/\s+/u).some((t) => WEB_ADDRE
 
 /** Clause 3: is `line` a line of names holding `family`? `names` are the words of every creator's names. */
 function nameLine(line: string, family: readonly string[], names: ReadonlySet<string>): boolean {
-  const raw = cleanText(line).replace(/\p{Cf}/gu, "").split(/\s+/u);
+  const clean = cleanText(line).replace(/\p{Cf}/gu, "");
+  if (plainWords(clean).some((w) => NOT_NAME_WORDS.has(w))) return false;
+  const raw = clean.split(/\s+/u);
   const kept: string[] = [];
   for (const tok of raw) {
     if (!tok) continue;
     if (WEB_ADDRESS.test(tok) || EMAIL_ADDRESS.test(tok) || PRICE.test(tok)) return false;
+    // A number standing by itself: one or two digits are affiliation marks, left out (R293 c); more (a year) fail.
+    if (!/\p{L}/u.test(tok) && /\p{N}/u.test(tok)) {
+      if (tok.split(/[,;.]/u).every((x) => !x || AFFILIATION_NUMBER.test(x))) continue;
+      return false;
+    }
     const t = tok.replace(/[,;.]/gu, "");
     if (!t) continue;
     kept.push(t);
     if (kept.length > NAME_LINE_TOKENS_MAX) return false;
     if (t === "&") continue;
-    // A number standing by itself (a year among them): no letter, a digit.
-    if (!/\p{L}/u.test(t) && /\p{N}/u.test(t)) return false;
     const w = t.replace(NAME_MARKS, "");
     if (!w || !/\p{L}/u.test(w)) return false;
     if (/^pp$/iu.test(w)) return false;
@@ -453,14 +473,24 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   const container = record.container ? plainWords(record.container) : [];
   const embedded = raw.title ?? "";
 
+  /** The nearest line below (step 1) or above (step -1) line k that is not empty (R293 d). */
+  const nearest = (k: number, step: 1 | -1): Line | undefined => {
+    let q = k + step;
+    while (blankish(lines[q])) q += step;
+    return lines[q];
+  };
   // 2 and 3. The places: a title block with a line of names holding the first author's family name directly below.
-  const places = family ? titleBlocks(lines, rec).filter((p) => !!lines[p.last + 1] && nameLine(lines[p.last + 1]!.text, family, names)) : [];
-  if (!places.length) return no("title-absent");
+  const places = family
+    ? titleBlocks(lines, rec).filter((p) => {
+        const below = nearest(p.last, 1);
+        return !!below && nameLine(below.text, family, names);
+      })
+    : [];
 
   // 4. Nothing unexplained directly above the block.
   const labels = new Set(ORDINARY_LABELS.map((l) => plainWords(l).join(" ")));
   const aboveExplained = (p: Place): boolean => {
-    const above = lines[p.first - 1];
+    const above = nearest(p.first, -1);
     if (!above) return true;
     const l = above.text;
     if (/\p{Nd}/u.test(l) || hasAddress(l)) return true;
@@ -488,8 +518,10 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
       return false;
     });
   const addedLabels = ADDED_KIND_LABELS.map((l) => plainWords(l)).filter((lw) => !containsRun(recAll, lw));
-  const kindSign = (p: Place): boolean => {
-    const zoneLines = lines.slice(0, p.last + 1 + ZONE_LINES_AFTER).map((l) => l.text);
+  const kindSign = (p: Place): boolean => kindIn(lines.slice(0, p.last + 1 + ZONE_LINES_AFTER).map((l) => l.text));
+  /** Clause 5's signs among `zone` (text lines) and the embedded title. */
+  const kindIn = (zone: readonly string[]): boolean => {
+    const zoneLines = [...zone];
     const textZoneWords = plainWords(zoneLines.join("\n"));
     if (embedded) zoneLines.push(embedded);
     const zoneWords = plainWords(zoneLines.join("\n"));
@@ -502,7 +534,7 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
       (!!embedded && aboutIn(plainWords(embedded))) ||
       zoneLines.some((l) => {
         const lw = plainWords(l);
-        return (lw.length === 1 && OTHER_KIND_LINES.has(lw[0]!) && !recAll.includes(lw[0]!)) || addedLabels.some((al) => startsWithRun(lw, al));
+        return (lw.length === 1 && OTHER_KIND_LINES.has(lw[0]!) && !recAll.includes(lw[0]!)) || addedLabels.some((al) => (al.length === 1 ? sameWords(lw, al) : startsWithRun(lw, al)));
       })
     );
   };
@@ -524,9 +556,11 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
     }
     return true;
   };
-  const versionSign = (p: Place): boolean => {
+  const versionSign = (p: Place): boolean =>
+    versionIn([...Array.from({ length: Math.min(VERSION_LINES_ABOVE, p.first) }, (_, k) => p.first - 1 - k), ...Array.from({ length: VERSION_LINES_BELOW }, (_, k) => p.last + 1 + k).filter((k) => k < lines.length)]);
+  /** Clause 6's signs on the lines numbered `window`, and in the embedded title. */
+  const versionIn = (window: readonly number[]): boolean => {
     if (embeddedVersion) return true;
-    const window = [...Array.from({ length: Math.min(VERSION_LINES_ABOVE, p.first) }, (_, k) => p.first - 1 - k), ...Array.from({ length: VERSION_LINES_BELOW }, (_, k) => p.last + 1 + k).filter((k) => k < lines.length)];
     return window.some((k) => {
       const l = lines[k]!.text;
       const ws = plainWords(l);
@@ -538,6 +572,15 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   // 8. An embedded title of two or more content words that is not the record's is another document's.
   const et = embedded.trim();
   const otherTitle = !!et && !FILE_NAME_TITLE.test(et) && contentWords(et).length >= 2 && !sameTitle(et, record.title) && !sameTitle(mainTitle(et), record.title) && !sameTitle(et, mainTitle(record.title));
+
+  // R293 e: no place — not a match. Only the reason told is worked out here: a sign of clause 5 or 6 on the lines
+  // beginning within the first 1,000 characters (and in the embedded title), else title-absent.
+  if (!places.length) {
+    const early = lines.flatMap((l, k) => (l.start < REASON_ZONE_CHARS ? [k] : []));
+    if (kindIn(early.map((k) => lines[k]!.text))) return no("other-kind");
+    if (versionIn(early)) return no("other-version");
+    return no("title-absent");
+  }
 
   // Any one place satisfying 4–6 is enough; otherwise the first reason that applies (to any place, or the file).
   const why = new Set<FileMismatchWhy>();

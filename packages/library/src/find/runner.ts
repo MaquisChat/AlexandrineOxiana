@@ -1552,7 +1552,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     if (!(await finish({ state: "fetching" }, ["nextTryAt", "reason", "offers"]))) return;
 
-    const record = { title: primary(sf.source.title) ?? "", creators: sf.source.creators, ...(sf.source.identifiers.doi ? { doi: sf.source.identifiers.doi } : {}) };
+    const record = { title: primary(sf.source.title) ?? "", creators: sf.source.creators, ...(sf.source.identifiers.doi ? { doi: sf.source.identifiers.doi } : {}), ...(sf.source.container && primary(sf.source.container) ? { container: primary(sf.source.container)! } : {}) };
     const folderName = `find-${eid}`;
     const folder = join(repoLibrary(repo).root, ".tmp", folderName);
     // The folder is held in use from before the first download until the file is stored or dropped (R257 b, R261 e).
