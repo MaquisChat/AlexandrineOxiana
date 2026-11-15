@@ -740,6 +740,33 @@ describe("SourceDetail: how a file was got (F18b; R340 e)", () => {
     expect([...file("window-host").querySelectorAll(".ao-source__acquired [dir=auto]")].map((p) => p.textContent)).toEqual(["repository.example.edu", `Nov ${new Date(AT).getDate()}, 2026`]);
   });
 
+  it("R348 g: a file got through the library in the researcher's own browser says so, with the tab's host; every other way reads as before", async () => {
+    const browser = { method: "library_access", via: "browser-extension", at: AT, tool, access: "signed-in-session" };
+    const file = await filesWith([
+      asset("browser-host", { ...browser, address: "https://www.publisher.example/doi/pdf/10.5555/z", check: { result: "match", by: "title" } }),
+      asset("browser-doubt", { ...browser, address: "https://someone:secret@ezproxy.example.edu:8443/x.pdf", check: { result: "accepted-after-mismatch", why: "other-version" } }),
+      asset("browser-no-host", { ...browser, address: "" }),
+      asset("browser-hostile", { ...browser, address: "javascript:alert(1)" }),
+      asset("window-library", { method: "library_access", via: "sign-in-window", address: "https://ezproxy.example.edu/x.pdf", at: AT, tool, access: "signed-in-session" }),
+      asset("library-later-via", { method: "library_access", via: "from-a-later-build", address: "https://ezproxy.example.edu/y.pdf", at: AT, tool, access: "signed-in-session" }),
+      asset("free-browser-via", { method: "free_copy", via: "browser-extension", address: "https://files.example.org/c.pdf", at: AT, tool, access: "public" }),
+    ]);
+    expect(how(file("browser-host"))).toBe(`Got through your library in your own browser, sent from www.publisher.example. ${ADDED} The app's check had said it looked like the right file.`);
+    expect(how(file("browser-doubt"))).toBe(
+      `Got through your library in your own browser, sent from ezproxy.example.edu:8443. ${ADDED} You used it although the app's check had a doubt: The file seems to be another volume, part or edition of this work.`,
+    );
+    expect(file("browser-doubt").textContent).not.toMatch(/someone|secret/u);
+    expect(how(file("browser-no-host"))).toBe(`Got through your library in your own browser. ${ADDED}`);
+    expect(how(file("browser-hostile"))).toBe(`Got through your library in your own browser. ${ADDED}`);
+    for (const id of ["browser-host", "browser-doubt", "browser-no-host"]) expect(how(file(id))).not.toMatch(/\badd(s|ed)?\b|window/iu);
+    // The host is the record's, through UserText.
+    expect([...file("browser-host").querySelectorAll(".ao-source__acquired [dir=auto]")].map((p) => p.textContent)).toEqual(["www.publisher.example", `Nov ${new Date(AT).getDate()}, 2026`]);
+    // Every other combination as before.
+    expect(how(file("window-library"))).toBe(`Fetched through your library (ezproxy.example.edu). ${ADDED}`);
+    expect(how(file("library-later-via"))).toBe(`Fetched through your library (ezproxy.example.edu). ${ADDED}`);
+    expect(how(file("free-browser-via"))).toBe(`A free copy from files.example.org. ${ADDED}`);
+  });
+
   it("every service as the Search sources screen names it", async () => {
     const names = { openalex: "OpenAlex", unpaywall: "Unpaywall", arxiv: "arXiv", europepmc: "Europe PMC", semanticscholar: "Semantic Scholar", doab: "Directory of Open Access Books", internetarchive: "Internet Archive" };
     const file = await filesWith(Object.keys(names).map((s) => asset(s, { method: "free_copy", via: "service", service: s, address: "https://archive.org/download/x/x.pdf", at: AT, tool, access: "public" })));

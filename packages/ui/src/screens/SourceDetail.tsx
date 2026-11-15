@@ -98,7 +98,9 @@ type AcquiredWords = Array<string | { user: string }>;
 /**
  * How a file was got, in words (R340 e), from its `acquired` record read defensively; undefined for a file without one.
  * `<host>` is parsed from the recorded address, never taken from anything else in the record. A free copy fetched in
- * the app's own window (`via` "sign-in-window", R347 c) says where the window was opened, never "A free copy from".
+ * the app's own window (`via` "sign-in-window", R347 c) says where the window was opened, never "A free copy from". A
+ * file got through the library in the researcher's own browser (`library_access` with `via` "browser-extension", R348 g)
+ * says so, with the host of the tab it was sent from.
  */
 export function acquiredWords(a: Asset): AcquiredWords | undefined {
   const r: unknown = a.acquired;
@@ -121,6 +123,9 @@ export function acquiredWords(a: Asset): AcquiredWords | undefined {
     if (host) out.push(" from ", { user: host });
     if (svc) out.push(", found through ", svc);
     out.push(".");
+  } else if (method === "library_access" && via === "browser-extension") {
+    // R348 g: sent by the paired extension from the researcher's own browser — the host is the tab's, as recorded.
+    out.push(...(host ? ["Got through your library in your own browser, sent from ", { user: host }, "."] : ["Got through your library in your own browser."]));
   } else if (method === "library_access") {
     out.push(...(host ? ["Fetched through your library (", { user: host }, ")."] : ["Fetched through your library."]));
   } else out.push("Got through Find and acquire.");

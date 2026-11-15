@@ -48,6 +48,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNod
 import { ApiClientError, type ApiClient } from "../api/client";
 import { UserText } from "../components/UserText";
 import { desktopShell, type DesktopShell } from "../desktopShell";
+import { inAppLink, PATHS } from "../navigation";
 import "./YourLibrary.css";
 
 /** This screen's own sentences (the service's are @ao/shared's). None says or implies that the app adds a file (R334 d). */
@@ -98,6 +99,10 @@ export const YOUR_LIBRARY_SCREEN_TEXT = {
   signingOut: "Signing out…",
   signedOut: "You are signed out of your library. The sign-in window's saved sign-in was removed.",
   signOutFailed: "Signing out did not work. Close the sign-in window and try again.",
+  // F20c (R348 h): the fallback when the sign-in window cannot sign the researcher in — one sentence, its middle a link.
+  browserFallbackLead: "If the sign-in window cannot sign you in — some libraries ask for a passkey, a security key or Google — use your own browser: ",
+  browserFallbackLink: "pair the browser extension",
+  browserFallbackTail: ", then use “Get through my library in my own browser” on a work.",
 } as const;
 const T = YOUR_LIBRARY_SCREEN_TEXT;
 
@@ -845,6 +850,18 @@ export function YourLibrary({ client }: { client: ApiClient }) {
           {signOutResult && (
             <p id={signOutResultId} className="ao-yl__result" data-testid="yl-signout-result">
               {signOutResult}
+            </p>
+          )}
+          {/* F20c (R348 h): the researcher's own browser, with the paired extension, as the fallback. Last in the part, so
+              the order of its controls is as before. R356 e: in the desktop app only — it names a control that exists
+              only there. */}
+          {shell && (
+            <p className="ao-yl__note" data-testid="yl-browser-fallback">
+              {T.browserFallbackLead}
+              <a href={PATHS.extension} onClick={inAppLink}>
+                {T.browserFallbackLink}
+              </a>
+              {T.browserFallbackTail}
             </p>
           )}
         </section>
