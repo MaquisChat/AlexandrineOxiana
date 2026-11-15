@@ -359,3 +359,88 @@ describe("the app's port changed (R171, defect D13)", () => {
     expect(storage.data.pairing).toBeUndefined();
   });
 });
+
+// Find and acquire, the browser's fallback (R348 f, i): the list and the file, with the token in the header only.
+describe("the browser's fallback: the list and the file (R348 f)", () => {
+  const TICKET = "0123456789abcdef0123456789abcdef";
+  const PAGE = "https://pdfs.publisher.example/a.pdf?x=1";
+  const pairedStorage = () => {
+    const storage = memoryStorage();
+    storage.data.pairing = { port: 48123, token: TOKEN, pairedAt: "" };
+    return storage;
+  };
+
+  it("the list: POST /find/browser/waiting with exactly {} as JSON, the token in the header; the answer as it came", async () => {
+    const { fn, calls } = fakeFetch(() => ({ status: 200, body: { waiting: [{ ticket: TICKET, label: "A work" }] } }));
+    const api = createApi({ fetch: fn, storage: pairedStorage() });
+    expect(await api.findWaiting()).toEqual({ waiting: [{ ticket: TICKET, label: "A work" }] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("http://127.0.0.1:48123/find/browser/waiting");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.init.body).toBe("{}");
+    expect(headerOf(calls[0]!.init, "content-type")).toBe("application/json");
+    expect(headerOf(calls[0]!.init, "authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(calls[0]!.init.credentials).toBe("omit");
+    expect(calls[0]!.init.redirect).toBe("error");
+  });
+
+  it("the file: ONE POST /find/browser/file/<ticket>, Content-Type application/pdf, x-ao-page, the PDF as the body; the token only in the header", async () => {
+    const { fn, calls } = fakeFetch(() => ({ status: 200, body: { outcome: "held", sentence: "Sent. The file waits for your check in the app's review queue." } }));
+    const api = createApi({ fetch: fn, storage: pairedStorage() });
+    const pdf = new Blob([new TextEncoder().encode("%PDF-1.7\n…")], { type: "application/pdf" });
+    const r = await api.sendFindPdf(TICKET, PAGE, pdf);
+    expect(r).toEqual({ outcome: "held", sentence: "Sent. The file waits for your check in the app's review queue." });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe(`http://127.0.0.1:48123/find/browser/file/${TICKET}`);
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.init.body).toBe(pdf);
+    expect(headerOf(calls[0]!.init, "content-type")).toBe("application/pdf");
+    expect(headerOf(calls[0]!.init, "x-ao-page")).toBe(PAGE);
+    expect(headerOf(calls[0]!.init, "authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(calls[0]!.url).not.toContain(TOKEN);
+    expect(calls[0]!.init.credentials).toBe("omit");
+    expect(calls[0]!.init.redirect).toBe("error");
+  });
+
+  it("a ticket that is not 32 lower-case hex is never put in an address", async () => {
+    const { fn, calls } = fakeFetch(() => ({ status: 200, body: {} }));
+    const api = createApi({ fetch: fn, storage: pairedStorage() });
+    for (const bad of ["../projects", `${TICKET}?x`, TICKET.toUpperCase(), ""]) {
+      await expect(api.sendFindPdf(bad, PAGE, new Blob([]))).rejects.toMatchObject({ code: "BAD_PATH" });
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it("a refusal carries the service's sentence; 401 forgets the pairing", async () => {
+    const storage = pairedStorage();
+    let status = 400;
+    const { fn } = fakeFetch(() => ({ status, body: { error: { code: "VALIDATION", message: "That tab's file is not a PDF. The work is still waiting.", reason: "browser-not-pdf" } } }));
+    const api = createApi({ fetch: fn, storage });
+    await expect(api.sendFindPdf(TICKET, PAGE, new Blob([]))).rejects.toMatchObject({ status: 400, message: "That tab's file is not a PDF. The work is still waiting.", serviceShaped: true });
+    status = 401;
+    await expect(api.sendFindPdf(TICKET, PAGE, new Blob([]))).rejects.toMatchObject({ status: 401 });
+    expect(storage.data.pairing).toBeUndefined();
+  });
+
+  it("no answer at all (the connection closed): UNREACHABLE, no status", async () => {
+    const fn = (async () => {
+      throw new TypeError("Failed to fetch");
+    }) as unknown as typeof fetch;
+    const api = createApi({ fetch: fn, storage: pairedStorage() });
+    const e = await api.sendFindPdf(TICKET, PAGE, new Blob([])).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ApiError);
+    expect(e).toMatchObject({ code: "UNREACHABLE" });
+    expect((e as ApiError).status).toBeUndefined();
+  });
+
+  it("a stop asked through the signal: ABORTED", async () => {
+    const fn = (async (_u: unknown, init: RequestInit) => {
+      if (init.signal?.aborted) throw new DOMException("aborted", "AbortError");
+      return new Response("{}");
+    }) as unknown as typeof fetch;
+    const api = createApi({ fetch: fn, storage: pairedStorage() });
+    const ac = new AbortController();
+    ac.abort();
+    await expect(api.findWaiting({ signal: ac.signal })).rejects.toMatchObject({ code: "ABORTED" });
+  });
+});

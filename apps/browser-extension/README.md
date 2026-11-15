@@ -6,6 +6,9 @@ counts, media links). "Capture profile as I scroll" (spec §5.5) notes the post 
 while you scroll it yourself. What the extension reads is stored as `page-dom` evidence. When you also
 use the downloader, the recheck compares that evidence with the platform's own data (spec §5.8).
 
+It also sends the app a PDF you opened through your library in this browser, for a work the app is waiting
+for (see "Send this tab's PDF" below). The file then waits in the app's review queue for your check.
+
 Works in Chrome/Edge (Manifest V3 service worker) and in Firefox 128 or later (the same `background.js`
 runs as a background script, and the code uses `webextension-polyfill`).
 
@@ -129,13 +132,60 @@ page shows; the extension never looks for a port by itself.
   service. It has no `<all_urls>`, `tabs`, `history` or `cookies` permission, and incognito is not
   allowed.
 - **When it runs:** nothing runs in a page until you click a button in the popup. That click grants
-  `activeTab` for that tab, and only then is `content.js` injected (`scripting.executeScript`). There are
-  no persistent content scripts and no resources exposed to pages.
+  `activeTab` for that tab, and only then is `content.js` (a capture) or `find-tab.js` ("Send this tab's
+  PDF") injected (`scripting.executeScript`, the tab's top frame, the extension's isolated world). There
+  are no persistent content scripts and no resources exposed to pages.
 - **Page text:** the popup renders anything that comes from a page or the service only as React text,
   never as HTML. The extension pages use the CSP `script-src 'self'`, with `connect-src` limited to the
   local service.
 - **Profile links:** the link list from "profile as I scroll" lives only in `storage.session` (cleared
   when the browser closes) until it is sent or discarded.
+- **A PDF sent to the app:** the extension reads a tab's file only when you press "Send this tab's PDF",
+  and only that tab's own file. Its bytes go straight to the app: the file is held only until it is sent,
+  never in the extension's storage, and never logged. The tab's address is sent with it without its query
+  and fragment (the part after `?` or `#`), so a library's or publisher's sign-in tokens in the address
+  are not sent. The pairing token and the app's ticket for the work stay inside the extension: the page
+  never sees them. Afterwards `storage.session` keeps only the sentence the popup showed, its time and a
+  one-way hash of the work's ticket (never the ticket or the title), until the popup's next opening.
+
+## Send this tab's PDF (Find and acquire)
+
+Some libraries' sign-in does not work in the app's own sign-in window (a passkey, a security key, or a
+Google sign-in). For those, the app offers "Get through my library in my own browser" on a work:
+
+1. The app opens your library's address for the work in your browser. Sign in there as you always do,
+   and open the PDF itself.
+2. Press the Alexandrine Oxiana button in the browser's toolbar. When the app is waiting for a PDF from
+   this browser, the popup's first part, **Find and acquire**, says "Waiting for a PDF:" and the work's
+   title, with the button **Send this tab's PDF**.
+3. Press it. The extension reads the PDF in that tab, as the tab itself would (with your library's
+   sign-in), and sends it to the app. The popup then shows the app's answer. The file is not put into
+   your library: it waits in the app's review queue until you check it there and decide.
+
+What the popup can say instead:
+
+- "This tab's address is not https, so its file cannot be sent." The extension sends only from https
+  pages.
+- "This tab's address holds a user name or password, so its file cannot be sent." or "This tab's address
+  is too long for the app, so its file cannot be sent." The app takes an address without a user name or
+  password, of at most 2,048 characters once its query is removed.
+- "This tab is not showing a PDF. Open the PDF itself, then try again." The tab shows a page about the
+  work, not the PDF. Open the PDF so that it fills the tab, then press again.
+- "This browser does not let the extension read this tab, so its PDF cannot be sent." Some browsers do
+  not let an extension into their own PDF viewer or their own pages. Firefox's PDF viewer is one of them;
+  download the PDF instead and give it to the work's record in the app yourself.
+- "The site did not give the PDF a second time, so nothing was sent. Download the PDF and add it to the
+  record in the app instead." The tab shows a PDF, but when the extension read it again the site answered
+  with a page (some sites give a PDF only once per address).
+- The app's own sentences when it does not take the file (not a PDF, larger than 200 MB, the work no
+  longer waiting, and so on). When the work still waits, the button is offered again.
+- "The PDF could not be sent. The work is still waiting — try again." The connection to the app ended
+  before its answer came.
+
+You can close the popup while the PDF is being sent: the sending goes on, and the popup shows its answer
+the next time you open it — unless the app is by then waiting for a different work; the app itself shows
+what became of the earlier one. No new permission is needed for any of this: the click on the toolbar button
+gives the extension that one tab, as for a capture.
 
 ## Selectors (`src/content/selectors.json`)
 
