@@ -8,8 +8,9 @@
 //!   closes.
 //! - Ready when it prints `AO_SERVICE_READY port=<n>`, within a time limit; otherwise it is stopped
 //!   and the reason is a plain sentence.
-//! - After the token, the shell writes on the same pipe only folder grant lines (grant.rs, R207),
-//!   through `ServiceInput::send_line`. Writing and closing take the same lock, so a grant is either
+//! - After the token, the shell writes on the same pipe only grant lines, all through
+//!   `ServiceInput::send_line`: the folder grants (grant.rs, R207) and the file grants of the sign-in
+//!   window's fetched files (library_window.rs `file_grant_line`, R225). Writing and closing take the same lock, so a grant is either
 //!   written whole before the close or refused after it; once closing has begun every send is
 //!   refused at once, and a close that cannot take the lock in time (a write stuck on a service that
 //!   no longer reads) gives way to the forced stop, whose kill ends the stuck write.

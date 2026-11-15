@@ -293,11 +293,15 @@ async fn detached<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 /// The sign-in window's commands (Task F16), granted to the main window only
 /// (capabilities/main-window.json). Each also checks its caller's label itself: from any other
 /// window it answers false and does nothing (library_window.rs, `Library`).
+///
+/// `open_library_window(ticket, url, from)`: `from` is the kind of start (R347 a) — absent means
+/// "library", "library" or "link" exactly, anything else (another word or case, not text) is refused
+/// with false like every other refusal, nothing opened (`Library::open_from`, `Start::from_arg`).
 #[tauri::command]
-async fn open_library_window(app: AppHandle, window: tauri::WebviewWindow, ticket: String, url: String) -> bool {
+async fn open_library_window(app: AppHandle, window: tauri::WebviewWindow, ticket: String, url: String, from: Option<serde_json::Value>) -> bool {
     let Some(shell) = app.try_state::<Arc<Shell>>().map(|s| s.inner().clone()) else { return false };
     let label = window.label().to_string();
-    detached(move || shell.library.open(&library_host(&app, &shell), &label, &ticket, &url)).await.unwrap_or(false)
+    detached(move || shell.library.open_from(&library_host(&app, &shell), &label, &ticket, &url, from.as_ref())).await.unwrap_or(false)
 }
 
 #[tauri::command]
