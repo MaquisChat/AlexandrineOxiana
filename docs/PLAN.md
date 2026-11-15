@@ -644,7 +644,7 @@ Update after every task; commit and push.
 | F20c Find and acquire: the browser extension's fallback — the app's screens (Ruling R348 h) | **done; merged** on the reader branch (0683c76): reviewed twice and approved (`task-F20c-review.md`, `-review2.md`; Rulings R356, R358); verified with F20a and F20b (52ec015), the desktop library scenarios among it. GitHub's run not made (R202) | — | — |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
-| 54 Final review | groundwork under way (15 Nov): the ledger's deferred points collected (`.superpowers/sdd/PLAN/final-review-list.md`, 615 items); a triage into fix / test / leave / the owner's is being made; **its scope is then put to the owner** (far larger than planned) | | |
+| 54 Final review | **under way (Ruling R362, 15 Nov):** the ledger's 616 deferred points collected and triaged (`.superpowers/sdd/PLAN/final-review-list.md`, `final-review-triage.md`): 7 points to fix now (FR-A1 and FR-A3 dispatched; FR-A2, FR-A4, FR-A7 waiting for disk), 16 tests to add (FR-C1, FR-C2), 94 rough edges put to the owner first (three taken regardless), 83 points for the owner (a page in `docs/review/`, being written), 386 left documented, 29 superseded; then the whole-branch review by package | | |
 | 55 Owner hands-on tests | the owner reports no errors found (2026-11-12, Mac build 3); build 4 available (2026-11-13) | | the current download is run 4 of "Desktop (macOS)" (id 43348805951, commit 14da33e): build 3 plus the fixes of D18, D19 and D20; the owner goes on to the review pages (Task 53) |
 | 56 Close out | not started | | |
 
