@@ -129,23 +129,35 @@ session cookie for the proxy's domain and a second cookie for the whole made-up 
 path that fails the run if asked twice or by the shell, publisher pages with and without
 `citation_pdf_url`, a PDF sent as a download, a PDF address that answers the shell with a redirect to a
 third host; and, for Task F18d, a library catalogue that is also a repository, its landing page and its PDF on
-one host, and a PDF on the proxy's own sign-in host). Eight scenarios: the marked page fetched by the shell and waiting in the review queue until
+one host, with a cookie of its own for that host, a PDF on the proxy's own sign-in host, and a catalogue page that
+links to it). Nine scenarios: the marked page fetched by the shell and waiting in the review queue until
 "Use this file"; a page without the mark and "Add the PDF showing in the sign-in window"; a download;
 the shell's own request redirected to a third host (its hop to the publisher carries the proxy's
 cookie, its hop to the third host does not — while the whole domain's cookie does — its `Referer` holds
 no query, and the file waits); the window closed while the entry waits; a quit and a new start (no
 cookie at the first request); "Open it here and fetch the PDF" on the catalogue's link (set on "Your
 library" to the stand-in's catalogue), its PDF on the host the window was opened at fetched and waiting for
-the check, then used as a fetched copy; and its twin, "Get through my library" reaching a PDF on the
-library's own sign-in host, which the shell never asks ("That is a sign-in page, …").
+the check, then used as a fetched copy (the shell's request carries exactly the catalogue's own cookie,
+never the proxy's); its twin, "Get through my library" reaching a PDF on the library's own sign-in host,
+which the shell never asks ("That is a sign-in page, …"); and a library's start handed over, then a link's
+start in the same window whose page leads back to that PDF on the library's sign-in host, which the shell
+still never asks (R360 a).
 
 **The sign-in window** (`src-tauri/src/library_window.rs`) is opened by the page with the kind of start
 (`open_library_window(ticket, url, from)`, R347 a): "library" (or none) — the host it is opened at is the
-library's sign-in host and is never fetched from — or "link" — no host is a sign-in host; the sign-in
-paths and queries (`/login`, `/saml`, a SAML or CAS ticket, …) are never fetched for either; any other
-`from` is refused. The kind is the ticket's and ends with the window. It has no address bar, so its title
-says where it is (R347 b): the host of the top page shown (its ASCII form, the port when not 443, a host
-over 64 characters by its end), set by the shell at every top-level navigation, then
+library's sign-in host and is never fetched from — or "link" — which adds no sign-in host of its own; the
+sign-in paths and queries (`/login`, `/saml`, a SAML or CAS ticket, …) are never fetched for either; any
+other `from` is refused. The kind is the ticket's (every `open` sets it). **Every host a library's start
+opened the window at stays a sign-in host for every later ticket of either kind for as long as the window's
+store lives** (R360 a): the window's session outlives a ticket, so a link's page could lead it back there.
+The hosts are forgotten exactly where the store is emptied — the sign-out, the quit that empties it, the
+start-up clean-up after a forced quit — and, where the store is the window's own (an ephemeral one: Linux,
+Windows), when the window closes; on macOS they outlive the window as its store does, and with "Stay signed
+in" they are kept across a quit in the device file (`library-window.json`, `signInHosts`), written before
+the window goes to a new library host. It has no address bar, so its title says where it is (R347 b,
+R360 b): the host of the top page shown (its ASCII form, the port when not 443, a host over 64 characters
+by its end), set by the shell at every top-level navigation — a re-used window keeps the host of the page
+it shows until the new address commits, only the words for the kind changing at once — then
 "sign in to your library, then open the PDF and the app will fetch it for you to check" or "open the PDF
 on this page and the app will fetch it for you to check". A page cannot set it. The scenarios find the
 window by that exact title. The sign-in window is typed into with xdotool (WebDriver does not reach
@@ -219,9 +231,9 @@ It needs, as the machine's own tools (not dependencies of the project): `openssl
 (util-linux) and `python3`. With the switch set, any obstacle — not Linux, not root, a tool missing, no
 namespace, another run holding the lock, leftovers that cannot be put back — **fails the run**, with
 the reason in its last lines ("FAILED: the library scenarios were asked for (AO_E2E_SYSTEM_SETUP=1) but
-the machine's set-up cannot be made: …"). Without the switch the eight scenarios are skipped and the run's
-last lines say so: "6 library scenarios NOT RUN (skipped), not passed — not run: AO_E2E_SYSTEM_SETUP=1
-is not set …"; the exit is as before.
+the machine's set-up cannot be made: …"). Without the switch the library scenarios are skipped and the
+run's last lines say so, with their number: "<number> library scenarios NOT RUN (skipped), not passed —
+not run: AO_E2E_SYSTEM_SETUP=1 is not set …"; the exit is as before.
 
 **If such a run was killed outright** (SIGKILL), the next run with the switch puts the machine back
 from the record by itself. To do it by hand instead (as root, when no desktop test is running):

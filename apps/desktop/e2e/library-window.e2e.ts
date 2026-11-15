@@ -48,7 +48,7 @@ import { join, relative } from "node:path";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { startDesktop, until, type Desktop } from "./desktop.js";
 import { expect, test } from "./fixtures.js";
-import { CATALOGUE_PDF_PATH, CATALOGUE_SEARCH_PATH, HOSTS, PROXY_PDF_PATH, READER, SAML_PATH, SESSION_COOKIE, SIGNED_IN_COOKIES, SPOOF_TITLE, STANDIN_NAMES, startStandin, WIDE_COOKIE, type PageKind, type Standin, type StandinRequest } from "./library-standin.js";
+import { CATALOGUE_COOKIE, CATALOGUE_PDF_PATH, CATALOGUE_PROXY_COPY_WORD, CATALOGUE_SEARCH_PATH, HOSTS, PROXY_PDF_PATH, READER, SAML_PATH, SESSION_COOKIE, SIGNED_IN_COOKIES, SPOOF_TITLE, STANDIN_NAMES, startStandin, WIDE_COOKIE, type PageKind, type Standin, type StandinRequest } from "./library-standin.js";
 import { decide, machineObstacle, SETUP_FAILED, SystemSetup } from "./system-setup.js";
 import { elementId } from "./webdriver.js";
 
@@ -137,6 +137,8 @@ const WORKS = {
   linked: work("linked", "linked", "Pilot Gigs and the Rivalries of Neighbouring Coves", "Demelza", "Rosevear", 2019),
   /** F18d: its PDF is on the proxy's own host (a library start: never fetched). */
   own: work("own", "own", "Pilchard Cellars and the Accounts of the Season", "Gwenna", "Tremayne", 2015),
+  /** F18d round 2 (R360 a): its catalogue search leads the window to the library's own copy on the proxy's sign-in host (never fetched). */
+  lugger: work("own", "lugger", `${CATALOGUE_PROXY_COPY_WORD} Crews and the Shares of the Catch`, "Senara", "Pascoe", 2013),
 };
 
 const PAGE_TEXT = [
@@ -403,10 +405,15 @@ async function readyApp(run: Parameters<typeof startDesktop>[0], works: Work[], 
 
   await s.click(await d.byRole("link", "Find and acquire"));
   await d.byRole("heading", "Find and acquire", { level: 1, timeoutMs: 30_000 });
-  const box = await d.byRole("textbox", "References");
-  await until("the References box to be enabled", STATE_TIMEOUT, async () => (await s.property(box, "disabled")) === false);
-  await s.sendKeys(box, works.map((w) => w.typed).join("\n"));
-  await s.click(await d.byRole("button", "Add"));
+  // One line at a time (two lines typed at once through WebDriver did not come out as two entries): each added and its
+  // row shown before the next.
+  for (const w of works) {
+    const box = await d.byRole("textbox", "References");
+    await until("the References box to be enabled", STATE_TIMEOUT, async () => (await s.property(box, "disabled")) === false);
+    await s.sendKeys(box, w.typed);
+    await s.click(await d.byRole("button", "Add"));
+    await rowUntil(d, w, "be shown", () => true);
+  }
   for (const w of works) {
     const r = await rowUntil(d, w, `rest “${WORDS.recordComplete}” with “Get through my library”`, (x) => x.state === WORDS.recordComplete && x.acts.includes("library"));
     expect(r.reason).toBe(WORDS.switchedOff);
@@ -739,9 +746,13 @@ test("a link whose PDF is on the host it was opened at is handed over: “Open i
   });
   await test.step("the researcher opens the PDF (Return on its link): the shell fetches it from the SAME host, once", async () => {
     await r.d.typeInto(titleAt(HOSTS.catalogue, "link"), [{ key: "Return" }]);
-    await recorded("the window's own request for the PDF", pressed, (q) => q.by === "window" && q.host === HOSTS.catalogue && q.path === CATALOGUE_PDF_PATH);
+    const own = await recorded("the window's own request for the PDF", pressed, (q) => q.by === "window" && q.host === HOSTS.catalogue && q.path === CATALOGUE_PDF_PATH);
+    expect(own.cookies, "the catalogue's own cookie, set by its search page, is in the window's session").toEqual([CATALOGUE_COOKIE]);
     const shellPdf = await recorded("the shell's request for the PDF", pressed, (q) => q.by === "shell");
-    expect(shellPdf).toMatchObject({ host: HOSTS.catalogue, method: "GET", path: CATALOGUE_PDF_PATH, cookies: [] });
+    // R360 e: the shell's request carries the window's session for this host — exactly the catalogue's own cookie —
+    // and nothing of the proxy's.
+    expect(shellPdf).toMatchObject({ host: HOSTS.catalogue, method: "GET", path: CATALOGUE_PDF_PATH, cookies: [CATALOGUE_COOKIE] });
+    expect(shellPdf.cookies).not.toContain(SESSION_COOKIE);
     await rowUntil(r.d, w, `say “${WORDS.needsCheck}”`, (x) => x.state === WORDS.needsCheck);
     expect(since(pressed).filter((q) => q.by === "shell"), "one request of the shell's own").toHaveLength(1);
     expect(since(pressed, HOSTS.proxy), "the library's sign-in is never asked").toEqual([]);
@@ -784,4 +795,54 @@ test("its twin: opened by “Get through my library”, a PDF on the library's o
   expect(recordOf(r.libraryPath, w)?.files ?? [], "nothing was added").toEqual([]);
   expect(placesOf(r.libraryPath, standin!.pdf("own")), "nothing was kept").toEqual([]);
   expectNoViolation(pressed);
+});
+
+// R360 a: the window's session (its cookies, its history) outlives a ticket, so a link's page can lead the re-used
+// window back to the library's sign-in host. Every host a library's start opened the window at stays a sign-in host
+// for every later ticket of either kind while the window's store lives.
+test("a link's start in the window a library's start left open: a PDF on the library's sign-in host is NOT fetched, and the row says it is a sign-in page", async ({ run }) => {
+  const a = WORKS.marked;
+  const b = WORKS.lugger;
+  const r = await readyApp(run, [a, b], { catalogue: catalogueTemplate() });
+  let pressed = 0;
+  await test.step("a library's start: signed in, its file handed over; the window stays", async () => {
+    pressed = await startThroughLibrary(r, a);
+    await signIn(r, pressed);
+    const shellPdf = await recorded("the shell's request for the first work's PDF", pressed, (q) => q.by === "shell");
+    expect(shellPdf).toMatchObject({ host: HOSTS.publisher, path: "/pdf/marked.pdf" });
+    await rowUntil(r.d, a, `say “${WORDS.needsCheck}”`, (x) => x.state === WORDS.needsCheck);
+    expect(r.d.windowId(titleAt(HOSTS.publisher)), "the window stays after the hand-over").toBeDefined();
+  });
+  let opened = 0;
+  await test.step("after the pause, a link's start re-uses the window at the catalogue; its page leads to the library's own copy", async () => {
+    // The pause after a hand-over (20 s: the service's LIBRARY_PAUSE_MS, the shell's PAUSE) refuses a new start; the
+    // row of the first work SAID when its file was held, and the scenario waits the pause out from that moment.
+    const held = (await seenOf(r.d, a)).find((x) => x.state === WORDS.needsCheck)!.at;
+    await until("the pause after the hand-over to be over", 60_000, () => Date.now() >= held + 21_000);
+    await r.d.session.execute(WATCH_SCRIPT, [b.typed]);
+    const prefix = `${WORDS.openHere}: ${WORDS.catalogueLabel} (${HOSTS.catalogue}`;
+    const button = await until(`“${prefix}…” on the row`, STATE_TIMEOUT, async () => (await r.d.session.execute<unknown>(OPEN_HERE_SCRIPT, [b.typed, prefix])) ?? undefined);
+    opened = Date.now();
+    await r.d.session.click(elementId(button));
+    await rowUntil(r.d, b, `say “${WORDS.waiting}”`, (x) => x.state === WORDS.waiting);
+    const first = await recorded("the window's request for the catalogue's search", opened, (q) => q.by === "window" && q.host === HOSTS.catalogue);
+    // The same window and session (a new window here would have a new ephemeral store, and no cookie): the cookie the
+    // library's sign-in set for the whole made-up domain goes with it.
+    expect(first).toMatchObject({ method: "GET", path: CATALOGUE_SEARCH_PATH, cookies: [WIDE_COOKIE] });
+    await until("the window titled by the catalogue's host and the link's words", 30_000, () => r.d.windowId(titleAt(HOSTS.catalogue, "link")));
+    await recorded("the catalogue's page shown, its link to the library's copy focused", opened, (q) => q.path === "/ready" && q.host === HOSTS.catalogue);
+    await r.d.typeInto(titleAt(HOSTS.catalogue, "link"), [{ key: "Return" }]);
+    const shown = await recorded("the window's own request for the library's copy", opened, (q) => q.by === "window" && q.host === HOSTS.proxy && q.path === PROXY_PDF_PATH);
+    expect(shown.cookies, "the window is still signed in to the library").toEqual(SIGNED_IN_COOKIES);
+    await until("the window titled by the library's host and the LINK's words", 30_000, () => r.d.windowId(titleAt(HOSTS.proxy, "link")));
+  });
+  await test.step("“Add the PDF showing in the sign-in window”: refused before any request, the sign-in sentence on the row", async () => {
+    await pressAct(r.d, b, "library-take");
+    const row = await rowUntil(r.d, b, `say “${WORDS.notAPdfSignIn}”`, (x) => x.note === WORDS.notAPdfSignIn);
+    expect(row.state).toBe(WORDS.waiting);
+    expect(since(opened).filter((q) => q.by === "shell"), "NO request of the shell's own under the link's ticket, at any host").toEqual([]);
+    expect(since(pressed, HOSTS.proxy).filter((q) => q.by === "shell"), "the shell never asked the library's sign-in host").toEqual([]);
+    expect(placesOf(r.libraryPath, standin!.pdf("own")), "nothing of the library's copy was kept").toEqual([]);
+    expectNoViolation(pressed);
+  });
 });

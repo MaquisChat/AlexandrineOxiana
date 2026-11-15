@@ -32,8 +32,12 @@
  *  - `cdn.ao-library-standin.test` — a third host, NOT under the proxy's domain: `/<slug>.pdf` (inline);
  *    records which cookies it is sent.
  *  - `catalogue.ao-library-standin.test` (Task F18d) — the library's catalogue, which is also a repository:
- *    `/search?q=…` (no sign-in) a landing page with a focused link to its PDF on the SAME host
- *    (`/items/linked.pdf`, inline); the page sets a title of its own pretending to be the library's sign-in.
+ *    `/search?q=…` (no sign-in) sets a cookie of its own for this host alone (`CATALOGUE_COOKIE`, no
+ *    Domain) and shows a landing page with a focused link to its PDF on the SAME host
+ *    (`/items/linked.pdf`, inline); the page sets a title of its own pretending to be the library's
+ *    sign-in. A search for a work whose title holds `CATALOGUE_PROXY_COPY_WORD` (R360 a) shows instead a
+ *    focused link to the library's own copy on the proxy's sign-in host (`/files/own.pdf` there): a link's
+ *    page that leads the window back to the library's sign-in host.
  *  - On the proxy's host itself (Task F18d), for the work `10.5555/ao.f19.own`: once signed in, `/login`
  *    sends the window to `/files/own.pdf`, a PDF on the sign-in host, which the shell must never ask.
  * No page's path holds what the shell takes for a PDF's address (`/download`, `/pdf/`, `.pdf`, …;
@@ -86,6 +90,10 @@ export const CATALOGUE_SEARCH_PATH = "/search";
 export const CATALOGUE_PDF_PATH = "/items/linked.pdf";
 /** The proxy's own PDF (F18d: on the sign-in host itself, never fetched by the shell). */
 export const PROXY_PDF_PATH = "/files/own.pdf";
+/** The catalogue's own cookie (F18d, R360 e): set by its search page for its host alone (its value random, never recorded). */
+export const CATALOGUE_COOKIE = "catalogue-visit";
+/** A catalogue search for a title holding this word leads to the library's own copy on the proxy's sign-in host (R360 a). */
+export const CATALOGUE_PROXY_COPY_WORD = "Lugger";
 /** What the catalogue's page sets as its own title (F18d, R347 b: the window never shows it). */
 export const SPOOF_TITLE = `${HOSTS.proxy} — sign in to your library, then open the PDF and the app will fetch it for you to check`;
 
@@ -251,6 +259,11 @@ export async function startStandin(tls: { certPem: string; keyPem: string }, pdf
     // library's sign-in (`SPOOF_TITLE`), at once and again later: the window's title must stay the shell's.
     if (host === HOSTS.catalogue) {
       if (url.pathname === CATALOGUE_SEARCH_PATH) {
+        res.setHeader("set-cookie", `${CATALOGUE_COOKIE}=${randomBytes(8).toString("hex")}; Path=/; Secure; HttpOnly; SameSite=Lax`);
+        if ((url.searchParams.get("q") ?? "").includes(CATALOGUE_PROXY_COPY_WORD)) {
+          const copy = `${origin(HOSTS.proxy)}${PROXY_PDF_PATH}`;
+          return send(res, 200, html("Invented Repository", `<h1>Invented Repository</h1><p>One record found, held by the library.</p><p><a id="pdf" href="${copy}">The library's copy (PDF)</a></p>${ready("catalogue-copy", "pdf")}`));
+        }
         const spoof = JSON.stringify(SPOOF_TITLE);
         return send(
           res,
