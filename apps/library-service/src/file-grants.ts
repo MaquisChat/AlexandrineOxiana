@@ -233,6 +233,38 @@ async function takeAt(at: string, id: string, to: string, max: number, chunk: nu
 }
 
 /**
+ * Task F20a (R348 f iv): the real path of an inbox when it is a private folder of the user's (step 1: a directory, not a
+ * symbolic link, the user's, mode 0700), else null. The browser's inbox (routes/find-browser.ts) is checked by it.
+ */
+export function privateInboxReal(inbox: string, fs: InboxFs = realFs): Promise<string | null> {
+  return inboxReal(inbox, fs);
+}
+
+/**
+ * Task F20a (R348 f iv): empties an inbox at the service's start — only when it is a private folder of the user's
+ * (step 1), and only the regular files DIRECTLY in it (`lstat`, never followed): a symbolic link (and what it points
+ * to), a folder and what is in it are left alone. Nothing is read; nothing is said.
+ */
+export async function emptyInbox(inbox: string, fs: InboxFs = realFs): Promise<void> {
+  const real = await inboxReal(inbox, fs);
+  if (!real) return;
+  let names: string[];
+  try {
+    names = await fsp.readdir(real);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const at = join(real, name);
+    try {
+      if ((await fs.lstat(at)).isFile()) await fs.unlink(at);
+    } catch {
+      // gone already, or not removable: left
+    }
+  }
+}
+
+/**
  * Removes the file a refused file grant names — only when it is inside the inbox (steps 1–2); a path outside it, or an
  * inbox that is not the shell's private folder, is left untouched and unread.
  */

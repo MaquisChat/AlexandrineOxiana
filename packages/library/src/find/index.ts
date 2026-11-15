@@ -116,6 +116,6 @@ export type { YourLibrary, YourLibraryRead } from "./settings.js";
 export { FindLibraryRefusedError, libraryChancesOf, restsForLibrary } from "./runner.js";
 export type { FindLibraryChanceOf } from "./runner.js";
 // Task F17 (R329): the file handed over through the library, as the runner is given it.
-export type { HandedFile } from "./runner.js";
+export type { FindHandOverEnd, HandedFile } from "./runner.js";
 export type { FindReturnTo } from "./types.js";
 export type { HeldFileCause, HeldFileFacts, HeldFileWhy } from "../repo/review.js";

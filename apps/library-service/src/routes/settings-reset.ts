@@ -45,8 +45,16 @@ export function registerSettingsReset(app: FastifyInstance, ctx: Ctx): void {
     if (b.confirm !== true) throw badRequest("A settings file is reset only after its confirmation in the desktop app.");
     const now = new Date();
     switch (b.file) {
-      case "extension-pairings":
-        return { reset: true, keptAs: await ctx.pairing.reset(now) };
+      case "extension-pairings": {
+        const keptAs = await ctx.pairing.reset(now);
+        // R354: no extension is paired now — a work waiting in the browser returns as by "Cancel", as when the last
+        // pairing is removed (routes/capture.ts): its ticket ends at once; the entry's write is not awaited, and its
+        // failure is a warning that names nothing of the work.
+        ctx.state.session?.find?.endBrowserWait().catch(() => {
+          req.log.warn("A work waiting in the browser could not be put back now; it comes back when its project is next unlocked or the library next opened.");
+        });
+        return { reset: true, keptAs };
+      }
       case "fonts":
         return { reset: true, keptAs: await resetFontIndex(dir, now) };
       case "appearance":
