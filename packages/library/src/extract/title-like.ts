@@ -155,7 +155,10 @@ function mostlyDigitsAndPunctuation(s: string): boolean {
 
 const fold = (s: string) => s.replace(/\s+/gu, " ").trim();
 
-/** Only this many characters are examined (a hostile file's 2 MB "title" costs no more than a long real one). */
+/**
+ * R410 f: the one bound on the text examined. Only the first 1,000 characters of an embedded title or author are read,
+ * cut before every test below (a hostile file's 2 MB "title" costs no more than a long real one).
+ */
 const EXAMINED_CHARS = 1000;
 /** Identifiers are short: a longer text is never only an identifier. */
 const MAX_IDENTIFIER_CHARS = 200;
@@ -166,19 +169,18 @@ const MAX_IDENTIFIER_CHARS = 200;
  * embedded title it cannot be told from a code, and the reference manager or the file name will name such a work.
  */
 export function looksLikeTitle(raw: string, fileName?: string): boolean {
-  const s = fold(raw.slice(0, EXAMINED_CHARS * 4));
+  const s = fold(raw.slice(0, EXAMINED_CHARS));
   if (!s) return false;
-  const head = s.slice(0, EXAMINED_CHARS);
-  if (!hasWord(head)) return false;
+  if (!hasWord(s)) return false;
   if (s.length <= MAX_IDENTIFIER_CHARS && isIdentifier(s)) return false;
-  if (FILE_EXTENSION.test(s.slice(-12)) || looksLikePath(head)) return false;
+  if (FILE_EXTENSION.test(s.slice(-12)) || looksLikePath(s)) return false;
   if (fileName) {
     const base = fileName.replace(/^.*[\\/]/u, "");
     const stem = fold(base.includes(".") ? base.slice(0, base.lastIndexOf(".")) : base);
     if (stem && stem.toLowerCase() === s.toLowerCase()) return false;
   }
   if (STOCK_TITLE.test(bare(s)) || STOCK_PREFIX.test(s) || WEB_OR_MAIL.test(s) || DATE_ONLY.test(s)) return false;
-  if (mostlyDigitsAndPunctuation(head)) return false;
+  if (mostlyDigitsAndPunctuation(s)) return false;
   return true;
 }
 
@@ -249,7 +251,7 @@ const WINDOWS_MACHINE = /^desktop-[a-z0-9]{4,}$/iu;
 const VERSION_SUFFIX = /(?:[-\s]*(?:v?\d[\d.]*|cs\d+))?(?:\s*\([^()]*\))?$/iu;
 
 export function isStockAuthor(raw: string): boolean {
-  const s = fold(raw);
+  const s = fold(raw.slice(0, EXAMINED_CHARS));
   if (!s) return true;
   const lower = s.toLowerCase();
   if (STOCK_AUTHOR_SET.has(lower) || STOCK_AUTHOR_SET.has(lower.replace(VERSION_SUFFIX, ""))) return true;

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { FIXTURE_DOI, FIXTURE_ISBN, buildPdf, buildZip, generateFixtures, type GeneratedFixtures } from "../../../../tests/fixtures/generate.mjs";
+import { FIXTURE_DOI, FIXTURE_ISBN, buildMobi, buildPdf, buildZip, generateFixtures, type GeneratedFixtures } from "../../../../tests/fixtures/generate.mjs";
 import { docxText } from "./docx.js";
 import { elements } from "./scan.js";
 import { MAX_TEXT_CHARS, UnsafeFileError, extractMetadata, mediaFromTags, shutdownExtractors } from "./index.js";
@@ -438,6 +438,33 @@ describe("R394: an embedded title or author is kept only when it looks like one"
     const x = await extractMetadata(f, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     expect(x.title).toBeUndefined();
     expect(x.creators).toBeUndefined();
+  });
+
+  it("EPUB (R410 f): an OPF title 'Untitled' by 'calibre' gives no title and no author; the title as found does not reach the import", async () => {
+    const f = join(tmp, "r410.epub");
+    const opf = `<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Untitled</dc:title><dc:creator>calibre</dc:creator></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>`;
+    await writeFile(
+      f,
+      buildZip([
+        { name: "mimetype", data: "application/epub+zip", store: true },
+        { name: "META-INF/container.xml", data: '<container><rootfiles><rootfile full-path="c.opf"/></rootfiles></container>' },
+        { name: "c.opf", data: opf },
+        { name: "c1.xhtml", data: "<html><body><p>Some text of the book.</p></body></html>" },
+      ]),
+    );
+    const x = await extractMetadata(f, "application/epub+zip");
+    expect(x.title).toBeUndefined();
+    expect(x.creators).toBeUndefined();
+    expect(x).not.toHaveProperty("rawTitle");
+  });
+
+  it("MOBI (R410 f): an EXTH title 'Untitled' by 'calibre' gives the PalmDB name and no author", async () => {
+    const f = join(tmp, "r410.mobi");
+    await writeFile(f, buildMobi({ exth: [[503, "Untitled"], [100, "calibre"]], fullName: "Document1" }));
+    const x = await extractMetadata(f, "application/x-mobipocket-ebook");
+    expect(x.title).toBe("salt_roads");
+    expect(x.creators).toBeUndefined();
+    expect(x).not.toHaveProperty("rawTitle");
   });
 
   it("HTML: a <title> that is a file name is dropped", async () => {

@@ -208,6 +208,32 @@ describe("looksLikeTitle (R394 a)", () => {
     for (const s of ["<dc:title>".repeat(200_000), "word ".repeat(400_000), "x.".repeat(1_000_000)]) looksLikeTitle(s, "f.pdf");
     expect(performance.now() - t0).toBeLessThan(1000);
   });
+  it("R410 f: only the first 1,000 characters of a 2 MB title or author are ever read (the work is counted, not timed)", () => {
+    const big = `${"word ".repeat(400_000)}.pdf`;
+    /** A string stand-in that allows only slice, and records how many characters each slice reads. */
+    const counted = (s: string) => {
+      const reads: number[] = [];
+      const proxy = new Proxy(Object(s) as object, {
+        get(target, key) {
+          if (key === "slice")
+            return (a?: number, b?: number) => {
+              const out = s.slice(a, b);
+              reads.push(out.length);
+              return out;
+            };
+          throw new Error(`the whole text was used (${String(key)})`);
+        },
+      });
+      return { value: proxy as unknown as string, reads };
+    };
+    const t = counted(big);
+    looksLikeTitle(t.value, "f.pdf");
+    expect(t.reads.length).toBeGreaterThan(0);
+    expect(Math.max(...t.reads)).toBeLessThanOrEqual(1000);
+    const a = counted(`Administrator ${"x".repeat(2_000_000)}`);
+    isStockAuthor(a.value);
+    expect(Math.max(...a.reads)).toBeLessThanOrEqual(1000);
+  });
   it("an empty or blank text is no title", () => {
     expect(looksLikeTitle("")).toBe(false);
     expect(looksLikeTitle("   ")).toBe(false);
