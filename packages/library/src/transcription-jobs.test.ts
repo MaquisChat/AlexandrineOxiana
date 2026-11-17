@@ -195,3 +195,125 @@ describe("transcription as a job", () => {
     expect(await transcriptionRerun(kit.repo, { ...rec, kind: "image.proxy" })).toBeUndefined();
   });
 });
+
+/**
+ * R367 (FR-A8): an allowed transcription leaves one audit entry of its processing, written where the
+ * run is authorised, before anything it stores; once per run of the job (a rerun after a restart,
+ * an unlock or a crash continues the same run and adds none); a denial is audited as before.
+ */
+describe("R367: an allowed transcription is audited once, where it runs", () => {
+  const isProcess = (e: { action: string }) => e.action === "process";
+  /** A store of the job's output: a derived asset (not, say, the governance edit a test makes). */
+  const isDerive = (e: { action: string; details?: Record<string, unknown> }) => e.action === "store" && e.details?.op === "asset.derive";
+  const isStore = (e: { action: string; decision?: { result?: string }; details?: Record<string, unknown> }) => isDerive(e) && e.decision?.result !== "deny";
+  /** The entries of the processing and of its storing, in order. */
+  const ofJob = <E extends { action: string; details?: Record<string, unknown> }>(events: E[]) => events.filter((e) => isProcess(e) || isDerive(e));
+
+  it("allowed and stored: one `process` allow entry naming the job, the recording and the tool, before the two `store` entries; the chain verifies", async () => {
+    const p = await makeProject(kit);
+    const sf = await audioSource(p);
+    const before = (await auditEvents(kit, p)).length;
+    const job = await transcriptionJob(kit.repo, p.id, sf.source.id, { model: "small" }, { id: randomUUID() });
+    await (await client()).submit(p.id, job);
+    const events = (await auditEvents(kit, p)).slice(before);
+    const processed = events.filter(isProcess);
+    expect(processed).toHaveLength(1);
+    expect(processed[0]).toMatchObject({
+      action: "process",
+      entity: { type: "asset", id: sf.assets[0]!.id },
+      decision: { result: "allow" },
+      details: { op: "worker.audio.transcribe", process: { op: "transcription", provider: "local" } },
+    });
+    // Nothing of the content: no path, no parameter, no word of the transcript.
+    expect(Object.keys(processed[0]!.details ?? {}).sort()).toEqual(["op", "process"]);
+    expect(events.map((e) => e.action)).toEqual(["process", "store", "store"]);
+    expect(events.filter(isStore).every((e) => (e.details as { op?: string }).op === "asset.derive")).toBe(true);
+    expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
+  });
+
+  for (const how of ["lock", "crash"] as const) {
+    it(`allowed, then a ${how} before the store: the \`process\` entry is there and no \`store\`; the rerun adds no second \`process\` entry`, async () => {
+      const p = await makeProject(kit, OPEN_GOV, true);
+      const sf = await audioSource(p);
+      const repo = kit.repo;
+      const before = (await auditEvents(kit, p)).length;
+      const original = repo.addDerivedAsset.bind(repo);
+      repo.addDerivedAsset = (async (...args: Parameters<typeof original>) => {
+        if (how === "lock") repo.lockProject(p.id);
+        else throw new JobInterruptedError(); // the process stops here: the journal still says running
+        return original(...args);
+      }) as typeof original;
+      const job = await transcriptionJob(repo, p.id, sf.source.id, { model: "small" }, { id: randomUUID() });
+      await expect((await client()).submit(p.id, job)).rejects.toThrow();
+      repo.addDerivedAsset = original;
+      if (how === "lock") await repo.unlockProject(p.id, "correct horse battery staple");
+      let events = (await auditEvents(kit, p)).slice(before);
+      expect(events.filter(isProcess)).toHaveLength(1);
+      expect(events.filter(isDerive)).toEqual([]);
+      const out = await (await client()).resumePending(p.id, { prepare: (rec) => transcriptionRerun(repo, rec) });
+      expect(out.map((x) => x.error)).toEqual([undefined]);
+      events = (await auditEvents(kit, p)).slice(before);
+      expect(ofJob(events).map((e) => e.action)).toEqual(["process", "store", "store"]);
+      expect((await repo.verifyAudit(p.id)).ok).toBe(true);
+    });
+  }
+
+  it("allowed, then refused at the store: the `process` entry is there, no allowed `store` entry", async () => {
+    const gov = OPEN_GOV.replace("containsIdentifiable: false", "containsIdentifiable: false\n  pseudonymizeFileNames: false");
+    const p = await makeProject(kit, gov);
+    const audio = await scratchFile(kit, "talk.mp3", Buffer.alloc(64, 1));
+    // An identifiable recording with no legal basis, accepted while the project does not ask for one.
+    const sf = await kit.repo.createSource(
+      p.id,
+      {
+        projectIds: [p.id], type: "audio" as never, title: { variants: [{ lang: "en", kind: "original", value: "Talk" }] }, creators: [], identifiers: {},
+        caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [],
+      },
+      [{ path: audio, role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: kit.clock.now.toISOString(), tool: { name: "test", version: "1" }, fileHashes: {}, legal: { status: "consented" }, identifiable: true } },
+    );
+    const before = (await auditEvents(kit, p)).length;
+    const job = await transcriptionJob(kit.repo, p.id, sf.source.id, {}, { id: randomUUID() });
+    // While the worker runs, the project starts to require a legal basis: the store is refused.
+    const c = await client(async (j) => {
+      const cur = await kit.repo.getGovernance(p.id);
+      await kit.repo.setGovernance(p.id, gov.replace("requireLegalBasis: false", "requireLegalBasis: true"), { baseSha256: cur.sha256 });
+      return transcribe(j);
+    });
+    await expect(c.submit(p.id, job)).rejects.toBeInstanceOf(PolicyDeniedError);
+    const events = ofJob((await auditEvents(kit, p)).slice(before));
+    expect(events.filter(isProcess)).toEqual([expect.objectContaining({ decision: { result: "allow" }, entity: { type: "asset", id: sf.assets[0]!.id } })]);
+    expect(events.filter(isStore)).toEqual([]);
+    expect(events.map((e) => [e.action, e.decision?.result])).toEqual([["process", "allow"], ["store", "deny"]]);
+    expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
+  });
+
+  it("a rerun after a restart (the worker was unreachable): one `process` entry for the job, not one per resubmission", async () => {
+    const p = await makeProject(kit, OPEN_GOV, true);
+    const sf = await audioSource(p);
+    const down = await stubWorker(() => ({ status: "done" }), { closers });
+    await closers.pop()!();
+    const before = (await auditEvents(kit, p)).length;
+    const job = await transcriptionJob(kit.repo, p.id, sf.source.id, { model: "small" }, { id: randomUUID() });
+    await expect(new WorkerClient({ repo: kit.repo, worker: down, pollMs: 5 }).submit(p.id, job)).rejects.toBeInstanceOf(WorkerUnavailableError);
+    expect((await auditEvents(kit, p)).slice(before).filter(isProcess)).toHaveLength(1);
+    // Two resubmissions at the next launch: one of them runs it; neither audits it again.
+    const [a, b] = await Promise.all([
+      (await client()).resumePending(undefined, { prepare: (rec) => transcriptionRerun(kit.repo, rec) }),
+      (await client()).resumePending(undefined, { prepare: (rec) => transcriptionRerun(kit.repo, rec) }),
+    ]);
+    expect([...a, ...b].filter((x) => x.error === undefined)).toHaveLength(1);
+    const events = (await auditEvents(kit, p)).slice(before);
+    expect(ofJob(events).map((e) => e.action)).toEqual(["process", "store", "store"]);
+  });
+
+  it("denied: as before, one deny (at the start), no allow entry, no job", async () => {
+    const p = await makeProject(kit, `${OPEN_GOV}processing:\n  transcription: []\n`);
+    const sf = await audioSource(p);
+    const before = (await auditEvents(kit, p)).length;
+    await expect(transcriptionJob(kit.repo, p.id, sf.source.id, {}, { id: randomUUID() })).rejects.toBeInstanceOf(PolicyDeniedError);
+    const events = (await auditEvents(kit, p)).slice(before);
+    expect(events.map((e) => [e.action, e.decision?.result])).toEqual([["process", "deny"]]);
+    expect(await transcriptionRecords(kit.repo, p.id, sf.source.id)).toEqual([]);
+  });
+});

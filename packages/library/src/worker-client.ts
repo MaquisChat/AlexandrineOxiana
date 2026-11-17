@@ -7,8 +7,10 @@
  *
  *   1. policy: `process` with `{ op, provider: 'local' }` (transcription, image_proxy, video_proxy,
  *      ocr), evaluated by the repo with the system tz and `now`; a deny is audited through the repo
- *      and thrown as PolicyDeniedError before the worker is contacted. `capture.download` is not
- *      evaluated here: the caller has already passed a `capture` decision.
+ *      and thrown as PolicyDeniedError before the worker is contacted. An allow is audited once per
+ *      run of the job (R367): at its submission, not again when a pending job is resubmitted.
+ *      `capture.download` is not evaluated here: the caller has already passed (and audited) a
+ *      `capture` decision.
  *   2. a record in the project's job journal (`<Project>/jobs/journal.jsonl`, sealed in encrypted
  *      projects, R31; see job-journal.ts), written before the `jobs` row of the index, which is
  *      only a cache of it (status queued → running → done | failed | cancelled), so that a job
@@ -392,11 +394,16 @@ export class WorkerClient {
       if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
       assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
       if (op !== null) {
+        // R367: an allow is audited here, once per run of the job: when it is first submitted, not
+        // when a pending job is run again (after a restart, an unlock or an interrupt it is the
+        // same run, under the same journal record). The entry names the job's kind, its entity and
+        // the processing asked for; nothing of the content. A deny is audited every time.
+        const processing = { op, provider: "local" } as const;
         decision = await authorizeProcessing(
           this.repo,
           projectId,
-          { action: "process", process: { op, provider: "local" } },
-          { op: `worker.${job.type}`, entity: job.entity },
+          { action: "process", process: processing },
+          { op: `worker.${job.type}`, entity: job.entity, ...(resumed ? {} : { auditAllow: { details: { process: processing } } }) },
         );
       }
     } catch (err) {
