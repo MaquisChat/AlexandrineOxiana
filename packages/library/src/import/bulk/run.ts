@@ -82,7 +82,7 @@ import { UnsafeFileError } from "../../extract/errors.js";
 import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
 import { lookupContextFor, type HttpClient, type LookupContext } from "../../lookup/index.js";
-import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../../repo/errors.js";
+import { NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "../../repo/errors.js";
 import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
 import {
@@ -146,7 +146,7 @@ import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRe
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
-import { DISK_FULL_NOTE, NoRoomError, cheapEstimate, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir } from "./space.js";
+import { DISK_FULL_NOTE, NoRoomError, RECOVERY_NOTE, cheapEstimate, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir } from "./space.js";
 import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = libraryVersion();
@@ -335,6 +335,7 @@ export function failedReason(kind: string): string {
 /** R393 a: the note of a batch stopped by an error of the given kind (R413 b: a full disk has its own sentence). */
 export function stoppedNote(kind: string): string {
   if (kind === "ENOSPC" || kind === "EDQUOT") return DISK_FULL_NOTE;
+  if (kind === "RecoveryPendingError") return RECOVERY_NOTE;
   const t = causeText(kind);
   if (!t) return `The import stopped because of an unexpected error (${kind}); resume the batch to continue.`;
   return `The import stopped because ${t.batch}; ${t.batchAction ?? "resume the batch to continue"}.`;
@@ -1143,7 +1144,9 @@ class Run {
     if (err instanceof ProjectLockedError) throw err;
     // R413 b: a full disk (or quota) is the batch's condition, not the item's: the batch stops here and the item in
     // hand gets no line, so a resume takes it up again (its change, if one had begun, rolled itself back, R26).
-    if (isDiskFull(err)) throw err;
+    // R413 c: so is a project that refuses every write (an earlier change could not be undone): stopped at the first
+    // refusal, instead of failing every item after it.
+    if (isDiskFull(err) || err instanceof RecoveryPendingError) throw err;
     if ((err as Error)?.name === "AbortError") throw err;
     // Anything else is unexpected (R393 a, b): the line keeps its kind and the report says it; the log gets the
     // kind and the program's stack, never the error's message (it may hold a path, a title or a name).
@@ -1814,7 +1817,7 @@ class Run {
     } catch (err) {
       // R413 b: a full disk stops the batch; the group's items keep no line (a resume takes them up again), and are
       // not retried one by one (each would fail the same way).
-      if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError" || isDiskFull(err)) throw err;
+      if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError" || isDiskFull(err) || err instanceof RecoveryPendingError) throw err;
       if (!(err instanceof PolicyDeniedError)) this.deps.debug?.(`bulk import group store failed, storing item by item: ${errorForLog(err)}`);
       // The group as a whole was refused (e.g. the rules changed during the run) or failed: each
       // item on its own, so only the items concerned fail, each with its own audited decision.

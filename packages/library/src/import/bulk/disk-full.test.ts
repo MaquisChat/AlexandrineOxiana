@@ -328,3 +328,36 @@ describe("the room for an item's files is checked before they are copied (R413 b
   });
 });
 
+describe("a project that refuses every write stops the batch too (R413 c)", () => {
+  it("at the first refusal the batch stops with its own sentence, no item failed for it; settled, a resume imports the rest", async () => {
+    const p = await project();
+    const keys = KEYS.map((k) => `x.zip!/${k}`);
+    // The second item's change fails (not for room) and its rollback cannot write either: from then on the project
+    // refuses every write until it is settled (H6).
+    const h = await bulk.startBatch(
+      p.id,
+      adapter(keys.map(item), (n) => {
+        if (n === 1) {
+          faults.singleOther = 1;
+          seams.failUndo = "dir"; // the new source folder's undo step
+        }
+      }),
+    );
+    const res = await h.done;
+    expect(res.state).toBe("failed");
+    // Not two hundred failed items: only the item whose own change failed is failed (with its kind); the rest wait.
+    expect(res.counts.failed).toBeLessThanOrEqual(1);
+    expect(notes.filter((n) => n.includes("kind=RecoveryPendingError") && n.startsWith("bulk import item failed"))).toEqual([]);
+    // The record cannot be saved in a project that refuses writes: the report still says why it stopped.
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.notes).toContain(RECOVERY_NOTE);
+    expect(report.failures.filter((f) => /earlier change|RecoveryPending/u.test(f.reason))).toEqual([]);
+
+    // Settled: the library is opened again (the open finishes the rollback), and the batch resumed.
+    delete seams.failUndo;
+    handle.close();
+    await lib.close();
+    await open(await openLibrary(join(tmp, "Lib"), deps()));
+    await resumedAll(p, h, adapter(keys.map(item)), keys);
+  });
+});
