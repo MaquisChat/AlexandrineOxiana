@@ -1750,6 +1750,47 @@ processing:
     expect(sync.every((t) => t === 2)).toBe(true);
   });
 
+  /** Every event of a run as [done, total]. */
+  const pairs = async (h: Awaited<ReturnType<typeof startZoteroWebImport>>) => {
+    const seen: Array<[number, number | undefined]> = [];
+    for await (const e of h.progress) seen.push([e.done, e.total]);
+    const r = await h.done;
+    return { seen, r };
+  };
+  const expectWholeBatch = (seen: Array<[number, number | undefined]>, n: number) => {
+    expect(seen.length).toBeGreaterThan(0);
+    for (const [, t] of seen) expect(t).toBe(n);
+    for (let i = 1; i < seen.length; i++) expect(seen[i]![0]).toBeGreaterThanOrEqual(seen[i - 1]![0]);
+    expect(seen.at(-1)![0]).toBe(n);
+  };
+
+  it("R426 a: a resumed full Web batch counts the whole batch: total 6 throughout, done never goes down and ends at 6", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three", "Four", "Five", "Six"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, web());
+    for await (const e of h.progress) {
+      if (e.done >= 3) {
+        h.cancel();
+        break;
+      }
+    }
+    expect((await h.done).state).toBe("cancelled");
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, h.batchId));
+    expect(r.state).toBe("finished");
+    expectWholeBatch(seen, 6);
+    expect(repo.listSourceIds(p.id)).toHaveLength(6);
+    expect(JSON.parse(await readFile(batchJson(p, 1), "utf8")).total).toBe(6);
+  });
+
+  it("R426 a: a resumed incremental Web batch counts the whole batch (the changed items passed by included)", async () => {
+    const { p, batchId } = await cancelledIncremental();
+    expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).total).toBe(4);
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, batchId));
+    expect(r.state).toBe("finished");
+    expectWholeBatch(seen, 4);
+    expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).total).toBe(4);
+  });
+
   it("a resumed Web batch asks since its recorded version and records the new one", async () => {
     const { p, batchId, v1, journaled } = await cancelledIncremental();
     const rec = JSON.parse(await readFile(batchJson(p, 2), "utf8"));
@@ -1983,5 +2024,41 @@ describe("FR-A21 (R392): the progress tells the truth about the total", () => {
     const told = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(4, { at: 0, total: 4 })));
     expect(told.at(-1)).toEqual({ done: 4, total: 4 });
     expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(4);
+  });
+
+  /** A resumed part that tells the whole batch's total and asks `skip` (twice) for each key; skipped keys are yielded only when `yieldSkipped`. */
+  const skipping = (n: number, yieldSkipped: boolean): ImportSourceAdapter => ({
+    kind: "csl-json",
+    location: "synthetic",
+    async *scan(_signal, ctx): AsyncGenerator<ScanItem> {
+      ctx?.total?.(n);
+      for (let i = 0; i < n; i++) {
+        const passed = ctx?.skip?.(`k${i}`) === true;
+        ctx?.skip?.(`k${i}`);
+        if (passed && !yieldSkipped) continue;
+        yield meta(`k${i}`);
+      }
+    },
+  });
+
+  it("R426 a: keys an adapter passes by through skip and never yields count as done, once each", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const seen = await events(await bulk.resumeBatch(p.id, h.batchId, skipping(5, false)));
+    for (let i = 1; i < seen.length; i++) expect(seen[i]!.done).toBeGreaterThanOrEqual(seen[i - 1]!.done);
+    expect(seen.at(-1)).toEqual({ done: 5, total: 5 });
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(5);
+  });
+
+  it("R426 a: keys passed by through skip and yielded all the same are not counted twice", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const seen = await events(await bulk.resumeBatch(p.id, h.batchId, skipping(5, true)));
+    for (const e of seen) expect(e.done).toBeLessThanOrEqual(5);
+    expect(seen.at(-1)).toEqual({ done: 5, total: 5 });
   });
 });

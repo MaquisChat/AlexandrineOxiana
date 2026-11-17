@@ -833,6 +833,8 @@ class Run {
       }
       let done = 0;
       const seenKeys = new Set<string>();
+      /** R426 a: keys of this batch's journal the adapter passed by through `skip`, counted as done once each. */
+      const passedBy = new Set<string>();
       const progress = (current?: string): BatchProgress => {
         if (total !== undefined && total < done) total = done;
         if (total !== undefined) this.rec.total = total;
@@ -844,7 +846,16 @@ class Run {
         workDir: () => this.ensureWorkDir(),
         note: (t) => this.note(t),
         // An item already in this batch's journal is passed by below: the adapter need not fetch it (Z2).
-        skip: (key) => this.latest.has(key),
+        // R426 a: the first time it is passed by, it counts as done (an adapter may yield nothing for it), so a
+        // resumed batch's "x of y" counts the whole batch. No event here: the next one carries the count.
+        skip: (key) => {
+          if (!this.latest.has(key)) return false;
+          if (!seenKeys.has(key) && !passedBy.has(key)) {
+            passedBy.add(key);
+            done++;
+          }
+          return true;
+        },
         total: (n) => {
           if (!Number.isSafeInteger(n) || n < 0) return;
           total = n;
@@ -865,7 +876,7 @@ class Run {
           if (sid) this.latest.set(item.key, this.queue({ key: item.key, outcome: "created", sourceId: sid }));
         }
         if (this.latest.has(item.key)) {
-          done++;
+          if (!passedBy.has(item.key)) done++; // counted already when the adapter passed it by (R426 a)
           continue;
         }
         if (this.cancelled) break;

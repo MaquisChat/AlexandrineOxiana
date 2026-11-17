@@ -947,6 +947,8 @@ async function* scanWeb(
   const since = o.full ? undefined : o.since;
   const wantFiles = o.files !== false;
   const skip = (key: string): boolean => ctx.skip?.(key) === true;
+  /** Incremental runs: the changed top-level items the engine passes by (left out of `tops`), counted in the total (R426 a). */
+  const passedTops = new Set<string>();
   let tree!: Tree;
   let tops: Set<string> | undefined;
   let pathsOf!: CollectionPaths;
@@ -966,9 +968,15 @@ async function* scanWeb(
       delete result.libraryVersion;
       keyList = undefined;
       keyListAsked = false;
+      passedTops.clear();
       try {
         if (since === undefined) tree = await fullTree(api, prefix, result);
-        else ({ tree, tops } = await changedTree(api, prefix, since, result, (k) => skip(`zotero:${k}`)));
+        else
+          ({ tree, tops } = await changedTree(api, prefix, since, result, (k) => {
+            const passed = skip(`zotero:${k}`);
+            if (passed) passedTops.add(k);
+            return passed;
+          }));
         pathsOf = await collectionPaths(api, prefix);
         // A7 (R215): the key list that decides "gone by absence" is taken here, at the version the scan is pinned
         // to and again after every restart, BEFORE any file is downloaded (hours of downloads, during which the
@@ -1042,14 +1050,14 @@ async function* scanWeb(
       }
     }
   }
-  for (const k of [...gone.keys()]) if (skip(`zotero:${k}`)) gone.delete(k);
-
-  // R392: every page is read, so the number of items this scan will yield is known before the first: the top-level
-  // items below (children, notes, annotations and what the engine passes by left out) and the gone ones. An item
-  // found empty below (known only once its files are looked at) lowers it when it is passed by.
+  // R392, R426 a: every page is read, so the number of items of the whole batch is known before the first: the
+  // top-level items below (children, notes and annotations left out) and the gone ones, those the engine passes by
+  // on a resume included (it counts them as done; they are neither fetched nor yielded). An item found empty below
+  // (known only once its files are looked at) lowers it when it is passed by.
   let told = gone.size;
+  for (const k of [...gone.keys()]) if (skip(`zotero:${k}`)) gone.delete(k);
   for (const it of tree.byKey.values()) {
-    if (tree.parentOf(it) || (tops && !tops.has(it.key)) || skip(`zotero:${it.key}`)) continue;
+    if (tree.parentOf(it) || (tops && !tops.has(it.key) && !passedTops.has(it.key))) continue;
     const type = str(it.data.itemType);
     if (type !== "note" && type !== "annotation") told++;
   }
