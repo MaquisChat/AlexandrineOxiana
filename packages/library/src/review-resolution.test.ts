@@ -403,7 +403,7 @@ describe("fix round 1, I1: a listed field that has left the report is settled (c
 });
 
 describe("fix round 1, I2: the withdrawal reason in an encrypted project's audit log (coordinator's ruling 2)", () => {
-  it("an encrypted project's audit holds that a reason was given and its SHA-256, never its text; the sealed entry keeps the text", async () => {
+  it("an encrypted project's audit holds that a reason was given and its keyed digest (R369 b), never its text; the sealed entry keeps the text", async () => {
     const { createHash } = await import("node:crypto");
     const enc = await makeProject(kit, OPEN_GOV, true);
     const sid = (await kit.repo.createSource(enc.id, draft("Sealed"), [], { provenance: provenance(), reviewItem: { kind: "verification", fields: {}, reasons: ["Consent was withdrawn."], cause: { kind: "consent-withdrawal", consentIds: [] } } })).source.id;
@@ -417,13 +417,14 @@ describe("fix round 1, I2: the withdrawal reason in an encrypted project's audit
     expect(bytes).not.toContain("Zebrafinch");
     expect(bytes).not.toContain("sister");
     const digest = createHash("sha256").update(reason, "utf8").digest("hex");
-    expect(bytes).toContain(digest);
+    // R369 b: a keyed digest, not the unkeyed SHA-256 a guess could be confirmed against.
+    expect(bytes).not.toContain(digest);
+    expect(bytes).toMatch(/"reasonMac":"[0-9a-f]{64}"/);
     expect(bytes).toContain('"reasonGiven":true');
     kit.repo.lockProject(enc.id);
     await kit.repo.unlockProject(enc.id, PASS);
     const sealed = (await projectReviewEntries(kit.repo, enc.id)).find((e) => e.id === entry!.id)!;
     expect(sealed.reason).toBe(reason);
-    expect(createHash("sha256").update(sealed.reason!, "utf8").digest("hex")).toBe(digest);
   });
 
   it("a project that is not encrypted audits the reason as typed", async () => {
