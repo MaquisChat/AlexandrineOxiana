@@ -151,7 +151,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 - Creating a library in a Mac folder that holds only the Finder's hidden `.DS_Store` file is refused as "not empty". **Fixing now regardless.**
 - An export of a restored copy can state as fact that a file "was destroyed under the retention rule" when the evidence is unverified. **Fixing now regardless.**
-- A source whose linked original file is missing is treated as already having a file, so Find and acquire never fetches a copy for it. **Fixing now regardless.**
+- A source whose linked original file is missing is treated as already having a file, so Find and acquire never fetches a copy for it. (This was left so on purpose: the file may only be on a drive that is not connected. Say if you want it changed.)
 - The list of collections cannot be opened or closed by clicking its little arrow with a mouse.
 - A project name written right to left flips the whole banner sentence.
 - After a download is confirmed in the optional tools screen, keyboard focus lands on the page body.
