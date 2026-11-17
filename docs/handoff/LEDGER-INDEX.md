@@ -354,3 +354,4 @@ R430 (2026-11-17): FR-D31 round 2 built — statfsFree for the free room accepte
 R431 (2026-11-17): FR-A21 round 2 built; a count of 0 read as no count is left (with FR-694); scoped look asked
 R432 (2026-11-17): FR-A13 round 3 built — the harness (39 rows; ten readers mended); a backup cut short by a lock leaves its audited decision (accepted, put to the reviewer); a fresh reviewer has the whole task
 R433 (2026-11-17): FR-A21 approved after round 2; a last point — a resumed batch sends no opening event (no '0 of N' during the listing); N3 listed with FR-694
+R434 (2026-11-17): FR-A10 round 4 built — identity keeps non-ignorable format characters (two participants: the safe side); the profile capture's look-up tries its names in their order; a fresh reviewer's scoped look asked
