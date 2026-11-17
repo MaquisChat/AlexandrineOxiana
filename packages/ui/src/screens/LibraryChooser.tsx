@@ -8,6 +8,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { ApiClientError } from "../api/client";
 import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry, type LibraryState } from "../api/library";
+import { formatSize } from "../api/tools";
 import { PathField } from "../components/PathField";
 import { DeviceNoticeBanners, useNoticeDismiss } from "../components/StatusBanner";
 import { UserText } from "../components/UserText";
@@ -22,6 +23,12 @@ export interface LibraryChooserProps {
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
 const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+/** R447 b: the room is asked for this long after the box last changed. */
+const ROOM_PAUSE_MS = 300;
+/** R447 b: under this many free bytes the line adds that it is little room. */
+const LITTLE_ROOM = 10e9;
+const roomText = (bytes: number) =>
+  `Free space on that disk: ${formatSize(bytes)}.${bytes < LITTLE_ROOM ? " That is little room: an import copies its files into the library." : ""}`;
 
 export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProps) {
   const [libraries, setLibraries] = useState<LibraryEntry[] | undefined>();
@@ -44,6 +51,44 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
     },
   );
   const id = useId();
+  // R447: a folder the service offers for a new library (never put in the box by itself), and the free room on the
+  // disk under the folder in the box, for the path it was asked for.
+  const [suggested, setSuggested] = useState<string | undefined>();
+  const [room, setRoom] = useState<{ path: string; bytes: number } | undefined>();
+  const roomAsk = useRef(0);
+
+  useEffect(() => {
+    let live = true;
+    api.libraries
+      .suggestedFolder()
+      .then((r) => {
+        if (live && typeof r.folder === "string" && r.folder) setSuggested(r.folder);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [api]);
+
+  useEffect(() => {
+    const p = path.trim();
+    const ask = ++roomAsk.current;
+    setRoom(undefined);
+    if (!isAbsolute(p)) return;
+    const timer = setTimeout(() => {
+      api.libraries
+        .folderRoom(p)
+        .then((r) => {
+          // An answer for a path the box no longer holds is dropped; no number, nothing said (never a guess).
+          if (roomAsk.current === ask && typeof r.freeBytes === "number" && Number.isFinite(r.freeBytes) && r.freeBytes >= 0) setRoom({ path: p, bytes: r.freeBytes });
+        })
+        .catch(() => {});
+    }, ROOM_PAUSE_MS);
+    return () => {
+      clearTimeout(timer);
+      roomAsk.current++;
+    };
+  }, [api, path]);
 
   useEffect(() => {
     let live = true;
@@ -148,6 +193,25 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
           Open library
         </button>
       </form>
+      <div className="ao-library-place">
+        {suggested && (
+          <p>
+            Suggested: <UserText className="ao-path">{suggested}</UserText>{" "}
+            <button
+              type="button"
+              aria-label="Use the suggested folder"
+              disabled={busy}
+              onClick={() => {
+                setPath(suggested);
+                setError(undefined);
+              }}
+            >
+              Use this folder
+            </button>
+          </p>
+        )}
+        <p role="status">{room && room.path === path.trim() ? roomText(room.bytes) : ""}</p>
+      </div>
       <form className="ao-inline-form" onSubmit={(e) => void openTyped(e, true)}>
         <label htmlFor={`${id}-name`}>New library name</label>
         <input id={`${id}-name`} dir="auto" value={name} onChange={(e) => setName(e.target.value)} />

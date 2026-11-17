@@ -7,7 +7,16 @@
  * Citations are always rendered by the service (participant codes and withheld sources are applied
  * there, R88/R90); the UI only shows and copies the string it returns.
  */
-import type { DestructionOldCopiesState, DeviceNotice, DeviceNoticeDismissRequest, DeviceNoticeKind, ProjectReviewPage } from "@ao/shared";
+import type {
+  DestructionOldCopiesState,
+  DeviceNotice,
+  DeviceNoticeDismissRequest,
+  DeviceNoticeKind,
+  LibraryFolderRoomRequest,
+  LibraryFolderRoomResponse,
+  LibrarySuggestedFolderResponse,
+  ProjectReviewPage,
+} from "@ao/shared";
 
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
@@ -337,6 +346,10 @@ export function libraryApi(client: ApiClient) {
       dismissNotice: (kind: DeviceNoticeKind) => r<{ notices: DeviceNotice[] }>("POST", "/settings/notices/dismiss", { body: { kind } satisfies DeviceNoticeDismissRequest }),
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),
       create: (path: string, name: string) => r<CurrentLibrary>("POST", "/libraries", { body: { path, name } }),
+      /** A folder to offer for a new library, if the service has one (R447 a); nothing is created. */
+      suggestedFolder: () => r<LibrarySuggestedFolderResponse>("GET", "/libraries/suggested-folder"),
+      /** The free room on the disk under a full path, sent in the body (R447 b, c); absent when it cannot be told. */
+      folderRoom: (path: string) => r<LibraryFolderRoomResponse>("POST", "/libraries/folder-room", { body: { path } satisfies LibraryFolderRoomRequest }),
       close: () => r<{ closed: true }>("POST", "/libraries/close"),
       reconnect: (path: string, libraryId: string, opts: { signal?: AbortSignal } = {}) =>
         r<ReconnectResult>("POST", "/libraries/reconnect", { body: { path, libraryId }, ...(opts.signal ? { signal: opts.signal } : {}) }),

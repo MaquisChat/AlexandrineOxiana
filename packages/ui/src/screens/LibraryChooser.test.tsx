@@ -73,4 +73,174 @@ describe("LibraryChooser", () => {
     await waitFor(() => expect(onOpened).toHaveBeenCalled());
     expect(body).toEqual({ path: "/home/r/Other" });
   });
+
+  // ---- R447 (Task FR-A23): a suggested folder, and the free room on the disk under the folder in the box ----
+
+  const SUGGESTED = "/Users/r/Documents/Alexandrine Oxiana";
+  const folderBox = () => screen.getByLabelText("Library folder") as HTMLInputElement;
+  const roomLine = () => screen.queryByText(/Free space on that disk/);
+
+  it("R447: the suggestion is offered under the box, which stays empty; “Use this folder” fills it and creates nothing", async () => {
+    const posts: string[] = [];
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.get(url("/libraries/suggested-folder"), () => HttpResponse.json({ folder: SUGGESTED })),
+      http.post(url("/libraries/folder-room"), () => HttpResponse.json({ freeBytes: 212e9 })),
+      http.post(/.*/, ({ request }) => {
+        posts.push(new URL(request.url).pathname);
+        return HttpResponse.json({});
+      }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    const use = await screen.findByRole("button", { name: "Use the suggested folder" });
+    expect(use.textContent).toBe("Use this folder");
+    const offer = use.closest("p") as HTMLElement;
+    expect(offer.textContent).toBe(`Suggested: ${SUGGESTED} Use this folder`);
+    const shown = within(offer).getByText(SUGGESTED);
+    expect(shown.getAttribute("dir")).toBe("auto");
+    // An offer, never a choice made for the researcher: the box is empty, and no room is asked for.
+    expect(folderBox().value).toBe("");
+    expect(roomLine()).toBeNull();
+    // A typed path's problem line clears when the button fills the box, as if typed.
+    await user.click(screen.getByRole("button", { name: "Create a new library in that folder" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/full path/);
+    await user.click(use);
+    expect(folderBox().value).toBe(SUGGESTED);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(document.activeElement).toBe(use);
+    expect((await screen.findByText("Free space on that disk: 212 GB.")).closest("[role=status]")).toBeTruthy();
+    expect(posts).toEqual([]);
+  });
+
+  it("R447: no suggestion from the service (none, or an error): nothing is offered, and the rest of the screen works", async () => {
+    for (const answer of [() => HttpResponse.json({}), () => serviceError(500, "INTERNAL", "Something failed.")]) {
+      server.use(
+        http.get(url("/libraries"), () => HttpResponse.json(LIBRARIES)),
+        http.get(url("/libraries/suggested-folder"), answer),
+      );
+      const { unmount } = render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+      await screen.findByRole("button", { name: "Open Grant 2025" });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(screen.queryByRole("button", { name: "Use the suggested folder" })).toBeNull();
+      expect(screen.queryByText(/Suggested:/)).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      unmount();
+    }
+  });
+
+  it("R447: a suggestion that never comes does not hold up the list of libraries", async () => {
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json(LIBRARIES)),
+      http.get(url("/libraries/suggested-folder"), () => new Promise<never>(() => {})),
+    );
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    expect(await screen.findByRole("button", { name: "Open Grant 2025" })).toBeTruthy();
+  });
+
+  it("R447: the room is said for a typed full path in a polite status, after a pause, and follows the path", async () => {
+    const asked: unknown[] = [];
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.post(url("/libraries/folder-room"), async ({ request }) => {
+        const body = (await request.json()) as { path: string };
+        asked.push(body);
+        return HttpResponse.json({ freeBytes: body.path.startsWith("/Volumes/Small") ? 9e9 : 11e9 });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByText(/No libraries yet/);
+    // Not a full path: nothing is asked.
+    await user.type(folderBox(), "Research");
+    await new Promise((r) => setTimeout(r, 450));
+    expect(asked).toEqual([]);
+    expect(roomLine()).toBeNull();
+    await user.clear(folderBox());
+    await user.type(folderBox(), "/Volumes/Big/Research library");
+    const line = await screen.findByText("Free space on that disk: 11 GB.");
+    const status = line.closest("[role=status]") as HTMLElement;
+    expect(status.getAttribute("aria-live") ?? "polite").toBe("polite");
+    expect(status.textContent).toBe("Free space on that disk: 11 GB.");
+    // One request for the whole typed path, the path in the body.
+    expect(asked).toEqual([{ path: "/Volumes/Big/Research library" }]);
+    // A changed path: the old figure goes at once, the new one comes; under 10 GB the second sentence.
+    await user.clear(folderBox());
+    expect(roomLine()).toBeNull();
+    await user.type(folderBox(), "/Volumes/Small/Research library");
+    expect(await screen.findByText("Free space on that disk: 9 GB. That is little room: an import copies its files into the library.")).toBeTruthy();
+  });
+
+  it("R447: an answer for a path the box no longer holds is dropped", async () => {
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((r) => (releaseFirst = r));
+    let firstArrived!: () => void;
+    const arrived = new Promise<void>((r) => (firstArrived = r));
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.post(url("/libraries/folder-room"), async ({ request }) => {
+        const { path } = (await request.json()) as { path: string };
+        if (path === "/first") {
+          firstArrived();
+          await firstHeld;
+          return HttpResponse.json({ freeBytes: 500e9 });
+        }
+        return HttpResponse.json({ freeBytes: 20e9 });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByText(/No libraries yet/);
+    await user.type(folderBox(), "/first");
+    await arrived;
+    await user.clear(folderBox());
+    await user.type(folderBox(), "/second");
+    expect(await screen.findByText("Free space on that disk: 20 GB.")).toBeTruthy();
+    releaseFirst();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(screen.queryByText(/500 GB/)).toBeNull();
+    expect(screen.getByText("Free space on that disk: 20 GB.")).toBeTruthy();
+  });
+
+  it("R447: nothing is said when the room cannot be told (an error, or no number)", async () => {
+    let n = 0;
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.post(url("/libraries/folder-room"), () => {
+        n++;
+        return n === 1 ? serviceError(400, "VALIDATION", '"path" must be an absolute path.') : HttpResponse.json({});
+      }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByText(/No libraries yet/);
+    await user.type(folderBox(), "/Volumes/Share/lib");
+    await waitFor(() => expect(n).toBe(1));
+    await user.type(folderBox(), "2");
+    await waitFor(() => expect(n).toBe(2));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(roomLine()).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("R447: by keyboard, in order — the box, Open library, the suggestion's button (Enter fills the box), the new library's name", async () => {
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.get(url("/libraries/suggested-folder"), () => HttpResponse.json({ folder: SUGGESTED })),
+      http.post(url("/libraries/folder-room"), () => HttpResponse.json({ freeBytes: 212e9 })),
+    );
+    const user = userEvent.setup();
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByRole("button", { name: "Use the suggested folder" });
+    folderBox().focus();
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Open library" }));
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Use the suggested folder" }));
+    await user.keyboard("{Enter}");
+    expect(folderBox().value).toBe(SUGGESTED);
+    expect(await screen.findByText("Free space on that disk: 212 GB.")).toBeTruthy();
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByLabelText("New library name"));
+  });
 });

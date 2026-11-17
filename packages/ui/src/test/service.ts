@@ -12,9 +12,16 @@ export const BASE = "http://127.0.0.1:4100";
 export const TOKEN = "t".repeat(40);
 export const url = (path: string) => `${BASE}${path}`;
 
-export const server = setupServer();
+/**
+ * The handlers every file starts with: "Choose a library" asks these two on its own (R447), so each screen that shows
+ * it has an answer — no suggestion, and no figure for the room. A test that is about them gives its own.
+ */
+export const server = setupServer(
+  http.get(url("/libraries/suggested-folder"), () => HttpResponse.json({})),
+  http.post(url("/libraries/folder-room"), () => HttpResponse.json({})),
+);
 
-/** Starts the mocked service for the file; every request must have a handler. */
+/** Starts the mocked service for the file; every request must have a handler (the two above are there from the start). */
 export function useMockService(): void {
   beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
   afterEach(() => server.resetHandlers());

@@ -51,6 +51,15 @@
   margin: var(--space-1) 0 var(--space-2);
 }
 
+/* R447: the suggested folder and the free room, under "Library folder" on "Choose a library". */
+.ao-library-place p {
+  margin: 0 0 var(--space-1);
+}
+
+.ao-library-place p:empty {
+  margin: 0;
+}
+
 .ao-pane-title {
   font-size: 1rem;
   margin: var(--space-3) 0 var(--space-1);
