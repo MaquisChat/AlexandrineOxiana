@@ -151,7 +151,8 @@ other `from` is refused. The kind is the ticket's (every `open` sets it). **Ever
 opened the window at stays a sign-in host for every later ticket of either kind for as long as the window's
 store lives** (R360 a): the window's session outlives a ticket, so a link's page could lead it back there.
 The hosts are forgotten exactly where the store is emptied — the sign-out, the quit that empties it, the
-start-up clean-up after a forced quit — and, where the store is the window's own (an ephemeral one: Linux,
+start-up clean-up after a forced quit; a sign-out whose window is still there after its five-second wait
+does not complete, keeps the hosts and the store, and answers false (R361) — and, where the store is the window's own (an ephemeral one: Linux,
 Windows), when the window closes; on macOS they outlive the window as its store does, and with "Stay signed
 in" they are kept across a quit in the device file (`library-window.json`, `signInHosts`), written before
 the window goes to a new library host. It has no address bar, so its title says where it is (R347 b,
