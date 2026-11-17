@@ -77,7 +77,9 @@ export function governanceReadability(yaml: string, roots: Iterable<string>): Go
   // the paths are scrubbed, so they cannot split a path); no path; at most MAX_LINE_CHARS (R397 b).
   const clean = (t: string) => {
     const line = scrubPaths(t.replace(/\s+/g, " ").replace(HIDDEN_CHARS, ""), roots).trim();
-    return line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS - 1)}…` : line;
+    // Cut by whole characters (code points), never half a surrogate pair (R421 c).
+    const chars = [...line];
+    return chars.length > MAX_LINE_CHARS ? `${chars.slice(0, MAX_LINE_CHARS - 1).join("")}…` : line;
   };
   try {
     const { config, warnings } = parseGovernanceWithWarnings(yaml);
@@ -94,14 +96,15 @@ export function governanceReadability(yaml: string, roots: Iterable<string>): Go
 
 /** At most this many issues (or warnings) are sent, then "and N more." (R397 b). */
 const MAX_LINES = 20;
-/** Each issue or warning is at most this many characters, cut with "…" (R397 b). */
+/** Each issue or warning is at most this many characters (code points), cut with "…" (R397 b). */
 const MAX_LINE_CHARS = 300;
 /**
- * Taken out of issues and warnings (R397 d): C0 and C1 control characters, the bidi marks,
- * embeddings, overrides and isolates (U+061C, U+200E–U+200F, U+202A–U+202E, U+2066–U+2069), and the
- * zero-width characters (U+200B–U+200D, U+2060–U+2064, U+FEFF).
+ * Taken out of issues and warnings (R397 d, R421 c): every control and format character (\p{Cc},
+ * \p{Cf}: C0 and C1 controls, the soft hyphen, the bidi marks, embeddings, overrides and isolates,
+ * the zero-width characters, the tag characters U+E0000–E007F), the invisible fillers U+034F,
+ * U+115F, U+1160 and U+3164, and the variation selectors U+FE00–FE0F.
  */
-const HIDDEN_CHARS = /[\u0000-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g;
+const HIDDEN_CHARS = /[\p{Cc}\p{Cf}\u034F\u115F\u1160\u3164\uFE00-\uFE0F]/gu;
 
 const capped = (lines: string[]): string[] => (lines.length > MAX_LINES ? [...lines.slice(0, MAX_LINES), `and ${lines.length - MAX_LINES} more.`] : lines);
 

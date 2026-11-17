@@ -1133,6 +1133,19 @@ describe("FR-A18 round 2 (R397 b–d): the issues are bounded, scrubbed, on one 
     for (const i of issues) expect(i).not.toMatch(/[\n\r]/);
   });
 
+  it("R421 c: the soft hyphen, a tag character, the Hangul filler and a variation selector are taken out too", async () => {
+    const issues = await issuesOf(`"ab\\u00ADc\\U000E0041d\\u3164e\\uFE0Ff\\u034Fg\\u115Fh\\u1160i": 1\n`);
+    expect(issues[0]).toMatch(/^abcdefghi: unknown key/);
+  });
+
+  it("R421 c: the cut at 300 is by whole characters, never half a pair", async () => {
+    const issues = await issuesOf(`? ${"k".repeat(298)}${"\u{1F600}".repeat(50)}\n: 1\n`);
+    const i = issues[0]!;
+    expect([...i]).toHaveLength(300);
+    expect(i.endsWith("\u{1F600}…")).toBe(true);
+    expect(i).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+
   it("d: control characters and the marks that reorder or hide text are taken out; angle brackets stay", async () => {
     const issues = await issuesOf(`"<img src=x onerror=alert(1)>\\u202E\\a\\u200B\\u2066": 1\n`);
     const i = issues.find((x) => x.includes("<img src=x onerror=alert(1)>"))!;
