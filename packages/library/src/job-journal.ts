@@ -21,8 +21,8 @@
  * such row into its project's journal once (migration 0003 marks a database that had rows).
  */
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
-import type { EntityType } from "@ao/core";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { LibraryRelativePath, type EntityType } from "@ao/core";
 import { writeFileAtomic } from "./fs/atomic.js";
 import type { KeyRing } from "./crypto/keys.js";
 import { getMeta, setMeta, type IndexDb } from "./index/db.js";
@@ -42,11 +42,20 @@ export const UNFINISHED: ReadonlySet<JobStatus> = new Set(["queued", "running"])
 /** The error of a job cancelled because its project was locked before it started (R142): it runs again at the next unlock. */
 export const LOCKED_CODE = "PROJECT_LOCKED";
 
-/** What is needed to submit the job again. */
+/**
+ * What is needed to submit the job again. No absolute path is stored (R379): `input` and `output`
+ * are relative to the library root ("/"-separated, no ".."), resolved against the root of the
+ * moment the job runs (`fromLibraryPath`). A capture's `input` is its URL. An input that is a file
+ * linked in place from outside the library is not stored as a path: `input` is "" and
+ * `inputAsset` names the asset, whose record holds the file's path. Lines written before R379 hold
+ * absolute paths; they are read as they are (see `fromLibraryPath`).
+ */
 export interface StoredJob {
   type: WorkerJobType;
   input: string;
   inputEncrypted?: boolean;
+  /** The input is this asset's file (a file linked in place, R379); `input` is then "". */
+  inputAsset?: JobInputAsset;
   output: string;
   params: Record<string, unknown>;
   entity?: { type: EntityType; id: string };
@@ -85,6 +94,44 @@ export interface JobAbout {
 }
 
 export type ProjectKey = { key: Uint8Array; keyId: string } | null;
+
+/** Which asset a job's input is: ids only (R379). */
+export interface JobInputAsset {
+  sourceId: string;
+  assetId: string;
+}
+
+// ---- paths (R379) ------------------------------------------------------------------------------
+
+/** A control character (C0, DEL, C1; NUL among them): never part of a path a job may use (R400 c). */
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+
+/**
+ * `abs` as a journal stores it: relative to `root`, "/"-separated, no ".." (R379). Undefined when
+ * `abs` is not an absolute path strictly inside `root`, or holds a control character (R400 c).
+ */
+export function toLibraryPath(root: string, abs: string): string | undefined {
+  if (!isAbsolute(abs) || CONTROL.test(abs)) return undefined;
+  const r = relative(resolve(root), resolve(abs));
+  if (!r || isAbsolute(r) || r === ".." || r.startsWith(`..${sep}`)) return undefined;
+  const rel = r.split(sep).join("/");
+  return LibraryRelativePath.safeParse(rel).success ? rel : undefined;
+}
+
+/**
+ * A stored path as an absolute path under the library's current root (R379). A relative path is
+ * joined to `root` (undefined unless it is a plain library-relative path: no "..", no empty or "."
+ * segment, no control character: R400 c). An absolute path (a line written before R379) is used as it is when it lies inside
+ * `root`; outside it (the library was moved or copied) it is undefined: the old place is not
+ * this library's.
+ */
+export function fromLibraryPath(root: string, stored: string): string | undefined {
+  if (CONTROL.test(stored)) return undefined; // R400 (c)
+  if (isAbsolute(stored)) return toLibraryPath(root, stored) !== undefined ? resolve(stored) : undefined;
+  if (!LibraryRelativePath.safeParse(stored).success || stored.split("/").some((s) => s === "" || s === ".")) return undefined;
+  return join(root, ...stored.split("/"));
+}
 
 // ---- secrets ---------------------------------------------------------------------------------
 
@@ -139,11 +186,17 @@ export interface ParsedJournal {
   lines: number;
   /** An incomplete last line was ignored. */
   torn: boolean;
+  /** Some readable line (superseded or not) holds an absolute path: written before R379 (R400 e). */
+  absolutePaths: boolean;
 }
+
+/** Whether a stored job names a file by an absolute path (a line written before R379). */
+const holdsAbsolutePath = (j: StoredJob | undefined): boolean =>
+  !!j && ((j.type !== "capture.download" && typeof j.input === "string" && isAbsolute(j.input)) || (typeof j.output === "string" && isAbsolute(j.output)));
 
 /** Parses a journal's text. `key` opens sealed lines (encrypted projects). */
 export function parseJobJournal(text: string, projectId: string, key: Uint8Array | null): ParsedJournal {
-  const out: ParsedJournal = { records: new Map(), latestLines: new Map(), unreadable: [], lines: 0, torn: false };
+  const out: ParsedJournal = { records: new Map(), latestLines: new Map(), unreadable: [], lines: 0, torn: false, absolutePaths: false };
   const parts = text.split("\n");
   for (const [i, line] of parts.entries()) {
     if (i === parts.length - 1) {
@@ -158,6 +211,7 @@ export function parseJobJournal(text: string, projectId: string, key: Uint8Array
       out.records.delete(o.id); // keep insertion order = order of the newest line
       out.records.set(o.id, o);
       out.latestLines.set(o.id, line);
+      if (holdsAbsolutePath(o.job)) out.absolutePaths = true;
     } catch {
       out.unreadable.push(line);
     }
@@ -309,7 +363,8 @@ function prunable(records: Map<string, JobRecord>, now: number): Set<string> {
  * the finished jobs R142 lets go (succeeded ones older than SUCCEEDED_MAX_AGE_DAYS or beyond the
  * MAX_SUCCEEDED_KEPT most recent; failed and cancelled ones beyond the MAX_FAILED_KEPT most
  * recent), plus any unreadable lines (kept verbatim). Runs when the journal has more than
- * `minLines` lines and either half of them are superseded or some record can be dropped. Returns
+ * `minLines` lines and either half of them are superseded or some record can be dropped, and
+ * whenever a line holds an absolute path (R400 e: such paths inside the root are written relative). Returns
  * true when it was rewritten. Bound: MAX_SUCCEEDED_KEPT + MAX_FAILED_KEPT lines plus the pending
  * jobs after compaction; between compactions at most three more lines per job (queued, running,
  * final). A job's result lives in its source's files: a dropped record loses only history.
@@ -330,12 +385,31 @@ export async function compactJobJournal(
     const parsed = parseJobJournal(raw.toString("utf8"), projectId, key ? key.key : null);
     const drop = prunable(parsed.records, now);
     const kept = parsed.latestLines.size - drop.size + parsed.unreadable.length;
-    if (parsed.lines <= minLines || (drop.size === 0 && kept * 2 > parsed.lines)) return false;
+    // R400 (e): a journal that still holds a line with an absolute path is compacted whatever its size.
+    if (!parsed.absolutePaths && (parsed.lines <= minLines || (drop.size === 0 && kept * 2 > parsed.lines))) return false;
     await prepare(root, projectRel);
-    const lines = [...parsed.unreadable, ...[...parsed.latestLines].filter(([id]) => !drop.has(id)).map(([, l]) => l)];
+    const lines = [
+      ...parsed.unreadable,
+      ...[...parsed.latestLines].filter(([id]) => !drop.has(id)).map(([id, l]) => relativeLine(root, parsed.records.get(id)!, key) ?? l),
+    ];
     await writeFileAtomic(path, lines.map((l) => `${l}\n`).join(""), { mode: FILE_MODE });
     return true;
   });
+}
+
+/**
+ * R400 (e): a newest line whose job names its files by absolute paths inside `root`, written again
+ * with the same record and those paths library-relative (R379). Undefined (the line is kept as it
+ * is) when it holds none, or one outside `root`: that job fails as a missing input when resumed,
+ * and the next compaction drops the superseded line.
+ */
+function relativeLine(root: string, rec: JobRecord, key: ProjectKey): string | undefined {
+  const j = rec.job;
+  if (!j || !holdsAbsolutePath(j)) return undefined;
+  const input = j.type === "capture.download" || !isAbsolute(j.input) ? j.input : toLibraryPath(root, j.input);
+  const output = isAbsolute(j.output) ? toLibraryPath(root, j.output) : j.output;
+  if (input === undefined || output === undefined) return undefined;
+  return encode({ ...rec, job: { ...j, input, output } }, key);
 }
 
 /**
@@ -406,7 +480,11 @@ export interface LegacyUpgrade {
   errors: Array<{ folder: string; message: string }>;
 }
 
-async function legacyJob(row: LegacyRow, key: ProjectKey): Promise<StoredJob | undefined> {
+/**
+ * A legacy row's job with its paths made library-relative (R379); `null` when a path lies outside
+ * the library (it cannot run here: recorded failed as a missing input).
+ */
+async function legacyJob(row: LegacyRow, key: ProjectKey, root: string): Promise<StoredJob | null | undefined> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(row.payload_json);
@@ -420,7 +498,10 @@ async function legacyJob(row: LegacyRow, key: ProjectKey): Promise<StoredJob | u
   }
   const j = parsed as Partial<StoredJob> | null;
   if (!j || typeof j.type !== "string" || typeof j.input !== "string" || typeof j.output !== "string") return undefined;
-  return { ...(j as StoredJob), params: j.params ?? {} };
+  const input = j.type === "capture.download" ? j.input : toLibraryPath(root, j.input);
+  const output = toLibraryPath(root, j.output);
+  if (input === undefined || output === undefined) return null;
+  return { ...(j as StoredJob), input, output, params: j.params ?? {} };
 }
 
 /**
@@ -465,18 +546,19 @@ export async function upgradeLegacyJobs(db: IndexDb, root: string, keyRing: Pick
       for (const r of list) {
         if (journal.records.has(r.id)) continue;
         const status = (STATUSES.has(r.status) ? r.status : "failed") as JobStatus;
-        const job = UNFINISHED.has(status) ? await legacyJob(r, k).catch(() => undefined) : undefined;
+        const job = UNFINISHED.has(status) ? await legacyJob(r, k, root).catch(() => undefined) : undefined;
         recs.push({
           v: 1,
           id: r.id,
           projectId,
           kind: r.kind,
-          // An unfinished row whose job cannot be read can never run again: recorded as failed.
+          // An unfinished row whose job cannot be read can never run again: recorded as failed; one
+          // whose paths lie outside this library (R379) fails as a missing input would.
           status: UNFINISHED.has(status) && !job ? "failed" : status,
           createdAt: r.created_at,
           updatedAt: r.created_at,
           ...(job ? { job } : {}),
-          ...(UNFINISHED.has(status) && !job ? { error: "UNRECOVERABLE" } : {}),
+          ...(UNFINISHED.has(status) && !job ? { error: job === null ? "INPUT_NOT_FOUND" : "UNRECOVERABLE" } : {}),
         });
       }
       await appendJobRecords(root, entry.rel, k, recs);

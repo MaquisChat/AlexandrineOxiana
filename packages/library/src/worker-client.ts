@@ -28,22 +28,24 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import * as fsp from "node:fs/promises";
-import { basename, dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
-import type { EntityType, PolicyDecision, ProcessingOp } from "@ao/core";
+import type { Asset, EntityType, PolicyDecision, ProcessingOp } from "@ao/core";
 import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
+import { insideFolder, insideLibrary, libraryRealRoot, realOrNearest } from "./fs/inside-library.js";
 import type { IndexDb } from "./index/db.js";
 import {
-  LOCKED_CODE, UNFINISHED, appendJobRecords, appendNewJobRecord, assertNoSecrets, claimJobRecord, compactJobJournal, errorCode, isPending, readJobJournal,
-  refreshJobRows, upgradeLegacyJobs, upsertJobRow, type JobAbout, type JobRecord, type JobStatus, type ProjectKey, type StoredJob, type WorkerJobType,
+  LOCKED_CODE, UNFINISHED, appendJobRecords, appendNewJobRecord, assertNoSecrets, claimJobRecord, compactJobJournal, errorCode, fromLibraryPath, isPending,
+  readJobJournal, refreshJobRows, toLibraryPath, upgradeLegacyJobs, upsertJobRow, type JobAbout, type JobInputAsset, type JobRecord, type JobStatus,
+  type ProjectKey, type StoredJob, type WorkerJobType,
 } from "./job-journal.js";
-import { PolicyDeniedError, ProjectLockedError } from "./repo/errors.js";
+import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "./repo/errors.js";
 import { activeTemp, isStaleWorkDir } from "./tmp-registry.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 import { mediaWorkerSourceDir } from "./resources.js";
 
-export type { JobAbout, JobRecord, WorkerJobType } from "./job-journal.js";
+export type { JobAbout, JobInputAsset, JobRecord, WorkerJobType } from "./job-journal.js";
 
 /** The processing op each job type is evaluated as (null: the caller passed a `capture` decision). */
 export const JOB_OPS: Record<WorkerJobType, ProcessingOp | null> = {
@@ -59,11 +61,17 @@ const DIR_OUTPUTS: ReadonlySet<WorkerJobType> = new Set(["audio.transcribe", "ca
 
 export interface WorkerJob {
   type: WorkerJobType;
-  /** Absolute path of the input file, or the URL for `capture.download`. */
+  /**
+   * Absolute path of the input file, or the URL for `capture.download`. It must lie inside the
+   * library, or be the file of `inputAsset` (a file linked in place): anything else is refused
+   * with a TypeError (R379: the journal stores no absolute path).
+   */
   input: string;
   /** The input is in the library's encrypted file format (decrypted with the project key first). */
   inputEncrypted?: boolean;
-  /** Final destination: a folder for audio.transcribe and capture.download, else a file. */
+  /** The asset whose linked file `input` is: the journal records the asset, not the path (R379). */
+  inputAsset?: JobInputAsset;
+  /** Final destination, inside the library (R379): a folder for audio.transcribe and capture.download, else a file. */
   output: string;
   params?: Record<string, unknown>;
   /** Entity recorded on a deny audit event. */
@@ -93,6 +101,8 @@ export interface ResumeExtras {
   /** The input and output worked out again from the library as it is now (e.g. after a move). */
   input?: string;
   inputEncrypted?: boolean;
+  /** With `input`: the asset whose linked file it is (R379). */
+  inputAsset?: JobInputAsset;
   output?: string;
   onProgress?: (progress: number) => void;
   signal?: AbortSignal;
@@ -124,6 +134,9 @@ function tell(extras: ResumeExtras, outcome: Parameters<NonNullable<ResumeExtras
 const isInterrupt = (signal: AbortSignal | undefined): boolean => !!signal?.aborted && signal.reason instanceof JobInterruptedError;
 const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CLOSED = "the library was closed; the job runs again when it is next opened";
+/** What a job whose input is missing fails with (the worker's own words for it). */
+const INPUT_NOT_FOUND = "INPUT_NOT_FOUND";
+const inputNotFound = () => new WorkerJobError(INPUT_NOT_FOUND, "the input file does not exist");
 
 export interface JobResult {
   /** The client's job id (the `jobs` row). */
@@ -308,6 +321,9 @@ export class WorkerClient {
     if (db) await this.write(() => upgradeLegacyJobs(db, library.root, { get: (keyId: string) => this.keyById(keyId) })).catch(() => undefined);
     const out: Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }> = [];
     const todo: JobRecord[] = [];
+    const opened: Array<{ folder: string; id: string; key: ProjectKey }> = [];
+    // R400 (c): what is returned for a job names no path (Node's own messages can quote one).
+    const report = (id: string, pid: string, error: unknown) => out.push({ id, projectId: pid, error: pathless(error, library.root) });
     for (const p of this.repo.listProjects()) {
       if (projectId !== undefined && p.id !== projectId) continue;
       let key: { key: Uint8Array; keyId: string } | null;
@@ -321,10 +337,11 @@ export class WorkerClient {
       }
       try {
         await this.write(() => compactJobJournal(library.root, p.folder, p.id, key));
+        opened.push({ folder: p.folder, id: p.id, key });
         const journal = await this.write(() => refreshJobRows(() => this.db(), library.root, p.folder, p.id, key));
         for (const r of journal.records.values()) if (isPending(r)) todo.push(r);
       } catch (error) {
-        out.push({ id: "", projectId: p.id, error });
+        report("", p.id, error);
       }
     }
     todo.sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt.localeCompare(b.createdAt)));
@@ -346,17 +363,43 @@ export class WorkerClient {
         continue;
       }
       let extras: ResumeExtras;
+      let input: { path: string; encrypted: boolean; asset?: JobInputAsset } | undefined;
+      let output: string | undefined;
       try {
         extras = (await opts.prepare?.(rec)) ?? {};
+        // R379: the stored paths resolved against the library's root now (or the linked asset's
+        // record); what `prepare` worked out again takes their place.
+        input =
+          extras.input !== undefined
+            ? { path: extras.input, encrypted: extras.inputEncrypted === true, ...(extras.inputAsset ? { asset: extras.inputAsset } : {}) }
+            : await this.storedInput(rec.projectId, rec.job);
+        output = extras.output ?? fromLibraryPath(library.root, rec.job.output);
+        // R400 (b): a line that would read outside the library or write outside its work folder
+        // (by real path) is settled as a missing input, before anything is sent.
+        if (input && output !== undefined && !(await this.placesAllowed(rec.projectId, { type: rec.job.type, input: input.path, ...(input.asset ? { inputAsset: input.asset } : {}), output }))) {
+          input = undefined;
+        }
       } catch (error) {
-        out.push({ id: rec.id, projectId: rec.projectId, error }); // left pending, as it was
+        report(rec.id, rec.projectId, error); // left pending, as it was
+        continue;
+      }
+      if (!input || output === undefined) {
+        // The input is not in this library (an old line naming where the library was before a
+        // move, an asset that is gone): it fails as a missing input does, recorded once.
+        const error = inputNotFound();
+        const ok = await this.claim(rec, { ...this.next(rec, "failed", INPUT_NOT_FOUND), attempt: randomUUID() }).catch(() => false);
+        tell(extras, { claimed: ok, ...(ok ? { error } : {}) });
+        if (ok) out.push({ id: rec.id, projectId: rec.projectId, error });
         continue;
       }
       const signals = [opts.signal, extras.signal].filter((s): s is AbortSignal => s !== undefined);
+      const { inputAsset: _stored, ...recorded } = rec.job;
       const job: WorkerJob = {
-        ...rec.job,
-        ...(extras.input !== undefined ? { input: extras.input, inputEncrypted: extras.inputEncrypted === true } : {}),
-        ...(extras.output !== undefined ? { output: extras.output } : {}),
+        ...recorded,
+        input: input.path,
+        inputEncrypted: input.encrypted,
+        ...(input.asset ? { inputAsset: input.asset } : {}),
+        output,
         ...(extras.onProgress ? { onProgress: extras.onProgress } : {}),
         ...(signals.length ? { signal: signals.length === 1 ? signals[0]! : AbortSignal.any(signals) } : {}),
         ...(extras.finish ? { finish: extras.finish } : {}),
@@ -368,8 +411,15 @@ export class WorkerClient {
       } catch (error) {
         const took = !(error instanceof NotClaimed);
         tell(extras, { claimed: took, error });
-        if (took) out.push({ id: rec.id, projectId: rec.projectId, error });
+        if (took) report(rec.id, rec.projectId, error);
       }
+    }
+    // R400 (e): once the jobs are settled, a journal still holding a line with an absolute path
+    // (an old line now superseded) is compacted, so that none is left after the first resume.
+    for (const j of opened) {
+      if (this.closed) break;
+      const rewritten = await this.write(() => compactJobJournal(library.root, j.folder, j.id, j.key)).catch(() => false);
+      if (rewritten) await this.write(() => refreshJobRows(() => this.db(), library.root, j.folder, j.id, j.key)).catch(() => undefined);
     }
     return out;
   }
@@ -389,10 +439,13 @@ export class WorkerClient {
 
   private async runClaimed(id: string, projectId: string, job: WorkerJob, resumed: JobRecord | undefined, chosenId: boolean): Promise<JobResult> {
     let decision: PolicyDecision | undefined;
+    let stored: StoredJob;
     try {
       const op = JOB_OPS[job.type];
       if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
       assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
+      stored = await this.storedJob(projectId, job); // R379: no absolute path in the record
+      if (!(await this.placesAllowed(projectId, job))) throw new TypeError("a worker job may read only inside the library and write only into its work folder");
       if (op !== null) {
         // R367: an allow is audited here, once per run of the job: when it is first submitted, not
         // when a pending job is run again (after a restart, an unlock or an interrupt it is the
@@ -423,21 +476,14 @@ export class WorkerClient {
     const lockedNow = () => dataKey !== null && !this.repo.isUnlocked(projectId);
     const mustEncrypt = decision?.result === "allow_with_conditions" && decision.conditions.some((c) => c.type === "encrypt");
     if (mustEncrypt && !dataKey) throw new WorkerJobError("ENCRYPTION_REQUIRED", "the decision requires encryption but the project is not encrypted");
-    const stored: StoredJob = {
-      type: job.type,
-      input: job.input,
-      ...(job.inputEncrypted ? { inputEncrypted: true } : {}),
-      output: job.output,
-      params: job.params ?? {},
-      ...(job.entity ? { entity: job.entity } : {}),
-    };
     const now = new Date().toISOString();
     const first: JobRecord = { v: 1, id, projectId, kind: stored.type, status: "queued", createdAt: now, updatedAt: now, job: stored, ...(job.about ? { about: job.about } : {}) };
     this.records.set(id, resumed ?? first);
     try {
       if (resumed) {
         // A rerun: claimed in the journal, once (R142); a second resubmission finds the claim.
-        const next: JobRecord = { ...this.next(resumed, "queued"), attempt: randomUUID() };
+        // Its job as it runs now (R379): an old line's absolute paths are written relative here.
+        const next: JobRecord = { ...this.next(resumed, "queued"), job: stored, attempt: randomUUID() };
         if (!(await this.claim(resumed, next, dataKey))) throw new NotClaimed();
         this.records.set(id, next);
       } else if (chosenId) {
@@ -509,6 +555,8 @@ export class WorkerClient {
       // Publishing, the finish step and the `done` line are one guarded write (M8, M9): a closed
       // client starts none of them (the job stays pending), and `close()` waits for all of them.
       return await this.write(async () => {
+        // R400 (b): checked again just before publishing (a link planted while the job ran).
+        if (!(await outputInWork(root, job))) throw inputNotFound();
         const files = await publish(outDir, finalBase, dataKey);
         const meta = rewritePaths(state.result?.meta ?? {}, outDir, finalBase) as Record<string, unknown>;
         const result: JobResult = { id, type: job.type, output: job.output, files, meta, encrypted: dataKey !== null };
@@ -611,6 +659,83 @@ export class WorkerClient {
   private async cancelForLock(id: string, projectId: string): Promise<never> {
     await this.transition(id, "cancelled", LOCKED_CODE, true);
     throw new ProjectLockedError(projectId);
+  }
+
+  /**
+   * The job as its journal lines record it (R379): input and output relative to the library root;
+   * a capture's input is its URL; a file linked in place is recorded as its asset. A path that is
+   * neither inside the library nor the named asset's linked file is a programming error: a
+   * TypeError that names no path.
+   */
+  private async storedJob(projectId: string, job: WorkerJob): Promise<StoredJob> {
+    const root = repoLibrary(this.repo).root;
+    let input: string | undefined = job.type === "capture.download" ? job.input : toLibraryPath(root, job.input);
+    let inputAsset: JobInputAsset | undefined;
+    if (input === undefined && job.inputAsset && (await this.isLinkedFile(projectId, job.inputAsset, job.input))) {
+      input = "";
+      inputAsset = { sourceId: job.inputAsset.sourceId, assetId: job.inputAsset.assetId };
+    }
+    if (input === undefined) throw new TypeError("a worker job's input must be a file inside the library or a linked file of one of its assets");
+    const output = toLibraryPath(root, job.output);
+    if (output === undefined) throw new TypeError("a worker job's output must be inside the library");
+    return {
+      type: job.type,
+      input,
+      ...(job.inputEncrypted ? { inputEncrypted: true } : {}),
+      ...(inputAsset ? { inputAsset } : {}),
+      output,
+      params: job.params ?? {},
+      ...(job.entity ? { entity: job.entity } : {}),
+    };
+  }
+
+  /**
+   * R400 (b): where a job may read and write, by real path (links followed). Its input (not a
+   * capture's URL) lies inside the library's real root, or is the current file of the linked asset
+   * it names; its output lies in the library's own work folder (see `outputInWork`).
+   */
+  private async placesAllowed(projectId: string, job: Pick<WorkerJob, "type" | "input" | "inputAsset" | "output">): Promise<boolean> {
+    const root = repoLibrary(this.repo).root;
+    if (job.type !== "capture.download") {
+      const linked = job.inputAsset !== undefined && (await this.isLinkedFile(projectId, job.inputAsset, job.input));
+      if (!linked && !(await insideLibrary(job.input, { root }))) return false;
+    }
+    return outputInWork(root, job);
+  }
+
+  /** Whether `path` is the file the asset is linked to (by its absolute or its library-relative path). */
+  private async isLinkedFile(projectId: string, ref: JobInputAsset, path: string): Promise<boolean> {
+    const linked = (await this.assetOf(projectId, ref))?.linked;
+    if (!linked) return false;
+    const root = repoLibrary(this.repo).root;
+    const p = resolve(path);
+    return p === resolve(linked.absolutePath) || p === resolve(root, ...linked.libraryRelativePath.split("/"));
+  }
+
+  /** The asset (not destroyed) of a source; undefined when either is gone. Other failures to read are thrown. */
+  private async assetOf(projectId: string, ref: JobInputAsset): Promise<Asset | undefined> {
+    const sf = await this.repo.getSource(projectId, ref.sourceId).catch((err: unknown) => {
+      if (err instanceof NotFoundError) return undefined;
+      throw err;
+    });
+    return sf?.assets.find((a) => a.id === ref.assetId && a.status !== "destroyed");
+  }
+
+  /**
+   * A stored job's input as an absolute path now (R379): a linked asset's file from its record
+   * (as it is now, after a relink too), else the stored path under the library's current root.
+   * Undefined when it is not in this library or the asset is gone.
+   */
+  private async storedInput(projectId: string, job: StoredJob): Promise<{ path: string; encrypted: boolean; asset?: JobInputAsset } | undefined> {
+    const root = repoLibrary(this.repo).root;
+    if (job.inputAsset) {
+      const asset = await this.assetOf(projectId, job.inputAsset);
+      if (!asset) return undefined;
+      const path = asset.linked ? asset.linked.absolutePath : fromLibraryPath(root, asset.path);
+      return path === undefined ? undefined : { path, encrypted: asset.encrypted, ...(asset.linked ? { asset: job.inputAsset } : {}) };
+    }
+    const path = fromLibraryPath(root, job.input);
+    return path === undefined ? undefined : { path, encrypted: job.inputEncrypted === true };
   }
 
   private dropKey(id: string): void {
@@ -750,6 +875,30 @@ async function walkFiles(dir: string): Promise<string[]> {
 }
 
 /** Moves (or encrypts) every file under `from` to the same relative path under `to`. */
+/**
+ * R400 (b): whether a job's output lies in the library's own work folder: the folder its files are
+ * published into (the output for a folder output, else the output's parent) is, by real path, a
+ * folder below `<root>/.tmp` — not `.tmp` itself, and not through a link that leads elsewhere.
+ * Every caller's output is there (proxies, text recognition, transcriptions, captures).
+ */
+/**
+ * R400 (c): an error safe to hand back from a resubmission: one whose message or `path` names a
+ * path (Node's file-system errors quote the path they failed on) is replaced by a WorkerJobError
+ * that names none; any other error is returned as it is.
+ */
+function pathless(error: unknown, root: string): unknown {
+  if (!(error instanceof Error)) return error;
+  const quoted = typeof (error as { path?: unknown }).path === "string" || error.message.includes(root) || /(^|[\s'"(])(\/|[A-Za-z]:\\)/.test(error.message);
+  return quoted ? new WorkerJobError(error instanceof WorkerJobError ? error.code : "FAILED", "the job failed") : error;
+}
+
+async function outputInWork(root: string, job: Pick<WorkerJob, "type" | "output">): Promise<boolean> {
+  const base = DIR_OUTPUTS.has(job.type) ? job.output : dirname(job.output);
+  const work = join(await libraryRealRoot(root), ".tmp");
+  const real = await realOrNearest(base);
+  return real !== work && insideFolder(work, real);
+}
+
 async function publish(from: string, to: string, dataKey: { key: Uint8Array; keyId: string } | null): Promise<string[]> {
   const written: string[] = [];
   for (const src of await walkFiles(from)) {

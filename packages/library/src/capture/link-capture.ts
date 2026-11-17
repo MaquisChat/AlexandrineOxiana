@@ -389,8 +389,10 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     const root = repoLibrary(repo).root;
     const r = await worker.submit(projectId, {
       type: "audio.transcribe",
-      input: join(root, ...media.path.split("/")),
+      input: media.linked ? media.linked.absolutePath : join(root, ...media.path.split("/")),
       inputEncrypted: media.encrypted,
+      // A file linked in place is recorded as its asset, never by its path (R379, R400 a).
+      ...(media.linked ? { inputAsset: { sourceId: sf.source.id, assetId: media.id } } : {}),
       output: join(work, "transcript"),
       // The shared default (R158) when none is named, never the worker's own.
       params: { model: params.model ?? DEFAULT_SPEECH_MODEL, ...(params.language && params.language !== "auto" ? { language: params.language } : {}) },

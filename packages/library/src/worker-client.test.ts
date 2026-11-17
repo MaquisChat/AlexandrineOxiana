@@ -31,6 +31,8 @@ const NO_TRANSCRIPTION_GOV = `${OPEN_GOV}processing:
 `;
 
 let tmp: string;
+/** A folder inside the library for the jobs' inputs and outputs. */
+let files: string;
 let lib: Library;
 let ring: KeyRing;
 let repo: Repo;
@@ -78,6 +80,10 @@ beforeEach(async () => {
   tmp = await mkdtemp(join(tmpdir(), "ao-worker-client-"));
   ring = new KeyRing();
   lib = await createLibrary(join(tmp, "Lib"), "Lib", deps());
+  // Job inputs and outputs live in the library's work folder (R379: the journal stores no absolute
+  // path; R400 b: a job writes only below `.tmp`).
+  files = join(lib.root, ".tmp", "test-files");
+  await mkdir(files, { recursive: true });
   repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester" });
   db = openIndex(lib.root);
 });
@@ -94,7 +100,7 @@ describe("WorkerClient.submit", () => {
   it("decrypts an encrypted input into <Library>/.tmp, encrypts the outputs and removes the temp folder", async () => {
     const { project } = await repo.createProject({ name: "E", governanceYaml: "captureMethods: [manual_upload]\n", encryption: { enabled: true, passphrase: "pw" } });
     const { key, keyId } = projectDataKey(repo, project.id)!;
-    const input = join(tmp, "audio.m4a.enc");
+    const input = join(files, "audio.m4a.enc");
     await writeFile(input, await encryptBytes(key, keyId, "secret audio bytes"));
     const seen: Record<string, unknown> = {};
     const worker = await stubWorker(async (job) => {
@@ -109,7 +115,7 @@ describe("WorkerClient.submit", () => {
       return { status: "done", result: { output: wOut, meta: { model: "tiny", detectedLanguages: ["en"], durationSec: 1, flaggedCount: 0 } } };
     });
     const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 10 });
-    const output = join(tmp, "out", "transcript");
+    const output = join(files, "out", "transcript");
     const progress: number[] = [];
     const result = await client.submit(project.id, {
       type: "audio.transcribe", input, inputEncrypted: true, output, params: { model: "tiny" }, onProgress: (p) => progress.push(p),
@@ -137,7 +143,7 @@ describe("WorkerClient.submit", () => {
   it("removes the decrypted input after a failed job and reports the worker's error", async () => {
     const { project } = await repo.createProject({ name: "E", governanceYaml: "captureMethods: [manual_upload]\n", encryption: { enabled: true, passphrase: "pw" } });
     const { key, keyId } = projectDataKey(repo, project.id)!;
-    const input = join(tmp, "clip.mov");
+    const input = join(files, "clip.mov");
     await writeFile(input, await encryptBytes(key, keyId, "video"));
     let workerInput = "";
     const worker = await stubWorker((job) => {
@@ -146,24 +152,24 @@ describe("WorkerClient.submit", () => {
     });
     const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 10 });
     const err = await client
-      .submit(project.id, { type: "video.proxy", input, inputEncrypted: true, output: join(tmp, "out", "proxy.mp4"), params: {} })
+      .submit(project.id, { type: "video.proxy", input, inputEncrypted: true, output: join(files, "out", "proxy.mp4"), params: {} })
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(WorkerJobError);
     expect((err as WorkerJobError).code).toBe("UNSUPPORTED_INPUT");
     expect(workerInput.startsWith(join(lib.root, ".tmp", "worker-"))).toBe(true);
     expect(existsSync(workerInput)).toBe(false);
     expect(await workerTempDirs()).toEqual([]);
-    expect(existsSync(join(tmp, "out", "proxy.mp4"))).toBe(false);
+    expect(existsSync(join(files, "out", "proxy.mp4"))).toBe(false);
     expect(jobRows().map((r) => r.status)).toEqual(["failed"]);
   });
 
   it("a denied transcription throws PolicyDeniedError, is audited, and never contacts the worker", async () => {
     const { project } = await repo.createProject({ name: "D", governanceYaml: NO_TRANSCRIPTION_GOV, encryption: { enabled: false } });
-    const input = join(tmp, "a.wav");
+    const input = join(files, "a.wav");
     await writeFile(input, "RIFF");
     const worker = await stubWorker(() => ({ status: "done" }));
     const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 10 });
-    await expect(client.submit(project.id, { type: "audio.transcribe", input, output: join(tmp, "t"), params: {} })).rejects.toBeInstanceOf(
+    await expect(client.submit(project.id, { type: "audio.transcribe", input, output: join(files, "t"), params: {} })).rejects.toBeInstanceOf(
       PolicyDeniedError,
     );
     expect(worker.requests).toEqual([]);
@@ -190,7 +196,7 @@ describe("WorkerClient.submit", () => {
       };
     });
     const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 10 });
-    const output = join(tmp, "capture");
+    const output = join(files, "capture");
     const r = await client.submit(project.id, { type: "capture.download", input: "https://www.youtube.com/watch?v=abc", output, params: { tool: "yt-dlp" } });
     expect(worker.jobs.get("j1")!.body.input).toBe("https://www.youtube.com/watch?v=abc");
     expect(r.encrypted).toBe(false);
@@ -202,12 +208,12 @@ describe("WorkerClient.submit", () => {
 
   it("cancels the worker job when the signal aborts", async () => {
     const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     const worker = await stubWorker(() => ({ status: "done", result: { output: "", meta: {} } }), { pollsUntilDone: 1000 });
     const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 10 });
     const ac = new AbortController();
-    const p = client.submit(project.id, { type: "image.proxy", input, output: join(tmp, "o.jpg"), params: {}, signal: ac.signal, onProgress: () => ac.abort() });
+    const p = client.submit(project.id, { type: "image.proxy", input, output: join(files, "o.jpg"), params: {}, signal: ac.signal, onProgress: () => ac.abort() });
     const err = await p.catch((e: unknown) => e);
     expect(err).toBeInstanceOf(WorkerJobError);
     expect((err as WorkerJobError).code).toBe("CANCELLED");
@@ -218,13 +224,13 @@ describe("WorkerClient.submit", () => {
 
   it("keeps a job pending when the worker is unreachable and resubmits it on the next launch", async () => {
     const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     const down = await stubWorker(() => ({ status: "done" }));
     closers.pop()!(); // close it: connections are refused
     await new Promise((r) => setTimeout(r, 20));
     const offline = new WorkerClient({ repo, worker: down, index: { db }, pollMs: 10 });
-    const output = join(tmp, "o.jpg");
+    const output = join(files, "o.jpg");
     await expect(offline.submit(project.id, { type: "image.proxy", input, output, params: { maxEdge: 100 } })).rejects.toBeInstanceOf(
       WorkerUnavailableError,
     );
@@ -249,7 +255,7 @@ describe("WorkerClient.submit", () => {
 describe("WorkerClient polling", () => {
   async function imageJob(failPolls: number) {
     const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     let workerOut = "";
     const worker = await stubWorker(
@@ -262,7 +268,7 @@ describe("WorkerClient polling", () => {
       { failPolls },
     );
     const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 10 });
-    const p = client.submit(project.id, { type: "image.proxy", input, output: join(tmp, "o.jpg"), params: {} });
+    const p = client.submit(project.id, { type: "image.proxy", input, output: join(files, "o.jpg"), params: {} });
     return { p, worker, workerOut: () => workerOut };
   }
 
@@ -406,7 +412,7 @@ describe("Task 62: jobs the service follows (an id, what it is about, finish, in
   };
   async function setup() {
     const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     const lines = async () =>
       (await readFile(journalPath(lib.root, project.folder), "utf8").catch(() => ""))
@@ -414,7 +420,7 @@ describe("Task 62: jobs the service follows (an id, what it is about, finish, in
         .filter(Boolean)
         .map((l) => JSON.parse(l) as JobRecord);
     const bytes = () => readFile(journalPath(lib.root, project.folder)).catch(() => Buffer.alloc(0));
-    return { project, input, output: join(tmp, "out", "a.jpg"), lines, bytes };
+    return { project, input, output: join(files, "out", "a.jpg"), lines, bytes };
   }
   /** A job left pending: submitted while the worker was unreachable. */
   async function pendingJob(projectId: string, input: string, output: string, extra: Partial<WorkerJob> = {}): Promise<string> {
@@ -456,7 +462,7 @@ describe("Task 62: jobs the service follows (an id, what it is about, finish, in
       },
     });
     expect(seen).toEqual({ file: true, status: "running" });
-    const err = await client.submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "b.jpg"), params: {}, finish: async () => { throw new Error("disk full"); } }).catch((e: unknown) => e);
+    const err = await client.submit(project.id, { type: "image.proxy", input, output: join(files, "out", "b.jpg"), params: {}, finish: async () => { throw new Error("disk full"); } }).catch((e: unknown) => e);
     expect((err as Error).message).toBe("disk full");
     expect((await lines()).at(-1)).toMatchObject({ status: "failed", error: "FAILED" });
   });
@@ -554,16 +560,16 @@ describe("Task 62: jobs the service follows (an id, what it is about, finish, in
 
   it("fix 1 I2: a lock while the worker runs: nothing is published or stored, the job is cancelled-locked and runs once at the unlock", async () => {
     const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     const worker = await stubWorker(okSubmit);
     let finished = 0;
     const err = await new WorkerClient({ repo, worker, index: { db }, pollMs: 5 })
-      .submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "e.jpg"), params: {}, finish: async () => void finished++, onProgress: () => repo.lockProject(project.id) })
+      .submit(project.id, { type: "image.proxy", input, output: join(files, "out", "e.jpg"), params: {}, finish: async () => void finished++, onProgress: () => repo.lockProject(project.id) })
       .catch((e: unknown) => e);
     expect((err as Error).name).toBe("ProjectLockedError");
     expect(finished).toBe(0);
-    expect(existsSync(join(tmp, "out", "e.jpg"))).toBe(false);
+    expect(existsSync(join(files, "out", "e.jpg"))).toBe(false);
     expect(jobRows().map((r) => r.status)).toEqual(["cancelled"]);
     await repo.unlockProject(project.id, "pw");
     const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 5 });
@@ -576,14 +582,14 @@ describe("Task 62: jobs the service follows (an id, what it is about, finish, in
 
   it("fix 1 I2: a lock during the finish step (the store refused): cancelled-locked, run once at the unlock", async () => {
     const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     const worker = await stubWorker(okSubmit);
     const err = await new WorkerClient({ repo, worker, index: { db }, pollMs: 5 })
       .submit(project.id, {
         type: "image.proxy",
         input,
-        output: join(tmp, "out", "f.jpg"),
+        output: join(files, "out", "f.jpg"),
         params: {},
         finish: async () => {
           repo.lockProject(project.id);
@@ -622,7 +628,7 @@ describe("Task 62: jobs the service follows (an id, what it is about, finish, in
   it("resumePending with a signal: an interrupt stops the job in hand (left pending) and starts no other", async () => {
     const { project, input, lines } = await setup();
     const ids = [];
-    for (let i = 0; i < 3; i++) ids.push(await pendingJob(project.id, input, join(tmp, "out", `${i}.jpg`)));
+    for (let i = 0; i < 3; i++) ids.push(await pendingJob(project.id, input, join(files, "out", `${i}.jpg`)));
     const slow = await stubWorker(okSubmit, { pollsUntilDone: 100_000 });
     const ac = new AbortController();
     const out = await new WorkerClient({ repo, worker: slow, index: { db }, pollMs: 5 }).resumePending(undefined, {
@@ -662,10 +668,10 @@ describe("R367: the run audits its allowed `process` decision, once", () => {
   for (const [type, op, name] of kinds) {
     it(`${type}: one \`process\` allow entry (op worker.${type}, the asset, ${op}/local), and only one, whether the job succeeds or fails`, async () => {
       const { project } = await repo.createProject({ name: "K", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
-      const input = join(tmp, name);
+      const input = join(files, name);
       await writeFile(input, "bytes");
       const entity = { type: "asset" as const, id: randomUUID() };
-      const output = type === "audio.transcribe" ? join(tmp, "out", "t") : join(tmp, "out", `o-${name}`);
+      const output = type === "audio.transcribe" ? join(files, "out", "t") : join(files, "out", `o-${name}`);
       const ok = await stubWorker(writeOut);
       await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).submit(project.id, { type, input, output, params: {}, entity });
       const after = await processEntries(project.folder);
@@ -684,23 +690,23 @@ describe("R367: the run audits its allowed `process` decision, once", () => {
     const { project } = await repo.createProject({ name: "C", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
     const before = (await auditEvents(project.folder)).length;
     const ok = await stubWorker(writeOut);
-    await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).submit(project.id, { type: "capture.download", input: "https://www.youtube.com/watch?v=abc", output: join(tmp, "cap"), params: {} });
+    await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).submit(project.id, { type: "capture.download", input: "https://www.youtube.com/watch?v=abc", output: join(files, "cap"), params: {} });
     expect((await auditEvents(project.folder)).slice(before)).toEqual([]);
   });
 
   it("one run of a job, one entry: a rerun after a restart, a rerun after an unlock and a lost claim add none", async () => {
     const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     // Left pending by a worker that went away (a restart follows).
     const down = await stubWorker(() => ({ status: "done" }));
     await closers.pop()!();
-    await expect(new WorkerClient({ repo, worker: down, index: { db }, pollMs: 5 }).submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "a.jpg"), params: {} })).rejects.toBeInstanceOf(WorkerUnavailableError);
+    await expect(new WorkerClient({ repo, worker: down, index: { db }, pollMs: 5 }).submit(project.id, { type: "image.proxy", input, output: join(files, "out", "a.jpg"), params: {} })).rejects.toBeInstanceOf(WorkerUnavailableError);
     expect(await processEntries(project.folder)).toHaveLength(1);
     // Cancelled by a lock while the worker runs; runs again at the unlock.
     const ok = await stubWorker(writeOut);
     await expect(
-      new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "b.jpg"), params: {}, finish: async () => {}, onProgress: () => repo.lockProject(project.id) }),
+      new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).submit(project.id, { type: "image.proxy", input, output: join(files, "out", "b.jpg"), params: {}, finish: async () => {}, onProgress: () => repo.lockProject(project.id) }),
     ).rejects.toThrow(ProjectLockedError);
     expect(await processEntries(project.folder)).toHaveLength(2);
     await repo.unlockProject(project.id, "pw");
@@ -716,10 +722,10 @@ describe("R367: the run audits its allowed `process` decision, once", () => {
 
   it("a denial at the run is audited as before: one deny, no allow", async () => {
     const { project } = await repo.createProject({ name: "D", governanceYaml: NO_TRANSCRIPTION_GOV, encryption: { enabled: false } });
-    const input = join(tmp, "a.wav");
+    const input = join(files, "a.wav");
     await writeFile(input, "RIFF");
     const worker = await stubWorker(() => ({ status: "done" }));
-    await expect(new WorkerClient({ repo, worker, index: { db }, pollMs: 5 }).submit(project.id, { type: "audio.transcribe", input, output: join(tmp, "t"), params: {} })).rejects.toBeInstanceOf(PolicyDeniedError);
+    await expect(new WorkerClient({ repo, worker, index: { db }, pollMs: 5 }).submit(project.id, { type: "audio.transcribe", input, output: join(files, "t"), params: {} })).rejects.toBeInstanceOf(PolicyDeniedError);
     expect((await processEntries(project.folder)).map((e) => e.decision?.result)).toEqual(["deny"]);
   });
 });

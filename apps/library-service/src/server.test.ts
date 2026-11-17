@@ -4,7 +4,7 @@
  * service's entry point.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -2616,13 +2616,15 @@ describe("worker client and the index (Task 51)", () => {
         }),
       };
       await start({ worker: provider, autoStartWorker: true });
-      await openNewLibrary();
+      const root = await openNewLibrary();
       const pid = await newProject();
       const client = await svc.state.workerClient();
-      const input = join(tmp, "a.png");
+      // Job paths inside the library (R379).
+      const input = join(root, "test-files", "a.png");
+      await mkdir(dirname(input), { recursive: true });
       await writeFile(input, "png");
       expect((await call({ method: "POST", url: "/libraries/rebuild-index" })).status).toBe(200);
-      const r = await client.submit(pid, { type: "image.proxy", input, output: join(tmp, "out", "a.jpg"), params: {} });
+      const r = await client.submit(pid, { type: "image.proxy", input, output: join(root, ".tmp", "test-files", "out", "a.jpg"), params: {} });
       const db = svc.state.session!.index!.db;
       expect(db.prepare("SELECT status FROM jobs WHERE id = ?").get(r.id)).toEqual({ status: "done" });
     } finally {
@@ -2691,9 +2693,11 @@ describe("worker jobs rerun at an unlock (Task 51 N-2)", () => {
     const client = await svc.state.workerClient();
     await svc.state.idle();
     onFirst = () => svc.state.session!.repo.lockProject(pid);
-    const input = join(tmp, "a.png");
+    // Job paths inside the library (R379).
+    const input = join(root, "test-files", "a.png");
+    await mkdir(dirname(input), { recursive: true });
     await writeFile(input, "png");
-    const err = await client.submit(pid, { type: "image.proxy", input, output: join(tmp, "out", "a.jpg"), params: {} }).catch((e: unknown) => e);
+    const err = await client.submit(pid, { type: "image.proxy", input, output: join(root, ".tmp", "test-files", "out", "a.jpg"), params: {} }).catch((e: unknown) => e);
     expect((err as Error).name).toBe("ProjectLockedError");
     const folder = (await call({ url: "/projects" })).json.projects.find((p: { id: string }) => p.id === pid).folder as string;
     const journalLines = async (libRoot: string) =>

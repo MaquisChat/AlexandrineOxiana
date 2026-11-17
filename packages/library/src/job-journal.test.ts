@@ -31,6 +31,8 @@ encryption:
 const MARKER = "zebra-marker-7f3a9c";
 
 let tmp: string;
+/** A folder inside the library for the jobs' inputs and outputs. */
+let files: string;
 let lib: Library;
 let ring: KeyRing;
 let repo: Repo;
@@ -88,10 +90,10 @@ async function indexBytes(): Promise<Buffer> {
 
 /** One finished job and one left pending (the worker was unreachable) in the project. */
 async function finishedAndPending(projectId: string): Promise<{ done: string; pending: string; input: string; output: string }> {
-  const input = join(tmp, "a.png");
+  const input = join(files, "a.png");
   await writeFile(input, "png");
-  const r = await client(await okWorker()).submit(projectId, { type: "image.proxy", input, output: join(tmp, "done.jpg"), params: { label: MARKER } });
-  const output = join(tmp, "pending.jpg");
+  const r = await client(await okWorker()).submit(projectId, { type: "image.proxy", input, output: join(files, "done.jpg"), params: { label: MARKER } });
+  const output = join(files, "pending.jpg");
   await expect(client(await downWorker()).submit(projectId, { type: "image.proxy", input, output, params: { label: MARKER } })).rejects.toBeInstanceOf(
     WorkerUnavailableError,
   );
@@ -103,6 +105,10 @@ beforeEach(async () => {
   tmp = await mkdtemp(join(tmpdir(), "ao-job-journal-"));
   ring = new KeyRing();
   lib = await createLibrary(join(tmp, "Lib"), "Lib", deps());
+  // Job inputs and outputs live in the library's work folder (R379: the journal stores no absolute
+  // path; R400 b: a job writes only below `.tmp`).
+  files = join(lib.root, ".tmp", "test-files");
+  await mkdir(files, { recursive: true });
   handle = new IndexHandle(lib.root);
   repo = await mkRepo();
 });
@@ -276,7 +282,7 @@ describe("job journal", () => {
     const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
     expect(() => assertNoSecrets({ cookiesFromBrowser: "firefox", quality: "best" })).not.toThrow();
     for (const params of [{ cookie: "sid=1" }, { nested: { apiKey: "k" } }, { Authorization: "Bearer x" }, { passphrase: "pw" }]) {
-      await expect(client(await okWorker()).submit(project.id, { type: "image.proxy", input: join(tmp, "x"), output: join(tmp, "y.jpg"), params })).rejects.toBeInstanceOf(TypeError);
+      await expect(client(await okWorker()).submit(project.id, { type: "image.proxy", input: join(files, "x"), output: join(files, "y.jpg"), params })).rejects.toBeInstanceOf(TypeError);
     }
     expect(jobRows()).toEqual([]);
     expect((await readJobJournal(lib.root, project.folder, project.id, null)).lines).toBe(0);
@@ -330,14 +336,14 @@ describe("upgrade of a library made before the journal", () => {
   it("writes legacy rows into the journals once (plain now, encrypted when unlocked), then survives deleting library.sqlite", async () => {
     const { project: plain } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
     const { project: enc } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     const job = (output: string) => ({ type: "image.proxy", input, output, params: { label: MARKER } });
     const k = projectDataKey(repo, enc.id)!;
-    const sealed = JSON.stringify({ sealed: (await encryptBytes(k.key, k.keyId, JSON.stringify(job(join(tmp, "e.jpg"))))).toString("base64") });
+    const sealed = JSON.stringify({ sealed: (await encryptBytes(k.key, k.keyId, JSON.stringify(job(join(files, "e.jpg"))))).toString("base64") });
     await legacyIndex([
       ["p-done", plain.id, "image.proxy", "done", "{}"],
-      ["p-queued", plain.id, "image.proxy", "queued", JSON.stringify(job(join(tmp, "p.jpg")))],
+      ["p-queued", plain.id, "image.proxy", "queued", JSON.stringify(job(join(files, "p.jpg")))],
       ["e-running", enc.id, "image.proxy", "running", sealed],
       ["gone", "no-such-project", "pdf.ocr", "queued", "{}"],
     ]);
@@ -363,7 +369,7 @@ describe("upgrade of a library made before the journal", () => {
     await repo.unlockProject(enc.id, "pw");
     expect(getMeta(handle.db, "jobsLegacy")).toBeUndefined();
     const ej = await readJobJournal(lib.root, enc.folder, enc.id, projectDataKey(repo, enc.id));
-    expect(ej.records.get("e-running")).toMatchObject({ status: "running", job: { output: join(tmp, "e.jpg"), params: { label: MARKER } } });
+    expect(ej.records.get("e-running")).toMatchObject({ status: "running", job: { output: ".tmp/test-files/e.jpg", params: { label: MARKER } } });
     expect(jobRows().map((r) => r.payload_json)).toEqual(["{}", "{}", "{}"]);
 
     await dropIndex();
@@ -387,7 +393,7 @@ describe("R142: a lock while a job runs", () => {
     const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
     const k = projectDataKey(repo, project.id)!;
     const key = { key: Uint8Array.from(k.key), keyId: k.keyId };
-    const input = join(tmp, "a.png.enc");
+    const input = join(files, "a.png.enc");
     await writeFile(input, await encryptBytes(key.key, key.keyId, "png"));
     return { project, key, input };
   }
@@ -406,7 +412,7 @@ describe("R142: a lock while a job runs", () => {
     );
     const c = client(w);
     let heldWhileRunning = -1;
-    const output = join(tmp, "out", "p.jpg");
+    const output = join(files, "out", "p.jpg");
     const r = await c.submit(project.id, {
       type: "image.proxy", input, inputEncrypted: true, output, params: {},
       onProgress: () => {
@@ -446,7 +452,7 @@ describe("R142: a lock while a job runs", () => {
       return { status: "done", result: { output: job.body.output, meta: {} } };
     }, { pollsUntilDone: 3 });
     const c = client(w);
-    const err = await c.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(tmp, "o.jpg"), params: {} }).catch((e: unknown) => e);
+    const err = await c.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(files, "o.jpg"), params: {} }).catch((e: unknown) => e);
     expect((err as Error).name).toBe("ProjectLockedError");
     expect(w.requests).toContain("POST /jobs/j1/cancel");
     expect(c.heldKeys).toBe(0);
@@ -465,12 +471,12 @@ describe("R142: a lock while a job runs", () => {
   it("the captured key is dropped after a failure and after a cancellation", async () => {
     const { project, input } = await encryptedJob();
     const failing = client(await stubWorker(() => ({ status: "failed", error: { code: "UNSUPPORTED_INPUT", message: "no" } })));
-    await expect(failing.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(tmp, "f.jpg"), params: {} })).rejects.toThrow();
+    await expect(failing.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(files, "f.jpg"), params: {} })).rejects.toThrow();
     expect(failing.heldKeys).toBe(0);
     const slow = client(await stubWorker(() => ({ status: "done", result: { output: "", meta: {} } }), { pollsUntilDone: 1000 }));
     const ac = new AbortController();
     await expect(
-      slow.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(tmp, "c.jpg"), params: {}, signal: ac.signal, onProgress: () => ac.abort() }),
+      slow.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(files, "c.jpg"), params: {}, signal: ac.signal, onProgress: () => ac.abort() }),
     ).rejects.toThrow();
     expect(slow.heldKeys).toBe(0);
   });
@@ -547,14 +553,14 @@ describe("R142 fix round 2: a rerun happens once", () => {
   async function lockCancelled(n: number) {
     const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
     const key = projectDataKey(repo, project.id);
-    const input = join(tmp, "a.png");
+    const input = join(files, "a.png");
     await writeFile(input, "png");
     const recs: JobRecord[] = [];
     for (let i = 0; i < n; i++) {
       const at = new Date(Date.now() - (n - i) * 1000).toISOString();
       recs.push({
         v: 1, id: `job-${i}`, projectId: project.id, kind: "image.proxy", status: "cancelled", error: "PROJECT_LOCKED", createdAt: at, updatedAt: at,
-        job: { type: "image.proxy", input, output: join(tmp, `out-${i}`, "p.jpg"), params: { n: i } },
+        job: { type: "image.proxy", input, output: join(files, `out-${i}`, "p.jpg"), params: { n: i } },
       });
     }
     await appendJobRecords(lib.root, project.folder, key, recs);
@@ -635,7 +641,7 @@ describe("R142 fix round 2: smaller points", () => {
   it("N-3: a lock that lands before the job starts decrypts nothing", async () => {
     const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
     // An "encrypted input" that cannot be read: decrypting it would fail the job instead.
-    const input = join(tmp, "dir.png.enc");
+    const input = join(files, "dir.png.enc");
     await mkdir(input);
     let armed = true;
     const index = {
@@ -650,7 +656,7 @@ describe("R142 fix round 2: smaller points", () => {
     };
     const w = await okWorker();
     const c = new WorkerClient({ repo, worker: w, index, pollMs: 5 });
-    const err = await c.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(tmp, "o.jpg"), params: {} }).catch((e: unknown) => e);
+    const err = await c.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(files, "o.jpg"), params: {} }).catch((e: unknown) => e);
     expect((err as Error).name).toBe("ProjectLockedError");
     expect(w.requests).toEqual([]);
     expect(jobRows().map((r) => [r.status, r.payload_json])).toEqual([["cancelled", '{"error":"PROJECT_LOCKED"}']]);

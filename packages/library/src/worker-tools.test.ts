@@ -3,7 +3,7 @@
  * as worker jobs with progress and cancel, and missing tools named on ordinary jobs.
  */
 import { createServer, type Server } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -159,6 +159,7 @@ let lib: Library;
 let ring: KeyRing;
 let repo: Repo;
 let db: IndexDb;
+let files: string;
 
 function deps(): Deps {
   return {
@@ -179,6 +180,8 @@ describe("WorkerClient.submit with a missing tool", () => {
     tmp = await mkdtemp(join(tmpdir(), "ao-worker-tools-"));
     ring = new KeyRing();
     lib = await createLibrary(join(tmp, "Lib"), "Lib", deps());
+    files = join(lib.root, ".tmp", "test-files"); // job paths in the library's work folder (R379, R400 b)
+    await mkdir(files, { recursive: true });
     repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester" });
     db = openIndex(lib.root);
   });
@@ -191,11 +194,11 @@ describe("WorkerClient.submit with a missing tool", () => {
 
   it("throws WorkerToolError naming the tool (a WorkerJobError, so existing handling still applies)", async () => {
     const { project } = await repo.createProject({ name: "P", governanceYaml: "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\n", encryption: { enabled: false } });
-    const input = join(tmp, "clip.mov");
+    const input = join(files, "clip.mov");
     await writeFile(input, "video");
     const worker = await stubWorker(() => ({ status: "failed", error: { code: "TOOL_NOT_INSTALLED", message: "Video tools (ffmpeg) is not installed.", tool: "ffmpeg" } }), { token: TOKEN, closers });
     const err = await new WorkerClient({ repo, worker, index: { db }, pollMs: 10 })
-      .submit(project.id, { type: "video.proxy", input, output: join(tmp, "out", "p.mp4"), params: {} })
+      .submit(project.id, { type: "video.proxy", input, output: join(files, "out", "p.mp4"), params: {} })
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(WorkerToolError);
     expect(err).toBeInstanceOf(WorkerJobError);

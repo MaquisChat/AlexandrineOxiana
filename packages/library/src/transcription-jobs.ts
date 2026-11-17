@@ -65,6 +65,8 @@ export async function transcriptionJob(
     type: TRANSCRIBE_KIND,
     input: join(repoLibrary(repo).root, ...media.path.split("/")),
     inputEncrypted: media.encrypted,
+    // A linked recording is recorded as its asset, never by its path (R379).
+    ...(media.linked ? { inputAsset: { sourceId, assetId: media.id } } : {}),
     output: outputFor(repo, opts.id),
     params: p,
     entity: { type: "asset", id: media.id },
@@ -100,6 +102,7 @@ export async function transcriptionRerun(repo: Repo, rec: JobRecord, onStored?: 
   return {
     input: join(repoLibrary(repo).root, ...media.path.split("/")),
     inputEncrypted: media.encrypted,
+    ...(media.linked ? { inputAsset: { sourceId, assetId: media.id } } : {}),
     output: outputFor(repo, rec.id),
     finish: async (r) => {
       const stored = await storeTranscript(repo, rec.projectId, sourceId, media, r, params, "user");
