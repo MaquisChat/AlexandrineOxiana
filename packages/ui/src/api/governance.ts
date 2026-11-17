@@ -6,7 +6,7 @@
  * Governance edits always name the version they were made from (`baseSha256`, the sha256 GET
  * returned; R99): the service answers 409 CONFLICT when the file changed elsewhere meanwhile.
  */
-import type { AttentionMarksResponse, AuditReasonView, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
+import type { AttentionMarksResponse, AuditReasonView, GovernanceReadability, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "./client";
 
 /**
@@ -49,13 +49,15 @@ export interface Violation {
   profile: Profile;
 }
 
-export interface GovernanceFile {
+/** The rules as written, and whether the policy engine can read them (R379 FR-A18). */
+export interface GovernanceFile extends GovernanceReadability {
   yaml: string;
   sha256: string;
   violations: Violation[];
 }
 
-export interface GovernanceSaved {
+/** The answer to a save; its readability is that of the text just saved (R379 FR-A18). */
+export interface GovernanceSaved extends GovernanceReadability {
   violations: Violation[];
   loosened: string[];
   sha256: string;

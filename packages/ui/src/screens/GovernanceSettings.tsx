@@ -7,9 +7,15 @@
  * time). Saving sends the version the edit was made from (R99); a 409 means the file changed
  * elsewhere: the edits stay and the person can reload. Violations the service reports are shown on
  * the card of their control. Also: protocol approval documents and the retention list.
+ *
+ * The cards are read with a lenient reader (so a broken file can still be corrected here); whether
+ * the policy engine can read the rules is the service's to say (R379 FR-A18, R58): when it cannot,
+ * an alert says that every capture, import, change and export is refused and lists the problems;
+ * readable rules with notes show them. Both are re-read after a save.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { isMap, isScalar, isSeq, parseDocument, type Document } from "yaml";
+import { GOVERNANCE_UNREADABLE_TEXT, GOVERNANCE_WARNINGS_TEXT, type GovernanceReadability } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
 import { FileDrop } from "../components/FileDrop";
@@ -111,6 +117,8 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
   };
   useEffect(() => () => clearTimeout(rawTimer.current), []);
   const [violations, setViolations] = useState<Violation[]>([]);
+  /** Whether the policy engine can read the saved rules, with its problems or notes (R379 FR-A18). */
+  const [readability, setReadability] = useState<GovernanceReadability | null>(null);
   const [reasons, setReasons] = useState<string[]>([]);
   const [pending, setPending] = useState<Pending | null>(null);
   const [status, setStatus] = useState<Status>(null);
@@ -127,6 +135,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
       setSaved({ yaml: g.yaml, sha256: g.sha256 });
       setText(g.yaml);
       setViolations(g.violations);
+      setReadability(readabilityOf(g));
       setReasons([]);
       setStatus(null);
       setLoadError(null);
@@ -216,6 +225,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
       const r = await api.putGovernance(projectId, text, saved.sha256, all.length ? all.join("; ") : undefined);
       setSaved({ yaml: text, sha256: r.sha256 });
       setViolations(r.violations);
+      setReadability(readabilityOf(r));
       setReasons([]);
       setStatus({ kind: "saved" });
     } catch (err) {
@@ -269,6 +279,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
   return (
     <main className="ao-screen">
       <h1>Governance</h1>
+      <RulesReadability readability={readability} />
       <p className="ao-hint">These rules are checked on every capture, import, change and export in this project. You may make any rule stricter; making one looser asks for a reason, which is kept in the audit log.</p>
       {readOnlyReason ? (
         <p id={`${rawId}-why`} className="ao-warning">
@@ -474,6 +485,48 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
         />
       ) : null}
     </main>
+  );
+}
+
+/** The service's readability answer, as given (lists default to empty). */
+function readabilityOf(g: Partial<GovernanceReadability>): GovernanceReadability {
+  return { readable: g.readable !== false, issues: g.issues ?? [], warnings: g.warnings ?? [] };
+}
+
+/**
+ * Rules the policy engine cannot read (an alert: every request in the project is refused), or the
+ * notes from reading readable ones (R379 FR-A18, R58). The alert does not move focus.
+ */
+function RulesReadability({ readability }: { readability: GovernanceReadability | null }) {
+  if (!readability) return null;
+  if (!readability.readable) {
+    return (
+      <div role="alert" className="ao-warning">
+        <p>{GOVERNANCE_UNREADABLE_TEXT}</p>
+        {readability.issues.length ? (
+          <ul className="ao-list">
+            {readability.issues.map((issue, i) => (
+              <li key={i}>
+                <UserText>{issue}</UserText>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+    );
+  }
+  if (!readability.warnings.length) return null;
+  return (
+    <div className="ao-hint">
+      <p>{GOVERNANCE_WARNINGS_TEXT}</p>
+      <ul className="ao-list">
+        {readability.warnings.map((w, i) => (
+          <li key={i}>
+            <UserText>{w}</UserText>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
