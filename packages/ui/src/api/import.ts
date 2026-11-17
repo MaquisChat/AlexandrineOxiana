@@ -67,6 +67,13 @@ export interface ScanSummary {
   outsideFiles: Array<{ item: string; folder: string; file: string }>;
   /** Files the source links in place (Zotero linked attachments), approved or not (R136); absent from an older service. */
   linkedFiles?: number;
+  /**
+   * R413 a: the bytes a batch with the default options would copy into the library, the free room on its disk, and the
+   * sentence a start would be refused with when they do not fit (all absent from an older service).
+   */
+  copyBytes?: number;
+  freeBytes?: number;
+  spaceWarning?: string;
 }
 
 export type BatchState = "running" | "paused" | "cancelled" | "finished" | "failed" | "undone" | "interrupted";

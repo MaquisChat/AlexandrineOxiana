@@ -11,7 +11,8 @@
  * or repeated batch recognises its items. ZIP archives are unpacked with the archive limits
  * (extractArchive: ≤ 50 MB per entry, ≤ 2 GB in all, ≤ 100,000 entries; traversal, absolute and
  * symlink entries refuse the archive) into the batch's private work folder; their items are keyed
- * `<archive key>!/<entry name>`. A refused or unreadable archive is one item with `unreadable` set.
+ * `<archive key>!/<entry name>`. A refused or unreadable archive is one item with `unreadable` set; a full disk while
+ * unpacking ends the scan (R436 a).
  */
 import type { Dirent } from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -27,6 +28,7 @@ import { bibtexAdapter, cslJsonAdapter, risAdapter } from "../refman.js";
 import { SIDECAR_EXTS } from "../sidecar.js";
 import { zoteroLocalAdapter } from "../zotero-local.js";
 import { zoteroRdfAdapter } from "../zotero-rdf.js";
+import { isDiskFull } from "./space.js";
 import { zoteroWebAdapterFor } from "../zotero-web.js";
 
 export interface ScanFile {
@@ -166,6 +168,11 @@ export interface ScanContext {
    */
   total?(n: number): void;
   /**
+   * R413 d: the room the scan's own temporary copies (the Zotero database) must leave free on the library's disk beyond
+   * themselves: the files the batch will copy and the import's margin (bulk/space.ts). Absent: the margin alone.
+   */
+  reserveBytes?: number;
+  /**
    * True when the engine will pass this item by anyway (e.g. it is already in a resumed batch's
    * journal): an adapter that downloads may then fetch nothing for it and yield nothing. Optional:
    * an adapter that ignores it is still correct (the engine keeps its own journal check). The adapter
@@ -265,6 +272,9 @@ async function* zipItems(zipPath: string, key: string, folderPath: string[], sig
   } catch (err) {
     await fsp.rm(dest, { recursive: true, force: true }).catch(() => {});
     if ((err as Error)?.name === "AbortError") throw err;
+    // R436 a: a full disk (or a quota) while unpacking is the batch's condition, not the archive's: it ends the scan
+    // (the run stops the batch, resumable, nothing recorded as failed) instead of making the archive "unreadable".
+    if (isDiskFull(err)) throw err;
     yield { key, files: [], unreadable: err instanceof UnsafeFileError ? `${err.message}, so it was not imported.` : ARCHIVE_UNREADABLE };
     return;
   }

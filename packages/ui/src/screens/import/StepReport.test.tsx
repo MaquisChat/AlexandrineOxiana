@@ -187,3 +187,34 @@ describe("kept edits", () => {
     expect(document.querySelector("li b")).toBeNull();
   });
 });
+
+describe("failures grouped by reason, the notes above them (R393)", () => {
+  const EMFILE = "The item could not be imported: the computer would not open more files at once. Close other programs and import again.";
+  const TYPE = "The item could not be imported: an unexpected error (TypeError).";
+  const STOP = "The import stopped because the computer would not open more files at once; close other programs and resume the batch to continue.";
+  const many = (n: number, reason: string, prefix: string) => Array.from({ length: n }, (_, i) => ({ item: `${prefix}:${i}`, reason }));
+
+  it("one entry per reason with its number of items; more than ten items are collapsed, fewer are shown", async () => {
+    show(report({ failures: [...many(12, EMFILE, "zotero:A"), ...many(2, TYPE, "zotero:B")], notes: [STOP] }, { failed: 14 }));
+    const failures = (await screen.findByText("Failures (14)")).closest("details")!;
+    expect(failures.open).toBe(true);
+    // The sentence once per reason, not once per item.
+    expect(within(failures).getAllByText(EMFILE, { exact: false })).toHaveLength(1);
+    const big = within(failures).getByText(`${EMFILE} (12 items)`).closest("details")!;
+    expect(big.open).toBe(false);
+    expect(within(big).getAllByRole("listitem")).toHaveLength(12);
+    // Ten items or fewer: listed under their reason, not collapsed.
+    const small = within(failures).getByText(`${TYPE} (2 items)`);
+    expect(small.closest("details")).toBe(failures);
+    expect(within(failures).getByText("zotero:B:1")).toBeTruthy();
+  });
+
+  it("the notes (the batch's stopping sentence) come right under the summary, before the failures", async () => {
+    show(report({ failures: many(3, EMFILE, "k"), notes: [STOP] }, { failed: 3 }));
+    const note = await screen.findByText(STOP);
+    const failures = screen.getByText("Failures (3)").closest("details")!;
+    expect(note.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Items by outcome" });
+    expect(table.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});

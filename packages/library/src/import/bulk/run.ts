@@ -82,7 +82,7 @@ import { UnsafeFileError } from "../../extract/errors.js";
 import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
 import { lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
-import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../../repo/errors.js";
+import { NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "../../repo/errors.js";
 import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
 import {
@@ -101,6 +101,7 @@ import {
   type Repo,
   projectDateZone,
   repoClock,
+  recoveryPendingProjects,
 } from "../../repo/repo.js";
 import { activeTemp } from "../../tmp-registry.js";
 import { acceptedType } from "../attach.js";
@@ -118,6 +119,7 @@ import {
   appendJournal,
   itemKeyHash,
   runListeners,
+  unsavedStops,
   batchDirs,
   countOutcomes,
   fileCounts,
@@ -145,6 +147,7 @@ import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRe
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
+import { DISK_FULL_NOTE, DISK_FULL_UNDONE_NOTE, NoRoomError, RECOVERY_NOTE, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir, type ScanApprovals } from "./space.js";
 import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = libraryVersion();
@@ -254,6 +257,108 @@ export const REASONS = {
   linkEncrypted:
     "Files cannot be linked in place in this project: its files must be encrypted at rest, and a linked file stays outside the library. Choose to copy the files instead.",
 } as const;
+
+/**
+ * R393: what an UNEXPECTED error was, said in plain words. Each kind (the system's error code) has what happened,
+ * for an item and for the batch, and what the researcher can do about it where there is something. SQLite codes can
+ * come from Zotero's database (read while the source is scanned) or from the library's own index (dedupe keys), so
+ * the sentence names both.
+ */
+interface CauseText {
+  item: string;
+  batch: string;
+  itemAction?: string;
+  batchAction?: string;
+}
+const NO_FILES: CauseText = {
+  item: "the computer would not open more files at once",
+  batch: "the computer would not open more files at once",
+  itemAction: "Close other programs and import again.",
+  batchAction: "close other programs and resume the batch to continue",
+};
+const UNREADABLE: CauseText = {
+  item: "a file of the item could not be read",
+  batch: "a file could not be read",
+  itemAction: "Check that the app may read the folder the file is in, then import again.",
+  batchAction: "check that the app may read the folder the import comes from, then resume the batch to continue",
+};
+const DB_BUSY: CauseText = {
+  item: "a database was busy (Zotero's, or the library's own index)",
+  batch: "a database was busy (Zotero's, or the library's own index)",
+  itemAction: "Close Zotero and import again.",
+  batchAction: "close Zotero and resume the batch to continue",
+};
+const DB_UNREADABLE: CauseText = {
+  item: "a database could not be read (Zotero's, or the library's own index)",
+  batch: "a database could not be read (Zotero's, or the library's own index)",
+};
+const CAUSE_TEXTS: Readonly<Record<string, CauseText>> = {
+  ENOSPC: { item: "the disk is full", batch: "the disk is full", itemAction: "Free some space and import again.", batchAction: "free some space and resume the batch to continue" },
+  EDQUOT: { item: "the disk is full", batch: "the disk is full", itemAction: "Free some space and import again.", batchAction: "free some space and resume the batch to continue" },
+  EMFILE: NO_FILES,
+  ENFILE: NO_FILES,
+  ENOENT: { item: "a file of the item was not found", batch: "a file was not found" },
+  EACCES: UNREADABLE,
+  EPERM: UNREADABLE,
+  EIO: { item: "the disk reported an error", batch: "the disk reported an error", itemAction: "Check the disk and import again.", batchAction: "check the disk and resume the batch to continue" },
+  ENAMETOOLONG: { item: "a file's name is too long", batch: "a file's name is too long" },
+  SQLITE_BUSY: DB_BUSY,
+  SQLITE_LOCKED: DB_BUSY,
+};
+
+/** A system code (`EMFILE`), a SQLite code (`SQLITE_BUSY_SNAPSHOT`) or a Node code (`ERR_…`): never free text. */
+const CODE_FORM = /^(?:E[A-Z0-9]{2,15}|SQLITE_[A-Z_]{2,40}|ERR_[A-Z0-9_]{2,60})$/u;
+/** An error class's name (`TypeError`, `SqliteError`): an identifier, never free text. */
+const CLASS_FORM = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
+
+/**
+ * R393 a: the kind of an unexpected error — its system code where it (or an error it wraps as `cause`) has one, else
+ * its class name; "unknown" for something thrown that is not an error. Never the message, never a path.
+ */
+export function causeOf(err: unknown): string {
+  for (let e: unknown = err, depth = 0; e && typeof e === "object" && depth < 4; e = (e as { cause?: unknown }).cause, depth++) {
+    const code = (e as { code?: unknown }).code;
+    if (typeof code === "string" && CODE_FORM.test(code)) return code;
+  }
+  if (!(err instanceof Error)) return "unknown";
+  return CLASS_FORM.test(err.name) ? err.name : "Error";
+}
+
+const causeText = (kind: string): CauseText | undefined => CAUSE_TEXTS[kind] ?? (kind.startsWith("SQLITE_BUSY") || kind.startsWith("SQLITE_LOCKED") ? DB_BUSY : kind.startsWith("SQLITE_") ? DB_UNREADABLE : undefined);
+
+/** R393 a: an item's failure of the given kind, as the report says it. */
+export function failedReason(kind: string): string {
+  const t = causeText(kind);
+  if (!t) return `The item could not be imported: an unexpected error (${kind}).`;
+  return `The item could not be imported: ${t.item}.${t.itemAction ? ` ${t.itemAction}` : ""}`;
+}
+
+/** R393 a: the note of a batch stopped by an error of the given kind (R413 b: a full disk has its own sentence). */
+export function stoppedNote(kind: string): string {
+  if (kind === "ENOSPC" || kind === "EDQUOT") return DISK_FULL_NOTE;
+  if (kind === "RecoveryPendingError") return RECOVERY_NOTE;
+  const t = causeText(kind);
+  if (!t) return `The import stopped because of an unexpected error (${kind}); resume the batch to continue.`;
+  return `The import stopped because ${t.batch}; ${t.batchAction ?? "resume the batch to continue"}.`;
+}
+
+/** Every note `stoppedNote` writes (and the one written before R393): a resumed run drops them. */
+const STOPPED_NOTE = /^The import stopped because .*(?:; .*resume the batch to continue|, then resume the import)\.$/u;
+
+/**
+ * R393 b: an unexpected error for the log — its kind, code, syscall and errno, and the program's stack frames (the
+ * lines that start with "at"); never its message, which may hold a path, a title or a name.
+ */
+export function errorForLog(err: unknown): string {
+  const e = (err ?? {}) as { code?: unknown; syscall?: unknown; errno?: unknown; name?: unknown; stack?: unknown };
+  const parts = [`kind=${causeOf(err)}`];
+  if (err instanceof Error) parts.push(`class=${CLASS_FORM.test(err.name) ? err.name : "Error"}`);
+  if (typeof e.code === "string" && CODE_FORM.test(e.code)) parts.push(`code=${e.code}`);
+  if (typeof e.syscall === "string" && /^[a-z_]{1,32}$/u.test(e.syscall)) parts.push(`syscall=${e.syscall}`);
+  if (typeof e.errno === "number") parts.push(`errno=${e.errno}`);
+  const frames = typeof e.stack === "string" ? e.stack.split("\n").filter((l) => /^\s+at /u.test(l)).slice(0, 20) : [];
+  return [parts.join(" "), ...frames].join("\n");
+}
 
 /**
  * Why a batch was refused, for callers that map it (R106): `denied` the project's rules; `running`
@@ -369,6 +474,10 @@ export interface BatchHandle {
 export interface ScanSummary {
   items: number;
   byType: Record<string, number>;
+  /**
+   * R436 b: the bytes of the files a batch would copy or link: only files of a kind that is imported, each once, and
+   * none of an item already in the project or a second copy within the scan (what the run would take as a duplicate).
+   */
   totalBytes: number;
   /** Items that are likely duplicates of another item in the scan or of a source in the project. */
   likelyDuplicates: number;
@@ -388,6 +497,14 @@ export interface ScanSummary {
    * offers to keep them as links only when there are some (R136).
    */
   linkedFiles: number;
+  /**
+   * R413 a: the bytes a batch with the default options (copy; files the source links in place kept as links, where
+   * the project allows) would copy into the library, and the free room on the library's disk (absent when it cannot
+   * tell); `spaceWarning`, the sentence a start would be refused with, when they do not fit.
+   */
+  copyBytes?: number;
+  freeBytes?: number;
+  spaceWarning?: string;
 }
 
 export interface BatchSummary {
@@ -509,6 +626,31 @@ async function preflightDeleted(repo: Repo, projectId: string, adapter: { increm
   await appendLibraryEvent(repo, projectId, "import.reset-deleted-records", {});
 }
 
+/** Kinds whose files can never be left where they are (R413 a): a ZIP's are unpacked from it, Zotero Web's downloaded. */
+const COPY_ONLY_KINDS: ReadonlySet<string> = new Set(["zip", "zotero-web"]);
+
+/**
+ * R413 a: before a batch that copies files starts, whether they fit. The bytes to be copied are what a dry run of
+ * the same source (and approvals) found within the last 30 minutes (R436 b; none: no check, the run's per-file check
+ * still protects), less the files the source links in place when they stay links; with the margin (10%, at least
+ * 500 MB) and, for a Zotero local import, its database copy, they must fit in the free room on the library's disk, or
+ * the start is refused (BatchRefusedError, nothing written). Returns the room the scan's own temporary copies must
+ * leave free beyond themselves (ScanContext.reserveBytes): the files and the margin.
+ */
+async function preflightSpace(repo: Repo, projectId: string, adapter: ImportSourceAdapter, options: ImportOptions, approvals: ScanApprovals | undefined): Promise<number> {
+  if (options.fileHandling === "link") return spaceMargin(0);
+  const est = rememberedScan(projectId, adapter, approvals, repoClock(repo)().getTime());
+  if (!est) return spaceMargin(0);
+  const linkRefused = await preflightLink(repo, projectId);
+  const copy = Math.max(0, est.totalBytes - (options.linkedFiles === "link" && !linkRefused ? est.linkedBytes : 0));
+  const reserve = copy + spaceMargin(copy);
+  if (!copy) return reserve;
+  const db = adapter.kind === "zotero-local" ? await zoteroCopyBytes(zoteroDataDir(adapter.location)) : 0;
+  const free = await freeRoom(repoLibrary(repo).root);
+  if (Number.isFinite(free) && reserve + db > free) throw new BatchRefusedError(fitSentence(copy, db, free, !linkRefused && !COPY_ONLY_KINDS.has(adapter.kind)));
+  return reserve;
+}
+
 /** Policy and option checks a batch must pass before it starts (or resumes). */
 async function preflight(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"], options: ImportOptions): Promise<GovernanceNote[]> {
   repo.getProject(projectId); // NotFoundError for an unknown project
@@ -574,6 +716,8 @@ interface Prepared {
   shaOf: Map<string, string>;
   /** Which files may carry a location and which get viewing proxies (R83); set by importItem. */
   plan: ProxyPlan;
+  /** R413 b: the bytes of the files that are to be copied into the library (not linked in place). */
+  copyBytes: number;
 }
 
 interface Queued {
@@ -667,6 +811,8 @@ class Run {
     journal: JournalEntry[],
     /** Resume guard: item-key hash → source of this batch found without a journal line. */
     private readonly recovered: Map<string, string> = new Map(),
+    /** R413 d: the room the scan's own temporary copies (the Zotero database) must leave free (preflightSpace). */
+    private readonly reserve: number = spaceMargin(0),
   ) {
     this.latest = latestByKey(journal);
     this.createdIds = new Set(rec.createdSourceIds);
@@ -806,6 +952,10 @@ class Run {
     runListeners.set(this.rec.id, (line) => this.latest.set(line.key, line));
     const watchdog = new PatternWatchdog(this.rec.options.fileNamePatterns, this.deps.patternBudgetMs ?? PATTERN_BUDGET_MS);
     let state: BatchState = "finished";
+    // R393: a stop of an earlier run of this batch is no longer the news; this run says its own.
+    this.rec.notes = this.rec.notes.filter((n) => !STOPPED_NOTE.test(n));
+    delete this.rec.stopCause;
+    unsavedStops.delete(this.rec.id);
     try {
       const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, (id) => hasSource(this.repo, this.projectId, id));
       this.dedupe = dedupe;
@@ -849,6 +999,7 @@ class Run {
       let knownIds: ReadonlySet<string> | undefined;
       const scan = this.adapter.scan(this.abort.signal, {
         workDir: () => this.ensureWorkDir(),
+        reserveBytes: this.reserve,
         note: (t) => this.note(t),
         // An item already in this batch's journal is passed by below: the adapter need not fetch it (Z2).
         // R426 a: the first time it is passed by, it counts as done (an adapter may yield nothing for it), so a
@@ -921,14 +1072,23 @@ class Run {
       if (this.cancelled && (err as Error)?.name === "AbortError") state = "cancelled";
       else {
         state = "failed";
+        // R436 d: a project left refusing every write (a change could not be undone) is what must be settled first,
+        // whatever stopped the run: the note says so, and how (closing and reopening the library finishes the undo).
+        const refusing = recoveryPendingProjects(this.repo).includes(this.projectId);
         this.note(
-          err instanceof ProjectLockedError
+          refusing
+            ? isDiskFull(err)
+              ? DISK_FULL_UNDONE_NOTE
+              : RECOVERY_NOTE
+            : err instanceof ProjectLockedError
             ? "The project was locked during the import; unlock it and resume the batch."
             : err instanceof BatchRefusedError || err instanceof PolicyDeniedError
               ? err.reason
-              : "The import stopped because of an unexpected error; resume the batch to continue.",
+              : stoppedNote(causeOf(err)),
         );
-        this.deps.debug?.(`bulk import stopped: ${err instanceof Error ? err.name : "error"}`);
+        // R393 a, b: the stopping error's kind is kept with the batch and logged with the program's stack.
+        if (!(err instanceof ProjectLockedError || err instanceof BatchRefusedError || err instanceof PolicyDeniedError)) this.rec.stopCause = causeOf(err);
+        this.deps.debug?.(`bulk import stopped: ${errorForLog(err)}`);
       }
     } finally {
       await watchdog.close();
@@ -961,7 +1121,10 @@ class Run {
       await this.checkpoint(state, true);
       await writeBatchReport(this.repo, this.projectId, this.rec.id);
     } catch (err) {
-      this.deps.debug?.(`bulk import: the batch record could not be saved (${err instanceof Error ? err.name : "error"})`);
+      this.deps.debug?.(`bulk import: the batch record could not be saved: ${errorForLog(err)}`);
+      // R413 b, c: the report still says why the batch stopped (kept in memory until the record is saved again).
+      const stop = this.rec.notes.find((n) => STOPPED_NOTE.test(n));
+      if (stop) unsavedStops.set(this.rec.id, stop);
     } finally {
       runListeners.delete(this.rec.id);
       active.delete(this.rec.id);
@@ -1023,10 +1186,17 @@ class Run {
     }
     if (err instanceof UnsafeFileError) return failed(REASONS.unsafe);
     if (err instanceof ProjectLockedError) throw err;
+    // R413 b: a full disk (or quota) is the batch's condition, not the item's: the batch stops here and the item in
+    // hand gets no line, so a resume takes it up again (its change, if one had begun, rolled itself back, R26).
+    // R413 c: so is a project that refuses every write (an earlier change could not be undone): stopped at the first
+    // refusal, instead of failing every item after it.
+    if (isDiskFull(err) || err instanceof RecoveryPendingError) throw err;
     if ((err as Error)?.name === "AbortError") throw err;
-    if (err instanceof NotFoundError) return failed(REASONS.failed);
-    this.deps.debug?.(`bulk import item failed: ${err instanceof Error ? err.name : "error"}`);
-    return failed(REASONS.failed);
+    // Anything else is unexpected (R393 a, b): the line keeps its kind and the report says it; the log gets the
+    // kind and the program's stack, never the error's message (it may hold a path, a title or a name).
+    const cause = causeOf(err);
+    this.deps.debug?.(`bulk import item failed: ${errorForLog(err)}`);
+    return this.queue({ key: item.key, outcome: "failed", reason: failedReason(cause), cause });
   }
 
   /**
@@ -1293,7 +1463,7 @@ class Run {
   private async prepareFiles(item: ScanItem): Promise<Prepared> {
     const opts = this.rec.options;
     const fromArchive = item.key.includes("!/");
-    const out: Prepared = { inputs: [], shas: [], kept: [], names: [], mime: "", dropped: [], copiedLinks: 0, realOf: new Map(), shaOf: new Map(), plan: { located: false, proxies: [] } };
+    const out: Prepared = { inputs: [], shas: [], kept: [], names: [], mime: "", dropped: [], copiedLinks: 0, realOf: new Map(), shaOf: new Map(), plan: { located: false, proxies: [] }, copyBytes: 0 };
     for (const f of item.files) {
       const st = await fsp.stat(f.path).catch(() => null);
       if (!st?.isFile()) {
@@ -1336,8 +1506,20 @@ class Run {
       if (wantsLink && sourceLinks && opts.fileHandling !== "link" && (await this.linkRefused())) out.copiedLinks++;
       const handling = wantsLink && !(await this.linkRefused()) ? "link" : "copy";
       out.inputs.push({ path: real, noFollow: true, role: "original", handling, ext: stored.ext, mime: stored.mime, kind: stored.kind, ...(f.metadata ? { metadata: f.metadata } : {}) });
+      if (handling === "copy") out.copyBytes += st.size;
     }
+    if (out.copyBytes) await this.roomFor(out.copyBytes);
     return out;
+  }
+
+  /**
+   * R413 b: before an item's files are copied into the library, the free room on its disk must be at least their size
+   * (with the files of the items queued in the current group, not stored yet) plus FILE_MARGIN; otherwise the batch
+   * stops (NoRoomError, a full disk) before anything of the item is written. A disk that cannot tell passes.
+   */
+  private async roomFor(bytes: number): Promise<void> {
+    const queued = this.group.reduce((n, q) => n + q.prep.copyBytes, 0);
+    if ((await freeRoom(repoLibrary(this.repo).root)) < queued + bytes + fileMargin()) throw new NoRoomError();
   }
 
   /** Whether this project refuses linking in place (R24), asked once per run. */
@@ -1677,7 +1859,10 @@ class Run {
       }
       if (needOcr.length) await this.ocr(needOcr);
     } catch (err) {
-      if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError") throw err;
+      // R413 b: a full disk stops the batch; the group's items keep no line (a resume takes them up again), and are
+      // not retried one by one (each would fail the same way).
+      if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError" || isDiskFull(err) || err instanceof RecoveryPendingError) throw err;
+      if (!(err instanceof PolicyDeniedError)) this.deps.debug?.(`bulk import group store failed, storing item by item: ${errorForLog(err)}`);
       // The group as a whole was refused (e.g. the rules changed during the run) or failed: each
       // item on its own, so only the items concerned fail, each with its own audited decision.
       dedupe.dropPending(group.map((q) => q.placeholder));
@@ -2338,6 +2523,9 @@ export async function startBatch(
   try {
     await refuseLibrarySource(deps.repo, adapter);
     const { approveOutside, ...options } = acceptOptions(input);
+    deps.repo.getProject(projectId); // NotFoundError for an unknown project, before its disk is asked
+    // R413 a: before anything is evaluated or written (a refusal leaves nothing, not even an audited decision).
+    const reserve = await preflightSpace(deps.repo, projectId, adapter, options, approveOutside);
     const governance = await preflight(deps.repo, projectId, adapter.kind, options);
     await preflightDeleted(deps.repo, projectId, adapter, options);
     const number = await allocateBatchNumber(deps.repo, projectId);
@@ -2380,7 +2568,7 @@ export async function startBatch(
         participants: rec.fieldwork.participantIds?.length ?? 0,
       });
     }
-    const run = new Run(deps, projectId, rec, adapter, []);
+    const run = new Run(deps, projectId, rec, adapter, [], new Map(), reserve);
     run.start();
     return run.handle();
   } catch (err) {
@@ -2495,6 +2683,23 @@ async function dryRunPolicy(repo: Repo, projectId: string, kind: ImportBatch["so
 }
 
 /**
+ * R413 a: what the dry run says of the room: the bytes a batch with the default options would copy, the free room on
+ * the library's disk and, when they do not fit (with the margin and a Zotero local import's database copy), the
+ * sentence the start would be refused with. The scan's numbers are remembered for a start from the same source.
+ */
+async function spaceOfScan(repo: Repo, projectId: string, adapter: ImportSourceAdapter, summary: ScanSummary, linkedBytes: number, approvals: ScanApprovals | undefined): Promise<void> {
+  rememberScan(projectId, adapter, approvals, { totalBytes: summary.totalBytes, linkedBytes }, repoClock(repo)().getTime());
+  const linkRefused = await preflightLink(repo, projectId);
+  const copy = Math.max(0, summary.totalBytes - (linkRefused ? 0 : linkedBytes));
+  summary.copyBytes = copy;
+  const free = await freeRoom(repoLibrary(repo).root);
+  if (!Number.isFinite(free)) return;
+  summary.freeBytes = free;
+  const db = adapter.kind === "zotero-local" ? await zoteroCopyBytes(zoteroDataDir(adapter.location)) : 0;
+  if (copy && copy + spaceMargin(copy) + db > free) summary.spaceWarning = fitSentence(copy, db, free, !linkRefused && !COPY_ONLY_KINDS.has(adapter.kind));
+}
+
+/**
  * Dry run (wizard step 2): what a batch from `adapter` would find. Nothing is written to the
  * library: archives are unpacked into a private work folder that is removed before this returns;
  * nothing is looked up online and no audit event is written.
@@ -2516,6 +2721,16 @@ export async function dryRun(
   let made = false;
   const seenSha = new Set<string>();
   const seenIds = new Set<string>();
+  let linkedBytes = 0;
+  // R436 b: what the total counts (as the run decides): each real file's first item, the files copied by their sha.
+  const fileOwners = new Map<string, string>();
+  const copiedShas = new Set<string>();
+  const shas = new Map<string, string>();
+  const shaOf = async (real: string): Promise<string> => {
+    let h = shas.get(real);
+    if (h === undefined) shas.set(real, (h = await sha256File(real)));
+    return h;
+  };
   const ac = new AbortController();
   try {
     const scan = adapter.scan(ac.signal, {
@@ -2531,6 +2746,7 @@ export async function dryRun(
         if (!summary.notes.includes(t)) summary.notes.push(t);
       },
       dryRun: true,
+      reserveBytes: spaceMargin(0),
     });
     // The approvals the batch would be given count here too (kept in memory only, under a throwaway secret).
     const secret = randomBytes(32).toString("hex");
@@ -2580,9 +2796,31 @@ export async function dryRun(
         if (inScan || inProject) summary.likelyDuplicates++;
         continue;
       }
-      let bytes = 0;
-      for (const x of item.files) bytes += (await fsp.stat(x.path).catch(() => null))?.size ?? x.bytes;
-      summary.totalBytes += bytes;
+      // R436 b: the total counts only what the run would copy (prepareFiles, importItem): files of a kind that is
+      // imported, each real file once over the scan, and nothing of an item whose first such file is already in the
+      // project or is a second copy of a file earlier in the scan (the run takes it for a duplicate and copies nothing).
+      const counted: Array<{ path: string; bytes: number; link: boolean }> = [];
+      for (const x of item.files) {
+        const st = await fsp.stat(x.path).catch(() => null);
+        if (!st?.isFile()) continue;
+        const real = await fsp.realpath(x.path).catch(() => resolve(x.path));
+        const owner = fileOwners.get(real);
+        if (owner !== undefined && owner !== item.key) continue;
+        const t = await fileTypeFromFile(real).catch(() => undefined);
+        if (!t || !acceptedType(t)) continue;
+        fileOwners.set(real, item.key);
+        counted.push({ path: real, bytes: st.size, link: x.link === true && !item.key.includes("!/") });
+      }
+      if (counted.length) {
+        const sha = await shaOf(counted[0]!.path);
+        if (!dedupe.bySha(sha) && !copiedShas.has(sha)) {
+          copiedShas.add(sha);
+          for (const c of counted) {
+            summary.totalBytes += c.bytes;
+            if (c.link) linkedBytes += c.bytes;
+          }
+        }
+      }
       const type = await fileTypeFromFile(f.path).catch(() => undefined);
       const stored = type ? acceptedType(type) : undefined;
       if (!type || !stored) {
@@ -2593,11 +2831,12 @@ export async function dryRun(
       if (stored.mime === "application/pdf") {
         if ((await extractMetadata(f.path, stored.mime)).readFailed) summary.unreadable.push({ path: item.key, reason: REASONS.unreadable });
       }
-      const sha = await sha256File(f.path);
+      const sha = await shaOf(await fsp.realpath(f.path).catch(() => resolve(f.path)));
       if (dedupe.bySha(sha)) summary.alreadyImported++;
       else if (seenSha.has(sha)) summary.likelyDuplicates++;
       seenSha.add(sha);
     }
+    await spaceOfScan(repo, projectId, adapter, summary, linkedBytes, opts.approveOutside);
   } finally {
     if (made) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     activeTemp.delete(name);

@@ -117,7 +117,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     let h: Awaited<ReturnType<typeof startZoteroWebImport>>;
     try {
       h = spec.web
-        ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
+        ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo), debug: state.importLog }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
         : await s.bulk.startBatch(projectId, spec.adapter, options);
     } catch (err) {
       release?.();
@@ -141,9 +141,20 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
       const s = state.requireWritable();
       const batchId = paramsOf(req).batchId ?? "";
       const projectId = await batchProject(state, batchId);
-      const running = s.batches.get(batchId);
+      // R436 e: a handle whose run has settled is not running, though kept until followBatch's end has run.
+      let running = s.batches.get(batchId);
+      if (running && state.batchSettled(running.handle)) running = undefined;
       // A sync's batch is the sync's to pause and resume (R250 k).
       if (action !== "cancel" && state.zoteroSync.ownsBatch(batchId)) throw new ApiError(409, "CONFLICT", ZOTERO_SYNC_SENTENCES.belongsToSync);
+      if (running && action === "resume") {
+        // R436 e: a run whose record already says it stopped is ending: it is let end, and the batch resumed from its
+        // record below (resuming the ending run in place would answer 200 while nothing runs).
+        const shown = (await s.bulk.listBatches(projectId)).find((b) => b.batchId === batchId)?.state;
+        if (shown !== "running" && shown !== "paused") {
+          await running.handle.done.catch(() => undefined);
+          running = undefined;
+        }
+      }
       if (running) {
         running.handle[action]();
         return { batchId, action };
@@ -160,7 +171,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
       try {
         h =
           listed?.kind === "zotero-web"
-            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, batchId)
+            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo), debug: state.importLog }, projectId, batchId)
             : await s.bulk.resumeBatch(projectId, batchId);
       } catch (err) {
         release?.();

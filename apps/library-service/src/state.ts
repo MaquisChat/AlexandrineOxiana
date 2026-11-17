@@ -884,6 +884,7 @@ export class ServiceState {
             // Awaited by the batch: one governed change per group, recorded before the batch moves on (R106).
             await ocr.enqueueMany(p, ids);
           },
+          debug: this.importLog,
         }) : undefined;
     s.unsubscribe.push(proxies.onResult((r) => this.events.publish("job.progress", { kind: "proxy", ...r })));
     s.unsubscribe.push(ocr.onResult((r) => this.events.publish("job.progress", { kind: "ocr", ...r })));
@@ -961,8 +962,18 @@ export class ServiceState {
 
   // ---- import batches ------------------------------------------------------------------
 
+  /** R436 e: handles whose run has settled (each stays in `s.batches` until followBatch's end has run). */
+  private readonly settledHandles = new WeakSet<BatchHandle>();
+
+  /** R436 e: whether this handle's run has settled (it is then not running, though still kept for a moment). */
+  batchSettled(h: BatchHandle): boolean {
+    return this.settledHandles.has(h);
+  }
+
   /** Follows a running batch: progress and its end as `import.progress`; it leaves the registry when it ends (R99 I3). */
   followBatch(s: Session, projectId: string, h: BatchHandle): void {
+    const settled = () => void this.settledHandles.add(h);
+    h.done.then(settled, settled);
     s.batches.set(h.batchId, { projectId, handle: h });
     this.track(
       (async () => {
@@ -1407,6 +1418,15 @@ export class ServiceState {
     });
     this.resumeFind(s);
   }
+
+  /**
+   * R393 b: the import's debug sink. Only the engine's own notes ("bulk import …": an unexpected error's kind, code and
+   * the program's stack frames, built without the error's message) are logged; other notes that reach the sink (a
+   * lookup's error text) are not, since they may hold a title or an address.
+   */
+  readonly importLog = (note: string): void => {
+    if (note.startsWith("bulk import")) this.opts.log.warn({ note }, "import");
+  };
 
   /** Resumes the queue of every unlocked project (or of `projectId`), whatever the index's state (R247 a). */
   resumeFind(s: Session, projectId?: string): void {

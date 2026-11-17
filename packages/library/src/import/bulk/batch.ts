@@ -22,6 +22,12 @@ import { projectDataKey, repoLibrary, type Repo } from "../../repo/repo.js";
 /** Batches running (or being undone) in this process (a `running` batch.json not listed here was interrupted, R45). */
 export const activeBatches = new Set<string>();
 
+/**
+ * R413 b, c: the stopping note of a batch whose record could not be saved when it stopped (the disk still full, or a
+ * project that refuses every write), by batch id. In memory only: the report shows it until the record is saved again.
+ */
+export const unsavedStops = new Map<string, string>();
+
 /** Runs in progress that want to hear about review decisions on their items (keeps their counts current). */
 export const runListeners = new Map<string, (line: JournalEntry) => void>();
 
@@ -68,6 +74,11 @@ export interface JournalEntry {
   outcome: ItemOutcome | string;
   sourceId?: string;
   reason?: string;
+  /**
+   * R393 a: a `failed` line of an unexpected error: what kind it was — the system's code (`EMFILE`, `SQLITE_BUSY`) or
+   * the error's class (`TypeError`); never its message or a path.
+   */
+  cause?: string;
   /** Merges: the existing source the item was merged into, and the pre-merge snapshot (project-relative). */
   mergedInto?: string;
   snapshot?: string;
@@ -163,6 +174,8 @@ export interface BatchRecord extends ImportBatch {
   governance: GovernanceNote[];
   /** Plain-language notes for the report (pattern timeouts, OCR not available, ...). */
   notes: string[];
+  /** R393 a: the kind of the unexpected error that stopped the batch's last run (as JournalEntry.cause); absent otherwise. */
+  stopCause?: string;
   /** Total items, when the source could count them. */
   total?: number;
   ocrQueued?: number;

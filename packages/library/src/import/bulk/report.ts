@@ -12,7 +12,7 @@
 import { appendLibraryEvent, projectReviewEntries, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
 import { createHash } from "node:crypto";
-import { BOOKKEEPING, activeBatches, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
+import { BOOKKEEPING, activeBatches, unsavedStops, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
 
 export interface ImportReport {
   batchId: string;
@@ -102,6 +102,17 @@ export function reportLabel(key: string, secret: string | null | undefined): str
 const droppedNote = (n: number): string[] =>
   n ? [`${n.toLocaleString("en-US")} ${n === 1 ? "annotation" : "annotations"} over the per-source limit (10,000 annotations or 16 MB of text) ${n === 1 ? "was" : "were"} not imported.`] : [];
 
+/** R393: failures by reason, in the order each reason first occurs, with their items in order. */
+export function failureGroups(failures: ImportReport["failures"]): Array<{ reason: string; items: string[] }> {
+  const groups = new Map<string, string[]>();
+  for (const f of failures) {
+    const items = groups.get(f.reason);
+    if (items) items.push(f.item);
+    else groups.set(f.reason, [f.item]);
+  }
+  return [...groups].map(([reason, items]) => ({ reason, items }));
+}
+
 function markdown(r: ImportReport): string {
   const lines = [
     `# Import report: batch ${r.number}`,
@@ -132,9 +143,19 @@ function markdown(r: ImportReport): string {
     `- Files left as links: ${r.files.linked}`,
     "",
   ];
+  // R393: the notes (where a stopped batch says why) right under the counts, so that they cannot be missed.
+  if (r.notes.length) {
+    lines.push("## Notes", "");
+    for (const n of r.notes) lines.push(`- ${n}`);
+    lines.push("");
+  }
+  // R393: failures that share a reason are one entry, with their number and the items under it.
   if (r.failures.length) {
     lines.push("## Failures", "");
-    for (const f of r.failures) lines.push(`- ${f.item}: ${f.reason}`);
+    for (const g of failureGroups(r.failures)) {
+      lines.push(`- ${g.reason} (${g.items.length} ${g.items.length === 1 ? "item" : "items"})`);
+      for (const item of g.items) lines.push(`  - ${item}`);
+    }
     lines.push("");
   }
   if (r.fileNotes.length) {
@@ -158,15 +179,16 @@ function markdown(r: ImportReport): string {
     }
     lines.push("");
   }
-  if (r.notes.length) {
-    lines.push("## Notes", "");
-    for (const n of r.notes) lines.push(`- ${n}`);
-    lines.push("");
-  }
   return lines.join("\n");
 }
 
 /** The batch's report as it stands, from its record, journal and the review queue. Writes nothing. */
+/** The stopping note of a batch not running whose record could not be saved (unsavedStops), unless the record has it. */
+function unsavedNote(notes: string[], batchId: string): string[] {
+  const n = unsavedStops.get(batchId);
+  return n && !activeBatches.has(batchId) && !notes.includes(n) ? [n] : [];
+}
+
 export async function batchReport(repo: Repo, projectId: string, batchId: string): Promise<ImportReport> {
   const rec = await findBatch(repo, projectId, batchId);
   if (!rec) throw new NotFoundError("Import batch", batchId);
@@ -202,7 +224,8 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     keptFields: [...latest.values()].filter((e) => e.merge?.kept?.length).map((e) => ({ item: reportLabel(e.key, rec.secret), fields: e.merge!.kept! })),
     annotationsDeletedHere: [...latest.values()].reduce((n, e) => n + (e.annotationsDeletedHere ?? 0), 0),
     governance: rec.governance,
-    notes: [...rec.notes, ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
+    // R413 b, c: a stop whose record could not be saved still says why.
+    notes: [...rec.notes, ...unsavedNote(rec.notes, batchId), ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
     created: { collectionIds: [...rec.createdCollectionIds], tagIds: [...rec.createdTagIds] },
   };
   return report;

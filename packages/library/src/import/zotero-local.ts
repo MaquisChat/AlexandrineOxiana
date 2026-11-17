@@ -51,6 +51,7 @@ import { checkFiles, referenceMetadata, text } from "./refman.js";
 import { extraCitationKey, recordFields, zoteroAnnotation, zoteroCreator, zoteroTimestamp, type ZoteroAnnotationRow } from "./zotero-common.js";
 
 export { ITEM_TYPES, zoteroAnnotation, zoteroTimestamp, type ZoteroAnnotationRow } from "./zotero-common.js";
+import { isDiskFull, spaceMargin } from "./bulk/space.js";
 import { CopyNoSpace, CopyTooLarge, CopyUnstable, CopyUnusual, UNUSUAL_STATE_REASON, cappedRows, columnsOf, copyDatabases, openCopy, plainTables, t64, tN } from "./sqlite-copy.js";
 
 export const ZOTERO_REASONS = {
@@ -416,10 +417,15 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
   try {
     copy = await copyDatabases(root, { required: ["zotero.sqlite"], optional: ["better-bibtex.sqlite"] }, await ctx.workDir(), "zotero", o.maxCopyBytes ?? MAX_ZOTERO_COPY_BYTES, {
       signal,
+      // R413 d: the copy leaves free what the import will copy and its margin, not 64 MB.
+      reserve: ctx.reserveBytes ?? spaceMargin(0),
       ...(o.freeSpace ? { freeSpace: o.freeSpace } : {}),
     });
   } catch (err) {
     if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
+    // R436 a: a full disk (or a quota) during the copy, after its own check of the room passed, ends the scan: the run
+    // stops the batch, resumable (copyDatabases has removed its folder). Never "missing or damaged".
+    if (isDiskFull(err)) throw err;
     yield fail(zoteroCopyReason(err));
     return;
   }

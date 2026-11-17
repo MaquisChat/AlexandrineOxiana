@@ -73,6 +73,8 @@ export interface CopyOptions {
   signal?: AbortSignal;
   /** Test seam: free bytes where the copy goes (default: statfs). */
   freeSpace?: (dir: string) => Promise<number>;
+  /** Room to leave free beyond the copy (default 64 MB; a Zotero import gives its own, R413 d). */
+  reserve?: number;
 }
 
 /** Free bytes in `dir` (statfs); Infinity when it cannot tell. */
@@ -191,7 +193,7 @@ export async function copyDatabases(
       let total = 0;
       for (const n of present) for (const s of ["", ...COMPANIONS]) total += (await stampOf(join(srcDir, n + s)))?.size ?? 0;
       if (total > maxBytes) throw new CopyTooLarge();
-      if (total + SPACE_MARGIN > (await (opts.freeSpace ?? statfsFree)(dir))) throw new CopyNoSpace();
+      if (total + (opts.reserve ?? SPACE_MARGIN) > (await (opts.freeSpace ?? statfsFree)(dir))) throw new CopyNoSpace();
       const paths = new Map<string, string>();
       for (const n of present) {
         const src = join(srcDir, n);

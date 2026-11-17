@@ -88,7 +88,7 @@ export function StepScan({ summary, sourceName, approvals, onApprovals, device }
         </div>
       </dl>
       <p>
-        Total size {size(summary.totalBytes)}
+        Size of the new files {size(summary.totalBytes)}
         {typeEntries(summary.byType).length > 0 && (
           <>
             {" · "}
@@ -98,6 +98,13 @@ export function StepScan({ summary, sourceName, approvals, onApprovals, device }
           </>
         )}
       </p>
+      {summary.spaceWarning && (
+        // R413 a: the files do not fit on the library's disk. The import can still be started (space may be freed
+        // meanwhile); the service refuses the start while it is still too little.
+        <p className="ao-import__warning" role="note">
+          <UserText>{summary.spaceWarning}</UserText>
+        </p>
+      )}
       {summary.unreadable.length > 0 && (
         <details className="ao-import__details">
           <summary>Unreadable files ({fmt(summary.unreadable.length)})</summary>
