@@ -68,7 +68,9 @@
  *  8. **The embedded title is never evidence:** an embedded title of two or more content words that is not the
  *     record's title (by F10's `sameTitle`) — nor the record's title with a subtitle, nor its main title when the
  *     record's title holds a subtitle — is another document's: "title-absent". An embedded title that names a file
- *     (FILE_NAME_TITLE: "Microsoft Word - …", "….pdf", "untitled") is ignored.
+ *     (FILE_NAME_TITLE: "Microsoft Word - …", "….pdf", "untitled") is ignored. This clause reads the import's
+ *     filtered embedded title (R394, R422: a production code or "Original Article" is no document's title); clauses 5
+ *     and 6 and the evidence shown read the embedded title as found (R410 b: "Front Matter", "Index").
  * Where several places satisfy 2 and 3 (a cover sheet and the first page; a running head), the file matches if ANY
  * one of them also satisfies 4–6, judged around THAT place; 1, 7 and 8 hold for the file as a whole. Otherwise the
  * reason is the first of no-text, other-doi, other-kind, other-version, title-absent among those that apply (to any
@@ -610,8 +612,10 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
     });
   };
 
-  // 8. An embedded title of two or more content words that is not the record's is another document's.
-  const et = embedded.trim();
+  // 8. An embedded title of two or more content words that is not the record's is another document's. R422: this asks
+  // whether the embedded text is some document's title, so it reads the import's filtered title (a production code or
+  // "Original Article" is no title, and the file is judged by its text as one with no embedded title is).
+  const et = (raw.title ?? "").trim();
   const otherTitle = !!et && !FILE_NAME_TITLE.test(et) && contentWords(et).length >= 2 && !sameTitle(et, record.title) && !sameTitle(mainTitle(et), record.title) && !sameTitle(et, mainTitle(record.title));
 
   // R293 e: no place — not a match. Only the reason told is worked out here: a sign of clause 5 or 6 on the lines

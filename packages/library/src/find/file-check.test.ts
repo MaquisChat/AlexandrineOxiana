@@ -239,6 +239,30 @@ describe("the embedded title as found is a sign of another kind of document (R41
   });
 });
 
+/**
+ * R422: the rule for another document's title (clause 8) reads the import's FILTERED embedded title, so a string that is
+ * no title (a production code, "Original Article") is not another document's title and the file is judged by its text,
+ * as a file with no embedded title is; the kind and version signs and the evidence shown read the title as found.
+ */
+describe("another document's title reads the filtered embedded title (R422)", () => {
+  const why = (r: Awaited<ReturnType<typeof checkFileAgainstRecord>>) => ({ match: r.match, ...(r.match ? { by: r.by } : { why: r.why }) });
+  it("with no embedded title, the record's title and author on page 1 → a match (the baseline)", async () => {
+    expect(why(await checkFileAgainstRecord(await pdf({ lines: [T, A, ...BODY] }), NO_DOI))).toEqual({ match: true, by: "title" });
+  });
+  it.each(["S0003598X20000800jra 900..915", "Original Article"])("embedded title %j → a match, as with no embedded title; the evidence shows it as found", async (title) => {
+    const r = await checkFileAgainstRecord(await pdf({ title, lines: [T, A, ...BODY] }), NO_DOI);
+    expect(why(r)).toEqual({ match: true, by: "title" });
+    expect(r.evidence.embeddedTitle).toBe(title);
+  });
+  it("an embedded real title of another work is still another document's", async () => {
+    const rec: FileCheckRecord = { title: "Rivers of the Central Plains", creators: RIVERS.creators };
+    const r = await checkFileAgainstRecord(await pdf({ title: "A History of Modern India", lines: [rec.title, A, ...BODY] }), rec);
+    expect(why(r)).toEqual({ match: false, why: "title-absent" });
+    // Without it, the same file matches: the embedded title is what refuses it.
+    expect(why(await checkFileAgainstRecord(await pdf({ lines: [rec.title, A, ...BODY] }), rec))).toEqual({ match: true, by: "title" });
+  });
+});
+
 describe("files that cannot be read", () => {
   it("a scanned PDF without text needs a check", async () => {
     const p = join(tmp, "scan.pdf");
