@@ -40,8 +40,25 @@ async function realFolderState(p: string): Promise<FolderState> {
  * Nothing under Documents is looked at (R449 a: iCloud's keeping of Documents cannot be told from its path, and a Mac
  * asks the researcher's permission the moment a program looks into it). None when the home folder is not known, or
  * when its own path is a cloud-synced place by classifyLocation (the path and the environment alone; no look).
+ * Bounded to FOLDER_ROOM_LOOK_MS: none when the look has not answered by then.
  */
-export async function suggestedLibraryFolder(env: LocationEnv, looks: PlaceLooks = {}): Promise<string | undefined> {
+export function suggestedLibraryFolder(env: LocationEnv, looks: PlaceLooks = {}): Promise<string | undefined> {
+  // One at a time (R449 b, M6): a request while a look runs joins it, even once its bound has answered.
+  if (suggestionLook) return suggestionLook;
+  const run = lookForSuggestion(env, looks)
+    .catch(() => undefined)
+    .finally(() => {
+      suggestionLook = undefined;
+    });
+  const bounded = withinBound(run);
+  suggestionLook = bounded;
+  return bounded;
+}
+
+/** The suggestion's look running now (bounded), until the look itself settles. */
+let suggestionLook: Promise<string | undefined> | undefined;
+
+async function lookForSuggestion(env: LocationEnv, looks: PlaceLooks): Promise<string | undefined> {
   const home = env.homeDir;
   if (!home) return undefined;
   if (classifyLocation(home, env).kind === "cloud_folder") return undefined;
@@ -53,6 +70,15 @@ export async function suggestedLibraryFolder(env: LocationEnv, looks: PlaceLooks
     if (s === "missing" || s === "empty") return candidate;
   }
   return undefined;
+}
+
+/** `run`'s answer, or undefined when it has not answered within FOLDER_ROOM_LOOK_MS (the look itself goes on: it cannot be cancelled). */
+function withinBound<T>(run: Promise<T | undefined>): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<undefined>((done) => {
+    timer = setTimeout(() => done(undefined), FOLDER_ROOM_LOOK_MS);
+  });
+  return Promise.race([run, limit]).finally(() => clearTimeout(timer));
 }
 
 /** How long one look at a disk's free room may take (R447 b: a share that does not answer within it is "cannot tell"). */
@@ -73,17 +99,23 @@ const isRealFolder = async (p: string) => {
   }
 };
 
-/** The paths whose look is still running in this process: one that does not answer is not looked at again until it does (as R429 e). */
-const roomsBeingLookedAt = new Set<string>();
+/**
+ * Whether a look at a disk's room is running in this process (R449 b, I1). A file-system call already started (a stat
+ * or statfs on a share that does not answer) cannot be cancelled and holds one of the runtime's file threads until the
+ * system answers; so while one runs — answered or not, given up on by its bound or not — every other request is
+ * answered "cannot tell" at once and starts nothing. A dead share then holds one thread, never all of them.
+ */
+let roomLookRunning = false;
 
 /**
  * The free bytes of the disk under `path` (R447 b), read for the folder, or for the nearest folder above it that
  * exists; undefined when it cannot be told — a path that is not a full local one, a place that cannot be read, a
- * look (the walk up and the read) that has not answered within FOLDER_ROOM_LOOK_MS. Never a guessed figure.
+ * look (the walk up and the read) that has not answered within FOLDER_ROOM_LOOK_MS, another look still running.
+ * Never a guessed figure.
  */
 export async function freeRoomFor(path: string, looks: RoomLooks = {}): Promise<number | undefined> {
   if (typeof path !== "string" || path === "" || path.includes("\0") || !isAbsolute(path)) return undefined;
-  if (roomsBeingLookedAt.has(path)) return undefined;
+  if (roomLookRunning) return undefined;
   const isFolder = looks.isFolder ?? isRealFolder;
   const free = looks.free ?? statfsFree;
   const look = async (): Promise<number | undefined> => {
@@ -96,13 +128,11 @@ export async function freeRoomFor(path: string, looks: RoomLooks = {}): Promise<
     const n = await free(dir);
     return Number.isFinite(n) && n >= 0 ? n : undefined;
   };
-  roomsBeingLookedAt.add(path);
-  let timer: NodeJS.Timeout | undefined;
-  const limit = new Promise<undefined>((done) => {
-    timer = setTimeout(() => done(undefined), FOLDER_ROOM_LOOK_MS);
-  });
+  roomLookRunning = true;
   const run = look()
     .catch(() => undefined)
-    .finally(() => roomsBeingLookedAt.delete(path));
-  return Promise.race([run, limit]).finally(() => clearTimeout(timer));
+    .finally(() => {
+      roomLookRunning = false;
+    });
+  return withinBound(run);
 }

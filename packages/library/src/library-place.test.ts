@@ -70,6 +70,40 @@ describe("suggestedLibraryFolder (R447 a as R449 a corrects it: in the home fold
     expect(fs.looked).not.toContain(`${base} 10`);
   });
 
+  it("R449 b (M6): a look that does not answer: none within two seconds; a second request joins it and starts no second look", async () => {
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let calls = 0;
+      const looks = {
+        folderState: async (): Promise<FolderState> => {
+          calls++;
+          await gate;
+          return "missing";
+        },
+      };
+      const first = suggestedLibraryFolder(env(), looks);
+      const second = suggestedLibraryFolder(env(), looks);
+      expect(second).toBe(first);
+      let settled: string | undefined | "pending" = "pending";
+      void first.then((v) => (settled = v));
+      await vi.advanceTimersByTimeAsync(FOLDER_ROOM_LOOK_MS - 1);
+      expect(settled).toBe("pending");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBeUndefined();
+      // Still hung after its bound: a third request starts nothing and answers none.
+      expect(await suggestedLibraryFolder(env(), looks)).toBeUndefined();
+      expect(calls).toBe(1);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      // Settled: the next request looks again.
+      expect(await suggestedLibraryFolder(env(), { folderState: async () => "missing" })).toBe(`${HOME}/Alexandrine Oxiana`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   describe("with the real file system (a temporary home folder)", () => {
     let home: string;
     beforeAll(async () => {
@@ -154,20 +188,68 @@ describe("freeRoomFor (R447 b)", () => {
     expect(l.asked).toEqual([]);
   });
 
-  it("a look that never answers: none, within the bound", async () => {
+  /** A look that hangs until released; `calls` counts the looks started. */
+  function hung<T>(value: T) {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const state = { calls: 0, release: () => release() };
+    const look = async (_p: string): Promise<T> => {
+      state.calls++;
+      await gate;
+      return value;
+    };
+    return { ...state, look, get count() { return state.calls; } };
+  }
+
+  it("a look that does not answer: none, within the bound (the read, and the walk up)", async () => {
     vi.useFakeTimers();
-    const never = () => new Promise<never>(() => {});
-    const room = freeRoomFor("/Volumes/Share/lib", { isFolder: async () => true, free: never });
+    const read = hung(1e9);
+    const room = freeRoomFor("/Volumes/Share/lib", { isFolder: async () => true, free: read.look });
     let settled: number | undefined | "pending" = "pending";
     void room.then((v) => (settled = v));
     await vi.advanceTimersByTimeAsync(FOLDER_ROOM_LOOK_MS - 1);
     expect(settled).toBe("pending");
     await vi.advanceTimersByTimeAsync(1);
     expect(settled).toBeUndefined();
-    // A walk up a share that does not answer is bounded the same way.
-    const walk = freeRoomFor("/Volumes/Other share/lib", { isFolder: never, free: async () => 1e9 });
+    read.release();
+    await vi.advanceTimersByTimeAsync(0);
+    const walk = hung(true);
+    const walked = freeRoomFor("/Volumes/Other share/lib", { isFolder: walk.look, free: async () => 1e9 });
     await vi.advanceTimersByTimeAsync(FOLDER_ROOM_LOOK_MS);
-    expect(await walk).toBeUndefined();
+    expect(await walked).toBeUndefined();
+    walk.release();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it("R449 b (I1): at most one look at a time in the process — thirty paths under a share that does not answer start ONE look", async () => {
+    vi.useFakeTimers();
+    const walk = hung(true);
+    const looks = { isFolder: walk.look, free: async () => 5e9 };
+    const first = freeRoomFor("/Volumes/Share/p0", looks);
+    const others = await Promise.all(Array.from({ length: 29 }, (_, i) => freeRoomFor(`/Volumes/Share/p${i + 1}`, looks)));
+    expect(others).toEqual(Array.from({ length: 29 }, () => undefined));
+    expect(walk.count).toBe(1);
+    await vi.advanceTimersByTimeAsync(FOLDER_ROOM_LOOK_MS);
+    expect(await first).toBeUndefined();
+    // Given up on by its bound but still running: another path, even on a healthy disk, starts nothing.
+    expect(await freeRoomFor("/Users/r", { isFolder: async () => true, free: async () => 7e9 })).toBeUndefined();
+    expect(walk.count).toBe(1);
+    // Once it settles, the next call looks again.
+    walk.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await freeRoomFor("/Volumes/Share/p0", looks)).toBe(5e9);
+    expect(walk.count).toBe(2);
+  });
+
+  it("R449 b (M1): the same path twice while its look runs: one look; the second answers none at once", async () => {
+    const read = hung(3e9);
+    const looks = { isFolder: async () => true, free: read.look };
+    const a = freeRoomFor("/Volumes/SSD", looks);
+    await Promise.resolve();
+    expect(await freeRoomFor("/Volumes/SSD", looks)).toBeUndefined();
+    read.release();
+    expect(await a).toBe(3e9);
+    expect(read.count).toBe(1);
   });
 
   it("is two seconds", () => {
