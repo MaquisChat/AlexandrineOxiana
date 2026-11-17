@@ -84,9 +84,38 @@ export class FetchFileError extends Error {
   constructor(
     readonly code: FetchFileErrorCode,
     message: string,
+    /** For "status": the answer's HTTP status (R379, FR-A17: it decides whether the failure may pass). */
+    readonly status?: number,
   ) {
     super(message);
   }
+}
+
+/**
+ * R379 (FR-A17): whether a refused or failed download may pass — "passing": tried again later, the copy still exists —
+ * or is "final" for this address. Every code is sorted here (the type makes the table complete).
+ */
+const DOWNLOAD_FAILURE: Record<FetchFileErrorCode, "passing" | "final"> = {
+  address: "final", // the fetcher's own safety rules refuse the address
+  "redirect-refused": "final", // ... or the place it leads to
+  "too-many-redirects": "final",
+  status: "final", // decided by the answer's status below
+  encoded: "final", // what the service sends, not when
+  "too-large": "final",
+  "not-pdf-or-epub": "final",
+  "headers-timeout": "passing",
+  deadline: "passing",
+  unreachable: "passing", // the network, a connection reset
+  "write-failed": "passing", // the library's temporary folder, not the copy
+};
+/** Answers that say "later": request time-out, too early, too many requests, and every 5xx. */
+const PASSING_STATUS = (s: number) => s === 408 || s === 425 || s === 429 || (s >= 500 && s <= 599);
+
+/** R379 (FR-A17): true when `err` (from `fetchFile`, or anything else) may pass; an error not sorted above passes. */
+export function downloadFailurePasses(err: unknown): boolean {
+  if (!(err instanceof FetchFileError)) return true;
+  if (err.code === "status") return err.status === undefined || PASSING_STATUS(err.status);
+  return DOWNLOAD_FAILURE[err.code] !== "final";
 }
 
 const SENTENCES = {
@@ -348,7 +377,7 @@ export async function fetchFile(
       }
       if (status !== 200) {
         res.body.destroy();
-        throw refuse("status", SENTENCES.status);
+        throw new FetchFileError("status", SENTENCES.status, status);
       }
       if (headerValues(res.headers, "content-encoding").some((v) => v !== "identity")) {
         res.body.destroy();
