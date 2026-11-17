@@ -1335,6 +1335,20 @@ describe("R379 (FR-A12): a title search never carries what may be a participant'
     expect(seen).toEqual([]);
   });
 
+  it("R385 c: a look-up context built by hand without titleSearchAllowed makes no title search (fail-closed)", async () => {
+    const p = await project();
+    const seen = recordSearches();
+    // The context of a project with no identifiable data, but without the flag.
+    const { titleSearchAllowed: _flag, ...byHand } = await lookupContextFor(repo, p.id, http);
+    expect(byHand.policy?.identifiability.containsIdentifiable).toBe(false);
+    const r = await resolveItem(
+      { path: await put(`${RECORDING}.pdf`, await buildPdf({ lines: ["Scanned pages without a usable text layer title."] })), mime: "application/pdf" },
+      { projectId: p.id, patterns: [], lookup: byHand },
+    );
+    expect(seen).toEqual([]);
+    expectNameOnDevice(r);
+  });
+
   it("an item with no file is not a media file: where the project holds no identifiable data, its title is searched for", async () => {
     const p = await project();
     const seen = recordSearches();

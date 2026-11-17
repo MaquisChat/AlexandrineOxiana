@@ -77,7 +77,9 @@ export async function lookupContextFor(
   opts: { debug?: (note: string) => void } = {},
 ): Promise<LookupContext> {
   const info = await lookupPolicyInfo(repo, projectId);
-  // R379 (ii): only a readable policy that says the project holds no identifiable data allows title searches.
-  const titleSearchAllowed = info.policy?.identifiability.containsIdentifiable === false;
+  // R379 (ii): only a readable policy that says the project holds no identifiable data allows title
+  // searches; R385 c: never for a locked encrypted project (nothing can be stored in it: fail closed).
+  const locked = info.sensitive && !repo.isUnlocked(projectId);
+  const titleSearchAllowed = !locked && info.policy?.identifiability.containsIdentifiable === false;
   return { http, projectId, ...info, titleSearchAllowed, ...(opts.debug ? { debug: opts.debug } : {}) };
 }

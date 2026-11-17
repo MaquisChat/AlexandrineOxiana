@@ -551,5 +551,24 @@ describe("lookupContextFor", () => {
     });
     expect((await lookupContextFor(repo, def.project.id, http)).titleSearchAllowed).toBe(false);
     expect((await lookupContextFor(repo, ident.project.id, http)).titleSearchAllowed).toBe(false);
+
+    // R385 c: fail-closed. Rules that cannot be read (corrupted, or gone) give a null policy and no title search.
+    const broken = await repo.createProject({ name: "Broken", governanceYaml: gov, encryption: { enabled: false } });
+    const govFile = join(lib.root, broken.project.folder, "governance.yaml");
+    await writeFile(govFile, "identifiability: [unclosed\n  ::: not rules");
+    const c = await lookupContextFor(repo, broken.project.id, http);
+    expect(c.policy).toBeNull();
+    expect(c.titleSearchAllowed).toBe(false);
+    await rm(govFile);
+    const gone = await lookupContextFor(repo, broken.project.id, http);
+    expect(gone.policy).toBeNull();
+    expect(gone.titleSearchAllowed).toBe(false);
+    // A locked encrypted project allows no title search, whatever its rules say (nothing can be stored in it).
+    repo.lockProject(enc.project.id);
+    const locked = await lookupContextFor(repo, enc.project.id, http);
+    expect(locked.sensitive).toBe(true);
+    expect(locked.titleSearchAllowed).toBe(false);
+    repo.lockProject(def.project.id);
+    expect((await lookupContextFor(repo, def.project.id, http)).titleSearchAllowed).toBe(false);
   });
 });
