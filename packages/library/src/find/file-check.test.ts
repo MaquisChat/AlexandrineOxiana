@@ -254,6 +254,10 @@ describe("another document's title reads the filtered embedded title (R422)", ()
     expect(why(r)).toEqual({ match: true, by: "title" });
     expect(r.evidence.embeddedTitle).toBe(title);
   });
+  it("R425 b: a right download carrying the scanner stamp 'CamScanner 01-02-2020' matches by its text", async () => {
+    const r = await checkFileAgainstRecord(await pdf({ title: "CamScanner 01-02-2020", lines: [T, A, ...BODY] }), NO_DOI);
+    expect(why(r)).toEqual({ match: true, by: "title" });
+  });
   it("an embedded real title of another work is still another document's", async () => {
     const rec: FileCheckRecord = { title: "Rivers of the Central Plains", creators: RIVERS.creators };
     const r = await checkFileAgainstRecord(await pdf({ title: "A History of Modern India", lines: [rec.title, A, ...BODY] }), rec);

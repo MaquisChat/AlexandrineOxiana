@@ -159,6 +159,14 @@ const TITLES: Array<[string, boolean, string?]> = [
   ["900..915", false],
   ["12345", false],
   ["토", false],
+  // R425 b: scanner stamps.
+  ["CamScanner", false],
+  ["CamScanner 01-02-2020", false],
+  ["CamScanner 01-02-2020 14.33", false],
+  ["CamScanner 2020-01-02 14:33:05", false],
+  ["Scanned with CamScanner", false],
+  ["Scanned by CamScanner", false],
+  ["CamScanner and the Paperless Office", true],
   // More than half digits and punctuation.
   ["Vol. 12, No. 3, pp. 45-67 (2019)", false],
   ["pp 1-20 / 2019 / ed 2", false],

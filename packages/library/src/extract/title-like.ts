@@ -101,6 +101,8 @@ const STOCK_TITLE = new RegExp(
   `^(?:${STOCK_TITLES.map((s) => bare(s).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&").replace(/ /gu, "\\s")).join("|")})(?:\\s*[-_#]?\\s*\\d+)?$`,
   "iu",
 );
+/** A scanner's stamp: "CamScanner", alone or with a date and a time after it, "Scanned with/by CamScanner" (R425 b). */
+const SCANNER_STAMP = /^(?:scanned\s(?:with|by)\s)?camscanner(?:\s+\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}(?:\s+\d{1,2}[.:]\d{2}(?:[.:]\d{2})?)?)?$/iu;
 /** A web address alone ("www.…", "http(s)://…", no space), or an e-mail address alone (R410 c). */
 const WEB_OR_MAIL = /^(?:(?:www\.|https?:\/\/)\S+|[^\s@]+@[^\s@]+\.[^\s@]+)$/iu;
 const MONTH = "(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?";
@@ -179,7 +181,7 @@ export function looksLikeTitle(raw: string, fileName?: string): boolean {
     const stem = fold(base.includes(".") ? base.slice(0, base.lastIndexOf(".")) : base);
     if (stem && stem.toLowerCase() === s.toLowerCase()) return false;
   }
-  if (STOCK_TITLE.test(bare(s)) || STOCK_PREFIX.test(s) || WEB_OR_MAIL.test(s) || DATE_ONLY.test(s)) return false;
+  if (STOCK_TITLE.test(bare(s)) || STOCK_PREFIX.test(s) || WEB_OR_MAIL.test(s) || DATE_ONLY.test(s) || SCANNER_STAMP.test(s)) return false;
   if (mostlyDigitsAndPunctuation(s)) return false;
   return true;
 }
