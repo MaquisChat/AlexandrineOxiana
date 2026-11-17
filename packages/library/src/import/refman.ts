@@ -522,14 +522,11 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
   let expandedBytes = 0;
   const macros = new Map<string, string>();
   const blocks = new BibBlocks(src, MAX_TRACKED_BLOCKS);
-  /** Where a block opening at `open` is read up to (R362 g); a `(` entry's close is the field parser's. */
-  const extent = (open: number): { blk?: BibBlock; lim: number } => {
+  /** Where a block opening at `open` is read up to (R362 g, R366). */
+  const extent = (open: number): { blk: BibBlock; lim: number } => {
     try {
-      if (src[open] === "{") {
-        const blk = blocks.block(open);
-        return { blk, lim: blk.end };
-      }
-      return { lim: blocks.nextEntryLine(open + 1) };
+      const blk = blocks.block(open);
+      return { blk, lim: blk.end };
     } catch (err) {
       if (err instanceof TooManyBibBlocks) throw new ExportUnreadable(REFMAN_REASONS.tooMany);
       throw err;
@@ -548,14 +545,10 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
     const close = src[j] === "(" ? ")" : "}";
     const { blk, lim } = extent(j);
     if (type === "comment" || type === "preamble") {
-      const end = blk ? blk.end : blocks.block(j).end;
-      i = src.indexOf("@", end);
+      i = src.indexOf("@", blk.end);
       continue;
     }
     j++;
-    /** Index where the block stopped (just past its closing delimiter, or its limit). */
-    let stop = lim;
-    let closed = false;
     // Key (entries only).
     let key = "";
     if (type !== "string") {
@@ -575,11 +568,7 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
     while (j < lim) {
       while (j < lim && (isSpace(src[j]) || src[j] === ",")) j++;
       if (j >= lim) break;
-      if (src[j] === close) {
-        stop = j + 1;
-        closed = true;
-        break;
-      }
+      if (src[j] === close) break;
       const ns = j;
       while (j < lim && isNameChar(src[j]) && j - ns < 200) j++;
       const name = src.slice(ns, j).toLowerCase();
@@ -659,12 +648,11 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
       while (j < lim && src[j] !== "," && src[j] !== close && !isSpace(src[j])) j++;
     }
     if (type !== "string") {
-      // A `{` block's state is bib-blocks'; a `(` entry is closed when its parser found the ")".
-      const doubt = bibDoubt(blk ?? { state: closed ? "closed" : lim < n ? "cut" : "eof", innerEntry: false });
+      const doubt = bibDoubt(blk);
       yield { type, key, fields, ...(doubt ? { doubt } : {}) };
     }
-    // A `{` block resumes after its own end (its matching brace, or where it was cut).
-    const next = blk ? blk.end : stop;
+    // The reader resumes after the block's own end (its closing delimiter, or where it was cut).
+    const next = blk.end;
     i = src.indexOf("@", next > i ? next : i + 1);
   }
 }

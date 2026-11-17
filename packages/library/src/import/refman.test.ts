@@ -1414,6 +1414,85 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
     });
   });
 
+  /** The review's 50-entry file: entry 10 lost its closing brace, entry 40 ends with an extra one. */
+  const brokenFifty = () => {
+    const parts: string[] = ["% Exported by a reference manager", ""];
+    for (let n = 1; n <= 50; n++) {
+      const end = n === 10 ? "" : n === 40 ? "}}" : "}";
+      parts.push(`@article{e${n},\n  title = {Entry Number ${n}},\n  author = {Doe, Jane and Roe, Rick},\n  year = {${2000 + n}},\n  abstract = {An abstract for entry ${n}.},\n  doi = {10.5555/e.${n}}\n${end}\n`);
+    }
+    return parts.join("\n");
+  };
+
+  describe("R366 a: an entry line between an entry's fields ends that entry", () => {
+    it("the 50-entry file with one closing brace missing and one extra later gives 50 records; the broken one is cut, with its own fields only", async () => {
+      const src = brokenFifty();
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(Array.from({ length: 50 }, (_, k) => `e${k + 1}`));
+      expect(es[9]!.doubt).toBe(BIB_DOUBTS.cut);
+      expect(es.filter((x) => x.doubt).map((x) => x.key)).toEqual(["e10"]);
+      const items = await collect(bibtexAdapter(await writeExport("fifty-broken.bib", src)));
+      expect(items).toHaveLength(50);
+      for (const [k, i] of items.entries()) {
+        const n = k + 1;
+        expect(title(i)).toBe(`Entry Number ${n}`);
+        expect(i.referenceMetadata?.issued).toBe(String(2000 + n));
+        expect(i.referenceMetadata?.identifiers?.doi).toBe(`10.5555/e.${n}`);
+        expect(i.doubts).toEqual(n === 10 ? [BIB_DOUBTS.cut] : undefined);
+      }
+    });
+
+    it("missingThenExtra: a, b and c, b's DOI on b (not on a)", () => {
+      const src = "@article{a, title={A}, year={2001}\n@article{b, title={B}, doi={10.5555/b}, year={2002}}}\n@article{c, title={C}, year={2003}}\n";
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(["a", "b", "c"]);
+      expect([...es[0]!.fields.entries()]).toEqual([["title", "A"], ["year", "2001"]]);
+      expect(es[0]!.doubt).toBe(BIB_DOUBTS.cut);
+      expect(es[1]!.fields.get("doi")).toBe("10.5555/b");
+      expect(es[1]!.doubt).toBeUndefined();
+      expect(es[2]!.doubt).toBeUndefined();
+    });
+
+    it("a citation pasted inside a balanced value (braces or quotes) still keeps its record whole, with the third doubt", () => {
+      for (const abstract of ["{As in\n@article{smith2020, title={Pasted}, year={2020}}\nwe find more.}", '"As in\n@article{smith2020, title={Pasted}, year={2020}}\nwe find more."']) {
+        const es = entries(`@article{k3,\n  title = {Citing},\n  abstract = ${abstract},\n  doi = {10.5555/k3},\n  year = {2021}\n}\n@book{k4, title={Next Book}}\n`);
+        expect(es.map((x) => x.key)).toEqual(["k3", "k4"]);
+        expect([...es[0]!.fields.keys()]).toEqual(["title", "doi", "year"]);
+        expect(es[0]!.doubt).toBe(BIB_DOUBTS.innerEntry);
+        expect(es[1]!.doubt).toBeUndefined();
+      }
+    });
+  });
+
+  describe("R366 d: in an entry delimited by parentheses, a ')' inside a value does not close it", () => {
+    it("every field is kept", async () => {
+      for (const abstract of ["{We ask 1) why and 2) how.}", '"We ask 1) why and 2) how."']) {
+        const src = `@article(a, title={T}, abstract=${abstract}, doi={10.5555/a}, year={2001})\n@book{n, title={Next}}\n`;
+        const es = entries(src);
+        expect(es.map((x) => x.key)).toEqual(["a", "n"]);
+        expect([...es[0]!.fields.entries()]).toEqual([["title", "T"], ["doi", "10.5555/a"], ["year", "2001"]]);
+        expect(es[0]!.doubt).toBeUndefined();
+        const items = await collect(bibtexAdapter(await writeExport("paren.bib", src)));
+        expect(items.map(title)).toEqual(["T", "Next"]);
+        expect(items[0]!.doubts).toBeUndefined();
+      }
+    });
+  });
+
+  describe("R366 g, h: what is tracked is bounded, and closed inner openers are forgotten", () => {
+    it("a one-entry file with over a million 'a@b{c}' inside a note is read, not refused as too many references", async () => {
+      const src = `@article{k, title={T}, note={${"a@b{c} ".repeat(1_100_000)}}, doi={10.5555/k}, year={2020}}\n`;
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(["k"]);
+      expect(es[0]!.fields.get("doi")).toBe("10.5555/k");
+    });
+
+    it("a file nesting more unclosed entries than any export can hold is refused as too many references (the bound on tracked blocks)", () => {
+      const src = "@a{k, t={\n".repeat(5 * MAX_EXPORT_RECORDS + 1);
+      expect(() => parseBibtexEntries(src).next()).toThrow(expect.objectContaining({ reason: expect.stringMatching(/too many references/) }));
+    });
+  });
+
   it("R366 f: the doubts of an unclosed entry say that its fields may also hold text from what followed it", () => {
     expect(BIB_DOUBTS.cut).toBe('The BibTeX entry was not closed, so it was cut at a line beginning with "@"; its fields may be incomplete or hold text from what followed it.');
     expect(BIB_DOUBTS.eof).toBe("The BibTeX entry was not closed before the end of the file; its fields may be incomplete or hold text from what followed it.");

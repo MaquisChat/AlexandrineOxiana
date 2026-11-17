@@ -112,6 +112,24 @@ describe("parseBibtex", () => {
       }
     });
 
+    it("R366 a: an entry line between the fields ends the entry, whatever brace closes later; inside a value it is kept, with the third doubt", () => {
+      const m = parseBibtex("@article{a, title={A}, year={2001}\n@article{b, title={B}, doi={10.5555/b}, year={2002}}}\n");
+      expect(m).toMatchObject({ title: "A", issued: "2001" });
+      expect(m.doi).toBeUndefined();
+      expect(m.doubt).toBe(BIB_DOUBTS.cut);
+      const q = parseBibtex('@article{k,\n  title = {Citing},\n  abstract = "As in\n@article{smith2020, title={Pasted}}\nmore.",\n  doi = {10.5555/k},\n  year = {2021}\n}\n');
+      expect(q).toMatchObject({ title: "Citing", doi: "10.5555/k", issued: "2021" });
+      expect(q.doubt).toBe(BIB_DOUBTS.innerEntry);
+    });
+
+    it("R366 d: in a ( entry, a ')' inside a braced or quoted value does not close it", () => {
+      for (const abstract of ["{We ask 1) why and 2) how.}", '"We ask 1) why and 2) how."']) {
+        const m = parseBibtex(`@article(a, title={T}, abstract=${abstract}, doi={10.5555/a}, year={2001})`);
+        expect(m).toMatchObject({ title: "T", doi: "10.5555/a", issued: "2001" });
+        expect(m.doubt).toBeUndefined();
+      }
+    });
+
     it("a sidecar's doubt reaches the resolution: the item goes to review with it", async () => {
       const dir = await mkdtemp(join(tmp, "res-"));
       const bib = join(dir, "paper.bib");

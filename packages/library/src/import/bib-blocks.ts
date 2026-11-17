@@ -77,29 +77,163 @@ export function bibDoubt(b: Pick<BibBlock, "state" | "innerEntry">): string | un
   return b.state === "cut" ? BIB_DOUBTS.cut : b.state === "eof" ? BIB_DOUBTS.eof : b.innerEntry ? BIB_DOUBTS.innerEntry : undefined;
 }
 
-/** More blocks are open at once (or closed ahead of the reader) than any export can hold: see BibBlocks. */
+/** More blocks are open at once (or resolved ahead of the reader) than any export can hold: see BibBlocks. */
 export class TooManyBibBlocks extends Error {
   constructor() {
     super("too many BibTeX blocks");
   }
 }
 
+/** The type letters of a block opened by the delimiter at `k` ("@", letters, optional white space before it), or undefined. */
+function openerType(src: string, k: number): string | undefined {
+  let j = k - 1;
+  while (j >= 0 && isSpace(src[j])) j--;
+  const last = j;
+  while (j >= 0 && isLetter(src[j])) j--;
+  return last > j && src[j] === "@" ? src.slice(j + 1, last + 1).toLowerCase() : undefined;
+}
+
+interface Open {
+  /** Its opening delimiter. */
+  open: number;
+  /** The brace depth of the block's own level (between its fields): just inside its "{", or at its "(". */
+  base: number;
+  paren: boolean;
+  /** An entry or @string (not @comment, @preamble): a block line at its own level ends it, and a quote there opens a value. */
+  fields: boolean;
+  /** Inside a quoted value at the block's own level. */
+  quote: boolean;
+  /** `(` blocks: parentheses open at the block's own level outside values (its own included). */
+  parens: number;
+  /** The scanner's count of block lines when it was opened. */
+  lines0: number;
+}
+
+type Result = BibBlock | "unclosed";
+
+/**
+ * One forward scan over the text from a block's opening delimiter. Brace depth is absolute (it may go
+ * below zero); every block is judged relative to its own level, so what a block's scan finds depends
+ * only on the text from its opening on.
+ */
+class Scanner {
+  pos: number;
+  private depth = 0;
+  private lineStart = false;
+  /** Count of block lines (beginsBlockLine) passed. */
+  private lines = 0;
+  readonly stack: Open[] = [];
+  /** Blocks resolved and not yet asked for. */
+  readonly done = new Map<number, Result>();
+  private target = -1;
+  private hit = false;
+
+  constructor(
+    private readonly src: string,
+    private readonly maxTracked: number,
+    /** Keep the results of blocks resolved inside another open block. */
+    private readonly keepNested: boolean,
+    from: number,
+  ) {
+    this.pos = from;
+  }
+
+  /** Moves the scan to `at` (only with nothing open: what lies between is not inside any block). */
+  jump(at: number): void {
+    this.pos = at;
+    this.lineStart = false;
+  }
+
+  private push(open: number, paren: boolean, type: string): void {
+    if (this.stack.length + this.done.size >= this.maxTracked) throw new TooManyBibBlocks();
+    this.stack.push({ open, base: this.depth, paren, fields: type !== "comment" && type !== "preamble", quote: false, parens: paren ? 1 : 0, lines0: this.lines });
+  }
+
+  /** `o` has just been taken off the stack with result `r`. */
+  private finish(o: Open, r: Result): void {
+    if (o.open === this.target) this.hit = true;
+    if (this.keepNested || this.stack.length === 0 || o.open === this.target) this.done.set(o.open, r);
+  }
+
+  private closed(o: Open, at: number): BibBlock {
+    return { end: at + 1, state: "closed", innerEntry: this.lines > o.lines0 };
+  }
+
+  /** A block line at `q`: it ends every block whose own level it is on (outside a quoted value); for the others it is inside a value. */
+  private blockLine(q: number): void {
+    for (let t = this.stack.at(-1); t && t.base === this.depth && t.fields && !t.quote; t = this.stack.at(-1)) {
+      this.stack.pop();
+      this.finish(t, { end: q, state: "cut", innerEntry: this.lines > t.lines0 });
+    }
+    this.lines++;
+  }
+
+  /** Scans until the block opening at `open` is resolved (or the text ends); its result, taken. */
+  runTo(open: number): Result | undefined {
+    this.target = open;
+    this.hit = this.done.has(open);
+    const { src } = this;
+    const n = src.length;
+    while (!this.hit && this.pos < n) {
+      const p = this.pos;
+      if (this.lineStart) {
+        this.lineStart = false;
+        let q = p;
+        while (src[q] === " " || src[q] === "\t") q++;
+        if (src[q] === "@" && beginsBlockLine(src, q)) this.blockLine(q);
+      }
+      const c = src[p];
+      const top = this.stack.at(-1);
+      if (c === "\\") {
+        const d = src[p + 1];
+        this.pos += d === undefined || d === "\n" || d === "\r" ? 1 : 2; // a backslash never hides a line break
+        continue;
+      }
+      if (c === "\n" || c === "\r") this.lineStart = true;
+      else if (c === "{") {
+        this.depth++;
+        const type = p === open ? (openerType(src, p) ?? "") : top?.quote ? undefined : openerType(src, p);
+        if (type !== undefined) this.push(p, false, type);
+      } else if (c === "}") {
+        this.depth--;
+        for (let t = this.stack.at(-1); t && t.base > this.depth; t = this.stack.at(-1)) {
+          this.stack.pop();
+          this.finish(t, t.paren ? "unclosed" : this.closed(t, p));
+        }
+      } else if (c === "(") {
+        const type = p === open ? (openerType(src, p) ?? "") : top?.quote ? undefined : openerType(src, p);
+        if (type !== undefined) this.push(p, true, type);
+        else if (top?.paren && top.base === this.depth && !top.quote) top.parens++;
+      } else if (c === ")") {
+        if (top?.paren && top.base === this.depth && !top.quote && --top.parens === 0) {
+          this.stack.pop();
+          this.finish(top, this.closed(top, p));
+        }
+      } else if (c === '"') {
+        if (top?.fields && top.base === this.depth) top.quote = !top.quote;
+      }
+      this.pos++;
+    }
+    if (!this.hit && this.pos >= n) {
+      // The end of the text: every block still open never closed (all kept: the reader may ask for any of them).
+      for (const o of this.stack) this.done.set(o.open, "unclosed");
+      this.stack.length = 0;
+    }
+    const r = this.done.get(open);
+    this.done.delete(open);
+    return r;
+  }
+}
+
 export class BibBlocks {
   private readonly n: number;
-  /** The brace scan: next index to look at, and the brace depth there (relative; may go below zero). */
-  private scan = 0;
-  private started = false;
-  private depth = 0;
-  /** Opening braces of blocks (`@type{`) not yet closed (in increasing order), with the depth just inside them. */
-  private readonly openAt: number[] = [];
-  private readonly openDepth: number[] = [];
-  /** Blocks the scan found closed that no query has asked for yet. */
-  private readonly closedAt = new Map<number, number>();
-  /** The last line-start search: from `from`, the first entry line is at `at` (n: none). */
+  /** The scan shared by the reader's queries (they come in increasing order). */
+  private readonly scan: Scanner;
+  /** The last line-start search: from `from`, the first block line is at `at` (n: none). */
   private memo = { from: -1, at: -1 };
 
   /**
-   * `maxTracked`: at most this many blocks are held open or closed ahead of the reader (memory stays
+   * `maxTracked`: at most this many blocks are held open or resolved ahead of the reader (memory stays
    * bounded on a hostile file); past it, TooManyBibBlocks.
    */
   constructor(
@@ -107,106 +241,22 @@ export class BibBlocks {
     private readonly maxTracked = Number.POSITIVE_INFINITY,
   ) {
     this.n = src.length;
-  }
-
-  /** Whether the brace at `at` is open and tracked (binary search: openAt is in increasing order). */
-  private isOpen(at: number): boolean {
-    let lo = 0;
-    let hi = this.openAt.length - 1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      const v = this.openAt[mid]!;
-      if (v === at) return true;
-      if (v < at) lo = mid + 1;
-      else hi = mid - 1;
-    }
-    return false;
-  }
-
-  /** Whether the "{" at `k` opens a block: "@", letters, optional white space before it (looked at once per brace). */
-  private opensBlock(k: number): boolean {
-    let j = k - 1;
-    while (j >= 0 && isSpace(this.src[j])) j--;
-    const last = j;
-    while (j >= 0 && isLetter(this.src[j])) j--;
-    return last > j && this.src[j] === "@";
-  }
-
-  private step(force = -1): void {
-    const c = this.src[this.scan];
-    if (c === "\\") {
-      this.scan += this.src[this.scan + 1] === "\n" ? 1 : 2;
-      return;
-    }
-    if (c === "{") {
-      this.depth++;
-      if (this.scan === force || this.opensBlock(this.scan)) {
-        if (this.openAt.length + this.closedAt.size >= this.maxTracked) throw new TooManyBibBlocks();
-        this.openAt.push(this.scan);
-        this.openDepth.push(this.depth);
-      }
-    } else if (c === "}") {
-      this.depth--;
-      while (this.openDepth.length && this.openDepth[this.openDepth.length - 1]! > this.depth) {
-        this.openDepth.pop();
-        this.closedAt.set(this.openAt.pop()!, this.scan);
-      }
-    }
-    this.scan++;
-  }
-
-  /** Index of the "}" that closes the "{" at `open`, or -1 when it never closes. Queries come in increasing order. */
-  matchBrace(open: number): number {
-    const known = this.closedAt.get(open);
-    if (known !== undefined) {
-      this.closedAt.delete(open);
-      return known;
-    }
-    if (!this.isOpen(open)) {
-      if (!this.started || open >= this.scan) {
-        if (!this.started) {
-          this.started = true;
-          this.scan = open;
-        }
-        while (this.scan < open) this.step();
-        if (this.scan === open) this.step(open);
-      } else return this.countFrom(open); // a brace the scan passed without taking it as a block's (not used by the readers)
-    }
-    while (this.scan < this.n && !this.closedAt.has(open)) this.step();
-    const m = this.closedAt.get(open) ?? -1;
-    this.closedAt.delete(open);
-    return m;
-  }
-
-  /** The plain count from `open` (the same rule as the scan). */
-  private countFrom(open: number): number {
-    let depth = 0;
-    for (let k = open; k < this.n; k++) {
-      const c = this.src[k];
-      if (c === "\\") {
-        if (this.src[k + 1] !== "\n") k++;
-      } else if (c === "{") depth++;
-      else if (c === "}" && --depth === 0) return k;
-    }
-    return -1;
-  }
-
-  /** Whether the "@" at `at` begins a block line: see beginsBlockLine. */
-  private beginsEntry(at: number): boolean {
-    return beginsBlockLine(this.src, at);
+    this.scan = new Scanner(src, maxTracked, true, 0);
   }
 
   /**
-   * Index of the "@" of the first line at or after `from` that begins an entry (spaces and tabs may
-   * come first), or the text's length. `from` is just past an opening delimiter.
+   * Index of the "@" of the first line at or after `from` that is a block line (beginsBlockLine; spaces
+   * and tabs may come first), or the text's length. `from` is just past an opening delimiter.
    */
   nextEntryLine(from: number): number {
     if (from >= this.memo.from && from <= this.memo.at && this.memo.from >= 0) return this.memo.at;
     let at = this.n;
-    for (let nl = this.src.indexOf("\n", from); nl >= 0; nl = this.src.indexOf("\n", nl + 1)) {
-      let j = nl + 1;
+    for (let k = from; k < this.n; k++) {
+      const c = this.src[k];
+      if (c !== "\n" && c !== "\r") continue;
+      let j = k + 1;
       while (this.src[j] === " " || this.src[j] === "\t") j++;
-      if (this.src[j] === "@" && this.beginsEntry(j)) {
+      if (this.src[j] === "@" && beginsBlockLine(this.src, j)) {
         at = j;
         break;
       }
@@ -215,21 +265,17 @@ export class BibBlocks {
     return at;
   }
 
-  /** The block whose opening delimiter ("{" or "(") is at `open`. */
+  /** The block whose opening delimiter ("{" or "(") is at `open`. Queries come in increasing order. */
   block(open: number): BibBlock {
-    if (this.src[open] === "{") {
-      const m = this.matchBrace(open);
-      if (m >= 0) return { end: m + 1, state: "closed", innerEntry: this.nextEntryLine(open + 1) < m };
-    } else {
-      const limit = this.nextEntryLine(open + 1);
-      let depth = 0;
-      for (let k = open; k < limit; k++) {
-        const c = this.src[k];
-        if (c === "(") depth++;
-        else if (c === ")" && --depth === 0) return { end: k + 1, state: "closed", innerEntry: false };
-      }
+    const g = this.scan;
+    let r: Result | undefined;
+    if (g.done.has(open) || open >= g.pos) {
+      if (!g.done.has(open) && !g.stack.length) g.jump(open);
+      r = g.runTo(open);
     }
-    return this.unclosed(open);
+    // A block the shared scan passed inside another (and so did not keep): its own scan.
+    r ??= new Scanner(this.src, this.maxTracked, false, open).runTo(open);
+    return r === undefined || r === "unclosed" ? this.unclosed(open) : r;
   }
 
   /** Where a block opening at `open` that never closes ends. */
