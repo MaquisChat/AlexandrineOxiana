@@ -379,3 +379,54 @@ describe("R409 (b): the certificate always says where it stands on old copies", 
     expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
   });
 });
+
+describe("R409 (c): the old place's Backups and trash are looked at", () => {
+  it("P5: a split move leaves the moved project's backup in the old root's Backups: the certificate names the old copy; after 'Delete the old copy' the warning stays until that backup is gone", async () => {
+    kit.clock.now = DUE;
+    const p = await makeProject(kit, GOV, false, "Interviews");
+    const sf = await rawSource(p);
+    const other = await makeProject(kit, GOV, false, "Stays");
+    const made = await backupProject(kit.repo, p.id);
+    const dest = join(kit.tmp, "Moved");
+    const res = await executeMove(kit.lib, dest, { deps: deps(), env: env(), sourceRepo: kit.repo, excludeProjectIds: [other.id] });
+    const repo = await openAt(dest);
+    expect(existsSync(made.path)).toBe(true); // still in the old root's Backups
+    kit.clock.now = new Date(DUE.getTime() + 3600_000);
+    const r = await destroyRaw(repo, p.id, [sf.assets[0]!.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending", notDestroyed: [{ movedAt: DUE.toISOString() }] });
+    await deleteOldCopy(kit.lib.root, res.confirmToken, { deps: deps(), destRepo: repo });
+    expect(existsSync(join(kit.lib.root, ...sf.assets[0]!.path.split("/")))).toBe(false);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+    await rm(made.path);
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).certificate!.oldCopies).toMatchObject({ status: "no-longer-present" });
+  });
+
+  it("an old copy whose project folder was removed by hand but whose Backups still hold the project's backup counts", async () => {
+    const p = await makeProject(kit, GOV, false, "Interviews");
+    const sf = await rawSource(p);
+    await backupProject(kit.repo, p.id);
+    const dest = join(kit.tmp, "Moved");
+    await executeMove(kit.lib, dest, { deps: deps(), env: env(), sourceRepo: kit.repo });
+    const repo = await openAt(dest);
+    await rm(join(kit.lib.root, ...repo.getProject(p.id).folder.split("/")), { recursive: true, force: true });
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [sf.assets[0]!.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending" });
+  });
+
+  it("an old copy whose project folder was removed by hand but whose trash still holds a destroyed file counts", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    await rm(join(kit.lib.root, ...repo.getProject(p.id).folder.split("/")), { recursive: true, force: true });
+    const trash = join(kit.lib.root, ".tmp", "trash-0b3c1f2e-1111-4222-8333-944455556666-1");
+    await mkdir(trash, { recursive: true });
+    await writeFile(join(trash, asset.path.split("/").at(-1)!), "RAW interview audio bytes");
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending" });
+  });
+});
