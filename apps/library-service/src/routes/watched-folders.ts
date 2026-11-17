@@ -196,16 +196,21 @@ export function placeOf(real: string, env: LocationEnv): WatchedFolderPlace {
   return { provider, providerName, display: real };
 }
 
-/** The test seam (R47: honoured only under NODE_ENV=test or VITEST), else this computer. */
-function locationEnv(ctx: Ctx): LocationEnv {
-  const testing = process.env.NODE_ENV === "test" || process.env.VITEST !== undefined;
-  if (testing && ctx.watchLocationEnv) return ctx.watchLocationEnv;
+/** This computer's home folder, platform and cloud-folder variables, without looking at its mounts (R450 d). */
+export function cheapLocationEnv(): LocationEnv {
   const vars: NonNullable<LocationEnv["vars"]> = {};
   for (const k of ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"] as const) {
     const v = process.env[k];
     if (v) vars[k] = v;
   }
   return { homeDir: homedir(), platform: process.platform, mounts: [], mountsKnown: false, vars };
+}
+
+/** The test seam (R47: honoured only under NODE_ENV=test or VITEST), else this computer. */
+function locationEnv(ctx: Ctx): LocationEnv {
+  const testing = process.env.NODE_ENV === "test" || process.env.VITEST !== undefined;
+  if (testing && ctx.watchLocationEnv) return ctx.watchLocationEnv;
+  return cheapLocationEnv();
 }
 
 // ---------------------------------------------------------------------------------------------------------------
