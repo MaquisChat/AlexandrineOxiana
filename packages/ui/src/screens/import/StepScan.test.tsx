@@ -6,7 +6,7 @@ import { SUMMARY } from "../../test/importService";
 import { NO_APPROVALS, StepScan } from "./StepScan";
 
 const SENTENCE =
-  "This import would copy about 2.4 GB of files into the library, but its disk has only 812 MB free. Free some space, or choose to leave the files where they are, and start again.";
+  "This import needs about 2.9 GB free on the library's disk (2.4 GB of files to copy, and room the library keeps free to work), but only 812 MB is free. Free some space, or choose to leave the files where they are, and start again.";
 
 function show(summary: ScanSummary) {
   render(<StepScan summary={summary} sourceName="Papers" approvals={NO_APPROVALS} onApprovals={() => {}} />);
@@ -22,6 +22,6 @@ describe("StepScan: room on the library's disk (R413 a)", () => {
 
   it("says nothing of room when they fit, or from an older service", () => {
     show({ ...SUMMARY, copyBytes: 2e6, freeBytes: 812e6 });
-    expect(screen.queryByText(/would copy about/)).toBeNull();
+    expect(screen.queryByText(/needs about/)).toBeNull();
   });
 });

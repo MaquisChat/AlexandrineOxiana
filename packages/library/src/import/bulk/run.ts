@@ -643,7 +643,7 @@ async function preflightSpace(repo: Repo, projectId: string, adapter: ImportSour
   if (!copy) return reserve;
   const db = adapter.kind === "zotero-local" ? await zoteroCopyBytes(zoteroDataDir(adapter.location)) : 0;
   const free = await freeRoom(repoLibrary(repo).root);
-  if (Number.isFinite(free) && reserve + db > free) throw new BatchRefusedError(fitSentence(copy, free, !linkRefused && !COPY_ONLY_KINDS.has(adapter.kind)));
+  if (Number.isFinite(free) && reserve + db > free) throw new BatchRefusedError(fitSentence(copy, db, free, !linkRefused && !COPY_ONLY_KINDS.has(adapter.kind)));
   return reserve;
 }
 
@@ -2654,7 +2654,7 @@ async function spaceOfScan(repo: Repo, projectId: string, adapter: ImportSourceA
   if (!Number.isFinite(free)) return;
   summary.freeBytes = free;
   const db = adapter.kind === "zotero-local" ? await zoteroCopyBytes(zoteroDataDir(adapter.location)) : 0;
-  if (copy && copy + spaceMargin(copy) + db > free) summary.spaceWarning = fitSentence(copy, free, !linkRefused && !COPY_ONLY_KINDS.has(adapter.kind));
+  if (copy && copy + spaceMargin(copy) + db > free) summary.spaceWarning = fitSentence(copy, db, free, !linkRefused && !COPY_ONLY_KINDS.has(adapter.kind));
 }
 
 /**

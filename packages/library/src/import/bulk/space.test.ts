@@ -125,12 +125,20 @@ afterAll(async () => {
   await shutdownExtractors();
 });
 
-describe("the sentence (R413 a)", () => {
-  it("names the two sizes in the interface's style, and the way out the source allows", () => {
-    expect(fitSentence(2.4e9, 812e6, true)).toBe(
-      "This import would copy about 2.4 GB of files into the library, but its disk has only 812 MB free. Free some space, or choose to leave the files where they are, and start again.",
+describe("the sentence (R436 c)", () => {
+  it("says what is needed: the files, the room the library keeps free, against what is free; the way out the source allows", () => {
+    expect(fitSentence(50e6, 0, 400e6, true)).toBe(
+      "This import needs about 550 MB free on the library's disk (50 MB of files to copy, and room the library keeps free to work), but only 400 MB is free. Free some space, or choose to leave the files where they are, and start again.",
     );
-    expect(fitSentence(3e6, 100e6, false)).toBe("This import would copy about 3 MB of files into the library, but its disk has only 100 MB free. Free some space and start again.");
+    expect(fitSentence(3e6, 0, 100e6, false)).toBe(
+      "This import needs about 503 MB free on the library's disk (3 MB of files to copy, and room the library keeps free to work), but only 100 MB is free. Free some space and start again.",
+    );
+  });
+
+  it("names the Zotero database's working copy when the source has one", () => {
+    expect(fitSentence(2e9, 300e6, 2.1e9, true)).toBe(
+      "This import needs about 2.8 GB free on the library's disk (2 GB of files to copy, a working copy of the Zotero database, and room the library keeps free to work), but only 2.1 GB is free. Free some space, or choose to leave the files where they are, and start again.",
+    );
   });
 });
 
@@ -143,7 +151,7 @@ describe("before a batch that copies files starts (R413 a)", () => {
     await bulk.dryRun(p.id, folderAdapter(src));
     await expect(bulk.startBatch(p.id, folderAdapter(src))).rejects.toMatchObject({
       name: "BatchRefusedError",
-      reason: "This import would copy about 3 MB of files into the library, but its disk has only 100 MB free. Free some space, or choose to leave the files where they are, and start again.",
+      reason: "This import needs about 503 MB free on the library's disk (3 MB of files to copy, and room the library keeps free to work), but only 100 MB is free. Free some space, or choose to leave the files where they are, and start again.",
     });
     await nothingWritten(p);
     // With the room for the files and the 500 MB margin it starts.
@@ -158,7 +166,7 @@ describe("before a batch that copies files starts (R413 a)", () => {
     const src = await folder("Papers", 3, 4e6);
     free = 12e6 + 1.2e6 - 1;
     await bulk.dryRun(p.id, folderAdapter(src));
-    await expect(bulk.startBatch(p.id, folderAdapter(src))).rejects.toMatchObject({ reason: fitSentence(12e6, free, true) });
+    await expect(bulk.startBatch(p.id, folderAdapter(src))).rejects.toMatchObject({ reason: fitSentence(12e6, 0, free, true) });
     await nothingWritten(p);
     free = 12e6 + 1.2e6;
     expect((await (await bulk.startBatch(p.id, folderAdapter(src))).done).state).toBe("finished");
@@ -274,7 +282,7 @@ describe("before a batch that copies files starts (R413 a)", () => {
     expect(files).toBeGreaterThan(0);
     const need = files + Math.ceil(files / 10) + db;
     free = need - 1;
-    await expect(bulk.startBatch(p.id, zoteroLocalAdapter(dataDir))).rejects.toMatchObject({ reason: fitSentence(files, need - 1, true) });
+    await expect(bulk.startBatch(p.id, zoteroLocalAdapter(dataDir))).rejects.toMatchObject({ reason: fitSentence(files, db, need - 1, true) });
     await nothingWritten(p);
     free = need;
     const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir));
@@ -290,7 +298,9 @@ describe("the dry run (R413 a)", () => {
     const s = await bulk.dryRun(p.id, folderAdapter(src));
     expect(s.copyBytes).toBe(3e6);
     expect(s.freeBytes).toBe(100e6);
-    expect(s.spaceWarning).toBe(fitSentence(3e6, 100e6, true));
+    expect(s.spaceWarning).toBe(
+      "This import needs about 503 MB free on the library's disk (3 MB of files to copy, and room the library keeps free to work), but only 100 MB is free. Free some space, or choose to leave the files where they are, and start again.",
+    );
     free = 600e6;
     const ok = await bulk.dryRun(p.id, folderAdapter(src));
     expect(ok.freeBytes).toBe(600e6);
