@@ -338,3 +338,4 @@ R414 (2026-11-17): FR-A19 round 2 built — commits not one per point accepted; 
 R415 (2026-11-17): FR-A11 approved after round 2 with small points — a small round 3: the snapshot drops path parameters and reads addresses as a browser does; a UUID and a long lower-case id count as a key; the last two blank checks; other-scheme addresses lose user information; test hygiene
 R416 (2026-11-17): FR-A10 round 3 built — where several participants' names fold alike, the one exactly named in the text gives its code; then a fresh reviewer for the whole task
 R417 (2026-11-17): FR-A19 approved after round 2 — one small mend (the lost-connection sentence goes when the service answers again), then done; three Minor points left (FR-687)
+R418 (2026-11-17): FR-A18 round 2 built — the repairing save is judged under the rules being saved (the defaults decide what is loosened; a reason and approver are always owed); the reviewer attacks that door hardest; scoped look asked
