@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 import { LibraryRelativePath } from "@ao/core";
-import { assertLiveKey, decryptStream, encryptStream } from "../crypto/format.js";
+import { assertLiveKey, decryptStream, encryptStream, noteOpening } from "../crypto/format.js";
 import { PathEscapeError, TornFileError } from "./errors.js";
 
 /** Absolute path of a library-relative path; validates it first. */
@@ -225,7 +225,9 @@ export function sealLine(key: Uint8Array, keyId: string, projectId: string, json
 
 export function openLine(key: Uint8Array, projectId: string, line: string, purpose = "ao-changes"): string {
   const o = JSON.parse(line) as { keyId?: unknown; nonce: string; ct: string };
-  assertLiveKey(key, typeof o.keyId === "string" ? o.keyId : ""); // a wiped key is "locked", not a line that does not open (R386 a)
+  const keyId = typeof o.keyId === "string" ? o.keyId : "";
+  noteOpening(keyId);
+  assertLiveKey(key, keyId); // a wiped key is "locked", not a line that does not open (R386 a)
   const ct = Buffer.from(o.ct, "base64");
   const d = createDecipheriv("aes-256-gcm", key, Buffer.from(o.nonce, "base64"), { authTagLength: 16 });
   d.setAAD(Buffer.from(`${purpose}|${projectId}`, "utf8"));

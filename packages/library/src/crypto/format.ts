@@ -73,6 +73,17 @@ export function assertKey(key: Uint8Array): void {
 }
 
 /**
+ * Test seam (R404; reached from tests through `repo/testing.ts`): `onOpen` runs as each opening with a project key is
+ * about to happen — in `decryptStream` and `openDecryptedHandle` before the key is asked for, in `openLine` before
+ * it is checked — so a test can lock the project at the Nth opening. Honoured only when NODE_ENV is "test" (R47).
+ */
+export const openingSeam: { onOpen?: (keyId: string) => void } = {};
+
+export function noteOpening(keyId: string): void {
+  if (openingSeam.onOpen && process.env.NODE_ENV === "test") openingSeam.onOpen(keyId);
+}
+
+/**
  * A live key: 32 bytes, not all zero. A key ring zero-fills a key when the project is locked; a buffer that reads
  * as zeros is a wiped key. Sealing under it would seal for anyone (R379); opening with it is a read the lock cut
  * short, which is "locked", never "damaged" nor "another project's line" (R386 a). Refused in every primitive that
@@ -330,6 +341,7 @@ export function decryptStream(
   const readHeader = () => {
     header = queue.take(HEADER_LEN);
     parsed = parseHeader(header);
+    noteOpening(parsed.keyId);
     let key: Uint8Array | undefined;
     try {
       key = getKey(parsed.keyId);

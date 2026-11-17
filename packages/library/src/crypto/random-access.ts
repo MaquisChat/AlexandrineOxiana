@@ -19,6 +19,7 @@ import {
   KeyNotAvailableError,
   TAG_LEN,
   assertLiveKey,
+  noteOpening,
   chunkAad,
   chunkNonce,
   parseHeader,
@@ -53,6 +54,7 @@ export async function openDecryptedHandle(fh: fsp.FileHandle, getKey: (keyId: st
     const header = Buffer.alloc(HEADER_LEN);
     const { bytesRead } = await fh.read(header, 0, HEADER_LEN, 0);
     const parsed = parseHeader(header.subarray(0, bytesRead));
+    noteOpening(parsed.keyId);
     const k = getKey(parsed.keyId);
     if (!(k instanceof Uint8Array) || k.length !== KEY_LEN) throw new KeyNotAvailableError(parsed.keyId);
     assertLiveKey(k, parsed.keyId);
