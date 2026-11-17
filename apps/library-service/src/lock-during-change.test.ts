@@ -156,12 +156,11 @@ describe("R443 a: unlock, unlock, then lock through the service", () => {
     const resumed = [vi.spyOn(state, "resumeProject"), vi.spyOn(state, "resumeFind"), vi.spyOn(state, "runScheduledBackups")];
     const startWork = vi.spyOn(state, "startWork");
     const startsBefore = startWork.mock.calls.length;
-    // A request has arrived when its handler has started: the unlock handler asks for the session twice (itself and
-    // `projectParam`) before anything else. An injected request's body is parsed over a few ticks, so a bare tick
-    // could let a later lock's handler (which has no body) run first.
-    const sessions = vi.spyOn(state, "requireSession");
-    const arrived = async (handlers: number) => {
-      while (sessions.mock.calls.length < 2 * handlers) await new Promise<void>((r) => setImmediate(r));
+    // An unlock request has arrived when its count of locks has been read (`lockAsksOf`). An injected request's body
+    // is parsed over a few ticks, so a bare tick could let a later lock's handler (which has no body) run first.
+    const reads = vi.spyOn(repo, "lockAsksOf");
+    const arrived = async (requests: number) => {
+      while (reads.mock.calls.length < requests) await new Promise<void>((r) => setImmediate(r));
     };
     // U1, U2, then L, each a tick after the one before it arrived: the lock is the last thing asked.
     const u1 = call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } });
