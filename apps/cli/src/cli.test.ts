@@ -11,6 +11,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { devWorkerPython, openLibrary } from "@ao/library";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
@@ -536,6 +537,17 @@ describe("import, export, secrets and maintenance", () => {
     expect(r.stderr).toMatch(/manual_upload/u);
     expect(r.stderr).not.toContain(tmp);
   }, 60_000);
+
+  it("R362 c: the library's own folder, a project's folder and a folder holding the library are refused, nothing imported", async () => {
+    for (const dir of [lib, join(lib, "Projects", "Imp"), tmp]) {
+      for (const extra of [["--dry-run"], []]) {
+        const r = await run(["import", dir, "--project", "Imp", ...extra]);
+        expect([r.code, r.stderr.includes(IN_LIBRARY_TEXT.folder)], r.stderr).toEqual([1, true]);
+      }
+    }
+    expect(json(await run(["--json", "list", "--project", "Imp"])).sources).toEqual([]);
+    expect(await readdir(join(lib, "Projects", "Imp"))).not.toContain("imports");
+  }, 120_000);
 
   it("imports a folder, then the same folder again finds the duplicates", async () => {
     const r = await run(["--json", "import", papers, "--project", "Imp", "--structure", "tags", "--duplicates", "skip"]);
