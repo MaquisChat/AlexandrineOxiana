@@ -638,3 +638,88 @@ describe("Task 62: jobs the service follows (an id, what it is about, finish, in
     expect(ok.jobs.size).toBe(3);
   });
 });
+
+/**
+ * R367 (FR-A8): every kind of job that processes a source's content audits its allowed `process`
+ * decision once per run of the job, where the run is authorised; a capture's download is audited by
+ * its caller (the capture's one decision), so the client adds nothing for it.
+ */
+describe("R367: the run audits its allowed `process` decision, once", () => {
+  const writeOut = async (job: { body: { output: string; type: string } }) => {
+    const file = job.body.type === "audio.transcribe" || job.body.type === "capture.download" ? join(job.body.output, "out.txt") : job.body.output;
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, "out");
+    return { status: "done", result: { output: job.body.output, meta: {} } };
+  };
+  const processEntries = async (folder: string) => (await auditEvents(folder)).filter((e) => e.action === "process");
+
+  const kinds = [
+    ["audio.transcribe", "transcription", "a.wav"],
+    ["image.proxy", "image_proxy", "a.png"],
+    ["video.proxy", "video_proxy", "a.mov"],
+    ["pdf.ocr", "ocr", "a.pdf"],
+  ] as const;
+  for (const [type, op, name] of kinds) {
+    it(`${type}: one \`process\` allow entry (op worker.${type}, the asset, ${op}/local), and only one, whether the job succeeds or fails`, async () => {
+      const { project } = await repo.createProject({ name: "K", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+      const input = join(tmp, name);
+      await writeFile(input, "bytes");
+      const entity = { type: "asset" as const, id: randomUUID() };
+      const output = type === "audio.transcribe" ? join(tmp, "out", "t") : join(tmp, "out", `o-${name}`);
+      const ok = await stubWorker(writeOut);
+      await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).submit(project.id, { type, input, output, params: {}, entity });
+      const after = await processEntries(project.folder);
+      expect(after).toHaveLength(1);
+      expect(after[0]).toMatchObject({ action: "process", entity, decision: { result: "allow" }, details: { op: `worker.${type}`, process: { op, provider: "local" } } });
+      expect(Object.keys(after[0]!.details ?? {}).sort()).toEqual(["op", "process"]);
+      // A second job is a second run: its own entry. A failing one is still a processing allowed and begun.
+      const failing = await stubWorker(() => ({ status: "failed", error: { code: "UNSUPPORTED_INPUT", message: "no" } }));
+      await expect(new WorkerClient({ repo, worker: failing, index: { db }, pollMs: 5 }).submit(project.id, { type, input, output, params: {}, entity })).rejects.toBeInstanceOf(WorkerJobError);
+      expect(await processEntries(project.folder)).toHaveLength(2);
+      expect((await repo.verifyAudit(project.id)).ok).toBe(true);
+    });
+  }
+
+  it("capture.download: the client audits nothing (the capture's caller audited its one decision)", async () => {
+    const { project } = await repo.createProject({ name: "C", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const before = (await auditEvents(project.folder)).length;
+    const ok = await stubWorker(writeOut);
+    await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).submit(project.id, { type: "capture.download", input: "https://www.youtube.com/watch?v=abc", output: join(tmp, "cap"), params: {} });
+    expect((await auditEvents(project.folder)).slice(before)).toEqual([]);
+  });
+
+  it("one run of a job, one entry: a rerun after a restart, a rerun after an unlock and a lost claim add none", async () => {
+    const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const input = join(tmp, "a.png");
+    await writeFile(input, "png");
+    // Left pending by a worker that went away (a restart follows).
+    const down = await stubWorker(() => ({ status: "done" }));
+    await closers.pop()!();
+    await expect(new WorkerClient({ repo, worker: down, index: { db }, pollMs: 5 }).submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "a.jpg"), params: {} })).rejects.toBeInstanceOf(WorkerUnavailableError);
+    expect(await processEntries(project.folder)).toHaveLength(1);
+    // Cancelled by a lock while the worker runs; runs again at the unlock.
+    const ok = await stubWorker(writeOut);
+    await expect(
+      new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "b.jpg"), params: {}, finish: async () => {}, onProgress: () => repo.lockProject(project.id) }),
+    ).rejects.toThrow(ProjectLockedError);
+    expect(await processEntries(project.folder)).toHaveLength(2);
+    await repo.unlockProject(project.id, "pw");
+    // Two resubmissions at once: each pending job runs once, and no rerun audits again.
+    const [a, b] = await Promise.all([
+      new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending(project.id, { prepare: () => ({ finish: async () => {} }) }),
+      new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending(project.id, { prepare: () => ({ finish: async () => {} }) }),
+    ]);
+    expect([...a, ...b].filter((x) => x.result !== undefined)).toHaveLength(2);
+    expect(await processEntries(project.folder)).toHaveLength(2);
+    expect((await repo.verifyAudit(project.id)).ok).toBe(true);
+  });
+
+  it("a denial at the run is audited as before: one deny, no allow", async () => {
+    const { project } = await repo.createProject({ name: "D", governanceYaml: NO_TRANSCRIPTION_GOV, encryption: { enabled: false } });
+    const input = join(tmp, "a.wav");
+    await writeFile(input, "RIFF");
+    const worker = await stubWorker(() => ({ status: "done" }));
+    await expect(new WorkerClient({ repo, worker, index: { db }, pollMs: 5 }).submit(project.id, { type: "audio.transcribe", input, output: join(tmp, "t"), params: {} })).rejects.toBeInstanceOf(PolicyDeniedError);
+    expect((await processEntries(project.folder)).map((e) => e.decision?.result)).toEqual(["deny"]);
+  });
+});
