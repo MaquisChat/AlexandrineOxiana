@@ -1023,11 +1023,11 @@ describe("R437 (a): in a creator written as given and family names, a run counts
     expect(item.author).toEqual([{ literal: "P-002" }, { family: "Onetti", given: "Juan Carlos" }]);
   });
 
-  it("guards: a run across the two fields (either way round) is coded; a whole name inside one field is coded; a creator of only one field takes no run", () => {
+  it("guards: a run across the two fields (either way round) is coded; a whole name inside one field is coded; a creator of only one field is one text, so a run counts in it (R440 a)", () => {
     expect(page([{ role: "author", given: "Lucía", family: "Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
     expect(page([{ role: "author", given: "Fernández", family: "Lucía" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
     expect(page([{ role: "author", given: "Dr. Maria", family: "Cocina" }], new Map([["Maria Cocina", "P-001"]])).author).toEqual([{ literal: "Dr. P-001" }]);
-    expect(page([{ role: "author", family: "Fernández Ruiz" }], LUCIA).author).toEqual([{ family: "Fernández Ruiz" }]);
+    expect(page([{ role: "author", family: "Fernández Ruiz" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
     expect(page([{ role: "author", family: "Lucía Fernández Ruiz" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
   });
 
@@ -1171,5 +1171,16 @@ describe("R387 (f): minor points of the FR-A10 review", () => {
   it("M5: tatweel and kana through the citation", () => {
     expect(toCslItem(story("مقابلة مـحـمـد"), { ...OPTS, pseudonyms: new Map([["محمد", "P-001"]]) }).title).toBe("مقابلة P-001");
     expect(toCslItem(story("ヤマダタロウの話"), { ...OPTS, pseudonyms: new Map([["やまだ たろう", "P-002"]]) }).title).toBe("P-002の話");
+  });
+});
+
+describe("R440 (a): a creator of one field is one text, like a literal", () => {
+  const page = (creators: Creator[], map: ReadonlyMap<string, string>) =>
+    toCslItem(source("webpage", mt(["es", "original", "A page"]), creators), { ...OPTS, pseudonyms: map });
+  const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
+
+  it("a family name or a given name that is a run of a participant's name is coded", () => {
+    expect(page([{ role: "author", family: "Lucía Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", given: "Lucía Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
   });
 });

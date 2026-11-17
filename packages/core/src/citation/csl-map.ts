@@ -234,10 +234,10 @@ function creatorWithWholeNames(c: Creator, whole: NameSet): string | undefined {
     // R437 a: in a creator written as given and family names, a run of a participant's name counts
     // only when its span takes words from BOTH fields ("Lucía Fernández"); one lying wholly inside
     // the given name ("Juan Carlos" of Juan Carlos Onetti) or the family name ("Fernández Ruiz" of
-    // Pedro Fernández Ruiz) is another person's name. A creator of one field takes no run. A whole
+    // Pedro Fernández Ruiz) is another person's name. A creator of one field is one text, like a literal: runs count in it (R440 a). A whole
     // name counts anywhere (R420 a).
     const across = (first: string) => (start: number, end: number) => start < first.length && end > first.length + 1;
-    if (!given || !family) return tryText(given ?? family, () => false);
+    if (!given || !family) return tryText(given ?? family);
     return tryText(`${given} ${family}`, across(given)) ?? tryText(`${family} ${given}`, across(family));
   }
   return tryText(c.literal) ?? (c.literal?.trim() ? undefined : tryText(c.handle));
