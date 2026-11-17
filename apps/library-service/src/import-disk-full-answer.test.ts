@@ -1,6 +1,6 @@
 /**
  * R439 (1): a "disk full" or "quota" error that reaches the service's error answer is said in plain words on every
- * route — "The library's disk is full. Free some space and try again." — never as an unexpected error, and with no
+ * route — "The disk is full. Free some space and try again." — never as an unexpected error, and with no
  * path or system text (R96). The full disk is injected (an unpack that fails with ENOSPC, a repo write that does);
  * no real disk is filled.
  */
@@ -39,7 +39,7 @@ captureMethods: [manual_upload]
 processing:
   metadata_lookup: []
 `;
-const SENTENCE = "The library's disk is full. Free some space and try again.";
+const SENTENCE = "The disk is full. Free some space and try again.";
 
 let tmp: string;
 let deps: Deps;
@@ -82,7 +82,7 @@ describe("a full disk is said in plain words on every route (R439 1)", () => {
     unpack.fail = 1;
     const r = await call({ method: "POST", url: `/projects/${pid}/import/dry-run`, body: { adapter: { kind: "folder", path: src } } });
     expect(r.status).toBe(503);
-    expect(r.json.error).toEqual({ code: "UNAVAILABLE", message: SENTENCE });
+    expect(r.json.error).toEqual({ code: "DISK_FULL", message: SENTENCE });
     expect(r.body).not.toMatch(/ENOSPC|jane|no space/u);
   });
 
@@ -94,7 +94,7 @@ describe("a full disk is said in plain words on every route (R439 1)", () => {
       };
       const r = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Fieldwork" } });
       expect(r.status).toBe(503);
-      expect(r.json.error).toEqual({ code: "UNAVAILABLE", message: SENTENCE });
+      expect(r.json.error).toEqual({ code: "DISK_FULL", message: SENTENCE });
     }
   });
 

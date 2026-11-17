@@ -195,7 +195,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof WorkerJobError) return new ApiError(502, "INTERNAL", "The media helper could not finish the job.", err.code);
   // R439 (1): a full disk (or a quota), by its code or one it wraps, in plain words on every route: a condition the
   // researcher can mend and then retry (503, as the file's other "not available now" answers), no path or system text.
-  if (isDiskFull(err)) return new ApiError(503, "UNAVAILABLE", "The library's disk is full. Free some space and try again.");
+  if (isDiskFull(err)) return new ApiError(503, "DISK_FULL", "The disk is full. Free some space and try again.");
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   if (code === "ENOENT" || code === "ENOTDIR") return new ApiError(404, "NOT_FOUND", "That file or folder could not be found.");
   if (code === "EACCES" || code === "EPERM") return new ApiError(409, "READ_ONLY", "That file or folder cannot be written to.");
