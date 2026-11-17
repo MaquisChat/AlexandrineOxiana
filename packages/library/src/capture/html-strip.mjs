@@ -57,9 +57,14 @@ const MIXED_KEY = /^[A-Za-z0-9_-]{20,}$/u;
 const ASPNET_KEY = /^\((?:[A-Z]\([^()/]+\))+\)$/u;
 const sessionLike = (seg) =>
   HEX_KEY.test(seg) || (MIXED_KEY.test(seg) && /[a-z]/u.test(seg) && /[A-Z]/u.test(seg) && /\d/u.test(seg)) || ASPNET_KEY.test(seg);
+const UUID_KEY = /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/u;
+const lowerIdRun = (v) => {
+  for (const m of v.matchAll(/[a-z0-9]{24,}/gu)) if (/[a-z]/u.test(m[0]) && /\d/u.test(m[0])) return true;
+  return false;
+};
 const keyLikeValue = (value) => {
   const v = String(value);
-  return sessionLike(v) || v.split(/[^A-Za-z0-9_-]+/u).some(sessionLike);
+  return sessionLike(v) || v.split(/[^A-Za-z0-9_-]+/u).some(sessionLike) || UUID_KEY.test(v) || lowerIdRun(v);
 };
 const signedTokenValue = (value) => /^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(String(value).trim());
 

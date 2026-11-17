@@ -14,13 +14,24 @@ export function sessionLike(seg: string): boolean {
   return HEX_KEY.test(seg) || (MIXED_KEY.test(seg) && /[a-z]/u.test(seg) && /[A-Z]/u.test(seg) && /\d/u.test(seg)) || ASPNET_KEY.test(seg);
 }
 
+/** A UUID (8-4-4-4-12 hexadecimal digits, either case), anywhere in a value (R415 b). */
+export const UUID_KEY = /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/u;
+
+/** True when a run of 24 or more lower-case letters and digits holds a letter and a digit (R415 b: a base32 or alphanumeric id). */
+function lowerIdRun(v: string): boolean {
+  for (const m of v.matchAll(/[a-z0-9]{24,}/gu)) if (/[a-z]/u.test(m[0]) && /\d/u.test(m[0])) return true;
+  return false;
+}
+
 /**
  * True when a parameter's (decoded) value holds a key (R391): the whole value is `sessionLike`, or one
- * of its runs of letters, digits, `-` and `_` is (an OAuth code `4/0AX4…`, a signature with `~` in it).
+ * of its runs of letters, digits, `-` and `_` is (an OAuth code `4/0AX4…`, a signature with `~` in it);
+ * or it holds a UUID, or a run of 24 or more lower-case letters and digits with both in it (R415 b — a
+ * reset or invitation token, a base32 session id). `sessionLike` itself (Find's rule) is unchanged.
  */
 export function keyLikeValue(value: string): boolean {
   const v = String(value);
-  return sessionLike(v) || v.split(/[^A-Za-z0-9_-]+/u).some(sessionLike);
+  return sessionLike(v) || v.split(/[^A-Za-z0-9_-]+/u).some(sessionLike) || UUID_KEY.test(v) || lowerIdRun(v);
 }
 
 /**

@@ -421,6 +421,11 @@ describe("the two copies of the secret-name rule decide alike, on one table of n
     // The splitting itself: at every character that is not a letter or digit, and at a digit before a capital.
     ["access~token", "1", true], ["api[key]", "1", true], ["session/id", "1", true], ["api2Key", MIXED, true], ["page2Token", MIXED, true],
     ["token", undefined, true], ["key", undefined, true], ["code", undefined, true], ["author", undefined, false], ["header_image", undefined, false],
+    // R415 b: a UUID and a run of 24 or more lower-case letters and digits holding both.
+    ["sid", "3f2504e0-4f89-11d3-9a0c-0305e82c3301", true], ["token", "3F2504E0-4F89-11D3-9A0C-0305E82C3301", true],
+    ["session", "mfrggzdfmztwq2lknnwg23tpobyxe43u", true], ["ticket", "t-abcdefghijkl0123456789ab", true],
+    ["code", "123456", false], ["session", "12", false], ["id", "3f2504e0-4f89-11d3-9a0c-0305e82c3301", false],
+    ["session", "abcdefghijklmnopqrstuvwxyzab", false], ["key", "abcdefghijk0123456789ab", false],
   ];
   it.each(TABLE)("%s = %s: %s in both copies", (name, value, secret) => {
     expect(coreSecretName(name, value)).toBe(secret);

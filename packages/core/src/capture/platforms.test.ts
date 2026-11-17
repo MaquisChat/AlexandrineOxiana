@@ -376,3 +376,15 @@ describe("removing a parameter leaves the rest of the query as written (R391 b; 
     expect(c.canonicalUrl).toBe("https://ex.example.org/p?keep=1");
   });
 });
+
+describe("a UUID or a long lower-case id under an ordinary name is dropped from the stored address (R415 b, review 2 M1)", () => {
+  it("sid=<uuid> and session=<base32> go; code=123456, session=12, key=value, token=verb and id=<uuid> stay", () => {
+    const UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    expect(classifyUrl(`https://ex.example.org/p?a=1&sid=${UUID}`).canonicalUrl).toBe("https://ex.example.org/p?a=1");
+    expect(classifyUrl("https://ex.example.org/p?session=mfrggzdfmztwq2lknnwg23tpobyxe43u&a=1").canonicalUrl).toBe("https://ex.example.org/p?a=1");
+    expect(classifyUrl("https://ex.example.org/p?code=123456&session=12&key=value&token=verb").canonicalUrl).toBe(
+      "https://ex.example.org/p?code=123456&session=12&key=value&token=verb",
+    );
+    expect(classifyUrl(`https://ex.example.org/p?id=${UUID}`).canonicalUrl).toBe(`https://ex.example.org/p?id=${UUID}`);
+  });
+});

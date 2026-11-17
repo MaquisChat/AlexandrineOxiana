@@ -59,3 +59,24 @@ describe("what looks like a key (R391 a: the project's sessionLike rule, moved f
     expect(secretName("state", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl")).toBe(true);
   });
 });
+
+describe("a UUID and a long lower-case id also look like a key (R415 b, review 2 M1)", () => {
+  const UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+  const B32 = "mfrggzdfmztwq2lknnwg23tpobyxe43u"; // 32 lower-case base32 characters
+  it.each([UUID, UUID.toUpperCase(), `x_${UUID}`, `a.${UUID}.b`, B32, "abcdefghijkl0123456789ab", `id-${B32}`])("%s looks like a key", (v) =>
+    expect(keyLikeValue(v)).toBe(true),
+  );
+  it.each(["123456", "12", "value", "verb", "abcdefghijklmnopqrstuvwxyzab", "123456789012345678901234".slice(0, 15), "abcdefghijk0123456789ab"])(
+    "%j does not",
+    (v) => expect(keyLikeValue(v)).toBe(false),
+  );
+  it("by name: a session id as a UUID and a base32 session id go; short codes, words and an `id` stay", () => {
+    expect(secretName("sid", UUID)).toBe(true);
+    expect(secretName("session", B32)).toBe(true);
+    expect(secretName("code", "123456")).toBe(false);
+    expect(secretName("session", "12")).toBe(false);
+    expect(secretName("key", "value")).toBe(false);
+    expect(secretName("token", "verb")).toBe(false);
+    expect(secretName("id", UUID)).toBe(false);
+  });
+});
