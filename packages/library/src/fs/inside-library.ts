@@ -62,8 +62,16 @@ export async function overlapsLibrary(dir: string, lib: { root: string }): Promi
   return insideFolder(root, dir) || insideFolder(dir, root);
 }
 
+/**
+ * Whether `real`, a path already resolved (by `realOrNearest`), is inside the library. For a caller that checks a path
+ * and then reads it (the attach, R368 c): it resolves the real path ONCE, checks that, and reads through it, so a link
+ * re-pointed after the check changes nothing.
+ */
+export async function realInsideLibrary(real: string, lib: { root: string }): Promise<boolean> {
+  return insideFolder(await libraryRealRoot(lib.root), real);
+}
+
 /** Whether `path`'s real path (links followed; a path not there yet, by its nearest existing parent) is inside the library. */
 export async function insideLibrary(path: string, lib: { root: string }): Promise<boolean> {
-  const [root, real] = await Promise.all([libraryRealRoot(lib.root), realOrNearest(path)]);
-  return insideFolder(root, real);
+  return realInsideLibrary(await realOrNearest(path), lib);
 }

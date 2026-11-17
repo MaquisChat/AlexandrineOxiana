@@ -4,12 +4,13 @@
  * command line go through these) refuse, by real path, a file inside the library and a folder inside it or holding it,
  * before anything is read or written. A found file waiting in `find/held/` comes in only through "Use this file".
  */
-import { copyFile, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { newId, type Project } from "@ao/core";
 import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { MockAgent } from "undici";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
 import { backupProject } from "../export/backup.js";
 import { attachConsentDocument } from "../consent-docs.js";
@@ -27,6 +28,27 @@ import { BatchRefusedError, createBulkImport, folderAdapter, zipAdapter, type Bu
 import { bibtexAdapter, cslJsonAdapter, risAdapter } from "./refman.js";
 import { zoteroLocalAdapter } from "./zotero-local.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
+
+/** R368 c: run right after the library check answers (a link swapped between the check and the read). */
+const hooks = vi.hoisted(() => ({ afterCheck: undefined as undefined | (() => Promise<void>) }));
+vi.mock("../fs/inside-library.js", async (importOriginal) => {
+  const m = await importOriginal<typeof import("../fs/inside-library.js")>();
+  const wrap =
+    <A extends unknown[]>(f: (...a: A) => Promise<boolean>) =>
+    async (...a: A) => {
+      const r = await f(...a);
+      const h = hooks.afterCheck;
+      hooks.afterCheck = undefined;
+      await h?.();
+      return r;
+    };
+  const named = m as unknown as Record<string, unknown>;
+  return {
+    ...m,
+    insideLibrary: wrap(m.insideLibrary),
+    ...(typeof named.realInsideLibrary === "function" ? { realInsideLibrary: wrap(named.realInsideLibrary as (...a: unknown[]) => Promise<boolean>) } : {}),
+  };
+});
 
 const GOV = `${OPEN_GOV}processing:
   metadata_lookup: []
@@ -48,6 +70,7 @@ beforeEach(async () => {
   bulk = createBulkImport({ repo: kit.repo, http, index: handle });
 });
 afterEach(async () => {
+  hooks.afterCheck = undefined;
   handle.close();
   await agent.close();
   await kit.close();
@@ -439,5 +462,48 @@ captureMethods: [manual_upload]
     expect(r[1]).toMatchObject({ outcome: "added" });
     expect((await listProtocolDocuments(kit.repo, b.id)).map((d) => d.name)).toEqual(["approval.pdf"]);
     expect(await snapshot(w)).toEqual(before);
+  });
+});
+
+describe("the attach checks the real path once and reads through it (R368 c)", () => {
+  const sha = async (p: string) => createHash("sha256").update(await readFile(p)).digest("hex");
+  /** A decoy outside the library (no title of its own), and a link to it named as the researcher named it. */
+  const decoyAndLink = async (w: World) => {
+    const decoy = await scratchFile(kit, "zz-decoy-123.pdf", await buildPdf({ extra: "decoy bytes" }));
+    await mkdir(join(kit.tmp, "elsewhere"), { recursive: true });
+    const link = join(kit.tmp, "elsewhere", "Okafor - Rivers of Memory.pdf");
+    await symlink(decoy, link);
+    // Right after the check answers, the link is re-pointed at the held file.
+    hooks.afterCheck = async () => {
+      await unlink(link);
+      await symlink(w.held, link);
+    };
+    return { decoy, link };
+  };
+
+  it("dropped on a source: the link swapped to the held file after the check — the decoy's bytes are stored, never the held file's", async () => {
+    const w = await world();
+    const { decoy, link } = await decoyAndLink(w);
+    const out = await attach().attachFiles(w.p.id, [link], { toSourceId: w.sourceId });
+    expect(out).toEqual([{ path: link, outcome: "attached", sourceId: w.sourceId }]);
+    const originals = (await kit.repo.getSource(w.p.id, w.sourceId)).assets.filter((a) => a.role === "original");
+    expect(originals.map((a) => a.sha256)).toEqual([await sha(decoy)]);
+    expect(originals.map((a) => a.sha256)).not.toContain(await sha(w.held));
+    expect((await snapshot(w)).pending).toEqual([w.reviewId]);
+  });
+
+  it("dropped on the library: the decoy's bytes are stored, and the source is named by the file as dropped (the link's name)", async () => {
+    const w = await world();
+    const { decoy, link } = await decoyAndLink(w);
+    const ids = kit.repo.listSourceIds(w.p.id);
+    const [o] = await attach().attachFiles(w.p.id, [link]);
+    expect(o).toMatchObject({ path: link, outcome: expect.stringMatching(/^(created|needs-review)$/u) });
+    expect(kit.repo.listSourceIds(w.p.id)).toHaveLength(ids.length + 1);
+    const sf = await kit.repo.getSource(w.p.id, o!.sourceId!);
+    expect(sf.assets.filter((a) => a.role === "original").map((a) => a.sha256)).toEqual([await sha(decoy)]);
+    expect(sf.source.title.variants[0]!.value).toBe("Okafor - Rivers of Memory");
+    expect(JSON.stringify(sf)).not.toContain("zz-decoy-123");
+    // The held file's review entry is still waiting (the new source may have its own entry for review).
+    expect((await snapshot(w)).pending).toContain(w.reviewId);
   });
 });
