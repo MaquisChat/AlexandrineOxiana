@@ -18,7 +18,7 @@ export const PURPOSE_IMPORT_JOURNAL = "ao-import-journal";
 export const PURPOSE_WATCH_REGISTER = "ao-watch-register";
 /** The Find and acquire queue (`find/queue.jsonl`). */
 export const PURPOSE_FIND_QUEUE = "ao-find-queue";
-/** The sealed store of reasons the audit log names only by SHA-256 (`audit-reasons.jsonl`, R362 b). */
+/** The sealed store of reasons the audit log names only by a keyed digest (`audit-reasons/reasons.jsonl`, R362 b, R369 b). */
 export const PURPOSE_AUDIT_REASONS = "ao-audit-reasons";
 
 /**
