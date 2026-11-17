@@ -31,6 +31,7 @@
 import type { Anchor } from "../model/anchor.js";
 import type { BiblioField, Creator, SourceFile, SourceType } from "../model/source.js";
 import type { MultiText } from "../model/text.js";
+import { fold, normName, scrubNames, type NameForm } from "../participant-names.js";
 
 export interface CslName {
   family?: string;
@@ -147,28 +148,9 @@ const lang1 = (tag: string) => tag.trim().toLowerCase().split(/[-_]/)[0] ?? "";
 // ------------------------------------------------------------------------------------------
 // Participant names (R88 I1)
 
-/** Letters NFKD leaves whole, spelled the way names are commonly written without them (R89). */
-const TRANSLIT: Readonly<Record<string, string>> = {
-  ł: "l", Ł: "L", ø: "o", Ø: "O", đ: "d", Đ: "D", ß: "ss", ẞ: "SS", æ: "ae", Æ: "AE", œ: "oe", Œ: "OE", þ: "th", Þ: "TH", ı: "i",
-};
-/** Name comparison key: those letters transliterated, then NFKD, combining marks removed, lowercase. */
-const fold = (s: string) =>
-  s
-    .replace(/[łŁøØđĐßẞæÆœŒþÞı]/gu, (c) => TRANSLIT[c] ?? c)
-    .normalize("NFKD")
-    .replace(/\p{M}+/gu, "")
-    .toLowerCase();
-/** The words of a name or text, folded ("@Lucía.Cocina" → ["lucia", "cocina"]). */
-const words = (s: string) => fold(s).match(/[\p{L}\p{N}]+/gu) ?? [];
-/** A name's comparison form: its folded words joined by single spaces (no "@", no punctuation). */
-export const normName = (s: string) => words(s).join(" ");
-
-/** A name form to look for, as folded words; `bare`: a lone given or family name. */
-interface NameForm {
-  words: string[];
-  code: string;
-  bare: boolean;
-}
+// The shared rule for recognising a participant's name (folding, words, no-space scripts): see
+// participant-names.ts (R378 a). Folder names use the same rule (naming.ts pseudonymize).
+export { normName };
 
 /** The forms under which a creator's name may appear (the lone given and family names marked bare). */
 function creatorForms(c: Creator): Array<{ text: string; bare: boolean }> {
@@ -196,35 +178,16 @@ function codeFor(c: Creator, keys: ReadonlyMap<string, string>): string | undefi
 }
 
 /**
- * Replaces every participant name form in `text` by its code, matching whole words after folding
- * (case, accents, full-width forms, an "@" in front). Longer forms win. A bare given or family name
- * of fewer than 4 letters is replaced only together with the other part of the name ("Li" alone is
- * kept, "Rose Li" and "Li, Rose" are not): replacing every short name everywhere would blank common
- * words. Longer bare names are always replaced, even where the word means something else ("Rose
- * gardens"): over-scrubbing a title is the fail-safe side (R88).
+ * Replaces every participant name form in `text` by its code, by the shared rule
+ * (participant-names.ts: folded case, accents and width; whole words, or inside a run of a script
+ * written without spaces; longer forms first). A bare given or family name of fewer than 4 letters
+ * is replaced only together with the other part of the name ("Li" alone is kept, "Rose Li" and
+ * "Li, Rose" are not): replacing every short name everywhere would blank common words. Longer bare
+ * names are always replaced, even where the word means something else ("Rose gardens"):
+ * over-scrubbing a title is the fail-safe side (R88).
  */
 function scrubText(text: string, forms: readonly NameForm[]): string {
-  const usable = forms.filter((f) => f.words.length > 0 && !(f.bare && f.words.length === 1 && f.words[0]!.length < 4));
-  // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
-  for (const f of [...usable]) if (f.words.length > 1) usable.push({ words: [f.words.join("")], code: f.code, bare: false });
-  if (usable.length === 0) return text;
-  usable.sort((a, b) => b.words.length - a.words.length);
-  const tokens = [...text.matchAll(/[\p{L}\p{N}\p{M}]+/gu)].map((m) => ({ start: m.index!, end: m.index! + m[0].length, w: words(m[0]).join("") }));
-  let out = "";
-  let pos = 0;
-  for (let i = 0; i < tokens.length; ) {
-    const hit = usable.find((f) => f.words.every((w, k) => tokens[i + k]?.w === w));
-    if (!hit) {
-      i++;
-      continue;
-    }
-    let start = tokens[i]!.start;
-    while (start > pos && text[start - 1] === "@") start--;
-    out += text.slice(pos, start) + hit.code;
-    pos = tokens[i + hit.words.length - 1]!.end;
-    i += hit.words.length;
-  }
-  return out + text.slice(pos);
+  return scrubNames(text, forms, { bareMinLength: 4 });
 }
 
 /** Whether a URL carries any participant name form, in any slug form (joined, -, ., _), as whole words. */

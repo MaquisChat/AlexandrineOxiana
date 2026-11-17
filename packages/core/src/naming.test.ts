@@ -213,7 +213,8 @@ describe("pseudonymize", () => {
   it("does not match inside a longer handle", () => {
     const map = new Map([["@maria.cocina", "P-014"]]);
     expect(pseudonymize("@maria.cocinas - Reel", map)).toBe("@maria.cocinas - Reel");
-    expect(pseudonymize("x@maria.cocina", map)).toBe("x@maria.cocina");
+    // The participant-name rule (R378 a): "x" is a word of its own, so the handle after it is replaced.
+    expect(pseudonymize("x@maria.cocina", map)).toBe("xP-014");
   });
 
   it("is case-insensitive for handles", () => {
@@ -315,8 +316,9 @@ describe("pseudonymize fails closed", () => {
     expect(pseudonymize("x @jos\u00e9 y", new Map([["@jose\u0301", "P-001"]]))).toBe("x P-001 y");
   });
 
-  it("does not match a handle followed by a combining mark", () => {
-    expect(pseudonymize("@jose\u0301", new Map([["@jose", "P-001"]]))).toBe("@jos\u00e9");
+  it("folds accents: a handle written with a combining mark is the same handle (R378 a)", () => {
+    expect(pseudonymize("@jose\u0301", new Map([["@jose", "P-001"]]))).toBe("P-001");
+    expect(pseudonymize("@jose\u0301s", new Map([["@jose", "P-001"]]))).toBe("@jos\u00e9s");
   });
 
   it("ignores empty keys", () => {
@@ -354,5 +356,43 @@ describe("datedFileName", () => {
     expect(datedFileName("profile-snapshot", at, "json", "UTC")).toBe("profile-snapshot - modified 2026-11-10 0905.json");
     expect(datedFileName("capture", at, "md", "Asia/Tokyo")).toBe("capture - modified 2026-11-10 1805.md");
     expect(datedFileName("a/b:c", at, ".JSON", "UTC")).toBe("a-b-c - modified 2026-11-10 0905.json");
+  });
+});
+
+describe("pseudonymize: the participant-name rule shared with citations (R378 a, FR-A10)", () => {
+  // The map as sources.ts builds it for a creator: each name form → the creator's code.
+  const lucia = new Map([
+    ["Lucía", "P-002"],
+    ["Fernández", "P-002"],
+    ["Lucía Fernández", "P-002"],
+    ["lucia.cocina", "P-002"],
+  ]);
+
+  it("C1: a name in a script written without spaces is replaced inside the run it is joined to", () => {
+    const map = new Map([["王小明", "P-001"]]);
+    expect(pseudonymize("王小明访谈录", map)).toBe("P-001访谈录");
+    expect(pseudonymize("Interview 王小明", map)).toBe("Interview P-001");
+    expect(pseudonymize("山田太郎さんへのインタビュー", new Map([["山田太郎", "P-005"]]))).toBe("P-005さんへのインタビュー");
+    expect(pseudonymize("บทสัมภาษณ์สมชายใจดี", new Map([["สมชาย ใจดี", "P-006"]]))).not.toContain("สมชาย");
+  });
+
+  it("C1: a one-character name of such a script is replaced only as a whole run, never inside a longer one", () => {
+    const map = new Map([["明", "P-007"]]);
+    expect(pseudonymize("王小明访谈录", map)).toBe("王小明访谈录");
+    expect(pseudonymize("Interview 明 2024", map)).toBe("Interview P-007 2024");
+  });
+
+  it("I1: accents, case and full-width forms are folded as in citations", () => {
+    expect(pseudonymize("Entrevista a Lucia Fernandez", lucia)).toBe("Entrevista a P-002");
+    expect(pseudonymize("ＬＵＣÍＡ talks", lucia)).toBe("P-002 talks");
+    expect(pseudonymize("lucia_cocina video", lucia)).toBe("P-002 video");
+    expect(pseudonymize("LUCÍA FERNÁNDEZ", lucia)).toBe("P-002");
+  });
+
+  it("whole words in Latin script: a name is not replaced inside a longer word", () => {
+    expect(pseudonymize("Annual report", new Map([["Ann", "P-010"]]))).toBe("Annual report");
+    expect(pseudonymize("Marianne at home", new Map([["Maria", "P-011"]]))).toBe("Marianne at home");
+    expect(pseudonymize("Rosemary and Primrose", new Map([["Rose", "P-012"]]))).toBe("Rosemary and Primrose");
+    expect(pseudonymize("Ann's annual report", new Map([["Ann", "P-010"]]))).toBe("P-010's annual report");
   });
 });

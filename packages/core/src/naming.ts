@@ -2,6 +2,7 @@
  * Human-readable, cross-platform file naming (spec 4.2, 4.4).
  * Platform-neutral: no node: imports.
  */
+import { scrubNames, words, type NameForm } from "./participant-names.js";
 
 export interface NamingTemplates {
   /** Placeholders: {date} {creator} {title} {id}. */
@@ -183,35 +184,19 @@ export function withCollisionSuffix(
   }
 }
 
+/**
+ * Replaces every participant name in `text` (a folder or file name) by its code, by the rule
+ * citations use (participant-names.ts, R378 a): case, accents and full-width forms folded; whole
+ * words, or inside a run of a script written without spaces; longer names first. `map`: name or
+ * handle → code. The result is NFC.
+ */
 export function pseudonymize(text: string, map: ReadonlyMap<string, string>): string {
-  const entries: { key: string; code: string; re: RegExp }[] = [];
-  const seen = new Set<string>();
-  for (const [handle, code] of map) {
-    const key = handle.normalize("NFC");
-    if (key === "" || seen.has(key.toLowerCase())) continue;
-    seen.add(key.toLowerCase());
-    entries.push({ key, code, re: new RegExp(`^${escapeRe(key)}$`, "iu") });
+  const forms: NameForm[] = [];
+  for (const [name, code] of map) {
+    const ws = words(name);
+    if (ws.length) forms.push({ words: ws, code, bare: false });
   }
-  const input = text.normalize("NFC");
-  if (entries.length === 0) return input;
-  const alternatives = entries
-    .map((e) => e.key)
-    .sort((a, b) => b.length - a.length)
-    .map(escapeRe);
-  const re = new RegExp(
-    `(?<![\\p{L}\\p{N}\\p{M}_@])(?:${alternatives.join("|")})(?![\\p{L}\\p{N}\\p{M}_]|\\.[\\p{L}\\p{N}\\p{M}_])`,
-    "giu",
-  );
-  return input.replace(re, (m) => {
-    // Fail closed: the match used the regex's case folding, so look up with the same folding.
-    const hit = entries.find((e) => e.re.test(m));
-    if (!hit) throw new Error("pseudonymize: matched handle has no mapping");
-    return hit.code;
-  });
-}
-
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return scrubNames(text.normalize("NFC"), forms);
 }
 
 export function encName(name: string): string {

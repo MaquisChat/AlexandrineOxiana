@@ -468,6 +468,48 @@ describe("review round 1 (R88 I1, I2): participant names are matched however the
   });
 });
 
+describe("the participant-name rule shared with folder names (R378 a, FR-A10)", () => {
+  const interview = (title: string, creators: Creator[], extra: Partial<SourceFile["source"]> = {}) =>
+    source("interview", mt(["und", "original", title]), creators, { participantIds: [PARTICIPANT.id], ...extra });
+
+  it("C1: a creator's name written without spaces is replaced in the title too (王小明访谈录, 山田太郎さんへのインタビュー)", () => {
+    const item = toCslItem(interview("王小明访谈录", [{ role: "interviewee", literal: "王小明" }]), { ...OPTS, pseudonyms: new Map([["王小明", "P-001"]]) });
+    expect(item.author).toEqual([{ literal: "P-001" }]);
+    expect(item.title).toBe("P-001访谈录");
+    const yamada = toCslItem(interview("山田太郎さんへのインタビュー", [{ role: "interviewee", family: "山田", given: "太郎" }]), { ...OPTS, pseudonyms: new Map([["山田太郎", "P-005"]]) });
+    expect(yamada.author).toEqual([{ literal: "P-005" }]);
+    expect(yamada.title).toBe("P-005さんへのインタビュー");
+  });
+
+  it("C1: a map entry written without spaces is replaced in the title of a source by someone else", () => {
+    const sf = source("article-journal", mt(["zh", "original", "关于王小明的报道"]), [{ role: "author", given: "Wei", family: "Chen" }]);
+    expect(toCslItem(sf, { ...OPTS, pseudonyms: new Map([["王小明", "P-001"]]) }).title).toBe("关于P-001的报道");
+  });
+
+  it("C1: a one-character name of such a script is replaced only as a whole run", () => {
+    const sf = (t: string) => source("article-journal", mt(["zh", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]);
+    const map = new Map([["明", "P-007"]]);
+    expect(toCslItem(sf("王小明访谈录"), { ...OPTS, pseudonyms: map }).title).toBe("王小明访谈录");
+    expect(toCslItem(sf("Interview 明"), { ...OPTS, pseudonyms: map }).title).toBe("Interview P-007");
+  });
+
+  it("I1: the folding is the one folder names use (accents, width, '_' as a separator)", () => {
+    const map = new Map([["Lucía", "P-002"], ["Fernández", "P-002"], ["Lucía Fernández", "P-002"], ["lucia.cocina", "P-002"]]);
+    const t = (title: string) => toCslItem(source("article-journal", mt(["es", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;
+    expect(t("Entrevista a Lucia Fernandez")).toBe("Entrevista a P-002");
+    expect(t("ＬＵＣÍＡ talks")).toBe("P-002 talks");
+    expect(t("lucia_cocina video")).toBe("P-002 video");
+  });
+
+  it("negative cases: a Latin name is not matched inside a longer word", () => {
+    const t = (title: string, key: string) =>
+      toCslItem(source("article-journal", mt(["en", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: new Map([[key, "P-010"]]) }).title;
+    expect(t("Annual report", "Ann")).toBe("Annual report");
+    expect(t("Marianne at home", "Maria")).toBe("Marianne at home");
+    expect(t("Ann's annual report", "Ann")).toBe("P-010's annual report");
+  });
+});
+
 describe("locatorFromAnchor", () => {
   const base = { id: newId(), assetId: newId() };
   const tr = (startMs: number, endMs: number): Anchor => ({ kind: "time-range", ...base, startMs, endMs });
