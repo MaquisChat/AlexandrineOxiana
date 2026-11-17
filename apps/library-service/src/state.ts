@@ -940,7 +940,8 @@ export class ServiceState {
     this.track(
       (async () => {
         try {
-          for await (const p of h.progress) this.events.publish("import.progress", { batchId: h.batchId, projectId, state: "running", done: p.done, total: p.total });
+          // R392: `total` only when the source told one (never a guess).
+          for await (const p of h.progress) this.events.publish("import.progress", { batchId: h.batchId, projectId, state: "running", done: p.done, ...(p.total !== undefined ? { total: p.total } : {}) });
           const r = await h.done;
           this.events.publish("import.progress", { batchId: h.batchId, projectId, state: r.state, counts: r.counts });
         } catch (err) {

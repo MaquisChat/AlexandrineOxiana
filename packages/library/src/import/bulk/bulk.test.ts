@@ -1883,3 +1883,84 @@ processing:
     expect(sum(r.counts)).toBe(fx.items);
   });
 });
+
+describe("FR-A21 (R392): the progress tells the truth about the total", () => {
+  const meta = (key: string): ScanItem => ({ key, files: [], referenceMetadata: { type: "book", title: { variants: [{ lang: "en", kind: "original", value: `Book ${key}` }] } } });
+  const synthetic = (n: number, tell?: { at: number; total: number }): ImportSourceAdapter => ({
+    kind: "csl-json",
+    location: "synthetic",
+    async *scan(_signal, ctx): AsyncGenerator<ScanItem> {
+      for (let i = 0; i < n; i++) {
+        if (tell && i === tell.at) ctx?.total?.(tell.total);
+        yield meta(`k${i}`);
+      }
+    },
+  });
+  async function events(h: Awaited<ReturnType<BulkImport["startBatch"]>>) {
+    const seen: Array<{ done: number; total?: number }> = [];
+    for await (const e of h.progress) seen.push({ done: e.done, ...("total" in e ? { total: e.total } : {}) });
+    await h.done;
+    return seen;
+  }
+  const recPath = (p: Project) => join(lib.root, p.folder, "imports", "batch-0001", "batch.json");
+
+  it("a source with neither count nor total: no progress event carries a total (never done + 1)", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(4)));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.at(-1)!.done).toBe(4);
+    for (const e of seen) {
+      expect(e.total).toBeUndefined();
+      expect(e.total).not.toBe(e.done + 1);
+    }
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBeUndefined();
+  });
+
+  it("a source that tells total(5000) after its first item: every later event carries 5,000", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(3, { at: 1, total: 5000 })));
+    const first = seen.findIndex((e) => e.total !== undefined);
+    expect(first).toBeGreaterThanOrEqual(0); // the feed keeps the latest value: the first events may be read together
+    expect(seen.slice(0, first).every((e) => e.total === undefined)).toBe(true);
+    expect(seen.slice(first).every((e) => e.total === 5000)).toBe(true);
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(5000);
+  });
+
+  it("more items than told: the total grows with the count (never x above y)", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(4, { at: 0, total: 2 })));
+    for (const e of seen) if (e.total !== undefined) expect(e.total).toBeGreaterThanOrEqual(e.done);
+    expect(seen.at(-1)).toEqual({ done: 4, total: 4 });
+  });
+
+  it("items yielded twice count as done: the total stays the scan's", async () => {
+    const p = await project();
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(_s, ctx): AsyncGenerator<ScanItem> {
+        ctx?.total?.(3);
+        yield meta("a");
+        yield meta("a");
+        yield meta("b");
+      },
+    };
+    const seen = await events(await bulk.startBatch(p.id, adapter));
+    expect(seen.at(-1)).toEqual({ done: 3, total: 3 });
+  });
+
+  it("a resumed batch starts from the total it recorded, and is corrected when the source tells a new one", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3, { at: 0, total: 3 }));
+    await h.done;
+    const reopen = async () => writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    await reopen();
+    const kept = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(3)));
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.every((e) => e.total === 3)).toBe(true);
+    await reopen();
+    const told = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(4, { at: 0, total: 4 })));
+    expect(told.at(-1)).toEqual({ done: 4, total: 4 });
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(4);
+  });
+});

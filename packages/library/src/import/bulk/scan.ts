@@ -160,6 +160,12 @@ export interface ScanContext {
   /** The scan is for a dry run (nothing is imported): adapters that download files skip the downloads. */
   dryRun?: boolean;
   /**
+   * R392: how many items this scan will yield, told once, as soon as the source knows it (without a second
+   * pass over its items). The engine records it with the batch and sends it with every later progress event;
+   * a later call corrects it. A source that never knows leaves the total unknown (never guessed).
+   */
+  total?(n: number): void;
+  /**
    * True when the engine will pass this item by anyway (e.g. it is already in a resumed batch's
    * journal): an adapter that downloads may then fetch nothing for it and yield nothing. Optional:
    * an adapter that ignores it is still correct (the engine keeps its own journal check). The adapter

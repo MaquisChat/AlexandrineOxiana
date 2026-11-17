@@ -129,6 +129,11 @@ function summaryLines(s: ScanSummary): string[] {
  * batch started while the program is closing is cancelled at once; with --json, Ctrl+C prints
  * `{batchId, state}` so a script knows which batch to look at.
  */
+/** The progress line (R392): "Imported 97 of 3412" when the source told its total, else "Imported 97 so far" (never a guess). */
+export function importProgressLine(p: { done: number; total?: number }): string {
+  return p.total !== undefined ? `Imported ${p.done} of ${p.total}` : `Imported ${p.done} so far`;
+}
+
 async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnType<typeof createBulkImport>, start: () => Promise<BatchHandle>): Promise<void> {
   let closing = false;
   const starting = start();
@@ -152,7 +157,7 @@ async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnT
   let last = "";
   const progress = (async () => {
     for await (const p of h.progress) {
-      const line = `Imported ${p.done} of ${p.total || "?"}`;
+      const line = importProgressLine(p);
       if (!out.json && line !== last && process.stderr.isTTY) process.stderr.write(`\r${line}`);
       last = line;
     }
