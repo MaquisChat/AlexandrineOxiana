@@ -1279,6 +1279,7 @@ class Run {
         ...(primaryFile ? { path: primaryFile.path, mime, sidecarPaths: await findSidecars(names[0]!), fileName: name } : {}),
         ...(item.referenceMetadata ? { referenceMetadata: item.referenceMetadata } : {}),
         ...(item.referenceSource ? { referenceSource: item.referenceSource } : {}),
+        ...(item.doubts?.length ? { doubts: item.doubts } : {}),
         ...(userParsedName ? { userParsedName } : {}),
       },
       { projectId: this.projectId, patterns: [], lookup: this.lookup },
