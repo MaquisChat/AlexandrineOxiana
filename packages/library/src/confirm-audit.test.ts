@@ -8,10 +8,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { AuditEvent, FieldEvidence, FieldVerification, Project, SourceDraft } from "@ao/core";
 import { OPEN_GOV, PASS, auditEvents, makeKit, makeProject, type Kit } from "./export/test-kit.js";
+import { SimulatedCrash, seams } from "./repo/testing.js";
 import { confirmField } from "./source-actions.js";
 
 let kit: Kit;
 afterEach(async () => {
+  seams.crashAt = undefined;
   await kit.close();
 });
 
@@ -159,6 +161,37 @@ for (const encrypted of [false, true]) {
       expect(check.problem).toBeUndefined();
       const ops = (await auditEvents(kit, p)).filter((e) => e.details?.op === "source.update").map((e) => e.details!.confirmed ?? null);
       expect(ops).toEqual([null, [{ field: "/title", choice: "changed" }], null]);
+    });
+
+    // FR-427 (Task 73's M2): the new detail at every crash point of the transaction marker (R26). A confirmation
+    // that did not land is never recorded as confirmed; one that landed is recorded exactly once, with its choice.
+    it("crash points: before the commit nothing says confirmed and the value stands; after it, the change and one entry naming the field and the choice", async () => {
+      kit = await makeKit("ao-confirm-audit-");
+      const p = await makeProject(kit, OPEN_GOV, encrypted);
+      const sid = await captured(p);
+      const reopened = async () => {
+        await kit.reopen();
+        if (encrypted && !kit.repo.isUnlocked(p.id)) await kit.repo.unlockProject(p.id, PASS);
+      };
+      const confirmations = async () => (await auditEvents(kit, p)).filter((e) => e.details?.confirmed !== undefined);
+      for (const point of ["before-changes", "before-audit", "torn-audit"] as const) {
+        seams.crashAt = point;
+        await expect(confirmField(kit.repo, p.id, sid, "/title", mt(OTHER_TITLE)), point).rejects.toBeInstanceOf(SimulatedCrash);
+        await reopened();
+        const sf = await kit.repo.getSource(p.id, sid);
+        expect([point, sf.source.title.variants[0]!.value, sf.verification["/title"]?.status]).toEqual([point, KEPT_TITLE, "conflict"]);
+        expect([point, await confirmations()]).toEqual([point, []]);
+        expect([point, (await kit.repo.verifyAudit(p.id)).ok]).toEqual([point, true]);
+      }
+      seams.crashAt = "before-marker-delete";
+      await expect(confirmField(kit.repo, p.id, sid, "/title", mt(OTHER_TITLE))).rejects.toBeInstanceOf(SimulatedCrash);
+      await reopened();
+      const sf = await kit.repo.getSource(p.id, sid);
+      expect([sf.source.title.variants[0]!.value, sf.verification["/title"]?.status]).toEqual([OTHER_TITLE, "user-confirmed"]);
+      const recorded = await confirmations();
+      expect(recorded.map((e) => [e.details!.op, e.entity, e.details!.confirmed])).toEqual([["source.update", { type: "source", id: sid }, [{ field: "/title", choice: "changed" }]]]);
+      for (const e of recorded) noContent(e);
+      expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
     });
   });
 }

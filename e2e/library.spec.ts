@@ -171,8 +171,23 @@ test("scenario 1: a library and an IRB + GDPR project with encryption; the recov
   await test.step("on disk: the key file wraps the key with the passphrase and the recovery code; the change log is sealed; only project.json names the project", async () => {
     const keyFile = JSON.parse(readFileSync(join(projectRoot, "keys", "project-key.json"), "utf8")) as Record<string, unknown>;
     expect(Object.keys(keyFile).sort()).toEqual(["keyId", "passphrase", "recovery"]);
-    expect(keyFile.passphrase).toEqual(expect.objectContaining({}));
-    expect(keyFile.recovery).toEqual(expect.objectContaining({}));
+    // FR-235: each wrapping is the project key, wrapped as the library wraps it (crypto/keys.ts, ADR 0006): bound to the
+    // file's key id, scrypt with its own 16-byte salt, a 12-byte nonce, and 48 bytes (the 32-byte key and the GCM tag) —
+    // nothing more; a wrong or empty wrapping fails here. (That each opens with its own secret: the unlocks below.)
+    const bytes = (v: unknown) => (typeof v === "string" && /^[A-Za-z0-9+/]+={0,2}$/u.test(v) ? Buffer.from(v, "base64").length : -1);
+    for (const which of ["passphrase", "recovery"] as const) {
+      const w = keyFile[which] as Record<string, unknown>;
+      expect(Object.keys(w).sort(), which).toEqual(["kdf", "keyId", "nonce", "wrapped"]);
+      expect(w.keyId, which).toBe(keyFile.keyId);
+      const kdf = w.kdf as { name: unknown; N: number; r: unknown; p: unknown; salt: unknown };
+      expect(Object.keys(kdf).sort(), which).toEqual(["N", "name", "p", "r", "salt"]);
+      expect([kdf.name, kdf.r, kdf.p], which).toEqual(["scrypt", 8, 1]);
+      expect(Number.isInteger(Math.log2(kdf.N)) && kdf.N >= 2 ** 10 && kdf.N <= 2 ** 18, `${which}: scrypt N = ${kdf.N}`).toBe(true);
+      expect([bytes(kdf.salt), bytes(w.nonce), bytes(w.wrapped)], which).toEqual([16, 12, 48]);
+    }
+    const [byPassphrase, byRecovery] = [keyFile.passphrase, keyFile.recovery] as Array<{ kdf: { salt: string }; wrapped: string }>;
+    expect(byPassphrase!.kdf.salt).not.toBe(byRecovery!.kdf.salt);
+    expect(byPassphrase!.wrapped).not.toBe(byRecovery!.wrapped);
     // The project record is readable and says it is encrypted, with that key.
     const projectJson = JSON.parse(readFileSync(join(projectRoot, "project.json"), "utf8")) as { project: { name: string; encryption: { enabled: boolean; keyId?: string } } };
     expect(projectJson.project.encryption).toEqual({ enabled: true, keyId: keyFile.keyId });

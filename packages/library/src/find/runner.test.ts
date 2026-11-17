@@ -3,6 +3,8 @@ import { createBulkImport } from "../import/bulk/index.js";
 import { bibtexAdapter } from "../import/refman.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { DEFAULT_GOVERNANCE, findDuplicate, newId, type Project, type SourceDraft } from "@ao/core";
 import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
@@ -5026,6 +5028,68 @@ describe("F15: a fetch through the researcher's library", () => {
       await r.stopAll();
       await expect(r.libraryChances(p.id, (await queue(p)).values(), EZ)).rejects.toBeInstanceOf(FindRunnerClosedError);
       expect(countP()).toBe(0);
+    });
+
+    // FR-547 (F15's N3, R333): the cache's own drops, with nothing else standing behind them — no read of the view while
+    // the project is locked, none after the close. What was read from an encrypted project's record must not stay in
+    // memory once it is locked, nor anything read once the library is closed: the record's facts the view was given (the
+    // very object the cache keeps) can be collected once the cache has let them go.
+    const gc = (() => {
+      setFlagsFromString("--expose-gc");
+      return runInNewContext("gc") as () => void;
+    })();
+    /** Whether the object behind `ref` is collected (garbage collection forced a few times, between turns). */
+    const collected = async (ref: WeakRef<object>): Promise<boolean> => {
+      for (let i = 0; i < 10; i++) {
+        await new Promise((res) => setImmediate(res));
+        gc();
+        if (ref.deref() === undefined) return true;
+      }
+      return false;
+    };
+    /** A weak reference to the record's facts the view gives for `e` (the cache keeps the same object). */
+    const viewed = async (r: FindRunner, p: Project, e: FindEntry): Promise<WeakRef<object>> =>
+      new WeakRef((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!.work);
+
+    it("FR-547: at a lock the project's records' facts are let go at once (another project's are kept), and read anew at the unlock", async () => {
+      const p = await project({ gov: NO_FREE, encrypted: true });
+      const q = await project({ gov: NO_FREE });
+      const e = await resting(p, RESTING[0]!);
+      const f = await resting(q, RESTING[1]!);
+      const r = runner();
+      const refP = await viewed(r, p, e);
+      const refQ = await viewed(r, q, f);
+      // Kept while the project is open (the cache holds them: nothing else does).
+      expect(await collected(refP)).toBe(false);
+      // Locked, and nothing asks the view meanwhile: the project's facts are gone from memory; the other project's stay.
+      r.stop(p.id);
+      repo.lockProject(p.id);
+      expect(await collected(refP)).toBe(true);
+      expect(await collected(refQ)).toBe(false);
+      // Unlocked: the record is read anew (not served from a cache that outlived the lock).
+      await repo.unlockProject(p.id, "pw");
+      const spy = vi.spyOn(repo, "getSource");
+      try {
+        expect((await r.libraryChances(p.id, (await queue(p)).values(), EZ)).get(e.id)!.chance).toBe("yes");
+        expect(spy.mock.calls.filter(([pid]) => pid === p.id)).toHaveLength(1);
+      } finally {
+        spy.mockRestore();
+      }
+      await r.stopAll();
+    });
+
+    it("FR-547: at the close every project's records' facts are let go at once", async () => {
+      const p = await project({ gov: NO_FREE, encrypted: true });
+      const q = await project({ gov: NO_FREE });
+      const e = await resting(p, RESTING[0]!);
+      const f = await resting(q, RESTING[1]!);
+      const r = runner();
+      const refs = [await viewed(r, p, e), await viewed(r, q, f)];
+      for (const ref of refs) expect(await collected(ref)).toBe(false);
+      await r.stopAll();
+      for (const ref of refs) expect(await collected(ref)).toBe(true);
+      // The runner itself is still held here (its cache could still be reached through it): it is closed.
+      await expect(r.libraryChances(q.id, (await queue(q)).values(), EZ)).rejects.toBeInstanceOf(FindRunnerClosedError);
     });
   });
 
