@@ -2,9 +2,9 @@
  * Task 36 routes: fieldwork update, consent withdrawal and guarded delete (R97), consent and
  * protocol documents, and the retention list / raw-data destruction.
  */
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { SourceDraft } from "@ao/core";
@@ -370,6 +370,21 @@ describe("attach takes only absolute paths (R379, WB5 M3)", () => {
 describe("every route that takes a path takes only an absolute path of this computer, without a NUL (R391 g, review M7)", () => {
   // On macOS and Linux a Windows drive path or a network path is a relative name, read from the service's folder.
   const FOREIGN = ["C:\\Windows\\win.ini", "c:/x.pdf", "\\\\server\\share\\package.json", "package.json", "/tmp/x\0.pdf"];
+  // R415 f (review 2 M5): these requests run from the test's temporary folder, never the repository's,
+  // so that a missing guard fails here without writing anything into the repository. Each foreign name
+  // exists there as a file, so that without the guard it would be read (and the test would fail).
+  let here: string;
+  beforeEach(async () => {
+    here = process.cwd();
+    process.chdir(tmp);
+    for (const p of FOREIGN.slice(0, 4)) {
+      await mkdir(dirname(join(tmp, p)), { recursive: true });
+      await writeFile(join(tmp, p), "{}");
+    }
+  });
+  afterEach(() => {
+    process.chdir(here);
+  });
   const refused = async (method: "POST", url: string, body: (p: string) => unknown, message: string) => {
     for (const p of FOREIGN) {
       const r = await call({ method, url, body: body(p) });
