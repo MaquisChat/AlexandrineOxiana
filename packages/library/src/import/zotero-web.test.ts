@@ -1323,6 +1323,55 @@ describe("unattended scans against the stand-in (Z2)", () => {
     expect(result.completed).toBe(false);
     expect(notes.filter((t) => t === "This sync could not confirm which items were deleted in Zotero, so the next sync will read the whole library again.")).toHaveLength(1);
   });
+
+  describe("FR-A21 (R392): the total the scan tells", () => {
+    /** The scan's items and the totals it told, each with how many items had been yielded by then. */
+    async function told(opts: Partial<ZoteroWebOptions> = {}, ctx: Partial<ScanContext> = {}) {
+      const totals: Array<{ n: number; after: number }> = [];
+      let yielded = 0;
+      const work = join(tmp, `work-${++n}`);
+      await mkdir(work, { recursive: true, mode: 0o700 });
+      const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {}, ...opts });
+      const items: ScanItem[] = [];
+      for await (const i of a.scan(new AbortController().signal, { workDir: async () => work, total: (t) => totals.push({ n: t, after: yielded }), ...ctx })) {
+        items.push(i);
+        yielded++;
+      }
+      return { items, totals };
+    }
+
+    it("a full run: the items it will yield (children, notes and the bin not counted; a known binned item is), told before the first", async () => {
+      const a = z.addItem(U, art("With a file"));
+      const att = await pdfAttachment(a);
+      highlight(att);
+      const b = z.addItem(U, art("With a note"));
+      z.addItem(U, { itemType: "note", note: "<p>child</p>" }, { parent: b });
+      z.addItem(U, { itemType: "note", note: "<p>standalone</p>" });
+      const binned = z.addItem(U, art("Binned, known here"));
+      const never = z.addItem(U, art("Binned, never here"));
+      z.trash(U, binned);
+      z.trash(U, never);
+      z.addItem(U, art("Plain"));
+      const { items, totals } = await told({}, { knownIds: known(a, binned) });
+      expect(items).toHaveLength(4); // three articles, and the known binned one as gone
+      expect(totals).toEqual([{ n: 4, after: 0 }]);
+    });
+
+    it("a sync asking only for what changed: the changed items (and gone ones) it will yield", async () => {
+      const a = z.addItem(U, art("Edited"));
+      const b = z.addItem(U, art("Untouched"));
+      const c = z.addItem(U, art("Deleted"));
+      const d = z.addItem(U, art("Binned"));
+      const since = z.libraryVersion(U);
+      z.editItem(U, a, { title: "Edited again" });
+      z.remove(U, c);
+      z.trash(U, d);
+      z.addItem(U, art("New"));
+      const { items, totals } = await told({ since }, { knownIds: known(a, b, c, d) });
+      expect(items).toHaveLength(4); // edited, new, deleted (gone), binned (gone)
+      expect(totals).toEqual([{ n: 4, after: 0 }]);
+    });
+  });
 });
 
 describe("Zotero Web import through the engine", () => {

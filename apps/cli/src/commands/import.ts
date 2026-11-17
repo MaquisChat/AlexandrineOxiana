@@ -124,6 +124,16 @@ function summaryLines(s: ScanSummary): string[] {
   return lines;
 }
 
+/** The progress line (R392): "Imported 97 of 3412" when the source told its total, else "Imported 97 so far" (never a guess). */
+export function importProgressLine(p: { done: number; total?: number }): string {
+  return p.total !== undefined ? `Imported ${p.done} of ${p.total}` : `Imported ${p.done} so far`;
+}
+
+/** What rewrites the terminal's progress line (written only to a terminal): back to its start, the line, clear to its end. */
+export function importProgressWrite(line: string): string {
+  return `\r${line}\x1b[K`;
+}
+
 /**
  * Starts the batch and reports it. The Ctrl+C hook is registered before the batch starts, so a
  * batch started while the program is closing is cancelled at once; with --json, Ctrl+C prints
@@ -152,8 +162,8 @@ async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnT
   let last = "";
   const progress = (async () => {
     for await (const p of h.progress) {
-      const line = `Imported ${p.done} of ${p.total || "?"}`;
-      if (!out.json && line !== last && process.stderr.isTTY) process.stderr.write(`\r${line}`);
+      const line = importProgressLine(p);
+      if (!out.json && line !== last && process.stderr.isTTY) process.stderr.write(importProgressWrite(line));
       last = line;
     }
   })();

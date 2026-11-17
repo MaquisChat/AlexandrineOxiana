@@ -446,16 +446,24 @@ export function exportAdapter<R>(
         if (!records.length && text.trim()) throw new ExportUnreadable(REFMAN_REASONS.empty);
         if (legacy) ctx?.note?.(LEGACY_ENCODING_NOTE);
       } catch (err) {
+        ctx?.total?.(1); // R392: the one unreadable item
         yield { key: `${prefix}#`, files: [], unreadable: err instanceof ExportUnreadable ? err.reason : REFMAN_REASONS.unreadable };
         return;
       }
+      // R392: the whole file is read, so its records are the total, told before the first item; an empty record
+      // (passed by below) lowers it.
+      let told = records.length;
+      ctx?.total?.(told);
       const keys = new ItemKeys(prefix);
       let skipped = 0;
       for (const r of records) {
         signal.throwIfAborted();
         const item = await toItem(r, keys, baseDir);
         if (item) yield item;
-        else skipped++;
+        else {
+          skipped++;
+          ctx?.total?.(--told);
+        }
       }
       if (skipped) ctx?.note?.(skippedNote(skipped));
     },

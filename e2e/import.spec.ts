@@ -184,6 +184,10 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     expect(sourcesOnDisk()).toHaveLength(5);
     // The approved linked PDF is part of its source (how it is stored: D4).
     expect(await z.linkedPdfAsset()).toBeDefined();
+    // R392 (FR-A21): the run's total was the data folder's real five items, never "done + 1". Five items run too fast
+    // to watch the run screen's "x of 5 items" reliably; the batch record keeps the total its progress events carried.
+    const rec = JSON.parse(readFileSync(join(z.libraryPath, z.projectFolder, "imports", "batch-0001", "batch.json"), "utf8")) as { total?: number };
+    expect(rec.total).toBe(5);
   });
 
   await test.step("with “Copy into the library”, the approved Zotero linked file is copied in; the report gives the files copied and the files left as links (R136)", async () => {

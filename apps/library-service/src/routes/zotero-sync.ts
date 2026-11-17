@@ -217,7 +217,7 @@ export class ZoteroSyncHolder {
               try {
                 for await (const p of h.progress) {
                   cur.done = p.done;
-                  cur.total = p.total;
+                  cur.total = p.total ?? 0; // 0: not known yet (the sync's own shape; R392: never a guess)
                   const t = performance.now();
                   if (linkEnded || t - lastProgress < PROGRESS_EVERY_MS) continue;
                   lastProgress = t;

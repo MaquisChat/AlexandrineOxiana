@@ -137,11 +137,12 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
       </p>
       <label className="ao-import__progress">
         <span>Import progress</span>
-        <progress value={done} {...(total !== undefined ? { max: total } : {})} />
+        {/* R392: with a total, a bar of that maximum; without one, an open-ended bar (no value, no maximum). */}
+        <progress {...(total !== undefined ? { value: done, max: total } : {})} />
       </label>
       <p role="status">
         {paused ? "Paused. " : ""}
-        {total !== undefined ? `${fmt(done)} of ${fmt(total)} items` : done > 0 ? `${fmt(done)} items` : "Starting…"}
+        {total !== undefined ? `${fmt(done)} of ${fmt(total)} items` : done > 0 ? `${fmt(done)} ${done === 1 ? "item" : "items"} so far` : "Starting…"}
       </p>
       {lost && (
         <div className="ao-import__warning" role="alert">

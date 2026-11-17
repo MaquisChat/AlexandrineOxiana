@@ -160,6 +160,12 @@ export interface ScanContext {
   /** The scan is for a dry run (nothing is imported): adapters that download files skip the downloads. */
   dryRun?: boolean;
   /**
+   * R392: how many items this scan will yield, told once, as soon as the source knows it (without a second
+   * pass over its items). The engine records it with the batch and sends it with every later progress event;
+   * a later call corrects it. A source that never knows leaves the total unknown (never guessed).
+   */
+  total?(n: number): void;
+  /**
    * True when the engine will pass this item by anyway (e.g. it is already in a resumed batch's
    * journal): an adapter that downloads may then fetch nothing for it and yield nothing. Optional:
    * an adapter that ignores it is still correct (the engine keeps its own journal check). The adapter
@@ -318,7 +324,10 @@ async function* walk(root: string, rel: string[], signal: AbortSignal, ctx: Scan
   }
 }
 
-/** Number of entries a ZIP archive lists (no extraction), or 1 when it cannot be read. */
+/**
+ * Number of importable entries a ZIP archive lists (no extraction): 0 for a readable archive with none (it yields
+ * nothing), 1 when it cannot be read (its one unreadable item), so the count is what the scan yields (R392 d, R426 e).
+ */
 function zipEntryCount(path: string): Promise<number> {
   return new Promise((resolve) => {
     yauzl.open(path, { lazyEntries: true, autoClose: false }, (err, zf) => {
@@ -331,7 +340,7 @@ function zipEntryCount(path: string): Promise<number> {
       });
       zf.on("end", () => {
         zf.close();
-        resolve(Math.max(1, n));
+        resolve(n);
       });
       zf.on("error", () => {
         zf.close();

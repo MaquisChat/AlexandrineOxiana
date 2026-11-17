@@ -321,7 +321,9 @@ export function deviceAdapter(dir: string, opts: DeviceAdapterOptions = {}): Imp
       const all = await collect(root, signal, note);
       const { kept, copies } = await splitDuplicates(all, signal);
       await readMetadata(all, signal);
-      for (const g of groupDeviceFiles(kept)) {
+      const groups = groupDeviceFiles(kept);
+      ctx?.total?.(groups.length + copies.length); // R392: every group and copy below is one item, known before the first
+      for (const g of groups) {
         signal.throwIfAborted();
         yield await toItem(g, researcher);
       }

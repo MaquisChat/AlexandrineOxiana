@@ -33,6 +33,7 @@ import {
 } from "@ao/library";
 import { existsSync } from "node:fs";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
+import { buildZoteroFixture } from "../../../packages/library/tests/fixtures/zotero/build-fixture.mjs";
 // Test seam of the library (same module instance as @ao/library's): makes overwriting a file fail.
 import { shredSeams } from "../../../packages/library/src/fs/shred.js";
 import { seams as repoSeams } from "../../../packages/library/src/repo/seams.js";
@@ -582,6 +583,25 @@ describe("appearance, fieldwork, import", () => {
     expect(undo.status, undo.body).toBe(200);
     expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(0);
     expect((await call({ method: "POST", url: `/projects/${pid}/import/dry-run`, body: { adapter: { kind: "nonsense" } } })).status).toBe(400);
+  });
+
+  it("FR-A21 (R392): a Zotero import's progress events carry its real total (the dry run's items), never done + 1", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dataDir = join(tmp, "Zotero");
+    buildZoteroFixture(dataDir, { pdf: await buildPdf({ extra: "z one" }), linkedPdf: await buildPdf({ extra: "z two" }), linkedDir: join(tmp, "Elsewhere") });
+    const adapter = { kind: "zotero-local", dataDir };
+    const dry = await call({ method: "POST", url: `/projects/${pid}/import/dry-run`, body: { adapter } });
+    expect(dry.status, dry.body).toBe(200);
+    expect(dry.json.items).toBe(5);
+    const events: Array<{ type: string; data: any }> = [];
+    svc.state.events.subscribe((e) => events.push(e));
+    const started = await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter, options: {} } });
+    expect(started.status, started.body).toBe(200);
+    await svc.state.idle();
+    const running = events.filter((e) => e.type === "import.progress" && e.data.batchId === started.json.batchId && e.data.state === "running" && e.data.done > 0);
+    expect(running.length).toBeGreaterThan(0);
+    expect(running.every((e) => e.data.total === 5)).toBe(true);
   });
 
   it("R362 c: a file inside the library is not attached, a folder inside it (or holding it) is not imported — said in plain words", async () => {

@@ -1570,6 +1570,18 @@ processing:
     expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain('The citation key "adebayo2019markets" from Zotero is also used by another source in this project.');
   });
 
+  it("FR-A21 (R392): the run's total is the dry run's items, carried by every progress event", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const dry = await bulk.dryRun(p.id, zoteroLocalAdapter(dataDir));
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    const totals: Array<number | undefined> = [];
+    for await (const e of h.progress) if (e.done > 0) totals.push(e.total);
+    await h.done;
+    expect(totals.length).toBeGreaterThan(0);
+    expect(totals.every((t) => t === dry.items)).toBe(true);
+  });
+
   // ---- R77 (review round 2) ----
   it("R77 C1: the import reports the refusal of a crafted journal", async () => {
     const victim = join(tmp, "victim.txt");
@@ -1735,3 +1747,37 @@ describe("R88 minor: Zotero genre, type and format fields", () => {
   });
 });
 
+
+describe("FR-A21 (R392): Zotero local tells its total before its first item", () => {
+  /** The scan's items, and the totals it told (with how many items had been yielded when each was told). */
+  async function scanWithTotal(a: ImportSourceAdapter): Promise<{ items: ScanItem[]; told: Array<{ n: number; after: number }> }> {
+    const items: ScanItem[] = [];
+    const told: Array<{ n: number; after: number }> = [];
+    const c: ScanContext = { ...ctx, total: (n) => told.push({ n, after: items.length }) };
+    for await (const i of a.scan(new AbortController().signal, c)) items.push(i);
+    return { items, told };
+  }
+
+  it("the personal library (deleted items, child notes and attachments present): the total is the items the scan yields", async () => {
+    const { items, told } = await scanWithTotal(zoteroLocalAdapter(dataDir));
+    expect(items).toHaveLength(5);
+    expect(told).toEqual([{ n: 5, after: 0 }]);
+  });
+
+  it("#library=N: the chosen library's items only", async () => {
+    const { items, told } = await scanWithTotal(zoteroLocalAdapter(`${dataDir}#library=2`));
+    expect(items).toHaveLength(1);
+    expect(told).toEqual([{ n: 1, after: 0 }]);
+  });
+
+  it("an empty standalone attachment the scan passes by: the total told is corrected to what the scan yields", async () => {
+    zoteroEdit((db) => {
+      db.prepare("INSERT INTO items (itemID, itemTypeID, libraryID, key, version, dateAdded, dateModified, clientDateModified) VALUES (31, 2, 1, 'EMPTYAT1', 1, '2024-07-01 08:00:00', '2024-07-01 08:00:00', '2024-07-01 08:00:00')").run();
+      db.prepare("INSERT INTO itemAttachments (itemID, parentItemID, linkMode, contentType, path) VALUES (31, NULL, 0, 'application/pdf', 'storage:missing.pdf')").run();
+    });
+    const { items, told } = await scanWithTotal(zoteroLocalAdapter(dataDir));
+    expect(items).toHaveLength(5);
+    expect(told[0]).toEqual({ n: 6, after: 0 });
+    expect(told.at(-1)!.n).toBe(5);
+  });
+});

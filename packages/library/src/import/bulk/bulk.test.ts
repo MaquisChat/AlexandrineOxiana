@@ -25,7 +25,7 @@ import { decryptBytes } from "../../repo/io.js";
 import type { Repo } from "../../repo/repo.js";
 import { importChange, projectCollectionsAndTags, projectDataKey } from "../../repo/repo.js";
 import { openTestRepo } from "../../repo/testing.js";
-import { BatchRefusedError, createBulkImport, folderAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
+import { BatchRefusedError, createBulkImport, folderAdapter, zipAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
 import { useMemorySecrets } from "../../secrets-testing.js";
 import { setSecret } from "../../secrets.js";
 import { ZOTERO_WEB_FILE_NOTES, resumeZoteroWebImport, startZoteroWebImport, zoteroWebAdapter, zoteroWebSince, type ZoteroWebOptions } from "../zotero-web.js";
@@ -1729,6 +1729,87 @@ processing:
 
   const batchJson = (p: Project, n: number) => join(lib.root, p.folder, "imports", `batch-${String(n).padStart(4, "0")}`, "batch.json");
 
+  it("FR-A21 (R392): a Web import's progress carries the stand-in's real total, the dry run's items, and a sync the changed items'", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three"]) await addWithFile(t);
+    z.addItem(U, { itemType: "note", note: "<p>standalone, not an item here</p>" });
+    const dry = await createBulkImport(deps()).dryRun(p.id, zoteroWebAdapter(web()));
+    expect(dry.items).toBe(3);
+    const totals = async (h: Awaited<ReturnType<typeof startZoteroWebImport>>) => {
+      const seen: Array<number | undefined> = [];
+      for await (const e of h.progress) if (e.done > 0) seen.push(e.total);
+      await h.done;
+      return seen;
+    };
+    const first = await totals(await startZoteroWebImport(deps(), p.id, web()));
+    expect(first.length).toBeGreaterThan(0);
+    expect(first.every((t) => t === 3)).toBe(true);
+    for (const t of ["Four", "Five"]) await addWithFile(t);
+    const sync = await totals(await startZoteroWebImport(deps(), p.id, web()));
+    expect(sync.length).toBeGreaterThan(0);
+    expect(sync.every((t) => t === 2)).toBe(true);
+  });
+
+  /** Every event of a run as [done, total]. */
+  const pairs = async (h: Awaited<ReturnType<typeof startZoteroWebImport>>) => {
+    const seen: Array<[number, number | undefined]> = [];
+    for await (const e of h.progress) seen.push([e.done, e.total]);
+    const r = await h.done;
+    return { seen, r };
+  };
+  const expectWholeBatch = (seen: Array<[number, number | undefined]>, n: number) => {
+    expect(seen.length).toBeGreaterThan(0);
+    for (const [, t] of seen) expect(t).toBe(n);
+    for (let i = 1; i < seen.length; i++) expect(seen[i]![0]).toBeGreaterThanOrEqual(seen[i - 1]![0]);
+    expect(seen.at(-1)![0]).toBe(n);
+  };
+
+  it("R426 a: a resumed full Web batch counts the whole batch: total 6 throughout, done never goes down and ends at 6", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three", "Four", "Five", "Six"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, web());
+    for await (const e of h.progress) {
+      if (e.done >= 3) {
+        h.cancel();
+        break;
+      }
+    }
+    expect((await h.done).state).toBe("cancelled");
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, h.batchId));
+    expect(r.state).toBe("finished");
+    expectWholeBatch(seen, 6);
+    expect(repo.listSourceIds(p.id)).toHaveLength(6);
+    expect(JSON.parse(await readFile(batchJson(p, 1), "utf8")).total).toBe(6);
+  });
+
+  it("R433 (1): a resumed Web batch sends no opening event: no event of the resumed run is below what the first part finished", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three", "Four", "Five", "Six"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, web());
+    for await (const e of h.progress) {
+      if (e.done >= 3) {
+        h.cancel();
+        break;
+      }
+    }
+    const first = await h.done;
+    expect(first.counts.items).toBeGreaterThanOrEqual(3);
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, h.batchId));
+    expect(r.state).toBe("finished");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const [d] of seen) expect(d).toBeGreaterThanOrEqual(first.counts.items);
+    expectWholeBatch(seen, 6);
+  });
+
+  it("R426 a: a resumed incremental Web batch counts the whole batch (the changed items passed by included)", async () => {
+    const { p, batchId } = await cancelledIncremental();
+    expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).total).toBe(4);
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, batchId));
+    expect(r.state).toBe("finished");
+    expectWholeBatch(seen, 4);
+    expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).total).toBe(4);
+  });
+
   it("a resumed Web batch asks since its recorded version and records the new one", async () => {
     const { p, batchId, v1, journaled } = await cancelledIncremental();
     const rec = JSON.parse(await readFile(batchJson(p, 2), "utf8"));
@@ -1940,4 +2021,238 @@ describe("R379 (FR-A12): a title search never carries what may be a participant'
     expect(seen).toEqual([]);
     expect((await bulk.batchReport(p.id, h.batchId)).notes.filter((n) => n.startsWith("Titles were not looked up"))).toEqual([]);
   });
+});
+
+describe("FR-A21 (R392): the progress tells the truth about the total", () => {
+  const meta = (key: string): ScanItem => ({ key, files: [], referenceMetadata: { type: "book", title: { variants: [{ lang: "en", kind: "original", value: `Book ${key}` }] } } });
+  const synthetic = (n: number, tell?: { at: number; total: number }): ImportSourceAdapter => ({
+    kind: "csl-json",
+    location: "synthetic",
+    async *scan(_signal, ctx): AsyncGenerator<ScanItem> {
+      for (let i = 0; i < n; i++) {
+        if (tell && i === tell.at) ctx?.total?.(tell.total);
+        yield meta(`k${i}`);
+      }
+    },
+  });
+  async function events(h: Awaited<ReturnType<BulkImport["startBatch"]>>) {
+    const seen: Array<{ done: number; total?: number }> = [];
+    for await (const e of h.progress) seen.push({ done: e.done, ...("total" in e ? { total: e.total } : {}) });
+    await h.done;
+    return seen;
+  }
+  const recPath = (p: Project) => join(lib.root, p.folder, "imports", "batch-0001", "batch.json");
+
+  it("a source with neither count nor total: no progress event carries a total (never done + 1)", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(4)));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.at(-1)!.done).toBe(4);
+    for (const e of seen) {
+      expect(e.total).toBeUndefined();
+      expect(e.total).not.toBe(e.done + 1);
+    }
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBeUndefined();
+  });
+
+  it("a source that tells total(5000) after its first item: every later event carries 5,000", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(3, { at: 1, total: 5000 })));
+    const first = seen.findIndex((e) => e.total !== undefined);
+    expect(first).toBeGreaterThanOrEqual(0); // the feed keeps the latest value: the first events may be read together
+    expect(seen.slice(0, first).every((e) => e.total === undefined)).toBe(true);
+    expect(seen.slice(first).every((e) => e.total === 5000)).toBe(true);
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(5000);
+  });
+
+  it("more items than told: the total grows with the count (never x above y)", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(4, { at: 0, total: 2 })));
+    for (const e of seen) if (e.total !== undefined) expect(e.total).toBeGreaterThanOrEqual(e.done);
+    expect(seen.at(-1)).toEqual({ done: 4, total: 4 });
+  });
+
+  it("items yielded twice count as done: the total stays the scan's", async () => {
+    const p = await project();
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(_s, ctx): AsyncGenerator<ScanItem> {
+        ctx?.total?.(3);
+        yield meta("a");
+        yield meta("a");
+        yield meta("b");
+      },
+    };
+    const seen = await events(await bulk.startBatch(p.id, adapter));
+    expect(seen.at(-1)).toEqual({ done: 3, total: 3 });
+  });
+
+  it("a resumed batch starts from the total it recorded, and is corrected when the source tells a new one", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3, { at: 0, total: 3 }));
+    await h.done;
+    const reopen = async () => writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    await reopen();
+    const kept = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(3)));
+    // R433: a resume sends no opening event, and this one tells no total and has no new item: it may send none.
+    expect(kept.every((e) => e.total === 3)).toBe(true);
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(3);
+    await reopen();
+    const told = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(4, { at: 0, total: 4 })));
+    expect(told.at(-1)).toEqual({ done: 4, total: 4 });
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(4);
+  });
+
+  /** A resumed part that tells the whole batch's total and asks `skip` (twice) for each key; skipped keys are yielded only when `yieldSkipped`. */
+  const skipping = (n: number, yieldSkipped: boolean): ImportSourceAdapter => ({
+    kind: "csl-json",
+    location: "synthetic",
+    async *scan(_signal, ctx): AsyncGenerator<ScanItem> {
+      ctx?.total?.(n);
+      for (let i = 0; i < n; i++) {
+        const passed = ctx?.skip?.(`k${i}`) === true;
+        ctx?.skip?.(`k${i}`);
+        if (passed && !yieldSkipped) continue;
+        yield meta(`k${i}`);
+      }
+    },
+  });
+
+  it("R426 a: keys an adapter passes by through skip and never yields count as done, once each", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const seen = await events(await bulk.resumeBatch(p.id, h.batchId, skipping(5, false)));
+    for (let i = 1; i < seen.length; i++) expect(seen[i]!.done).toBeGreaterThanOrEqual(seen[i - 1]!.done);
+    expect(seen.at(-1)).toEqual({ done: 5, total: 5 });
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(5);
+  });
+
+  it("R426 a: keys passed by through skip and yielded all the same are not counted twice", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const seen = await events(await bulk.resumeBatch(p.id, h.batchId, skipping(5, true)));
+    for (const e of seen) expect(e.done).toBeLessThanOrEqual(5);
+    expect(seen.at(-1)).toEqual({ done: 5, total: 5 });
+  });
+
+  const signal = () => new AbortController().signal;
+  const archives: Array<[string, Buffer]> = [
+    ["an empty ZIP", buildZip([])],
+    ["a ZIP of folders only", buildZip([{ name: "a/", data: "" }, { name: "a/b/", data: "" }])],
+  ];
+  for (const [what, zip] of archives) {
+    it(`R426 e: ${what} counts 0, as many as it yields; the dry run and the run agree`, async () => {
+      const p = await project();
+      const src = await folderWith(`r426e-${what.replace(/\W+/gu, "-")}`, { "x.zip": zip });
+      const za = zipAdapter(join(src, "x.zip"));
+      expect(await za.count!(signal())).toBe(0);
+      expect((await bulk.dryRun(p.id, za)).items).toBe(0);
+      const seen = await events(await bulk.startBatch(p.id, za));
+      expect(seen.at(-1)!.done).toBe(0);
+      for (const e of seen) if (e.total !== undefined) expect(e.total).toBe(0);
+    });
+  }
+
+  it("R426 e: a folder holding an empty ZIP ends with done equal to its total, and its dry run agrees", async () => {
+    const p = await project();
+    const src = await folderWith("r426e-folder", {
+      "one.pdf": await buildPdf({ title: "One", lines: ["One"], extra: "r426e-1" }),
+      "two.pdf": await buildPdf({ title: "Two", lines: ["Two"], extra: "r426e-2" }),
+      "empty.zip": buildZip([]),
+    });
+    expect(await folderAdapter(src).count!(signal())).toBe(2);
+    expect((await bulk.dryRun(p.id, folderAdapter(src))).items).toBe(2);
+    const seen = await events(await bulk.startBatch(p.id, folderAdapter(src)));
+    expect(seen.at(-1)).toEqual({ done: 2, total: 2 });
+  });
+
+  it("R426 e: an archive that cannot be read counts 1 and yields its one unreadable item", async () => {
+    const p = await project();
+    const src = await folderWith("r426e-unreadable", { "broken.zip": Buffer.from("not an archive at all") });
+    const za = zipAdapter(join(src, "broken.zip"));
+    expect(await za.count!(signal())).toBe(1);
+    const dry = await bulk.dryRun(p.id, za);
+    expect(dry.items).toBe(1);
+    expect(dry.unreadable).toHaveLength(1);
+    const seen = await events(await bulk.startBatch(p.id, za));
+    expect(seen.at(-1)).toEqual({ done: 1, total: 1 });
+  });
+
+  /** An adapter that says when its scan starts and yields its items only once `open` is called. */
+  const gated = (n: number) => {
+    let started!: () => void;
+    let open!: () => void;
+    const scanStarted = new Promise<void>((r) => (started = r));
+    const gate = new Promise<void>((r) => (open = r));
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(): AsyncGenerator<ScanItem> {
+        started();
+        await gate;
+        for (let i = 0; i < n; i++) yield meta(`k${i}`);
+      },
+    };
+    return { adapter, scanStarted, open };
+  };
+  /** The event already sent when the scan starts, or "none". */
+  const opening = async (h: Awaited<ReturnType<BulkImport["startBatch"]>>, scanStarted: Promise<void>) => {
+    await scanStarted;
+    const it = h.progress[Symbol.asyncIterator]();
+    return Promise.race([it.next().then((x) => (x.done ? "none" : x.value)), new Promise<"none">((r) => setTimeout(() => r("none"), 100))]);
+  };
+
+  it("R433 (1): a first run opens with its event before the scan yields anything", async () => {
+    const p = await project();
+    const g = gated(2);
+    const h = await bulk.startBatch(p.id, g.adapter);
+    expect(await opening(h, g.scanStarted)).toEqual({ done: 0 });
+    g.open();
+    expect((await h.done).state).toBe("finished");
+  });
+
+  it("R433 (1): a resumed batch sends no opening event; its first event carries what the journal holds", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(2));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const g = gated(4);
+    const r = await bulk.resumeBatch(p.id, h.batchId, g.adapter);
+    expect(await opening(r, g.scanStarted)).toBe("none");
+    g.open();
+    const seen = await events(r);
+    for (const e of seen) expect(e.done).toBeGreaterThanOrEqual(2);
+    expect(seen.at(-1)!.done).toBe(4);
+  });
+
+  it("R433 (2): a key yielded and then asked through skip is not counted again", async () => {
+    const p = await project();
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(_s, ctx): AsyncGenerator<ScanItem> {
+        ctx?.total?.(2);
+        yield { key: "k0", files: [], unreadable: "not readable" }; // journaled at once (a failed item)
+        if (ctx?.skip?.("k0") !== true) throw new Error("k0 should be in the journal");
+        yield meta("k1");
+      },
+    };
+    const seen = await events(await bulk.startBatch(p.id, adapter));
+    for (const e of seen) expect(e.done).toBeLessThanOrEqual(2);
+    expect(seen.at(-1)).toEqual({ done: 2, total: 2 });
+  });
+
+  for (const bad of [2.5, Number.NaN, -1]) {
+    it(`R426 c: a total of ${bad} is not a total: no event carries one`, async () => {
+      const p = await project();
+      const seen = await events(await bulk.startBatch(p.id, synthetic(3, { at: 0, total: bad })));
+      expect(seen.at(-1)!.done).toBe(3);
+      for (const e of seen) expect(e.total).toBeUndefined();
+    });
+  }
 });

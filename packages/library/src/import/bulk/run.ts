@@ -297,8 +297,11 @@ export interface BulkImportDeps {
 
 export interface BatchProgress {
   done: number;
-  /** Items the source said it holds (or found so far, when it cannot count). */
-  total: number;
+  /**
+   * Items the source said its scan will yield (its count, or what it told the scan's `total`), grown to `done`
+   * when it proves too small. Absent while no total is known: never guessed (R392).
+   */
+  total?: number;
   /** The item being worked on (its key: a path relative to the import's root). */
   current?: string;
 }
@@ -425,7 +428,7 @@ export const isBatchActive = (batchId: string) => active.has(batchId);
 
 /** Latest-value progress, readable by any number of consumers. */
 class ProgressFeed {
-  private last: BatchProgress = { done: 0, total: 0 };
+  private last: BatchProgress = { done: 0 };
   private seq = 0;
   private ended = false;
   private wake = new Set<() => void>();
@@ -821,26 +824,55 @@ class Run {
         this.known = await knownVersions(this.repo, this.projectId, this.rec.source.kind, this.marks);
         await this.refreshDeleted();
       }
-      let total = 0;
+      // R392: the total is the source's own (its count, or what its scan tells), else the one this batch recorded
+      // (a resume); never guessed. One that proves too small grows with `done`.
+      let total: number | undefined = this.rec.total;
       try {
-        total = (await this.adapter.count?.(this.abort.signal)) ?? 0;
+        const counted = await this.adapter.count?.(this.abort.signal);
+        if (counted) total = counted;
       } catch {
-        total = 0;
+        // no count: the total stays as it was
       }
-      if (total) this.rec.total = total;
       let done = 0;
       const seenKeys = new Set<string>();
-      this.feed.emit({ done, total });
+      /** R426 a: keys of this batch's journal the adapter passed by through `skip`, counted as done once each. */
+      const passedBy = new Set<string>();
+      const progress = (current?: string): BatchProgress => {
+        if (total !== undefined && total < done) total = done;
+        if (total !== undefined) this.rec.total = total;
+        return { done, ...(total !== undefined ? { total } : {}), ...(current !== undefined ? { current } : {}) };
+      };
+      // R433: a resumed batch (its journal holds entries) sends no opening event: it would say "0 of y" until the
+      // source reaches the items it passes by. Its first event is the one sent when the total is told, or its first
+      // item's, so the screen says "Starting…" meanwhile. A batch that is not a resume opens with this event.
+      if (this.latest.size === 0) this.feed.emit(progress());
       let knownIds: ReadonlySet<string> | undefined;
       const scan = this.adapter.scan(this.abort.signal, {
         workDir: () => this.ensureWorkDir(),
         note: (t) => this.note(t),
         // An item already in this batch's journal is passed by below: the adapter need not fetch it (Z2).
-        skip: (key) => this.latest.has(key),
+        // R426 a: the first time it is passed by, it counts as done (an adapter may yield nothing for it), so a
+        // resumed batch's "x of y" counts the whole batch. No event here: the next one carries the count.
+        skip: (key) => {
+          if (!this.latest.has(key)) return false;
+          if (!seenKeys.has(key) && !passedBy.has(key)) {
+            passedBy.add(key);
+            done++;
+          }
+          return true;
+        },
+        total: (n) => {
+          if (!Number.isSafeInteger(n) || n < 0) return;
+          total = n;
+          this.feed.emit(progress());
+        },
         ...(this.adapter.incremental ? { knownIds: () => (knownIds ??= new Set(this.known.keys())), fileKnown: (id, att, v) => this.fileKnown(id, att, v) } : {}),
       });
       for await (const item of scan) {
-        if (seenKeys.has(item.key)) continue;
+        if (seenKeys.has(item.key)) {
+          done++; // yielded twice: counted as done, so `done` reaches the scan's total (R392)
+          continue;
+        }
         seenKeys.add(item.key);
         // Gone at its source (Zotero): marked in `item` (Z5); like any item, passed by when this batch has its line.
         if (!item.gone && !this.latest.has(item.key) && this.recovered.size) {
@@ -849,17 +881,15 @@ class Run {
           if (sid) this.latest.set(item.key, this.queue({ key: item.key, outcome: "created", sourceId: sid }));
         }
         if (this.latest.has(item.key)) {
-          done++;
-          total = Math.max(total, done);
+          if (!passedBy.has(item.key)) done++; // counted already when the adapter passed it by (R426 a)
           continue;
         }
         if (this.cancelled) break;
-        this.feed.emit({ done, total: Math.max(total, done + 1), current: item.key });
+        this.feed.emit(progress(item.key));
         const entry = await this.item(item, dedupe, watchdog);
         if (entry) this.latest.set(entry.key, entry); // queued items are recorded when their group is stored
         done++;
-        total = Math.max(total, done);
-        this.feed.emit({ done, total });
+        this.feed.emit(progress());
         if (this.pending.length >= 200) await this.checkpoint("running");
         // A pause or suspend takes effect here, after the item in hand and BEFORE the next is asked of the
         // adapter: an item the adapter already fetched (a Zotero file downloaded for it, Z4) is never dropped

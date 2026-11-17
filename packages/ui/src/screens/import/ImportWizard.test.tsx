@@ -125,6 +125,31 @@ describe("Bulk Import wizard", () => {
     expect(await screen.findByRole("button", { name: "Pause" })).toBeTruthy();
   });
 
+  it("FR-A21 (R392): no total → \"97 items so far\" and an open-ended bar; a total arriving mid-run → \"x of y\"", async () => {
+    const { m, user } = setup();
+    await scanFolder(user);
+    await toOptions(user);
+    await user.click(screen.getByRole("button", { name: "Start import" }));
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(m.calls.some((c) => c.path === "/events")).toBe(true));
+    const bar = await screen.findByRole("progressbar", { name: "Import progress" });
+    expect(screen.getByRole("status").textContent).toBe("Starting…");
+    await act(async () => m.emit("import.progress", { batchId: B1, projectId: P1, state: "running", done: 1 }));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("1 item so far"));
+    await act(async () => m.emit("import.progress", { batchId: B1, projectId: P1, state: "running", done: 97 }));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("97 items so far"));
+    expect(screen.queryByText(/of 98/u)).toBeNull();
+    // An open-ended bar: no maximum (and no value, which would read as a full bar of maximum 1).
+    expect(bar.hasAttribute("max")).toBe(false);
+    expect(bar.hasAttribute("value")).toBe(false);
+    expect(screen.getByRole("progressbar", { name: "Import progress" })).toBe(bar);
+    // The source tells its total once it knows it (Zotero web: once its listing is read, R423): the screen switches to "x of y".
+    await act(async () => m.emit("import.progress", { batchId: B1, projectId: P1, state: "running", done: 97, total: 3412 }));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("97 of 3,412 items"));
+    expect(bar.getAttribute("max")).toBe("3412");
+    expect(bar.getAttribute("value")).toBe("97");
+  });
+
   it("Undo asks with the real counts and calls undo on confirm", async () => {
     const { m, user } = setup();
     await scanFolder(user);
