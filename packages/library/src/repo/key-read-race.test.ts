@@ -305,6 +305,40 @@ describe("(b) locking is immediate for everyone but the change in progress (R386
   });
 });
 
+describe("(c) R404: lock, unlock, lock asked while a change is held ends locked", () => {
+  for (const wait of [0, 20]) {
+    it(`the last lock is a new lock after the unlock, not the first lock's promise (the unlock ${wait ? "waiting for the first lock" : "just asked"})`, async () => {
+      const p = await makeProject(kit, GOV, true);
+      const sf = await addSource(kit, p, { title: "T" });
+      const keyId = kit.repo.getProject(p.id).encryption.keyId!;
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let entered!: () => void;
+      const inside = new Promise<void>((r) => (entered = r));
+      const done = importChange(kit.repo, p.id, STORE, async (ops) => {
+        const cur = await ops.readSource(sf.source.id);
+        entered();
+        await gate;
+        await ops.writeSource(cur, { ...cur, source: { ...cur.source, caseAttributes: { note: "held" } } });
+      }, { op: "test.note" });
+      await inside;
+      const settled: string[] = [];
+      const lock1 = kit.repo.lockProject(p.id).then(() => settled.push("lock1"));
+      const unlock = kit.repo.unlockProject(p.id, PASS).then(() => settled.push("unlock"));
+      await ticks(wait);
+      const lock3p = kit.repo.lockProject(p.id);
+      const lock3 = lock3p.then(() => settled.push("lock3"));
+      release();
+      await done;
+      await Promise.all([lock1, unlock, lock3]);
+      expect(settled.indexOf("lock3")).toBeGreaterThan(settled.indexOf("unlock"));
+      expect(kit.repo.isUnlocked(p.id)).toBe(false);
+      expect(kit.ring.has(keyId)).toBe(false);
+      await expect(kit.repo.getSource(p.id, sf.source.id)).rejects.toBeInstanceOf(ProjectLockedError);
+    });
+  }
+});
+
 describe("(c) the repeat unlock and an unknown project (R386 c)", () => {
   it("a different key under the same key id, added by an unlock while a change is being saved, never zeroes the key that change seals with", async () => {
     const p = await makeProject(kit, GOV, true);

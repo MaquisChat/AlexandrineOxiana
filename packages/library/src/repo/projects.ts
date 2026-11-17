@@ -215,8 +215,24 @@ async function readKeyFile(core: RepoCore, st: ProjectState): Promise<ProjectKey
   return JSON.parse(raw.toString("utf8")) as ProjectKeyFile;
 }
 
-/** Unlocks with the passphrase or, failing that, the recovery code. */
-export async function unlockProject(core: RepoCore, projectId: string, secret: string): Promise<void> {
+/**
+ * Unlocks with the passphrase or, failing that, the recovery code. While it runs it is the project's pending unlock:
+ * a lock asked meanwhile is queued after it (R404 c), so "lock, unlock, lock" ends locked.
+ */
+export function unlockProject(core: RepoCore, projectId: string, secret: string): Promise<void> {
+  const run = unlockNow(core, projectId, secret);
+  const mark = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  core.pendingUnlocks.set(projectId, mark);
+  void mark.then(() => {
+    if (core.pendingUnlocks.get(projectId) === mark) core.pendingUnlocks.delete(projectId);
+  });
+  return run;
+}
+
+async function unlockNow(core: RepoCore, projectId: string, secret: string): Promise<void> {
   const st = core.state(projectId);
   if (!core.encrypted(st)) return;
   // Unlocking is audited; that append must wait until the interrupted write is resolved.
@@ -491,6 +507,10 @@ export function lockProject(core: RepoCore, projectId: string): Promise<void> {
   } catch (err) {
     return Promise.reject(err);
   }
+  // A lock asked while an unlock is in progress is a NEW lock after that unlock, never the earlier lock's promise
+  // (R404 c): the last thing asked wins.
+  const unlocking = core.pendingUnlocks.get(projectId);
+  if (unlocking) return unlocking.then(() => lockProject(core, projectId));
   const pending = core.pendingLocks.get(projectId);
   if (pending) return pending;
   const keyId = st.project.encryption.keyId;

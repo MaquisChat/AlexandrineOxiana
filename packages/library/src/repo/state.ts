@@ -168,6 +168,8 @@ export class RepoCore {
   private running: Turn | undefined;
   /** Locks asked and not yet done (the key is wiped when the turn in progress ends), by project id (R386 b). */
   readonly pendingLocks = new Map<string, Promise<void>>();
+  /** Unlocks in progress, per project: a lock asked meanwhile is a new lock after them (R404 c). */
+  readonly pendingUnlocks = new Map<string, Promise<void>>();
 
   constructor(
     readonly library: Library,
