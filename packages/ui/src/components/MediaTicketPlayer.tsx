@@ -16,6 +16,12 @@
  * The position is kept by the player, not read back from the element while a new `src` loads: a
  * browser reports 0 then, and a resume seeks to the kept position before any report counts.
  *
+ * A recording never starts by itself (R362 f): what the researcher does while a ticket is renewed is
+ * kept. A pause pressed then ends the renewal paused; a play pressed then plays when it lands; a seek
+ * made then is where it resumes. Until the new `src` is set every pause, play and seek the element
+ * reports is the researcher's; after it, a pause is the browser's own (the source changed) unless the
+ * researcher pressed play since.
+ *
  * The ticket address is a secret (R135 5): it goes to the element only — never shown as text,
  * logged, stored, or put in the page address. No `crossorigin` attribute: the service expects the
  * element's plain (no-cors) range reads.
@@ -56,6 +62,19 @@ export const RENEWAL_PROGRESS_S = 3;
 export const SAME_PLACE_S = 2;
 /** A reported time this close to a resume target means the resume seek has landed. */
 const SEEK_TOLERANCE_S = 1;
+
+/**
+ * A resume in progress: where to seek, whether to play, whether its seek was issued, whether the new
+ * `src` was set (R362 f: before it, the element's events are the researcher's), and whether the
+ * researcher pressed play after it (a pause after that is theirs too).
+ */
+interface Pending {
+  at: number;
+  play: boolean;
+  seekIssued: boolean;
+  srcSet: boolean;
+  playedSince: boolean;
+}
 
 type Phase = { kind: "loading" } | { kind: "ready" } | { kind: "renewing" } | { kind: "failed"; message: string; retry: boolean };
 
@@ -102,7 +121,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
      * A resume in progress after a new `src`: where to seek and whether to play. Until the seek has
      * completed (`seeked`, or a reported time at the target), the element's reported time is ignored.
      */
-    let pending: { at: number; play: boolean; seekIssued: boolean } | null = null;
+    let pending: Pending | null = null;
     /** Given up (or refused): the element's reports are ignored until Try again. */
     let halted = false;
     let stopped = { at: 0, play: false };
@@ -162,6 +181,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       ticket = path;
       if (old && old !== path) revoke(old);
       el.src = address;
+      if (pending) pending.srcSet = true;
       setPhase({ kind: "ready" });
     };
 
@@ -172,14 +192,14 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       const samePlace = failures.filter((f) => Math.abs(f - at) <= SAME_PLACE_S).length;
       failures.push(at);
       if (renewals >= MAX_RENEWALS_WITHOUT_PROGRESS || samePlace >= MAX_RENEWALS_WITHOUT_PROGRESS) {
-        pending = { at, play, seekIssued: false };
+        pending = { at, play, seekIssued: false, srcSet: false, playedSince: false };
         halt({ kind: "failed", message: `The recording could not be played: it stopped at the same place again. Its file may be damaged or in a format this app cannot play. You can choose ${RETRY}.`, retry: true });
         return;
       }
       renewals++;
       failedAt = at;
       position = at;
-      pending = { at, play, seekIssued: false };
+      pending = { at, play, seekIssued: false, srcSet: false, playedSince: false };
       setPhase({ kind: "renewing" });
       void attach(true);
     };
@@ -195,27 +215,44 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       timeRef.current?.(position);
     };
     const onPlay = () => {
-      if (!pending && !halted) wantPlay = true;
+      if (halted) return;
+      if (!pending) wantPlay = true;
+      else {
+        // R362 f: a play pressed during a renewal still plays when it lands.
+        pending.play = true;
+        if (pending.srcSet) pending.playedSince = true;
+      }
     };
     const onPause = () => {
-      // A browser pauses an element whose source changes: that is not the researcher pausing.
-      if (!pending && !halted) wantPlay = false;
+      if (halted) return;
+      if (!pending) wantPlay = false;
+      // R362 f: a pause pressed during a renewal is kept: it ends paused. A browser pauses an element whose source
+      // changes: after the new `src` that pause is not the researcher's, unless they pressed play since.
+      else if (!pending.srcSet || pending.playedSince) pending.play = false;
+    };
+    const onSeeking = () => {
+      // R362 f: a seek by the researcher while the new ticket is asked for: the renewal resumes there.
+      if (halted || !pending || pending.srcSet) return;
+      pending.at = el.currentTime;
+      position = pending.at;
+      timeRef.current?.(position);
     };
     const onMetadata = () => {
       if (!pending || pending.seekIssued || !ticket || halted) return;
       pending.seekIssued = true;
       el.currentTime = pending.at;
+      wantPlay = pending.play;
       if (pending.play) {
-        wantPlay = true;
         const p = el.play() as Promise<void> | undefined;
         if (p && typeof p.catch === "function") p.catch(() => {});
-      }
+      } else if (!el.paused) el.pause();
     };
     el.addEventListener("error", onError);
     el.addEventListener("timeupdate", onTimeUpdate);
     el.addEventListener("seeked", onTimeUpdate);
     el.addEventListener("play", onPlay);
     el.addEventListener("pause", onPause);
+    el.addEventListener("seeking", onSeeking);
     el.addEventListener("loadedmetadata", onMetadata);
     setPhase({ kind: "loading" });
     void attach(false);
@@ -226,7 +263,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       renewals = 0;
       failures = [];
       position = stopped.at;
-      pending = { at: stopped.at, play: stopped.play, seekIssued: false };
+      pending = { at: stopped.at, play: stopped.play, seekIssued: false, srcSet: false, playedSince: false };
       setPhase({ kind: "loading" });
       void attach(false);
     };
@@ -253,6 +290,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       el.removeEventListener("seeked", onTimeUpdate);
       el.removeEventListener("play", onPlay);
       el.removeEventListener("pause", onPause);
+      el.removeEventListener("seeking", onSeeking);
       el.removeEventListener("loadedmetadata", onMetadata);
       if (control) control.current = null;
       release();

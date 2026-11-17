@@ -206,6 +206,62 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(played).toBe(before);
   });
 
+  // R362 f: a recording never starts by itself. What the researcher does while a ticket is being renewed is kept.
+  it("R362 f: playing, the ticket ends, the researcher pauses during the renewal: the renewal lands at the same place, PAUSED, and play() is not called", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4.25);
+    fireEvent(el, new Event("error"));
+    // The researcher presses pause while the new ticket is asked for.
+    fireEvent(el, new Event("pause"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    // The browser's own pause as the source changes.
+    fireEvent(el, new Event("pause"));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(4.25);
+    expect(played).toBe(before);
+  });
+
+  it("R362 f: paused, the ticket ends, the researcher presses play during the renewal: it plays when the renewal lands", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    playTo(el, 3);
+    fireEvent(el, new Event("error"));
+    fireEvent(el, new Event("play"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(3);
+    expect(played).toBe(before + 1);
+  });
+
+  it("R362 f: a seek by the researcher during the renewal keeps the place asked", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4.25);
+    fireEvent(el, new Event("error"));
+    // The researcher drags the element's own position control while the new ticket is asked for.
+    el.currentTime = 30;
+    fireEvent(el, new Event("seeking"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(30);
+    expect(played).toBe(before + 1);
+  });
+
   it("a project locked during playback: renewal is refused, the transcript is hidden, and Try again brings it back after unlocking", async () => {
     const onLocked = vi.fn();
     const { svc } = await open({}, { onLocked });
