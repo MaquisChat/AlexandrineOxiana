@@ -89,6 +89,8 @@ export interface ServiceSetup {
   dryRunDelayMs?: number;
   /** Delay (ms) before the governance answers. */
   governanceDelayMs?: number;
+  /** The service says it cannot read the project's rules (`readable: false`, R379 FR-A18). */
+  governanceUnreadable?: boolean;
   /** Source ids whose first request fails (HTTP 500). */
   failSourcesOnce?: string[];
   /** The Zotero key in the password store (Task 57): stored at the start, or no store at all. */
@@ -169,7 +171,15 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     http.get(url("/projects/:id/governance"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/governance`);
       await wait(o.governanceDelayMs);
-      return HttpResponse.json({ yaml: o.governance ?? OPEN_GOVERNANCE, sha256: "0".repeat(64), violations: [] });
+      const unreadable = o.governanceUnreadable ?? false;
+      return HttpResponse.json({
+        yaml: o.governance ?? OPEN_GOVERNANCE,
+        sha256: "0".repeat(64),
+        violations: [],
+        readable: !unreadable,
+        issues: unreadable ? ["residencey: unknown key (check spelling) in governance.yaml"] : [],
+        warnings: [],
+      });
     }),
     http.post(url("/projects/:id/import/dry-run"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/import/dry-run`);

@@ -11,7 +11,7 @@
 import { effectivePolicy } from "@ao/core/governance/merge";
 import { parseGovernance } from "@ao/core/governance/schema";
 import { isId } from "@ao/core/ids";
-import { PICTURE_MAX_BYTES, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse, type ZoteroSyncUndoNote } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type GovernanceReadability, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse, type ZoteroSyncUndoNote } from "@ao/shared";
 import type { ApiClient } from "./client";
 
 export type { ProjectReviewPage, ReviewCause, ReviewGroup, WithdrawalReviewedResponse, ZoteroDataFolder };
@@ -288,6 +288,12 @@ export interface ImportPolicy {
   encryptionRequired: boolean;
 }
 
+/** The policy as read for the wizard: also whether the service can read the rules at all (R379 FR-A18). */
+export interface ImportPolicyRead extends ImportPolicy {
+  /** False when the policy engine cannot read the rules: every import is refused, and the reading is the strictest. */
+  readable: boolean;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Methods
 
@@ -328,8 +334,11 @@ export function importApi(client: ApiClient) {
   const r = client.request;
   return {
     projects: async () => (await r<{ projects: ProjectInfo[] }>("GET", "/projects")).projects,
-    policy: async (projectId: string): Promise<ImportPolicy> =>
-      importPolicyFromYaml((await r<{ yaml: string }>("GET", `/projects/${pid(projectId)}/governance`)).yaml),
+    /** The service's `readable: false` reads the rules strictly and says so (R379 FR-A18). */
+    policy: async (projectId: string): Promise<ImportPolicyRead> => {
+      const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`);
+      return g.readable === false ? { pseudonymizeNames: true, encryptionRequired: true, readable: false } : { ...importPolicyFromYaml(g.yaml), readable: true };
+    },
 
     dryRun: (projectId: string, adapter: ImportAdapter, approveOutside?: ApproveOutside) =>
       r<ScanSummary>("POST", `/projects/${pid(projectId)}/import/dry-run`, { body: { adapter, ...(approveOutside ? { approveOutside } : {}) } }),

@@ -443,6 +443,23 @@ describe("Bulk Import wizard", () => {
     await waitFor(() => expect((screen.getByRole("radio", { name: "Folders become collections" }) as HTMLInputElement).checked).toBe(true), { timeout: 1000 });
   });
 
+  const UNREADABLE = "This project's rules cannot be read, so nothing can be imported here. Correct them on the Governance screen.";
+
+  it("says why nothing can be imported when the service cannot read the rules; the options stay strict (R379 FR-A18)", async () => {
+    const { user } = setup({ governanceUnreadable: true });
+    expect(await screen.findByText(UNREADABLE)).toBeTruthy();
+    await scanFolder(user);
+    await toOptions(user);
+    expect((screen.getByRole("radio", { name: "Link in place" }) as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it("does not say it when the rules are readable (R379 FR-A18)", async () => {
+    const { m } = setup();
+    await waitFor(() => expect(m.calls.some((c) => c.path.endsWith("/governance"))).toBe(true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByText(UNREADABLE)).toBeNull();
+  });
+
   it("keeps the researcher's own options when the rules arrive", async () => {
     const { user } = setup({ governanceDelayMs: 300 });
     await scanFolder(user);
