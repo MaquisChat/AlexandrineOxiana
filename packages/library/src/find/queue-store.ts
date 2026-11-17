@@ -50,13 +50,14 @@ import { statSync } from "node:fs";
 import { Readable } from "node:stream";
 import * as fsp from "node:fs/promises";
 import { Creator, SourceType, isId } from "@ao/core";
-import { InvalidInputError } from "../repo/errors.js";
+import { InvalidInputError, ProjectLockedError } from "../repo/errors.js";
 import { openLine, readMaybe, sealLine } from "../repo/io.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "../repo/mutate.js";
 import { PURPOSE_FIND_QUEUE } from "../repo/sealed-purposes.js";
-import type { ProjectState, RepoCore } from "../repo/state.js";
+import { lockPurges, type ProjectState, type RepoCore } from "../repo/state.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FIND_DOI_MAX, FIND_LINE_MAX_BYTES, FIND_QUEUE_MAX, FIND_QUEUE_OPS, FIND_STATES, FIND_TYPED_MAX, type FindEntry, type FindState, type OfferLink, type PersonCandidate } from "./types.js";
+import { KeyNotAvailableError } from "../crypto/format.js";
 
 const PURPOSE = PURPOSE_FIND_QUEUE;
 const DIR = "find";
@@ -329,7 +330,8 @@ function parseLine(line: string, projectId: string, key: Uint8Array | null): Fin
   try {
     const e = sanitizeEntry(JSON.parse(key ? openLine(key, projectId, line, PURPOSE) : line));
     return e && e.projectId === projectId ? e : null;
-  } catch {
+  } catch (err) {
+    if (err instanceof KeyNotAvailableError) throw err; // a wiped key: the read was cut short by a lock (R386 a)
     return null;
   }
 }
@@ -432,6 +434,16 @@ function cacheOf(core: RepoCore): Map<string, { sig: string; folded: Folded }> {
   return c;
 }
 
+/** At lock (R386 a): the project's kept queue is dropped; no decrypted entry stays behind the lock. */
+lockPurges.push((core, st) => {
+  caches.get(core)?.delete(core.abs(queueRel(st.rel)));
+});
+
+/** Test seam: how many queues are kept for this repository. */
+export function findCacheSize(repo: object): number {
+  return caches.get((repo as { core: RepoCore }).core)?.size ?? 0;
+}
+
 /** Notes left for the developer in `core.indexErrors` (the repository's place for what does not fail a committed change): each kind once, and a few at most. */
 const noted = new WeakMap<RepoCore, Set<string>>();
 function note(core: RepoCore, message: string, once: string): void {
@@ -466,6 +478,8 @@ async function loadFolded(core: RepoCore, st: ProjectState): Promise<Folded> {
     folded = await foldFile(abs, st.project.id, key, Number(stat.size));
   } catch (err) {
     cache.delete(abs);
+    // Locked while it was read: refused as locked, and nothing is kept (R386 a).
+    if (err instanceof KeyNotAvailableError) throw new ProjectLockedError(st.project.id);
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return emptyFolded();
     throw new FindQueueUnreadableError();
   }

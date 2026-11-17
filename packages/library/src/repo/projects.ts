@@ -32,7 +32,7 @@ import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, Polic
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
-import type { Manifest, ProjectJson, ProjectState, RepoCore } from "./state.js";
+import { lockPurges, type Manifest, type ProjectJson, type ProjectState, type RepoCore } from "./state.js";
 
 export interface CreateProjectInput {
   name: string;
@@ -235,6 +235,8 @@ export async function unlockProject(core: RepoCore, projectId: string, secret: s
     key = await unwrapWithRecovery(file.recovery, secret);
   }
   try {
+    // A lock asked before this unlock is done first: then the key is added again (R386 b).
+    for (let p = core.pendingLocks.get(projectId); p; p = core.pendingLocks.get(projectId)) await p.catch(() => {});
     // An unlocked project's key is replaced only between turns of the write queue (R379); the same key again
     // changes nothing (KeyRing.add keeps the buffer a change may be sealing with).
     if (core.keyRing.has(file.keyId) && !core.queueIdle()) await core.serialNext(async () => core.keyRing.add(file.keyId, key));
@@ -475,28 +477,52 @@ export async function recoveryCodeUnshown(core: RepoCore, st: ProjectState): Pro
 }
 
 /**
- * Locks the project: its in-memory index content is dropped and its key zeroed in the key ring. R379: the key is
- * wiped only between turns of the write queue, never under a change being saved: at once when no write is running,
- * else as the next turn (after the change in progress, ahead of those waiting, which then find the project locked).
+ * Locks the project: its in-memory content (index, kept registers and queues) is dropped and its key zeroed in the
+ * key ring. R379: the key is wiped only between turns of the write queue, never under a change being saved: at once
+ * when no write is running, else as the next turn (after the change in progress, ahead of those waiting, which then
+ * find the project locked). R386 b: locking is immediate for everyone but that change: before this returns, the
+ * project counts as locked for every read and every new change (the key ring answers only the turn running now);
+ * the returned promise settles when the key is wiped. An unknown project is a rejected promise, never a throw.
  */
 export function lockProject(core: RepoCore, projectId: string): Promise<void> {
-  const keyId = core.state(projectId).project.encryption.keyId;
-  const lock = () => {
-    // Drop the project's in-memory index content first; a failure must not keep the project unlocked.
+  let st: ProjectState;
+  try {
+    st = core.state(projectId);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  const pending = core.pendingLocks.get(projectId);
+  if (pending) return pending;
+  const keyId = st.project.encryption.keyId;
+  const purge = () => {
+    // A failure must not keep the project unlocked.
     try {
       core.index.purgeProject?.(projectId);
     } catch (error) {
       core.indexErrors.push({ op: "project.lock", error });
     }
+    for (const p of lockPurges) {
+      try {
+        p(core, st);
+      } catch (error) {
+        core.indexErrors.push({ op: "project.lock", error });
+      }
+    }
+  };
+  const lock = () => {
+    purge();
     if (keyId) core.keyRing.remove(keyId);
   };
-  // Not "in a turn" (holdsTurn): a timer or callback started inside a turn carries its context afterwards.
-  // A turn that awaited its own lock would wait forever; none does.
   if (core.queueIdle()) {
     lock();
     return Promise.resolve();
   }
-  return core.serialNext(async () => lock());
+  // Locked for everyone at once but the turn running now, which may still be sealing with the key.
+  if (keyId) core.keyRing.markLocking(keyId, core.admitsOnlyRunningTurn());
+  purge();
+  const done = core.serialNext(async () => lock()).finally(() => core.pendingLocks.delete(projectId));
+  core.pendingLocks.set(projectId, done);
+  return done;
 }
 
 export function isUnlocked(core: RepoCore, projectId: string): boolean {

@@ -125,8 +125,21 @@ export interface ProjectState {
   auditUnverified?: boolean;
 }
 
-/** The repo whose write-queue turn the current code runs in, if any. */
-const inTurn = new AsyncLocalStorage<RepoCore>();
+/** One turn of a repo's write queue. */
+interface Turn {
+  readonly core: RepoCore;
+}
+/**
+ * The write-queue turn the current code runs in, if any. A timer or callback started inside a turn carries the
+ * turn's context with it, even after the turn has ended.
+ */
+const inTurn = new AsyncLocalStorage<Turn>();
+
+/**
+ * Run when a project is locked, in the lock's own turn (and when the lock is asked): each module that keeps a
+ * project's decrypted content in memory drops it there (R386 a: the watched-folders register, the Find queue).
+ */
+export const lockPurges: Array<(core: RepoCore, st: ProjectState) => void> = [];
 
 export class RepoCore {
   readonly projects = new Map<string, ProjectState>();
@@ -151,6 +164,10 @@ export class RepoCore {
   private readonly urgent: Array<() => void> = [];
   /** A turn is running or about to start. */
   private writing = false;
+  /** The turn running now, if any. */
+  private running: Turn | undefined;
+  /** Locks asked and not yet done (the key is wiped when the turn in progress ends), by project id (R386 b). */
+  readonly pendingLocks = new Map<string, Promise<void>>();
 
   constructor(
     readonly library: Library,
@@ -210,17 +227,33 @@ export class RepoCore {
     return !this.writing;
   }
 
+  /**
+   * A test that admits only the turn running now (none, when none is running) and the code that runs in its
+   * context: what still gets a project's key between a lock being asked and the key being wiped (R386 b).
+   * A later turn, and any code outside the write queue, is not admitted. A timer or callback started inside the
+   * running turn is (it carries that turn's context), until the key is wiped when the turn ends.
+   */
+  admitsOnlyRunningTurn(): () => boolean {
+    const turn = this.running;
+    return () => turn !== undefined && inTurn.getStore() === turn;
+  }
+
   private enqueue<T>(fn: () => Promise<T>, next: boolean): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       // Bound to the caller's async context, as a promise reaction would be.
       const start = AsyncResource.bind(() => {
+        const turn: Turn = { core: this };
+        this.running = turn;
         let run: Promise<T>;
         try {
-          run = Promise.resolve(inTurn.run(this, fn));
+          run = Promise.resolve(inTurn.run(turn, fn));
         } catch (err) {
           run = Promise.reject(err);
         }
-        run.then(resolve, reject).finally(() => this.startNext());
+        run.then(resolve, reject).finally(() => {
+          if (this.running === turn) this.running = undefined;
+          this.startNext();
+        });
       });
       (next ? this.urgent : this.waiting).push(start);
       if (!this.writing) {
@@ -238,7 +271,7 @@ export class RepoCore {
 
   /** True while running in a turn of this repo's write queue (`serial`): no other write is in progress. */
   holdsTurn(): boolean {
-    return inTurn.getStore() === this;
+    return inTurn.getStore()?.core === this;
   }
 
   state(projectId: string): ProjectState {

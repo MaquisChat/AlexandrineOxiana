@@ -265,6 +265,21 @@ export async function unwrapWithRecovery(w: WrappedKey, code: string): Promise<U
  */
 export class KeyRing {
   private readonly keys = new Map<string, Buffer>();
+  /** Keys being locked: answered only to the callers `admits` lets through, until removed (R386 b). */
+  private readonly locking = new Map<string, () => boolean>();
+
+  /**
+   * Marks a key as being locked: from now on `get` and `has` answer as if it were gone, except to the callers
+   * `admits` lets through (the change in progress); `remove` then wipes it (R386 b).
+   */
+  markLocking(keyId: string, admits: () => boolean): void {
+    if (this.keys.has(keyId)) this.locking.set(keyId, admits);
+  }
+
+  private hidden(keyId: string): boolean {
+    const admits = this.locking.get(keyId);
+    return admits !== undefined && !admits();
+  }
 
   add(keyId: string, key: Uint8Array): void {
     assertKeyId(keyId);
@@ -278,11 +293,11 @@ export class KeyRing {
 
   /** The stored key (not a copy); it is zeroed when removed or cleared. */
   get(keyId: string): Uint8Array | undefined {
-    return this.keys.get(keyId);
+    return this.hidden(keyId) ? undefined : this.keys.get(keyId);
   }
 
   has(keyId: string): boolean {
-    return this.keys.has(keyId);
+    return this.keys.has(keyId) && !this.hidden(keyId);
   }
 
   get size(): number {
@@ -292,10 +307,12 @@ export class KeyRing {
   remove(keyId: string): void {
     this.keys.get(keyId)?.fill(0);
     this.keys.delete(keyId);
+    this.locking.delete(keyId);
   }
 
   clear(): void {
     for (const k of this.keys.values()) k.fill(0);
     this.keys.clear();
+    this.locking.clear();
   }
 }

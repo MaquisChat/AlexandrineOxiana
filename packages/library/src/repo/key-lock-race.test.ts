@@ -161,9 +161,10 @@ describe("a lock or a second unlock while a change is being saved (R379)", () =>
     let locked = false;
     void lock.then(() => (locked = true));
     await new Promise((r) => setTimeout(r, 20));
-    // The lock is waiting for the change in progress: the key is still there.
+    // The lock is waiting for the change in progress (the key is not wiped yet); for everyone else the project
+    // already counts as locked (R386 b).
     expect(locked).toBe(false);
-    expect(kit.repo.isUnlocked(p.id)).toBe(true);
+    expect(kit.repo.isUnlocked(p.id)).toBe(false);
     const filesBefore = await walk(folderOf(p));
     release();
     await first;
