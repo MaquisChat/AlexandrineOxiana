@@ -1604,12 +1604,19 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
     expect(BIB_DOUBTS.eof).toBe("The BibTeX entry was not closed before the end of the file; its fields may be incomplete or hold text from what followed it.");
   });
 
-  it("stays linear with many '@' lines and pasted entries inside one value (1 MB, < 1 s)", async () => {
+  // A generous bound (R366 h): quadratic work on these 1 MB files takes minutes, and a loaded machine a few seconds at most.
+  it("stays linear with many '@' lines, pasted entries and unclosed entries (1 MB each, < 5 s)", async () => {
+    const LIMIT = 5000;
     const inside = await writeExport("lin1.bib", `@article{k, title={T}, abstract={${"\n@someuser replied".repeat(MB / 18)}}, doi={10.5555/x}}`);
-    expect(await timed(() => collect(bibtexAdapter(inside)))).toBeLessThan(1000);
+    expect(await timed(() => collect(bibtexAdapter(inside)))).toBeLessThan(LIMIT);
     const pasted = await writeExport("lin2.bib", `@article{k, title={T}, abstract={${"\n@article{p, title={x}}".repeat(MB / 23)}}, doi={10.5555/x}}`);
-    expect(await timed(() => collect(bibtexAdapter(pasted)))).toBeLessThan(1000);
+    expect(await timed(() => collect(bibtexAdapter(pasted)))).toBeLessThan(LIMIT);
     const unclosed = await writeExport("lin3.bib", "@article{k, title={T}, abstract={x\n@someuser\n".repeat(MB / 44));
-    expect(await timed(() => collect(bibtexAdapter(unclosed)))).toBeLessThan(1000);
+    expect(await timed(() => collect(bibtexAdapter(unclosed)))).toBeLessThan(LIMIT);
+    // Unclosed entries nested in each other's values, and one unclosed entry around many closed ones (each read on its own).
+    const nested = await writeExport("lin4.bib", "@a{k, t={\n".repeat(MB / 10));
+    expect(await timed(() => collect(bibtexAdapter(nested)))).toBeLessThan(LIMIT);
+    const around = await writeExport("lin5.bib", `@article{k, title={x\n${"@misc{m, title={M}}\n".repeat(MB / 20)}`);
+    expect(await timed(() => collect(bibtexAdapter(around)))).toBeLessThan(LIMIT);
   });
 });
