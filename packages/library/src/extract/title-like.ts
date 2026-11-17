@@ -4,8 +4,8 @@
  * and XMP, DOCX core properties, EPUB OPF, MOBI EXTH and PalmDB name, HTML meta and <title>) passes it through here;
  * what fails is dropped at extraction, so it is not the item's title, not evidence and not a conflict.
  *
- * The stock words are English only: other languages' stock words ("Sans titre", "Unbenannt", "Документ") are not
- * covered.
+ * The stock texts are mostly English, with "untitled" in a few other languages (R410 c: "Sans titre", "Unbenannt",
+ * "無題"); other languages' stock texts ("Документ") are not covered.
  */
 import type { Creator } from "@ao/core";
 
@@ -36,10 +36,73 @@ export const STOCK_TITLES: readonly string[] = [
   "cover",
   "table of contents",
   "index",
+  // R410 c: section and template words, sites and services, and "untitled" in other languages. Not "book review",
+  // "erratum", "corrigendum", "contents", "supplementary material", "appendix": true signs of a wrong file.
+  "original article",
+  "research article",
+  "review article",
+  "article",
+  "manuscript",
+  "author manuscript",
+  "accepted manuscript",
+  "abstract",
+  "introduction",
+  "chapter",
+  "page",
+  "template",
+  "paper title",
+  "paper title (use style: paper title)",
+  "insert title here",
+  "your title here",
+  "title of the paper",
+  "document title",
+  "proof",
+  "preview",
+  "word",
+  "blank page",
+  "front cover",
+  "cover page",
+  "title page",
+  "frontmatter",
+  "no title",
+  "unknown",
+  "unknown title",
+  "ebook",
+  "calibre",
+  "jstor",
+  "ieee xplore",
+  "sciencedirect",
+  "springerlink",
+  "proquest",
+  "acs paragon plus environment",
+  "sans titre",
+  "sin título",
+  "senza titolo",
+  "unbenannt",
+  "ohne titel",
+  "titel",
+  "sem título",
+  "без названия",
+  "無題",
+  "无标题",
+  "제목 없음",
 ];
-/** Titles programs write as a prefix followed by the file's own name ("Microsoft Word - draft3"). */
-const STOCK_PREFIX = /^(?:microsoft word - |microsoft powerpoint - |adobe photoshop\b)/iu;
-const STOCK_TITLE = new RegExp(`^(?:${STOCK_TITLES.map((s) => s.replace(/ /gu, "\\s")).join("|")})(?:\\s*[-_#]?\\s*\\d+)?$`, "iu");
+/** Accents folded (Hangul and other composed letters recomposed), so "Sin titulo" is "Sin título". */
+const bare = (s: string) => s.normalize("NFKD").replace(/\p{M}+/gu, "").normalize("NFC");
+/**
+ * Titles programs write as a prefix followed by the file's own name ("Microsoft Word - draft3", also in parentheses),
+ * and the prefixes of a running head or a download notice (R410 c).
+ */
+const STOCK_PREFIX = /^(?:\(?microsoft word - |microsoft powerpoint - |adobe photoshop\b|running head:|downloaded from\s)/iu;
+const STOCK_TITLE = new RegExp(
+  `^(?:${STOCK_TITLES.map((s) => bare(s).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&").replace(/ /gu, "\\s")).join("|")})(?:\\s*[-_#]?\\s*\\d+)?$`,
+  "iu",
+);
+/** A web address alone ("www.…", "http(s)://…", no space), or an e-mail address alone (R410 c). */
+const WEB_OR_MAIL = /^(?:(?:www\.|https?:\/\/)\S+|[^\s@]+@[^\s@]+\.[^\s@]+)$/iu;
+const MONTH = "(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?";
+/** A date alone: "15 January 2020", "January 2020", "Jan. 15, 2020", "2020-01-15", "01/15/2020" (R410 c). */
+const DATE_ONLY = new RegExp(`^(?:(?:\\d{1,2}\\s+)?${MONTH}(?:\\s+\\d{1,2},?)?\\s+\\d{4}|\\d{4}-\\d{1,2}-\\d{1,2}|\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4})$`, "iu");
 
 /** Extensions of files whose names end up in title fields. */
 const FILE_EXTENSION =
@@ -108,7 +171,7 @@ export function looksLikeTitle(raw: string, fileName?: string): boolean {
     const stem = fold(base.includes(".") ? base.slice(0, base.lastIndexOf(".")) : base);
     if (stem && stem.toLowerCase() === s.toLowerCase()) return false;
   }
-  if (STOCK_TITLE.test(s) || STOCK_PREFIX.test(s)) return false;
+  if (STOCK_TITLE.test(bare(s)) || STOCK_PREFIX.test(s) || WEB_OR_MAIL.test(s) || DATE_ONLY.test(s)) return false;
   if (mostlyDigitsAndPunctuation(head)) return false;
   return true;
 }
