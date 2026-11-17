@@ -62,7 +62,7 @@ import {
 } from "../repo/repo.js";
 import { activeTemp } from "../tmp-registry.js";
 import { WITHHELD_NOTE } from "./bibliography.js";
-import { buildExport } from "./refman-export.js";
+import { PARTICIPANT_CODE_MISSING_NOTE, buildExport } from "./refman-export.js";
 
 /** The export destination is inside the library (or not a folder). */
 export class ExportDestinationError extends Error {
@@ -438,6 +438,13 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
     await writeFileAtomic(join(root, "sources.bib"), bib.text, { mode: 0o600 });
 
     if (withheld) notes.push(WITHHELD_NOTE(withheld));
+    // The reference files follow R88's participant rules (R379, FR-A14): a source failing closed is not in them.
+    const codeMissing = csl.excluded.filter((e) => e.reason === PARTICIPANT_CODE_MISSING_NOTE).length;
+    if (codeMissing) {
+      notes.push(
+        `${plural(codeMissing, "source is", "sources are")} not in sources.bib and sources.csl.json because a participant in ${codeMissing === 1 ? "it has" : "them has"} no participant code yet.`,
+      );
+    }
     if (omittedLocated) {
       notes.push(
         `${plural(omittedLocated, "file with a location was", "files with a location were")} left out: this project hides locations and no viewing copy without the location exists yet.`,

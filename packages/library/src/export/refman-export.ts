@@ -13,6 +13,14 @@
  *   - CSL-JSON: `JSON.stringify` (standard escaping); `id` and `citation-key` = the citation key.
  * Citation keys are made unique within one export (a, b, c … appended, noted).
  *
+ * Participants (R88, R379 FR-A14): every source goes through the bibliography's participant rules (`participantRules`
+ * and core's `toCslItem`, one code path). Where they touch a source (it is linked to participants, or a creator is
+ * coded, or a name is scrubbed from its text), the creators, title, container, publisher, the bibliographic text
+ * (address included) and the URL written are the ones `toCslItem` gives — participants as their codes — and its
+ * citation key is withheld: the writer makes its own (`ref<n>`, holding no name), as for a source without a key. A
+ * source that fails closed (a participant without a code where codes are required) is left out, named by its id in
+ * `excluded` and counted in a note. A source the rules do not touch is written exactly as before.
+ *
  * Exported: type, title, creators (author / editor / translator), date, container, publisher,
  * DOI, ISBN, ISSN, URL, arXiv id (BibTeX), the citation key, and tags only with `includeTags`; and
  * the bibliographic detail each format can hold (R87): BibTeX volume, number (an article's issue,
@@ -30,14 +38,15 @@
  * original, the rules file or any other library file is never replaced by an export), never over a folder or a
  * symbolic link. A refused destination is an invalid input: nothing is evaluated, written or audited.
  */
-import type { Biblio, Creator, Source, SourceType } from "@ao/core";
-import { biblioOf, primary } from "@ao/core";
+import type { Biblio, BiblioField, CslItem, CslName, Creator, Source, SourceFile, SourceType, ToCslOptions } from "@ao/core";
+import { ParticipantCodeMissingError, biblioOf, primary, toCslItem } from "@ao/core";
 import { lstat } from "node:fs/promises";
 import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { insideLibrary } from "../fs/inside-library.js";
 import { InvalidInputError } from "../repo/errors.js";
 import { appendLibraryEvent, authorizeProcessing, projectCollectionsAndTags, repoLibrary, type Repo } from "../repo/repo.js";
+import { participantRules } from "./bibliography.js";
 
 export type RefmanFormat = "bibtex" | "ris" | "csl-json";
 export const REFMAN_FORMATS: readonly RefmanFormat[] = ["bibtex", "ris", "csl-json"];
@@ -60,12 +69,18 @@ export const EXPORT_FILE_IS_FOLDER = "That place is a folder. Give the name of t
 export const EXPORT_FILE_IS_LINK = "That place is a link to another file. Give the name of a file to write, not a link.";
 
 export const DEIDENTIFIED_NOTE = "This project allows only de-identified exports, and this source holds identifiable data.";
+/** A source that fails closed under the participant rules (R88 I2, R379 FR-A14). */
+export const PARTICIPANT_CODE_MISSING_NOTE = "A participant in this source has no participant code yet, so it cannot be exported.";
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 const EXPORT_NOTES = {
   deidentified: (n: number) =>
     `${plural(n, "source was", "sources were")} left out because this project allows only de-identified exports and ${n === 1 ? "it holds" : "they hold"} identifiable data.`,
   keyChanged: (n: number) => `${plural(n, "citation key was", "citation keys were")} changed to be valid or unique in this export.`,
+  codeMissing: (n: number) =>
+    `${plural(n, "source was", "sources were")} left out because a participant in ${n === 1 ? "it has" : "them has"} no participant code yet.`,
+  keyWithheld: (n: number) =>
+    `${plural(n, "citation key was", "citation keys were")} not exported because the source involves a participant (a key is often made from a name); a plain key was used instead.`,
 };
 
 /** What one exported reference holds (no files, notes, annotations or provenance). */
@@ -282,6 +297,56 @@ function toCslJson(refs: Ref[]): string {
 }
 
 // ------------------------------------------------------------------------------------------
+// Participants (R88, R379 FR-A14)
+
+/** A source's bibliographic field → the CSL variable `toCslItem` writes it to (scrubbed). */
+const BIBLIO_CSL: Readonly<Record<BiblioField, keyof CslItem>> = {
+  volume: "volume", issue: "issue", page: "page", edition: "edition", numberOfPages: "number-of-pages",
+  publisherPlace: "publisher-place", collectionTitle: "collection-title", collectionNumber: "collection-number",
+  number: "number", genre: "genre", medium: "medium",
+};
+const CSL_ROLES = ["author", "interviewer", "contributor", "editor", "translator"] as const;
+
+const creatorOf = (n: CslName, role: Creator["role"]): Creator =>
+  n.literal !== undefined ? { literal: n.literal, role } : { ...(n.family ? { family: n.family } : {}), ...(n.given ? { given: n.given } : {}), role };
+
+/**
+ * The reference as the participant rules give it: creators (participants as their codes), title, container, publisher,
+ * bibliographic text and URL from `item` (toCslItem's output); type, date and identifiers as the source has them.
+ */
+function codedRef(base: Omit<Ref, "key">, item: CslItem): Omit<Ref, "key"> {
+  const creators = CSL_ROLES.flatMap((role) => (item[role] ?? []).map((n) => creatorOf(n, role)));
+  const out: Omit<Ref, "key"> = { ...base, title: item.title ?? "", creators };
+  delete out.container;
+  delete out.publisher;
+  delete out.url;
+  if (item["container-title"]) out.container = item["container-title"];
+  if (item.publisher) out.publisher = item.publisher;
+  if (item.URL) out.url = item.URL;
+  for (const k of Object.keys(BIBLIO_CSL) as BiblioField[]) {
+    if (out[k] === undefined) continue;
+    const v = item[BIBLIO_CSL[k]];
+    if (typeof v === "string" && v) out[k] = v;
+    else delete out[k];
+  }
+  return out;
+}
+
+/** The participant rules' reading of one source: unchanged (null), coded, or failing closed. */
+function underParticipantRules(sf: SourceFile, opts: ToCslOptions): CslItem | null | "code-missing" {
+  let item: CslItem;
+  try {
+    item = toCslItem(sf, opts);
+  } catch (err) {
+    if (err instanceof ParticipantCodeMissingError) return "code-missing";
+    throw err;
+  }
+  if (sf.source.participantIds.length > 0) return item;
+  const plain = toCslItem(sf, { ...opts, pseudonyms: new Map(), requireParticipantCodes: false });
+  return JSON.stringify(item) === JSON.stringify(plain) ? null : item;
+}
+
+// ------------------------------------------------------------------------------------------
 
 /** Creators that go in the `role` list: editors and translators in theirs, everyone else as authors. */
 function roleOf(creators: Creator[], role: "author" | "editor" | "translator"): Creator[] {
@@ -325,6 +390,18 @@ export async function buildExport(
   const excluded: RefmanExportResult["excluded"] = [];
   const used = new Set<string>();
   let changedKeys = 0;
+  let withheldKeys = 0;
+  let codeMissing = 0;
+  // The bibliography's participant rules (R88 I2), read once per export.
+  const rules = await participantRules(repo, projectId);
+  const project = repo.getProject(projectId);
+  const cslOptions = (sf: SourceFile): ToCslOptions => ({
+    citationLanguage: project.targetLanguages[0] ?? "en-US",
+    translatedTitles: "off",
+    script: "original",
+    pseudonyms: rules.pseudonyms,
+    requireParticipantCodes: rules.requireCodes && sf.source.provenance.identifiable,
+  });
   for (const id of [...new Set(sourceIds)]) {
     const sf = await repo.getSource(projectId, id);
     const s = sf.source;
@@ -339,7 +416,15 @@ export async function buildExport(
       excluded.push({ sourceId: id, reason: DEIDENTIFIED_NOTE });
       continue;
     }
-    const wanted = s.citationKey.trim() || `ref${refs.length + 1}`;
+    const coded = underParticipantRules(sf, cslOptions(sf));
+    if (coded === "code-missing") {
+      excluded.push({ sourceId: id, reason: PARTICIPANT_CODE_MISSING_NOTE });
+      codeMissing++;
+      continue;
+    }
+    // A coded source's own key is withheld (it is usually made from a name): the writer makes a plain one.
+    if (coded && s.citationKey.trim()) withheldKeys++;
+    const wanted = (coded ? "" : s.citationKey.trim()) || `ref${refs.length + 1}`;
     let key = format === "bibtex" ? bibKey(wanted) : oneLine(wanted);
     if (used.has(key.toLowerCase())) {
       let n = 0;
@@ -347,14 +432,17 @@ export async function buildExport(
       do key = `${base}${suffix(n++)}`;
       while (used.has(key.toLowerCase()));
     }
-    if (key !== s.citationKey) changedKeys++;
+    if (!coded && key !== s.citationKey) changedKeys++;
     used.add(key.toLowerCase());
-    refs.push({ key, ...refOf(s, tagNames, opts.includeTags === true) });
+    const ref = refOf(s, tagNames, opts.includeTags === true);
+    refs.push({ key, ...(coded ? codedRef(ref, coded) : ref) });
   }
   const text = format === "bibtex" ? toBibtex(refs) : format === "ris" ? toRis(refs) : toCslJson(refs);
   const notes: string[] = [];
-  if (excluded.length) notes.push(EXPORT_NOTES.deidentified(excluded.length));
+  if (excluded.length > codeMissing) notes.push(EXPORT_NOTES.deidentified(excluded.length - codeMissing));
+  if (codeMissing) notes.push(EXPORT_NOTES.codeMissing(codeMissing));
   if (changedKeys) notes.push(EXPORT_NOTES.keyChanged(changedKeys));
+  if (withheldKeys) notes.push(EXPORT_NOTES.keyWithheld(withheldKeys));
   return { text, exported: refs.length, excluded, notes };
 }
 

@@ -14,7 +14,7 @@
  * hasLocation:false}})` (authorizeProcessing: a deny is audited and refuses the whole request,
  * PolicyDeniedError). Under `deidentified-only` identifiable sources are left out and the result
  * says so ("1 source withheld by project policy"). Participant rules (R88 I2, wired here from the
- * project's governance): the pseudonym map (keys/pseudonyms.json.enc) plus each participant's
+ * project's governance; the reference exports use the same rules, R379 FR-A14): the pseudonym map (keys/pseudonyms.json.enc) plus each participant's
  * identifying details (name / handle fields) map people to their participant codes; in a project
  * that holds identifiable data and pseudonymizes names, every creator of an identifiable source must
  * have a code (requireParticipantCodes; a source linked to participants always does) — otherwise
@@ -92,7 +92,7 @@ const NAME_KEY = /name|handle|user|alias|account/iu;
  * The participant rules from the project's governance (R88 I2): the pseudonym map plus the
  * participants' identifying names, and whether identifiable sources must cite codes only.
  */
-async function participantRules(repo: Repo, projectId: string): Promise<{ pseudonyms: Map<string, string>; requireCodes: boolean }> {
+export async function participantRules(repo: Repo, projectId: string): Promise<{ pseudonyms: Map<string, string>; requireCodes: boolean }> {
   // The engine's own condition decides (unreadable governance: the strictest reading).
   const requireCodes = await pseudonymizesIdentifiable(repo, projectId);
   const pseudonyms = await projectPseudonymMap(repo, projectId);
