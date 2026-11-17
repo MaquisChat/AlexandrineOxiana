@@ -949,11 +949,11 @@ describe("R420 (a): a participant's WHOLE name inside the name of a creator who 
     expect(page([{ role: "author", literal: "北京王芳文化研究会" }], new Map([["王芳", "P-003"]])).author).toEqual([{ literal: "北京P-003文化研究会" }]);
   });
 
-  it("a coded creator's whole forms, whatever the order of the creators; not its bare parts", () => {
+  it("a coded creator's whole forms, whatever the order of the creators; not its single names (changed by R427 b: a run of two words is replaced)", () => {
     const map = new Map([["@rosa.d", "P-004"]]);
     const coded: Creator = { role: "interviewee", handle: "@rosa.d", given: "Rosa", family: "Diaz Ruiz" };
     const item = page([{ role: "author", literal: "Amigos de Rosa Diaz Ruiz" }, coded, { role: "author", literal: "Diaz Ruiz Foundation" }, { role: "author", literal: "Amigos de Rosa" }], map);
-    expect(item.author).toEqual([{ literal: "Amigos de P-004" }, { literal: "P-004" }, { literal: "Diaz Ruiz Foundation" }, { literal: "Amigos de Rosa" }]);
+    expect(item.author).toEqual([{ literal: "Amigos de P-004" }, { literal: "P-004" }, { literal: "P-004 Foundation" }, { literal: "Amigos de Rosa" }]);
   });
 
   it("names that fold alike: the exact one gives its code (R416)", () => {
@@ -964,6 +964,30 @@ describe("R420 (a): a participant's WHOLE name inside the name of a creator who 
 
   it("an empty map: the creator is untouched", () => {
     expect(page([{ role: "author", literal: "Friends of Maria Cocina" }], new Map()).author).toEqual([{ literal: "Friends of Maria Cocina" }]);
+  });
+});
+
+describe("R427 (b): inside a creator who gets no code, whole names and runs are replaced, single names are not (I3 of the FR-A10 third review)", () => {
+  const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
+  const page = (t: string, creators: Creator[], map: ReadonlyMap<string, string> = LUCIA) =>
+    toCslItem(source("webpage", mt(["es", "original", t]), creators), { ...OPTS, pseudonyms: map });
+
+  it("a run of two words of the participant's name inside another creator's name: author and title agree, the key withheld", () => {
+    const item = page("Amigos de Lucía Fernández", [{ role: "author", literal: "Amigos de Lucía Fernández" }]);
+    expect(item.author).toEqual([{ literal: "Amigos de P-005" }]);
+    expect(item.title).toBe("Amigos de P-005");
+    expect(item["citation-key"]).toBeUndefined();
+  });
+
+  it("a creator who is the run (the participant under her usual short name) becomes the code", () => {
+    expect(page("x", [{ role: "author", given: "Lucía", family: "Fernández" }]).author).toEqual([{ literal: "P-005" }]);
+  });
+
+  it("guards (they hold before R427 too): a shared given name, and a coded creator's single name, are not looked for", () => {
+    expect(page("x", [{ role: "author", given: "Maria", family: "Lopez" }], new Map([["Maria Cocina", "P-001"]])).author).toEqual([{ family: "Lopez", given: "Maria" }]);
+    const coded: Creator = { role: "interviewee", given: "Rosa", family: "Díaz" };
+    const item = page("x", [coded, { role: "author", literal: "Amigos de Rosa" }], new Map([["Rosa Díaz", "P-004"]]));
+    expect(item.author).toEqual([{ literal: "P-004" }, { literal: "Amigos de Rosa" }]);
   });
 });
 

@@ -211,13 +211,14 @@ function urlNamesParticipant(url: string, names: NameSet): boolean {
 }
 
 /**
- * R420 a: a creator who is not a participant, whose name holds a participant's WHOLE name (a map
- * entry, a name or a handle; a coded creator's handle, literal, "given family", "family given"):
- * the text that cslName would print (the literal, else the handle; for a given/family creator the
- * joined "given family", else "family given"), with each such whole name replaced by its code
- * (by the shared rule, R416's choice included). Parts of a name (a lone given or family name, a run
- * of some of its words) are not looked for: an author who shares a first name with a participant
- * is not rewritten. Undefined when nothing was replaced.
+ * R420 a, corrected by R427 b: a creator who is not a participant, whose name holds a participant's
+ * WHOLE name (a map entry, a name or a handle; a coded creator's handle, literal, "given family",
+ * "family given") or a RUN of two or more words of one that is a form by R403 c ("Lucía Fernández"
+ * of "Lucía Fernández Ruiz"): the text that cslName would print (the literal, else the handle; for a
+ * given/family creator the joined "given family", else "family given"), with each such name replaced
+ * by its code (by the shared rule, R416's choice included). Single names (a lone given or family
+ * name, one word of a compound name) are not looked for: an author who shares a first name with a
+ * participant is not rewritten (the stated limit FR-699). Undefined when nothing was replaced.
  */
 function creatorWithWholeNames(c: Creator, whole: NameSet): string | undefined {
   const tryText = (t: string | undefined): string | undefined => {
@@ -315,7 +316,7 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
     if (code) forms.push(...nameForms(c, code));
     else if (requireCodes && c.role !== "interviewer" && creatorForms(c).length > 0) throw new ParticipantCodeMissingError();
   }
-  const whole: NameSet = { map, forms, wholeOnly: true };
+  const whole: NameSet = { map, forms, noSingleNames: true };
   const lookForWhole = keys.size > 0 || forms.length > 0;
   for (const [i, c] of s.creators.entries()) {
     const code = codes[i];

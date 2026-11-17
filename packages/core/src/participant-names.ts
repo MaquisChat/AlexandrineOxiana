@@ -132,7 +132,7 @@ export interface NameForm {
   full?: string;
   /** R427 a: the name as written, NFC, ends trimmed (the form as written only). */
   written?: string;
-  /** A run of some of a longer name's words (R387 e): a part, not the whole name (R420 a). */
+  /** A run of some of a longer name's words (R387 e): a part, not the whole name (kept by `noSingleNames`, R427 b). */
   part?: boolean;
 }
 
@@ -615,10 +615,11 @@ export interface NameSet {
   map?: ReadonlyMap<string, string>;
   forms?: readonly NameForm[];
   /**
-   * R420 a: whole names only — no lone given or family name (`bare`), no run of some of a longer
-   * name's words (`part`). Every order of a whole name and its words joined stay.
+   * R420 a as corrected by R427 b: no single names — no lone given or family name, nor one word of a
+   * compound family name (`bare`). Whole names (every order, and their words joined) and runs of two
+   * or more words of a longer name that are forms by R403 c (`part`) stay.
    */
-  wholeOnly?: boolean;
+  noSingleNames?: boolean;
 }
 export type Names = readonly NameForm[] | NameSet;
 
@@ -689,8 +690,8 @@ export function mapCode(map: ReadonlyMap<string, string>, text: string): string 
 
 function indexesOf(names: Names, opts: ScrubOptions): Index[] {
   const set: NameSet = Array.isArray(names) ? { forms: names as readonly NameForm[] } : (names as NameSet);
-  const whole = set.wholeOnly === true;
-  const keep = (fs: readonly NameForm[]) => (whole ? fs.filter((f) => !f.bare && !f.part) : fs);
+  const whole = set.noSingleNames === true;
+  const keep = (fs: readonly NameForm[]) => (whole ? fs.filter((f) => !f.bare) : fs);
   const out: Index[] = [];
   if (set.map && set.map.size) {
     const c = cacheOf(set.map);
