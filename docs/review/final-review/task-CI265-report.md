@@ -33,3 +33,38 @@ Neither case is a product fault. In both, the product writes the reason the rule
 - **Why GitHub loses the race:** not measured. Faster file I/O there is likely.
 - **One slip:** a mis-backgrounded command ran `vitest run` and `pnpm -r typecheck` once in the main checkout. It is read-only there, and that checkout's `git status` is clean.
 - **Inconsistent order:** the record part asks the settings before the rules (runner.ts:1690–1700), but the copy part asks the rules first. The copy part's order is why a "switched off" rest turns into "copy-not-allowed" when free copies are forbidden too. That is correct as built, but the inconsistency could be worth a ruling.
+
+## The sweep (R451 b)
+
+**Result:** three more tests in `runner.test.ts` were racy, all at fault in the test (case A). No product fault was found and no `*.ci265.test.ts` file was left. The fixes are in commit `1f88219`, on top of `e3ac256`, not pushed.
+
+**Where the delays went.** Every "wait, then read" in `src/find/*.test.ts` goes through `until` in `runner.test.ts`; `settled` is built on it. So a temporary delay at the end of `until`, once its condition holds, reaches every such wait. The mirror experiment slowed the copy part instead: a temporary 1000 ms delay at the start of `copyOn`.
+
+**Experiments on the whole of `runner.test.ts`** (300 tests, `--testTimeout` raised):
+
+| Delay | Before the fix | After the fix |
+|---|---|---|
+| 200 ms at the end of each wait | 2 failed | 300 passed |
+| 1000 ms at the end of each wait | the same 2 failed | 300 passed |
+| copy part slowed by 1000 ms, no read delay | 2 failed* | 300 passed |
+
+*One of these two was my own first fix of test 1 below (see its note); the other is test 3.
+
+**The three tests and why each read too early:**
+1. **"a typed line becomes a record > a sure match creates one source…"** (read delay). It counted the entry's events as exactly `[looking-up, record-complete]`. The copy part then rests the entry at `switched-off by settings` (R312 c) and sends a third event. The fixed test waits for that rest and for its event, then checks the reason and the three events exactly. Under the slowed copy part, my first fix still lost the race: the event follows the line's commit, so the queue line can be read before the event arrives. Waiting for the event as well closed that.
+2. **"R326 … the record part: a service switched on puts the entry back to work"** (read delay; it timed out). `settled` only returned because it caught the moment the record's line was written. The entry then goes on to look for a copy and rests at `no-open-copy`, which is not in `settled`'s final states, so a later read never finds a final state. The fixed test waits for `no-open-copy` and checks it has its record and no reason.
+3. **"Try again: accepted on a copy entry resting switched off"** (the mirror fault). It waited a fixed 100 ms (`quiet()`) for the copy part to rest again. It now waits until the entry leaves `looking-for-copy`, then checks the same `switched-off by settings` rest.
+
+The other `quiet()` waits check that nothing happens. They need a period of waiting by design, and none failed in any experiment.
+
+**Other test files:**
+- The other test files in `src/find` do not drive the runner (none calls `createFindRunner`).
+- `apps/library-service/src/find-routes.test.ts` does drive it, and its own `settled` and `MADE` already allow for the copy part's states. I ran the same experiment there by delaying its `until` before it returns. It passed 43/43 in all four runs: no delay, 200 ms, the copy part slowed by 1000 ms, and 1000 ms.
+- `packages/ui/src/screens/FindAcquire.test.tsx` runs against a made-up client with fixed queues and no runner, so the pattern is not there. I did not run the experiment on it.
+
+**After the fix,** with every temporary delay removed (`git status --short` is empty):
+- `runner.test.ts` ×2: 300/300 both times.
+- `src/find`: 13 files, 1194 passed.
+- `pnpm -r typecheck`: exit 0.
+
+Every command in this round ran in the worktree.
