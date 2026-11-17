@@ -1256,8 +1256,10 @@ export function updateSourceRechecked(
 
 /**
  * Package-internal (profile capture): the participant code the project's pseudonym map gives the
- * first of `names` that names one, by the SAME identity look-up as `assignCodes` (`participantCodeOf`:
- * as written, then the strict key; R427 a), if any. Needs the unlocked project key.
+ * first of `names` that names one, each looked up by `participantCodeOf` (as written, then the strict
+ * key; R427 a), if any. It decides nothing about which spellings to try: the profile capture passes
+ * exactly one, the `creatorKey` of the creator its source will carry, so the answer is the record
+ * `assignCodes` links that source to (R437 b). Needs the unlocked project key.
  */
 export async function pseudonymCodeFor(repo: Repo, projectId: string, names: string[]): Promise<string | undefined> {
   const core = cores.get(repo)!;

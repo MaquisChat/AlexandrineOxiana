@@ -68,6 +68,7 @@ import {
   repoTz,
   updateSourceRechecked,
 } from "../repo/repo.js";
+import { creatorKey } from "../repo/pseudonyms.js";
 import { WorkerJobError, WorkerToolError, WorkerUnavailableError } from "../worker-client.js";
 import { AcknowledgementRequiredError, CaptureCancelledError, plainReason, toolMissingReason } from "./errors.js";
 import type { CaptureCore, CaptureOptions, CaptureOutcome, ItemContext } from "./link-capture.js";
@@ -174,6 +175,12 @@ function invalidOptions(o: ProfileCaptureOptions): boolean {
 }
 
 /** The part of a profile link that names it when no handle is in the link (channel id, playlist id). */
+/** The one creator a profile's own source carries (`createProfileSource`): the display name and the handle. */
+function profileCreator(c: ClassifiedUrl, profile: ProfileMeta): SourceDraft["creators"][number] {
+  const handle = c.handle ?? profile.handle;
+  return { ...(profile.displayName ? { literal: profile.displayName } : {}), role: c.platform === "youtube" ? "channel" : "uploader", ...(handle ? { handle } : {}) };
+}
+
 function linkKey(c: ClassifiedUrl): string {
   if (c.handle) return c.handle;
   const u = new URL(c.canonicalUrl);
@@ -371,7 +378,12 @@ export function createProfileCapture(core: CaptureCore) {
     if (!(await core.stillAllowed(projectId, platform))) return audited(projectId, platform, policyChanged());
     const handle = c.handle ?? profile.handle;
     const label = handle ?? linkKey(c);
-    const names = [label, label.replace(/^@+/, ""), `@${label.replace(/^@+/, "")}`, ...(profile.handle ? [profile.handle] : [])];
+    // R437 b: the participant is looked up by ONE key, the one `assignCodes` will look up for the
+    // creator the profile's own source carries (`creatorKey`: its handle as written, else its display
+    // name) — never the handle without its "@", which is another person (R403 b). So the profile's
+    // folder, its collection and its source belong to one record.
+    const ownKey = creatorKey(profileCreator(c, profile));
+    const names = ownKey ? [ownKey] : [];
     const projectRel = repo.getProject(projectId).folder;
     const fold = platform === "youtube" || platform === "tiktok";
     const folderOf = (name: string, isCode: boolean) => {
@@ -771,9 +783,7 @@ export function createProfileCapture(core: CaptureCore) {
     const evidence: FieldEvidence[] = [];
     const ev = (field: string, value: unknown, ref: string) => evidence.push({ field, value, source: { kind: "platform-json", provider: o.tool, ref }, at: o.at });
     if (profile.displayName || handle) ev("/title", name, profile.displayName ? "/displayName" : "/handle");
-    const creators: SourceDraft["creators"] = [
-      { ...(profile.displayName ? { literal: profile.displayName } : {}), role: platform === "youtube" ? "channel" : "uploader", ...(handle ? { handle } : {}) },
-    ];
+    const creators: SourceDraft["creators"] = [profileCreator(c, profile)];
     if (profile.displayName || handle) ev("/creators", creators, handle ? "/handle" : "/displayName");
     if (profile.url === c.canonicalUrl) ev("/identifiers/url", c.canonicalUrl, "/webpage_url");
     // The snapshot used for verification and kept in provenance, with the identity keys the checks read.

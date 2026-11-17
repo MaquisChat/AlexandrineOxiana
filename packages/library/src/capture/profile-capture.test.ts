@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import type { AuditEvent, SourceFile } from "@ao/core";
+import type { AuditEvent, SourceDraft, SourceFile } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -550,6 +550,62 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     const again = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
     expect(again).toMatchObject({ created: 0, profileSourceId: r.profileSourceId });
     expect(await readdir(profilesDir)).toEqual(["tiktok-P-001"]);
+  });
+
+  describe("R437 (b): the profile is filed under the code of exactly the creator its source carries (C1 of the FR-A10 fourth review)", () => {
+    /** A source by one creator, as a downloader capture with a legal basis (what PSEUDO_GOV allows). */
+    const sourceBy = (projectId: string, creator: SourceDraft["creators"][number]) =>
+      repo.createSource(
+        projectId,
+        {
+          projectIds: [],
+          type: "interview",
+          title: { variants: [{ lang: "es", kind: "original", value: "Entrevista" }] },
+          creators: [creator],
+          identifiers: {},
+          caseAttributes: {},
+          availability: { status: "available" },
+          collectionIds: [],
+          tagIds: [],
+          participantIds: [],
+        },
+        [],
+        {
+          provenance: {
+            captureMethod: "downloader",
+            capturedAt: new Date().toISOString(),
+            tool: { name: "test", version: "1" },
+            fileHashes: {},
+            legal: { status: "consented", basis: "consent" },
+            identifiable: true,
+          },
+        },
+      );
+    const codeOfProfileSource = async (projectId: string, sourceId: string) => {
+      const prof = await repo.getSource(projectId, sourceId);
+      const fw = await repo.getFieldwork(projectId);
+      return prof.source.participantIds.map((id) => fw.participants.find((x) => x.id === id)!.code);
+    };
+
+    it("a participant named like the handle without its '@' is another person: the profile gets its own source's new code", async () => {
+      const p = await project(PSEUDO_GOV, true);
+      const first = await sourceBy(p.id, { role: "interviewee", literal: "fake.dancer" });
+      const fw0 = await repo.getFieldwork(p.id);
+      expect(first.source.participantIds.map((id) => fw0.participants.find((x) => x.id === id)!.code)).toEqual(["P-001"]);
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+      expect(r.status).toBe("completed");
+      expect(await codeOfProfileSource(p.id, r.profileSourceId!)).toEqual(["P-002"]);
+      expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-P-002"]);
+    });
+
+    it("a profile whose handle is already a participant's recorded handle finds that participant", async () => {
+      const p = await project(PSEUDO_GOV, true);
+      await sourceBy(p.id, { role: "uploader", handle: "@fake.dancer" });
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+      expect(r.status).toBe("completed");
+      expect(await codeOfProfileSource(p.id, r.profileSourceId!)).toEqual(["P-001"]);
+      expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-P-001"]);
+    });
   });
 
   it("R42b: governance changed during the run → POLICY_CHANGED, nothing more stored, one deny audited", async () => {
