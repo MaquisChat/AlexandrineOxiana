@@ -5,13 +5,15 @@
  * before anything is read or written. A found file waiting in `find/held/` comes in only through "Use this file".
  */
 import { copyFile, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { newId, type Project } from "@ao/core";
 import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { MockAgent } from "undici";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
 import { backupProject } from "../export/backup.js";
+import { attachConsentDocument } from "../consent-docs.js";
+import { addProtocolDocuments, listProtocolDocuments } from "../protocol-docs.js";
 import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
 import { appendFindEntries } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
@@ -380,5 +382,62 @@ describe("the batch's own work folder is exempt only for the files the run itsel
     for (const id of kit.repo.listSourceIds(w.p.id)) {
       expect((await kit.repo.getSource(w.p.id, id)).assets.filter((a) => a.role === "original")).toEqual([]);
     }
+  });
+});
+
+describe("a consent form or a protocol document inside the library is refused (R368 b)", () => {
+  /** An unencrypted project holding identifiable data (consent forms are identifiable sources). */
+  const IDENT_GOV = `identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+encryption:
+  atRest: optional
+consent:
+  requireLegalBasis: false
+captureMethods: [manual_upload]
+`;
+  const otherProject = async () => {
+    const b = await makeProject(kit, IDENT_GOV, false, "Field B");
+    const part = await kit.repo.createParticipant(b.id, {});
+    const c = await kit.repo.createConsent(b.id, { participantId: part.id, scope: "audio", date: "2026-03-14" });
+    return { b, consentId: c.id };
+  };
+
+  it("project A's held file dropped as project B's consent form: refused, no source, the review entry untouched", async () => {
+    const w = await world();
+    const { b, consentId } = await otherProject();
+    const before = await snapshot(w);
+    await expect(attachConsentDocument(kit.repo, b.id, consentId, w.held)).rejects.toThrow(IN_LIBRARY_TEXT.file);
+    expect(kit.repo.listSourceIds(b.id)).toEqual([]);
+    expect((await kit.repo.getFieldwork(b.id)).consents[0]!.documentAssetId).toBeUndefined();
+    expect(await snapshot(w)).toEqual(before);
+  });
+
+  it("the same through a link outside the library", async () => {
+    const w = await world();
+    const { b, consentId } = await otherProject();
+    await mkdir(join(kit.tmp, "elsewhere"), { recursive: true });
+    const link = join(kit.tmp, "elsewhere", "signed.pdf");
+    await symlink(w.held, link);
+    await expect(attachConsentDocument(kit.repo, b.id, consentId, link)).rejects.toThrow(IN_LIBRARY_TEXT.file);
+    expect(kit.repo.listSourceIds(b.id)).toEqual([]);
+  });
+
+  it("an ordinary consent form outside the library still attaches", async () => {
+    const { b, consentId } = await otherProject();
+    const r = await attachConsentDocument(kit.repo, b.id, consentId, await outsidePdf("signed.pdf"));
+    expect(kit.repo.listSourceIds(b.id)).toEqual([r.sourceId]);
+  });
+
+  it("a held file dropped as a protocol document: refused, nothing stored; an ordinary document is added", async () => {
+    const w = await world();
+    const { b } = await otherProject();
+    const before = await snapshot(w);
+    const ok = await outsidePdf("approval.pdf");
+    const r = await addProtocolDocuments(kit.repo, b.id, [w.held, ok]);
+    expect(r[0]).toEqual({ file: basename(w.held), outcome: "failed", reason: IN_LIBRARY_TEXT.file });
+    expect(r[1]).toMatchObject({ outcome: "added" });
+    expect((await listProtocolDocuments(kit.repo, b.id)).map((d) => d.name)).toEqual(["approval.pdf"]);
+    expect(await snapshot(w)).toEqual(before);
   });
 });
