@@ -163,3 +163,88 @@ def test_unknown_location_mode_is_rejected(worker, tmp_path):
     Image.new("RGB", (8, 8)).save(src)
     status, body = worker.request("POST", "/jobs", {"type": "image.proxy", "input": str(src), "output": str(tmp_path / "o.jpg"), "params": {"location": "blur"}})
     assert status == 400, body
+
+
+# FR-A20 / R379: nothing from the source's `info` rides along except the EXIF the worker builds and the ICC profile.
+COMMENT = b"Participant Jane Roe, 12 Elm Street"
+MODES = ["strip", "coarsen", "keep"]
+
+
+def _no_free_text(out):
+    raw = out.read_bytes()
+    assert b"Jane" not in raw and b"Elm Street" not in raw and b"Roe" not in raw
+    with Image.open(out) as im:
+        assert not im.info.get("comment")
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_jpeg_comment_is_never_copied(worker, tmp_path, mode):
+    src = tmp_path / "a.jpg"
+    exif = Image.Exif()
+    exif[0x010F] = "Apple"
+    exif[0x0110] = "iPhone 15"
+    exif.get_ifd(EXIF_IFD)[0x9003] = "2026:03:14 10:15:30"
+    gps = exif.get_ifd(GPS)
+    gps[1], gps[2], gps[3], gps[4] = "N", (40.0, 42.0, 46.08), "W", (74.0, 0.0, 21.6)
+    Image.new("RGB", (64, 48), (1, 2, 3)).save(src, exif=exif.tobytes(), xmp=XMP_GPS, comment=COMMENT)
+    with Image.open(src) as im:
+        assert im.info["comment"] == COMMENT
+    out = tmp_path / "o.jpg"
+    job = worker.run("image.proxy", str(src), str(out), {"location": mode})
+    assert job["status"] == "done", job
+    _no_free_text(out)
+    with Image.open(out) as im:
+        got = im.getexif()
+        assert got[0x010F] == "Apple" and got[0x0110] == "iPhone 15"
+        assert got.get_ifd(EXIF_IFD)[0x9003] == "2026:03:14 10:15:30"
+        if mode == "strip":
+            assert not got.get_ifd(GPS)
+        elif mode == "coarsen":
+            assert _gps_decimal(got.get_ifd(GPS)) == (40.7, -74.0)
+
+
+def test_gif_comment_is_never_copied(worker, tmp_path):
+    src = tmp_path / "a.gif"
+    Image.new("P", (40, 30)).save(src, comment=COMMENT)
+    with Image.open(src) as im:
+        assert im.info.get("comment") == COMMENT
+    out = tmp_path / "o.jpg"
+    assert worker.run("image.proxy", str(src), str(out), {})["status"] == "done"
+    _no_free_text(out)
+
+
+def test_png_text_chunk_is_never_copied(worker, tmp_path):
+    from PIL.PngImagePlugin import PngInfo
+
+    src = tmp_path / "a.png"
+    meta = PngInfo()
+    meta.add_text("Comment", "Participant Jane Roe, 12 Elm Street")
+    Image.new("RGB", (40, 30)).save(src, pnginfo=meta)
+    out = tmp_path / "o.jpg"
+    assert worker.run("image.proxy", str(src), str(out), {})["status"] == "done"
+    _no_free_text(out)
+
+
+def test_icc_profile_survives_next_to_a_comment(worker, tmp_path):
+    from PIL import ImageCms
+
+    icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    src = tmp_path / "a.jpg"
+    Image.new("RGB", (64, 48)).save(src, icc_profile=icc, comment=COMMENT)
+    out = tmp_path / "o.jpg"
+    assert worker.run("image.proxy", str(src), str(out), {})["status"] == "done"
+    _no_free_text(out)
+    with Image.open(out) as im:
+        assert im.info.get("icc_profile") == icc
+
+
+def test_dpi_and_jfif_extras_do_not_break_the_proxy(worker, tmp_path):
+    src = tmp_path / "a.jpg"
+    Image.new("RGB", (120, 80)).save(src, dpi=(300, 300), comment=COMMENT)
+    with Image.open(src) as im:
+        assert im.info.get("dpi") and im.info.get("jfif")
+    out = tmp_path / "o.jpg"
+    assert worker.run("image.proxy", str(src), str(out), {})["status"] == "done"
+    with Image.open(out) as im:
+        assert im.format == "JPEG" and im.size == (120, 80)
+    _no_free_text(out)
