@@ -23,3 +23,4 @@ export * from "./watched-folders.js";
 export * from "./find.js";
 export * from "./zotero-sync.js";
 export * from "./search-settings.js";
+export * from "./governance.js";

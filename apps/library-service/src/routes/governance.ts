@@ -16,7 +16,8 @@
 import { userInfo } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
-import { effectivePolicy, parseGovernance } from "@ao/core";
+import { GovernanceParseError, effectivePolicy, parseGovernance, parseGovernanceWithWarnings } from "@ao/core";
+import type { GovernanceReadability } from "@ao/shared";
 import {
   GOVERNANCE_MAX_BYTES,
   addProtocolDocuments,
@@ -65,6 +66,27 @@ export function safeYamlCheck(text: string): void {
   }
 }
 
+/**
+ * Whether the policy engine can read these rules (R379 FR-A18, R58): when it cannot, every request
+ * in the project is refused, so the answer says so with the engine's own messages, one line per
+ * problem (the key and what is wrong; no path, no stack); readable rules carry their non-fatal
+ * warnings (a key in an old spelling, an exception that waives nothing).
+ */
+export function governanceReadability(yaml: string, roots: Iterable<string>): GovernanceReadability {
+  const clean = (t: string) => scrubPaths(t, roots).replace(/\s+/g, " ").trim();
+  try {
+    const { config, warnings } = parseGovernanceWithWarnings(yaml);
+    effectivePolicy(config);
+    return { readable: true, issues: [], warnings: warnings.map(clean) };
+  } catch (err) {
+    let issues: string[] = [];
+    if (err instanceof GovernanceParseError && err.issues.length) issues = err.issues;
+    else if (err instanceof Error) issues = [err.message.split("\n")[0]!.replace(/^governance\.yaml:\s*/, "").replace(/:\s*$/, "")];
+    issues = issues.map(clean).filter(Boolean);
+    return { readable: false, issues: issues.length ? issues : ["the rules file could not be read"], warnings: [] };
+  }
+}
+
 export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
@@ -80,7 +102,7 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     } catch {
       // unreadable rules: every request is denied; the text is still shown for fixing
     }
-    return { yaml, sha256, violations };
+    return { yaml, sha256, violations, ...governanceReadability(yaml, state.roots) };
   });
 
   app.put("/projects/:id/governance", async (req) => {
@@ -105,7 +127,7 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     state.publishState();
     // R282 f: the project's Find and acquire entries the rules had stopped are looked at again under the new rules.
     state.resumeFind(s, projectId);
-    return { violations: r.violations, loosened: r.loosened, sha256: r.sha256 };
+    return { violations: r.violations, loosened: r.loosened, sha256: r.sha256, ...governanceReadability(yaml, state.roots) };
   });
 
   app.get("/projects/:id/protocol/documents", async (req) => {

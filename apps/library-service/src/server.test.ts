@@ -861,6 +861,69 @@ describe("review round 1: governance PUT (R99 I1)", () => {
   });
 });
 
+describe("FR-A18 (R379, R58): the rules' answer says whether the engine can read them", () => {
+  beforeEach(() => start());
+
+  const folderOf = async () => (await call({ url: "/projects" })).json.projects[0].folder as string;
+
+  it("an unknown key: readable false, an issue naming the key, no path; GET's yaml is still the text", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const text = "encryption: {atRest: optional}\nresidencey: {allowed: [local]}\n";
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), text);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status).toBe(200);
+    expect(g.json.yaml).toBe(text);
+    expect(g.json.readable).toBe(false);
+    expect(g.json.issues.length).toBeGreaterThan(0);
+    expect(g.json.issues.some((i: string) => i.includes("residencey"))).toBe(true);
+    expect(g.json.warnings).toEqual([]);
+    expect(g.body).not.toContain(tmp);
+    expect(g.body).not.toContain(join(tmp, "Lib"));
+    for (const i of g.json.issues as string[]) expect(i).not.toMatch(/\n|at .*\.(js|ts):\d/);
+  });
+
+  it("text that is not YAML: readable false with one plain line", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), "encryption: [broken");
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json.readable).toBe(false);
+    expect(g.json.issues).toHaveLength(1);
+    expect(g.json.issues[0]).not.toContain("\n");
+    expect(g.body).not.toContain(tmp);
+  });
+
+  it("the old spelling of a legal-basis key: readable, with the note; an ordinary file: readable, no notes", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const g0 = await call({ url: `/projects/${pid}/governance` });
+    expect(g0.json).toMatchObject({ readable: true, issues: [], warnings: [] });
+    const old = `${OPEN_GOV.replace("consent:\n  requireLegalBasis: false\n", "consent:\n  requireLegalBasis: false\n  defaultLegalBasis:\n    manual_upload: consent\n    manual-upload: consent\n")}`;
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), old);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json.readable).toBe(true);
+    expect(g.json.issues).toEqual([]);
+    expect(g.json.warnings).toHaveLength(1);
+    expect(g.json.warnings[0]).toContain("consent.defaultLegalBasis.manual_upload: ignored");
+  });
+
+  it("the save answer carries the same fields for the text just saved", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const { sha256 } = (await call({ url: `/projects/${pid}/governance` })).json;
+    const withNote = `${OPEN_GOV}exceptions:\n  - control: residencey.allowed\n    value: [local]\n    reason: x\n    by: y\n    at: 2026-01-01T09:30:00Z\n`;
+    const r = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: withNote, baseSha256: sha256, reason: "test" } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.readable).toBe(true);
+    expect(r.json.issues).toEqual([]);
+    expect(r.json.warnings.some((w: string) => w.includes("residencey.allowed"))).toBe(true);
+    const r2 = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: r.json.sha256, reason: "back" } });
+    expect(r2.json).toMatchObject({ readable: true, issues: [], warnings: [] });
+    expect(r2.body).not.toContain(tmp);
+  });
+});
+
 describe("review round 1: errors, query credentials, pairing (R98, R99)", () => {
   beforeEach(() => start());
 
