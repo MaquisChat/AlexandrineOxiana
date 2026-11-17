@@ -169,10 +169,55 @@ describe("StatusBanner", () => {
     expect(seen.size).toBe(kinds.length);
   });
 
-  it("FR-A16 (R379): old copies of the library still holding destroyed data have the sentence the researcher reads", () => {
-    expect(warningText("destruction-old-copies-pending", "P")).toBe(
-      "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them from the Move library screen (or by hand) to complete the destruction.",
-    );
+});
+
+describe("R409 d: old copies of the library still holding destroyed data", () => {
+  const BY_HAND =
+    "Old copies of this library, left by a move, still hold data that was destroyed here. Delete the folder named below by hand to complete the destruction; the app will notice when it is gone.";
+  const IN_APP = "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them on the Move library screen to complete the destruction.";
+  const NO_RECORD =
+    "An old copy of this library, left by the move of 2026-11-10, may still hold data that was destroyed here. This computer has no record of where it is: open the library on the computer that moved it.";
+  const UNCHECKED =
+    "This computer's list of old copies of this library left by a move could not be read, so whether such a copy still holds the destroyed data could not be checked. Any that does was not destroyed.";
+  const place = "/Volumes/Field <b>SSD</b>/Old library";
+  const banner = (oldCopies: Array<{ movedOn?: string; place?: string; canDelete: boolean }>, unchecked?: true) =>
+    bannersFor(
+      {
+        projectWarnings: { p1: ["destruction-old-copies-pending"] },
+        destructionOldCopiesPending: { p1: { message: "ignored: the sentence is chosen from the facts", destructions: [], oldCopies, ...(unchecked ? { unchecked } : {}) } },
+      },
+      { projectNames: { p1: "Dissertation" } },
+    )[0]!;
+
+  it("the app can no longer delete it: by hand, with the folder named below through UserText", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", place, canDelete: false }])} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toContain(BY_HAND);
+    const item = screen.getByRole("listitem");
+    expect(item.textContent).toBe(place);
+    expect(item.querySelector("b")).toBeNull(); // shown as text, never as markup
+    expect(item.querySelector("[dir=auto]")).not.toBeNull();
+  });
+
+  it("the app can still delete it: on the Move library screen, its place named", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", place, canDelete: true }])} />);
+    expect(screen.getByRole("status").textContent).toContain(IN_APP);
+    expect(screen.getByRole("listitem").textContent).toBe(place);
+  });
+
+  it("this computer has no record of where it is: the date of the move, no place", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", canDelete: false }])} />);
+    expect(screen.getByRole("status").textContent).toBe(NO_RECORD);
+    expect(screen.queryByRole("listitem")).toBeNull();
+  });
+
+  it("the list could not be checked: round 1's sentence", () => {
+    render(<StatusBanner variant={banner([], true)} />);
+    expect(screen.getByRole("status").textContent).toBe(UNCHECKED);
+  });
+
+  it("without what stands behind it yet, the warning still has a sentence of its own", () => {
+    expect(warningText("destruction-old-copies-pending", "P")).toBe("Old copies of this library, left by a move, still hold data that was destroyed here.");
   });
 });
 

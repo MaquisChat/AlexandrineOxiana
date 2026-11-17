@@ -1175,7 +1175,7 @@ export const DESTRUCTION_BACKUPS_PENDING_WARNING = "destruction-backups-pending"
  * Noted in `Backups/backups-state.json` (`oldCopiesUndestroyed`) while an old copy of the library
  * left by a move, which this computer lists, still holds files a destruction under the retention
  * rule destroyed, or while that list could not be checked (R379). Rewritten from the audit log at
- * every retry pass, as the backups' note is; its sentence is DESTRUCTION_OLD_COPIES_PENDING_TEXT.
+ * every retry pass, as the backups' note is; its sentences are in @ao/shared (oldCopiesPendingText).
  */
 export { DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "@ao/shared";
 

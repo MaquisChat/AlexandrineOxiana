@@ -114,7 +114,7 @@ import {
   type Audited,
   type OldCopyRef,
 } from "./destruction-record.js";
-import { oldCopiesOfLibrary, removePendingOldCopy, type PendingOldCopy } from "./old-copies.js";
+import { isExpired, oldCopiesOfLibrary, removePendingOldCopy, type PendingOldCopy } from "./old-copies.js";
 import {
   backupCrashPoint,
   backupFailureReason,
@@ -1326,7 +1326,7 @@ function oldCopiesSentence(copies: readonly OldCopyRef[], unchecked: boolean, tz
   const n = copies.length;
   if (n === 0) return OLD_COPIES_NONE;
   const dates = [...new Set(copies.map((c) => moveDate(c.movedAt, tz)))].join(", ");
-  return `${n === 1 ? "An old copy" : `${n} old copies`} of this library, left by the move of ${dates}, still ${n === 1 ? "holds" : "hold"} the destroyed data and ${n === 1 ? "was" : "were"} not destroyed. Delete ${n === 1 ? "it" : "them"} from the Move library screen (or by hand) to complete the destruction.`;
+  return `${n === 1 ? "An old copy" : `${n} old copies`} of this library, left by the move of ${dates}, still ${n === 1 ? "holds" : "hold"} the destroyed data and ${n === 1 ? "was" : "were"} not destroyed. Deleting ${n === 1 ? "it" : "them"} completes the destruction.`;
 }
 
 function oldCopiesStatusOf(a: Audited): OldCopiesStatus {
@@ -1544,6 +1544,46 @@ export async function oldCopiesAwaitingDeletion(repo: Repo, projectId: string): 
   return Object.keys(notes)
     .sort()
     .map((rel) => ({ certificateFile: rel, oldCopies: notes[rel]!.copies.map((c) => ({ movedAt: c.movedAt })), ...(notes[rel]!.unchecked ? { unchecked: true as const } : {}) }));
+}
+
+/**
+ * The old copies behind the project's `destruction-old-copies-pending` warning, as the researcher's
+ * own screen is told of them (R409 d): each once, by the date of its move (in the project's zone),
+ * its place from this computer's list when the list has a record of it (`place`: for the screen
+ * only, never written anywhere), and whether its offer of deletion is still open (finished, not
+ * deleted, not expired: the service adds whether it still holds the token). `unchecked` when a
+ * destruction could not check the list, or the list cannot be read now (no place is given then).
+ */
+export async function oldCopiesBehindWarning(
+  repo: Repo,
+  projectId: string,
+): Promise<{ destructions: DestructionOldCopiesPending[]; unchecked: boolean; oldCopies: Array<{ movedOn?: string; place?: string; offerOpen: boolean }> }> {
+  const destructions = await oldCopiesAwaitingDeletion(repo, projectId);
+  const notes = await oldCopiesNotes(repo, projectId);
+  const byId = new Map<string, string>();
+  for (const n of Object.values(notes)) for (const c of n.copies) byId.set(c.id, c.movedAt);
+  let unchecked = destructions.some((d) => d.unchecked === true);
+  const lib = repoLibrary(repo);
+  const cfg = { appConfigDir: lib.appConfigDir, clock: repoClock(repo) };
+  let records: PendingOldCopy[] = [];
+  try {
+    const list = await oldCopiesOfLibrary(cfg, lib.id);
+    if (list.damaged) unchecked = true;
+    else records = list.records;
+  } catch {
+    unchecked = true;
+  }
+  const tz = projectTimeZone(repo, projectId);
+  const oldCopies = [...byId].map(([id, movedAt]) => {
+    const r = unchecked ? undefined : records.find((x) => x.id === id);
+    const movedOn = Number.isNaN(Date.parse(movedAt)) ? undefined : moveDate(movedAt, tz);
+    return {
+      ...(movedOn ? { movedOn } : {}),
+      ...(r ? { place: resolve(r.oldRoot) } : {}),
+      offerOpen: !!r && r.complete && !r.deleted && !isExpired(r, cfg),
+    };
+  });
+  return { destructions, unchecked, oldCopies };
 }
 
 /** `destruction-<YYYY-MM-DD HHmm>` for a time in `tz`. */

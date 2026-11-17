@@ -4,6 +4,7 @@
  * batches), the media worker, the event bus and the daily backup scheduler (R96 carry-overs).
  * Everything that changes the library goes through `@ao/library`.
  */
+import { resolve as resolvePath } from "node:path";
 import { userInfo } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -15,6 +16,7 @@ import {
   backupIfDue,
   backupsAwaitingRemoval,
   oldCopiesAwaitingDeletion,
+  oldCopiesBehindWarning,
   resumeDestruction,
   createBulkImport,
   createIndexSink,
@@ -68,8 +70,8 @@ import {
   type SearchSettings,
   type SearchSettingsRead,
 } from "@ao/library";
-import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DeviceNotice, FindProgressEvent } from "@ao/shared";
-import { DESTRUCTION_OLD_COPIES_PENDING_TEXT, DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "@ao/shared";
+import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent } from "@ao/shared";
+import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
 import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 
 import { ApiError } from "./errors.js";
@@ -1507,9 +1509,10 @@ export class ServiceState {
       // What stands behind `destruction-backups-pending` (R147): which backups still wait to be
       // removed after a destruction, and why the app does not remove them by itself when it does not.
       destructionBackupsPending: this.cachedPendingRemovals,
-      // What stands behind `destruction-old-copies-pending` (R379): the sentence the researcher reads,
-      // and for each destruction the old copies of the library still holding its files, by the time
-      // of the move (never a path), or that this computer's list could not be checked.
+      // What stands behind `destruction-old-copies-pending` (R379, R409 d): the sentence that fits, for
+      // each destruction the old copies still holding its files (by the time of the move), and each
+      // old copy with its place from this computer's list — for the researcher's own screen only:
+      // the place is never written into the library, a certificate, an audit entry or an export.
       destructionOldCopiesPending: this.cachedOldCopies,
       // This computer's own notices (Task 68, R154, R178): kind and time only; shown in the banner area.
       notices: this.cachedNotices,
@@ -1543,7 +1546,24 @@ export class ServiceState {
   private cachedProjectWarnings: Record<string, string[]> = {};
   private cachedBackupFailures: Record<string, BackupFailure> = {};
   private cachedPendingRemovals: Record<string, PendingRemoval[]> = {};
-  private cachedOldCopies: Record<string, { message: string; destructions: DestructionOldCopiesPending[] }> = {};
+  private cachedOldCopies: Record<string, DestructionOldCopiesState> = {};
+
+  /**
+   * What the researcher's screen is told of the old copies behind `destruction-old-copies-pending`
+   * (R409 d): each by the date of its move, its place when this computer's list knows it, and
+   * whether the app can still delete it (its offer is open AND this service holds its token).
+   */
+  private async oldCopiesState(s: Session, projectId: string): Promise<DestructionOldCopiesState> {
+    const behind = await oldCopiesBehindWarning(s.repo, projectId).catch(() => ({ destructions: [] as DestructionOldCopiesPending[], unchecked: true, oldCopies: [] }));
+    const move = this.pendingMove();
+    const oldCopies: DestructionOldCopy[] = behind.oldCopies.map((c) => ({
+      ...(c.movedOn ? { movedOn: c.movedOn } : {}),
+      ...(c.place ? { place: c.place } : {}),
+      canDelete: !!c.place && c.offerOpen && !!move && resolvePath(move.oldRoot) === c.place,
+    }));
+    const unchecked = behind.unchecked;
+    return { message: oldCopiesPendingText({ oldCopies, ...(unchecked ? { unchecked: true } : {}) }), destructions: behind.destructions, oldCopies, ...(unchecked ? { unchecked: true as const } : {}) };
+  }
 
   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {
     return [
@@ -1562,7 +1582,7 @@ export class ServiceState {
     const out: Record<string, string[]> = {};
     const failures: Record<string, BackupFailure> = {};
     const waiting: Record<string, PendingRemoval[]> = {};
-    const copies: Record<string, { message: string; destructions: DestructionOldCopiesPending[] }> = {};
+    const copies: Record<string, DestructionOldCopiesState> = {};
     for (const p of s.repo.listProjects()) {
       out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
       const f = out[p.id]!.includes("backup-failed") ? await backupFailure(s.repo, p.id).catch(() => undefined) : undefined;
@@ -1570,8 +1590,7 @@ export class ServiceState {
       const w = out[p.id]!.includes("destruction-backups-pending") ? await this.pendingRemovals(s, p.id) : [];
       if (w.length) waiting[p.id] = w;
       if (out[p.id]!.includes(DESTRUCTION_OLD_COPIES_PENDING_WARNING)) {
-        const destructions = await oldCopiesAwaitingDeletion(s.repo, p.id).catch((): DestructionOldCopiesPending[] => []);
-        copies[p.id] = { message: DESTRUCTION_OLD_COPIES_PENDING_TEXT, destructions };
+        copies[p.id] = await this.oldCopiesState(s, p.id);
       }
     }
     this.cachedProjectWarnings = out;

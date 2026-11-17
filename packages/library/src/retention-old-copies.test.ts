@@ -10,7 +10,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AuditEvent, Project, SourceFile } from "@ao/core";
-import { DESTRUCTION_OLD_COPIES_PENDING_TEXT, DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "@ao/shared";
+import { DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "@ao/shared";
 import type { Deps } from "./deps.js";
 import { backupProject, restoreBackup } from "./export/backup.js";
 import { addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
@@ -20,7 +20,7 @@ import { deleteOldCopy, executeMove } from "./move.js";
 import { addPendingOldCopy, markPendingComplete } from "./old-copies.js";
 import { projectWarnings, type Repo } from "./repo/index.js";
 import { openTestRepo } from "./repo/testing.js";
-import { DESTRUCTION_NOTICE, destroyRaw, oldCopiesAwaitingDeletion, readDestruction, resumeDestruction } from "./retention.js";
+import { DESTRUCTION_NOTICE, destroyRaw, oldCopiesAwaitingDeletion, oldCopiesBehindWarning, readDestruction, resumeDestruction } from "./retention.js";
 
 const WARNING = "destruction-old-copies-pending";
 const MOVED_AT = "2026-11-10T09:30:00.000Z";
@@ -118,9 +118,7 @@ describe("FR-A16: old copies of the library left by a move, at a destruction", (
     // The warning, with its note.
     expect(await projectWarnings(repo, p.id)).toContain(WARNING);
     expect(DESTRUCTION_OLD_COPIES_PENDING_WARNING).toBe(WARNING);
-    expect(DESTRUCTION_OLD_COPIES_PENDING_TEXT).toBe(
-      "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them from the Move library screen (or by hand) to complete the destruction.",
-    );
+    // The sentence that fits is R409 d's (see the "R409 (d)" tests).
     expect(await oldCopiesAwaitingDeletion(repo, p.id)).toEqual([{ certificateFile: expect.stringMatching(/retention\/destruction-/u), oldCopies: [{ movedAt: MOVED_AT }] }]);
     // The destruction did not reach into the old copy (it is the researcher's to delete).
     expect(await readFile(join(kit.lib.root, ...asset.path.split("/")), "utf8")).toBe("RAW interview audio bytes");
@@ -428,5 +426,45 @@ describe("R409 (c): the old place's Backups and trash are looked at", () => {
     kit.clock.now = DUE;
     const r = await destroyRaw(repo, p.id, [asset.id], "tester");
     expect(r.original.oldCopies).toMatchObject({ status: "pending" });
+  });
+});
+
+describe("R409 (d): the researcher's screen is told the place and what can be done", () => {
+  /** Every file under `dir`, read as text. */
+  async function allText(dir: string): Promise<string> {
+    const { readdir } = await import("node:fs/promises");
+    let out = "";
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      out += e.isDirectory() ? await allText(p) : await readFile(p, "latin1");
+    }
+    return out;
+  }
+
+  it("each old copy behind the warning, by the date of its move, with its place from this computer's list and whether its offer is open; the place is in no file of the library", async () => {
+    kit.clock.now = DUE;
+    const { p, dest, repo, asset } = await movedLibrary();
+    kit.clock.now = new Date(DUE.getTime() + 3600_000);
+    await destroyRaw(repo, p.id, [asset.id], "tester");
+    await resumeDestruction(repo, p.id);
+    expect(await oldCopiesBehindWarning(repo, p.id)).toEqual({
+      destructions: [{ certificateFile: expect.any(String), oldCopies: [{ movedAt: DUE.toISOString() }] }],
+      unchecked: false,
+      oldCopies: [{ movedOn: "2026-12-02", place: kit.lib.root, offerOpen: true }],
+    });
+    // A day later the offer has expired: the folder is to be deleted by hand.
+    kit.clock.now = new Date(DUE.getTime() + 26 * 3600_000);
+    expect((await oldCopiesBehindWarning(repo, p.id)).oldCopies).toEqual([{ movedOn: "2026-12-02", place: kit.lib.root, offerOpen: false }]);
+    expect(await allText(dest)).not.toContain(kit.lib.root);
+  });
+
+  it("on a computer with no record of the old copy: no place, the date only", async () => {
+    const { p, dest, repo, asset } = await movedLibrary();
+    kit.clock.now = DUE;
+    await destroyRaw(repo, p.id, [asset.id], "tester");
+    for (const l of opened.splice(0)) await l.close();
+    const onB = await openAt(dest, "B");
+    expect(await oldCopiesBehindWarning(onB, p.id)).toMatchObject({ unchecked: false, oldCopies: [{ movedOn: "2026-11-10", offerOpen: false }] });
+    expect((await oldCopiesBehindWarning(onB, p.id)).oldCopies[0]).not.toHaveProperty("place");
   });
 });

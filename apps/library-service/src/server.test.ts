@@ -1327,10 +1327,72 @@ processing:
     const state = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; destructionOldCopiesPending: Record<string, unknown> };
     expect(state.projectWarnings[pid]).toContain("destruction-old-copies-pending");
     expect(state.destructionOldCopiesPending[pid]).toEqual({
-      message: "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them from the Move library screen (or by hand) to complete the destruction.",
+      // R409 d: the list could not be checked — round 1's "could not be checked" sentence.
+      message:
+        "This computer's list of old copies of this library left by a move could not be read, so whether such a copy still holds the destroyed data could not be checked. Any that does was not destroyed.",
       destructions: [{ certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), oldCopies: [], unchecked: true }],
+      oldCopies: [],
+      unchecked: true,
     });
     expect(JSON.stringify(state)).not.toContain(tmp);
+  });
+
+  it("R409 d: the warning tells the researcher's screen the old copy's place and what can be done — by hand, on the Move library screen, or that this computer has no record of it; the place is in no file of the library", async () => {
+    const libRoot = await openNewLibrary();
+    const pid = await newProject(RETAIN, false, "Retain");
+    const file = join(tmp, "in", "interview.mp3");
+    const fsp = await import("node:fs/promises");
+    await fsp.mkdir(dirname(file), { recursive: true });
+    await writeFile(file, "RAW interview audio bytes");
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "interview", title: { variants: [{ lang: "en", kind: "original", value: "Interview" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: file, role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "consented", basis: "test" }, identifiable: true } },
+    );
+    // An old copy of this library left by a move, still holding the file.
+    const oldRoot = join(tmp, "OldPlace");
+    const asset = sf.assets[0]!;
+    await fsp.mkdir(join(oldRoot, ...asset.path.split("/").slice(0, -1)), { recursive: true });
+    await writeFile(join(oldRoot, ...asset.path.split("/")), "RAW interview audio bytes");
+    // This computer's list of old copies (as a finished move writes it).
+    const record = { id: "rec1", oldRoot, newRoot: libRoot, libraryId: svc.state.session!.lib.id, verifiedHashesFile: join(deps.appConfigDir, "old-copies", "rec1.json"), createdAt: clock.now.toISOString(), split: false, movedFolders: [], movedProjectIds: [pid], moveId: "m1", complete: true };
+    await fsp.mkdir(deps.appConfigDir, { recursive: true });
+    await writeFile(join(deps.appConfigDir, "pending-old-copies.json"), JSON.stringify({ formatVersion: 1, records: [record] }));
+    const d = await destroyRaw(repo, pid, [asset.id], "tester");
+    expect(d.original.oldCopies).toMatchObject({ status: "pending" });
+    const entry = async () => {
+      await svc.state.projectWarnings(svc.state.session!);
+      return (svc.state.libraryState() as { destructionOldCopiesPending: Record<string, { message: string; oldCopies: unknown[] }> }).destructionOldCopiesPending[pid]!;
+    };
+    // The service holds no token for it: by hand, the folder named below.
+    expect(await entry()).toMatchObject({
+      message: "Old copies of this library, left by a move, still hold data that was destroyed here. Delete the folder named below by hand to complete the destruction; the app will notice when it is gone.",
+      oldCopies: [{ movedOn: "2026-12-02", place: oldRoot, canDelete: false }],
+    });
+    // Its offer is open and the service holds its token: on the Move library screen.
+    svc.state.recordMove({ oldRoot, newRoot: libRoot, confirmToken: "a-token" });
+    expect(await entry()).toMatchObject({
+      message: "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them on the Move library screen to complete the destruction.",
+      oldCopies: [{ movedOn: "2026-12-02", place: oldRoot, canDelete: true }],
+    });
+    svc.state.forgetMove();
+    // This computer has no record of it.
+    await rm(join(deps.appConfigDir, "pending-old-copies.json"));
+    expect(await entry()).toEqual({
+      message:
+        "An old copy of this library, left by the move of 2026-12-02, may still hold data that was destroyed here. This computer has no record of where it is: open the library on the computer that moved it.",
+      destructions: [expect.objectContaining({ oldCopies: [{ movedAt: clock.now.toISOString() }] })],
+      oldCopies: [{ movedOn: "2026-12-02", canDelete: false }],
+    });
+    // The place is never written into the library.
+    const all = async (dir: string): Promise<string> => {
+      let out = "";
+      for (const e of await fsp.readdir(dir, { withFileTypes: true })) out += e.isDirectory() ? await all(join(dir, e.name)) : await readFile(join(dir, e.name), "latin1");
+      return out;
+    };
+    expect(await all(libRoot)).not.toContain(oldRoot);
   });
 
   describe("Task 46a: a reopen at start that the researcher's own choice supersedes starts nothing", () => {

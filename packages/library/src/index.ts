@@ -280,7 +280,7 @@ export {
 export type { BackupEntry, BackupFailure, BackupOptions, BackupResult, RestoreOptions, RestoreResult } from "./export/backup.js";
 export { ExportDestinationError, ExportFailedError, escapeMarkdown, exportProjectOpenFormats } from "./export/project-export.js";
 export type { ProjectExportResult } from "./export/project-export.js";
-export { DESTRUCTION_NOTICE, backupsAwaitingRemoval, destroyRaw, listDestructions, oldCopiesAwaitingDeletion, readDestruction, resumeDestruction, retentionDue } from "./retention.js";
+export { DESTRUCTION_NOTICE, backupsAwaitingRemoval, destroyRaw, listDestructions, oldCopiesAwaitingDeletion, oldCopiesBehindWarning, readDestruction, resumeDestruction, retentionDue } from "./retention.js";
 export type { BackupsStepStatus, DestroyOptions, DestroyResult, DestructionAmendment, DestructionRecord, DueItem, PendingRemoval } from "./retention.js";
 export { addProtocolDocuments, listProtocolDocuments } from "./protocol-docs.js";
 export type { ProtocolDocument, ProtocolDocumentResult } from "./protocol-docs.js";
