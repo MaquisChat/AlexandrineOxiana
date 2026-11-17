@@ -1272,19 +1272,30 @@ export const OLD_PLACE_LOOK_MS = 2000;
  */
 export const oldCopyLookSeams: { hang?: (root: string) => Promise<OldPlaceLook>; locationEnv?: LocationEnv } = {};
 
+/** The places (resolved) whose look is still running in this process, given up on or not (R429 e). */
+const placesBeingLookedAt = new Set<string>();
+
 /**
  * A look at an old place, bounded in time (R409 e, M4): raced against a timer of OLD_PLACE_LOOK_MS
  * for the whole look; no answer by then is `cannot-tell`. A file-system call already started (an
  * lstat on a share that does not answer) cannot be cancelled: it goes on in the background, holding
- * one of the runtime's worker threads until the system answers, and its answer is ignored.
+ * one of the runtime's worker threads until the system answers, and its answer is ignored. So that a
+ * share that does not answer holds one thread, not one per look, a place whose earlier look is still
+ * running is not looked at again: the answer is `cannot-tell` at once, until that look returns,
+ * either way (R429 e).
  */
 function bounded(root: string, look: () => Promise<OldPlaceLook>): Promise<OldPlaceLook> {
+  if (placesBeingLookedAt.has(root)) return Promise.resolve("cannot-tell");
+  placesBeingLookedAt.add(root);
   const seam = process.env.NODE_ENV === "test" ? oldCopyLookSeams.hang : undefined;
   let timer: NodeJS.Timeout | undefined;
   const limit = new Promise<OldPlaceLook>((done) => {
     timer = setTimeout(() => done("cannot-tell"), OLD_PLACE_LOOK_MS);
   });
-  const run = (seam ? seam(root) : look()).catch((): OldPlaceLook => "cannot-tell");
+  const run = Promise.resolve()
+    .then(() => (seam ? seam(root) : look()))
+    .catch((): OldPlaceLook => "cannot-tell")
+    .finally(() => placesBeingLookedAt.delete(root));
   return Promise.race([run, limit]).finally(() => clearTimeout(timer));
 }
 

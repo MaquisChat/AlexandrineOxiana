@@ -18,10 +18,22 @@ import { addSource, makeKit, makeProject, scratchFile, type Kit } from "./export
 import { openLibrary, type Library } from "./library.js";
 import type { LocationEnv } from "./location.js";
 import { deleteOldCopy, executeMove } from "./move.js";
-import { addPendingOldCopy, markPendingComplete } from "./old-copies.js";
+import { addPendingOldCopy, markPendingComplete, type PendingOldCopy } from "./old-copies.js";
 import { projectWarnings, type Repo } from "./repo/index.js";
 import { openTestRepo } from "./repo/testing.js";
-import { DESTRUCTION_NOTICE, destroyRaw, isVolumeRoot, oldCopiesAwaitingDeletion, oldCopiesBehindWarning, oldCopyLookSeams, readDestruction, resumeDestruction } from "./retention.js";
+import {
+  DESTRUCTION_NOTICE,
+  destroyRaw,
+  isVolumeRoot,
+  OLD_PLACE_LOOK_MS,
+  oldCopiesAwaitingDeletion,
+  oldCopiesBehindWarning,
+  oldCopyLookSeams,
+  oldPlaceLook,
+  readDestruction,
+  resumeDestruction,
+  type OldPlaceLook,
+} from "./retention.js";
 
 const WARNING = "destruction-old-copies-pending";
 const MOVED_AT = "2026-11-10T09:30:00.000Z";
@@ -693,4 +705,36 @@ describe("R429: old copies of a moved library and a destruction's certificate (r
     const r = await destroyRaw(repo, p.id, [asset.id], "tester");
     expect(r.original.oldCopies).toMatchObject({ status: "pending", note: expect.stringContaining("still holds the destroyed data and was not destroyed") });
   });
+
+  it("(e) N3: a place whose look is still running is not looked at again: later looks answer 'cannot tell' at once and start no call; once the first call returns (late), a new look runs", async () => {
+    const place = join(kit.tmp, "Share", "Lib");
+    const rec = { oldRoot: place } as PendingOldCopy;
+    let calls = 0;
+    let answer: (v: OldPlaceLook) => void = () => {};
+    oldCopyLookSeams.hang = () => {
+      calls += 1;
+      return calls === 1 ? new Promise<OldPlaceLook>((done) => (answer = done)) : Promise.resolve("none");
+    };
+    try {
+      // The first look gives up after the bound; its call goes on.
+      expect(await oldPlaceLook(rec)).toBe("cannot-tell");
+      expect(calls).toBe(1);
+      // While that call runs, a second and a third look answer at once and start nothing.
+      const t = Date.now();
+      expect(await oldPlaceLook(rec)).toBe("cannot-tell");
+      expect(await oldPlaceLook(rec)).toBe("cannot-tell");
+      expect(Date.now() - t).toBeLessThan(OLD_PLACE_LOOK_MS);
+      expect(calls).toBe(1);
+      // Another place is looked at as usual.
+      expect(await oldPlaceLook({ oldRoot: join(kit.tmp, "Elsewhere") } as PendingOldCopy)).toBe("none");
+      expect(calls).toBe(2);
+      // The first call returns at last: the place is free, and a new look runs.
+      answer("holds");
+      await new Promise((r) => setImmediate(r));
+      expect(await oldPlaceLook(rec)).toBe("none");
+      expect(calls).toBe(3);
+    } finally {
+      oldCopyLookSeams.hang = undefined;
+    }
+  }, 30_000);
 });
