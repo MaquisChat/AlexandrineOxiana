@@ -2186,7 +2186,7 @@ function keptLabels(sf: SourceFile, keys: string[]): string[] {
 }
 
 /** R379: the batch's note when title searches were withheld (the project holds identifiable data). */
-const TITLES_WITHHELD_NOTE = "Titles were not looked up online, because this project holds identifiable data. Identifiers (DOI, ISBN) were still looked up.";
+const TITLES_WITHHELD_NOTE = "Titles were not looked up online, because this project holds identifiable data. Look-ups by identifier (DOI, ISBN) are not affected.";
 const DELETED_NOTE = /^\d+ items? you deleted here (?:was|were) not re-imported/u;
 
 /** Task Z5: the note on items deleted in Zotero (the scan's, and this one, which counts what was marked). */

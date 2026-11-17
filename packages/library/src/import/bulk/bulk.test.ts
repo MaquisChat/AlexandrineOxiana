@@ -1886,7 +1886,7 @@ processing:
 
 describe("R379 (FR-A12): a title search never carries what may be a participant's data", () => {
   const RECORDING = "Gonzalez 2024 Interview about her eviction";
-  const NOTE = "Titles were not looked up online, because this project holds identifiable data. Identifiers (DOI, ISBN) were still looked up.";
+  const NOTE = "Titles were not looked up online, because this project holds identifiable data. Look-ups by identifier (DOI, ISBN) are not affected.";
   /** Every request to OpenAlex's search endpoint (answered with no results). */
   const recordSearches = (): string[] => {
     const seen: string[] = [];
@@ -1928,6 +1928,16 @@ describe("R379 (FR-A12): a title search never carries what may be a participant'
     const seen = recordSearches();
     const { handle: h } = await run(p, folderAdapter(await interviews()));
     expect(seen).toEqual(["/works?search=Interview+about+her+eviction+Gonzalez&per-page=5"]);
-    expect((await bulk.batchReport(p.id, h.batchId)).notes).not.toContain(NOTE);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes.filter((n) => n.startsWith("Titles were not looked up"))).toEqual([]);
+  });
+
+  it("no note where the project allows no look-up service at all (nothing was withheld for this reason)", async () => {
+    // The default rules (identifiable data), with every look-up service turned off.
+    const p = await project('consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\nprocessing:\n  metadata_lookup: []\n', true);
+    const seen = recordSearches();
+    const { handle: h, result } = await run(p, folderAdapter(await interviews()));
+    expect(result.counts.failed).toBe(0);
+    expect(seen).toEqual([]);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes.filter((n) => n.startsWith("Titles were not looked up"))).toEqual([]);
   });
 });
