@@ -88,6 +88,52 @@ const MAX_IDENTIFIER_LOOKUPS = 3;
 /** Confidence of an identifier lookup whose title disagrees with the file's own title (R49e). */
 const CONFLICT_CONFIDENCE = 0.6;
 const AGREE = 0.9;
+/** Small words: they do not count towards the three real words a running head or a cut-off title needs (R410 a iii). */
+const SMALL_WORDS = new Set(["a", "an", "the", "of", "in", "on", "at", "by", "for", "from", "to", "and", "or", "with", "de", "la", "le", "les", "du", "des", "el", "los", "las", "y", "e", "der", "die", "das", "und", "il", "lo", "di"]);
+/** What begins a subtitle, looked at in the original text right after the shorter title's last word (R410 a ii, iv). */
+const SUBTITLE_MARK = /^(?:\s*[:–—?!]|\s+-\s|\s*\.\s)/u;
+
+/** The folded words of a title (normalizeTitle per white-space-separated chunk) and, for each, where its last letter or digit ends in the original. */
+function foldedWords(title: string): Array<{ word: string; end: number }> {
+  const out: Array<{ word: string; end: number }> = [];
+  for (const m of title.matchAll(/\S+/gu)) {
+    const word = normalizeTitle(m[0]);
+    if (!word || word.includes(" ")) continue;
+    const tail = /[\p{L}\p{M}\p{N}][^\p{L}\p{M}\p{N}]*$/u.exec(m[0]);
+    out.push({ word, end: m.index + (tail ? tail.index + 1 : m[0].length) });
+  }
+  return out;
+}
+
+/** `short` is a prefix of `long` ending at a word, and what follows in `long`'s original text begins a subtitle. */
+function withoutSubtitle(short: string, long: string): boolean {
+  const s = normalizeTitle(short).split(" ");
+  const l = foldedWords(long);
+  if (!s[0] || s.length >= l.length || !s.every((w, i) => l[i]!.word === w)) return false;
+  return SUBTITLE_MARK.test(long.slice(l[s.length - 1]!.end));
+}
+
+/** `part` is a run of whole words inside `whole` (anywhere), with at least three words that are not small words. */
+function runOfRealWords(part: string, whole: string): boolean {
+  const p = normalizeTitle(part).split(" ");
+  const w = normalizeTitle(whole).split(" ");
+  if (!p[0] || p.length >= w.length || p.filter((x) => !SMALL_WORDS.has(x)).length < 3) return false;
+  for (let k = 0; k + p.length <= w.length; k++) if (p.every((x, i) => w[k + i] === x)) return true;
+  return false;
+}
+
+/**
+ * R410 a: how the file's embedded title stands to the reference manager's title. "same": equal after folding case,
+ * accents, punctuation and white space, or a similarity at or above the import's threshold (AGREE). "part": the same
+ * work's title in part — the title without its subtitle, a running head or a title cut off at a word (three real words
+ * or more), or the reference without the subtitle the embedded title carries. "other": anything else, another work's
+ * title (a conflict, as before R394: the wrong file may be attached).
+ */
+function embeddedAgainstReference(reference: string, embedded: string): "same" | "part" | "other" {
+  if (normalizeTitle(reference) === normalizeTitle(embedded) || titleSimilarity(reference, embedded) >= AGREE) return "same";
+  if (withoutSubtitle(embedded, reference) || runOfRealWords(embedded, reference) || withoutSubtitle(reference, embedded)) return "part";
+  return "other";
+}
 
 export interface ResolveInput {
   /** The file; absent for a metadata-only item (reference metadata, no file): nothing is extracted. */
@@ -345,7 +391,10 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       ...(extracted.issued ? { issued: extracted.issued } : {}),
     }, { kind: "embedded" });
   } else if (done() && extracted.title) {
-    record("title", extracted.title, { kind: "embedded" });
+    // R394 c, R410 a: agreement before conflict. An embedded title that is the same as the reference title is recorded
+    // (it corroborates); one that is only a part of the same work's title agrees and is not recorded (core's checks
+    // would call it a conflict; R406 a); any other is recorded and stays a conflict, worth the researcher's look.
+    if (!refFields.title || embeddedAgainstReference(refFields.title, extracted.title) !== "part") record("title", extracted.title, { kind: "embedded" });
   }
 
   // 3. Identifiers (+ lookup). An identifier from the file (metadata fields or the first pages'

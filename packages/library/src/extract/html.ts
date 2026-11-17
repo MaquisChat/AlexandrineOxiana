@@ -5,9 +5,11 @@
  * first 512 KB only; body text stops once enough has been collected.
  */
 import * as fsp from "node:fs/promises";
+import { basename } from "node:path";
 import type { Creator } from "@ao/core";
 import { clean, decodeEntities, markupToText, normalizeDate, parseName } from "./names.js";
 import { attrPairs, attrValue, textOf, tokens } from "./scan.js";
+import { embeddedTitle, keepCreators } from "./title-like.js";
 import { MAX_TEXT_CHARS, type RawExtract } from "./types.js";
 
 const MAX_HTML_BYTES = 16 * 1024 * 1024;
@@ -59,13 +61,17 @@ export async function extractHtml(path: string): Promise<RawExtract> {
   const list = (...keys: string[]) => keys.map((k) => meta.get(k) ?? []).find((v) => v.length) ?? [];
 
   const out: RawExtract = {};
-  const title = first("citation_title", "dc.title", "dcterms.title", "og:title") ?? (docTitle || undefined);
+  // R394 a: the meta title, else the <title>, whichever first looks like a title.
+  const metaTitle = first("citation_title", "dc.title", "dcterms.title", "og:title");
+  const title = embeddedTitle(metaTitle, basename(path)) ?? embeddedTitle(docTitle || undefined, basename(path));
   if (title) out.title = title;
+  const rawTitles = [metaTitle, docTitle].filter((t): t is string => !!t);
+  if (rawTitles.length) out.rawTitles = rawTitles;
 
   let creators = list("citation_author").map((n) => parseName(n));
   if (!creators.length) creators = list("dc.creator", "dcterms.creator").map((n) => parseName(n));
   if (!creators.length) creators = list("author", "article:author").filter((n) => !/^https?:/iu.test(n)).map((n) => parseName(n));
-  const cs = creators.filter((c): c is Creator => !!c).slice(0, MAX_CREATORS);
+  const cs = keepCreators(creators.filter((c): c is Creator => !!c)).slice(0, MAX_CREATORS);
   if (cs.length) out.creators = cs;
 
   const issued = normalizeDate(
