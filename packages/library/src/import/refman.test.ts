@@ -1381,6 +1381,39 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
     }
   });
 
+  describe("R366 c: a line begins an entry only as '@type{key,'", () => {
+    const lines = ["@jdoe (2021) wrote back", "@jdoe {at} the meeting"];
+    const shapes = (line: string) => ({
+      braces: `@article{k,\n  title = {Replies},\n  abstract = {We read.\n${line}\nEnd.},\n  doi = {10.5555/k},\n  year = {2021}\n}\n@book{n, title={Next}}\n`,
+      quotes: `@article{k,\n  title = {Replies},\n  abstract = "We read.\n${line}\nEnd.",\n  doi = {10.5555/k},\n  year = {2021}\n}\n@book{n, title={Next}}\n`,
+      parens: `@article(k,\n  title = {Replies},\n  abstract = {We read.\n${line}\nEnd.},\n  doi = {10.5555/k},\n  year = {2021}\n)\n@book{n, title={Next}}\n`,
+      parensQuoted: `@article(k,\n  title = {Replies},\n  abstract = "We read.\n${line}\nEnd.",\n  doi = {10.5555/k},\n  year = {2021}\n)\n@book{n, title={Next}}\n`,
+    });
+    for (const line of lines) {
+      for (const [shape, src] of Object.entries(shapes(line))) {
+        it(`"${line}" in ${shape}: no doubt, no cut, every field, no spurious record`, async () => {
+          const es = entries(src);
+          expect(es.map((x) => x.key)).toEqual(["k", "n"]);
+          expect([...es[0]!.fields.keys()]).toEqual(["title", "doi", "year"]);
+          expect(es[0]!.doubt).toBeUndefined();
+          const items = await collect(bibtexAdapter(await writeExport("strict.bib", src)));
+          expect(items.map(title)).toEqual(["Replies", "Next"]);
+          expect(items[0]!.referenceMetadata?.identifiers?.doi).toBe("10.5555/k");
+          expect(items[0]!.doubts).toBeUndefined();
+        });
+      }
+    }
+
+    it('"@article { smith2020 ," still begins an entry: it cuts an unclosed entry; @comment{ and @string{x = lines end one too', () => {
+      for (const next of ["@article { smith2020 ,\n  title={Smith}}", "@comment{jabref-meta: x}\n@article{smith2020, title={Smith}}", '@string{x = "y"}\n@article{smith2020, title={Smith}}']) {
+        const es = entries(`@article{a, title={A}, abstract={never closed\n${next}\n`);
+        expect(es.map((x) => x.key)).toEqual(["a", "smith2020"]);
+        expect(es[0]!.doubt).toBe(BIB_DOUBTS.cut);
+        expect(es[1]!.fields.get("title")).toBe("Smith");
+      }
+    });
+  });
+
   it("R366 f: the doubts of an unclosed entry say that its fields may also hold text from what followed it", () => {
     expect(BIB_DOUBTS.cut).toBe('The BibTeX entry was not closed, so it was cut at a line beginning with "@"; its fields may be incomplete or hold text from what followed it.');
     expect(BIB_DOUBTS.eof).toBe("The BibTeX entry was not closed before the end of the file; its fields may be incomplete or hold text from what followed it.");

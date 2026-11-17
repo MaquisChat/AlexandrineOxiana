@@ -43,6 +43,35 @@ export interface BibBlock {
 const isLetter = (c: string | undefined) => !!c && ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z"));
 const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v";
 
+/** A key's or an @string name's character: none of white space, a brace, a parenthesis, a quote, "=" or ",". */
+const isKeyChar = (c: string | undefined) =>
+  !!c && !isSpace(c) && c !== "{" && c !== "}" && c !== "(" && c !== ")" && c !== '"' && c !== "=" && c !== ",";
+
+/**
+ * Whether the "@" at `at` (first on its line, after optional spaces or tabs) begins a block line (R366 c):
+ *   - an entry: "@", the type's letters, optional white space, "{" or "(", optional white space, a key
+ *     (isKeyChar, one or more), optional white space, ",";
+ *   - `@string{name =` (the same, with "=" for ","), `@comment{` and `@preamble{` ("{" or "(").
+ * "@jdoe (2021) wrote back" or "@jdoe {at} the meeting" begins none.
+ */
+export function beginsBlockLine(src: string, at: number): boolean {
+  let j = at + 1;
+  const s = j;
+  while (isLetter(src[j])) j++;
+  if (j === s) return false;
+  const type = src.slice(s, j).toLowerCase();
+  while (isSpace(src[j])) j++;
+  if (src[j] !== "{" && src[j] !== "(") return false;
+  if (type === "comment" || type === "preamble") return true;
+  j++;
+  while (isSpace(src[j])) j++;
+  const k = j;
+  while (isKeyChar(src[j])) j++;
+  if (j === k) return false;
+  while (isSpace(src[j])) j++;
+  return src[j] === (type === "string" ? "=" : ",");
+}
+
 /** The doubt a record carries for its block, if any. */
 export function bibDoubt(b: Pick<BibBlock, "state" | "innerEntry">): string | undefined {
   return b.state === "cut" ? BIB_DOUBTS.cut : b.state === "eof" ? BIB_DOUBTS.eof : b.innerEntry ? BIB_DOUBTS.innerEntry : undefined;
@@ -162,14 +191,9 @@ export class BibBlocks {
     return -1;
   }
 
-  /** Whether the "@" at `at` begins an entry: letters, optional white space, then "{" or "(". */
+  /** Whether the "@" at `at` begins a block line: see beginsBlockLine. */
   private beginsEntry(at: number): boolean {
-    let j = at + 1;
-    const s = j;
-    while (isLetter(this.src[j])) j++;
-    if (j === s) return false;
-    while (isSpace(this.src[j])) j++;
-    return this.src[j] === "{" || this.src[j] === "(";
+    return beginsBlockLine(this.src, at);
   }
 
   /**

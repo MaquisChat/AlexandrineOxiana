@@ -100,6 +100,18 @@ describe("parseBibtex", () => {
       expect(eof.doubt).toBe(BIB_DOUBTS.eof);
     });
 
+    it("R366 c: '@jdoe (2021) wrote back' and '@jdoe {at} the meeting' begin no entry: in braces, quotes and a ( entry, every field, no doubt", () => {
+      for (const line of ["@jdoe (2021) wrote back", "@jdoe {at} the meeting"]) {
+        for (const [open, close] of [["{", "}"], ["(", ")"]]) {
+          for (const value of [`{We read.\n${line}\nEnd.}`, `"We read.\n${line}\nEnd."`]) {
+            const m = parseBibtex(`@article${open}k,\n  title = {Replies},\n  abstract = ${value},\n  doi = {10.5555/k},\n  year = {2021}\n${close}\n@book{n, title={Next}}\n`);
+            expect([line, open, value[0], m]).toMatchObject([line, open, value[0], { title: "Replies", doi: "10.5555/k", issued: "2021" }]);
+            expect(m.doubt).toBeUndefined();
+          }
+        }
+      }
+    });
+
     it("a sidecar's doubt reaches the resolution: the item goes to review with it", async () => {
       const dir = await mkdtemp(join(tmp, "res-"));
       const bib = join(dir, "paper.bib");
