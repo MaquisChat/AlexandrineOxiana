@@ -1307,6 +1307,32 @@ processing:
     }
   });
 
+  it("FR-A16 (R379): the library state carries destruction-old-copies-pending with its sentence and what stands behind it, without a path", async () => {
+    await openNewLibrary();
+    // This computer's list of old copies cannot be read: the destruction cannot check them.
+    await import("node:fs/promises").then((f) => f.mkdir(join(deps.appConfigDir, "pending-old-copies.json"), { recursive: true }));
+    const pid = await newProject(RETAIN, false, "Retain");
+    const file = join(tmp, "in", "interview.mp3");
+    await import("node:fs/promises").then((f) => f.mkdir(dirname(file), { recursive: true }));
+    await writeFile(file, "RAW interview audio bytes");
+    const sf = await svc.state.session!.repo.createSource(
+      pid,
+      { projectIds: [pid], type: "interview", title: { variants: [{ lang: "en", kind: "original", value: "Interview" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: file, role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "consented", basis: "test" }, identifiable: true } },
+    );
+    const d = await destroyRaw(svc.state.session!.repo, pid, [sf.assets[0]!.id], "tester");
+    expect(d.original.oldCopies).toMatchObject({ status: "unknown-pending" });
+    await svc.state.projectWarnings(svc.state.session!);
+    const state = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; destructionOldCopiesPending: Record<string, unknown> };
+    expect(state.projectWarnings[pid]).toContain("destruction-old-copies-pending");
+    expect(state.destructionOldCopiesPending[pid]).toEqual({
+      message: "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them from the Move library screen (or by hand) to complete the destruction.",
+      destructions: [{ certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), oldCopies: [], unchecked: true }],
+    });
+    expect(JSON.stringify(state)).not.toContain(tmp);
+  });
+
   describe("Task 46a: a reopen at start that the researcher's own choice supersedes starts nothing", () => {
     /**
      * The service stopped with a library open (so it is the one reopened at the next start) whose
