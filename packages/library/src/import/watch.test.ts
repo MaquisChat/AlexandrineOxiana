@@ -3854,3 +3854,32 @@ describe("R251 (Task W11): whether a changed file's new version is on this compu
     expect(repo.listSourceIds(p.id)).toEqual([sid]);
   }, 60_000);
 });
+
+describe("R379 (FR-A12): a watched folder never sends a recording's name for a title search", () => {
+  it("a recording arriving in a default project's watched folder: no search request; its record keeps the file name's title", async () => {
+    // The default rules (identifiable data, encryption required), with a legal basis for the files brought in.
+    const { project: p } = await repo.createProject({
+      name: `D${Math.random().toString(36).slice(2, 7)}`,
+      governanceYaml: 'consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\n',
+      encryption: { enabled: true, passphrase: "pw" },
+    });
+    const seen: string[] = [];
+    agent
+      .get("https://api.openalex.org")
+      .intercept({ path: (q: string) => q.startsWith("/works?"), method: "GET" })
+      .reply(200, (o) => (seen.push(String(o.path)), JSON.stringify({ results: [] })), { headers: { "content-type": "application/json" } })
+      .persist();
+    const { w, events } = start(p, { stabilityMs: 200 });
+    await w.ready;
+    const m4a = Buffer.alloc(64);
+    m4a.writeUInt32BE(32, 0);
+    m4a.write("ftypM4A ", 4, "latin1");
+    await writeFile(join(inbox, "Gonzalez 2024 Interview about her eviction.m4a"), m4a);
+    await until(() => events.some((e) => e.kind === "imported"));
+    const ev = events.find((e) => e.kind === "imported")!;
+    expect(ev).toMatchObject({ outcome: expect.stringMatching(/created|needs-review/u), sourceId: expect.any(String) });
+    expect(seen).toEqual([]);
+    const sf = await repo.getSource(p.id, repo.listSourceIds(p.id)[0]!);
+    expect(sf.source.title.variants[0]!.value).toBe("Interview about her eviction");
+  }, 30_000);
+});

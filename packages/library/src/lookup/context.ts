@@ -32,6 +32,13 @@ export interface LookupContext {
    * `false` counts as sensitive. `lookupContextFor` sets it from the project.
    */
   sensitive?: boolean;
+  /**
+   * R379 (ii): an import may search for an item by the title from its file name, its embedded
+   * metadata or a reference manager's record (`resolveItem` steps 5 and 6) only when this is `true`:
+   * the project's rules say it holds no identifiable data. Fail-closed: absent counts as false.
+   * Look-ups by identifier (DOI, ISBN, arXiv) are not affected. `lookupContextFor` sets it.
+   */
+  titleSearchAllowed?: boolean;
   /** Receives a short note when a provider is skipped (denied by policy, or unavailable). */
   debug?: (note: string) => void;
 }
@@ -70,5 +77,9 @@ export async function lookupContextFor(
   opts: { debug?: (note: string) => void } = {},
 ): Promise<LookupContext> {
   const info = await lookupPolicyInfo(repo, projectId);
-  return { http, projectId, ...info, ...(opts.debug ? { debug: opts.debug } : {}) };
+  // R379 (ii): only a readable policy that says the project holds no identifiable data allows title
+  // searches; R385 c: never for a locked encrypted project (nothing can be stored in it: fail closed).
+  const locked = info.sensitive && !repo.isUnlocked(projectId);
+  const titleSearchAllowed = !locked && info.policy?.identifiability.containsIdentifiable === false;
+  return { http, projectId, ...info, titleSearchAllowed, ...(opts.debug ? { debug: opts.debug } : {}) };
 }

@@ -1883,3 +1883,61 @@ processing:
     expect(sum(r.counts)).toBe(fx.items);
   });
 });
+
+describe("R379 (FR-A12): a title search never carries what may be a participant's data", () => {
+  const RECORDING = "Gonzalez 2024 Interview about her eviction";
+  const NOTE = "Titles were not looked up online, because this project holds identifiable data. Look-ups by identifier (DOI, ISBN) are not affected.";
+  /** Every request to OpenAlex's search endpoint (answered with no results). */
+  const recordSearches = (): string[] => {
+    const seen: string[] = [];
+    agent
+      .get("https://api.openalex.org")
+      .intercept({ path: (p: string) => p.startsWith("/works?"), method: "GET" })
+      .reply(200, (o) => (seen.push(String(o.path)), JSON.stringify({ results: [] })), JSON_HEADERS)
+      .persist();
+    return seen;
+  };
+  const m4a = () => {
+    const b = Buffer.alloc(64);
+    b.writeUInt32BE(32, 0);
+    b.write("ftypM4A ", 4, "latin1");
+    return b;
+  };
+  const interviews = async () => {
+    const src = join(tmp, "Interviews");
+    await mkdir(src);
+    await writeFile(join(src, `${RECORDING}.m4a`), m4a());
+    await writeFile(join(src, `${RECORDING}.pdf`), await buildPdf({ lines: ["Transcript pages."] }));
+    return src;
+  };
+
+  it("the bulk engine in a default project: the names never leave, the records keep them, and the report says why", async () => {
+    // The default rules (identifiable data, encryption required), with a legal basis for the files brought in.
+    const p = await project('consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\n', true);
+    const seen = recordSearches();
+    const { handle: h, result } = await run(p, folderAdapter(await interviews()));
+    expect(result.counts.failed).toBe(0);
+    expect(seen).toEqual([]);
+    const titles = await Promise.all(repo.listSourceIds(p.id).map(async (id) => primary((await repo.getSource(p.id, id)).source.title)));
+    expect(titles).toEqual(["Interview about her eviction", "Interview about her eviction"]);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain(NOTE);
+  });
+
+  it("where the project holds no identifiable data, the PDF's title is searched for as before, and no such note", async () => {
+    const p = await project(GOV.replace("metadata_lookup: []", "metadata_lookup: [openalex]"));
+    const seen = recordSearches();
+    const { handle: h } = await run(p, folderAdapter(await interviews()));
+    expect(seen).toEqual(["/works?search=Interview+about+her+eviction+Gonzalez&per-page=5"]);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes.filter((n) => n.startsWith("Titles were not looked up"))).toEqual([]);
+  });
+
+  it("no note where the project allows no look-up service at all (nothing was withheld for this reason)", async () => {
+    // The default rules (identifiable data), with every look-up service turned off.
+    const p = await project('consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\nprocessing:\n  metadata_lookup: []\n', true);
+    const seen = recordSearches();
+    const { handle: h, result } = await run(p, folderAdapter(await interviews()));
+    expect(result.counts.failed).toBe(0);
+    expect(seen).toEqual([]);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes.filter((n) => n.startsWith("Titles were not looked up"))).toEqual([]);
+  });
+});

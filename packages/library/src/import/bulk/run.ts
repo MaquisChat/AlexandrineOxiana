@@ -81,7 +81,7 @@ import {
 import { UnsafeFileError } from "../../extract/errors.js";
 import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
-import { lookupContextFor, type HttpClient, type LookupContext } from "../../lookup/index.js";
+import { lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../../repo/errors.js";
 import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
@@ -807,6 +807,8 @@ class Run {
       const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, (id) => hasSource(this.repo, this.projectId, id));
       this.dedupe = dedupe;
       this.lookup = await lookupContextFor(this.repo, this.projectId, this.deps.http, this.deps.debug ? { debug: this.deps.debug } : {});
+      // R379 (ii): the report says once that title searches were withheld because the project holds identifiable data.
+      if (this.lookup.policy && !this.lookup.titleSearchAllowed && providerAllowed(this.lookup, "openalex")) this.note(TITLES_WITHHELD_NOTE);
       if (this.adapter.viewingProxies) this.policyMode = (await projectPolicyOrDefault(this.repo, this.projectId))?.sharing.locationMetadata ?? "strip";
       this.outside = await OutsidePolicy.create(
         this.adapter.roots,
@@ -2183,6 +2185,8 @@ function keptLabels(sf: SourceFile, keys: string[]): string[] {
   });
 }
 
+/** R379: the batch's note when title searches were withheld (the project holds identifiable data). */
+const TITLES_WITHHELD_NOTE = "Titles were not looked up online, because this project holds identifiable data. Look-ups by identifier (DOI, ISBN) are not affected.";
 const DELETED_NOTE = /^\d+ items? you deleted here (?:was|were) not re-imported/u;
 
 /** Task Z5: the note on items deleted in Zotero (the scan's, and this one, which counts what was marked). */

@@ -1234,3 +1234,138 @@ describe("cloud-drive folders: attach's collection and origin (Task W3)", () => 
     expect(after.source.collectionIds).toEqual(before.source.collectionIds);
   });
 });
+
+describe("R379 (FR-A12): a title search never carries what may be a participant's data", () => {
+  const RECORDING = "Gonzalez 2024 Interview about her eviction";
+  /**
+   * A project under the default rules (it says it holds identifiable data; encryption required), with a
+   * default legal basis for dropped files so that attach can store them.
+   */
+  const defaultProject = async () =>
+    (
+      await repo.createProject({
+        name: `D${Math.random().toString(36).slice(2, 7)}`,
+        governanceYaml: 'consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\n',
+        encryption: { enabled: true, passphrase: "pw" },
+      })
+    ).project;
+  /** Every request to OpenAlex's search endpoint (answered with no results). */
+  const recordSearches = (): string[] => {
+    const seen: string[] = [];
+    openalex()
+      .intercept({ path: searchPath, method: "GET" })
+      .reply(200, (o) => (seen.push(String(o.path)), JSON.stringify({ results: [] })), JSON_HEADERS)
+      .persist();
+    return seen;
+  };
+  const m4a = () => {
+    const b = Buffer.alloc(64);
+    b.writeUInt32BE(32, 0);
+    b.write("ftypM4A ", 4, "latin1");
+    return b;
+  };
+  const resolveIn = async (p: { id: string }, input: Parameters<typeof resolveItem>[0]) =>
+    resolveItem(input, { projectId: p.id, patterns: [], lookup: await lookupContextFor(repo, p.id, http) });
+  const expectNameOnDevice = (r: Awaited<ReturnType<typeof resolveItem>>) => {
+    expect(r.draft.title.variants[0]!.value).toBe("Interview about her eviction");
+    expect(r.draft.creators[0]).toMatchObject({ literal: "Gonzalez" });
+    expect(r.draft.issued).toBe("2024");
+    expect(r.evidence.method).toBe("filename");
+    for (const f of ["/title", "/creators", "/issued"]) expect(r.fieldEvidence).toContainEqual(expect.objectContaining({ field: f, source: { kind: "filename" } }));
+  };
+
+  it("the reviewer's probe: a recording under the default rules is never searched for; its name still fills the record", async () => {
+    const p = await defaultProject();
+    const seen = recordSearches();
+    const r = await resolveIn(p, { path: await put(`${RECORDING}.m4a`, m4a()), mime: "audio/mp4" });
+    expect(seen).toEqual([]);
+    expectNameOnDevice(r);
+  });
+
+  it("audio, video and image files are never searched for, even where the project holds no identifiable data", async () => {
+    const p = await project();
+    const seen = recordSearches();
+    for (const [name, mime, bytes] of [
+      [`${RECORDING}.m4a`, "audio/mp4", m4a()],
+      [`${RECORDING}.mp4`, "video/mp4", m4a()],
+      [`${RECORDING}.png`, "image/png", tinyPng()],
+    ] as const) {
+      const r = await resolveIn(p, { path: await put(name, bytes), mime });
+      expect(seen, mime).toEqual([]);
+      expectNameOnDevice(r);
+    }
+  });
+
+  it("a PDF named after the interview: no search in a default project; searched as before where the project holds no identifiable data", async () => {
+    const pdf = await buildPdf({ lines: ["Scanned pages without a usable text layer title."] });
+    const d = await defaultProject();
+    const seen = recordSearches();
+    expectNameOnDevice(await resolveIn(d, { path: await put(`${RECORDING}.pdf`, pdf), mime: "application/pdf" }));
+    expect(seen).toEqual([]);
+
+    const open = await project();
+    await resolveIn(open, { path: await put(`open/${RECORDING}.pdf`, pdf), mime: "application/pdf" });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("search=Interview+about+her+eviction+Gonzalez");
+  });
+
+  it("a PDF with a DOI in a default project: the DOI is still looked up", async () => {
+    const p = await defaultProject();
+    const seen = recordSearches();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    const r = await resolveIn(p, { path: await put("doi-article.pdf", await buildDoiPdf()), mime: "application/pdf" });
+    expect(r.draft.identifiers.doi).toBe(FIXTURE_DOI);
+    expect(r.evidence.method).toBe("identifier+lookup");
+    expect(r.fieldEvidence).toContainEqual(expect.objectContaining({ field: "/title", source: { kind: "lookup", provider: "crossref" } }));
+    expect(seen).toEqual([]);
+  });
+
+  it("an embedded title (step 6) and a reference manager's title in a default project are not searched for", async () => {
+    const p = await defaultProject();
+    const seen = recordSearches();
+    const slides = await resolveIn(p, { path: await put("conference_slides.pdf", await slidesPdf()), mime: "application/pdf" });
+    expect(slides.draft.title.variants[0]!.value).toBe("Field Notes on Market Days");
+    const pdf = await put("scan0001.pdf", await buildPdf({ lines: ["Some page text without a title that we could use."] }));
+    const ris = await put("scan0001.ris", "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nAU  - Adebayo, Ngozi\nPY  - 2009\nER  - \n");
+    const side = await resolveIn(p, { path: pdf, mime: "application/pdf", sidecarPaths: [ris] });
+    expect(side.draft.title.variants[0]!.value).toBe("Weaving and Kinship in Highland Markets");
+    expect(side.evidence.method).toBe("sidecar");
+    // A record with no file (a reference manager's sidecar alone).
+    await resolveIn(p, { sidecarPaths: [ris] });
+    expect(seen).toEqual([]);
+  });
+
+  it("R385 c: a look-up context built by hand without titleSearchAllowed makes no title search (fail-closed)", async () => {
+    const p = await project();
+    const seen = recordSearches();
+    // The context of a project with no identifiable data, but without the flag.
+    const { titleSearchAllowed: _flag, ...byHand } = await lookupContextFor(repo, p.id, http);
+    expect(byHand.policy?.identifiability.containsIdentifiable).toBe(false);
+    const r = await resolveItem(
+      { path: await put(`${RECORDING}.pdf`, await buildPdf({ lines: ["Scanned pages without a usable text layer title."] })), mime: "application/pdf" },
+      { projectId: p.id, patterns: [], lookup: byHand },
+    );
+    expect(seen).toEqual([]);
+    expectNameOnDevice(r);
+  });
+
+  it("an item with no file is not a media file: where the project holds no identifiable data, its title is searched for", async () => {
+    const p = await project();
+    const seen = recordSearches();
+    const ris = await put("record.ris", "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nAU  - Adebayo, Ngozi\nPY  - 2009\nER  - \n");
+    await resolveIn(p, { sidecarPaths: [ris] });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("search=Weaving+and+Kinship+in+Highland+Markets");
+  });
+
+  it("through attach (drop on the library) in a default project: the recording's and the PDF's names never leave", async () => {
+    const p = await defaultProject();
+    const seen = recordSearches();
+    const rs = await attach.attachFiles(p.id, [await put(`${RECORDING}.m4a`, m4a()), await put(`${RECORDING}.pdf`, await buildPdf({ lines: ["Transcript pages."] }))]);
+    for (const r of rs) {
+      expect(r.sourceId, r.reason).toBeDefined();
+      expect((await repo.getSource(p.id, r.sourceId!)).source.title.variants[0]!.value).toBe("Interview about her eviction");
+    }
+    expect(seen).toEqual([]);
+  });
+});

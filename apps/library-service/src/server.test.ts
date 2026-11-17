@@ -38,6 +38,8 @@ import { shredSeams } from "../../../packages/library/src/fs/shred.js";
 import * as authModule from "./auth.js";
 import { CREDENTIAL_QUERY_KEYS, IN_LIBRARY_TEXT } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
+// The service has no undici of its own: the library's (the one its lookup client uses) sets the global dispatcher.
+import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
 
 // The library as it is, with the destruction retry observable: a test can tell whether the service
 // started it for a project at all (R3-M3), not only what it changed.
@@ -2721,5 +2723,45 @@ describe("worker jobs rerun at an unlock (Task 51 N-2)", () => {
     }
     await svc.state.idle();
     expect(stub!.runs).toHaveLength(1);
+  });
+});
+
+describe("R379 (FR-A12): a dropped recording's name never leaves the device", () => {
+  beforeEach(() => start());
+
+  it("a recording dropped in a project under the default rules makes no title search request", async () => {
+    // The made-up services as the global dispatcher (nothing reaches the network); every request is kept.
+    const previous = getGlobalDispatcher();
+    const agent = new MockAgent();
+    agent.disableNetConnect();
+    const sent: string[] = [];
+    for (const origin of ["https://api.openalex.org", "https://api.crossref.org"]) {
+      agent
+        .get(origin)
+        .intercept({ path: () => true, method: "GET" })
+        .reply((o) => (sent.push(`${origin}${String(o.path)}`), { statusCode: 404, data: "{}", responseOptions: { headers: { "content-type": "application/json" } } }))
+        .persist();
+    }
+    setGlobalDispatcher(agent);
+    try {
+      await openNewLibrary();
+      // The default rules (identifiable data, encryption required), with a legal basis for dropped files.
+      const pid = await newProject('consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\n', true);
+      const m4a = Buffer.alloc(64);
+      m4a.writeUInt32BE(32, 0);
+      m4a.write("ftypM4A ", 4, "latin1");
+      const path = join(tmp, "in", "Gonzalez 2024 Interview about her eviction.m4a");
+      await import("node:fs/promises").then((f) => f.mkdir(dirname(path), { recursive: true }));
+      await writeFile(path, m4a);
+      const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [path] } });
+      expect(att.status, att.body).toBe(200);
+      expect(att.json.items[0], att.body).toMatchObject({ outcome: expect.stringMatching(/created|needs-review/u), sourceId: expect.any(String) });
+      expect(sent).toEqual([]);
+      const one = await call({ url: `/projects/${pid}/sources/${att.json.items[0].sourceId as string}` });
+      expect(one.json.source.title.variants[0].value).toBe("Interview about her eviction");
+    } finally {
+      setGlobalDispatcher(previous);
+      await agent.close();
+    }
   });
 });
