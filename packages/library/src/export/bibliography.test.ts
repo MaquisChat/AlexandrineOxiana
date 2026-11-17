@@ -323,3 +323,16 @@ describe.skipIf(!HAVE_BUNDLE)("R416: two participants whose names fold alike eac
     expect(bibB.content).not.toContain(ca);
   });
 });
+
+describe.skipIf(!HAVE_BUNDLE)("R420 (a): a participant's whole name inside a creator who is not a participant", () => {
+  it("the printed entry shows 'Friends of P-001', never the name", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const part = await kit.repo.createParticipant(p.id, { details: { fullName: "Maria Cocina", handle: "@maria.cocina" }, legalBasis: "consent" });
+    const page = await addSource(kit, p, { type: "webpage", title: "Recetas de la abuela", creators: [{ literal: "Friends of Maria Cocina", role: "author" }], issued: "2025" });
+    for (const style of ["apa", "chicago-author-date"]) {
+      const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [page.source.id] }, style, "text");
+      expect(bib.content).toContain(`Friends of ${part.code}`);
+      expect(bib.content.toLowerCase()).not.toContain("cocina");
+    }
+  });
+});

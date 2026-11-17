@@ -919,6 +919,54 @@ describe("R416: where names fold alike, the participant whose name is exactly wh
   });
 });
 
+describe("R420 (a): a participant's WHOLE name inside the name of a creator who is not a participant", () => {
+  const MARIA = new Map([["Maria Cocina", "P-001"], ["@maria.cocina", "P-001"]]);
+  const page = (creators: Creator[], map: ReadonlyMap<string, string> = MARIA) =>
+    toCslItem(source("webpage", mt(["en", "original", "A page"]), creators), { ...OPTS, pseudonyms: map });
+
+  it("a literal, a handle-like literal and a given/family pair holding the whole name are coded", () => {
+    expect(page([{ role: "author", literal: "Friends of Maria Cocina" }]).author).toEqual([{ literal: "Friends of P-001" }]);
+    expect(page([{ role: "author", literal: "Friends of @maria.cocina" }]).author).toEqual([{ literal: "Friends of P-001" }]);
+    expect(page([{ role: "author", given: "Dr. Maria", family: "Cocina" }]).author).toEqual([{ literal: "Dr. P-001" }]);
+  });
+
+  it("guards (they hold before R420 too): parts of the name are not looked for inside another creator's name", () => {
+    expect(page([{ role: "author", given: "Maria", family: "Lopez" }]).author).toEqual([{ family: "Lopez", given: "Maria" }]);
+    expect(page([{ role: "author", literal: "Maria Lopez Institute" }]).author).toEqual([{ literal: "Maria Lopez Institute" }]);
+    expect(page([{ role: "author", given: "Juan", family: "Cocina" }]).author).toEqual([{ family: "Cocina", given: "Juan" }]);
+  });
+
+  it("a map entry of one word is a whole name", () => {
+    expect(page([{ role: "author", literal: "Friends of Lucía" }], new Map([["Lucía", "P-002"]])).author).toEqual([{ literal: "Friends of P-002" }]);
+  });
+
+  it("a creator changed this way counts as coded: the source's own citation key is withheld", () => {
+    expect(page([{ role: "author", literal: "Friends of Maria Cocina" }])["citation-key"]).toBeUndefined();
+    expect(page([{ role: "author", given: "Juan", family: "Cocina" }])["citation-key"]).toBe("key");
+  });
+
+  it("a no-space script: the whole name inside an organisation's name", () => {
+    expect(page([{ role: "author", literal: "北京王芳文化研究会" }], new Map([["王芳", "P-003"]])).author).toEqual([{ literal: "北京P-003文化研究会" }]);
+  });
+
+  it("a coded creator's whole forms, whatever the order of the creators; not its bare parts", () => {
+    const map = new Map([["@rosa.d", "P-004"]]);
+    const coded: Creator = { role: "interviewee", handle: "@rosa.d", given: "Rosa", family: "Diaz Ruiz" };
+    const item = page([{ role: "author", literal: "Amigos de Rosa Diaz Ruiz" }, coded, { role: "author", literal: "Diaz Ruiz Foundation" }, { role: "author", literal: "Amigos de Rosa" }], map);
+    expect(item.author).toEqual([{ literal: "Amigos de P-004" }, { literal: "P-004" }, { literal: "Diaz Ruiz Foundation" }, { literal: "Amigos de Rosa" }]);
+  });
+
+  it("names that fold alike: the exact one gives its code (R416)", () => {
+    const pena = new Map([["Ana Peña", "P-001"], ["Ana Pena", "P-002"]]);
+    expect(page([{ role: "author", literal: "Amigos de Ana Pena" }], pena).author).toEqual([{ literal: "Amigos de P-002" }]);
+    expect(page([{ role: "author", literal: "Amigos de Ana Peña" }], pena).author).toEqual([{ literal: "Amigos de P-001" }]);
+  });
+
+  it("an empty map: the creator is untouched", () => {
+    expect(page([{ role: "author", literal: "Friends of Maria Cocina" }], new Map()).author).toEqual([{ literal: "Friends of Maria Cocina" }]);
+  });
+});
+
 describe("R387 (b): one function makes a name's forms (I1 of the FR-A10 review)", () => {
   const title = (t: string, map: ReadonlyMap<string, string>) =>
     toCslItem(source("article-journal", mt(["ja", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;

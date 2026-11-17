@@ -128,6 +128,8 @@ export interface NameForm {
   strict?: string;
   /** R416: the strict key of the name as written (the form as written only). */
   full?: string;
+  /** A run of some of a longer name's words (R387 e): a part, not the whole name (R420 a). */
+  part?: boolean;
 }
 
 /** The longest name whose runs of words are made into forms (R387 e); longer names get none. */
@@ -195,7 +197,7 @@ export function nameForms(name: string | CreatorName, code: string, bare = false
         const run = ws.slice(at, at + len);
         // A run is the name only when at least TWO of its words could be a name by themselves
         // (R403 c): "Lucía Fernández", "Fernández Ruiz" — not "Maria de", "la Cruz", "der Berg".
-        if (run.filter((w) => standsAlone(w, LATIN_FLOOR)).length >= 2) out.push(...ordersOf(run, code, bare, true, true, ss?.slice(at, at + len)));
+        if (run.filter((w) => standsAlone(w, LATIN_FLOOR)).length >= 2) out.push(...ordersOf(run, code, bare, true, true, ss?.slice(at, at + len)).map((f) => ({ ...f, part: true })));
       }
     }
   }
@@ -595,6 +597,11 @@ export function mergeHits(hits: readonly Hit[], extra: readonly Hit[]): Hit[] {
 export interface NameSet {
   map?: ReadonlyMap<string, string>;
   forms?: readonly NameForm[];
+  /**
+   * R420 a: whole names only — no lone given or family name (`bare`), no run of some of a longer
+   * name's words (`part`). Every order of a whole name and its words joined stay.
+   */
+  wholeOnly?: boolean;
 }
 export type Names = readonly NameForm[] | NameSet;
 
@@ -659,15 +666,18 @@ export function mapCode(map: ReadonlyMap<string, string>, text: string): string 
 
 function indexesOf(names: Names, opts: ScrubOptions): Index[] {
   const set: NameSet = Array.isArray(names) ? { forms: names as readonly NameForm[] } : (names as NameSet);
+  const whole = set.wholeOnly === true;
+  const keep = (fs: readonly NameForm[]) => (whole ? fs.filter((f) => !f.bare && !f.part) : fs);
   const out: Index[] = [];
   if (set.map && set.map.size) {
     const c = cacheOf(set.map);
-    const key = `${opts.bareMinLength ?? 0}|${opts.splitDigits ? 1 : 0}`;
+    const key = `${whole ? "w" : ""}${opts.bareMinLength ?? 0}|${opts.splitDigits ? 1 : 0}`;
     let ix = c.indexes.get(key);
-    if (!ix) c.indexes.set(key, (ix = patterns(c.forms, opts)));
+    if (!ix) c.indexes.set(key, (ix = patterns(keep(c.forms), opts)));
     out.push(ix);
   }
-  if (set.forms && set.forms.length) out.push(patterns(set.forms, opts));
+  const forms = set.forms && set.forms.length ? keep(set.forms) : [];
+  if (forms.length) out.push(patterns(forms, opts));
   return out.filter((ix) => ix.byFirst.size > 0);
 }
 

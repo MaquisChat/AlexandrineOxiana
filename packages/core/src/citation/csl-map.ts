@@ -210,6 +210,31 @@ function urlNamesParticipant(url: string, names: NameSet): boolean {
   return urlNamesAny(url, names);
 }
 
+/**
+ * R420 a: a creator who is not a participant, whose name holds a participant's WHOLE name (a map
+ * entry, a name or a handle; a coded creator's handle, literal, "given family", "family given"):
+ * the text that cslName would print (the literal, else the handle; for a given/family creator the
+ * joined "given family", else "family given"), with each such whole name replaced by its code
+ * (by the shared rule, R416's choice included). Parts of a name (a lone given or family name, a run
+ * of some of its words) are not looked for: an author who shares a first name with a participant
+ * is not rewritten. Undefined when nothing was replaced.
+ */
+function creatorWithWholeNames(c: Creator, whole: NameSet): string | undefined {
+  const tryText = (t: string | undefined): string | undefined => {
+    const v = t?.trim();
+    if (!v) return undefined;
+    const out = scrubNames(v, whole);
+    return out !== v ? out : undefined;
+  };
+  const given = c.given?.trim();
+  const family = c.family?.trim();
+  if (given || family) {
+    const joined = [given, family].filter(Boolean).join(" ");
+    return tryText(joined) ?? (given && family ? tryText(`${family} ${given}`) : undefined);
+  }
+  return tryText(c.literal) ?? (c.literal?.trim() ? undefined : tryText(c.handle));
+}
+
 function cslName(c: Creator): CslName | undefined {
   if (c.family?.trim() || c.given?.trim()) {
     const n: CslName = {};
@@ -282,16 +307,29 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   // Participants but no pseudonym map to code them with: nothing about them can be cited safely (R89).
   if (s.participantIds.length > 0 && keys.size === 0) throw new ParticipantCodeMissingError();
   let anyCoded = false;
-  for (const c of s.creators) {
-    const code = codeFor(c, map);
+  // Every creator's code first, so that a creator who is not a participant can be read against the
+  // whole names of every coded creator, wherever it stands in the list (R420 a).
+  const codes = s.creators.map((c) => codeFor(c, map));
+  for (const [i, c] of s.creators.entries()) {
+    const code = codes[i];
+    if (code) forms.push(...nameForms(c, code));
+    else if (requireCodes && c.role !== "interviewer" && creatorForms(c).length > 0) throw new ParticipantCodeMissingError();
+  }
+  const whole: NameSet = { map, forms, wholeOnly: true };
+  const lookForWhole = keys.size > 0 || forms.length > 0;
+  for (const [i, c] of s.creators.entries()) {
+    const code = codes[i];
     let name: CslName | undefined;
     if (code) {
       anyCoded = true;
       name = { literal: code };
-      forms.push(...nameForms(c, code));
     } else {
-      if (requireCodes && c.role !== "interviewer" && creatorForms(c).length > 0) throw new ParticipantCodeMissingError();
       name = cslName(c);
+      const scrubbed = lookForWhole ? creatorWithWholeNames(c, whole) : undefined;
+      if (scrubbed !== undefined) {
+        anyCoded = true;
+        name = { literal: scrubbed };
+      }
     }
     if (!name) continue;
     const role = ROLE_MAP[c.role];
