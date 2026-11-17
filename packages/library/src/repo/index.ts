@@ -1,4 +1,4 @@
-export { Repo, openRepo, projectWarnings, setProjectTimeZone, BACKUP_FAILED_WARNING, BACKUP_AUDIT_PENDING_WARNING, DESTRUCTION_BACKUPS_PENDING_WARNING } from "./repo.js";
+export { Repo, openRepo, projectWarnings, setProjectTimeZone, BACKUP_FAILED_WARNING, BACKUP_AUDIT_PENDING_WARNING, DESTRUCTION_BACKUPS_PENDING_WARNING, DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "./repo.js";
 export { RECOVERY_CODE_UNSHOWN_WARNING } from "./projects.js";
 export { GOVERNANCE_MAX_BYTES, GovernanceConflictError, GovernanceLooseningError, GOVERNANCE_UNOPENABLE_SAVE, type GovernanceFileState, type GovernanceRepair } from "./governance-edit.js";
 export type { GovernanceEditResult } from "./governance-edit.js";

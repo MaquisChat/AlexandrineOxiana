@@ -5,7 +5,7 @@
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
 import { useRef, useState } from "react";
-import { isDeviceNoticeKind, type DeviceNoticeKind } from "@ao/shared";
+import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
 import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
@@ -20,8 +20,12 @@ export type BannerVariant =
   | { kind: "index-rebuilding"; done: number; total: number }
   /** The index could not be rebuilt (D8); the service's reason is not shown (it can name files). */
   | { kind: "index-failed" }
-  /** `detail` is accepted for the record but never shown (R114 I1). */
-  | { kind: "warning"; warning: string; project: string; detail?: string }
+  /**
+   * `detail` is accepted for the record but never shown (R114 I1). `oldCopies`: for
+   * `destruction-old-copies-pending`, the sentence that fits and the old copies' places, shown under
+   * it (R409 d).
+   */
+  | { kind: "warning"; warning: string; project: string; detail?: string; oldCopies?: { text: string; places: string[] } }
   /** This computer's own notice (Task 68, R154, R178): fixed words by kind; goes by "Got it". */
   | { kind: "notice"; notice: DeviceNoticeKind };
 
@@ -108,6 +112,8 @@ const WARNINGS: Record<string, (p: string) => string> = {
     `Changes to ${p} that could not be recorded at the time were recorded in the audit log of ${p} now. They are marked as recorded late.`,
   "refusal-unrecorded": () => "A refused request could not be recorded in the library's audit log. Nothing was changed.",
   "retention-due": (p) => `${p} has reached its retention date. Review which raw data must now be destroyed or kept.`,
+  // Only until what stands behind it arrives: then the sentence that fits, from @ao/shared (R409 d).
+  [DESTRUCTION_OLD_COPIES_PENDING_WARNING]: () => "Old copies of this library, left by a move, still hold data that was destroyed here.",
 };
 
 /** The sentence for a warning kind; an unknown kind gets a generic sentence (never the detail). */
@@ -131,7 +137,7 @@ function text(v: BannerVariant): string {
     case "index-failed":
       return "The library's search index could not be rebuilt, so sources and search may be incomplete. Your sources are safe in the library folder.";
     case "warning":
-      return warningText(v.warning, v.project);
+      return v.oldCopies?.text ?? warningText(v.warning, v.project);
     case "notice":
       return NOTICE_TEXT[v.notice];
   }
@@ -199,6 +205,15 @@ export function StatusBanner({ variant, onResolve, onDismiss }: { variant: Banne
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
       <UserText>{text(variant)}</UserText>
+      {variant.kind === "warning" && !!variant.oldCopies?.places.length && (
+        <ul>
+          {variant.oldCopies.places.map((p) => (
+            <li key={p}>
+              <UserText>{p}</UserText>
+            </li>
+          ))}
+        </ul>
+      )}
       {variant.kind === "index-failed" && (
         <>
           {" "}
@@ -251,7 +266,7 @@ export interface BannerContext {
 }
 
 /** Banners for the library's state, in order: access, index progress, integrity warnings, project warnings. */
-export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index" | "notices">>, ctx: BannerContext = {}): BannerVariant[] {
+export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index" | "notices" | "destructionOldCopiesPending">>, ctx: BannerContext = {}): BannerVariant[] {
   const out: BannerVariant[] = [];
   if (state.mode === "read-only") {
     const r = state.readOnlyReason;
@@ -269,7 +284,16 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
   else if (ctx.index && ctx.index.done < ctx.index.total) out.push({ kind: "index-rebuilding", ...ctx.index });
   for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail });
   for (const [pid, list] of Object.entries(state.projectWarnings ?? {})) {
-    for (const w of list) out.push({ kind: "warning", warning: w, project: ctx.projectNames?.[pid] ?? "a project" });
+    for (const w of list) {
+      const project = ctx.projectNames?.[pid] ?? "a project";
+      // The old copies behind the warning (R409 d): every sentence that applies, and each known place,
+      // also under "could not be checked" (R429 f).
+      const copies = w === DESTRUCTION_OLD_COPIES_PENDING_WARNING ? state.destructionOldCopiesPending?.[pid] : undefined;
+      if (copies && Array.isArray(copies.oldCopies)) {
+        const places = [...new Set(copies.oldCopies.flatMap((c) => (typeof c.place === "string" ? [c.place] : [])))];
+        out.push({ kind: "warning", warning: w, project, oldCopies: { text: oldCopiesPendingText(copies), places } });
+      } else out.push({ kind: "warning", warning: w, project });
+    }
   }
   // This computer's own notices (Task 68): known kinds only, once each.
   const seen = new Set<string>();

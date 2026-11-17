@@ -7,7 +7,7 @@
  * Citations are always rendered by the service (participant codes and withheld sources are applied
  * there, R88/R90); the UI only shows and copies the string it returns.
  */
-import type { DeviceNotice, DeviceNoticeDismissRequest, DeviceNoticeKind, ProjectReviewPage } from "@ao/shared";
+import type { DestructionOldCopiesState, DeviceNotice, DeviceNoticeDismissRequest, DeviceNoticeKind, ProjectReviewPage } from "@ao/shared";
 
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
@@ -107,6 +107,8 @@ export interface LibraryState {
   index?: IndexStatus;
   integrityWarnings?: IntegrityWarning[];
   projectWarnings?: Record<string, string[]>;
+  /** What stands behind `destruction-old-copies-pending`, per project (R409 d). */
+  destructionOldCopiesPending?: Record<string, DestructionOldCopiesState>;
   /** This computer's own notices (Task 68): kind and time only. */
   notices?: DeviceNotice[];
 }

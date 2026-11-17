@@ -103,6 +103,7 @@ import { AuditChainInvalidError, DestructionRecordError, RestoreError, Unreadabl
 import { parseProjectJson } from "../repo/state.js";
 import {
   DESTRUCTION_BACKUPS_PENDING_WARNING,
+  DESTRUCTION_OLD_COPIES_PENDING_WARNING,
   adoptRestoredProject,
   appendLibraryEvent,
   authorizeProcessing,
@@ -124,7 +125,7 @@ import {
 import { isDue, projectTimeZone } from "../retention-date.js";
 // The readers a restore needs: built on the shared reading of the destruction record, and importing
 // neither this module nor retention.ts (which imports this module).
-import { destroyedOnRecord, inheritedOutstanding, type DestroyedOnRecord } from "../restore-record.js";
+import { destroyedOnRecord, inheritedOldCopies, inheritedOutstanding, type DestroyedOnRecord } from "../restore-record.js";
 
 export { AuditChainInvalidError, DestructionRecordError, RestoreError, UnreadableBackupError };
 
@@ -359,6 +360,21 @@ interface BackupState {
   destructionProblems: Record<string, Record<string, string>>;
   /** Per destruction certificate (`<projectId>:<rel>`): the retry record of its backups step (R2-I1). Bookkeeping, not authority. */
   retries: Record<string, RetentionRetry>;
+  /**
+   * Per project, per destruction certificate: the old copies of the library left by a move that
+   * still hold destroyed files, or a list that could not be checked (R379): what raises
+   * `destruction-old-copies-pending`. A note for the warning only, rewritten from the audit log at
+   * every retry pass, as `undestroyed` is.
+   */
+  oldCopiesUndestroyed: Record<string, Record<string, OldCopiesNote>>;
+}
+
+/** Package-internal (retention, R379): what the state file notes of one destruction's old copies. */
+export interface OldCopiesNote {
+  /** Each by the id of this computer's record of it and the time of the move that left it (never a path). */
+  copies: Array<{ id: string; movedAt: string }>;
+  /** The list of old copies could not be read, so this was not checked yet. */
+  unchecked?: true;
 }
 
 /** Why the project's last backup failed (plain text; never a path), and when. */
@@ -402,6 +418,23 @@ function undestroyedOf(v: unknown): Record<string, Record<string, string[]>> {
   return out;
 }
 
+/** Per project, per certificate: the old copies noted (R379); anything malformed is dropped. */
+function oldCopiesNotesOf(v: unknown): Record<string, Record<string, OldCopiesNote>> {
+  const out: Record<string, Record<string, OldCopiesNote>> = {};
+  if (!isObject(v)) return out;
+  for (const [pid, per] of Object.entries(v)) {
+    if (!isObject(per)) continue;
+    const mine: Record<string, OldCopiesNote> = {};
+    for (const [rel, n] of Object.entries(per)) {
+      if (!isObject(n)) continue;
+      const copies = (Array.isArray(n.copies) ? n.copies : []).filter((c): c is { id: string; movedAt: string } => isObject(c) && typeof c.id === "string" && typeof c.movedAt === "string").map((c) => ({ id: c.id, movedAt: c.movedAt }));
+      if (copies.length || n.unchecked === true) mine[rel] = { copies, ...(n.unchecked === true ? { unchecked: true as const } : {}) };
+    }
+    if (Object.keys(mine).length) out[pid] = mine;
+  }
+  return out;
+}
+
 /** Per project, per certificate: one plain sentence or more. */
 function problemsOf(v: unknown): Record<string, Record<string, string>> {
   const out: Record<string, Record<string, string>> = {};
@@ -426,9 +459,10 @@ async function readState(dir: string): Promise<BackupState> {
       undestroyed: undestroyedOf(s.undestroyed),
       destructionProblems: problemsOf(s.destructionProblems),
       retries: isObject(s.retries) ? (s.retries as Record<string, RetentionRetry>) : {},
+      oldCopiesUndestroyed: oldCopiesNotesOf(s.oldCopiesUndestroyed),
     };
   } catch {
-    return { formatVersion: 1, owners: {}, failures: {}, pending: {}, undestroyed: {}, destructionProblems: {}, retries: {} };
+    return { formatVersion: 1, owners: {}, failures: {}, pending: {}, undestroyed: {}, destructionProblems: {}, retries: {}, oldCopiesUndestroyed: {} };
   }
 }
 
@@ -436,8 +470,11 @@ async function readState(dir: string): Promise<BackupState> {
 async function editStateNow(dir: string, fn: (s: BackupState) => void): Promise<void> {
   const s = await readState(dir);
   fn(s);
+  // Written only when it holds something (R379): a library with no such note keeps the file as before.
+  const { oldCopiesUndestroyed, ...rest } = s;
+  const out = Object.keys(oldCopiesUndestroyed).length ? s : rest;
   await fsp.mkdir(dir, { recursive: true });
-  await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(s, null, 2)}\n`, { mode: 0o600 });
+  await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(out, null, 2)}\n`, { mode: 0o600 });
 }
 
 /** The recorded failure of the project's last backup (the warning `backup-failed`), if any. */
@@ -566,6 +603,15 @@ export async function listBackups(repo: Repo, projectId: string): Promise<Backup
 }
 
 /**
+ * Package-internal (here, and retention's look into an old copy, R429 d): whether the sealed backup
+ * at `abs` is sealed with the key `keyId` (read from its header; false when it cannot be read or
+ * the project has no key).
+ */
+export async function sealedWithKey(abs: string, keyId: string | undefined): Promise<boolean> {
+  return !!keyId && (await readKeyId(abs).catch(() => undefined)) === keyId;
+}
+
+/**
  * Package-internal (retention, R92 I2): backup files that could not be read when the manifest was
  * rebuilt and whose name is the project's — they may hold its data.
  */
@@ -585,7 +631,7 @@ export async function unresolvedBackupsOf(repo: Repo, projectId: string): Promis
     const owner = Object.hasOwn(state.owners, f) ? state.owners[f] : undefined;
     let mine: boolean;
     if (owner) mine = owner === projectId;
-    else if (f.endsWith(".enc")) mine = !!project.encryption.keyId && (await readKeyId(abs).catch(() => undefined)) === project.encryption.keyId;
+    else if (f.endsWith(".enc")) mine = await sealedWithKey(abs, project.encryption.keyId);
     else mine = f.startsWith(`${stem} - modified `);
     if (mine) out.push(f);
   }
@@ -1464,6 +1510,47 @@ export async function setDestructionNotes(repo: Repo, projectId: string, notes: 
   });
 }
 
+/** Package-internal (retention, R379): the project's notes of old copies still holding destroyed files, by certificate (library-relative). */
+export async function oldCopiesNotes(repo: Repo, projectId: string): Promise<Record<string, OldCopiesNote>> {
+  const u = (await readState(backupsDir(repo))).oldCopiesUndestroyed;
+  return Object.hasOwn(u, projectId) ? structuredClone(u[projectId]!) : {};
+}
+
+/**
+ * Package-internal (retention, R379): replaces the project's notes of old copies (every certificate
+ * at once, from the audit log, as setDestructionNotes does for backups). Written only when something differs.
+ */
+export async function setOldCopiesNotes(repo: Repo, projectId: string, notes: Record<string, OldCopiesNote>): Promise<void> {
+  const wanted = Object.fromEntries(Object.entries(notes).filter(([, n]) => n.copies.length || n.unchecked));
+  const key = (x: Record<string, OldCopiesNote>) => JSON.stringify(Object.keys(x).sort().map((k) => [k, x[k]!.copies.map((c) => [c.id, c.movedAt]), x[k]!.unchecked === true]));
+  if (key(await oldCopiesNotes(repo, projectId)) === key(wanted)) return;
+  await withState(repo, (s) => setOrDrop(s.oldCopiesUndestroyed, projectId, wanted));
+}
+
+/**
+ * Package-internal (move, retention, R409 a): whether the notes in the Backups folder `dir` (any
+ * project of that library) still name the old copy `id` as holding destroyed files. A note file
+ * that is missing names none; one that cannot be read or parsed counts as naming it (the record of
+ * the old copy is then kept: the warning errs toward staying, R147).
+ */
+export async function oldCopyNotedIn(dir: string, id: string): Promise<boolean> {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(join(dir, BACKUPS_STATE), "utf8");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+  let s: unknown;
+  try {
+    s = JSON.parse(raw);
+  } catch {
+    return true;
+  }
+  if (!isObject(s)) return true;
+  const notes = oldCopiesNotesOf(s.oldCopiesUndestroyed);
+  return Object.values(notes).some((per) => Object.values(per).some((n) => n.copies.some((c) => c.id === id)));
+}
+
 /** Package-internal: every backup of the project still to be removed for a destruction (all certificates). */
 export async function holdingNotRemoved(repo: Repo, projectId: string): Promise<string[]> {
   const u = (await readState(backupsDir(repo))).undestroyed;
@@ -1547,6 +1634,7 @@ export interface RestoreResult {
   /**
    * `retention-due`: the restored project's retention date has passed.
    * `destruction-backups-pending`: it inherits backups a destruction still lists for removal (R175).
+   * `destruction-old-copies-pending`: it inherits old copies of the library a destruction named as not destroyed (R379).
    */
   warnings: string[];
   /**
@@ -1862,9 +1950,25 @@ async function restoreOpened(
       // removed are noted, so its warning stands from that moment (R175); taken back if it does not go live.
       beforeLive: async (copy) => {
         const outstanding = inheritedOutstanding(copy.events, copy.folder);
-        if (!Object.keys(outstanding).length) return { warnings: [], undo: async () => {} };
-        await setDestructionNotes(repo, copy.projectId, outstanding);
-        return { warnings: [DESTRUCTION_BACKUPS_PENDING_WARNING], undo: () => setDestructionNotes(repo, copy.projectId, {}) };
+        // The old copies of the library a destruction named as not destroyed are inherited the same way (R379).
+        const copies = inheritedOldCopies(copy.events, copy.folder);
+        const warnings: string[] = [];
+        if (Object.keys(outstanding).length) {
+          await setDestructionNotes(repo, copy.projectId, outstanding);
+          warnings.push(DESTRUCTION_BACKUPS_PENDING_WARNING);
+        }
+        if (Object.keys(copies).length) {
+          await setOldCopiesNotes(repo, copy.projectId, copies);
+          warnings.push(DESTRUCTION_OLD_COPIES_PENDING_WARNING);
+        }
+        if (!warnings.length) return { warnings, undo: async () => {} };
+        return {
+          warnings,
+          undo: async () => {
+            if (Object.keys(outstanding).length) await setDestructionNotes(repo, copy.projectId, {});
+            if (Object.keys(copies).length) await setOldCopiesNotes(repo, copy.projectId, {});
+          },
+        };
       },
     });
     const warnings: string[] = [...inherited];

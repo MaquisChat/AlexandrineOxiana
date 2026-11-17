@@ -37,6 +37,14 @@ export interface PendingOldCopy {
   moveId: string;
   /** False while the move's switch has not finished. */
   complete: boolean;
+  /**
+   * Set when the app deleted the old copy (deleteOldCopy) but the record was kept (R409 a): something
+   * of the library stayed at the old place (`remains`: a file it kept or could not remove, or data
+   * of the moved projects outside what it deletes), or a destruction under the retention rule still
+   * names the copy. Later retry passes go on looking at the place; the record is dropped once the
+   * place holds nothing of the library and no destruction names it. Never offered for deletion again.
+   */
+  deleted?: { at: string; remains: boolean };
 }
 
 export interface VerifiedHashes {
@@ -179,6 +187,31 @@ export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<Pend
   return (await load(deps)).find((r) => r.id === id);
 }
 
+/**
+ * Every old copy this computer lists for the library `libraryId`, finished or not, its offer expired
+ * or not, deleted with remains or not (a destruction under the retention rule must know them all,
+ * R379), and whether the list is `damaged` (unparsable, or a record without a usable place: which
+ * library it was cannot be told, so the list is not the whole truth, R409 a, b). Throws
+ * OldCopiesUnreadableError when the list cannot be read.
+ */
+export async function oldCopiesOfLibrary(deps: CfgDeps, libraryId: string): Promise<{ records: PendingOldCopy[]; damaged: boolean }> {
+  const { records, damaged } = await readList(deps);
+  return { records: records.filter((r) => r.libraryId === libraryId), damaged };
+}
+
+/**
+ * The app deleted the old copy `id` but its record is kept, marked deleted (R409 a): see
+ * PendingOldCopy.deleted. Throws OldCopiesUnreadableError when the list cannot be read.
+ */
+export async function markPendingDeleted(deps: CfgDeps, id: string, remains: boolean): Promise<void> {
+  return changeList(deps, async (all) => {
+    const r = all.find((x) => x.id === id);
+    if (!r) return { records: null, result: undefined };
+    r.deleted = { at: deps.clock().toISOString(), remains: remains || r.deleted?.remains === true };
+    return { records: all, result: undefined };
+  });
+}
+
 export async function markPendingComplete(deps: CfgDeps, id: string): Promise<void> {
   return changeList(deps, async (all) => {
     const r = all.find((x) => x.id === id);
@@ -205,6 +238,7 @@ export const isExpired = (rec: PendingOldCopy, deps: Pick<Deps, "clock">) => dep
 /** Old copies of finished moves that can still be deleted with `deleteOldCopy(oldRoot, { confirm: true })`. */
 export async function listPendingOldCopies(deps: CfgDeps): Promise<Array<PendingOldCopy & { expiresAt: string; expired: boolean }>> {
   return (await load(deps))
-    .filter((r) => r.complete)
+    // A copy the app already deleted (kept only to be looked at again, R409 a) is not offered again.
+    .filter((r) => r.complete && !r.deleted)
     .map((r) => ({ ...r, expiresAt: new Date(Date.parse(r.createdAt) + OLD_COPY_TTL_MS).toISOString(), expired: isExpired(r, deps) }));
 }

@@ -30,7 +30,8 @@
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AuditEvent, Project } from "@ao/core";
-import { auditedDestructions, outstandingOf, parseObject, readPlain, retentionNames, sha256, strings } from "./destruction-record.js";
+import { auditedDestructions, oldCopiesOutstandingOf, oldCopiesPending, outstandingOf, parseObject, readPlain, retentionNames, sha256, strings } from "./destruction-record.js";
+import type { OldCopiesNote } from "./export/backup.js";
 import { projectMovedAway } from "./library.js";
 import { auditSegments } from "./repo/audit-store.js";
 import { DESTRUCTION_CERTIFICATE } from "./repo/destroy.js";
@@ -458,6 +459,22 @@ export function inheritedOutstanding(events: Iterable<AuditEvent | null>, folder
   for (const a of auditedDestructions(events).list) {
     const left = outstandingOf(a);
     if (left.length) notes[`${folder}/retention/${a.certificate}`] = { files: left };
+  }
+  return notes;
+}
+
+/**
+ * Package-internal (restore, R379): the old copies of the library a restored copy inherits as still
+ * holding destroyed files, as inheritedOutstanding does for backups: the note behind its
+ * `destruction-old-copies-pending` warning from the moment it is live. The duty follows the data
+ * (R175): its own retry passes settle it, by looking at this computer's list and the old copies.
+ */
+export function inheritedOldCopies(events: Iterable<AuditEvent | null>, folder: string): Record<string, OldCopiesNote> {
+  const notes: Record<string, OldCopiesNote> = {};
+  for (const a of auditedDestructions(events).list) {
+    if (!oldCopiesPending(a)) continue;
+    const copies = oldCopiesOutstandingOf(a).map((id) => ({ id, movedAt: a.oldCopies.get(id)!.movedAt }));
+    notes[`${folder}/retention/${a.certificate}`] = { copies, ...(a.oldCopiesUnchecked && a.oldCopiesCheckedAt === undefined ? { unchecked: true as const } : {}) };
   }
   return notes;
 }

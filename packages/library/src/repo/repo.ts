@@ -1,4 +1,5 @@
 /** `openRepo` and the `Repo` facade: one per open library. */
+import { DESTRUCTION_OLD_COPIES_PENDING_WARNING as DESTRUCTION_OLD_COPIES_PENDING_WARNING_KIND } from "@ao/shared";
 import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -1174,8 +1175,16 @@ export const BACKUP_AUDIT_PENDING_WARNING = "backup-audit-pending";
 export const DESTRUCTION_BACKUPS_PENDING_WARNING = "destruction-backups-pending";
 
 /**
+ * Noted in `Backups/backups-state.json` (`oldCopiesUndestroyed`) while an old copy of the library
+ * left by a move, which this computer lists, still holds files a destruction under the retention
+ * rule destroyed, or while that list could not be checked (R379). Rewritten from the audit log at
+ * every retry pass, as the backups' note is; its sentences are in @ao/shared (oldCopiesPendingText).
+ */
+export { DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "@ao/shared";
+
+/**
  * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
- * 'backup-failed', R92; 'backup-audit-pending', R125; 'destruction-backups-pending', R147;
+ * 'backup-failed', R92; 'backup-audit-pending', R125; 'destruction-backups-pending', R147; 'destruction-old-copies-pending', R379;
  * 'recovery-code-unshown', R141 b; 'audit-unrecorded' and 'permissions-not-set', Task 50).
  */
 export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
@@ -1195,6 +1204,11 @@ export async function projectWarnings(repo: Repo, projectId: string): Promise<st
     // Per destruction certificate (R2-I2): the warning stands while any of them has a backup left.
     const lists = Array.isArray(stuck) ? [stuck] : stuck && typeof stuck === "object" ? Object.values(stuck as Record<string, unknown>) : [];
     if (lists.some((l) => Array.isArray(l) && l.length > 0)) out.push(DESTRUCTION_BACKUPS_PENDING_WARNING);
+    // Old copies of the library left by a move (R379), per certificate: a copy listed, or a list not checked.
+    const copies = (m as { oldCopiesUndestroyed?: Record<string, unknown> } | undefined)?.oldCopiesUndestroyed;
+    const mine = copies && typeof copies === "object" && Object.hasOwn(copies, projectId) ? copies[projectId] : undefined;
+    const noted = mine && typeof mine === "object" ? Object.values(mine as Record<string, { copies?: unknown; unchecked?: unknown } | null>) : [];
+    if (noted.some((n) => (Array.isArray(n?.copies) && n.copies.length > 0) || n?.unchecked === true)) out.push(DESTRUCTION_OLD_COPIES_PENDING_WARNING_KIND);
     const pending = m?.pending && typeof m.pending === "object" ? Object.values(m.pending) : [];
     if (pending.some((op) => (op as { kind?: unknown; projectId?: unknown; auditFailed?: unknown } | null)?.kind === "prune" && (op as { projectId?: unknown }).projectId === projectId && (op as { auditFailed?: unknown }).auditFailed === true)) {
       out.push(BACKUP_AUDIT_PENDING_WARNING);

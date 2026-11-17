@@ -37,7 +37,7 @@ import {
   listUnfinishedMoves,
   markPendingComplete,
   readVerifiedHashes,
-  removePendingOldCopy,
+  markPendingDeleted,
   type PendingOldCopy,
 } from "./old-copies.js";
 import { addKnownPath, registerLibrary } from "./registry.js";
@@ -1113,7 +1113,13 @@ export async function deleteOldCopy(
     if (acquired) await releaseLock(root, deps).catch(() => {});
   }
   if (!rec.split) rootRemoved = await fsp.rmdir(root).then(() => true, () => false);
-  await removePendingOldCopy(deps, rec.id);
+  // The record is not dropped while anything of the library stays at the old place (R409 a): it is
+  // marked deleted (with `remains` when a file was kept or left, or the place still holds data of
+  // the moved projects), so a destruction under the retention rule that names this copy goes on
+  // looking there. (Imported when needed: retention.ts imports backups, which import this module.)
+  const { oldPlaceLook, pruneDeletedOldCopy, recordOldCopyDeleted } = await import("./retention.js");
+  const remains = kept.length > 0 || leftovers.length > 0 || (await oldPlaceLook(rec)) !== "none";
+  await markPendingDeleted(deps, rec.id, remains);
 
   await auditIn(
     rec.newRoot,
@@ -1125,5 +1131,18 @@ export async function deleteOldCopy(
     warnings,
     { expectId: rec.libraryId },
   );
+  // A destruction under the retention rule that named this old copy as not destroyed records it as
+  // removed once none of its files is left there, and its warning ends (R379), in the library open
+  // here. Elsewhere, the next retry pass there looks at the place.
+  const dest = opts.destRepo && repoLibrary(opts.destRepo).id === rec.libraryId ? opts.destRepo : undefined;
+  if (dest) {
+    for (const p of dest.listProjects()) {
+      await recordOldCopyDeleted(dest, p.id, rec.id).catch((err: unknown) => {
+        warnings.push(`That the old copy was deleted could not be recorded for a destruction in project ${p.id} yet (${msg(err)}); it is recorded when the library is next opened`);
+      });
+    }
+  }
+  // Dropped now when nothing of the library is left there and no destruction names it.
+  await pruneDeletedOldCopy(deps, rec.libraryId, rec.id, join(dest ? repoLibrary(dest).root : rec.newRoot, "Backups")).catch(() => {});
   return { filesDeleted, kept: kept.sort(), leftovers, movedAwayKept, rootRemoved, warnings };
 }
