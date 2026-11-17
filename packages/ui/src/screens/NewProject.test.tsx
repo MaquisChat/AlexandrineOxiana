@@ -320,3 +320,187 @@ describe("New project dialog", () => {
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "New project" }));
   });
 });
+
+/** Fills the dialog for an unencrypted project (identifiable off, encryption off). */
+async function fillOpen(dialog: HTMLElement, user: ReturnType<typeof userEvent.setup>) {
+  await user.type(within(dialog).getByRole("textbox", { name: "Project name" }), "Tide-line interviews");
+  await user.click(within(dialog).getByRole("checkbox", { name: /holds identifiable information/ }));
+  await user.click(within(dialog).getByRole("checkbox", { name: "Encrypt this project" }));
+}
+
+/** Fills the dialog for an encrypted project and creates it; resolves at the recovery step. */
+async function createEncrypted(user: ReturnType<typeof userEvent.setup>) {
+  const dialog = await openDialog(user);
+  await user.type(within(dialog).getByRole("textbox", { name: "Project name" }), "Clinic follow-up");
+  await user.click(within(dialog).getByRole("checkbox", { name: "HIPAA" }));
+  await user.type(within(dialog).getByLabelText("Passphrase"), "correct horse battery");
+  await user.type(within(dialog).getByLabelText("Passphrase again"), "correct horse battery");
+  await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+  await screen.findByRole("heading", { name: "Save the recovery code" });
+  return screen.getByRole("dialog", { name: "Save the recovery code" });
+}
+
+describe("New project dialog: the refusal's variants, the clipboard, the keyboard while busy (FR-195)", () => {
+  const IDENTIFIABLE_REFUSAL =
+    "This project contains identifiable data and pseudonymizes file names; the pseudonym map must be stored encrypted, so enable encryption for this project";
+
+  it("the identifiable-data refusal is said in plain words, switches encryption on and asks for a passphrase", async () => {
+    const posted = serveCreate(() => HttpResponse.json({ error: { code: "VALIDATION", message: IDENTIFIABLE_REFUSAL } }, { status: 400 }));
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toBe(
+      "These rules require encryption, so the project was not created. Encryption is now on: choose a passphrase, enter it twice, and create the project again.",
+    );
+    // The service's own wording (its terms, its internals) is not shown.
+    expect(dialog.textContent).not.toMatch(/pseudonym map|pseudonymizes|enable encryption for this project/);
+    expect(posted).toHaveLength(1);
+    const encrypt = within(dialog).getByRole("checkbox", { name: "Encrypt this project" });
+    expect(encrypt).toHaveProperty("checked", true);
+    expect(encrypt).toHaveProperty("disabled", true);
+    expect(within(dialog).getByText(/Encryption is required/).textContent).toBe("Encryption is required. The project's rules require it.");
+    await waitFor(() => expect(document.activeElement).toBe(within(dialog).getByLabelText("Passphrase")));
+  });
+
+  it("after the encryption refusal, choosing a passphrase completes the create as an encrypted project", async () => {
+    let calls = 0;
+    const posted = serveCreate(() =>
+      ++calls === 1
+        ? HttpResponse.json({ error: { code: "VALIDATION", message: "Governance requires encryption at rest; enable encryption for this project" } }, { status: 400 })
+        : HttpResponse.json({ project: { ...NEW_ENC, name: "Tide-line interviews" }, recoveryCode: RECOVERY }),
+    );
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await within(dialog).findByRole("alert");
+    expect(posted[0]!.encryption).toEqual({ enabled: false });
+
+    await user.type(within(dialog).getByLabelText("Passphrase"), "correct horse battery");
+    await user.type(within(dialog).getByLabelText("Passphrase again"), "correct horse battery");
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+
+    const step = await screen.findByRole("dialog", { name: "Save the recovery code" });
+    expect(within(step).getByText(RECOVERY)).toBeTruthy();
+    expect(posted).toHaveLength(2);
+    expect(posted[1]!.name).toBe("Tide-line interviews");
+    expect(posted[1]!.encryption).toEqual({ enabled: true, passphrase: "correct horse battery" });
+    // The second create's rules no longer say encryption is optional.
+    expect(readConfig(posted[1]!.governanceYaml).encryption.atRest).not.toBe("optional");
+
+    await user.click(within(step).getByRole("checkbox", { name: "I have saved the recovery code" }));
+    await user.click(within(step).getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(selected).toHaveBeenLastCalledWith("p4");
+  });
+
+  it("a clipboard that fails at the recovery step says so, keeps the code on screen and does not pass the step", async () => {
+    serveCreate(() => HttpResponse.json({ project: NEW_ENC, recoveryCode: RECOVERY }));
+    const selected = vi.fn();
+    const user = userEvent.setup(); // installs its own clipboard: stubbed after it
+    const writeText = vi.fn(async () => {
+      throw new DOMException("Document is not focused.", "NotAllowedError");
+    });
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(<Routed onSelected={selected} />);
+    const step = await createEncrypted(user);
+
+    await user.click(within(step).getByRole("button", { name: "Copy recovery code" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(RECOVERY));
+    const status = await within(step).findByRole("status");
+    expect(status.textContent).toBe("Copying did not work here. Select the code and copy it, or write it down.");
+    expect(within(step).queryByText("Copied.")).toBeNull();
+    // The code is still there, and the step is not passed: Done stays off until confirmed.
+    expect(within(step).getByText(RECOVERY)).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Save the recovery code" })).toBe(step);
+    expect(within(step).getByRole("button", { name: "Done" })).toHaveProperty("disabled", true);
+    expect(selected).not.toHaveBeenCalledWith("p4");
+  });
+
+  it("Tab and Shift+Tab stay inside the recovery step", async () => {
+    serveCreate(() => HttpResponse.json({ project: NEW_ENC, recoveryCode: RECOVERY }));
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    const step = await createEncrypted(user);
+    const copy = within(step).getByRole("button", { name: "Copy recovery code" });
+    const saved = within(step).getByRole("checkbox", { name: "I have saved the recovery code" });
+    expect(document.activeElement).toBe(within(step).getByRole("heading", { name: "Save the recovery code" }));
+
+    // jsdom's selector engine lists a selector group's matches group by group (all inputs, then all
+    // buttons), not in document order as the DOM standard and every browser do; the trap reads its
+    // ends from such a list. The dialog's own lookups are put in document order here, as a browser's.
+    const own = step.querySelectorAll.bind(step);
+    Object.defineProperty(step, "querySelectorAll", {
+      configurable: true,
+      value: (sel: string) => Array.from(own(sel)).sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1)),
+    });
+
+    // Done is off until the code is confirmed: from the heading, Tab goes to the copy button, then the
+    // confirmation, then wraps; Shift+Tab wraps the other way.
+    await user.tab();
+    expect(document.activeElement).toBe(copy);
+    await user.tab();
+    expect(document.activeElement).toBe(saved);
+    await user.tab();
+    expect(document.activeElement).toBe(copy);
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(document.activeElement).toBe(saved);
+
+    // Once confirmed, Done is the last control and the trap wraps from it, both ways.
+    await user.keyboard(" ");
+    const done = within(step).getByRole("button", { name: "Done" });
+    expect(done).toHaveProperty("disabled", false);
+    await user.tab();
+    expect(document.activeElement).toBe(done);
+    await user.tab();
+    expect(document.activeElement).toBe(copy);
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(document.activeElement).toBe(done);
+    expect(screen.getByRole("dialog", { name: "Save the recovery code" })).toBe(step);
+  });
+
+  it("Escape while the create is in flight neither closes the dialog nor loses the recovery code that comes back", async () => {
+    let answer!: (r: Response) => void;
+    const posted: Posted[] = [];
+    server.use(
+      http.post(url("/projects"), async ({ request }) => {
+        posted.push((await request.json()) as Posted);
+        return new Promise<Response>((resolve) => (answer = resolve));
+      }),
+      ...libraryHandlers(),
+    );
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    const dialog = await openDialog(user);
+    await user.type(within(dialog).getByRole("textbox", { name: "Project name" }), "Clinic follow-up");
+    await user.click(within(dialog).getByRole("checkbox", { name: "HIPAA" }));
+    await user.type(within(dialog).getByLabelText("Passphrase"), "correct horse battery");
+    await user.type(within(dialog).getByLabelText("Passphrase again"), "correct horse battery");
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(within(dialog).getByRole("status").textContent).toMatch(/Creating the project/);
+
+    // Escape from inside the dialog while busy: nothing closes.
+    within(dialog).getByRole("textbox", { name: "Project name" }).focus();
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "New project" })).toBe(dialog);
+    expect(screen.getByRole("navigation", { name: "Projects", hidden: true }).closest("[inert]")).not.toBeNull();
+
+    // The answer arrives: the recovery code is shown, and Escape there does nothing either.
+    answer(HttpResponse.json({ project: NEW_ENC, recoveryCode: RECOVERY }));
+    const step = await screen.findByRole("dialog", { name: "Save the recovery code" });
+    expect(within(step).getByText(RECOVERY)).toBeTruthy();
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Save the recovery code" })).toBe(step);
+    expect(within(step).getByText(RECOVERY)).toBeTruthy();
+    expect(posted).toHaveLength(1);
+    expect(selected).not.toHaveBeenCalledWith("p4");
+  });
+});
