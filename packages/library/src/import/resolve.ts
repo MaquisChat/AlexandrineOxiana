@@ -86,6 +86,23 @@ const MAX_IDENTIFIER_LOOKUPS = 3;
 /** Confidence of an identifier lookup whose title disagrees with the file's own title (R49e). */
 const CONFLICT_CONFIDENCE = 0.6;
 const AGREE = 0.9;
+/** Core's cross-source threshold for titles (verify/checks.ts `conflicts`): below it two titles disagree. */
+const CROSS_SOURCE_AGREE = 0.6;
+
+/**
+ * R394 c: the embedded title is only a part of the reference title, or the other way round (a running head, a title
+ * without its subtitle, a title cut off by a length limit): after folding case, accents, punctuation and white space
+ * they are equal, or one begins with or contains the other and the shorter has at least three words.
+ */
+function partOfTitle(a: string, b: string): boolean {
+  const x = normalizeTitle(a);
+  const y = normalizeTitle(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  if (short.split(" ").length < 3) return false;
+  return long.startsWith(short) || ` ${long} `.includes(` ${short} `);
+}
 
 export interface ResolveInput {
   /** The file; absent for a metadata-only item (reference metadata, no file): nothing is extracted. */
@@ -335,7 +352,16 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       ...(extracted.issued ? { issued: extracted.issued } : {}),
     }, { kind: "embedded" });
   } else if (done() && extracted.title) {
-    record("title", extracted.title, { kind: "embedded" });
+    // R394 c: agreement before conflict. The embedded title AGREES with the reference title when it is only a part
+    // of it (partOfTitle) or core's cross-source measure says so (similarity >= 0.6). Core's checks would still call
+    // such a title a conflict (its draft-vs-evidence check accepts only an equal title or a similarity >= 0.9), so an
+    // embedded title that agrees only loosely is not recorded as title evidence: the item's title is the reference's
+    // either way. An equal or nearly equal one is recorded (it corroborates); one that clearly names another work is
+    // recorded and stays a conflict, worth the researcher's look (the wrong file may be attached).
+    const sim = refFields.title ? titleSimilarity(refFields.title, extracted.title) : 0;
+    const same = !refFields.title || normalizeTitle(refFields.title) === normalizeTitle(extracted.title) || sim >= AGREE;
+    const agrees = !!refFields.title && (sim >= CROSS_SOURCE_AGREE || partOfTitle(refFields.title, extracted.title));
+    if (same || !agrees) record("title", extracted.title, { kind: "embedded" });
   }
 
   // 3. Identifiers (+ lookup). An identifier from the file (metadata fields or the first pages'
