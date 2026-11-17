@@ -131,3 +131,19 @@ export async function importOverlapsLibrary(dir: string, lib: { root: string }, 
   if (insideFolder(root, dir) || insideFolder(dir, root)) return true;
   return (await onFolderPath(dir, await folderId(lib.root, stat), stat)) || (await onFolderPath(root, await folderId(dir, stat), stat));
 }
+
+/**
+ * An export's destination (R379 FR-A14, R390 c, R408 c): refused when its real path is inside the library, except in
+ * the library's own `Exports` folder — the library's place for exports and the default destination — whether it is
+ * the default or named outright. Decided on the real path (links followed; a path not there yet by its nearest
+ * existing parent plus the remaining names, so `<root>/Exports/…` before `Exports` exists is allowed): a link named
+ * `Exports` that leads elsewhere, or `Exports/../Projects/…`, resolves out of it and stays refused. A second spelling
+ * of the library (a bind mount, a firmlink) is caught by the device and inode walk and stays refused. A file in
+ * `Exports` is in the clear, as every export is, and the import refuses to take a file from inside the library (R368
+ * a), so what is written there is not imported back from there.
+ */
+export async function exportDestinationInsideLibrary(path: string, lib: { root: string }, stat: StatId = statId): Promise<boolean> {
+  const real = await realOrNearest(path);
+  if (insideFolder(join(await libraryRealRoot(lib.root), "Exports"), real)) return false;
+  return realInsideLibrary(real, lib, stat);
+}

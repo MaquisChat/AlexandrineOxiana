@@ -4,7 +4,7 @@
  * service's entry point.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -362,6 +362,35 @@ describe("governance, audit, citations", () => {
     const rm = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "bibtex" } });
     expect(rm.status, rm.body).toBe(200);
     expect(rm.json.text).toContain("@");
+  });
+
+  it("R379 (FR-A14): POST /export/refman refuses an outputPath inside the library (400, the sentence); the rules file is unchanged", async () => {
+    const libPath = await openNewLibrary();
+    const pid = await newProject();
+    const sid = (await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } })).json.items[0].sourceId;
+    const gov = join(libPath, "Projects", "Study", "governance.yaml");
+    const before = await readFile(gov);
+    const r = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: gov } });
+    expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message: IN_LIBRARY_TEXT.exportFile }]);
+    expect(await readFile(gov)).toEqual(before);
+    const rel = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: "refs.ris" } });
+    expect(rel.status).toBe(400);
+    const ok = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: join(tmp, "refs.ris") } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(await readFile(join(tmp, "refs.ris"), "utf8")).toContain("TY  - ");
+  });
+
+  it("R390 (c): POST /bibliography refuses a dest inside the library (400, the sentence) and makes no folder; one outside works", async () => {
+    const libPath = await openNewLibrary();
+    const pid = await newProject();
+    const sid = (await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } })).json.items[0].sourceId;
+    const dest = join(libPath, "Projects", "Study", "sources", "zz-new");
+    const r = await call({ method: "POST", url: "/bibliography", body: { projectId: pid, selection: { sourceIds: [sid] }, style: "apa", format: "text", dest } });
+    expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message: IN_LIBRARY_TEXT.exportFile }]);
+    await expect(stat(dest)).rejects.toThrow();
+    const ok = await call({ method: "POST", url: "/bibliography", body: { projectId: pid, selection: { sourceIds: [sid] }, style: "apa", format: "text", dest: join(tmp, "bibs") } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(await readFile(ok.json.path, "utf8")).toContain("Coastal");
   });
 });
 

@@ -764,6 +764,15 @@ describe("import, export, secrets and maintenance", () => {
     expect(webDry.stderr).not.toMatch(/was not saved/u);
   }, 120_000);
 
+  it("R379 (FR-A14): export --output inside the library is refused (exit 1, the sentence); the rules file is unchanged", async () => {
+    const gov = join(lib, "Projects", "RefsB", "governance.yaml");
+    const before = await readFile(gov);
+    const r = await run(["export", "--project", "RefsB", "--format", "bibtex", "--output", gov]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain(IN_LIBRARY_TEXT.exportFile);
+    expect(await readFile(gov)).toEqual(before);
+  }, 60_000);
+
   it("review round 1: export --output to a folder or into a missing folder gives a plain message", async () => {
     const dir = await run(["export", "--project", "RefsB", "--format", "ris", "--output", tmp]);
     expect(dir.code).toBe(1);

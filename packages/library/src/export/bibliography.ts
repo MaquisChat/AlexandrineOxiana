@@ -14,7 +14,7 @@
  * hasLocation:false}})` (authorizeProcessing: a deny is audited and refuses the whole request,
  * PolicyDeniedError). Under `deidentified-only` identifiable sources are left out and the result
  * says so ("1 source withheld by project policy"). Participant rules (R88 I2, wired here from the
- * project's governance): the pseudonym map (keys/pseudonyms.json.enc) plus each participant's
+ * project's governance; the reference exports use the same rules, R379 FR-A14): the pseudonym map (keys/pseudonyms.json.enc) plus each participant's
  * identifying details (name / handle fields) map people to their participant codes; in a project
  * that holds identifiable data and pseudonymizes names, every creator of an identifiable source must
  * have a code (requireParticipantCodes; a source linked to participants always does) — otherwise
@@ -39,15 +39,18 @@ import {
   type SourceFile,
   type ToCslOptions,
 } from "@ao/core";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { renderBibliographyIn, renderCitationIn } from "../citation/custom-styles.js";
 import { writeFileAtomic } from "../fs/atomic.js";
-import { NotFoundError } from "../repo/errors.js";
+import { exportDestinationInsideLibrary } from "../fs/inside-library.js";
+import { InvalidInputError, NotFoundError } from "../repo/errors.js";
 import { foldName, namesIn } from "../repo/io.js";
 import {
   appendLibraryEvent,
   authorizeProcessing,
   lookupPolicyInfo,
   projectCollectionsAndTags,
+  projectEncrypted,
   projectPseudonymMap,
   pseudonymizesIdentifiable,
   repoLibrary,
@@ -90,9 +93,14 @@ const NAME_KEY = /name|handle|user|alias|account/iu;
 
 /**
  * The participant rules from the project's governance (R88 I2): the pseudonym map plus the
- * participants' identifying names, and whether identifiable sources must cite codes only.
+ * participants' identifying names, whether identifiable sources must cite codes only, and whether the
+ * project can keep a list of participants' names at all (`keepsNameList`: only an encrypted one does;
+ * R390 d tells "no list" apart from "a participant without a code" by it).
  */
-async function participantRules(repo: Repo, projectId: string): Promise<{ pseudonyms: Map<string, string>; requireCodes: boolean }> {
+export async function participantRules(
+  repo: Repo,
+  projectId: string,
+): Promise<{ pseudonyms: Map<string, string>; requireCodes: boolean; keepsNameList: boolean }> {
   // The engine's own condition decides (unreadable governance: the strictest reading).
   const requireCodes = await pseudonymizesIdentifiable(repo, projectId);
   const pseudonyms = await projectPseudonymMap(repo, projectId);
@@ -100,7 +108,7 @@ async function participantRules(repo: Repo, projectId: string): Promise<{ pseudo
   for (const p of fw.participants) {
     for (const [k, v] of Object.entries(p.details ?? {})) if (NAME_KEY.test(k) && v.trim().length >= 2 && !pseudonyms.has(v.trim())) pseudonyms.set(v.trim(), p.code);
   }
-  return { pseudonyms, requireCodes };
+  return { pseudonyms, requireCodes, keepsNameList: projectEncrypted(repo, projectId) };
 }
 
 interface Prepared {
@@ -221,7 +229,9 @@ function document(body: string, format: CitationFormat, notes: string[]): string
 
 /**
  * The bibliography of `selection` in `styleId`, written to Exports/ (or the folder `dest`) under a
- * dated name. Throws PolicyDeniedError when the project's rules refuse it (nothing is written).
+ * dated name. Throws PolicyDeniedError when the project's rules refuse it (nothing is written), and InvalidInputError
+ * when `dest` lies inside the open library's own folder other than its `Exports` folder (R390 c, R408 c; nothing is
+ * made or written).
  */
 export async function exportBibliography(
   repo: Repo,
@@ -233,6 +243,10 @@ export async function exportBibliography(
   opts: CiteOptions = {},
 ): Promise<BibliographyResult> {
   if (!(format in EXT)) throw new TypeError(`unknown format "${String(format)}"`);
+  // A folder the researcher names is never inside the open library's own folder, its `Exports` folder apart (R390 c,
+  // R408 c; the reference export's check: by real path, links followed): refused before anything is evaluated, made,
+  // written or audited.
+  if (dest !== undefined && (await exportDestinationInsideLibrary(dest, repoLibrary(repo)))) throw new InvalidInputError(IN_LIBRARY_TEXT.exportFile);
   const project = repo.getProject(projectId);
   const ids = await selected(repo, projectId, selection);
   const prep = await prepare(repo, projectId, ids, "export.bibliography", opts.lang);
