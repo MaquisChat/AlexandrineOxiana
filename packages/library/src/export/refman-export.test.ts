@@ -485,4 +485,26 @@ describe("R379 (FR-A14, I1): the destination is never inside the library", () =>
     expect(r.exported).toBe(1);
     expect(await readFile(out, "utf8")).toContain("@article{smith2020paper,");
   });
+
+  it("R408 (c): a file in the library's own Exports folder is written; every other place inside stays refused", async () => {
+    const { p, id } = await withOriginal();
+    // Refused first (the helper asserts no export was audited at all): `..` out of Exports, the project's folder,
+    // Backups, the library's root, and a link named Exports that leads elsewhere inside the library.
+    await refusedInside(p, id, `${join(lib.root, "Exports")}/../Projects/${p.folder.split("/").pop()}/x.bib`);
+    await refusedInside(p, id, join(lib.root, p.folder, "x.bib"));
+    await refusedInside(p, id, join(lib.root, "Backups", "x.bib"));
+    await refusedInside(p, id, join(lib.root, "x.bib"));
+    await rm(join(lib.root, "Exports"), { recursive: true, force: true });
+    await symlink(join(lib.root, p.folder), join(lib.root, "Exports"));
+    await refusedInside(p, id, join(lib.root, "Exports", "x.bib"));
+    await expect(stat(join(lib.root, p.folder, "x.bib"))).rejects.toThrow();
+    // The library's Exports folder (the writer makes no folder: it must exist, as for any destination).
+    await rm(join(lib.root, "Exports"));
+    await mkdir(join(lib.root, "Exports"));
+    const out = join(lib.root, "Exports", "refs.bib");
+    const r = await writeRefmanExport(repo, p.id, [id], "bibtex", out);
+    expect(r.exported).toBe(1);
+    expect(await readFile(out, "utf8")).toContain("@article{smith2020paper,");
+    await expect(stat(join(lib.root, p.folder, "x.bib"))).rejects.toThrow();
+  });
 });

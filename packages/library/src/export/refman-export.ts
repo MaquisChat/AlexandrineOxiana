@@ -40,7 +40,8 @@
  * out with a note. One `export.refman` audit event records the format and counts (never the path).
  * `writeRefmanExport` writes the file atomically (0600) to the path the user chose — never inside the open library's
  * own folder (R379, FR-A14: by real path, links followed, a path not there yet by its nearest existing parent; an
- * original, the rules file or any other library file is never replaced by an export), never over a folder or a
+ * original, the rules file or any other library file is never replaced by an export) except its `Exports` folder
+ * (R408 c), never over a folder or a
  * symbolic link. A refused destination is an invalid input: nothing is evaluated, written or audited.
  */
 import type { Biblio, BiblioField, CslItem, CslName, Creator, Source, SourceFile, SourceType, ToCslOptions } from "@ao/core";
@@ -48,7 +49,7 @@ import { BIBLIO_FIELDS, ParticipantCodeMissingError, biblioOf, primary, toCslIte
 import { lstat } from "node:fs/promises";
 import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { writeFileAtomic } from "../fs/atomic.js";
-import { insideLibrary } from "../fs/inside-library.js";
+import { exportDestinationInsideLibrary } from "../fs/inside-library.js";
 import { InvalidInputError } from "../repo/errors.js";
 import { appendLibraryEvent, authorizeProcessing, projectCollectionsAndTags, repoLibrary, type Repo } from "../repo/repo.js";
 import { participantRules } from "./bibliography.js";
@@ -538,11 +539,11 @@ function suffix(n: number): string {
 }
 
 /**
- * Refuses a destination inside the open library's own folder (by real path; the check the imports and the open-format
- * export use, R362 c, R92 I1), an existing folder and a symbolic link (R379, FR-A14). InvalidInputError, path-free.
+ * Refuses a destination inside the open library's own folder other than its `Exports` folder (by real path; the check
+ * the imports and the open-format export use, R362 c, R92 I1, with `Exports` allowed, R408 c), an existing folder and a symbolic link (R379, FR-A14). InvalidInputError, path-free.
  */
 async function checkDestination(repo: Repo, outputPath: string): Promise<void> {
-  if (await insideLibrary(outputPath, repoLibrary(repo))) throw new InvalidInputError(IN_LIBRARY_TEXT.exportFile);
+  if (await exportDestinationInsideLibrary(outputPath, repoLibrary(repo))) throw new InvalidInputError(IN_LIBRARY_TEXT.exportFile);
   const st = await lstat(outputPath).catch(() => null);
   if (st?.isSymbolicLink()) throw new InvalidInputError(EXPORT_FILE_IS_LINK);
   if (st?.isDirectory()) throw new InvalidInputError(EXPORT_FILE_IS_FOLDER);
