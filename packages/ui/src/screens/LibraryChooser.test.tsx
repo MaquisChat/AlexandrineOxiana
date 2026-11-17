@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 import { LIBRARIES, server, serviceError, testApi, url, useMockService } from "../test/service";
-import { LibraryChooser } from "./LibraryChooser";
+import { LibraryChooser, roomSentence } from "./LibraryChooser";
 
 useMockService();
 
@@ -245,5 +245,23 @@ describe("LibraryChooser", () => {
     expect(await screen.findByText("Free space on that disk: 212 GB.")).toBeTruthy();
     await user.tab();
     expect(document.activeElement).toBe(screen.getByLabelText("New library name"));
+  });
+
+  it("R449 d (M4): the room is never written larger than it is, and the figure and the little-room sentence agree", () => {
+    const LITTLE = " That is little room: an import copies its files into the library.";
+    const rows: Array<[number, string]> = [
+      [9_999_999_999, "9.9 GB." + LITTLE],
+      [9.96e9, "9.9 GB." + LITTLE],
+      [0, "less than 1 MB." + LITTLE],
+      [999.6e6, "999 MB." + LITTLE],
+      [3.6e12, "3.6 TB."],
+      [10e9, "10 GB."],
+      [11e9, "11 GB."],
+      [212.9e9, "212 GB."],
+      [999.99e9, "999 GB."],
+      [1e12, "1 TB."],
+      [1.5e9, "1.5 GB." + LITTLE],
+    ];
+    for (const [bytes, rest] of rows) expect([bytes, roomSentence(bytes)]).toEqual([bytes, `Free space on that disk: ${rest}`]);
   });
 });

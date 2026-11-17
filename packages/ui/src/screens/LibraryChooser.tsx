@@ -8,7 +8,6 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { ApiClientError } from "../api/client";
 import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry, type LibraryState } from "../api/library";
-import { formatSize } from "../api/tools";
 import { PathField } from "../components/PathField";
 import { DeviceNoticeBanners, useNoticeDismiss } from "../components/StatusBanner";
 import { UserText } from "../components/UserText";
@@ -27,8 +26,23 @@ const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 const ROOM_PAUSE_MS = 300;
 /** R447 b: under this many free bytes the line adds that it is little room. */
 const LITTLE_ROOM = 10e9;
-const roomText = (bytes: number) =>
-  `Free space on that disk: ${formatSize(bytes)}.${bytes < LITTLE_ROOM ? " That is little room: an import copies its files into the library." : ""}`;
+/** `n` rounded DOWN to one decimal, without a trailing ".0". */
+const downToTenth = (n: number) => String(Math.floor(n * 10) / 10);
+/**
+ * A disk's free room in words, never larger than it is (R449 d): rounded down — from 1,000 GB in TB with one decimal,
+ * from 10 GB in whole GB, from 1 GB in GB with one decimal, from 1 MB in whole MB, below that "less than 1 MB" — so the
+ * figure and the little-room sentence (under 10 GB) can never contradict each other. Only this line; `formatSize`
+ * keeps its own rounding for the rest of the app.
+ */
+const roomFigure = (bytes: number): string => {
+  if (bytes >= 1e12) return `${downToTenth(bytes / 1e12)} TB`;
+  if (bytes >= 10e9) return `${Math.floor(bytes / 1e9)} GB`;
+  if (bytes >= 1e9) return `${downToTenth(bytes / 1e9)} GB`;
+  if (bytes >= 1e6) return `${Math.floor(bytes / 1e6)} MB`;
+  return "less than 1 MB";
+};
+export const roomSentence = (bytes: number) =>
+  `Free space on that disk: ${roomFigure(bytes)}.${bytes < LITTLE_ROOM ? " That is little room: an import copies its files into the library." : ""}`;
 
 export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProps) {
   const [libraries, setLibraries] = useState<LibraryEntry[] | undefined>();
@@ -213,7 +227,7 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
             </button>
           </p>
         )}
-        <p role="status">{room && room.path === path.trim() ? roomText(room.bytes) : ""}</p>
+        <p role="status">{room && room.path === path.trim() ? roomSentence(room.bytes) : ""}</p>
       </div>
       <form className="ao-inline-form" onSubmit={(e) => void openTyped(e, true)}>
         <label htmlFor={`${id}-name`}>New library name</label>
