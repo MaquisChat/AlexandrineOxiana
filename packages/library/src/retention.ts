@@ -1557,7 +1557,8 @@ async function settleOldCopies(
   for (const id of removed) next.oldCopiesRemoved.set(id, at);
   for (const id of gone) next.oldCopiesGone.set(id, at);
   const status = oldCopiesStatusOf(next);
-  const refOf = (id: string) => ({ movedAt: next.oldCopies.get(id)!.movedAt });
+  // By id, as the amendment records it (not the module's refOf, which `found` above uses).
+  const refById = (id: string) => ({ movedAt: next.oldCopies.get(id)!.movedAt });
   const number = a.amendments.length + 1;
   const content = {
     formatVersion: 1,
@@ -1569,9 +1570,9 @@ async function settleOldCopies(
     at,
     oldCopies: {
       ...(needCheck ? { checkedAt: at, found: found.map((c) => ({ movedAt: c.movedAt, moveId: c.moveId })) } : {}),
-      removed: removed.map((id) => ({ ...refOf(id), at })),
-      noLongerHolding: gone.map((id) => ({ ...refOf(id), at })),
-      outstanding: oldCopiesOutstandingOf(next).map(refOf),
+      removed: removed.map((id) => ({ ...refById(id), at })),
+      noLongerHolding: gone.map((id) => ({ ...refById(id), at })),
+      outstanding: oldCopiesOutstandingOf(next).map(refById),
       status,
     },
   };

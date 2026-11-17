@@ -803,4 +803,20 @@ describe("R429: old copies of a moved library and a destruction's certificate (r
     await markPendingDeleted(deps(), (await records())[0]!.id, true);
     expect(await listPendingOldCopies(deps())).toEqual([]);
   });
+
+  it("a destruction that could not check the list: once readable, a pass that finds an old copy holding the data records it (and does not throw)", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    const good = await readFile(listFile(), "utf8");
+    await writeFile(listFile(), "{ damaged");
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "unknown-pending" });
+    await writeFile(listFile(), good);
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    const rec = await readDestruction(repo, p.id, r.certificatePath);
+    expect(rec.amendments).toHaveLength(1);
+    expect(rec.amendments[0]!.content).toMatchObject({ oldCopies: { found: [{ movedAt: MOVED_AT }], outstanding: [{ movedAt: MOVED_AT }], status: "pending" } });
+    expect(await oldCopiesAwaitingDeletion(repo, p.id)).toEqual([{ certificateFile: expect.any(String), oldCopies: [{ movedAt: MOVED_AT }] }]);
+  });
 });
