@@ -337,3 +337,4 @@ R413 (2026-11-17): FR-D31 — defect D31's leading cause is a full disk (reprodu
 R414 (2026-11-17): FR-A19 round 2 built — commits not one per point accepted; a finished move matched by destination only put to the reviewer; the countdown test judged in the verification; scoped look asked
 R415 (2026-11-17): FR-A11 approved after round 2 with small points — a small round 3: the snapshot drops path parameters and reads addresses as a browser does; a UUID and a long lower-case id count as a key; the last two blank checks; other-scheme addresses lose user information; test hygiene
 R416 (2026-11-17): FR-A10 round 3 built — where several participants' names fold alike, the one exactly named in the text gives its code; then a fresh reviewer for the whole task
+R417 (2026-11-17): FR-A19 approved after round 2 — one small mend (the lost-connection sentence goes when the service answers again), then done; three Minor points left (FR-687)
