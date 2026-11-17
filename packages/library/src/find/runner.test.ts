@@ -3077,9 +3077,14 @@ describe("F12: Search sources and Elicit in the runner", () => {
       const p = await project({ gov: ELICIT_GOV() });
       const { added } = await r.add(p.id, [LINE]);
       await settled(p, added[0]!.id);
+      // The record made, the copy part goes on and rests: every copy service is off in these settings (R312 c).
+      await until(async () => (await entryOf(p, added[0]!.id))?.reason !== undefined, "the copy part to rest");
       const e = (await entryOf(p, added[0]!.id))!;
       expect(e.state, String(status)).toBe("record-complete");
-      expect(e.reason).toBeUndefined();
+      // Nothing of Elicit's failure: the one reason is the copy part's, no attempt counted, no later try.
+      expect(e.reason).toEqual({ code: "switched-off", by: "settings" });
+      expect(e.attempts).toBe(0);
+      expect(e.nextTryAt).toBeUndefined();
     }
     // After the 429 Elicit is not asked again (five minutes, in this process): four bodies, not five.
     expect(elicitBodies.length).toBe(4);
@@ -4825,6 +4830,12 @@ describe("F15: a fetch through the researcher's library", () => {
   ];
   /** Rules under which a resting entry stays as it is at a resume (free copies not allowed: nothing is asked). */
   const NO_FREE = GOV("acquireMethods: [reference_lookup, library_access]");
+  /**
+   * Rules under which `rest` stays as it is when the copy part looks at the entry again (a way back wakes it: R324 b):
+   * "switched off" by the settings only where the rules allow free copies (the rules are asked first, so under NO_FREE
+   * the copy part says "copy-not-allowed" anew); every copy service is off in these tests' settings.
+   */
+  const stableFor = (rest: Rest) => (rest.reason?.code === "switched-off" ? GOV("acquireMethods: [reference_lookup, library_access, free_copy]") : NO_FREE);
   const draft = (o: { doi?: string | null; isbn?: string[]; type?: SourceDraft["type"] }): SourceDraft => ({
     ...draftOf(ZORBLATT),
     ...(o.type ? { type: o.type } : {}),
@@ -5009,7 +5020,7 @@ describe("F15: a fetch through the researcher's library", () => {
     for (const rest of RESTING) {
       // 1. Cancel.
       {
-        const p = await project({ gov: NO_FREE });
+        const p = await project({ gov: stableFor(rest) });
         const e = await resting(p, rest);
         const r = runner();
         const { ticket } = await r.libraryStart(p.id, e.id, EZ);
@@ -5021,7 +5032,7 @@ describe("F15: a fetch through the researcher's library", () => {
       }
       // 2. The ticket runs out (30 minutes).
       {
-        const p = await project({ gov: NO_FREE });
+        const p = await project({ gov: stableFor(rest) });
         const e = await resting(p, rest);
         const r = runner();
         const { ticket } = await r.libraryStart(p.id, e.id, EZ);
@@ -5035,7 +5046,7 @@ describe("F15: a fetch through the researcher's library", () => {
       }
       // 3. Start-up: a new runner (the ticket was in memory only) returns it at resume.
       {
-        const p = await project({ gov: NO_FREE });
+        const p = await project({ gov: stableFor(rest) });
         const e = await resting(p, rest);
         const r = runner();
         const { ticket } = await r.libraryStart(p.id, e.id, EZ);
@@ -5050,7 +5061,7 @@ describe("F15: a fetch through the researcher's library", () => {
       }
       // 4. The project locked (its key gone: nothing can be written), then unlocked.
       {
-        const p = await project({ gov: NO_FREE, encrypted: true });
+        const p = await project({ gov: stableFor(rest), encrypted: true });
         const e = await resting(p, rest);
         const r = runner();
         const { ticket } = await r.libraryStart(p.id, e.id, EZ);
@@ -5065,7 +5076,7 @@ describe("F15: a fetch through the researcher's library", () => {
       }
       // 5. The library closed (stopAll): the ticket ends at once; the entry comes back at the next open.
       {
-        const p = await project({ gov: NO_FREE });
+        const p = await project({ gov: stableFor(rest) });
         const e = await resting(p, rest);
         const r = runner();
         const { ticket } = await r.libraryStart(p.id, e.id, EZ);
