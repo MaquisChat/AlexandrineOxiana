@@ -55,7 +55,7 @@ import { findSourceBy, type IndexDb } from "../index/db.js";
 import { storeInputs } from "../import/common.js";
 import { serialStore } from "../import/project-queue.js";
 import { lookupContextFor, providerAllowed, type LookupContext } from "../lookup/context.js";
-import type { HttpClient } from "../lookup/http.js";
+import { retryAfterMs, type HttpClient } from "../lookup/http.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError } from "../repo/errors.js";
 import {
   appendFindEntriesIn,
@@ -118,6 +118,15 @@ export type FindHandOverEnd = { outcome: "held" } | { outcome: "not-kept"; why: 
 export const FIND_CONCURRENCY = 2;
 /** After a failure to get an answer the entry is tried again after each of these delays in turn, then it is "failed". */
 export const FIND_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000, 900_000];
+/** R411 b: the longest a service's Retry-After may put off the next try by itself (a longer wish is cut to this). */
+export const FIND_RETRY_AFTER_MAX_MS = 3_600_000;
+
+/** R411 b: the longest wait the services asked for (raw Retry-After values; unreadable ones ignored), cut to the hour. */
+function askedWaitMs(values: readonly string[], at: number): number {
+  let ms = 0;
+  for (const v of values) ms = Math.max(ms, Math.min(retryAfterMs(v, at) ?? 0, FIND_RETRY_AFTER_MAX_MS));
+  return ms;
+}
 /** How long the "Search sources" settings may take to answer (a local file: a stall is a fault, retried). */
 export const FIND_SETTINGS_TIMEOUT_MS = 5_000;
 /**
@@ -1570,13 +1579,16 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
      * before the failure and is kept for the next try (F8: the one person found, whose works did not come). `rest`, when
      * given, is where the entry rests instead of "failed" once the delays are spent (R379: a copy found, not downloaded).
      */
-    const tryLater = async (code: FindReasonCode, patch: Partial<FindEntry> = {}, rest: Partial<FindEntry> = {}) => {
+    const tryLater = async (code: FindReasonCode, patch: Partial<FindEntry> = {}, rest: Partial<FindEntry> = {}, retryAfter: readonly string[] = []) => {
       const attempts = at0.attempts + 1;
-      const delay = FIND_RETRY_DELAYS_MS[attempts - 1];
-      if (delay === undefined) {
+      const usual = FIND_RETRY_DELAYS_MS[attempts - 1];
+      if (usual === undefined) {
         await finish({ ...patch, state: "failed", attempts, reason: { code }, ...rest }, ["nextTryAt"]);
         return;
       }
+      // R411 b: a service's "wait this long" (the longest asked, each cut to FIND_RETRY_AFTER_MAX_MS) puts the next try
+      // by itself no sooner than it; the number of tries is unchanged, and "Try again" still goes at once.
+      const delay = Math.max(usual, askedWaitMs(retryAfter, now().getTime()));
       const at = new Date(now().getTime() + delay).toISOString();
       const w = await finish({ ...patch, attempts, nextTryAt: at }, ["reason"]);
       if (w && live()) later(pid, eid, at);
@@ -1618,7 +1630,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     r: Run,
     live: () => boolean,
     finish: (patch: Partial<FindEntry>, drop?: Array<keyof FindEntry>) => Promise<FindEntry | null>,
-    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>, rest?: Partial<FindEntry>) => Promise<void>,
+    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>, rest?: Partial<FindEntry>, retryAfter?: readonly string[]) => Promise<void>,
   ): Promise<void> {
     /**
      * OpenAlex's daily allowance is used up: the entry waits for the pause's end (never less than the first retry
@@ -2041,7 +2053,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     r: Run,
     live: () => boolean,
     finish: (patch: Partial<FindEntry>, drop?: Array<keyof FindEntry>) => Promise<FindEntry | null>,
-    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>, rest?: Partial<FindEntry>) => Promise<void>,
+    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>, rest?: Partial<FindEntry>, retryAfter?: readonly string[]) => Promise<void>,
     version: { get(): FindEntry; set(e: FindEntry): void },
   ): Promise<void> {
     const sid = entry.sourceId!;
@@ -2125,7 +2137,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const asked = sources.filter((x) => x !== "unpaywall" || email);
       if (found.failed.length && found.failed.length >= asked.length) {
         debug("find: no free-copy service could be reached");
-        await tryLater("unreachable");
+        await tryLater("unreachable", {}, {}, found.retryAfter ?? []);
         return;
       }
       const links = linksOf(found.elsewhere);
@@ -2159,6 +2171,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     let held: { path: string; offer: CopyOffer; check: FileCheckResult } | undefined;
     /** R379 (FR-A17): some offer failed for a reason that may pass (a time-out, the network, a 429, a 5xx…). */
     let passing = false;
+    /** R411 b: what the services and the file hosts asked the app to wait (raw Retry-After values). */
+    const retryAfter = [...(found.retryAfter ?? [])];
     try {
       let n = 0;
       for (const offer of found.offers) {
@@ -2175,6 +2189,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           }
           // Refused or failed (its sentence names no address): the next offer is tried. Whether it may pass is kept (R379).
           if (downloadFailurePasses(err)) passing = true;
+          if (err instanceof FetchFileError && err.retryAfter !== undefined) retryAfter.push(err.retryAfter);
           debug(`find: a free copy could not be downloaded (${err instanceof FetchFileError ? err.code : errName(err)})`);
           continue;
         }
@@ -2215,7 +2230,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         // is tried again (services asked again) like an unreachable free-copy lookup (R282 e), on the same delays; once
         // they are spent it rests "no-open-copy" / "copy-not-downloaded", with its links, and "Try again" is accepted.
         debug("find: no free copy could be downloaded this time");
-        await tryLater("copy-not-downloaded", { state: "looking-for-copy" }, { state: "no-open-copy", ...(links?.length ? { offers: links } : {}) });
+        await tryLater("copy-not-downloaded", { state: "looking-for-copy" }, { state: "no-open-copy", ...(links?.length ? { offers: links } : {}) }, retryAfter);
         return;
       }
       // Every offer refused for good: no open copy here — unless a service could not be reached, which might have had a

@@ -120,6 +120,8 @@ export class LookupHttpError extends Error {
   override name = "LookupHttpError";
   /** Set when the last answer was a 429 (not enumerable: it stays out of serialised errors). */
   declare readonly rateLimit?: RateLimitInfo;
+  /** The last answer's raw Retry-After, when it gave one (at most 100 characters; not enumerable). R411 b. */
+  declare readonly retryAfter?: string;
   constructor(
     message: string,
     readonly status?: number,
@@ -128,6 +130,11 @@ export class LookupHttpError extends Error {
     super(message);
     if (rateLimit) Object.defineProperty(this, "rateLimit", { value: Object.freeze({ ...rateLimit }), enumerable: false });
   }
+}
+
+/** Keeps an answer's Retry-After on its error, not enumerable (R411 b: the free-copy runner's next try honours it). */
+function withRetryAfter(e: LookupHttpError, value: string | undefined): void {
+  if (value !== undefined) Object.defineProperty(e, "retryAfter", { value: value.slice(0, 100), enumerable: false });
 }
 
 /** A header value as a whole number, or undefined when it is not 1 to 12 digits. */
@@ -631,9 +638,11 @@ export class HttpClient {
             ...(reset !== undefined ? { reset } : {}),
             final,
           });
+          withRetryAfter(lastError, res.retryAfter);
           if (final) throw lastError;
         } else {
           lastError = new LookupHttpError(`The metadata service answered HTTP ${res.status}`, res.status);
+          withRetryAfter(lastError, res.retryAfter);
           if (res.status < 500 || final5xx) throw lastError;
         }
       }

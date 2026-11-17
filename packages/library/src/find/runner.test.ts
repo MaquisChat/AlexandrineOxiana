@@ -3187,6 +3187,8 @@ describe("F11: the free copy of a record the queue completed", () => {
   let saved: Dispatcher;
   /** R282 e: OpenAlex's free-copy answers fail (503). */
   let oaDown: boolean;
+  /** R411 b: OpenAlex's free-copy answers are this status and headers (a 429 or a 503 with a Retry-After). */
+  let oaAnswer: { status: number; headers: Record<string, string> } | undefined;
   /** R379 (FR-A17): file addresses that answer with this status (and headers) instead of their file. */
   let fileStatus: Map<string, { status: number; headers?: Record<string, string> }>;
 
@@ -3235,6 +3237,7 @@ describe("F11: the free copy of a record the queue completed", () => {
         const doi = decodeURIComponent(String(o.path).slice("/works/doi:".length));
         copyRequests.push(String(o.path));
         if (oaDown) return { statusCode: 503, data: "unavailable" };
+        if (oaAnswer) return { statusCode: oaAnswer.status, data: "wait", responseOptions: { headers: oaAnswer.headers } };
         const urls = oaCopies.get(doi) ?? [];
         const [best, ...rest] = urls;
         return {
@@ -3271,6 +3274,7 @@ describe("F11: the free copy of a record the queue completed", () => {
     copyRequests = [];
     oaDown = false;
     fileStatus = new Map();
+    oaAnswer = undefined;
     settings = COPY_ONLY_OPENALEX();
     mockCopies();
   });
@@ -4003,14 +4007,14 @@ describe("F11: the free copy of a record the queue completed", () => {
   });
 
   /** The entry waits, its retry timer set and its download folder gone (R379: like an unreachable free-copy lookup). */
-  const waitsToRetry = async (p: Project, eid: string, attempts: number) => {
+  const waitsToRetry = async (p: Project, eid: string, attempts: number, delay = FIND_RETRY_DELAYS_MS[attempts - 1]!) => {
     await until(async () => (await entryOf(p, eid))?.attempts === attempts && !!(await entryOf(p, eid))?.nextTryAt, `attempt ${attempts} waiting`);
     await until(async () => !activeTemp.has(`find-${eid}`) && !(await exists(folderOf(eid))), "its folder to go");
     await until(() => timers.pending.size > 0, "the retry's timer");
     const e = (await entryOf(p, eid))!;
     expect(e).toMatchObject({ state: "looking-for-copy", attempts });
     expect(e.reason).toBeUndefined();
-    expect(e.nextTryAt).toBe(new Date(timers.now + FIND_RETRY_DELAYS_MS[attempts - 1]!).toISOString());
+    expect(e.nextTryAt).toBe(new Date(timers.now + delay).toISOString());
   };
   /** Every retry's delay waited out (`each` after each retry started), until the entry rests. */
   const retriesRunOut = async (p: Project, eid: string, each: (i: number) => Promise<void> = async () => {}) => {
@@ -4081,17 +4085,97 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect((await repo.getSource(p.id, sid)).assets).toHaveLength(0);
   });
 
-  it("R379 (FR-A17): a 429 with a Retry-After waits as an unreachable lookup waits (the runner's delays), never sooner", async () => {
+  it("R379, R411 b (M6): a download's Retry-After shorter than the usual delay (5 s): the usual delay (60 s), nothing sooner", async () => {
     const A = "https://arxiv.org/pdf/2101.00001";
     oaCopies.set(ZORBLATT.doi!, [A]);
-    fileStatus.set(A, { status: 429, headers: { "retry-after": "30" } });
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "5" } });
     const { p, eid } = await recordMade();
     await waitsToRetry(p, eid, 1);
-    expect(Date.parse((await entryOf(p, eid))!.nextTryAt!) - timers.now).toBeGreaterThanOrEqual(30_000);
     const n = fileRequests.length;
     timers.advance(FIND_RETRY_DELAYS_MS[0]! - 1);
     await new Promise((res) => setTimeout(res, 30));
     expect(fileRequests.length).toBe(n);
+  });
+
+  const HOUR = 3_600_000;
+  /** Nothing is requested before `ms` from now; at `ms`, the next try goes by itself. */
+  const nothingBefore = async (ms: number) => {
+    const n = fileRequests.length;
+    const c = copyRequests.length;
+    timers.advance(ms - 1);
+    await new Promise((res) => setTimeout(res, 30));
+    expect(fileRequests.length, "no file asked before the wait").toBe(n);
+    expect(copyRequests.length, "no service asked before the wait").toBe(c);
+    timers.advance(1);
+    await until(() => fileRequests.length > n || copyRequests.length > c, "the next try at its time");
+  };
+
+  it("R411 b (M2): a download answered 429 with Retry-After 3600: the next try by itself an hour ahead, nothing requested before", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "3600" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, HOUR);
+    await nothingBefore(HOUR);
+    // The number of tries is unchanged: the second waits the longer of its own delay and the hour again.
+    await waitsToRetry(p, eid, 2, HOUR);
+  });
+
+  it("R411 b (M2): a Retry-After longer than an hour (7200) is cut to the hour", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "7200" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, HOUR);
+  });
+
+  it("R411 b (M2): a Retry-After as an HTTP date, on a 503: honoured; several offers: the longest counts", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    const B = "https://arxiv.org/pdf/2101.00002";
+    oaCopies.set(ZORBLATT.doi!, [A, B]);
+    fileStatus.set(A, { status: 503, headers: { "retry-after": new Date(timers.now + 1_800_000).toUTCString() } });
+    fileStatus.set(B, { status: 429, headers: { "retry-after": "600" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, 1_800_000);
+    await nothingBefore(1_800_000);
+  });
+
+  it("R411 b (M2): a download's unreadable Retry-After is ignored (the usual delay)", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 503, headers: { "retry-after": "soon, please" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+  });
+
+  it("R411 b (M2): a copy service answering 429 with Retry-After 3600 (every service asked): the wait honours it", async () => {
+    oaAnswer = { status: 429, headers: { "retry-after": "3600" } };
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, HOUR);
+    await nothingBefore(HOUR);
+  });
+
+  it("R411 b (M2): a copy service answering 503 with Retry-After 900: the wait honours it", async () => {
+    oaAnswer = { status: 503, headers: { "retry-after": "900" } };
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, 900_000);
+    await nothingBefore(900_000);
+  });
+
+  it("R411 b (M2): the researcher's Try again during an hour's wait goes at once", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "3600" } });
+    const { p, r, eid, sid } = await recordMade();
+    await waitsToRetry(p, eid, 1, HOUR);
+    fileStatus.clear();
+    files.set(A, await good());
+    const n = fileRequests.length;
+    expect(await r.retry(p.id, eid)).toMatchObject({ state: "looking-for-copy", attempts: 0 });
+    await until(() => fileRequests.length > n, "the file asked at once");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check" });
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(0);
   });
 
   it("R411 a (M1): a service unreachable and every offered file refused for good: 'no open copy' saying a copy may still exist, its links kept, Try again accepted", async () => {

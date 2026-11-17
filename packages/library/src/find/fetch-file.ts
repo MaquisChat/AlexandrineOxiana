@@ -86,6 +86,8 @@ export class FetchFileError extends Error {
     message: string,
     /** For "status": the answer's HTTP status (R379, FR-A17: it decides whether the failure may pass). */
     readonly status?: number,
+    /** For "status": the answer's raw Retry-After (at most 100 characters), for the runner's next try (R411 b). */
+    readonly retryAfter?: string,
   ) {
     super(message);
   }
@@ -377,7 +379,7 @@ export async function fetchFile(
       }
       if (status !== 200) {
         res.body.destroy();
-        throw new FetchFileError("status", SENTENCES.status, status);
+        throw new FetchFileError("status", SENTENCES.status, status, header(res.headers, "retry-after")?.slice(0, 100));
       }
       if (headerValues(res.headers, "content-encoding").some((v) => v !== "identity")) {
         res.body.destroy();

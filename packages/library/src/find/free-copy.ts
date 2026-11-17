@@ -219,8 +219,12 @@ type Raw = { url: string; base?: URL; kind: "pdf" | "epub"; version?: CopyOffer[
 
 /** An answer that is not of the expected shape: never cached, the service skipped. */
 class BadAnswer extends Error {}
-/** The service answered 429: left alone for this call. */
-class Throttled extends Error {}
+/** The service answered 429: left alone for this call; its Retry-After, if any, is kept for the next try (R411 b). */
+class Throttled extends Error {
+  constructor(readonly retryAfter?: string) {
+    super("throttled");
+  }
+}
 
 const noRetry429 = () => true;
 
@@ -239,7 +243,7 @@ async function ask<T>(ctx: LookupContext, url: string, cacheKey: string, check: 
   try {
     body = await ctx.http.getText(url, opts);
   } catch (e) {
-    if (e instanceof LookupHttpError && e.status === 429) throw new Throttled();
+    if (e instanceof LookupHttpError && e.status === 429) throw new Throttled(e.retryAfter);
     throw e;
   }
   if (body === null) return null;
@@ -527,10 +531,12 @@ export async function findFreeCopies(
   ctx: LookupContext,
   sources: FreeCopySource[],
   email?: string,
-): Promise<{ offers: CopyOffer[]; elsewhere: Array<{ host: string; url: string }>; failed: FreeCopySource[] }> {
+): Promise<{ offers: CopyOffer[]; elsewhere: Array<{ host: string; url: string }>; failed: FreeCopySource[]; retryAfter?: string[] }> {
   const wanted = new Set(Array.isArray(sources) ? sources : []);
   const order = FREE_COPY_SOURCES.filter((s) => wanted.has(s));
   const failedSet = new Set<FreeCopySource>();
+  /** R411 b: the raw Retry-After of each service that asked the app to wait (a 429, or a 5xx with one); absent when none did. */
+  const retryAfter: string[] = [];
   const askOne = async (s: FreeCopySource): Promise<Raw[]> => {
     try {
       switch (s) {
@@ -554,6 +560,8 @@ export async function findFreeCopies(
         e instanceof Throttled ? "it asked the app to slow down (left alone for now)" : e instanceof BadAnswer ? "its answer was not of the expected shape" : e instanceof LookupHttpError && e.status ? `HTTP ${e.status}` : "it could not be reached";
       ctx.debug?.(`free copy via ${s} skipped: ${why}`);
       failedSet.add(s);
+      const wait = e instanceof Throttled ? e.retryAfter : e instanceof LookupHttpError ? e.retryAfter : undefined;
+      if (wait !== undefined) retryAfter.push(wait);
       return [];
     }
   };
@@ -593,5 +601,5 @@ export async function findFreeCopies(
       offered.add(o.url);
     }
   });
-  return { offers, elsewhere, failed: order.filter((s) => failedSet.has(s)) };
+  return { offers, elsewhere, failed: order.filter((s) => failedSet.has(s)), ...(retryAfter.length ? { retryAfter } : {}) };
 }
