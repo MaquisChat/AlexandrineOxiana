@@ -20,7 +20,7 @@ import { deleteOldCopy, executeMove } from "./move.js";
 import { addPendingOldCopy, markPendingComplete } from "./old-copies.js";
 import { projectWarnings, type Repo } from "./repo/index.js";
 import { openTestRepo } from "./repo/testing.js";
-import { DESTRUCTION_NOTICE, destroyRaw, oldCopiesAwaitingDeletion, oldCopiesBehindWarning, oldCopyLookSeams, readDestruction, resumeDestruction } from "./retention.js";
+import { DESTRUCTION_NOTICE, destroyRaw, isVolumeRoot, oldCopiesAwaitingDeletion, oldCopiesBehindWarning, oldCopyLookSeams, readDestruction, resumeDestruction } from "./retention.js";
 
 const WARNING = "destruction-old-copies-pending";
 const MOVED_AT = "2026-11-10T09:30:00.000Z";
@@ -627,5 +627,40 @@ describe("R429: old copies of a moved library and a destruction's certificate (r
       "An old copy of this library, left by the move of 2026-11-10, may still hold the destroyed data (it could not be looked at) and was not destroyed. Deleting it completes the destruction.",
     );
     expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+  });
+
+  it("(c) N4: an absent old root that is a volume's root is 'cannot tell' (the review's case: /Volumes/Ext with /Volumes there)", () => {
+    const e: LocationEnv = { homeDir: "/Users/r", platform: "darwin", mounts: [{ path: "/", removable: false, network: false }, { path: "/Volumes/Data", removable: true, network: false }] };
+    expect(isVolumeRoot("/Volumes/Ext", e)).toBe(true); // directly under /Volumes
+    expect(isVolumeRoot("/Ext", e)).toBe(true); // its parent is the file system's root
+    expect(isVolumeRoot("/mnt/disks/Data", { ...e, mounts: [...e.mounts, { path: "/mnt/disks/Data", removable: true, network: false }] })).toBe(true); // a mount point this computer knows
+    expect(isVolumeRoot("/Volumes/Ext/Library", e)).toBe(false);
+    expect(isVolumeRoot("/Users/r/Documents/Library", e)).toBe(false);
+  });
+
+  it("(c) N4: an old copy at a mount point that is not there (its disk unplugged, its parent there): named at the destruction and the warning stays through a pass; an ordinary folder deleted is still 'gone'", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    // The old copy's place is a disk's mount point; the disk is unplugged (the folder gone, its parent there).
+    const mountPoint = join(kit.tmp, "media", "Ext");
+    const list = JSON.parse(await readFile(listFile(), "utf8")) as { records: Array<Record<string, unknown>> };
+    list.records[0]!.oldRoot = mountPoint;
+    await writeFile(listFile(), JSON.stringify(list));
+    await mkdir(join(kit.tmp, "media"), { recursive: true });
+    oldCopyLookSeams.locationEnv = { ...env(), mounts: [...env().mounts, { path: mountPoint, removable: true, network: false }] };
+    try {
+      kit.clock.now = DUE;
+      const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+      expect(r.original.oldCopies).toMatchObject({ status: "pending", note: expect.stringContaining("could not be looked at") });
+      await resumeDestruction(repo, p.id);
+      expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+      expect((await readDestruction(repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+      // Not a mount point: an ordinary folder that was deleted (its parent there) is gone.
+      oldCopyLookSeams.locationEnv = env();
+      await resumeDestruction(repo, p.id);
+      expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
+      expect((await readDestruction(repo, p.id, r.certificatePath)).certificate!.oldCopies).toMatchObject({ status: "no-longer-present" });
+    } finally {
+      oldCopyLookSeams.locationEnv = undefined;
+    }
   });
 });

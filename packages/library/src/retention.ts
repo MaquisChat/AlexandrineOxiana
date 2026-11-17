@@ -117,6 +117,7 @@ import {
   type Audited,
   type OldCopyRef,
 } from "./destruction-record.js";
+import { defaultLocationEnv, type LocationEnv } from "./location.js";
 import { isExpired, oldCopiesOfLibrary, removePendingOldCopy, type PendingOldCopy } from "./old-copies.js";
 import {
   backupCrashPoint,
@@ -1095,12 +1096,34 @@ const exists = (p: string): Promise<"yes" | "no" | "cannot-tell"> =>
  */
 export type OldPlaceLook = "holds" | "none" | "cannot-tell";
 
-/** The old folder itself: there, gone (its parent is there: it was deleted), or cannot tell (a disk unplugged: neither is there). */
+/**
+ * Whether `root` is a volume's root (R429 c): it sits directly under `/Volumes`, its parent is the
+ * file system's root, or it is a mount point in the location environment. Such a folder that is not
+ * there is a disk unplugged, not a folder deleted, even though its parent is there.
+ */
+export function isVolumeRoot(root: string, env: Pick<LocationEnv, "mounts">): boolean {
+  const r = resolve(root);
+  const parent = dirname(r);
+  return parent === "/Volumes" || dirname(parent) === parent || env.mounts.some((m) => resolve(m.path) === r);
+}
+
+/** This computer's location environment (its mounts); the seam's under test (R47). */
+const locationEnvNow = (): Promise<LocationEnv> => {
+  const seam = process.env.NODE_ENV === "test" ? oldCopyLookSeams.locationEnv : undefined;
+  return seam ? Promise.resolve(seam) : defaultLocationEnv();
+};
+
+/**
+ * The old folder itself: there, gone (it is not there, its parent is, and it is not a volume's
+ * root: it was deleted), or cannot tell (a disk unplugged: neither is there, or it is a volume's
+ * root, R429 c; an error other than "not there").
+ */
 async function oldRootThere(root: string): Promise<"yes" | "gone" | "cannot-tell"> {
   const here = await exists(root);
   if (here === "yes") return "yes";
   if (here === "cannot-tell") return "cannot-tell";
-  return (await exists(dirname(root))) === "yes" ? "gone" : "cannot-tell";
+  if ((await exists(dirname(root))) !== "yes") return "cannot-tell";
+  return isVolumeRoot(root, await locationEnvNow()) ? "cannot-tell" : "gone";
 }
 
 /** What a look for one destruction's files searches (R379, R409). */
@@ -1232,8 +1255,12 @@ async function lookAtPlace(root: string, what: DestroyedData): Promise<OldPlaceL
 /** How long one look at an old place may take in all (R409 e, M4). */
 export const OLD_PLACE_LOOK_MS = 2000;
 
-/** Test seam (honoured only when NODE_ENV is "test", R47): `hang` replaces every look at an old place, e.g. by one that never answers. */
-export const oldCopyLookSeams: { hang?: (root: string) => Promise<OldPlaceLook> } = {};
+/**
+ * Test seams (honoured only when NODE_ENV is "test", R47): `hang` replaces every look at an old
+ * place, e.g. by one that never answers; `locationEnv` is this computer's location environment (its
+ * mounts) in place of the probed one.
+ */
+export const oldCopyLookSeams: { hang?: (root: string) => Promise<OldPlaceLook>; locationEnv?: LocationEnv } = {};
 
 /**
  * A look at an old place, bounded in time (R409 e, M4): raced against a timer of OLD_PLACE_LOOK_MS
