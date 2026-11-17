@@ -1225,14 +1225,44 @@ async function lookAtPlace(root: string, what: DestroyedData): Promise<OldPlaceL
   return unsure || backups === "cannot-tell" || trash === "cannot-tell" ? "cannot-tell" : "none";
 }
 
+/** How long one look at an old place may take in all (R409 e, M4). */
+export const OLD_PLACE_LOOK_MS = 2000;
+
+/** Test seam (honoured only when NODE_ENV is "test", R47): `hang` replaces every look at an old place, e.g. by one that never answers. */
+export const oldCopyLookSeams: { hang?: (root: string) => Promise<OldPlaceLook> } = {};
+
 /**
- * A look at the old copy a record names, for one destruction's data. The library's own folder is
- * never an old copy of itself (a move A→B→A): `none`.
+ * A look at an old place, bounded in time (R409 e, M4): raced against a timer of OLD_PLACE_LOOK_MS
+ * for the whole look; no answer by then is `cannot-tell`. A file-system call already started (an
+ * lstat on a share that does not answer) cannot be cancelled: it goes on in the background, holding
+ * one of the runtime's worker threads until the system answers, and its answer is ignored.
+ */
+function bounded(root: string, look: () => Promise<OldPlaceLook>): Promise<OldPlaceLook> {
+  const seam = process.env.NODE_ENV === "test" ? oldCopyLookSeams.hang : undefined;
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<OldPlaceLook>((done) => {
+    timer = setTimeout(() => done("cannot-tell"), OLD_PLACE_LOOK_MS);
+  });
+  const run = (seam ? seam(root) : look()).catch((): OldPlaceLook => "cannot-tell");
+  return Promise.race([run, limit]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * A look at the old copy a record names, for one destruction's data, each place bounded in time.
+ * The library's own folder is never an old copy of itself (a move A→B→A). For a move that has not
+ * finished whose old root is the current library, the destination it names (`newRoot`) holds a
+ * copy too and is looked at (R409 e, M3).
  */
 async function oldCopyLook(currentRoot: string, rec: PendingOldCopy, what: DestroyedData): Promise<OldPlaceLook> {
-  const root = resolve(rec.oldRoot);
-  if (root === resolve(currentRoot)) return "none";
-  return lookAtPlace(root, what);
+  const here = resolve(currentRoot);
+  const places = [rec.oldRoot, ...(!rec.complete && typeof rec.newRoot === "string" ? [rec.newRoot] : [])].map((x) => resolve(x)).filter((x) => x !== here);
+  let unsure = false;
+  for (const root of new Set(places)) {
+    const look = await bounded(root, () => lookAtPlace(root, what));
+    if (look === "holds") return "holds";
+    if (look === "cannot-tell") unsure = true;
+  }
+  return unsure ? "cannot-tell" : "none";
 }
 
 /**
@@ -1243,8 +1273,12 @@ async function oldCopyLook(currentRoot: string, rec: PendingOldCopy, what: Destr
  * `Backups/`, and, for a whole-library copy, no file in its `.tmp/trash-*`. `none` only when the
  * place was looked at and holds none of these, or is gone (its parent folder is there).
  */
-export async function oldPlaceLook(rec: PendingOldCopy): Promise<OldPlaceLook> {
+export function oldPlaceLook(rec: PendingOldCopy): Promise<OldPlaceLook> {
   const root = resolve(rec.oldRoot);
+  return bounded(root, () => oldPlaceLookUnbounded(rec, root));
+}
+
+async function oldPlaceLookUnbounded(rec: PendingOldCopy, root: string): Promise<OldPlaceLook> {
   const there = await oldRootThere(root);
   if (there !== "yes") return there === "gone" ? "none" : "cannot-tell";
   const scope = rec.split ? rec.movedFolders : ["Projects"];
@@ -1308,12 +1342,16 @@ async function holdingOldCopies(repo: Repo, what: DestroyedData): Promise<{ notD
     return { notDestroyed: [], unchecked: true };
   }
   const out: Array<OldCopyRef & { id: string }> = [];
-  for (const r of records) if ((await oldCopyLook(lib.root, r, what)) !== "none") out.push({ id: r.id, movedAt: r.createdAt, moveId: r.moveId });
+  for (const r of records) if ((await oldCopyLook(lib.root, r, what)) !== "none") out.push(refOf(r));
   return { notDestroyed: out, unchecked: false };
 }
 
-/** The date of a move, in the project's zone: how a researcher knows which old copy is meant. */
-const moveDate = (movedAt: string, tz: string | undefined) => formatModified(new Date(movedAt), tz).slice(0, 10);
+/** How a destruction records an old copy: a record with no date or a bad one (damaged by hand) gives "" (R409 e, M1). */
+const refOf = (r: PendingOldCopy): OldCopyRef & { id: string } => ({ id: r.id, movedAt: typeof r.createdAt === "string" ? r.createdAt : "", moveId: typeof r.moveId === "string" ? r.moveId : "" });
+
+/** The date of a move, in the project's zone: how a researcher knows which old copy is meant; undefined when not known (M1). */
+const moveDate = (movedAt: string, tz: string | undefined): string | undefined =>
+  Number.isNaN(Date.parse(movedAt)) ? undefined : formatModified(new Date(movedAt), tz).slice(0, 10);
 
 /** The certificate's line when this computer's list names no old copy that holds the destroyed data (R409 b). */
 export const OLD_COPIES_NONE = "Old copies of the library left by a move: none known to this computer.";
@@ -1325,8 +1363,13 @@ function oldCopiesSentence(copies: readonly OldCopyRef[], unchecked: boolean, tz
   }
   const n = copies.length;
   if (n === 0) return OLD_COPIES_NONE;
-  const dates = [...new Set(copies.map((c) => moveDate(c.movedAt, tz)))].join(", ");
-  return `${n === 1 ? "An old copy" : `${n} old copies`} of this library, left by the move of ${dates}, still ${n === 1 ? "holds" : "hold"} the destroyed data and ${n === 1 ? "was" : "were"} not destroyed. Deleting ${n === 1 ? "it" : "them"} completes the destruction.`;
+  const known = copies.map((c) => moveDate(c.movedAt, tz));
+  const dates = [...new Set(known.filter((d): d is string => d !== undefined))];
+  const unknown = known.length - known.filter((d) => d !== undefined).length;
+  // A copy whose date is not known is named as such (M1).
+  const subject = n === 1 ? (unknown ? "An old copy (date unknown)" : "An old copy") : `${n} old copies`;
+  const by = dates.length ? `the move of ${dates.join(", ")}${unknown ? ` and ${unknown === 1 ? "a move" : "moves"} of unknown date` : ""}` : unknown > 1 ? "moves of unknown date" : "a move";
+  return `${subject} of this library, left by ${by}, still ${n === 1 ? "holds" : "hold"} the destroyed data and ${n === 1 ? "was" : "were"} not destroyed. Deleting ${n === 1 ? "it" : "them"} completes the destruction.`;
 }
 
 function oldCopiesStatusOf(a: Audited): OldCopiesStatus {
@@ -1405,7 +1448,7 @@ async function settleOldCopies(
     return;
   }
   const found: Array<OldCopyRef & { id: string }> = [];
-  if (needCheck) for (const r of records) if ((await oldCopyLook(lib.root, r, what)) !== "none") found.push({ id: r.id, movedAt: r.createdAt, moveId: r.moveId });
+  if (needCheck) for (const r of records) if ((await oldCopyLook(lib.root, r, what)) !== "none") found.push(refOf(r));
   const removed: string[] = [];
   const gone: string[] = [];
   for (const id of left) {
@@ -1576,11 +1619,11 @@ export async function oldCopiesBehindWarning(
   const tz = projectTimeZone(repo, projectId);
   const oldCopies = [...byId].map(([id, movedAt]) => {
     const r = unchecked ? undefined : records.find((x) => x.id === id);
-    const movedOn = Number.isNaN(Date.parse(movedAt)) ? undefined : moveDate(movedAt, tz);
+    const movedOn = moveDate(movedAt, tz);
     return {
       ...(movedOn ? { movedOn } : {}),
       ...(r ? { place: resolve(r.oldRoot) } : {}),
-      offerOpen: !!r && r.complete && !r.deleted && !isExpired(r, cfg),
+      offerOpen: !!r && r.complete && !r.deleted && !Number.isNaN(Date.parse(r.createdAt)) && !isExpired(r, cfg),
     };
   });
   return { destructions, unchecked, oldCopies };

@@ -20,7 +20,7 @@ import { deleteOldCopy, executeMove } from "./move.js";
 import { addPendingOldCopy, markPendingComplete } from "./old-copies.js";
 import { projectWarnings, type Repo } from "./repo/index.js";
 import { openTestRepo } from "./repo/testing.js";
-import { DESTRUCTION_NOTICE, destroyRaw, oldCopiesAwaitingDeletion, oldCopiesBehindWarning, readDestruction, resumeDestruction } from "./retention.js";
+import { DESTRUCTION_NOTICE, destroyRaw, oldCopiesAwaitingDeletion, oldCopiesBehindWarning, oldCopyLookSeams, readDestruction, resumeDestruction } from "./retention.js";
 
 const WARNING = "destruction-old-copies-pending";
 const MOVED_AT = "2026-11-10T09:30:00.000Z";
@@ -467,4 +467,109 @@ describe("R409 (d): the researcher's screen is told the place and what can be do
     expect(await oldCopiesBehindWarning(onB, p.id)).toMatchObject({ unchecked: false, oldCopies: [{ movedOn: "2026-11-10", offerOpen: false }] });
     expect((await oldCopiesBehindWarning(onB, p.id)).oldCopies[0]).not.toHaveProperty("place");
   });
+});
+
+describe("R409 (e): the minor points", () => {
+  const listFile = () => join(kit.lib.appConfigDir, "pending-old-copies.json");
+  async function editList(fn: (r: Record<string, unknown>) => void): Promise<void> {
+    const list = JSON.parse(await readFile(listFile(), "utf8")) as { records: Array<Record<string, unknown>> };
+    fn(list.records[0]!);
+    await writeFile(listFile(), JSON.stringify(list));
+  }
+
+  it("M1 (P6): a record of this library with no date, or a bad one, never makes a destruction throw: it is named as an old copy of unknown date", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    await editList((r) => {
+      delete r.createdAt;
+    });
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending", note: expect.stringContaining("An old copy (date unknown)") });
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    expect((await oldCopiesBehindWarning(repo, p.id)).oldCopies).toEqual([{ place: kit.lib.root, offerOpen: false }]);
+  });
+
+  it("M1: a bad date in a record", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    await editList((r) => {
+      r.createdAt = "not a date";
+    });
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending", note: expect.stringContaining("(date unknown)") });
+  });
+
+  it("M2: the library's own folder is never its own old copy (a stale record naming the current root)", async () => {
+    const p = await makeProject(kit, GOV, false, "Interviews");
+    const sf = await rawSource(p);
+    const rec = await addPendingOldCopy(deps(), { oldRoot: kit.lib.root, newRoot: join(kit.tmp, "Elsewhere"), libraryId: kit.lib.id, split: false, movedFolders: [], movedProjectIds: [p.id], moveId: "m1" }, { files: {}, dirs: [] });
+    await markPendingComplete(deps(), rec.id);
+    kit.clock.now = DUE;
+    const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "none" });
+    expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
+  });
+
+  it("M2: a pass on a log that does not hold together records nothing, also when the old copy is gone", async () => {
+    const { p, dest, repo, asset } = await movedLibrary();
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    await rm(kit.lib.root, { recursive: true, force: true });
+    // An earlier line of the project's audit log changed outside the app.
+    const dir = join(dest, repo.getProject(p.id).folder, "audit");
+    const { readdir } = await import("node:fs/promises");
+    const seg = join(dir, (await readdir(dir)).sort().at(-1)!);
+    const lines = (await readFile(seg, "utf8")).split("\n");
+    const i = lines.findIndex((l) => l.includes('"op":"retention.destroy"'));
+    const e = JSON.parse(lines[i]!) as { details: Record<string, unknown> };
+    e.details = { ...e.details, changedOutside: true };
+    lines[i] = JSON.stringify(e);
+    await writeFile(seg, lines.join("\n"));
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+    expect((await events(repo, dest, p)).filter((x) => x.action === "retention.old-copies")).toEqual([]);
+  });
+
+  it("M3: an unfinished move's record whose old root is the current root: its destination is looked at too", async () => {
+    const p = await makeProject(kit, GOV, false, "Interviews");
+    const sf = await rawSource(p);
+    const asset = sf.assets[0]!;
+    const destination = join(kit.tmp, "HalfMoved");
+    await mkdir(join(destination, ...asset.path.split("/").slice(0, -1)), { recursive: true });
+    await writeFile(join(destination, ...asset.path.split("/")), "RAW interview audio bytes");
+    await addPendingOldCopy(deps(), { oldRoot: kit.lib.root, newRoot: destination, libraryId: kit.lib.id, split: false, movedFolders: [], movedProjectIds: [p.id], moveId: "m1" }, { files: {}, dirs: [] });
+    kit.clock.now = DUE;
+    const r = await destroyRaw(kit.repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending" });
+    expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+    // Its destination unreachable (its disk unplugged): still named, and the pass records nothing.
+    await rm(destination, { recursive: true, force: true });
+    await editList((x) => {
+      x.newRoot = join(kit.tmp, "Volumes", "Gone", "HalfMoved");
+    });
+    await resumeDestruction(kit.repo, p.id);
+    expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+    expect((await readDestruction(kit.repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+  });
+
+  it("M4: a look at an old place that never answers is bounded to two seconds: the destruction names the copy, the pass records nothing and does not wait longer", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    oldCopyLookSeams.hang = () => new Promise<never>(() => {});
+    try {
+      kit.clock.now = DUE;
+      let t = Date.now();
+      const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+      expect(r.original.oldCopies).toMatchObject({ status: "pending" });
+      // The old copy is gone, but the look does not answer: cannot tell.
+      await rm(kit.lib.root, { recursive: true, force: true });
+      t = Date.now();
+      await resumeDestruction(repo, p.id);
+      expect(Date.now() - t).toBeLessThan(2 * 2000 + 4000); // one look per copy (and one for the record's tidy-up), each at most two seconds
+      expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+      expect((await readDestruction(repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+    } finally {
+      oldCopyLookSeams.hang = undefined;
+    }
+  }, 60_000);
 });
