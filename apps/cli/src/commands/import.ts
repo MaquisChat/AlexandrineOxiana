@@ -134,6 +134,11 @@ export function importProgressLine(p: { done: number; total?: number }): string 
   return p.total !== undefined ? `Imported ${p.done} of ${p.total}` : `Imported ${p.done} so far`;
 }
 
+/** What rewrites the terminal's progress line (written only to a terminal): back to its start, the line, clear to its end. */
+export function importProgressWrite(line: string): string {
+  return `\r${line}\x1b[K`;
+}
+
 async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnType<typeof createBulkImport>, start: () => Promise<BatchHandle>): Promise<void> {
   let closing = false;
   const starting = start();
@@ -158,7 +163,7 @@ async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnT
   const progress = (async () => {
     for await (const p of h.progress) {
       const line = importProgressLine(p);
-      if (!out.json && line !== last && process.stderr.isTTY) process.stderr.write(`\r${line}`);
+      if (!out.json && line !== last && process.stderr.isTTY) process.stderr.write(importProgressWrite(line));
       last = line;
     }
   })();
