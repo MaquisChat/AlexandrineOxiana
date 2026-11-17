@@ -143,7 +143,7 @@ describe("Bulk Import wizard", () => {
     expect(bar.hasAttribute("max")).toBe(false);
     expect(bar.hasAttribute("value")).toBe(false);
     expect(screen.getByRole("progressbar", { name: "Import progress" })).toBe(bar);
-    // The source tells its total (Zotero web's first page): the screen switches to "x of y".
+    // The source tells its total once it knows it (Zotero web: once its listing is read, R423): the screen switches to "x of y".
     await act(async () => m.emit("import.progress", { batchId: B1, projectId: P1, state: "running", done: 97, total: 3412 }));
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("97 of 3,412 items"));
     expect(bar.getAttribute("max")).toBe("3412");

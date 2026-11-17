@@ -124,11 +124,6 @@ function summaryLines(s: ScanSummary): string[] {
   return lines;
 }
 
-/**
- * Starts the batch and reports it. The Ctrl+C hook is registered before the batch starts, so a
- * batch started while the program is closing is cancelled at once; with --json, Ctrl+C prints
- * `{batchId, state}` so a script knows which batch to look at.
- */
 /** The progress line (R392): "Imported 97 of 3412" when the source told its total, else "Imported 97 so far" (never a guess). */
 export function importProgressLine(p: { done: number; total?: number }): string {
   return p.total !== undefined ? `Imported ${p.done} of ${p.total}` : `Imported ${p.done} so far`;
@@ -139,6 +134,11 @@ export function importProgressWrite(line: string): string {
   return `\r${line}\x1b[K`;
 }
 
+/**
+ * Starts the batch and reports it. The Ctrl+C hook is registered before the batch starts, so a
+ * batch started while the program is closing is cancelled at once; with --json, Ctrl+C prints
+ * `{batchId, state}` so a script knows which batch to look at.
+ */
 async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnType<typeof createBulkImport>, start: () => Promise<BatchHandle>): Promise<void> {
   let closing = false;
   const starting = start();
