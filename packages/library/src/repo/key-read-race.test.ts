@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DecryptionError, KeyNotAvailableError, decryptStream } from "../crypto/format.js";
 import { openDecrypted } from "../crypto/random-access.js";
 import { exportProjectOpenFormats } from "../export/project-export.js";
-import { PASS, addSource, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
+import { PASS, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
 import type { FindEntry } from "../find/types.js";
 import { journalPath, parseJobJournal, refreshJobRows } from "../job-journal.js";
 import { NotFoundError, ProjectLockedError } from "./errors.js";
@@ -562,5 +562,39 @@ describe("R443 a: an unlock is overtaken by every lock asked after its REQUEST a
     // Given the current count (a request that arrived after the lock), the unlock wins, as without it.
     await kit.repo.unlockProject(a.id, PASS, kit.repo.lockAsksOf(a.id));
     expect((await kit.repo.getSource(a.id, sf.source.id)).source.id).toBe(sf.source.id);
+  });
+});
+
+describe("R443 b: an overtaken unlock's audit entry is timed when its key was added", () => {
+  it("the key added at T1, the lock at T2 while the entry waits its turn: one key.unlock entry, at T1", async () => {
+    const a = await makeProject(kit, GOV, true, "A");
+    const b = await makeProject(kit, GOV, false, "B");
+    await kit.repo.lockProject(a.id);
+    const before = (await auditEvents(kit, a)).filter((e) => e.action === "key.unlock").length;
+    // Another project's change is held: the unlock's audit entry waits behind it.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => (entered = r));
+    const held = importChange(kit.repo, b.id, STORE, async () => {
+      entered();
+      await gate;
+    }, { op: "test.held" });
+    await inside;
+    const t1 = new Date("2026-11-10T10:00:00.000Z");
+    const t2 = new Date("2026-11-10T10:05:00.000Z");
+    kit.clock.now = t1;
+    const unlock = kit.repo.unlockProject(a.id, PASS);
+    unlock.catch(() => {});
+    while (!kit.repo.isUnlocked(a.id)) await ticks(1); // the key is in (at T1); its entry waits for its turn
+    kit.clock.now = t2;
+    const lock = kit.repo.lockProject(a.id);
+    release();
+    await held;
+    await expect(unlock).rejects.toBeInstanceOf(ProjectLockedError);
+    await lock;
+    const unlocks = (await auditEvents(kit, a)).filter((e) => e.action === "key.unlock");
+    expect(unlocks.length).toBe(before + 1);
+    expect(unlocks.at(-1)!.at).toBe(t1.toISOString());
   });
 });

@@ -258,10 +258,13 @@ async function unlockNow(core: RepoCore, projectId: string, secret: string, lock
     key = await unwrapWithRecovery(file.recovery, secret);
   }
   let added = false;
+  /** When the key entered the ring: the time of the `key.unlock` entry, even when a lock overtakes it later (R443 b). */
+  let addedAt = "";
   // Checked in the same step as the add: a lock asked before it means the key never enters the ring (R435 a).
   const add = () => {
     if (overtaken()) return;
     core.keyRing.add(file.keyId, key);
+    addedAt = core.clock().toISOString();
     added = true;
   };
   try {
@@ -278,8 +281,7 @@ async function unlockNow(core: RepoCore, projectId: string, secret: string, lock
   // The unlock took effect (the key was in the ring), so it is audited even when a lock overtakes it now.
   if (core.library.mode === "read-write") {
     await core.serial(async () => {
-      const at = core.clock().toISOString();
-      await core.auditNow(st, { ...core.auditBase(st, at), action: "key.unlock", entity: { type: "project", id: projectId } });
+      await core.auditNow(st, { ...core.auditBase(st, addedAt), action: "key.unlock", entity: { type: "project", id: projectId } });
     });
   }
   // Overtaken by a lock: no reload (a reload a lock cuts short ends as a locked project's, R404), and locked.
