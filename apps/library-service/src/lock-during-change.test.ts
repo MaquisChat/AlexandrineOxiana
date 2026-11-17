@@ -1,7 +1,7 @@
 /**
- * R379 (FR-A13): POST /projects/:id/lock while a change of the encrypted project is being saved. The lock waits
- * for that change (it never lands inside it) and answers after it; the change's change-log lines open with the
- * project's real key, never with an all-zero one.
+ * R379, R386 b (FR-A13): POST /projects/:id/lock while a change of the encrypted project is being saved. The lock
+ * answers at once and the project is locked for every reader; the change in progress keeps the key until it ends
+ * (the key is never wiped inside it): its change-log lines open with the project's real key, never with zeros.
  */
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -53,7 +53,7 @@ afterEach(async () => {
 });
 
 describe("POST /projects/:id/lock while a change is being saved (R379)", () => {
-  it("answers after the change; the change's lines open with the real key", async () => {
+  it("answers at once, locked for every reader; the change's lines open with the real key", async () => {
     const path = join(tmp, "Lib");
     expect((await call({ method: "POST", url: "/libraries", body: { path, name: "Lib" } })).status).toBe(200);
     const created = await call({ method: "POST", url: "/projects", body: { name: "Study", governanceYaml: GOV, encryption: { enabled: true, passphrase: PASS } } });
@@ -74,20 +74,19 @@ describe("POST /projects/:id/lock while a change is being saved (R379)", () => {
     }, { op: "test.note" });
     await inside;
 
-    const order: string[] = [];
-    const lock = call({ method: "POST", url: `/projects/${pid}/lock` }).then((r) => {
-      order.push("lock answered");
-      return r;
-    });
-    await new Promise((r) => setTimeout(r, 50));
-    expect(order).toEqual([]);
-    expect(repo.isUnlocked(pid)).toBe(true);
+    expect((await call({ url: `/projects/${pid}/review` })).status).toBe(200);
+    // R386 b: the lock answers at once; the project is locked for every reader (the list says so) while the
+    // change in progress still holds the key, which is wiped when that change ends.
+    const lock = await call({ method: "POST", url: `/projects/${pid}/lock` });
+    expect(lock.status).toBe(200);
+    expect(lock.json).toEqual({ unlocked: false });
+    const list = await call({ url: "/projects" });
+    const shown = (list.json.projects ?? list.json).find((x: { id: string }) => x.id === pid);
+    expect(shown.unlocked).toBe(false);
+    expect((await call({ url: `/projects/${pid}/review` })).status).toBe(423);
     release();
-    await change.then(() => order.push("change committed"));
-    expect((await lock).status).toBe(200);
-    expect(order).toEqual(["change committed", "lock answered"]);
+    await change;
     expect(repo.isUnlocked(pid)).toBe(false);
-
     const folder = repo.getProject(pid).folder;
     const dir = join(path, folder, "changes");
     const lines: string[] = [];

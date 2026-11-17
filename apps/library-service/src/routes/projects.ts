@@ -166,8 +166,9 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const id = projectParam(ctx, req);
     // Find and acquire (Task F5) stops for an encrypted project BEFORE its key is dropped: nothing more is written.
     if (s.repo.getProject(id).encryption.enabled) state.stopFind(s, id);
-    // R379: waits for the change being saved (if any), never lands inside it.
-    await s.repo.lockProject(id);
+    // R386 b: the project counts as locked for every read and every new change from here on (the list says so
+    // too); the key itself is wiped when the change being saved, if any, ends (R379): the answer does not wait.
+    s.repo.lockProject(id).catch(() => {});
     // Its recordings stop playing: media tickets end with the key (R135 2).
     state.media.revokeProject(id);
     // Nothing looked up for an encrypted project stays in memory once it is locked (R30, R50),
