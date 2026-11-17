@@ -58,6 +58,7 @@ import {
   type CaptureStartedResponse,
   type CaptureToolsUpdateResponse,
   type CaptureToolVersionsResponse,
+  type GovernanceReadability,
   type ProfileCaptureRequestOptions,
   type SpeechModel,
 } from "@ao/shared";
@@ -130,6 +131,9 @@ export interface CapturePolicy {
 /** The `consent.defaultLegalBasis` category link capture uses (link-capture.ts LEGAL_CATEGORY). */
 const LEGAL_CATEGORY = "social-media";
 
+/** Unreadable rules are read strictly (the service refuses everything then). */
+const UNREADABLE_POLICY: CapturePolicy = { legalBasisRequired: true, defaultLegalBasis: undefined, downloaderAllowed: false, readable: false };
+
 export function capturePolicyFromYaml(yaml: string): CapturePolicy {
   try {
     const p = effectivePolicy(parseGovernance(yaml)).policy;
@@ -141,7 +145,7 @@ export function capturePolicyFromYaml(yaml: string): CapturePolicy {
       readable: true,
     };
   } catch {
-    return { legalBasisRequired: true, defaultLegalBasis: undefined, downloaderAllowed: false, readable: false };
+    return { ...UNREADABLE_POLICY };
   }
 }
 
@@ -578,7 +582,11 @@ export function captureApi(client: ApiClient) {
   const r = client.request;
   return {
     projects: async () => (await r<{ projects: CaptureProject[] }>("GET", "/projects")).projects,
-    policy: async (projectId: string): Promise<CapturePolicy> => capturePolicyFromYaml((await r<{ yaml: string }>("GET", `/projects/${pid(projectId)}/governance`)).yaml),
+    /** The rules as the screen reads them; the service's `readable: false` also counts as unreadable (R379 FR-A18). */
+    policy: async (projectId: string): Promise<CapturePolicy> => {
+      const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`);
+      return g.readable === false ? { ...UNREADABLE_POLICY } : capturePolicyFromYaml(g.yaml);
+    },
     /** Queues links for the downloader; outcomes arrive as `capture.progress` events. */
     capture: (projectId: string, urls: string[], options: CaptureOptions) => {
       const body: CaptureLinksRequest = { urls, options };

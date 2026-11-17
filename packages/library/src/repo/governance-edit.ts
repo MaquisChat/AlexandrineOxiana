@@ -5,10 +5,18 @@
  * changed since. Inside the governed change (under the repository's serial lock) the current file
  * is read again and compared: a change that loosens any control (`loosenedControls`) or asks for
  * less than a selected profile requires (a new effectivePolicy violation) needs a written reason,
- * recorded on the audit event. An unreadable current file may be replaced, but only with a reason
- * (everything counts as loosened); the change is then evaluated under the new rules.
+ * recorded on the audit event.
+ *
+ * R397 a: a current file that is missing or that the engine cannot
+ * read may be replaced by readable rules: the edit is then decided as a change from the default
+ * rules (DEFAULT_GOVERNANCE, the strictest) to the new ones, ALWAYS needs a reason (whatever the new
+ * rules say), and is audited with `rulesFile: "missing" | "unreadable"`. The write itself is
+ * evaluated under the new rules (`unreadablePolicyFallback`): the engine has no rules of the project
+ * to judge it by, and the defaults would refuse it in any project that is not encrypted (they ask
+ * for encryption at rest). Every other change in the project stays refused until then.
  */
 import { createHash } from "node:crypto";
+import { lstat } from "node:fs/promises";
 import { DEFAULT_GOVERNANCE, effectivePolicy, loosenedControls, parseGovernance, type GovernanceConfig, type Violation } from "@ao/core";
 import { GovernanceViolationError, InvalidInputError } from "./errors.js";
 import { readMaybe } from "./io.js";
@@ -18,8 +26,8 @@ import type { RepoCore } from "./state.js";
 
 /** Longest governance.yaml accepted (bytes). */
 export const GOVERNANCE_MAX_BYTES = 64 * 1024;
-/** What `loosened` lists when the current file could not be read. */
-export const UNREADABLE_GOVERNANCE = "(unreadable governance.yaml)";
+/** Why the current rules file is being replaced without rules to compare with (R397 a). */
+export type GovernanceRepair = "missing" | "unreadable";
 
 export class GovernanceLooseningError extends Error {
   override name = "GovernanceLooseningError";
@@ -28,12 +36,17 @@ export class GovernanceLooseningError extends Error {
     readonly loosened: string[],
     /** Controls where the edit asks for less than a selected profile requires. */
     readonly violations: Violation[],
+    /** Set when the current file is missing or cannot be read: the change is compared with the default rules (R397 a). */
+    readonly repair?: GovernanceRepair,
   ) {
     const parts = [
-      ...loosened.map((c) => (c === UNREADABLE_GOVERNANCE ? "the current rules file cannot be read, so replacing it" : `${c} is looser than before`)),
+      ...loosened.map((c) => `${c} is looser than ${repair ? "the strictest rules" : "before"}`),
       ...violations.map((v) => `${v.control}: the ${v.profile} profile requires ${JSON.stringify(v.required)} (this asks for ${JSON.stringify(v.actual)})`),
     ];
-    super(`This change loosens the project's rules, so it needs a reason: ${parts.join("; ")}`);
+    const head = repair
+      ? `The project's rules file ${repair === "missing" ? "is missing" : "cannot be read"}, so putting rules back needs a reason`
+      : "This change loosens the project's rules, so it needs a reason";
+    super(parts.length ? `${head}: ${parts.join("; ")}` : `${head}.`);
   }
 }
 
@@ -56,11 +69,68 @@ export interface GovernanceEditResult {
 
 export const sha256Of = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
 
-/** The file as written (the empty text when there is none) and its SHA-256. */
-export async function readGovernance(core: RepoCore, projectId: string): Promise<{ yaml: string; sha256: string }> {
+/**
+ * The rules file as read: there, missing (no file; R397 a), or something that cannot be opened in
+ * its place (a folder, a file without permission, R397 e; a link whose target is missing, R421 b).
+ */
+export type GovernanceFileState = "present" | "missing" | "unopenable";
+
+/** Why a save cannot replace what is in the rules file's place (R397 e). */
+export const GOVERNANCE_UNOPENABLE_SAVE =
+  "The rules file could not be opened (something other than a readable file, such as a folder or a link to a file that is not there, is in its place), so it cannot be replaced from here. Remove it from the project's folder, then save the rules again.";
+
+/**
+ * The rules file's bytes, or null when nothing is in its place. A symbolic link whose target is
+ * missing is not "nothing" (R421 b: a save could not replace it, the transaction refuses to write
+ * through a link): it throws a file-system error, as a folder does.
+ */
+async function readRulesBytes(path: string): Promise<Buffer | null> {
+  const buf = await readMaybe(path);
+  if (buf) return buf;
+  try {
+    await lstat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+  throw Object.assign(new Error("governance.yaml is a link to a file that is not there"), { code: "ENOENT" });
+}
+
+/**
+ * The file as written (the empty text when there is none), its SHA-256, and whether it is there at
+ * all. Throws when something that cannot be opened is in its place (callers fail closed on that).
+ */
+export async function readGovernance(core: RepoCore, projectId: string): Promise<{ yaml: string; sha256: string; file: "present" | "missing" }> {
   const st = core.state(projectId);
-  const raw = (await readMaybe(core.abs(`${st.rel}/governance.yaml`))) ?? Buffer.alloc(0);
-  return { yaml: raw.toString("utf8"), sha256: sha256Of(raw) };
+  const buf = await readRulesBytes(core.abs(`${st.rel}/governance.yaml`));
+  const raw = buf ?? Buffer.alloc(0);
+  return { yaml: raw.toString("utf8"), sha256: sha256Of(raw), file: buf ? "present" : "missing" };
+}
+
+/**
+ * As `readGovernance`, but something that cannot be opened in the file's place is answered as
+ * `file: "unopenable"` with the empty text, never thrown (R397 e: the rules' screen says so).
+ */
+export async function readGovernanceFile(core: RepoCore, projectId: string): Promise<{ yaml: string; sha256: string; file: GovernanceFileState }> {
+  try {
+    return await readGovernance(core, projectId);
+  } catch (err) {
+    if (!isFsError(err)) throw err;
+    return { yaml: "", sha256: sha256Of(Buffer.alloc(0)), file: "unopenable" };
+  }
+}
+
+/** A file-system error (EISDIR, EACCES, ELOOP, …), not a project that is unknown or locked. */
+const isFsError = (err: unknown): boolean => typeof (err as NodeJS.ErrnoException | null)?.code === "string" && /^E[A-Z]+$/.test((err as NodeJS.ErrnoException).code!);
+
+/** The rules file's bytes for the edit; something that cannot be opened in its place refuses the save (R397 e). */
+async function readForEdit(path: string): Promise<Buffer | null> {
+  try {
+    return await readRulesBytes(path);
+  } catch (err) {
+    if (isFsError(err)) throw new InvalidInputError(GOVERNANCE_UNOPENABLE_SAVE);
+    throw err;
+  }
 }
 
 const key = (v: Violation) => `${v.profile}\u0000${v.control}`;
@@ -72,7 +142,9 @@ export async function setGovernance(core: RepoCore, projectId: string, yamlText:
   if (typeof opts?.baseSha256 !== "string" || !/^[0-9a-f]{64}$/.test(opts.baseSha256)) {
     throw new InvalidInputError("the version of the rules this change was made from (baseSha256) is required");
   }
-  const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+  // R421 a: a reason that holds nothing a person can see (white space and invisible format
+  // characters only) is no reason, for a repair and an ordinary loosening alike.
+  const reason = typeof opts.reason === "string" && opts.reason.replace(/[\s\p{Cf}]/gu, "") !== "" ? opts.reason.trim() : "";
   if (reason.length > 2000) throw new InvalidInputError("the reason must be at most 2000 characters");
   const next = parseGovernance(yamlText); // GovernanceParseError for invalid text
   const effective = effectivePolicy(next);
@@ -85,36 +157,43 @@ export async function setGovernance(core: RepoCore, projectId: string, yamlText:
       throw new GovernanceViolationError("This project contains identifiable data and pseudonymizes file names; that needs an encrypted project");
     }
   }
-  // Is the current file readable? (Decides the policy the write itself is evaluated under.)
-  const pre = await readGovernance(core, projectId);
-  let unreadable = false;
+  // Is the current file there and readable? (Decides the policy the write itself is evaluated under.)
+  const pre = await readGovernanceFile(core, projectId);
+  if (pre.file === "unopenable") throw new InvalidInputError(GOVERNANCE_UNOPENABLE_SAVE);
+  let repairing = pre.file === "missing";
   try {
     if (pre.yaml) parseGovernance(pre.yaml);
   } catch {
-    unreadable = true;
+    repairing = true;
   }
-  let result: { loosened: string[]; fresh: Violation[]; repaired: boolean } | undefined;
+  let result: { loosened: string[]; fresh: Violation[]; repair: GovernanceRepair | undefined } | undefined;
   await runMutation(
     core,
     projectId,
     { action: "store", store: { identifiable: false, hasLocation: false } },
     async (tx) => {
       // Under the serial lock: the file as it is now, and the decision made against it.
-      const raw = (await readMaybe(core.abs(`${st.rel}/governance.yaml`))) ?? Buffer.alloc(0);
+      const buf = await readForEdit(core.abs(`${st.rel}/governance.yaml`));
+      const raw = buf ?? Buffer.alloc(0);
       if (sha256Of(raw) !== opts.baseSha256) throw new GovernanceConflictError();
       let cur: GovernanceConfig | undefined;
-      try {
-        cur = raw.length ? parseGovernance(raw.toString("utf8")) : DEFAULT_GOVERNANCE;
-      } catch {
-        cur = undefined;
+      let repair: GovernanceRepair | undefined = buf ? undefined : "missing";
+      if (buf) {
+        try {
+          cur = raw.length ? parseGovernance(raw.toString("utf8")) : DEFAULT_GOVERNANCE;
+        } catch {
+          repair = "unreadable";
+        }
       }
-      const loosened = cur ? loosenedControls(cur, next) : [UNREADABLE_GOVERNANCE];
-      const before = new Set(cur ? effectivePolicy(cur).violations.map(key) : []);
+      // R397 a: no rules to compare with → compared with the default (strictest) rules, and a reason is always needed.
+      const from = cur ?? DEFAULT_GOVERNANCE;
+      const loosened = loosenedControls(from, next);
+      const before = new Set(effectivePolicy(from).violations.map(key));
       const fresh = effective.violations.filter((v) => !before.has(key(v)));
-      if ((loosened.length || fresh.length) && !reason) throw new GovernanceLooseningError(loosened, fresh);
+      if ((repair || loosened.length || fresh.length) && !reason) throw new GovernanceLooseningError(loosened, fresh, repair);
       await tx.writeFile(`${st.rel}/governance.yaml`, yamlText);
       tx.record("project", projectId, { governanceYaml: raw.toString("utf8") }, { governanceYaml: yamlText });
-      result = { loosened, fresh, repaired: !cur };
+      result = { loosened, fresh, repair };
     },
     {
       op: "project.governance",
@@ -122,8 +201,8 @@ export async function setGovernance(core: RepoCore, projectId: string, yamlText:
       // Known once the decision inside the change is made.
       auditDetails: () => details(),
       ...(reason ? { sealedReason: reason } : {}),
-      // The old rules cannot be read: the write is judged under the new ones (a reason is required).
-      ...(unreadable ? { unreadablePolicyFallback: next } : {}),
+      // The old rules are missing or cannot be read: the write is judged under the new ones (a reason is required).
+      ...(repairing ? { unreadablePolicyFallback: next } : {}),
     },
   );
   function details(): Record<string, unknown> {
@@ -131,7 +210,8 @@ export async function setGovernance(core: RepoCore, projectId: string, yamlText:
     return {
       ...(result.loosened.length ? { loosened: result.loosened } : {}),
       ...(result.fresh.length ? { violations: result.fresh.map((v) => ({ control: v.control, profile: v.profile })) } : {}),
-      ...(result.repaired ? { repairedUnreadable: true } : {}),
+      // R397 a: the file was replaced while the engine could not read it, and why (a word, never a path).
+      ...(result.repair ? { repairedUnreadable: true, rulesFile: result.repair } : {}),
       // R362 b: in an encrypted project only that a reason was given and its keyed digest (R369 b); the text is sealed in this change.
       ...(reason ? auditedReasonIn(core, st, reason) : {}),
     };

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { http, HttpResponse } from "msw";
 import { importApi, importPolicyFromYaml, isProgressFor } from "./import";
-import { mockService, OPEN_GOVERNANCE, PSEUDONYMISING_GOVERNANCE, server, B1, P1 } from "../test/importService";
+import { mockService, BASE, OPEN_GOVERNANCE, PSEUDONYMISING_GOVERNANCE, server, B1, P1 } from "../test/importService";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
@@ -16,6 +17,15 @@ describe("importPolicyFromYaml", () => {
 });
 
 describe("importApi", () => {
+  it("R397 f: an answer without `readable` is readable only if the rules read here (M6)", async () => {
+    const m = mockService();
+    const answer = (yaml: string) => server.use(http.get(`${BASE}/projects/:id/governance`, () => HttpResponse.json({ yaml, sha256: "0".repeat(64), violations: [] })));
+    answer("encryption: {atRest: optional}\nresidencey: {allowed: [local]}\n");
+    expect(await importApi(m.client).policy(P1)).toEqual({ pseudonymizeNames: true, encryptionRequired: true, readable: false });
+    answer(OPEN_GOVERNANCE);
+    expect(await importApi(m.client).policy(P1)).toEqual({ pseudonymizeNames: false, encryptionRequired: false, readable: true });
+  });
+
   it("refuses '.', '..' and empty path segments and ids that are not UUIDv7", async () => {
     const m = mockService();
     const api = importApi(m.client);

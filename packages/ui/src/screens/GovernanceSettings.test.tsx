@@ -1005,3 +1005,115 @@ describe("The Elicit box says what the rules in force say (R314 a, e, f)", () =>
     expect(parse(cap.puts[0]!.body.yaml).acquireMethods).toEqual(["library_access", "a_later_way"]);
   });
 });
+
+describe("rules the engine cannot read are said (R379 FR-A18, R58)", () => {
+  const PROBE = "encryption: {atRest: optional}\nresidencey: {allowed: [local]}\n";
+  const FIXED = "encryption: {atRest: optional}\nresidency: {allowed: [device]}\n";
+  const ALERT = "The app cannot read this project's rules. Until they are corrected it refuses every capture, import, change and export in this project.";
+
+  function serveRead(get: Record<string, unknown>, put?: Record<string, unknown>) {
+    const puts: any[] = [];
+    server.use(
+      http.get(url(`/projects/${PID}/governance`), () => HttpResponse.json({ sha256: SHA, violations: [], ...get })),
+      http.put(url(`/projects/${PID}/governance`), async ({ request }) => {
+        puts.push(await request.json());
+        return HttpResponse.json({ violations: [], loosened: [], sha256: "b".repeat(64), readable: true, issues: [], warnings: [], ...put });
+      }),
+      http.get(url(`/projects/${PID}/protocol/documents`), () => HttpResponse.json({ documents: [] })),
+      http.get(url(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    return puts;
+  }
+
+  it("readable false: the alert and the issues; the cards still render; a corrected text saves and the alert goes; focus is not moved", async () => {
+    const puts = serveRead({ yaml: PROBE, readable: false, issues: ["residencey: unknown key (check spelling) in governance.yaml"], warnings: [] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const alert = screen.getAllByRole("alert").find((a) => a.textContent?.includes(ALERT))!;
+    expect(alert).toBeTruthy();
+    expect(alert.className).toContain("ao-warning");
+    expect(within(alert).getByRole("listitem").textContent).toBe("residencey: unknown key (check spelling) in governance.yaml");
+    expect(document.activeElement).toBe(document.body);
+    // The cards still show what the file says, so it can be corrected.
+    expect((within(card("Encryption")).getByRole("combobox", { name: "Encryption at rest" }) as HTMLSelectElement).value).toBe("optional");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "View governance.yaml" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "governance.yaml" }), { target: { value: FIXED } });
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    expect(puts[0].yaml).toBe(FIXED);
+    expect(screen.queryByText(ALERT)).toBeNull();
+    expect(screen.queryByText(/residencey: unknown key/)).toBeNull();
+  });
+
+  it("readable with warnings: a note (not an alert) and the list; gone after a save that has none", async () => {
+    const w = 'consent.defaultLegalBasis.manual_upload: ignored, "manual-upload" is set (the old spelling of the same category)';
+    serveRead({ yaml: YAML, readable: true, issues: [], warnings: [w] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const lead = screen.getByText("The rules were read, with these notes:");
+    const note = lead.closest("div")!;
+    expect(note.getAttribute("role")).not.toBe("alert");
+    expect(within(note).getByRole("listitem").textContent).toBe(w);
+    expect(screen.queryByText(ALERT)).toBeNull();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "View governance.yaml" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "governance.yaml" }), { target: { value: `${YAML}audit:\n  enabled: true\n` } });
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Saved.");
+    expect(screen.queryByText("The rules were read, with these notes:")).toBeNull();
+  });
+
+  it("R397 a: a missing file: the alert with its issue; a save asks for a reason and an approver, then puts the rules back", async () => {
+    const MISSING = "The rules file (governance.yaml) is missing from this project's folder.";
+    const puts: any[] = [];
+    server.use(
+      http.get(url(`/projects/${PID}/governance`), () => HttpResponse.json({ yaml: "", sha256: SHA, violations: [], readable: false, issues: [MISSING], warnings: [] })),
+      http.put(url(`/projects/${PID}/governance`), async ({ request }) => {
+        const b = (await request.json()) as { reason?: string };
+        puts.push(b);
+        if (!b.reason) return HttpResponse.json({ error: { code: "VALIDATION", message: "The project's rules file is missing, so putting rules back needs a reason: audit.enabled is looser than the strictest rules" } }, { status: 400 });
+        return HttpResponse.json({ violations: [], loosened: [], sha256: "b".repeat(64), readable: true, issues: [], warnings: [] });
+      }),
+      http.get(url(`/projects/${PID}/protocol/documents`), () => HttpResponse.json({ documents: [] })),
+      http.get(url(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const alert = screen.getAllByRole("alert").find((a) => a.textContent?.includes(ALERT))!;
+    expect(within(alert).getByRole("listitem").textContent).toBe(MISSING);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "View governance.yaml" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "governance.yaml" }), { target: { value: FIXED } });
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    const dialog = await screen.findByRole("dialog", { name: "Record a reason" });
+    expect(dialog.textContent).toMatch(/is missing, so putting rules back needs a reason/);
+    await user.type(within(dialog).getByRole("textbox", { name: "Reason" }), "Putting the rules back");
+    await user.type(within(dialog).getByRole("textbox", { name: "Approved by" }), "Ana");
+    await user.click(within(dialog).getByRole("button", { name: "Record reason" }));
+    await screen.findByText("Saved.");
+    expect(puts).toHaveLength(2);
+    expect(puts[1].reason).toBe("Putting the rules back (Ana)");
+    expect(puts[1].yaml).toBe(FIXED);
+    expect(screen.queryByText(ALERT)).toBeNull();
+  });
+
+  it("R397 d: an issue quoting markup is shown as text, never as markup", async () => {
+    const issue = "<img src=x onerror=alert(1)>: unknown key (check spelling) in governance.yaml";
+    serveRead({ yaml: PROBE, readable: false, issues: [issue], warnings: [] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const alert = screen.getAllByRole("alert").find((a) => a.textContent?.includes(ALERT))!;
+    expect(within(alert).getByRole("listitem").textContent).toBe(issue);
+    expect(document.querySelector("img")).toBeNull();
+  });
+
+  it("readable without warnings: nothing new is shown", async () => {
+    serveRead({ yaml: YAML, readable: true, issues: [], warnings: [] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    expect(screen.queryByText(ALERT)).toBeNull();
+    expect(screen.queryByText("The rules were read, with these notes:")).toBeNull();
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+  });
+});

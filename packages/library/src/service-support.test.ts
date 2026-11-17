@@ -4,10 +4,10 @@
  * (loosening needs a reason, audited), field confirmation, transcript versions, capture preflight,
  * app settings and path scrubbing.
  */
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { GovernanceParseError, newId, type PendingProxy, type Project } from "@ao/core";
+import { DEFAULT_GOVERNANCE, GovernanceParseError, loosenedControls, newId, parseGovernance, type PendingProxy, type Project } from "@ao/core";
 import { readAppSetting, scrubPaths, updateAppSettingStrict } from "./app-settings.js";
 import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
 import { OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
@@ -309,18 +309,53 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     await expect(kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: base })).rejects.toBeInstanceOf(GovernanceLooseningError);
   });
 
-  it("an unreadable governance.yaml can be replaced, but only with a reason (everything counts as loosened)", async () => {
+  it("an unreadable governance.yaml can be replaced, but only with a reason (compared with the default rules; R397 a)", async () => {
     const file = join(kit.lib.root, p.folder, "governance.yaml");
     await writeFile(file, "encryption: [this is: not valid");
     const { sha256, yaml } = await kit.repo.getGovernance(p.id);
     expect(yaml).toContain("not valid");
     const err = await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: sha256 }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(GovernanceLooseningError);
-    expect((err as GovernanceLooseningError).loosened).toEqual(["(unreadable governance.yaml)"]);
+    expect((err as GovernanceLooseningError).repair).toBe("unreadable");
+    expect((err as GovernanceLooseningError).loosened).toEqual(loosenedControls(DEFAULT_GOVERNANCE, parseGovernance(OPEN_GOV)));
     await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: sha256, reason: "repairing a damaged rules file" });
     expect(await readFile(file, "utf8")).toBe(OPEN_GOV);
     const ev = (await auditEvents(kit, p)).filter((e) => e.details?.op === "project.governance");
-    expect(ev.at(-1)!.details).toMatchObject({ reason: "repairing a damaged rules file", repairedUnreadable: true });
+    expect(ev.at(-1)!.details).toMatchObject({ reason: "repairing a damaged rules file", repairedUnreadable: true, rulesFile: "unreadable" });
+  });
+
+  it("R421 a: a reason of only white space and invisible characters is no reason (a repair and an ordinary loosening)", async () => {
+    const file = join(kit.lib.root, p.folder, "governance.yaml");
+    const invisible = " \u200B\u2060\uFEFF\u00AD\n";
+    // An ordinary loosening: the current file is OPEN_GOV, the new one turns the audit log off.
+    const looser = `${OPEN_GOV}audit:\n  enabled: false\n`;
+    const base0 = (await kit.repo.getGovernance(p.id)).sha256;
+    await expect(kit.repo.setGovernance(p.id, looser, { baseSha256: base0, reason: invisible })).rejects.toBeInstanceOf(GovernanceLooseningError);
+    await rm(file);
+    const g = await kit.repo.getGovernance(p.id);
+    const err = await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: g.sha256, reason: invisible }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GovernanceLooseningError);
+    expect((err as GovernanceLooseningError).repair).toBe("missing");
+  });
+
+  it("R397 a: a missing governance.yaml refuses every other change; readable rules put it back, only with a reason, audited as such", async () => {
+    const file = join(kit.lib.root, p.folder, "governance.yaml");
+    await rm(file);
+    const g = await kit.repo.getGovernance(p.id);
+    expect(g).toMatchObject({ yaml: "", file: "missing" });
+    await expect(kit.repo.createTag(p.id, "before")).rejects.toBeInstanceOf(PolicyDeniedError);
+    const err = await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: g.sha256 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GovernanceLooseningError);
+    expect((err as GovernanceLooseningError).repair).toBe("missing");
+    expect((err as Error).message).toMatch(/is missing, so putting rules back needs a reason/);
+    await expect(kit.repo.createTag(p.id, "still")).rejects.toBeInstanceOf(PolicyDeniedError);
+    await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: g.sha256, reason: "putting the rules back (Ana)" });
+    expect(await readFile(file, "utf8")).toBe(OPEN_GOV);
+    expect((await kit.repo.getGovernance(p.id)).file).toBe("present");
+    await kit.repo.createTag(p.id, "after");
+    const ev = (await auditEvents(kit, p)).filter((e) => e.details?.op === "project.governance");
+    expect(ev.at(-1)!.details).toMatchObject({ reason: "putting the rules back (Ana)", rulesFile: "missing" });
+    expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
   });
 
   it("tags can be renamed and deleted, collections renamed (governed); deleting a tag removes it from sources", async () => {

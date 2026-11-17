@@ -20,7 +20,7 @@
  */
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { CAPTURE_RUNNING, CAPTURE_STOPPING } from "@ao/shared";
+import { CAPTURE_RULES_UNREADABLE_TEXT, CAPTURE_RUNNING, CAPTURE_STOPPING } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "../api/client";
 import {
   applyProgress,
@@ -739,6 +739,8 @@ export function Capture({ client, projectId }: CaptureProps) {
           This project is locked. <a href={libraryHref(projectId)} onClick={inAppLink}>Unlock it in the library</a>, then capture.
         </p>
       )}
+      {/* Rules the engine cannot read: every capture is refused; say why (R379 FR-A18). A failed read is said above. */}
+      {policy && !policy.readable && !loadError && <p className="ao-capture__note">{CAPTURE_RULES_UNREADABLE_TEXT}</p>}
       {policy?.readable && !policy.downloaderAllowed && (
         <p className="ao-capture__note">
           This project&apos;s rules do not allow capture with the downloader, so links will be refused. Whoever manages the project&apos;s rules can allow it under Governance.

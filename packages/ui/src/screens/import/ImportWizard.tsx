@@ -15,6 +15,7 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "../../api/client";
+import { IMPORT_RULES_UNREADABLE_TEXT } from "@ao/shared";
 import { importApi, isValidId, type BatchState, type BatchSummary, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
 import { UserText } from "../../components/UserText";
 import { inAppLink, navigate } from "../../navigation";
@@ -83,6 +84,8 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [projectId, setProjectIdState] = useState(isValidId(initialProject) ? initialProject : "");
   const [policy, setPolicy] = useState<ImportPolicy | null>(null);
+  /** The service cannot read the project's rules: every import is refused (R379 FR-A18). */
+  const [rulesUnreadable, setRulesUnreadable] = useState(false);
   const [choice, setChoice] = useState<SourceChoice>({ kind: "folder", path: "" });
   const [scanned, setScanned] = useState<Scanned | null>(null);
   const [approvals, setApprovals] = useState<OutsideApprovals>(NO_APPROVALS);
@@ -169,10 +172,15 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
     if (!isValidId(projectId)) return;
     let live = true;
     setPolicy(null);
+    setRulesUnreadable(false);
     setOptions(null); // defaults follow the project's rules
     api
       .policy(projectId)
-      .then((p) => live && setPolicy(p))
+      .then((p) => {
+        if (!live) return;
+        setPolicy(p);
+        setRulesUnreadable(!p.readable);
+      })
       .catch(() => live && setPolicy(STRICT));
     return () => {
       live = false;
@@ -259,6 +267,8 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
       </ol>
 
       {opening && <p role="status">Opening the import…</p>}
+      {/* Rules the engine cannot read: every import is refused; say why on the first step (R379 FR-A18). */}
+      {!opening && step === "source" && rulesUnreadable && isValidId(projectId) && <ErrorNote error={IMPORT_RULES_UNREADABLE_TEXT} />}
       {!opening && step === "source" && (
         <StepSource
           api={api}

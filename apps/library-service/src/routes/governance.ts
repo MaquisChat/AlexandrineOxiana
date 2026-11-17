@@ -16,7 +16,8 @@
 import { userInfo } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
-import { effectivePolicy, parseGovernance } from "@ao/core";
+import { GovernanceParseError, effectivePolicy, parseGovernance, parseGovernanceWithWarnings } from "@ao/core";
+import type { GovernanceReadability } from "@ao/shared";
 import {
   GOVERNANCE_MAX_BYTES,
   addProtocolDocuments,
@@ -65,13 +66,60 @@ export function safeYamlCheck(text: string): void {
   }
 }
 
+/**
+ * Whether the policy engine can read these rules (R379 FR-A18, R58): when it cannot, every request
+ * in the project is refused, so the answer says so with the engine's own messages, one line per
+ * problem (the key and what is wrong; no path, no stack); readable rules carry their non-fatal
+ * warnings (a key in an old spelling, an exception that waives nothing).
+ */
+export function governanceReadability(yaml: string, roots: Iterable<string>): GovernanceReadability {
+  // R397 c, d: one line; no control characters or marks that reorder or hide text (taken out before
+  // the paths are scrubbed, so they cannot split a path); no path; at most MAX_LINE_CHARS (R397 b).
+  const clean = (t: string) => {
+    const line = scrubPaths(t.replace(/\s+/g, " ").replace(HIDDEN_CHARS, ""), roots).trim();
+    // Cut by whole characters (code points), never half a surrogate pair (R421 c).
+    const chars = [...line];
+    return chars.length > MAX_LINE_CHARS ? `${chars.slice(0, MAX_LINE_CHARS - 1).join("")}…` : line;
+  };
+  try {
+    const { config, warnings } = parseGovernanceWithWarnings(yaml);
+    effectivePolicy(config);
+    return { readable: true, issues: [], warnings: capped(warnings.map(clean).filter(Boolean)) };
+  } catch (err) {
+    let issues: string[] = [];
+    if (err instanceof GovernanceParseError && err.issues.length) issues = err.issues;
+    else if (err instanceof Error) issues = [err.message.split("\n")[0]!.replace(/^governance\.yaml:\s*/, "").replace(/:\s*$/, "")];
+    issues = issues.map(clean).filter(Boolean);
+    return { readable: false, issues: issues.length ? capped(issues) : ["the rules file could not be read"], warnings: [] };
+  }
+}
+
+/** At most this many issues (or warnings) are sent, then "and N more." (R397 b). */
+const MAX_LINES = 20;
+/** Each issue or warning is at most this many characters (code points), cut with "…" (R397 b). */
+const MAX_LINE_CHARS = 300;
+/**
+ * Taken out of issues and warnings (R397 d, R421 c): every control and format character (\p{Cc},
+ * \p{Cf}: C0 and C1 controls, the soft hyphen, the bidi marks, embeddings, overrides and isolates,
+ * the zero-width characters, the tag characters U+E0000–E007F), the invisible fillers U+034F,
+ * U+115F, U+1160 and U+3164, and the variation selectors U+FE00–FE0F.
+ */
+const HIDDEN_CHARS = /[\p{Cc}\p{Cf}\u034F\u115F\u1160\u3164\uFE00-\uFE0F]/gu;
+
+const capped = (lines: string[]): string[] => (lines.length > MAX_LINES ? [...lines.slice(0, MAX_LINES), `and ${lines.length - MAX_LINES} more.`] : lines);
+
+/** The single issue when the project's rules file is missing (a link to nothing cannot be opened: R421 b) (R397 a). */
+export const GOVERNANCE_MISSING_ISSUE = "The rules file (governance.yaml) is missing from this project's folder.";
+/** The single issue when something that cannot be opened is in the rules file's place: a folder, a file without permission (R397 e), a link to a file that is not there (R421 b). */
+export const GOVERNANCE_UNOPENABLE_ISSUE = "The rules file could not be opened.";
+
 export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
   app.get("/projects/:id/governance", async (req, reply) => {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
-    const { yaml, sha256 } = await s.repo.getGovernance(projectId);
+    const { yaml, sha256, file } = await s.repo.getGovernance(projectId);
     // The version an edit is made from: send it back as If-Match (or `baseSha256`).
     void reply.header("ETag", `"${sha256}"`);
     let violations: unknown[] = [];
@@ -80,7 +128,14 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     } catch {
       // unreadable rules: every request is denied; the text is still shown for fixing
     }
-    return { yaml, sha256, violations };
+    // R397 a, e: no file (or one that cannot be opened) is not an empty file: the engine refuses everything until rules are put back.
+    const readability: GovernanceReadability =
+      file === "missing"
+        ? { readable: false, issues: [GOVERNANCE_MISSING_ISSUE], warnings: [] }
+        : file === "unopenable"
+          ? { readable: false, issues: [GOVERNANCE_UNOPENABLE_ISSUE], warnings: [] }
+          : governanceReadability(yaml, state.roots);
+    return { yaml, sha256, violations, ...readability };
   });
 
   app.put("/projects/:id/governance", async (req) => {
@@ -105,7 +160,7 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     state.publishState();
     // R282 f: the project's Find and acquire entries the rules had stopped are looked at again under the new rules.
     state.resumeFind(s, projectId);
-    return { violations: r.violations, loosened: r.loosened, sha256: r.sha256 };
+    return { violations: r.violations, loosened: r.loosened, sha256: r.sha256, ...governanceReadability(yaml, state.roots) };
   });
 
   app.get("/projects/:id/protocol/documents", async (req) => {

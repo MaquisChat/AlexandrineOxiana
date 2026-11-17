@@ -38,6 +38,8 @@ export interface CaptureSetup {
   profileAnswer?: (n: number) => Response | undefined;
   /** Delay before GET /projects/:id/governance answers. */
   governanceDelayMs?: number;
+  /** Projects whose rules the service says it cannot read (`readable: false`, R379 FR-A18). */
+  unreadable?: string[];
   versions?: Record<string, string | null>;
   versionsAnswer?: () => Response | undefined;
   updateAnswer?: () => Response | undefined;
@@ -106,7 +108,15 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
     http.get(url("/projects/:id/governance"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/governance`);
       await wait(o.governanceDelayMs);
-      return HttpResponse.json({ yaml: o.governance?.[params.id as string] ?? OPEN_RULES, sha256: "0".repeat(64), violations: [] });
+      const unreadable = o.unreadable?.includes(params.id as string) ?? false;
+      return HttpResponse.json({
+        yaml: o.governance?.[params.id as string] ?? OPEN_RULES,
+        sha256: "0".repeat(64),
+        violations: [],
+        readable: !unreadable,
+        issues: unreadable ? ["residencey: unknown key (check spelling) in governance.yaml"] : [],
+        warnings: [],
+      });
     }),
     http.post(url("/projects/:id/acknowledge"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/acknowledge`);
