@@ -2172,6 +2172,23 @@ describe("FR-A21 (R392): the progress tells the truth about the total", () => {
     expect(seen.at(-1)!.done).toBe(4);
   });
 
+  it("R433 (2): a key yielded and then asked through skip is not counted again", async () => {
+    const p = await project();
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(_s, ctx): AsyncGenerator<ScanItem> {
+        ctx?.total?.(2);
+        yield { key: "k0", files: [], unreadable: "not readable" }; // journaled at once (a failed item)
+        if (ctx?.skip?.("k0") !== true) throw new Error("k0 should be in the journal");
+        yield meta("k1");
+      },
+    };
+    const seen = await events(await bulk.startBatch(p.id, adapter));
+    for (const e of seen) expect(e.done).toBeLessThanOrEqual(2);
+    expect(seen.at(-1)).toEqual({ done: 2, total: 2 });
+  });
+
   for (const bad of [2.5, Number.NaN, -1]) {
     it(`R426 c: a total of ${bad} is not a total: no event carries one`, async () => {
       const p = await project();

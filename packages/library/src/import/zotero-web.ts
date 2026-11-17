@@ -968,6 +968,8 @@ async function* scanWeb(
       delete result.libraryVersion;
       keyList = undefined;
       keyListAsked = false;
+      // Defensive (no test): a restarted listing notes its own passed tops; a stale one would count only if it were a
+      // top of the new tree, where the new listing notes it anyway, so a test would need a contrived restart.
       passedTops.clear();
       try {
         if (since === undefined) tree = await fullTree(api, prefix, result);
