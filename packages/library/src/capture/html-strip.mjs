@@ -9,7 +9,8 @@
 // key; meta tags and form fields that carry a token or a password; javascript:, vbscript: and
 // data: URLs in every URL attribute; CSS expression().
 // Removed too: meta refresh and set-cookie (R107).
-// Cleaned: every URL (absolute, protocol-relative or relative) loses its query and fragment — in
+// Cleaned: every URL (absolute, protocol-relative or relative) loses its query, fragment, user
+// information and path parameters (R391 d, R415 a) — in
 // URL attributes, srcset, meta content (og:image …), URL-like data-* values, and CSS url()/@import,
 // image-set candidates (quoted or not) and URL-like strings and custom properties in <style> and style=.
 //
@@ -98,8 +99,9 @@ export function secretName(k, value) {
 }
 
 /**
- * null: an unsafe scheme (the attribute is dropped); else the URL without query and fragment, and
- * without a user name and password in its authority (`https://ana:pw@host/p` → `https://host/p`, R391 d).
+ * null: an unsafe scheme (the attribute is dropped); else the URL without query and fragment, without
+ * a user name and password in its authority (`https://ana:pw@host/p` → `https://host/p`, R391 d), and
+ * without any path parameter (`/app;jsessionid=…/next` → `/app/next`, R415 a).
  */
 export function cleanUrl(value) {
   const compact = String(value).replace(/[\u0000- \u007f-\u009f]/g, "").toLowerCase();
@@ -108,7 +110,14 @@ export function cleanUrl(value) {
   const q = v.search(/[?#]/);
   const head = q >= 0 ? v.slice(0, q) : v;
   // The authority runs from `//` to the next `/`; everything up to its last `@` is user information.
-  return head.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)([^/]*@)/i, "$1");
+  const noUser = head.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)([^/]*@)/i, "$1");
+  // Path parameters (R415 a): in every segment of the path, everything from its first `;` goes, whatever
+  // its name — a site that rewrites its addresses writes the session id there in every link. The
+  // authority is left as it is, and so is an address of a scheme with no `//` (`mailto:` …).
+  const auth = /^\s*(?:[a-z][a-z0-9+.-]*:)?\/\/[^/]*/i.exec(noUser);
+  if (!auth && /^\s*[a-z][a-z0-9+.-]*:/i.test(noUser)) return noUser;
+  const start = auth ? auth[0].length : 0;
+  return noUser.slice(0, start) + noUser.slice(start).replace(/;[^/]*/g, "");
 }
 
 function cleanSrcset(value) {

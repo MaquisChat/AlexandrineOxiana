@@ -428,3 +428,28 @@ describe("the two copies of the secret-name rule decide alike, on one table of n
   });
   it("the table is large enough", () => expect(TABLE.length).toBeGreaterThanOrEqual(40));
 });
+
+describe("the snapshot's address cleaner drops every path parameter (R415 a, review 2 I1)", () => {
+  it("the review's probe: a jsessionid path parameter in a canonical link, og:url, a link and a form action", async () => {
+    const out = await stripHtmlSnapshot(
+      `<html><head><link rel="canonical" href="https://portal.example.org/app;jsessionid=JSESSHTML1/case">` +
+        `<meta property="og:url" content="https://portal.example.org/a;jsessionid=JSESSMETA"></head>` +
+        `<body><a href="/app;jsessionid=JSESSLINK1/next">n</a><form action="/login;jsessionid=JSESSFORM1"><button>go</button></form>` +
+        `<img src="/i.png" srcset="/app;jsessionid=JSESSSRCSET/i.png 2x"></body></html>`,
+    );
+    expect(out).not.toMatch(/jsessionid|JSESS/i);
+    expect(out).toContain('href="https://portal.example.org/app/case"');
+    expect(out).toContain('content="https://portal.example.org/a"');
+    expect(out).toContain('href="/app/next"');
+    expect(out).toContain('action="/login"');
+    expect(out).toContain('srcset="/app/i.png 2x"');
+  });
+  it("each segment loses everything from its first `;`, whatever the parameter's name", () => {
+    expect(cleanUrl("/app;jsessionid=ABC/viewtopic.php")).toBe("/app/viewtopic.php");
+    expect(cleanUrl("https://host/a;foo=bar;x=1/b;v=2/c?q#f")).toBe("https://host/a/b/c");
+    expect(cleanUrl("https://host/p;x=1")).toBe("https://host/p");
+    expect(cleanUrl("//host/a;sid=1/b")).toBe("//host/a/b");
+    expect(cleanUrl("page.html;s=1")).toBe("page.html");
+    expect(cleanUrl("https://host/plain/path")).toBe("https://host/plain/path");
+  });
+});
