@@ -7,7 +7,7 @@
  * less than a selected profile requires (a new effectivePolicy violation) needs a written reason,
  * recorded on the audit event.
  *
- * R397 a: a current file that is missing (or a link that leads nowhere) or that the engine cannot
+ * R397 a: a current file that is missing or that the engine cannot
  * read may be replaced by readable rules: the edit is then decided as a change from the default
  * rules (DEFAULT_GOVERNANCE, the strictest) to the new ones, ALWAYS needs a reason (whatever the new
  * rules say), and is audited with `rulesFile: "missing" | "unreadable"`. The write itself is
@@ -16,6 +16,7 @@
  * for encryption at rest). Every other change in the project stays refused until then.
  */
 import { createHash } from "node:crypto";
+import { lstat } from "node:fs/promises";
 import { DEFAULT_GOVERNANCE, effectivePolicy, loosenedControls, parseGovernance, type GovernanceConfig, type Violation } from "@ao/core";
 import { GovernanceViolationError, InvalidInputError } from "./errors.js";
 import { readMaybe } from "./io.js";
@@ -69,14 +70,31 @@ export interface GovernanceEditResult {
 export const sha256Of = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
 
 /**
- * The rules file as read: there, missing (no file, or a link that leads nowhere; R397 a), or
- * something that cannot be opened in its place (a folder, a file without permission; R397 e).
+ * The rules file as read: there, missing (no file; R397 a), or something that cannot be opened in
+ * its place (a folder, a file without permission, R397 e; a link whose target is missing, R421 b).
  */
 export type GovernanceFileState = "present" | "missing" | "unopenable";
 
 /** Why a save cannot replace what is in the rules file's place (R397 e). */
 export const GOVERNANCE_UNOPENABLE_SAVE =
-  "The rules file could not be opened (something other than a readable file, such as a folder, is in its place), so it cannot be replaced from here. Remove it from the project's folder, then save the rules again.";
+  "The rules file could not be opened (something other than a readable file, such as a folder or a link to a file that is not there, is in its place), so it cannot be replaced from here. Remove it from the project's folder, then save the rules again.";
+
+/**
+ * The rules file's bytes, or null when nothing is in its place. A symbolic link whose target is
+ * missing is not "nothing" (R421 b: a save could not replace it, the transaction refuses to write
+ * through a link): it throws a file-system error, as a folder does.
+ */
+async function readRulesBytes(path: string): Promise<Buffer | null> {
+  const buf = await readMaybe(path);
+  if (buf) return buf;
+  try {
+    await lstat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+  throw Object.assign(new Error("governance.yaml is a link to a file that is not there"), { code: "ENOENT" });
+}
 
 /**
  * The file as written (the empty text when there is none), its SHA-256, and whether it is there at
@@ -84,7 +102,7 @@ export const GOVERNANCE_UNOPENABLE_SAVE =
  */
 export async function readGovernance(core: RepoCore, projectId: string): Promise<{ yaml: string; sha256: string; file: "present" | "missing" }> {
   const st = core.state(projectId);
-  const buf = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
+  const buf = await readRulesBytes(core.abs(`${st.rel}/governance.yaml`));
   const raw = buf ?? Buffer.alloc(0);
   return { yaml: raw.toString("utf8"), sha256: sha256Of(raw), file: buf ? "present" : "missing" };
 }
@@ -108,7 +126,7 @@ const isFsError = (err: unknown): boolean => typeof (err as NodeJS.ErrnoExceptio
 /** The rules file's bytes for the edit; something that cannot be opened in its place refuses the save (R397 e). */
 async function readForEdit(path: string): Promise<Buffer | null> {
   try {
-    return await readMaybe(path);
+    return await readRulesBytes(path);
   } catch (err) {
     if (isFsError(err)) throw new InvalidInputError(GOVERNANCE_UNOPENABLE_SAVE);
     throw err;

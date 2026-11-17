@@ -105,9 +105,9 @@ const HIDDEN_CHARS = /[\u0000-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202
 
 const capped = (lines: string[]): string[] => (lines.length > MAX_LINES ? [...lines.slice(0, MAX_LINES), `and ${lines.length - MAX_LINES} more.`] : lines);
 
-/** The single issue when the project's rules file is missing, or is a link that leads nowhere (R397 a). */
+/** The single issue when the project's rules file is missing (a link to nothing cannot be opened: R421 b) (R397 a). */
 export const GOVERNANCE_MISSING_ISSUE = "The rules file (governance.yaml) is missing from this project's folder.";
-/** The single issue when something that cannot be opened is in the rules file's place: a folder, a file without permission (R397 e). */
+/** The single issue when something that cannot be opened is in the rules file's place: a folder, a file without permission (R397 e), a link to a file that is not there (R421 b). */
 export const GOVERNANCE_UNOPENABLE_ISSUE = "The rules file could not be opened.";
 
 export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {

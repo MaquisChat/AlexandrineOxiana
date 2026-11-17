@@ -985,16 +985,6 @@ describe("FR-A18 round 2 (R397 a): a missing or unreadable rules file is said, a
     expect((await call({ url: `/projects/${pid}/governance` })).json.readable).toBe(false);
   });
 
-  it("a symbolic link that leads nowhere is missing too", async () => {
-    await openNewLibrary();
-    const pid = await newProject();
-    const f = await govFile();
-    await rm(f);
-    await symlink(join(tmp, "nowhere.yaml"), f);
-    const g = await call({ url: `/projects/${pid}/governance` });
-    expect(g.json).toMatchObject({ yaml: "", readable: false, issues: [MISSING] });
-  });
-
   it("in an encrypted project even rules as strict as the defaults need a reason to put back", async () => {
     await openNewLibrary();
     const pid = await newProject(HIPAA_GOV, true);
@@ -1046,6 +1036,39 @@ describe("FR-A18 round 2 (R397 e): a rules file that cannot be opened is said, n
     expect(put.body).not.toContain(tmp);
     expect(put.body).not.toMatch(/EISDIR/);
     expect((await call({ url: `/projects/${pid}/retention` })).status).toBe(200);
+  });
+
+  it("R421 b: a symbolic link whose target is missing cannot be opened; a save says to remove it, not that the path is refused", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    await rm(f);
+    await symlink(join(tmp, "nowhere.yaml"), f);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status, g.body).toBe(200);
+    expect(g.json).toMatchObject({ yaml: "", readable: false, issues: [OPENED], warnings: [] });
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "back (Ana)" } });
+    expect(put.status, put.body).toBe(400);
+    expect(put.json.error.message).toMatch(/could not be opened.*Remove it from the project's folder/);
+    expect(put.body).not.toContain(tmp);
+  });
+
+  it("R421 b: a symbolic link to a readable file outside the library: read through the link; a save over it is refused", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    const outside = join(tmp, "elsewhere.yaml");
+    await writeFile(outside, OPEN_GOV);
+    await rm(f);
+    await symlink(outside, f);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json).toMatchObject({ yaml: OPEN_GOV, readable: true, issues: [] });
+    expect((await call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: "kin" } })).status).toBe(200);
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: `${OPEN_GOV}# note\n`, baseSha256: g.json.sha256, reason: "x (y)" } });
+    // Unchanged by R421: the transaction's path guard refuses to write through the link.
+    expect(put.status, put.body).toBe(400);
+    expect(put.json.error.message).toBe("That path is not allowed.");
+    expect(await readFile(outside, "utf8")).toBe(OPEN_GOV);
   });
 
   it.skipIf(process.getuid?.() === 0)("a rules file that cannot be opened (no permission): readable false with one issue", async () => {
