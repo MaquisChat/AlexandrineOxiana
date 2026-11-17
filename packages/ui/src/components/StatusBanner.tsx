@@ -286,10 +286,11 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
   for (const [pid, list] of Object.entries(state.projectWarnings ?? {})) {
     for (const w of list) {
       const project = ctx.projectNames?.[pid] ?? "a project";
-      // The old copies behind the warning (R409 d): the sentence that fits, and each known place.
+      // The old copies behind the warning (R409 d): every sentence that applies, and each known place,
+      // also under "could not be checked" (R429 f).
       const copies = w === DESTRUCTION_OLD_COPIES_PENDING_WARNING ? state.destructionOldCopiesPending?.[pid] : undefined;
       if (copies && Array.isArray(copies.oldCopies)) {
-        const places = copies.unchecked ? [] : [...new Set(copies.oldCopies.flatMap((c) => (typeof c.place === "string" ? [c.place] : [])))];
+        const places = [...new Set(copies.oldCopies.flatMap((c) => (typeof c.place === "string" ? [c.place] : [])))];
         out.push({ kind: "warning", warning: w, project, oldCopies: { text: oldCopiesPendingText(copies), places } });
       } else out.push({ kind: "warning", warning: w, project });
     }

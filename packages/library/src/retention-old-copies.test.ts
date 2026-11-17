@@ -737,4 +737,25 @@ describe("R429: old copies of a moved library and a destruction's certificate (r
       oldCopyLookSeams.hang = undefined;
     }
   }, 30_000);
+
+  it("(f) N5: a destruction that could not be checked beside one that names a copy: the known place is still given to the screen while the list can be read", async () => {
+    const p = await makeProject(kit, GOV, false, "Interviews");
+    const asset = (await rawSource(p)).assets[0]!;
+    const second = (await addSource(kit, p, { type: "interview", title: "Interview two", identifiable: true, files: [{ path: await scratchFile(kit, "two.mp3", "second raw"), role: "original", handling: "copy" }] })).assets[0]!;
+    const dest = join(kit.tmp, "Moved");
+    await executeMove(kit.lib, dest, { deps: deps(), env: env(), sourceRepo: kit.repo });
+    const repo = await openAt(dest);
+    const good = await readFile(listFile(), "utf8");
+    await writeFile(listFile(), "{ damaged");
+    kit.clock.now = DUE;
+    await destroyRaw(repo, p.id, [asset.id], "tester"); // could not be checked
+    await writeFile(listFile(), good);
+    await destroyRaw(repo, p.id, [second.id], "tester"); // names the old copy
+    const behind = await oldCopiesBehindWarning(repo, p.id);
+    expect(behind.unchecked).toBe(true);
+    expect(behind.oldCopies).toEqual([{ movedOn: "2026-11-10", place: kit.lib.root, offerOpen: false }]);
+    // The list unreadable now: no place.
+    await writeFile(listFile(), "{ damaged");
+    expect((await oldCopiesBehindWarning(repo, p.id)).oldCopies[0]).not.toHaveProperty("place");
+  });
 });

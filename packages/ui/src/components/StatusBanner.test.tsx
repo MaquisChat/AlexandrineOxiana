@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
@@ -214,6 +214,27 @@ describe("R409 d: old copies of the library still holding destroyed data", () =>
   it("the list could not be checked: round 1's sentence", () => {
     render(<StatusBanner variant={banner([], true)} />);
     expect(screen.getByRole("status").textContent).toBe(UNCHECKED);
+  });
+
+  it("R429 f: one copy with no record beside one with a known place: both sentences, the known place listed", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", canDelete: false }, { movedOn: "2026-11-20", place, canDelete: false }])} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(`${NO_RECORD} ${BY_HAND}${place}`);
+    expect(screen.getByRole("listitem").textContent).toBe(place);
+    expect(screen.getByRole("listitem").querySelector("b")).toBeNull();
+    // The known one can still be deleted in the app: that sentence beside the "no record" one.
+    cleanup();
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", canDelete: false }, { movedOn: "2026-11-20", place, canDelete: true }])} />);
+    expect(screen.getByRole("status").textContent).toBe(`${NO_RECORD} ${IN_APP}${place}`);
+  });
+
+  it("R429 f: a destruction that could not be checked: the known places stay listed under that sentence", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-20", place, canDelete: false }], true)} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(`${UNCHECKED} ${BY_HAND}${place}`);
+    expect(screen.getByRole("list")).not.toBeNull();
+    expect(screen.getByRole("listitem").textContent).toBe(place);
+    expect(screen.getByRole("listitem").querySelector("[dir=auto]")).not.toBeNull();
   });
 
   it("without what stands behind it yet, the warning still has a sentence of its own", () => {

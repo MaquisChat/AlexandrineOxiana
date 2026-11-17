@@ -60,13 +60,19 @@ export interface DestructionOldCopiesState {
 }
 
 /**
- * The sentence that fits (R409 d): the list could not be checked; else this computer has no record
- * of an old copy; else every one can still be deleted in the app; else (the usual case) by hand.
+ * Every sentence that applies (R409 d, R429 f), in this order: the list could not be checked; else
+ * (only when it could) this computer has no record of an old copy; and, for the old copies whose
+ * place is known, what to do with the folders named below: delete them on the Move library screen
+ * when the app can still delete every one, else by hand. With no copy known at all (and the list
+ * checked), the by-hand sentence.
  */
 export function oldCopiesPendingText(s: Pick<DestructionOldCopiesState, "oldCopies" | "unchecked">): string {
-  if (s.unchecked) return OLD_COPIES_UNCHECKED_TEXT;
+  const out: string[] = [];
+  if (s.unchecked) out.push(OLD_COPIES_UNCHECKED_TEXT);
   const unknown = s.oldCopies.filter((c) => c.place === undefined);
-  if (unknown.length) return oldCopiesNoRecordText(unknown.flatMap((c) => (c.movedOn ? [c.movedOn] : [])));
-  if (s.oldCopies.length && s.oldCopies.every((c) => c.canDelete)) return OLD_COPIES_DELETE_IN_APP_TEXT;
-  return OLD_COPIES_DELETE_BY_HAND_TEXT;
+  // A list that could not be read does not say "no record": its own sentence covers those copies.
+  if (!s.unchecked && unknown.length) out.push(oldCopiesNoRecordText(unknown.flatMap((c) => (c.movedOn ? [c.movedOn] : []))));
+  const known = s.oldCopies.filter((c) => c.place !== undefined);
+  if (known.length) out.push(known.every((c) => c.canDelete) ? OLD_COPIES_DELETE_IN_APP_TEXT : OLD_COPIES_DELETE_BY_HAND_TEXT);
+  return out.length ? out.join(" ") : OLD_COPIES_DELETE_BY_HAND_TEXT;
 }

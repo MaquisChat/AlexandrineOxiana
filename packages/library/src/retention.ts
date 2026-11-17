@@ -1681,7 +1681,8 @@ export async function oldCopiesAwaitingDeletion(repo: Repo, projectId: string): 
  * its place from this computer's list when the list has a record of it (`place`: for the screen
  * only, never written anywhere), and whether its offer of deletion is still open (finished, not
  * deleted, not expired: the service adds whether it still holds the token). `unchecked` when a
- * destruction could not check the list, or the list cannot be read now (no place is given then).
+ * destruction could not check the list, or the list cannot be read now (no place is given then: a
+ * destruction that could not check it does not hide the places the list now knows, R429 f).
  */
 export async function oldCopiesBehindWarning(
   repo: Repo,
@@ -1694,6 +1695,7 @@ export async function oldCopiesBehindWarning(
   let unchecked = destructions.some((d) => d.unchecked === true);
   const lib = repoLibrary(repo);
   const cfg = { appConfigDir: lib.appConfigDir, clock: repoClock(repo) };
+  // A destruction that could not check the list does not hide the places a readable list knows (R429 f).
   let records: PendingOldCopy[] = [];
   try {
     const list = await oldCopiesOfLibrary(cfg, lib.id);
@@ -1704,7 +1706,7 @@ export async function oldCopiesBehindWarning(
   }
   const tz = projectTimeZone(repo, projectId);
   const oldCopies = [...byId].map(([id, movedAt]) => {
-    const r = unchecked ? undefined : records.find((x) => x.id === id);
+    const r = records.find((x) => x.id === id);
     const movedOn = moveDate(movedAt, tz);
     return {
       ...(movedOn ? { movedOn } : {}),
