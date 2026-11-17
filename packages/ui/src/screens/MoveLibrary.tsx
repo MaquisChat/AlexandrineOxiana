@@ -44,6 +44,8 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
   const [verified, setVerified] = useState<{ token: string; newRoot: string; message: string; warnings: string[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [waiting, setWaiting] = useState(false);
+  /** From the failure of a move request until the first status answer (R399 d). */
+  const [checking, setChecking] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deletedNote, setDeletedNote] = useState<string | null>(null);
@@ -63,10 +65,20 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
    * (another move's is never taken); stopped with an error → that error. `notStarted` is given when
    * the move request failed before the service answered (R379): then, and only then, no move running
    * and none made means it was not started; until the service answers at all, nothing is claimed
-   * about the files.
+   * about the files. In that mode (R399): the first question waits one interval (the service marks
+   * the move as asked for at the start of its request); "not started" needs TWO successive answers
+   * that agree; and once any answer said a move is running it is never concluded (the service keeps
+   * the move's state in memory only, so an empty answer after it may be a restart): the asking then
+   * ends as the cut-off path ends.
    */
   const follow = async (target: string, attempt: string, note: string, notStarted?: string) => {
     if (notStarted === undefined) setWaiting(true);
+    else {
+      setChecking(true);
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+    let seenRunning = false;
+    let empty = 0;
     for (let i = 0; i < maxPolls && alive.current; i++) {
       let st: MoveStatus | undefined;
       try {
@@ -77,6 +89,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
       }
       if (!alive.current) return;
       if (st) {
+        setChecking(false);
         const { pending, failed } = st;
         if (pending && sameRoot(pending.newRoot, target)) {
           setError(null);
@@ -92,20 +105,23 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
           return;
         }
         if (notStarted !== undefined) {
-          if (!st.running) {
+          if (st.running) {
+            seenRunning = true;
+            setError(null);
+            setWaiting(true);
+          } else if (!seenRunning && ++empty >= 2) {
             setWaiting(false);
             setError(`The move could not be started: ${notStarted} Nothing was copied or changed.`);
             setStage(plan ? "plan" : "pick");
             return;
           }
-          setError(null);
-          setWaiting(true);
         }
       }
       await new Promise((r) => setTimeout(r, pollMs));
     }
     if (alive.current) {
       setWaiting(false);
+      setChecking(false);
       setError("No finished move was found. Open the library to check where it is before trying again.");
       setStage("failed");
     }
@@ -132,6 +148,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
   const move = async (exclude: string[]) => {
     setError(null);
     setProgress(null);
+    setChecking(false);
     setStage("moving");
     const target = dest.trim();
     const ac = new AbortController();
@@ -301,6 +318,11 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
                 {PHASE[progress.phase]}: {progress.filesDone.toLocaleString("en-US")} of {progress.fileCount.toLocaleString("en-US")} files
               </p>
             </>
+          ) : null}
+          {checking ? (
+            <p role="status" className="ao-hint">
+              Checking what became of the move…
+            </p>
           ) : null}
           {waiting ? <p className="ao-hint">Waiting for the move to finish…</p> : null}
           {verified ? (

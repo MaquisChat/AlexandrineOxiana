@@ -290,7 +290,124 @@ describe("Move library", () => {
       expect((await screen.findByRole("alert", {}, { timeout: 3000 })).textContent).toBeTruthy();
       await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/The move could not be started/));
       expect(sawLost).toBe(true);
-      expect(polls).toBe(3);
+      // "Not started" needs two successive answers that agree (R399 b): the third and the fourth.
+      expect(polls).toBe(4);
+    });
+
+    it("a move seen running, then the service restarted (empty answers): never \"not started\"; it ends as the cut-off path does (R399 a)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      const alerts: string[] = [];
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          const a = screen.queryByRole("alert")?.textContent;
+          if (a) alerts.push(a);
+          if (polls <= 2) return HttpResponse.json({ pending: null, running: true, failed: null });
+          if (polls <= 4) return HttpResponse.error();
+          return HttpResponse.json({ pending: null, running: false, failed: null });
+        }),
+      );
+      server.use(http.post(url("/libraries/move/plan"), () => HttpResponse.json({ ...PLAN, perProject: [PLAN.perProject[0]!] })));
+      render(<MoveLibrary api={makeApi()} pollMs={5} maxPolls={12} />);
+      await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+      await user.click(screen.getByRole("button", { name: "Check destination" }));
+      await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+      await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("No finished move was found. Open the library to check where it is before trying again."), { timeout: 5000 });
+      expect(polls).toBe(12);
+      expect(alerts.some((a) => /Nothing was copied or changed/.test(a))).toBe(false);
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
+    });
+
+    it("the first status question waits one polling interval (R399 b)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let failedAt = 0;
+      let askedAt = 0;
+      server.use(
+        http.post(url("/libraries/move"), async ({ request }) => {
+          seen.body = await request.json();
+          failedAt = Date.now();
+          return HttpResponse.error();
+        }),
+        http.get(url("/libraries/move/status"), () => {
+          askedAt ||= Date.now();
+          return HttpResponse.json({ pending: null, running: false, failed: null });
+        }),
+      );
+      server.use(http.post(url("/libraries/move/plan"), () => HttpResponse.json({ ...PLAN, perProject: [PLAN.perProject[0]!] })));
+      render(<MoveLibrary api={makeApi()} pollMs={150} maxPolls={20} />);
+      await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+      await user.click(screen.getByRole("button", { name: "Check destination" }));
+      await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+      await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/The move could not be started/), { timeout: 5000 });
+      expect(askedAt - failedAt).toBeGreaterThanOrEqual(140);
+    });
+
+    it("one empty answer followed by \"running\" does not conclude \"not started\" (R399 b)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      const alerts: string[] = [];
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          const a = screen.queryByRole("alert")?.textContent;
+          if (a) alerts.push(a);
+          if (polls === 1) return HttpResponse.json({ pending: null, running: false, failed: null });
+          if (polls <= 3) return HttpResponse.json({ pending: null, running: true, failed: null });
+          return HttpResponse.json({ pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-late", expiresAt: "2026-11-11T10:15:00.000Z" }, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("status", { name: "Verification" }, { timeout: 3000 })).textContent).toMatch(/finished and was verified/);
+      expect(alerts.some((a) => /could not be started/.test(a))).toBe(false);
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+    });
+
+    it("a move refused after it was marked (background work that could not be paused): that reason, not \"could not be reached\" (R399 c)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () =>
+          HttpResponse.json({
+            pending: null,
+            running: false,
+            failed: { newRoot: DEST, attempt: seen.body?.attempt, error: { code: "CONFLICT", message: "Some background work could not be paused in time, so the library was not moved; try again in a moment." } },
+          }),
+        ),
+      );
+      await start(user);
+      const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
+      await waitFor(() => expect(alert.textContent).toMatch(/^Some background work could not be paused in time/));
+      expect(alert.textContent).not.toMatch(/could not be reached/);
+    });
+
+    it("until the first status answer the screen says \"Checking what became of the move…\" in a status region, not an alert (R399 d)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let answer!: () => void;
+      const held = new Promise<void>((r) => (answer = r));
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), async () => {
+          await held;
+          return HttpResponse.json({ pending: null, running: true, failed: null });
+        }),
+      );
+      await start(user);
+      const checking = await screen.findByText("Checking what became of the move…");
+      expect(checking.getAttribute("role")).toBe("status");
+      expect(within(screen.getByRole("region", { name: "Progress" })).getByText("Checking what became of the move…")).toBe(checking);
+      expect(screen.queryByRole("alert")).toBeNull();
+      answer();
+      expect(await screen.findByText("Waiting for the move to finish…")).toBeTruthy();
+      expect(screen.queryByText("Checking what became of the move…")).toBeNull();
     });
 
     it("a plain refusal from the service (4xx with a reason) is shown as it is; move/status is not asked", async () => {
