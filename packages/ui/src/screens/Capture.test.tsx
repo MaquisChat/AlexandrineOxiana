@@ -217,14 +217,16 @@ describe("Capture screen — the browser-session acknowledgement", () => {
   describe("focus (R145)", () => {
     const CONFIRM = "I understand, use my browser session";
 
-    /** Open from the checkbox; focus is on the first control of the dialog, and Tab and Shift+Tab stay inside at both ends. */
+    /** Open from the checkbox; focus is on the dialog's heading, then its first control, and Tab and Shift+Tab stay inside at both ends. */
     async function openAndWalk(user: ReturnType<typeof userEvent.setup>) {
       const box = screen.getByRole("checkbox", { name: "Use my browser session" });
       await user.click(box);
       const dialog = await screen.findByRole("dialog", { name: "Use your browser session?" });
       const confirm = within(dialog).getByRole("button", { name: CONFIRM });
       const cancel = within(dialog).getByRole("button", { name: "Cancel" });
-      expect(document.activeElement).toBe(confirm); // on open
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Use your browser session?" })); // on open: the heading (R376 c)
+      await user.tab();
+      expect(document.activeElement).toBe(confirm);
       await user.tab();
       expect(document.activeElement).toBe(cancel);
       await user.tab(); // past the last: back to the first
@@ -269,7 +271,7 @@ describe("Capture screen — the browser-session acknowledgement", () => {
       const dialog = await screen.findByRole("dialog", { name: "Use your browser session?" });
       const confirm = within(dialog).getByRole("button", { name: CONFIRM });
       const cancel = within(dialog).getByRole("button", { name: "Cancel" });
-      expect(document.activeElement).toBe(confirm);
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Use your browser session?" })); // R376 c
       await user.tab({ shift: true });
       expect(document.activeElement).toBe(cancel);
       await user.tab();
@@ -291,6 +293,48 @@ describe("Capture screen — the browser-session acknowledgement", () => {
       await user.click(box);
       const dialog = await screen.findByRole("dialog");
       await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(document.activeElement).toBe(box);
+    });
+  });
+
+  describe("a held or repeated key on the opener never acknowledges (R376 c)", () => {
+    const CONFIRM = "I understand, use my browser session";
+    async function openWithSpace(user: ReturnType<typeof userEvent.setup>) {
+      const box = screen.getByRole("checkbox", { name: "Use my browser session" });
+      box.focus();
+      await user.keyboard("[Space]");
+      const dialog = await screen.findByRole("dialog", { name: "Use your browser session?" });
+      return { box, dialog };
+    }
+
+    it("held and doubled Enter after it opens: still open, nothing recorded, focus on the heading", async () => {
+      const { m, user } = await setup();
+      const { dialog } = await openWithSpace(user);
+      await user.keyboard("{Enter>4}{/Enter}{Enter}");
+      expect(screen.getByRole("dialog", { name: "Use your browser session?" })).toBe(dialog);
+      expect(m.bodies(`POST /projects/${P1}/acknowledge`)).toHaveLength(0);
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Use your browser session?" }));
+    });
+
+    it("Tab from the heading reaches the confirming button; Enter there records it exactly once", async () => {
+      const { m, user } = await setup();
+      const { dialog } = await openWithSpace(user);
+      await user.tab();
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: CONFIRM }));
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(m.bodies(`POST /projects/${P1}/acknowledge`)).toHaveLength(1);
+    });
+
+    it("Shift+Tab from the heading reaches Cancel; Escape closes it and focus returns to the box", async () => {
+      const { user } = await setup();
+      const { box, dialog } = await openWithSpace(user);
+      await user.tab({ shift: true });
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" }));
+      await user.tab(); // back to the first control
+      await user.tab({ shift: true });
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog")).toBeNull();
       expect(document.activeElement).toBe(box);
     });
   });
