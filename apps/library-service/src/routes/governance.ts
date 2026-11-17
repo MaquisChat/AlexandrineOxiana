@@ -87,13 +87,16 @@ export function governanceReadability(yaml: string, roots: Iterable<string>): Go
   }
 }
 
+/** The single issue when the project's rules file is missing, or is a link that leads nowhere (R397 a). */
+export const GOVERNANCE_MISSING_ISSUE = "The rules file (governance.yaml) is missing from this project's folder.";
+
 export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
   app.get("/projects/:id/governance", async (req, reply) => {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
-    const { yaml, sha256 } = await s.repo.getGovernance(projectId);
+    const { yaml, sha256, file } = await s.repo.getGovernance(projectId);
     // The version an edit is made from: send it back as If-Match (or `baseSha256`).
     void reply.header("ETag", `"${sha256}"`);
     let violations: unknown[] = [];
@@ -102,7 +105,9 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     } catch {
       // unreadable rules: every request is denied; the text is still shown for fixing
     }
-    return { yaml, sha256, violations, ...governanceReadability(yaml, state.roots) };
+    // R397 a: no file is not an empty file: the engine refuses everything until rules are put back.
+    const readability: GovernanceReadability = file === "missing" ? { readable: false, issues: [GOVERNANCE_MISSING_ISSUE], warnings: [] } : governanceReadability(yaml, state.roots);
+    return { yaml, sha256, violations, ...readability };
   });
 
   app.put("/projects/:id/governance", async (req) => {

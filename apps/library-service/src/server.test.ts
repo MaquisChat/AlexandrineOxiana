@@ -4,7 +4,7 @@
  * service's entry point.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -921,6 +921,95 @@ describe("FR-A18 (R379, R58): the rules' answer says whether the engine can read
     const r2 = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: r.json.sha256, reason: "back" } });
     expect(r2.json).toMatchObject({ readable: true, issues: [], warnings: [] });
     expect(r2.body).not.toContain(tmp);
+  });
+});
+
+describe("FR-A18 round 2 (R397 a): a missing or unreadable rules file is said, and a save of readable rules puts it back", () => {
+  beforeEach(() => start());
+
+  const MISSING = "The rules file (governance.yaml) is missing from this project's folder.";
+  const folderOf = async () => (await call({ url: "/projects" })).json.projects[0].folder as string;
+  const govFile = async () => join(tmp, "Lib", await folderOf(), "governance.yaml");
+  /** Three kinds of change: a collection, a tag, the project's time zone. */
+  const changes = (pid: string) => [
+    () => call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: `C${Math.random()}` } }),
+    () => call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: `t${Math.random()}` } }),
+    () => call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone: "Europe/Berlin" } }),
+  ];
+
+  async function repairs(pid: string, expectIssue: (issues: string[]) => void, mark: Record<string, unknown>) {
+    for (const c of changes(pid)) expect((await c()).status).toBe(403);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status).toBe(200);
+    expect(g.json.readable).toBe(false);
+    expectIssue(g.json.issues);
+    expect(g.body).not.toContain(tmp);
+    // An unreadable text is still refused.
+    const bad = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: "residencey: {allowed: [local]}\n", baseSha256: g.json.sha256, reason: "x (y)" } });
+    expect(bad.status).toBe(400);
+    // No reason: "a reason is needed" (the screen's "Record a reason" dialog opens on it).
+    const noReason = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256 } });
+    expect(noReason.status, noReason.body).toBe(400);
+    expect(noReason.json.error.code).toBe("VALIDATION");
+    expect(noReason.json.error.message).toMatch(/needs a reason/i);
+    for (const c of changes(pid)) expect((await c()).status).toBe(403);
+    const ok = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "putting the rules back (Ana)" } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(await readFile(await govFile(), "utf8")).toBe(OPEN_GOV);
+    expect((await call({ url: `/projects/${pid}/governance` })).json).toMatchObject({ readable: true, issues: [] });
+    for (const c of changes(pid)) expect((await c()).status).toBe(200);
+    const events = (await call({ url: `/projects/${pid}/audit?limit=1000` })).json.events as Array<{ details?: Record<string, unknown> }>;
+    const edit = events.find((e) => e.details?.op === "project.governance");
+    expect(edit?.details).toMatchObject({ reason: "putting the rules back (Ana)", ...mark });
+    expect(JSON.stringify(edit)).not.toContain(tmp);
+    expect((await call({ url: `/projects/${pid}/audit/verify` })).json.ok).toBe(true);
+  }
+
+  it("a deleted rules file: refused, said missing, and a save with a reason puts it back", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await rm(await govFile());
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json).toMatchObject({ yaml: "", readable: false, issues: [MISSING], warnings: [] });
+    await repairs(pid, (i) => expect(i).toEqual([MISSING]), { rulesFile: "missing" });
+  });
+
+  it("a symbolic link that leads nowhere is missing too", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    await rm(f);
+    await symlink(join(tmp, "nowhere.yaml"), f);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json).toMatchObject({ yaml: "", readable: false, issues: [MISSING] });
+  });
+
+  it("in an encrypted project even rules as strict as the defaults need a reason to put back", async () => {
+    await openNewLibrary();
+    const pid = await newProject(HIPAA_GOV, true);
+    await rm(await govFile());
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json).toMatchObject({ readable: false, issues: [MISSING] });
+    const strict = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: "# the default rules\n", baseSha256: g.json.sha256 } });
+    expect(strict.status, strict.body).toBe(400);
+    expect(strict.json.error.message).toMatch(/needs a reason/i);
+    const ok = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: "# the default rules\n", baseSha256: g.json.sha256, reason: "back (Ana)" } });
+    expect(ok.status, ok.body).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: "kin" } })).status).toBe(200);
+  });
+
+  it("an empty file stays readable (the default rules)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await writeFile(await govFile(), "");
+    expect((await call({ url: `/projects/${pid}/governance` })).json).toMatchObject({ yaml: "", readable: true, issues: [] });
+  });
+
+  it("a file the engine cannot read: refused, said, and a save with a reason puts it back", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await writeFile(await govFile(), "encryption: {atRest: optional}\nresidencey: {allowed: [local]}\n");
+    await repairs(pid, (i) => expect(i.some((x) => x.includes("residencey"))).toBe(true), { rulesFile: "unreadable" });
   });
 });
 

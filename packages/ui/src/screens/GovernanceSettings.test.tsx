@@ -1064,6 +1064,40 @@ describe("rules the engine cannot read are said (R379 FR-A18, R58)", () => {
     expect(screen.queryByText("The rules were read, with these notes:")).toBeNull();
   });
 
+  it("R397 a: a missing file: the alert with its issue; a save asks for a reason and an approver, then puts the rules back", async () => {
+    const MISSING = "The rules file (governance.yaml) is missing from this project's folder.";
+    const puts: any[] = [];
+    server.use(
+      http.get(url(`/projects/${PID}/governance`), () => HttpResponse.json({ yaml: "", sha256: SHA, violations: [], readable: false, issues: [MISSING], warnings: [] })),
+      http.put(url(`/projects/${PID}/governance`), async ({ request }) => {
+        const b = (await request.json()) as { reason?: string };
+        puts.push(b);
+        if (!b.reason) return HttpResponse.json({ error: { code: "VALIDATION", message: "The project's rules file is missing, so putting rules back needs a reason: audit.enabled is looser than the strictest rules" } }, { status: 400 });
+        return HttpResponse.json({ violations: [], loosened: [], sha256: "b".repeat(64), readable: true, issues: [], warnings: [] });
+      }),
+      http.get(url(`/projects/${PID}/protocol/documents`), () => HttpResponse.json({ documents: [] })),
+      http.get(url(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const alert = screen.getAllByRole("alert").find((a) => a.textContent?.includes(ALERT))!;
+    expect(within(alert).getByRole("listitem").textContent).toBe(MISSING);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "View governance.yaml" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "governance.yaml" }), { target: { value: FIXED } });
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    const dialog = await screen.findByRole("dialog", { name: "Record a reason" });
+    expect(dialog.textContent).toMatch(/is missing, so putting rules back needs a reason/);
+    await user.type(within(dialog).getByRole("textbox", { name: "Reason" }), "Putting the rules back");
+    await user.type(within(dialog).getByRole("textbox", { name: "Approved by" }), "Ana");
+    await user.click(within(dialog).getByRole("button", { name: "Record reason" }));
+    await screen.findByText("Saved.");
+    expect(puts).toHaveLength(2);
+    expect(puts[1].reason).toBe("Putting the rules back (Ana)");
+    expect(puts[1].yaml).toBe(FIXED);
+    expect(screen.queryByText(ALERT)).toBeNull();
+  });
+
   it("readable without warnings: nothing new is shown", async () => {
     serveRead({ yaml: YAML, readable: true, issues: [], warnings: [] });
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);

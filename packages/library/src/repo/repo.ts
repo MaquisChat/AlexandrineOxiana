@@ -105,7 +105,7 @@ import {
 import { amendDestruction, destroyAssets, type AmendInput, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 import { setTimeZone as setTimeZoneIn } from "./time-zone.js";
-import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
+import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult, type GovernanceFileState } from "./governance-edit.js";
 import {
   AUDIT_WAITING_WARNING,
   attentionWarnings,
@@ -484,8 +484,8 @@ export class Repo {
   async getGovernanceText(projectId: string): Promise<string> {
     return (await readGovernance(this.core, projectId)).yaml;
   }
-  /** The governance.yaml text and its SHA-256 (the `baseSha256` of an edit). */
-  getGovernance(projectId: string): Promise<{ yaml: string; sha256: string }> {
+  /** The governance.yaml text, its SHA-256 (the `baseSha256` of an edit), and whether the file is there at all (R397 a). */
+  getGovernance(projectId: string): Promise<{ yaml: string; sha256: string; file: GovernanceFileState }> {
     return readGovernance(this.core, projectId);
   }
   /**
