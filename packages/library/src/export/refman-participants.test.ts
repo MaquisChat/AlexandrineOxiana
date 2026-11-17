@@ -327,3 +327,41 @@ describe("R390 (e): a coded source's plain key is made from its own id; a note s
     expect(none.notes.join(" ")).not.toContain("replaced by their codes");
   });
 });
+
+describe("R420 (b): a participant's whole name inside another creator's name never reaches a reference export (the join of FR-A14 and FR-A10)", () => {
+  async function r420Project(): Promise<{ p: Project; page: string }> {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    await kit.repo.createParticipant(p.id, { details: { fullName: "Maria Cocina", handle: "@maria.cocina" }, legalBasis: "consent" });
+    const page = await addSource(kit, p, { type: "webpage", title: "Recetas de la abuela", creators: [{ literal: "Friends of Maria Cocina", role: "author" }], issued: "2025" });
+    return { p, page: page.source.id };
+  }
+
+  it("BibTeX, RIS and CSL-JSON write 'Friends of P-001', no form of the name, and a plain key", async () => {
+    const { p, page } = await r420Project();
+    for (const format of FORMATS) {
+      const r = await exportRefman(kit.repo, p.id, [page], format);
+      expect(r.exported, format).toBe(1);
+      expect(r.text, format).toContain("Friends of P-001");
+      const low = r.text.toLowerCase();
+      expect(low, format).not.toContain("cocina");
+      expect(low, format).not.toContain("maria");
+      expect(low, format).not.toContain("friendsofmariacocina");
+      if (format === "bibtex") expect(r.text).toMatch(/ref-[0-9a-f]{8}/u);
+    }
+  });
+
+  it("the open-format export's sources.bib and sources.csl.json hold the same", async () => {
+    const { p } = await r420Project();
+    const dest = join(kit.tmp, "out");
+    await mkdir(dest, { recursive: true });
+    const r = await exportProjectOpenFormats(kit.repo, p.id, dest);
+    for (const f of ["sources.bib", "sources.csl.json"]) {
+      const text = await readFile(join(r.path, f), "utf8");
+      expect(text, f).toContain("Friends of P-001");
+      expect(text.toLowerCase(), f).not.toContain("cocina");
+      expect(text.toLowerCase(), f).not.toContain("maria");
+      expect(text.toLowerCase(), f).not.toContain("friendsofmariacocina");
+      expect(text, f).toMatch(/ref-[0-9a-f]{8}/u);
+    }
+  });
+});
