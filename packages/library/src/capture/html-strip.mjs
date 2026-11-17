@@ -96,13 +96,18 @@ export function secretName(k, value) {
   return false;
 }
 
-/** null: an unsafe scheme (the attribute is dropped); else the URL without query and fragment. */
+/**
+ * null: an unsafe scheme (the attribute is dropped); else the URL without query and fragment, and
+ * without a user name and password in its authority (`https://ana:pw@host/p` → `https://host/p`, R391 d).
+ */
 export function cleanUrl(value) {
   const compact = String(value).replace(/[\u0000- \u007f-\u009f]/g, "").toLowerCase();
   if (/^(javascript|vbscript|data|livescript|mocha|jar):/.test(compact)) return null;
   const v = String(value);
   const q = v.search(/[?#]/);
-  return q >= 0 ? v.slice(0, q) : v;
+  const head = q >= 0 ? v.slice(0, q) : v;
+  // The authority runs from `//` to the next `/`; everything up to its last `@` is user information.
+  return head.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)([^/]*@)/i, "$1");
 }
 
 function cleanSrcset(value) {

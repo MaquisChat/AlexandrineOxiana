@@ -13,7 +13,7 @@ import {
   TOKEN_PREFIXES as CORE_TOKEN_PREFIXES,
 } from "@ao/core";
 import { BROWSER_CAPTURE_LIMITS, stripHtmlSnapshot } from "./browser-capture.js";
-import { KEY_PREFIXES, ORDINARY_WORDS, SECRET_WORDS, SIGNED_LINK_NAMES, TOKEN_PREFIXES } from "./html-strip.mjs";
+import { KEY_PREFIXES, ORDINARY_WORDS, SECRET_WORDS, SIGNED_LINK_NAMES, TOKEN_PREFIXES, cleanUrl } from "./html-strip.mjs";
 
 const S = "SECRETX";
 const BYPASSES: Array<[string, string]> = [
@@ -379,5 +379,22 @@ describe("one word rule for secret names (R379)", () => {
     expect([...TOKEN_PREFIXES].sort()).toEqual([...CORE_TOKEN_PREFIXES].sort());
     expect([...SIGNED_LINK_NAMES].sort()).toEqual([...CORE_SIGNED_LINK_NAMES].sort());
     expect([...ORDINARY_WORDS].sort()).toEqual([...CORE_ORDINARY_WORDS].sort());
+  });
+});
+
+describe("the snapshot's address cleaner drops a user name and password too (R391 d, review M4)", () => {
+  it("the review's probe: a canonical link with credentials", async () => {
+    const out = await stripHtmlSnapshot(`<html><head><link rel="canonical" href="https://ana:hunter2@portal.example.org/case/7?access_token=T#f"></head><body><p>x</p></body></html>`);
+    expect(out).toContain('href="https://portal.example.org/case/7"');
+    expect(out).not.toMatch(/ana|hunter2/);
+  });
+  it("every form: with a scheme, protocol-relative, a user name alone, an `@` in the password; nothing else changes", () => {
+    expect(cleanUrl("https://ana:hunter2@host/p?x")).toBe("https://host/p");
+    expect(cleanUrl("//ana:hunter2@host/p")).toBe("//host/p");
+    expect(cleanUrl("http://ana@host:8080/p#f")).toBe("http://host:8080/p");
+    expect(cleanUrl("https://a:b@c@host/p")).toBe("https://host/p");
+    expect(cleanUrl("https://host/p@q")).toBe("https://host/p@q");
+    expect(cleanUrl("/a/b@c?x")).toBe("/a/b@c");
+    expect(cleanUrl("mailto:ana@example.org")).toBe("mailto:ana@example.org");
   });
 });
