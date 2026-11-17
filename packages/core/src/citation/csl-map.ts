@@ -21,7 +21,10 @@
  * name forms (handle, literal, "given family", "family given", family, given) becomes
  * `{ literal: <code> }`. Every map entry and every coded creator's name forms are replaced by the
  * code in the title, container, publisher and the other text fields (see scrubText for the rule on
- * short bare names). A URL carrying any of them in a slug form (joined, -, ., _) is left out, and
+ * short bare names; a name of two or more words also in reversed order and as "Family, Given"; a
+ * name in a script written without spaces also inside the run it is joined to — the rule shared
+ * with folder names, participant-names.ts, R378 a). A URL carrying any of them with any separator
+ * (space, %20, +, -, ., _, none) in either order is left out, and
  * no citation key is copied when participants are involved. The participant's `details` are never
  * an input here. A source linked to participants with no pseudonym map is an error outright. A
  * source linked to participants (`participantIds`), or any source when
@@ -31,7 +34,7 @@
 import type { Anchor } from "../model/anchor.js";
 import type { BiblioField, Creator, SourceFile, SourceType } from "../model/source.js";
 import type { MultiText } from "../model/text.js";
-import { fold, normName, scrubNames, type NameForm } from "../participant-names.js";
+import { normName, scrubNames, urlNamesAny, type NameForm } from "../participant-names.js";
 
 export interface CslName {
   family?: string;
@@ -190,22 +193,12 @@ function scrubText(text: string, forms: readonly NameForm[]): string {
   return scrubNames(text, forms, { bareMinLength: 4 });
 }
 
-/** Whether a URL carries any participant name form, in any slug form (joined, -, ., _), as whole words. */
+/**
+ * Whether a URL carries any participant name form, by the shared rule (participant-names.ts): decoded
+ * safely, any separator (space, %20, +, -, ., _, none), either word order, no length floor.
+ */
 function urlNamesParticipant(url: string, forms: readonly NameForm[]): boolean {
-  let u = url;
-  try {
-    u = decodeURIComponent(url);
-  } catch {
-    // keep as is
-  }
-  const hay = fold(u);
-  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  return forms.some((f) =>
-    ["", "-", ".", "_"].some((sep) => {
-      const slug = f.words.join(sep);
-      return slug !== "" && new RegExp(`(?<![\\p{L}\\p{N}])${esc(slug)}(?![\\p{L}])`, "u").test(hay);
-    }),
-  );
+  return urlNamesAny(url, forms);
 }
 
 function cslName(c: Creator): CslName | undefined {

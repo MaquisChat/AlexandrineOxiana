@@ -13,7 +13,9 @@
  *   own, so a name of two or more such characters is found inside the run it is joined to
  *   ("王小明访谈录"), as `hasTokens` finds it in verification. A name of ONE such character is too
  *   short to be a name inside a run, so it matches only a run of its own.
- * - A name of two or more words also matches with its words joined ("marialopez").
+ * - Word order: a name of two or more words also matches in any rotation ("Lopez, Maria",
+ *   "Fernández Ruiz, Lucía") and fully reversed, and with its words joined ("marialopez",
+ *   "lopezmaria"); any separator may stand between the words.
  * Platform-neutral: no node: imports.
  */
 import { NO_SPACE_SCRIPT } from "./verify/evidence.js";
@@ -190,6 +192,11 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Map<string, P
     if (ws.length === 0) continue;
     if (f.bare && ws.length === 1 && [...ws[0]!].length < min) continue;
     const orders: string[][] = [ws];
+    if (ws.length > 1) {
+      // Any rotation ("Family, Given": "Lopez, Maria", "Fernández Ruiz, Lucía") and the full reverse.
+      for (let k = 1; k < ws.length; k++) orders.push([...ws.slice(k), ...ws.slice(0, k)]);
+      orders.push([...ws].reverse());
+    }
     for (const o of orders) {
       add(o, f.code);
       // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
@@ -253,4 +260,32 @@ export function scrubNames(text: string, forms: readonly NameForm[], opts: Scrub
 /** Whether `text` names any of the forms (the rule above). */
 export function namesAny(text: string, forms: readonly NameForm[], opts: ScrubOptions = {}): boolean {
   return findAll(text, forms, opts, true).length > 0;
+}
+
+/** Percent-escapes decoded where they are valid UTF-8; a malformed one is left as written. */
+function safeDecode(s: string): string {
+  return s.replace(/(?:%[0-9A-Fa-f]{2})+/gu, (run) => {
+    try {
+      return decodeURIComponent(run);
+    } catch {
+      // Decode the ASCII escapes of a malformed run one by one; leave the rest as written.
+      return run.replace(/%([0-7][0-9A-Fa-f])/gu, (_m, h: string) => String.fromCharCode(parseInt(h, 16)));
+    }
+  });
+}
+
+/**
+ * Whether an address names any of the forms: decoded safely (a malformed escape never throws; up to
+ * three times, for an address encoded more than once), "+" read as a space, then matched by the rule
+ * above, so every separator is alike (space, "+", "-", ".", "_", "/", none) in either word order.
+ * No length floor: every form counts. Letters and digits are split ("lopezmaria2024").
+ */
+export function urlNamesAny(url: string, forms: readonly NameForm[]): boolean {
+  let u = url;
+  for (let k = 0; k < 3; k++) {
+    const d = safeDecode(u);
+    if (d === u) break;
+    u = d;
+  }
+  return namesAny(u.replace(/\+/gu, " "), forms, { splitDigits: true });
 }

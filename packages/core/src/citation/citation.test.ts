@@ -510,6 +510,45 @@ describe("the participant-name rule shared with folder names (R378 a, FR-A10)", 
   });
 });
 
+describe("I2 (R378 a, FR-A10): a participant who is not a creator, in any word order and in any address form", () => {
+  const MAP = new Map([["Maria Lopez", "P-003"]]);
+  const story = (title: string, url?: string) =>
+    source("article-journal", mt(["en", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }], url ? { identifiers: { url } } : {});
+
+  it("the title: reversed, 'Family, Given' and upper case with accents are replaced", () => {
+    expect(toCslItem(story("Lopez, Maria: her life; and LÓPEZ MARIA"), { ...OPTS, pseudonyms: MAP }).title).toBe("P-003: her life; and P-003");
+    expect(toCslItem(story("lopezmaria and Maria  Lopez"), { ...OPTS, pseudonyms: MAP }).title).toBe("P-003 and P-003");
+    const three = new Map([["Lucía Fernández Ruiz", "P-014"]]);
+    expect(toCslItem(story("Fernández Ruiz, Lucía; Ruiz Fernández Lucía"), { ...OPTS, pseudonyms: three }).title).toBe("P-014; P-014");
+  });
+
+  it("the address: %20, '+', reversed and any separator drop the URL", () => {
+    for (const url of [
+      "https://news.example/Maria%20Lopez/story",
+      "https://news.example/search?q=maria+lopez",
+      "https://news.example/lopez-maria",
+      "https://news.example/lopez_maria",
+      "https://news.example/lopezmaria2024",
+      "https://news.example/Mar%C3%ADa%2BL%C3%B3pez",
+      "https://news.example/Maria%2520Lopez",
+    ]) {
+      expect(toCslItem(story("A story", url), { ...OPTS, pseudonyms: MAP }).URL, url).toBeUndefined();
+    }
+    expect(toCslItem(story("A story", "https://news.example/marianne-lopezia"), { ...OPTS, pseudonyms: MAP }).URL).toBe("https://news.example/marianne-lopezia");
+  });
+
+  it("a malformed escape in the address does not throw, and the name around it is still found", () => {
+    expect(() => toCslItem(story("A story", "https://news.example/%E0%A4%A/x"), { ...OPTS, pseudonyms: MAP })).not.toThrow();
+    expect(toCslItem(story("A story", "https://news.example/%E0%A4%A/x"), { ...OPTS, pseudonyms: MAP }).URL).toBe("https://news.example/%E0%A4%A/x");
+    expect(toCslItem(story("A story", "https://news.example/%ZZ/Maria%20Lopez/%E0%A4"), { ...OPTS, pseudonyms: MAP }).URL).toBeUndefined();
+  });
+
+  it("an address with a no-space-script name joined to other characters is dropped", () => {
+    const item = toCslItem(story("A story", "https://news.example/%E7%8E%8B%E5%B0%8F%E6%98%8E%E8%AE%BF%E8%B0%88"), { ...OPTS, pseudonyms: new Map([["王小明", "P-001"]]) });
+    expect(item.URL).toBeUndefined();
+  });
+});
+
 describe("locatorFromAnchor", () => {
   const base = { id: newId(), assetId: newId() };
   const tr = (startMs: number, endMs: number): Anchor => ({ kind: "time-range", ...base, startMs, endMs });

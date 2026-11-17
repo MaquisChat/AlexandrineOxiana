@@ -396,3 +396,11 @@ describe("pseudonymize: the participant-name rule shared with citations (R378 a,
     expect(pseudonymize("Ann's annual report", new Map([["Ann", "P-010"]]))).toBe("P-010's annual report");
   });
 });
+
+describe("pseudonymize: word order (R378 a, FR-A10 I2)", () => {
+  it("a name of two or more words is replaced reversed and as 'Family, Given'", () => {
+    const map = new Map([["Maria Lopez", "P-003"]]);
+    expect(pseudonymize("Lopez, Maria: her life; and LÓPEZ MARIA", map)).toBe("P-003: her life; and P-003");
+    expect(pseudonymize("Fernández Ruiz, Lucía", new Map([["Lucía Fernández Ruiz", "P-014"]]))).toBe("P-014");
+  });
+});
