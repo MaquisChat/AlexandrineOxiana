@@ -58,21 +58,27 @@ const isKeyChar = (c: string | undefined) =>
  * "@jdoe (2021) wrote back" or "@jdoe {at} the meeting" begins none.
  */
 export function beginsBlockLine(src: string, at: number): boolean {
+  return blockLineOpen(src, at) >= 0;
+}
+
+/** The index of the opening delimiter of the block line whose "@" is at `at` (beginsBlockLine), or -1. */
+function blockLineOpen(src: string, at: number): number {
   let j = at + 1;
   const s = j;
   while (isLetter(src[j])) j++;
-  if (j === s) return false;
+  if (j === s) return -1;
   const type = src.slice(s, j).toLowerCase();
   while (isSpace(src[j])) j++;
-  if (src[j] !== "{" && src[j] !== "(") return false;
-  if (type === "comment" || type === "preamble") return true;
+  if (src[j] !== "{" && src[j] !== "(") return -1;
+  const open = j;
+  if (type === "comment" || type === "preamble") return open;
   j++;
   while (isSpace(src[j])) j++;
   const k = j;
   while (isKeyChar(src[j])) j++;
-  if (j === k) return false;
+  if (j === k) return -1;
   while (isSpace(src[j])) j++;
-  return src[j] === (type === "string" ? "=" : ",");
+  return src[j] === (type === "string" ? "=" : ",") ? open : -1;
 }
 
 /** The doubt a record carries for its block, if any. */
@@ -132,6 +138,13 @@ interface Open {
 
 type Result = BibBlock | "unclosed";
 
+/** What the scans of one text share: results not yet asked for, and the work done (bounded). */
+interface Shared {
+  done: Map<number, Result>;
+  steps: number;
+  budget: number;
+}
+
 /**
  * One forward scan over the text from a block's opening delimiter. Brace depth is absolute (it may go
  * below zero); every block is judged relative to its own level, so what a block's scan finds depends
@@ -143,9 +156,9 @@ class Scanner {
   private lineStart = false;
   /** Count of block lines (beginsBlockLine) passed. */
   private lines = 0;
+  /** The opening delimiter of the last block line passed. */
+  private lineOpen = -1;
   readonly stack: Open[] = [];
-  /** Blocks resolved and not yet asked for. */
-  readonly done = new Map<number, Result>();
   private target = -1;
   private hit = false;
 
@@ -153,8 +166,13 @@ class Scanner {
     private readonly src: string,
     private readonly maxTracked: number,
     from: number,
+    private readonly shared: Shared,
   ) {
     this.pos = from;
+  }
+
+  private get done(): Map<number, Result> {
+    return this.shared.done;
   }
 
   /** Moves the scan to `at` (only with nothing open: what lies between is not inside any block). */
@@ -184,6 +202,7 @@ class Scanner {
 
   /** A block line at `q`: it ends every block whose own level it is on (outside a quoted value); for the others it is inside a value. */
   private blockLine(q: number): void {
+    this.lineOpen = blockLineOpen(this.src, q);
     for (let t = this.stack.at(-1); t && t.base === this.depth && t.fields && !t.quote; t = this.stack.at(-1)) {
       this.stack.pop();
       this.finish(t, { end: q, state: "cut", innerEntry: this.lines > t.lines0 });
@@ -199,11 +218,13 @@ class Scanner {
     const n = src.length;
     while (!this.hit && this.pos < n) {
       const p = this.pos;
+      if (++this.shared.steps > this.shared.budget) throw new TooManyBibBlocks();
       if (this.lineStart) {
         this.lineStart = false;
         let q = p;
         while (src[q] === " " || src[q] === "\t") q++;
         if (src[q] === "@" && beginsBlockLine(src, q)) this.blockLine(q);
+        this.shared.steps += q - p;
       }
       const c = src[p];
       const top = this.stack.at(-1);
@@ -215,7 +236,10 @@ class Scanner {
       if (c === "\n" || c === "\r") this.lineStart = true;
       else if (c === "{") {
         this.depth++;
-        const type = p === open ? (openerType(src, p) ?? "") : top?.quote ? undefined : openerType(src, p);
+        // Tracked: the block asked for, and blocks opened by a block line (R366 g: never one opened
+        // mid-line inside a value, such as "a@b{c}"; the reader asks for those only after an unclosed
+        // block, and then their own scan finds the same).
+        const type = p === open ? (openerType(src, p) ?? "") : p === this.lineOpen ? openerType(src, p) : undefined;
         if (type !== undefined) this.push(p, false, type);
       } else if (c === "}") {
         this.depth--;
@@ -224,7 +248,8 @@ class Scanner {
           this.finish(t, t.paren ? "unclosed" : this.closed(t, p));
         }
       } else if (c === "(") {
-        const type = p === open ? (openerType(src, p) ?? "") : top?.quote ? undefined : openerType(src, p);
+        // A "(" inside a quoted value at the block's level is not tracked (its own quotes would be the value's).
+        const type = p === open ? (openerType(src, p) ?? "") : p === this.lineOpen && !top?.quote ? openerType(src, p) : undefined;
         if (type !== undefined) this.push(p, true, type);
         else if (top?.paren && top.base === this.depth && !top.quote) top.parens++;
       } else if (c === ")") {
@@ -252,6 +277,7 @@ export class BibBlocks {
   private readonly n: number;
   /** The scan shared by the reader's queries (they come in increasing order). */
   private readonly scan: Scanner;
+  private readonly shared: Shared;
   /** The last line-start search: from `from`, the first block line is at `at` (n: none). */
   private memo = { from: -1, at: -1 };
 
@@ -264,7 +290,10 @@ export class BibBlocks {
     private readonly maxTracked = Number.POSITIVE_INFINITY,
   ) {
     this.n = src.length;
-    this.scan = new Scanner(src, maxTracked, 0);
+    // The scans' work is bounded: one pass, plus the own scans of blocks inside an unclosed one (a
+    // hostile file that would need more is refused like one with too many blocks).
+    this.shared = { done: new Map(), steps: 0, budget: 8 * this.n + 64 * 1024 * 1024 };
+    this.scan = new Scanner(src, maxTracked, 0, this.shared);
   }
 
   /**
@@ -291,13 +320,14 @@ export class BibBlocks {
   /** The block whose opening delimiter ("{" or "(") is at `open`. Queries come in increasing order. */
   block(open: number): BibBlock {
     const g = this.scan;
+    const known = this.shared.done.has(open);
     let r: Result | undefined;
-    if (g.done.has(open) || open >= g.pos) {
-      if (!g.done.has(open) && !g.stack.length) g.jump(open);
+    if (known || open >= g.pos) {
+      if (!known && !g.stack.length) g.jump(open);
       r = g.runTo(open);
     }
     // A block the shared scan passed inside another (and so did not keep): its own scan.
-    r ??= new Scanner(this.src, this.maxTracked, open).runTo(open);
+    r ??= new Scanner(this.src, this.maxTracked, open, this.shared).runTo(open);
     if (r === undefined || r === "unclosed") return this.unclosed(open);
     return r.state === "closed" && this.src[open] === "{" && textAfter(this.src, r.end) ? { ...r, textAfter: true } : r;
   }
