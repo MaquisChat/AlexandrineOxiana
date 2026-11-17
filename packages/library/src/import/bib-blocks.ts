@@ -131,8 +131,6 @@ class Scanner {
   constructor(
     private readonly src: string,
     private readonly maxTracked: number,
-    /** Keep the results of blocks resolved inside another open block. */
-    private readonly keepNested: boolean,
     from: number,
   ) {
     this.pos = from;
@@ -149,10 +147,14 @@ class Scanner {
     this.stack.push({ open, base: this.depth, paren, fields: type !== "comment" && type !== "preamble", quote: false, parens: paren ? 1 : 0, lines0: this.lines });
   }
 
-  /** `o` has just been taken off the stack with result `r`. */
+  /**
+   * `o` has just been taken off the stack with result `r`. A block resolved inside another open block
+   * is forgotten (R366 g): the reader asks for it only if the outer one never closes, and then its own
+   * scan finds the same result (bounded by its extent).
+   */
   private finish(o: Open, r: Result): void {
     if (o.open === this.target) this.hit = true;
-    if (this.keepNested || this.stack.length === 0 || o.open === this.target) this.done.set(o.open, r);
+    if (this.stack.length === 0 || o.open === this.target) this.done.set(o.open, r);
   }
 
   private closed(o: Open, at: number): BibBlock {
@@ -241,7 +243,7 @@ export class BibBlocks {
     private readonly maxTracked = Number.POSITIVE_INFINITY,
   ) {
     this.n = src.length;
-    this.scan = new Scanner(src, maxTracked, true, 0);
+    this.scan = new Scanner(src, maxTracked, 0);
   }
 
   /**
@@ -274,7 +276,7 @@ export class BibBlocks {
       r = g.runTo(open);
     }
     // A block the shared scan passed inside another (and so did not keep): its own scan.
-    r ??= new Scanner(this.src, this.maxTracked, false, open).runTo(open);
+    r ??= new Scanner(this.src, this.maxTracked, open).runTo(open);
     return r === undefined || r === "unclosed" ? this.unclosed(open) : r;
   }
 
