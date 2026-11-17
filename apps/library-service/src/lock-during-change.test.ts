@@ -142,3 +142,47 @@ describe("R435 a: POST /projects/:id/unlock overtaken by a lock", () => {
     expect((await call({ url: `/projects/${pid}/review` })).status).toBe(423);
   });
 });
+
+describe("R443 a: unlock, unlock, then lock through the service", () => {
+  it("ends locked: the second unlock, which waited its turn, is overtaken too and resumes nothing", async () => {
+    const path = join(tmp, "Lib");
+    expect((await call({ method: "POST", url: "/libraries", body: { path, name: "Lib" } })).status).toBe(200);
+    const a = await call({ method: "POST", url: "/projects", body: { name: "A", governanceYaml: GOV, encryption: { enabled: true, passphrase: PASS } } });
+    expect(a.status, a.body).toBe(200);
+    const pid = a.json.project.id as string;
+    const repo = svc.state.session!.repo;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    const state = svc.state;
+    const resumed = [vi.spyOn(state, "resumeProject"), vi.spyOn(state, "resumeFind"), vi.spyOn(state, "runScheduledBackups")];
+    const startWork = vi.spyOn(state, "startWork");
+    const startsBefore = startWork.mock.calls.length;
+    // A request has arrived when its handler has started: the unlock handler asks for the session twice (itself and
+    // `projectParam`) before anything else. An injected request's body is parsed over a few ticks, so a bare tick
+    // could let a later lock's handler (which has no body) run first.
+    const sessions = vi.spyOn(state, "requireSession");
+    const arrived = async (handlers: number) => {
+      while (sessions.mock.calls.length < 2 * handlers) await new Promise<void>((r) => setImmediate(r));
+    };
+    // U1, U2, then L, each a tick after the one before it arrived: the lock is the last thing asked.
+    const u1 = call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } });
+    await arrived(1);
+    await new Promise<void>((r) => setImmediate(r));
+    const u2 = call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } });
+    await arrived(2);
+    await new Promise<void>((r) => setImmediate(r));
+    const lock = await call({ method: "POST", url: `/projects/${pid}/lock` });
+    expect(lock.status).toBe(200);
+    expect(repo.isUnlocked(pid)).toBe(false);
+    const [r1, r2] = await Promise.all([u1, u2]);
+    // Both answers are in, so both unlocks have ended in the library; let anything they started settle.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(r1.status, r1.body).toBe(423);
+    expect(r2.status, r2.body).toBe(423);
+    expect(r2.json.error.code).toBe("PROJECT_LOCKED");
+    expect(repo.isUnlocked(pid)).toBe(false);
+    expect(() => projectDataKey(repo, pid)).toThrow();
+    for (const s of resumed) expect(s).not.toHaveBeenCalled();
+    expect(startWork.mock.calls.slice(startsBefore).map((c) => c[0])).not.toContain("backup");
+    expect((await call({ url: `/projects/${pid}/review` })).status).toBe(423);
+  });
+});

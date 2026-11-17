@@ -57,6 +57,7 @@ import {
   createProject,
   isUnlocked,
   issueRecoveryCode,
+  lockAsksOf,
   lockProject,
   readFullData,
   recoveryCodeUnshown,
@@ -221,8 +222,9 @@ export class Repo {
   createProject(input: CreateProjectInput): Promise<{ project: Project; recoveryCode?: string }> {
     return createProject(this.core, input);
   }
-  async unlockProject(projectId: string, passphraseOrRecovery: string): Promise<void> {
-    await unlockProject(this.core, projectId, passphraseOrRecovery);
+  /** `lockAsksAtRequest` (R443 a): the count `lockAsksOf` gave when the request arrived; every later lock overtakes this unlock. */
+  async unlockProject(projectId: string, passphraseOrRecovery: string, lockAsksAtRequest?: number): Promise<void> {
+    await unlockProject(this.core, projectId, passphraseOrRecovery, lockAsksAtRequest);
     // Work that waited for the key (e.g. sealed backups the backups manifest could not read, R94).
     for (const h of unlockHooks) await h(this, projectId).catch(() => {});
   }
@@ -239,6 +241,10 @@ export class Repo {
   }
   isUnlocked(projectId: string): boolean {
     return isUnlocked(this.core, projectId);
+  }
+  /** The project's count of locks asked so far (read-only): noted by an unlock when its request arrives (R443 a). */
+  lockAsksOf(projectId: string): number {
+    return lockAsksOf(this.core, projectId);
   }
 
   /** The governed write path; see mutate.ts for the ordering guarantees. */

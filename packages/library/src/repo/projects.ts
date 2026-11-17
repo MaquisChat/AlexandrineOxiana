@@ -220,9 +220,11 @@ async function readKeyFile(core: RepoCore, st: ProjectState): Promise<ProjectKey
  * R435 a: a lock asked meanwhile takes effect at once and OVERTAKES this unlock: the unlock then rejects with
  * `ProjectLockedError` (its caller is told the project is locked and resumes nothing), its key is not added, its
  * index reload is not run, and the project ends locked. An unlock asked after a lock waits for it and wins.
+ * R443 a: `lockAsksAtRequest`, when given, is the project's count of locks asked (`lockAsksOf`) noted when the
+ * unlock's request arrived, before it waited its turn: every lock asked after that overtakes this unlock.
  */
-export function unlockProject(core: RepoCore, projectId: string, secret: string): Promise<void> {
-  const run = unlockNow(core, projectId, secret);
+export function unlockProject(core: RepoCore, projectId: string, secret: string, lockAsksAtRequest?: number): Promise<void> {
+  const run = unlockNow(core, projectId, secret, lockAsksAtRequest);
   const mark = run.then(
     () => undefined,
     () => undefined,
@@ -234,11 +236,11 @@ export function unlockProject(core: RepoCore, projectId: string, secret: string)
   return run;
 }
 
-async function unlockNow(core: RepoCore, projectId: string, secret: string): Promise<void> {
+async function unlockNow(core: RepoCore, projectId: string, secret: string, lockAsksAtRequest?: number): Promise<void> {
   const st = core.state(projectId);
   if (!core.encrypted(st)) return;
-  // A lock asked from here on overtakes this unlock (R435 a).
-  const asked = core.lockAsks.get(projectId) ?? 0;
+  // A lock asked from here on (R435 a), or since the request arrived when its count is given (R443 a), overtakes this unlock.
+  const asked = lockAsksAtRequest ?? core.lockAsks.get(projectId) ?? 0;
   const overtaken = () => (core.lockAsks.get(projectId) ?? 0) !== asked;
   // Unlocking is audited; that append must wait until the interrupted write is resolved.
   if (st.recoveryPending && core.library.mode === "read-write") throw new RecoveryPendingError(projectId);
@@ -565,6 +567,11 @@ function lockAtOnce(core: RepoCore, projectId: string, st: ProjectState): Promis
   const done = core.serialNext(async () => lock()).finally(() => core.pendingLocks.delete(projectId));
   core.pendingLocks.set(projectId, done);
   return done;
+}
+
+/** The project's count of locks asked so far (R443 a): read-only, for an unlock to note when its request arrives. */
+export function lockAsksOf(core: RepoCore, projectId: string): number {
+  return core.lockAsks.get(projectId) ?? 0;
 }
 
 export function isUnlocked(core: RepoCore, projectId: string): boolean {

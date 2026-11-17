@@ -547,3 +547,20 @@ describe("R435 c: nothing decrypted is kept past a lock that lands just after th
     });
   }
 });
+
+describe("R443 a: an unlock is overtaken by every lock asked after its REQUEST arrived", () => {
+  it("an unlock given a count of locks older than a lock already asked is overtaken at once and adds no key", async () => {
+    const a = await makeProject(kit, GOV, true, "A");
+    const sf = await addSource(kit, a, { title: "Secret A" });
+    const keyId = kit.repo.getProject(a.id).encryption.keyId!;
+    const asked = kit.repo.lockAsksOf(a.id); // noted when the request arrived
+    await kit.repo.lockProject(a.id); // a lock asked while that request waited its turn
+    expect(kit.repo.lockAsksOf(a.id)).toBe(asked + 1);
+    await expect(kit.repo.unlockProject(a.id, PASS, asked)).rejects.toBeInstanceOf(ProjectLockedError);
+    expect(kit.repo.isUnlocked(a.id)).toBe(false);
+    expect(kit.ring.has(keyId)).toBe(false);
+    // Given the current count (a request that arrived after the lock), the unlock wins, as without it.
+    await kit.repo.unlockProject(a.id, PASS, kit.repo.lockAsksOf(a.id));
+    expect((await kit.repo.getSource(a.id, sf.source.id)).source.id).toBe(sf.source.id);
+  });
+});
