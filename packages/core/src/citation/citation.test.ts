@@ -751,3 +751,20 @@ describe.skipIf(!HAVE_BUNDLE)("rendering with the bundled styles", () => {
     await expect(parts.join("\n")).toMatchFileSnapshot(`./__snapshots__/${style}.txt`);
   });
 });
+
+describe("toCslItem: linear in the title (FR-A10)", () => {
+  it("a 100,000-character title with a map of 500 names is scrubbed in well under a second", () => {
+    const map = new Map<string, string>();
+    for (let i = 0; i < 500; i++) map.set(i % 5 === 0 ? `王${String.fromCodePoint(0x4e00 + i)}明` : `Given${i} Family${i}`, `P-${String(i).padStart(3, "0")}`);
+    const chunk = "Lopez maria and Given7 the 王小明访谈录 FAMILY12, given12 annual ";
+    const title = chunk.repeat(Math.ceil(100_000 / chunk.length)).slice(0, 100_000);
+    const sf = source("article-journal", mt(["en", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }], {
+      identifiers: { url: `https://news.example/${"a-".repeat(50_000)}` },
+    });
+    const t = performance.now();
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: map });
+    expect(performance.now() - t).toBeLessThan(1000);
+    expect(item.title).not.toMatch(/family12/iu);
+    expect(item.URL).toBeDefined();
+  });
+});

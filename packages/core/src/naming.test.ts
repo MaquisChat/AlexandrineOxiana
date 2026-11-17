@@ -404,3 +404,20 @@ describe("pseudonymize: word order (R378 a, FR-A10 I2)", () => {
     expect(pseudonymize("Fernández Ruiz, Lucía", new Map([["Lucía Fernández Ruiz", "P-014"]]))).toBe("P-014");
   });
 });
+
+describe("pseudonymize: linear in the text (FR-A10)", () => {
+  it("a 100,000-character title with a map of 500 names is handled in well under a second", () => {
+    const map = new Map<string, string>();
+    for (let i = 0; i < 500; i++) {
+      const code = `P-${String(i).padStart(3, "0")}`;
+      map.set(i % 5 === 0 ? `王${String.fromCodePoint(0x4e00 + i)}明` : `Given${i} Family${i}`, code);
+    }
+    const chunk = "Lopez maria and Given7 the 王小明访谈录 FAMILY12, given12 annual ";
+    const title = chunk.repeat(Math.ceil(100_000 / chunk.length)).slice(0, 100_000);
+    const t = performance.now();
+    const out = pseudonymize(title, map);
+    expect(performance.now() - t).toBeLessThan(1000);
+    expect(out).toContain("P-012");
+    expect(out).not.toMatch(/family12/iu);
+  });
+});

@@ -154,6 +154,34 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(bib.content.toLowerCase()).not.toContain("maria");
   });
 
+  it("FR-A10 (R378 a): a source's folder name and its bibliography entry agree for a participant written without spaces and one with accents", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const wang = await addSource(kit, p, { type: "book", title: "王小明访谈录", creators: [{ literal: "王小明", role: "interviewee" }], issued: "2025", identifiable: true });
+    const lucia = await addSource(kit, p, {
+      type: "book", // (a book: the styles give a recorded interview no reference-list entry)
+      title: "Entrevista a Lucia Fernandez",
+      creators: [{ given: "Lucía", family: "Fernández", role: "interviewee" }],
+      issued: "2025",
+      identifiable: true,
+    });
+    const codeOf = (folder: string) => /P-\d{3}/u.exec(folder)?.[0];
+    const wangCode = codeOf(wang.source.folder);
+    const luciaCode = codeOf(lucia.source.folder);
+    expect(wangCode).toBeDefined();
+    expect(luciaCode).toBeDefined();
+    // The folder: the name replaced inside the title too, accents or not.
+    expect(wang.source.folder).not.toContain("王小明");
+    expect(wang.source.folder).toContain(`${wangCode}访谈录`);
+    expect(lucia.source.folder.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()).not.toMatch(/lucia|fernandez/u);
+    expect(lucia.source.folder).toContain(`Entrevista a ${luciaCode}`);
+    // The bibliography: the same codes, the same titles.
+    const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [wang.source.id, lucia.source.id] }, "apa", "text");
+    expect(bib.content).not.toContain("王小明");
+    expect(bib.content.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()).not.toMatch(/lucia|fernandez/u);
+    expect(bib.content).toContain(`${wangCode}访谈录`);
+    expect(bib.content).toContain(`Entrevista a ${luciaCode}`);
+  });
+
   it("a custom style renders through the sandbox", async () => {
     const p = await makeProject(kit);
     const xml = `<?xml version="1.0" encoding="utf-8"?>
