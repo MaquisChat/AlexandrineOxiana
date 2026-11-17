@@ -43,6 +43,7 @@ import {
   applyVerification,
   datedFileName,
   encName,
+  nonBlank,
   newId,
   recheckSourceFile,
   sanitizeSegment,
@@ -277,7 +278,7 @@ export function createProfileCapture(core: CaptureCore) {
     );
     const policy = await projectPolicy(repo, projectId);
     const identifiable = policy?.identifiability.containsIdentifiable ?? true;
-    const legalBasis = opts.legalBasis?.trim() || policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]?.trim() || undefined;
+    const legalBasis = nonBlank(opts.legalBasis) ?? nonBlank(policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]); // R391 c: a blank one is none
     const storeCheck = async (ident: boolean, op: string): Promise<boolean> => {
       try {
         await authorizeProcessing(repo, projectId, { action: "store", store: { identifiable: ident, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } }, { op });

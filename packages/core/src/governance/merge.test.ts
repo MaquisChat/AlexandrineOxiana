@@ -59,6 +59,16 @@ describe("effectivePolicy: spec scenarios", () => {
     );
     expect(violations).toHaveLength(1);
   });
+  it("an exception whose reason or approver is blank (invisible characters) waives nothing, and the file is still read (R391 c)", () => {
+    for (const reason of ["\\u200b", "\\u2800", "\\u0301"]) {
+      const { violations } = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + exc("encryption.atRest", "optional", reason)));
+      expect(violations, reason).toHaveLength(1);
+    }
+    const byBlank = `exceptions:\n  - { control: "encryption.atRest", value: optional, reason: "IRB amendment 3", by: "\\u200b\\u3164", at: "2026-01-01T09:30:00Z" }\n`;
+    const { policy, violations } = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + byBlank));
+    expect(violations).toHaveLength(1);
+    expect(policy.encryption.atRest).toBe("required");
+  });
   it("irb + gdpr sets both requirements", () => {
     const { policy, violations } = effectivePolicy(
       cfg("profiles: [irb, gdpr]\nprotocol: { requireBeforeCapture: false }\nconsent: { requireLegalBasis: false }"),

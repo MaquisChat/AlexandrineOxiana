@@ -823,6 +823,11 @@ consent:
 `);
     expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true })).toMatchObject({ status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" });
     expect(worker.submitted).toEqual([]);
+    // R391 c: a legal basis of invisible characters is no legal basis for the comments either.
+    for (const legalBasis of ["\u200b", "\u2800", "\u0301"]) {
+      expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true, legalBasis }), JSON.stringify(legalBasis)).toMatchObject({ status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" });
+    }
+    expect(worker.submitted).toEqual([]);
     expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true, maxItems: 1, legalBasis: "consent" })).created).toBe(1);
   });
 

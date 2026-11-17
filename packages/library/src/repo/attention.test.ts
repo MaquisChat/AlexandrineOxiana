@@ -281,6 +281,8 @@ describe("R154 d: a mark that cannot be repaired can be set aside", () => {
     const id = (await repo.attentionMarks(pid))[0]!.id;
     // Refused by the policy engine itself (N7), and audited.
     await expect(repo.setAsideMark(pid, id, "  ")).rejects.toBeInstanceOf(PolicyDeniedError);
+    // R391 c: invisible characters and a combining mark alone are no reason either.
+    for (const r of ["\u200b", "\u0301", "\u2800"]) await expect(repo.setAsideMark(pid, id, r)).rejects.toBeInstanceOf(PolicyDeniedError);
     expect((await events()).at(-1)).toMatchObject({ action: "set-aside", decision: { result: "deny", reason: "A reason is required to set this aside" } });
     await expect(repo.setAsideMark(pid, "nope.json", "x")).rejects.toBeInstanceOf(NotFoundError);
     expect(await repo.setAsideMark(pid, id, "The disk damaged it; nothing else is missing")).toEqual({ recordedIn: "project" });

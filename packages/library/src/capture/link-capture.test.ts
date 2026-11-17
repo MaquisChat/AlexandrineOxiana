@@ -572,6 +572,16 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
     expect((sf.source.provenance.platformSnapshot as { author?: unknown }).author).toMatchObject({ uniqueId: "fake.dancer", nickname: "Fake Dancer" });
   });
 
+  it("a legal basis of invisible characters is no legal basis: LEGAL_BASIS_REQUIRED, not POLICY_DENIED (R391 c)", async () => {
+    const p = await project(GDPR_GOV(), true);
+    for (const legalBasis of ["\u200b", "\u2800", "\u0301"]) {
+      const out = await capture.captureUrl(p.id, YT, { transcribe: false, legalBasis });
+      expect(out, JSON.stringify(legalBasis)).toMatchObject({ status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" });
+    }
+    expect(worker.submitted).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
   it("I1: an identifiable GDPR project without a legal basis fails plainly before downloading; with the project default or an override it captures", async () => {
     const p = await project(GDPR_GOV(), true);
     const out = await capture.captureUrl(p.id, YT, { transcribe: false });

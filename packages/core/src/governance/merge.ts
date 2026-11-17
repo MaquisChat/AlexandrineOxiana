@@ -1,3 +1,4 @@
+import { blank } from "../blank.js";
 import { PROFILE_MINIMUMS, PROFILE_RULES } from "./profiles/index.js";
 import {
   DATE_PATHS,
@@ -139,10 +140,10 @@ const isEmpty = (v: unknown): boolean =>
  * Never throws on a parsed config.
  */
 export function effectivePolicy(cfg: GovernanceConfig): EffectivePolicy {
-  // Only exceptions with a written reason count, and only for their exact control path.
+  // Only exceptions with a written reason and approver count (neither blank, R391 c), and only for their exact control path.
   const excs = new Map<string, GovernanceException>();
   for (const e of cfg.exceptions ?? []) {
-    if (typeof e.reason === "string" && e.reason.trim() !== "" && !excs.has(e.control)) excs.set(e.control, e);
+    if (!blank(e.reason) && !blank(e.by) && !excs.has(e.control)) excs.set(e.control, e);
   }
   const exceptionFor = (c: string) => excs.get(c);
 

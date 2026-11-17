@@ -1,3 +1,4 @@
+import { blank } from "../blank.js";
 import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
 import { ACQUIRE_METHODS, ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
@@ -160,14 +161,6 @@ function datePart(d: string): string {
   return new Date(t).toISOString().slice(0, 10);
 }
 
-/**
- * True for a value that holds nothing a reader would see: absent, or only white space and invisible
- * format characters (a no-break or zero-width space). A required value must be more than that (R379).
- */
-function blank(v: string | null | undefined): boolean {
-  return !v || /^[\s\p{Cf}]*$/u.test(v);
-}
-
 function capture(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const c = need(req.capture, "capture");
   const method = str(c.method, "capture.method");
@@ -246,18 +239,18 @@ function exportData(p: GovernanceConfig, req: PolicyRequest, warnings: string[])
 function setAside(req: PolicyRequest, warnings: string[]): PolicyDecision {
   const s = need(req.setAside, "setAside");
   str(s.reason, "setAside.reason");
-  if (s.reason.trim() === "") return deny("A reason is required to set this aside", warnings);
+  if (blank(s.reason)) return deny("A reason is required to set this aside", warnings);
   return allow(warnings);
 }
 
 /**
  * Recording that a source flagged by a consent withdrawal was reviewed (R176 2, following R157):
- * allowed in every profile, but only with a reason that is not empty once trimmed.
+ * allowed in every profile, but only with a reason that is not blank (`blank`, R391 c).
  */
 function reviewWithdrawal(req: PolicyRequest, warnings: string[]): PolicyDecision {
   const s = need(req.reviewWithdrawal, "reviewWithdrawal");
   str(s.reason, "reviewWithdrawal.reason");
-  if (s.reason.trim() === "") return deny("A reason is required to record that this source was reviewed after the withdrawal", warnings);
+  if (blank(s.reason)) return deny("A reason is required to record that this source was reviewed after the withdrawal", warnings);
   return allow(warnings);
 }
 

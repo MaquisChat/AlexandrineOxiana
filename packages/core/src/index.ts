@@ -2,6 +2,7 @@
 export const packageName = "@ao/core";
 
 export { isId, newId, shortId } from "./ids.js";
+export { blank, nonBlank } from "./blank.js";
 
 export * from "./model/index.js";
 
