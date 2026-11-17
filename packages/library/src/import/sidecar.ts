@@ -170,11 +170,11 @@ const NON_ENTRIES = new Set(["string", "comment", "preamble"]);
 
 /**
  * The first `@type{key, field = {value} | "value" | number, ...}` entry, braces balanced by counting.
- * Where each block ends is the export reader's rule (bib-blocks.ts, R362 g): at its own closing
- * delimiter, so a line beginning with "@" inside a value belongs to it when the block closes properly
- * after it; a block that would otherwise run unclosed (an unbalanced @comment, a quoted brace in
- * @string, an entry missing its closing brace) is cut at the next line that begins an entry. The
- * entry read carries the doubt the rule gives it (`doubt`).
+ * Where each block ends is the export reader's rule (bib-blocks.ts, R362 g, R366): at its own closing
+ * delimiter, so a line beginning with "@" inside a value belongs to it; a line that begins an entry
+ * between an entry's fields, or after a block that never closes (an unbalanced @comment, a quoted
+ * brace in @string, an entry missing its closing brace), cuts it. The entry read carries the doubt
+ * the rule gives it (`doubt`).
  */
 export function parseBibtex(text: string): SidecarMetadata {
   const blocks = new BibBlocks(text);

@@ -1,27 +1,27 @@
 /**
  * Where a BibTeX block ends: the one rule of both BibTeX readers, the export reader (refman.ts) and
- * the sidecar reader (sidecar.ts) (R362 g, refining the recovery of R57/R58).
+ * the sidecar reader (sidecar.ts) (R362 g, R366; refining the recovery of R57/R58).
  *
- * A block (`@type{…}` or `@type(…)`: an entry, @string, @comment, @preamble) ends at its OWN closing
- * delimiter. A line beginning with "@" inside it — a field value quoting an account ("@someuser
- * replied…") or a pasted citation ("@article{smith2020, …}") — is part of it whenever the block closes
- * properly after it:
+ * A block (`@type{…}` or `@type(…)`: an entry, @string, @comment, @preamble) is judged at its own
+ * level — between its fields, inside no braced value and (for an entry or @string) no quoted value:
  *
- *   - `{` blocks: braces are counted (a backslash escapes the next character, never a line break);
- *     the block is closed by the brace that brings the count back to zero, wherever that is.
- *   - `(` blocks: parentheses are counted up to the next line that begins an entry (see below); the
- *     export reader's own field parser decides where a `(` entry closes, within the same bound.
+ *   - `{` blocks are closed by the brace that brings the count back to their level's (a backslash
+ *     escapes the next character, never a line break); `(` blocks by their own ")", parentheses being
+ *     counted only at their level outside values.
+ *   - A block line (beginsBlockLine: "@type{key," and the forms of @string, @comment, @preamble) at
+ *     an entry's or @string's own level ends it there: it is cut, whatever closes later (R366 a).
+ *     Inside a value it is part of the value, and a closed entry around it carries the third doubt.
+ *     A @comment or @preamble is not cut by such a line (commented-out entries stay comments).
+ *   - A block that never closes is cut at the first block line after its opening, at any depth, or
+ *     runs to the end of the text.
  *
- * Only a block that would otherwise run unclosed is recovered: it is cut at the first line after its
- * opening that begins an entry — "@", a type of letters, optional white space, then "{" or "(" (spaces
- * and tabs may come before the "@") — and with no such line it runs to the end of the text. A line
- * such as "@someuser replied" begins no entry, so it never cuts anything. A record so cut, or left
- * unclosed at the end of the text, carries a doubt (BIB_DOUBTS); so does a record that closed
- * properly around a line that begins an entry (had the file lost a closing brace there, entries would
- * be inside it).
+ * A record so cut, or left unclosed at the end, carries a doubt (BIB_DOUBTS); so does one closed with
+ * stray text after its closing brace (R366 e), and one closed around a block line inside a value.
  *
- * Linear in the text: brace matches are found by one forward scan shared by every query (queries come
- * in increasing order), and so are the lines that begin an entry.
+ * Linear: one forward scan shared by the reader's queries (they come in increasing order); a block
+ * the scan passed inside another is scanned on its own if asked for (bounded by its extent), and all
+ * scanning of a text is bounded. Only the block asked for and blocks opened by a block line are
+ * tracked, at most `maxTracked` at once.
  */
 
 /** The doubts a BibTeX record carries when the reader could not take it whole (R362 g). */

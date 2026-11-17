@@ -507,11 +507,11 @@ const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n"
 /**
  * Entries of a BibTeX file (linear; no recursion). @comment and @preamble are skipped, @string
  * macros are defined and expanded. Where a block ends is the rule both BibTeX readers share
- * (bib-blocks.ts, R362 g): at its own closing delimiter, so a line beginning with "@" inside a field's
- * value belongs to the value when the entry closes properly after it; only a block that would
- * otherwise run unclosed is cut, at the next line that begins an entry, so one broken entry never
- * swallows the rest of the file — and an entry so cut, or left unclosed at the end of the file,
- * carries a `doubt` (BIB_DOUBTS), as does one that closed around a line beginning an entry. Only
+ * (bib-blocks.ts, R362 g, R366): at its own closing delimiter, so a line beginning with "@" inside a
+ * field's value belongs to the value; a line that begins an entry between an entry's fields, or after
+ * an entry that never closes, cuts it, so one broken entry never swallows the rest of the file — and
+ * an entry so cut, or left unclosed at the end of the file, carries a `doubt` (BIB_DOUBTS), as do one
+ * closed with stray text after it and one closed around an entry line inside a value. Only
  * KNOWN_FIELDS are kept (at most 64 per entry); other values
  * are scanned past without expanding macros. All @string values together are at most 4 MB and all
  * kept values of the file at most 32 MB: past either budget, ExportUnreadable (R68).

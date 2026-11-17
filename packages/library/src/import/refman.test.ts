@@ -1567,6 +1567,9 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
       const es = entries(src);
       expect(es.map((x) => x.key)).toEqual(["k"]);
       expect(es[0]!.fields.get("doi")).toBe("10.5555/k");
+      // Openers by parentheses, which never close, inside a value: not tracked either.
+      const paren = entries(`@article{k, title={T}, note={${"x@c(".repeat(2_100_000)}}, doi={10.5555/k}}\n`);
+      expect(paren.map((x) => x.key)).toEqual(["k"]);
     });
 
     it("a file nesting more unclosed entries than any export can hold is refused as too many references (the bound on tracked blocks)", () => {
