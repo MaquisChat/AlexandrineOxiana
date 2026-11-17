@@ -344,12 +344,21 @@ function scrubbedRef(ref: Omit<Ref, "key">, rule: ReturnType<typeof nameRule>, c
   return out;
 }
 
+/** One source under the participant rules: the reference to write, whether it was coded, whether a tag name was scrubbed. */
+interface RuledRef {
+  ref: Omit<Ref, "key">;
+  coded: boolean;
+  tagsScrubbed: boolean;
+}
+
 /**
- * The participant rules' reading of one source: unchanged (null), coded (the reference to write), or failing closed.
- * Touched when the source is linked to participants, `toCslItem` codes or scrubs anything, any text the writers emit
- * changes under the name rule, or its own citation key names a participant (R390 a: the key by the address rule).
+ * The participant rules' reading of one source: the reference to write, or failing closed. Coded (touched) when the
+ * source is linked to participants, `toCslItem` codes or scrubs anything, any text the writers emit changes under the
+ * name rule, or its own citation key names a participant (R390 a: the key by the address rule). Tag names, when
+ * written, go through the name rule on every entry (R390 b); they say nothing of the source itself, so they alone do
+ * not make it coded.
  */
-function underParticipantRules(sf: SourceFile, opts: ToCslOptions, ref: Omit<Ref, "key">): Omit<Ref, "key"> | null | "code-missing" {
+function underParticipantRules(sf: SourceFile, opts: ToCslOptions, ref: Omit<Ref, "key">): RuledRef | "code-missing" {
   let item: CslItem;
   try {
     item = toCslItem(sf, opts);
@@ -358,13 +367,16 @@ function underParticipantRules(sf: SourceFile, opts: ToCslOptions, ref: Omit<Ref
     throw err;
   }
   // No names to replace (no map): nothing can be touched, the reference is written as it is.
-  if (!opts.pseudonyms?.size && sf.source.participantIds.length === 0) return null;
+  if (!opts.pseudonyms?.size && sf.source.participantIds.length === 0) return { ref, coded: false, tagsScrubbed: false };
   const rule = nameRule(sf, opts);
-  const coded = scrubbedRef(ref, rule, sf.source.creators.map(rule.creator).filter((c): c is Creator => !!c));
-  if (sf.source.participantIds.length > 0) return coded;
+  const tags = ref.tags.map(rule.scrub);
+  const tagsScrubbed = tags.some((t, i) => t !== ref.tags[i]);
+  const coded = { ...scrubbedRef(ref, rule, sf.source.creators.map(rule.creator).filter((c): c is Creator => !!c)), tags };
+  if (sf.source.participantIds.length > 0) return { ref: coded, coded: true, tagsScrubbed };
   const plain = toCslItem(sf, { ...opts, pseudonyms: new Map(), requireParticipantCodes: false });
-  const same = JSON.stringify(item) === JSON.stringify(plain) && JSON.stringify({ ...coded, creators: [] }) === JSON.stringify({ ...ref, creators: [] }) && !rule.names(sf.source.citationKey);
-  return same ? null : coded;
+  const textOf = (r: Omit<Ref, "key">) => JSON.stringify({ ...r, creators: [], tags: [] });
+  const same = JSON.stringify(item) === JSON.stringify(plain) && textOf(coded) === textOf(ref) && !rule.names(sf.source.citationKey);
+  return same ? { ref: { ...ref, tags }, coded: false, tagsScrubbed } : { ref: coded, coded: true, tagsScrubbed };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -438,12 +450,13 @@ export async function buildExport(
       continue;
     }
     const ref = refOf(s, tagNames, opts.includeTags === true);
-    const coded = underParticipantRules(sf, cslOptions(sf), ref);
-    if (coded === "code-missing") {
+    const ruled = underParticipantRules(sf, cslOptions(sf), ref);
+    if (ruled === "code-missing") {
       excluded.push({ sourceId: id, reason: PARTICIPANT_CODE_MISSING_NOTE });
       codeMissing++;
       continue;
     }
+    const coded = ruled.coded;
     // A coded source's own key is withheld (it is usually made from a name): the writer makes a plain one.
     if (coded && s.citationKey.trim()) withheldKeys++;
     const wanted = (coded ? "" : s.citationKey.trim()) || `ref${refs.length + 1}`;
@@ -456,7 +469,7 @@ export async function buildExport(
     }
     if (!coded && key !== s.citationKey) changedKeys++;
     used.add(key.toLowerCase());
-    refs.push({ key, ...(coded ?? ref) });
+    refs.push({ key, ...ruled.ref });
   }
   const text = format === "bibtex" ? toBibtex(refs) : format === "ris" ? toRis(refs) : toCslJson(refs);
   const notes: string[] = [];

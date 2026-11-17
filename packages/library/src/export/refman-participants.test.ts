@@ -252,3 +252,22 @@ describe("R390 (a): every text the reference export writes goes through the name
     }
   });
 });
+
+describe("R390 (b): with includeTags, each tag's name goes through the name rule on every entry", () => {
+  it("the reviewer's probe: the tag 'maria.cocina interviews' is written as 'P-001 interviews', on a coded and an untouched source", async () => {
+    const { p, post, book } = await r390Project();
+    const plainBook = (await addSource(kit, p, { type: "book", title: "Other", creators: [{ family: "Lee", given: "Ann", role: "author" }], citationKey: "lee" })).source.id;
+    const tag = await kit.repo.createTag(p.id, "maria.cocina interviews");
+    for (const id of [post, book, plainBook]) await kit.repo.updateSource(p.id, id, { tagIds: [tag.id] });
+    for (const format of FORMATS) {
+      const r = await exportRefman(kit.repo, p.id, [post, book, plainBook], format, { includeTags: true });
+      expect(r.text.toLowerCase(), format).not.toContain("maria");
+      expect(r.text.toLowerCase(), format).not.toContain("cocina");
+      expect(r.text.split("P-001 interviews").length - 1, format).toBe(3);
+    }
+    const ris = (await exportRefman(kit.repo, p.id, [post, book, plainBook], "ris", { includeTags: true })).text;
+    expect(ris.match(/^KW {2}- P-001 interviews$/gmu)).toHaveLength(3);
+    // The untouched source keeps its own key.
+    expect(ris).toContain("ID  - lee");
+  });
+});
