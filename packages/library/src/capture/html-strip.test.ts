@@ -5,7 +5,9 @@
  */
 import { parse } from "parse5";
 import { describe, expect, it } from "vitest";
+import { KEY_PREFIXES as CORE_KEY_PREFIXES, SECRET_WORDS as CORE_SECRET_WORDS } from "@ao/core";
 import { BROWSER_CAPTURE_LIMITS, stripHtmlSnapshot } from "./browser-capture.js";
+import { KEY_PREFIXES, SECRET_WORDS } from "./html-strip.mjs";
 
 const S = "SECRETX";
 const BYPASSES: Array<[string, string]> = [
@@ -362,4 +364,11 @@ describe("pre-scan model (R107 I1): never below what parse5 builds", () => {
       expect(c.elements, page.slice(0, 200)).toBeGreaterThanOrEqual(real.elements);
     }
   }, 60_000);
+});
+
+describe("one word rule for secret names (R379)", () => {
+  it("the snapshot cleaner's word lists equal core's (it runs as plain JavaScript in a worker and keeps its own copy)", () => {
+    expect([...SECRET_WORDS].sort()).toEqual([...CORE_SECRET_WORDS].sort());
+    expect([...KEY_PREFIXES].sort()).toEqual([...CORE_KEY_PREFIXES].sort());
+  });
 });

@@ -7,6 +7,8 @@
  * No Node or DOM APIs beyond the WHATWG URL, which both have.
  */
 
+import { secretName } from "./secret-names.js";
+
 /** Longest address the service accepts (routes/capture.ts). */
 export const MAX_ADDRESS_LENGTH = 2048;
 
@@ -27,7 +29,10 @@ export type LinkKind = "video" | "short" | "post" | "reel" | "carousel" | "story
 export interface ClassifiedUrl {
   platform: Platform;
   kind: LinkKind;
-  /** The link without tracking parameters or fragment (platform links in their canonical form). */
+  /**
+   * The link as stored and printed: platform links in their canonical form; any other link without
+   * user name, password, fragment, tracking or secret-named parameters (R379).
+   */
   canonicalUrl: string;
   postId?: string;
   handle?: string;
@@ -57,11 +62,17 @@ function hostOf(u: URL): string {
   return u.hostname.toLowerCase().replace(/^(www|m|mobile|music)\./, "");
 }
 
-/** Strips tracking parameters and the fragment; everything else is kept as given. */
+/**
+ * The address as stored and printed (R379; R41 C1, R99 I8: no secret in a stored address): without
+ * the user name and password, the fragment, tracking parameters and parameters whose name is
+ * secret-like (`secretName`). The path and every other parameter stay, so it still leads to the page.
+ */
 function stripTracking(u: URL): string {
   const out = new URL(u.href);
   out.hash = "";
-  for (const k of [...out.searchParams.keys()]) if (TRACKING.test(k)) out.searchParams.delete(k);
+  out.username = "";
+  out.password = "";
+  for (const k of [...out.searchParams.keys()]) if (TRACKING.test(k) || secretName(k)) out.searchParams.delete(k);
   out.hostname = out.hostname.toLowerCase();
   return out.href;
 }

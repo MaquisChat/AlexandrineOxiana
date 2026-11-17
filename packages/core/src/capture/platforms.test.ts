@@ -241,3 +241,45 @@ describe("classifyUrl never throws (R379, WB1 I4)", () => {
     }
   });
 });
+
+describe("the stored address holds no credentials and no secret parameters (R379, WB3 I1, WB1 M7; R41 C1, R99 I8)", () => {
+  const PROBE = "https://ana:hunter2@portal.example.org/case/7?access_token=SECRETTOKEN&sessionid=SESS#frag";
+
+  it("the reviewer's probe: user name, password, token and session go; the path stays", () => {
+    const c = classifyUrl(PROBE);
+    expect(c).toEqual({ platform: "other", kind: "unknown", canonicalUrl: "https://portal.example.org/case/7" });
+    for (const bad of ["ana", "hunter2", "SECRETTOKEN", "SESS", "frag"]) expect(c.canonicalUrl).not.toContain(bad);
+  });
+
+  it("ordinary parameters stay, in their order, so the address still leads to the page", () => {
+    expect(classifyUrl("https://user:pw@example.org/a/b?id=7&token=T0K&page=2&utm_source=x&lang=en#top").canonicalUrl).toBe("https://example.org/a/b?id=7&page=2&lang=en");
+  });
+
+  const SECRET_PARAMS = [
+    "Signature", "X-Amz-Signature", "X-Amz-Credential", "X-Amz-Security-Token", "sig", "token", "auth", "apikey", "api_key",
+    "sessionid", "PHPSESSID", "jsessionid", "access_token", "id_token", "refresh_token", "password", "client_secret", "AWSAccessKeyId",
+  ];
+  it.each(SECRET_PARAMS)("the parameter %s goes", (name) => {
+    const c = classifyUrl(`https://files.example.org/doc.pdf?id=7&${name}=S3CR3T&page=2`);
+    expect(c.canonicalUrl).toBe("https://files.example.org/doc.pdf?id=7&page=2");
+  });
+
+  it("a bare `key` and a bare `code` stay (they name a record, a document or a country far more often than a secret)", () => {
+    expect(classifyUrl("https://example.org/sheet?key=abc&code=FR").canonicalUrl).toBe("https://example.org/sheet?key=abc&code=FR");
+  });
+
+  it("a user name alone goes too, on every platform's unrecognised path", () => {
+    expect(classifyUrl("https://ana@example.org/x").canonicalUrl).toBe("https://example.org/x");
+    expect(classifyUrl("https://ana:pw@www.youtube.com/feed/trending?token=T").canonicalUrl).toBe("https://www.youtube.com/feed/trending");
+    expect(classifyUrl("https://ana:pw@www.instagram.com/explore/?sessionid=S").canonicalUrl).toBe("https://www.instagram.com/explore/");
+    expect(classifyUrl("https://ana:pw@www.tiktok.com/t/ZTabc/?sig=S").canonicalUrl).toBe("https://www.tiktok.com/t/ZTabc/");
+  });
+
+  it("platform addresses are unchanged", () => {
+    expect(classifyUrl("https://ana:pw@www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123&token=T").canonicalUrl).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123");
+    expect(classifyUrl("https://www.youtube.com/playlist?list=PL123").canonicalUrl).toBe("https://www.youtube.com/playlist?list=PL123");
+    expect(classifyUrl("https://www.tiktok.com/@someone/video/7234567890").canonicalUrl).toBe("https://www.tiktok.com/@someone/video/7234567890");
+    expect(classifyUrl("https://www.instagram.com/p/Cabc123/").canonicalUrl).toBe("https://www.instagram.com/p/Cabc123/");
+    expect(classifyUrl("https://vm.tiktok.com/ZMabc/").canonicalUrl).toBe("https://vm.tiktok.com/ZMabc/");
+  });
+});

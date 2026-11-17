@@ -380,6 +380,22 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     await expect(captureBrowserPage(kit.repo, open.id, { url: "ftp://x" })).rejects.toBeInstanceOf(InvalidInputError);
   });
 
+  it("browser capture stores the page's address without user name, password or secret parameters (R379, WB3 I1)", async () => {
+    const open = await makeProject(kit, OPEN_GOV.replace("downloader]", "downloader, browser_capture]"));
+    const url = "https://ana:hunter2@portal.example.org/case/7?id=7&access_token=SECRETTOKEN&page=2&sessionid=SESS&lang=en#frag";
+    const r = await captureBrowserPage(kit.repo, open.id, { url, screenshotPng: tinyPng().toString("base64") });
+    const sf = await kit.repo.getSource(open.id, r.sourceId);
+    expect(sf.source.identifiers.url).toBe("https://portal.example.org/case/7?id=7&page=2&lang=en");
+    expect(sf.source.provenance.originalUrl).toBe("https://portal.example.org/case/7?id=7&page=2&lang=en");
+    const all = JSON.stringify(sf) + JSON.stringify(await auditEvents(kit, open));
+    for (const bad of ["ana", "hunter2", "SECRETTOKEN", "SESS", "frag"]) expect(all, bad).not.toContain(bad);
+    // The token in `url` itself, the extension's own canonical address holding one too.
+    const r2 = await captureBrowserPage(kit.repo, open.id, { url: "https://example.org/a?token=SECRETTOKEN2&x=1", screenshotPng: tinyPng().toString("base64"), extracted: { canonicalUrl: "https://example.org/a?token=SECRETTOKEN3" } });
+    const sf2 = await kit.repo.getSource(open.id, r2.sourceId);
+    expect(sf2.source.identifiers.url).toBe("https://example.org/a?x=1");
+    expect(JSON.stringify(sf2)).not.toMatch(/SECRETTOKEN/);
+  });
+
   it("scrubPaths removes whole paths with spaces, non-ASCII letters and Windows forms", () => {
     expect(scrubPaths('could not open "/home/ana/My Research/interview 1.m4a"', [])).toBe('could not open "<path>"');
     expect(scrubPaths("could not open /Users/josé/Données de terrain/entrevista.wav", [])).toBe("could not open <path>");

@@ -27,11 +27,15 @@ const URL_ATTRS = new Set([
 ]);
 const SRCSET_ATTRS = new Set(["srcset", "imagesrcset"]);
 const DROP_ATTRS = new Set(["srcdoc", "nonce", "integrity", "formtarget"]);
-const SECRET_WORDS = new Set([
-  "csrf", "xsrf", "token", "tokens", "auth", "authorization", "authenticity", "session", "sessionid", "password", "passwd", "secret",
-  "signature", "sig", "nonce", "jwt", "credential", "credentials", "apikey", "cookie", "cookies", "otp",
+// The word rule for secret names is defined in @ao/core (capture/secret-names.ts, R379). This file
+// runs as plain JavaScript in a worker thread, where @ao/core's TypeScript source cannot be loaded,
+// so it keeps a copy of the two lists; html-strip.test.ts keeps them equal to core's.
+export const SECRET_WORDS = new Set([
+  "csrf", "xsrf", "token", "tokens", "auth", "authorization", "authentication", "authenticity", "bearer",
+  "session", "sessionid", "phpsessid", "jsessionid", "password", "passwd", "secret", "signature", "sig", "nonce", "otp", "jwt",
+  "credential", "credentials", "apikey", "accesskey", "privatekey", "secretkey", "cookie", "cookies",
 ]);
-const KEY_PREFIXES = new Set(["api", "access", "private", "secret"]);
+export const KEY_PREFIXES = new Set(["api", "access", "private", "secret"]);
 
 function words(k) {
   return String(k)

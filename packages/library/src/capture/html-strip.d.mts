@@ -8,3 +8,5 @@ export declare const SNAPSHOT_CSP: string;
 export declare const SNAPSHOT_CSP_POLICY: string;
 export declare const PRESCAN_LIMITS: { depth: number; attributes: number; elements: number; attributeBytes: number };
 export declare class SnapshotRefused extends Error {}
+export declare const SECRET_WORDS: ReadonlySet<string>;
+export declare const KEY_PREFIXES: ReadonlySet<string>;
