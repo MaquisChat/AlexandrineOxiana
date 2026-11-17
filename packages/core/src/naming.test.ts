@@ -9,6 +9,7 @@ import {
   sourceFolderName,
   withCollisionSuffix,
 } from "./naming.js";
+import { creatorNameTexts } from "./participant-names.js";
 
 const bytes = (s: string) => new TextEncoder().encode(s).length;
 
@@ -559,8 +560,9 @@ describe("R387 (e): partial names (I4 of the FR-A10 review)", () => {
   it("a run made only of short particles is not a name ('de la' of 'Juan de la Cruz')", () => {
     const map = new Map([["Juan de la Cruz", "P-002"]]);
     expect(pseudonymize("Historia de la ciudad", map)).toBe("Historia de la ciudad");
-    expect(pseudonymize("Juan de la ciudad", map)).toBe("P-002 ciudad");
-    expect(pseudonymize("la Cruz del sur", map)).toBe("P-002 del sur");
+    // R403 (c): a run needs two words that stand alone, so "Juan de la" and "la Cruz" are not the name.
+    expect(pseudonymize("Juan de la ciudad", map)).toBe("Juan de la ciudad");
+    expect(pseudonymize("la Cruz del sur", map)).toBe("la Cruz del sur");
   });
 
   it("stated limit: words dropped from the middle ('Siti Ahmad' of 'Siti binti Ahmad') are not matched", () => {
@@ -666,5 +668,32 @@ describe("R403 (a): an invisible character is both nothing and a boundary (C1 of
 
   it("the span replaced holds the invisible characters inside the name, not those at its edges", () => {
     expect(pseudonymize("x​Lu­cía​habla", new Map([["Lucía", "P-001"]]))).toBe("x​P-001​habla");
+  });
+});
+
+describe("R403 (c): a part of a name stands for the name only when it could be a name by itself (I2, M1 of the FR-A10 second review)", () => {
+  const texts = (c: Parameters<typeof creatorNameTexts>[0]) => creatorNameTexts(c).map((t) => t.text);
+
+  it("a single word of a family name of several words is a lone form only when it stands alone (four letters; two no-space characters; two Hangul syllables)", () => {
+    expect(texts({ given: "Juan", family: "de la Cruz" })).toEqual(["Juan de la Cruz", "de la Cruz", "cruz", "Juan"]);
+    expect(texts({ given: "Jan", family: "van der Berg" })).toEqual(["Jan van der Berg", "van der Berg", "berg", "Jan"]);
+    expect(texts({ given: "Lucía", family: "Fernández Ruiz" })).toEqual(["Lucía Fernández Ruiz", "Fernández Ruiz", "fernandez", "ruiz", "Lucía"]);
+    // The family name as a whole and the given name as written are kept at any length (the folder's rule).
+    expect(texts({ given: "Li", family: "de la O" })).toEqual(["Li de la O", "de la O", "Li"]);
+  });
+
+  it("a run of a longer name is a form only when at least two of its words stand alone", () => {
+    for (const [entry, text] of [
+      ["Maria de Lopez", "Ave Maria de Guadalupe"],
+      ["Maria de Lopez", "Calle de Lopez"],
+      ["Juan de la Cruz", "la Cruz Roja"],
+      ["Juan de la Cruz", "San Juan de Dios"],
+      ["Jan van der Berg", "Der Berg ruft"],
+    ] as const) {
+      expect(pseudonymize(text, new Map([[entry, "P-001"]])), `${entry} / ${text}`).toBe(text);
+    }
+    const lucia = new Map([["Lucía Fernández Ruiz", "P-001"]]);
+    expect(pseudonymize("Entrevista a Lucía Fernández", lucia)).toBe("Entrevista a P-001");
+    expect(pseudonymize("Fernández Ruiz habla", lucia)).toBe("P-001 habla");
   });
 });

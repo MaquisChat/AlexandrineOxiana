@@ -43,7 +43,8 @@ export const NAME_KEY = /name|handle|user|alias|account/iu;
  * pseudonym map; each participant's identifying details whose key names the person (`NAME_KEY`;
  * "fullName", "handle" …); and `creators` with their codes (the folder name of a new source: each
  * of core's `creatorNameTexts` — handle, literal, "given family", family, each word of a family name
- * of several words, given; a folder replaces each of any length, R387 c). The first
+ * of several words that could be a name by itself (R403 c), given; a folder replaces each of these
+ * of any length, R387 c). The first
  * entry of a name wins. The citation codes its creators itself (toCslItem), so it passes none.
  */
 export function participantNames(

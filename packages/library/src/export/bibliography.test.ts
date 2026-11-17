@@ -286,3 +286,19 @@ describe("R403 (b): who is the same participant is decided by a strict key (I1 o
     expect(links[1]).toEqual(links[0]);
   });
 });
+
+describe.skipIf(!HAVE_BUNDLE)("R403 (c): a single word of a compound family name stands for the name only when it could be a name by itself (I2 of the FR-A10 second review)", () => {
+  it.each([
+    [{ given: "Juan", family: "de la Cruz" }, "Historia de la ciudad y la Cruz Roja", "Historia de la ciudad y la CODE Roja"],
+    [{ given: "Jan", family: "van der Berg" }, "Der Berg ruft van Gogh", "Der CODE ruft van Gogh"],
+    [{ given: "Lucía", family: "Fernández Ruiz" }, "Fernández habla y Ruiz calla", "CODE habla y CODE calla"],
+  ])("%j with %j: the folder name and the bibliography agree, particles kept", async (c, title, expected) => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const sf = await addSource(kit, p, { type: "book", title, creators: [{ ...c, role: "interviewee" }], issued: "2025", identifiable: true });
+    const code = /P-\d{3}/u.exec(sf.source.folder)![0];
+    const want = expected.replaceAll("CODE", code);
+    expect(sf.source.folder).toContain(want);
+    const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text");
+    expect(bib.content).toContain(want);
+  });
+});

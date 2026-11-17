@@ -31,9 +31,10 @@
  *   any length is replaced there, as before (the folder stays on disk in the clear and errs toward
  *   the code). That is the one ruled difference between the two.
  * - Partial names (R387 e): for a name of three to ten words, every run of two or more of its words
- *   in order is the name too ("Lucía Fernández" of "Lucía Fernández Ruiz"), unless the run is made
- *   only of words too short to stand alone ("de la"); each word of a creator's family name of
- *   several words counts as a lone family name.
+ *   in order is the name too ("Lucía Fernández" of "Lucía Fernández Ruiz") when at least two of its
+ *   words could stand alone (R403 c: not "Maria de", "la Cruz", "der Berg"); each word of a
+ *   creator's family name of several words that could stand alone counts as a lone family name
+ *   ("Fernández", "Ruiz"; not "de", "la", "van", "der").
  * - Limits: inflected forms in Latin script ("Marian", "Marias") are not matched (FR-657); nor
  *   initials ("M. Lopez", "Lopez M."), a middle name present in the text but not in the record
  *   ("Maria Isabel Lopez" against "Maria Lopez"), a part dropped from the middle ("Siti Ahmad" of
@@ -127,8 +128,8 @@ function ordersOf(ws: readonly string[], code: string, bare: boolean, variant: b
  *   "太郎山田"), before words of a no-space script are joined into one run.
  * - A name of three to ten words (R387 e): every run of two or more of its words in order is a form
  *   too, with the same rotations and joins ("Lucía Fernández" and "Fernández Ruiz" of "Lucía
- *   Fernández Ruiz"), unless every word of the run is shorter than a lone name may be (R88's floor
- *   by script): "de la" of "Juan de la Cruz" is not a name.
+ *   Fernández Ruiz") when at least two words of the run reach the floor of a lone name (R88's floor
+ *   by script; R403 c): "de la", "la Cruz" of "Juan de la Cruz" are not a name.
  * - A creator (`{ given, family, literal, handle }`): the forms of each of `creatorNameTexts`.
  */
 export function nameForms(name: string | CreatorName, code: string, bare = false): NameForm[] {
@@ -146,7 +147,9 @@ export function nameForms(name: string | CreatorName, code: string, bare = false
     for (let len = ws.length - 1; len >= 2; len--) {
       for (let at = 0; at + len <= ws.length; at++) {
         const run = ws.slice(at, at + len);
-        if (run.some((w) => standsAlone(w, LATIN_FLOOR))) out.push(...ordersOf(run, code, bare, true));
+        // A run is the name only when at least TWO of its words could be a name by themselves
+        // (R403 c): "Lucía Fernández", "Fernández Ruiz" — not "Maria de", "la Cruz", "der Berg".
+        if (run.filter((w) => standsAlone(w, LATIN_FLOOR)).length >= 2) out.push(...ordersOf(run, code, bare, true));
       }
     }
   }
@@ -164,7 +167,8 @@ export interface CreatorName {
 /**
  * The texts a creator's name may appear as (R387 d, e), each marked `bare` when it is a lone given
  * or family name: the handle, the literal, "given family", the family name, each word of a family
- * name of several words ("Fernández" and "Ruiz" of "Fernández Ruiz"), the given name. Folder names
+ * name of several words that could be a name by itself ("Fernández" and "Ruiz" of "Fernández Ruiz";
+ * not "de" or "la" of "de la Cruz", R403 c), the given name. Folder names
  * (through the library's list of participant names) and citations use the same texts.
  */
 export function creatorNameTexts(c: CreatorName): Array<{ text: string; bare: boolean }> {
@@ -176,8 +180,12 @@ export function creatorNameTexts(c: CreatorName): Array<{ text: string; bare: bo
   add(c.literal);
   if (c.given?.trim() && c.family?.trim()) add(`${c.given.trim()} ${c.family.trim()}`);
   add(c.family, true);
+  // A word of a family name of several words stands for the name only when it could be a name by
+  // itself (R403 c): "Fernández", "Ruiz"; not "de", "la", "van", "der" — in folder names as in
+  // citations. The family name as a whole and the given name are kept at any length (a folder name
+  // replaced those before, of any length).
   const fam = words(c.family ?? "");
-  if (fam.length > 1) for (const w of fam) add(w, true);
+  if (fam.length > 1) for (const w of fam) if (standsAlone(w, LATIN_FLOOR)) add(w, true);
   add(c.given, true);
   return out;
 }

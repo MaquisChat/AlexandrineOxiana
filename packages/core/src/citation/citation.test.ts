@@ -861,6 +861,34 @@ describe("R403 (a): an invisible character is both nothing and a boundary (C1 of
   });
 });
 
+describe("R403 (c): a part of a name stands for the name only when it could be a name by itself (I2, M1 of the FR-A10 second review)", () => {
+  const story = (t: string) => source("article-journal", mt(["es", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]);
+  const title = (t: string, map: ReadonlyMap<string, string>) => toCslItem(story(t), { ...OPTS, pseudonyms: map }).title;
+  const own = (t: string, c: Creator, key: string) =>
+    toCslItem(source("interview", mt(["es", "original", t]), [{ ...c, role: "interviewee" }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: new Map([[key, "P-001"]]) }).title;
+
+  it("runs of a map entry: only those with two words that stand alone", () => {
+    for (const [entry, text] of [
+      ["Maria de Lopez", "Ave Maria de Guadalupe"],
+      ["Maria de Lopez", "Calle de Lopez"],
+      ["Juan de la Cruz", "la Cruz Roja"],
+      ["Juan de la Cruz", "San Juan de Dios"],
+      ["Jan van der Berg", "Der Berg ruft"],
+    ] as const) {
+      expect(title(text, new Map([[entry, "P-001"]])), `${entry} / ${text}`).toBe(text);
+    }
+    const lucia = new Map([["Lucía Fernández Ruiz", "P-001"]]);
+    expect(title("Entrevista a Lucía Fernández", lucia)).toBe("Entrevista a P-001");
+    expect(title("Fernández Ruiz habla", lucia)).toBe("P-001 habla");
+  });
+
+  it("a creator's family words: 'de', 'la', 'van', 'der' stay; 'Cruz', 'Berg', 'Fernández', 'Ruiz' are replaced", () => {
+    expect(own("Historia de la ciudad y la Cruz Roja", { given: "Juan", family: "de la Cruz" }, "Juan de la Cruz")).toBe("Historia de la ciudad y la P-001 Roja");
+    expect(own("Der Berg ruft van Gogh", { given: "Jan", family: "van der Berg" }, "Jan van der Berg")).toBe("Der P-001 ruft van Gogh");
+    expect(own("Fernández habla y Ruiz calla", { given: "Lucía", family: "Fernández Ruiz" }, "Lucía Fernández Ruiz")).toBe("P-001 habla y P-001 calla");
+  });
+});
+
 describe("R387 (b): one function makes a name's forms (I1 of the FR-A10 review)", () => {
   const title = (t: string, map: ReadonlyMap<string, string>) =>
     toCslItem(source("article-journal", mt(["ja", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;
