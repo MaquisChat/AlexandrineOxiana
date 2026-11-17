@@ -510,7 +510,8 @@ describe("R387 (a): a name with an invisible character inside it (C1 of the FR-A
     expect(pseudonymize("क्‍षमा का साक्षात्कार", new Map([["क्षमा", "P-003"]]))).toBe("P-003 का साक्षात्कार");
     expect(pseudonymize("گفتگو با علی‌رضا", new Map([["علیرضا", "P-004"]]))).toBe("گفتگو با P-004");
     expect(pseudonymize("گفتگو با علیرضا", new Map([["علی‌رضا", "P-004"]]))).toBe("گفتگو با P-004");
-    expect(pseudonymize("Video by ⁨@maria.cocina⁩", new Map([["@maria.cocina", "P-005"]]))).toBe("Video by P-005");
+    // The isolates at the edges of the handle stay around the code (R403 a); the folder sanitiser strips them.
+    expect(pseudonymize("Video by ⁨@maria.cocina⁩", new Map([["@maria.cocina", "P-005"]]))).toBe("Video by ⁨P-005⁩");
   });
 
   it("the Hangul filler and the halfwidth filler inside a Hangul name fold away too", () => {
@@ -622,5 +623,48 @@ describe("R387 (f): minor points of the FR-A10 review", () => {
   it("M6: a Hangul name written apart equals the same name written together", () => {
     expect(pseudonymize("김 민수의 인터뷰", new Map([["김민수", "P-001"]]))).toBe("P-001의 인터뷰");
     expect(pseudonymize("김민수의 인터뷰", new Map([["김 민수", "P-001"]]))).toBe("P-001의 인터뷰");
+  });
+});
+
+describe("R403 (a): an invisible character is both nothing and a boundary (C1 of the FR-A10 second review)", () => {
+  const folder = (title: string, map: ReadonlyMap<string, string>) =>
+    sourceFolderName({ dateOrYear: "2026", primaryCreator: "P-009", shortTitle: pseudonymize(title, map), shortId: "ab12" });
+  const plain = (s: string) => s.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+  // [entry, text, the name's parts that must not stay, the pseudonymised text]
+  const table: Array<[string, string, RegExp, string]> = [
+    ["Lucía", "Lucía​habla", /luc/u, "P-001​habla"],
+    ["Maria Lopez", "Maria​Lopez​habla", /maria|lopez/u, "P-001​habla"],
+    ["Ana", "Ana​Luis", /ana/u, "P-001​Luis"],
+    ["Maria", "Maria‎שלום", /maria/u, "P-001‎שלום"],
+    ["Maria", "#Maria⁠Day", /maria/u, "#P-001⁠Day"],
+    ["Maria", "⁨Maria⁩⁨Lopez⁩", /maria/u, "⁨P-001⁩⁨Lopez⁩"],
+  ];
+  it.each(table)("%s in %j: replaced, and the folder name holds no part of it", (entry, text, parts, expected) => {
+    const map = new Map([[entry, "P-001"]]);
+    expect(pseudonymize(text, map)).toBe(expected);
+    const f = folder(text, map);
+    expect(f).toContain("P-001");
+    expect(plain(f)).not.toMatch(parts);
+  });
+
+  it("the isolates around two names: each isolate is a boundary, so the folder never reads 'MariaLopez'", () => {
+    const f = folder("⁨Maria⁩⁨Lopez⁩", new Map([["Maria", "P-001"], ["Lopez", "P-002"]]));
+    expect(f).toBe("2026 P-009 - P-001P-002 [ab12]");
+  });
+
+  it("a Latin name still never matches inside a longer word without an invisible character", () => {
+    expect(pseudonymize("Marianne", new Map([["Maria", "P-001"]]))).toBe("Marianne");
+    expect(pseudonymize("Anabel habla", new Map([["Ana", "P-001"]]))).toBe("Anabel habla");
+  });
+
+  it("'Ana​bel': with the entry 'Anabel' the longer match wins; with 'Ana' only, 'Ana' is replaced and 'bel' kept", () => {
+    expect(pseudonymize("Ana​bel habla", new Map([["Anabel", "P-001"], ["Ana", "P-002"]]))).toBe("P-001 habla");
+    expect(pseudonymize("Ana​bel habla", new Map([["Ana", "P-002"], ["Anabel", "P-001"]]))).toBe("P-001 habla");
+    // The price of treating the character as a boundary: "Ana" is found at the start of "Ana​bel".
+    expect(pseudonymize("Ana​bel habla", new Map([["Ana", "P-002"]]))).toBe("P-002​bel habla");
+  });
+
+  it("the span replaced holds the invisible characters inside the name, not those at its edges", () => {
+    expect(pseudonymize("x​Lu­cía​habla", new Map([["Lucía", "P-001"]]))).toBe("x​P-001​habla");
   });
 });

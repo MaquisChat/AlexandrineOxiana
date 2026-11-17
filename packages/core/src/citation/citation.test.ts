@@ -824,7 +824,40 @@ describe("R387 (a): a name with an invisible character inside it (C1 of the FR-A
   it("Devanagari with a ZWJ, Persian with a ZWNJ against the entry without it, a bidi-wrapped handle", () => {
     expect(title("क्‍षमा का साक्षात्कार", new Map([["क्षमा", "P-003"]]))).toBe("P-003 का साक्षात्कार");
     expect(title("گفتگو با علی‌رضا", new Map([["علیرضا", "P-004"]]))).toBe("گفتگو با P-004");
-    expect(title("Video by ⁨@maria.cocina⁩", new Map([["@maria.cocina", "P-005"]]))).toBe("Video by P-005");
+    // The isolates at the edges of the handle stay around the code (R403 a).
+    expect(title("Video by ⁨@maria.cocina⁩", new Map([["@maria.cocina", "P-005"]]))).toBe("Video by ⁨P-005⁩");
+  });
+});
+
+describe("R403 (a): an invisible character is both nothing and a boundary (C1 of the FR-A10 second review)", () => {
+  const story = (title: string, url?: string) =>
+    source("article-journal", mt(["es", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }], url ? { identifiers: { url } } : {});
+  const title = (t: string, map: ReadonlyMap<string, string>) => toCslItem(story(t), { ...OPTS, pseudonyms: map }).title;
+  const table: Array<[string, string, string]> = [
+    ["Lucía", "Lucía\u200Bhabla", "P-001\u200Bhabla"],
+    ["Maria Lopez", "Maria\u200BLopez\u200Bhabla", "P-001\u200Bhabla"],
+    ["Ana", "Ana\u200BLuis", "P-001\u200BLuis"],
+    ["Maria", "Maria\u200Eשלום", "P-001\u200Eשלום"],
+    ["Maria", "#Maria\u2060Day", "#P-001\u2060Day"],
+    ["Maria", "\u2068Maria\u2069\u2068Lopez\u2069", "\u2068P-001\u2069\u2068Lopez\u2069"],
+  ];
+  it.each(table)("%s in %j is replaced in the title", (entry, text, expected) => {
+    expect(title(text, new Map([[entry, "P-001"]]))).toBe(expected);
+  });
+
+  it("a creator's own name glued to the next word by a zero-width space is replaced in the title", () => {
+    const sf = source("interview", mt(["es", "original", "Lucía\u200Bhabla"]), [{ role: "interviewee", given: "Lucía", family: "Fernández" }], { participantIds: [PARTICIPANT.id] });
+    expect(toCslItem(sf, { ...OPTS, pseudonyms: new Map([["Lucía Fernández", "P-002"]]) }).title).toBe("P-002\u200Bhabla");
+  });
+
+  it("the address Luc%C3%ADa%E2%80%8Bhabla is dropped", () => {
+    expect(toCslItem(story("A story", "https://news.example/Luc%C3%ADa%E2%80%8Bhabla"), { ...OPTS, pseudonyms: new Map([["Lucía", "P-001"]]) }).URL).toBeUndefined();
+  });
+
+  it("'Ana\u200Bbel': the longer entry wins; 'Ana' alone leaves 'bel' (the price of the boundary); 'Marianne' is kept", () => {
+    expect(title("Ana\u200Bbel habla", new Map([["Ana", "P-002"], ["Anabel", "P-001"]]))).toBe("P-001 habla");
+    expect(title("Ana\u200Bbel habla", new Map([["Ana", "P-002"]]))).toBe("P-002\u200Bbel habla");
+    expect(title("Marianne habla", new Map([["Maria", "P-001"]]))).toBe("Marianne habla");
   });
 });
 

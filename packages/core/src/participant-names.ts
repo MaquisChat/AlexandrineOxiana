@@ -8,6 +8,11 @@
  * - Words: runs of letters and digits; any other character separates them ("lucia_cocina",
  *   "lucia.cocina" and "Lucía Cocina" are the same two words). A name matches whole words only,
  *   so "Ann" is not found in "Annual".
+ * - Invisible characters (R403 a: the default-ignorable ones — zero-width space and joiners, word
+ *   joiner, direction marks and isolates, soft hyphen …) inside a run of letters are both nothing and
+ *   a boundary: a name may run across one ("Luc\u00ADía" is "Lucía") and may also begin or end at one
+ *   ("Lucía\u200Bhabla", "\u2068Maria\u2069\u2068Lopez\u2069"); the longer match wins. The price:
+ *   "Ana" is found in "Ana\u200Bbel" when no longer name is.
  * - Scripts written without spaces (Han, Hiragana, Katakana, Thai, Lao, Khmer, Myanmar; the
  *   `NO_SPACE_SCRIPT` that title verification uses): each of their characters is a word of its
  *   own, so a name of two or more such characters is found inside the run it is joined to
@@ -225,6 +230,12 @@ interface Token {
   /** Another no-space-script character touches it on the left / right (no separator between). */
   gluedLeft: boolean;
   gluedRight: boolean;
+  /**
+   * Joined to the token before it by invisible characters only (R403 a): the two are one word
+   * ("Luc\u00ADía" is "Lucía") and also two ("Lucía\u200Bhabla"): a name may run across this soft
+   * boundary, and may also begin or end at it.
+   */
+  soft: boolean;
 }
 
 const foldCache = new Map<string, string>();
@@ -238,16 +249,21 @@ function foldChar(cp: string): string {
 }
 
 /**
- * The text's word units, folded, with their spans in the original text. Folding is done one code
- * point at a time so that every folded character points back to the original it came from; a
- * combining mark folds to nothing and is taken into the span of the letter before it.
+ * The text's word units, folded, with their spans in the original text, in ONE pass. Folding is done
+ * one code point at a time so that every folded character points back to the original it came from;
+ * a combining mark folds to nothing and is taken into the span of the letter before it. An invisible
+ * (default-ignorable) character inside a run of letters ends the unit before it and marks the next
+ * one `soft` (R403 a): it is not in either span, so a name that begins or ends at it leaves it in
+ * place, and a name that runs across it takes it inside its span. Between two no-space-script
+ * characters it keeps them glued (a one-character name there is still not a run of its own).
  */
 function tokenize(text: string, splitDigits: boolean): Token[] {
   const tokens: Token[] = [];
-  let cur: { w: string; start: number; end: number; digit: boolean } | undefined;
+  let cur: { w: string; start: number; end: number; digit: boolean; soft: boolean } | undefined;
   let prevNoSpaceEnd = -1; // end index (original) of the last no-space unit, when nothing came between
+  let pendingSoft = false; // an invisible character ended the last unit, and nothing else came since
   const flush = () => {
-    if (cur) tokens.push({ w: cur.w, start: cur.start, end: cur.end, gluedLeft: false, gluedRight: false });
+    if (cur) tokens.push({ w: cur.w, start: cur.start, end: cur.end, gluedLeft: false, gluedRight: false, soft: cur.soft });
     cur = undefined;
   };
   let i = 0;
@@ -256,9 +272,15 @@ function tokenize(text: string, splitDigits: boolean): Token[] {
     const next = i + cp.length;
     const f = foldChar(cp);
     if (f === "") {
+      if (IGNORABLE_ONE.test(cp)) {
+        // An invisible character: a soft boundary inside a run of letters (R403 a).
+        if (cur) {
+          flush();
+          pendingSoft = true;
+        }
+      } else if (cur) cur.end = next;
       // A combining mark (or another character that folds away): part of whatever it follows.
-      if (cur) cur.end = next;
-      else if (tokens.length && tokens[tokens.length - 1]!.end === i) tokens[tokens.length - 1]!.end = next;
+      else if (!pendingSoft && tokens.length && tokens[tokens.length - 1]!.end === i) tokens[tokens.length - 1]!.end = next;
       if (prevNoSpaceEnd === i) prevNoSpaceEnd = next;
       i = next;
       continue;
@@ -266,9 +288,10 @@ function tokenize(text: string, splitDigits: boolean): Token[] {
     for (const ch of f) {
       if (isNoSpace(ch)) {
         flush();
+        pendingSoft = false;
         const glued = prevNoSpaceEnd === i;
         if (glued) tokens[tokens.length - 1]!.gluedRight = true;
-        tokens.push({ w: ch, start: i, end: next, gluedLeft: glued, gluedRight: false });
+        tokens.push({ w: ch, start: i, end: next, gluedLeft: glued, gluedRight: false, soft: false });
         prevNoSpaceEnd = next;
       } else if (WORD.test(ch)) {
         const digit = DIGIT.test(ch);
@@ -277,10 +300,12 @@ function tokenize(text: string, splitDigits: boolean): Token[] {
           cur.w += ch;
           cur.end = next;
           cur.digit = digit;
-        } else cur = { w: ch, start: i, end: next, digit };
+        } else cur = { w: ch, start: i, end: next, digit, soft: pendingSoft };
+        pendingSoft = false;
         prevNoSpaceEnd = -1;
       } else {
         flush();
+        pendingSoft = false;
         prevNoSpaceEnd = -1;
       }
     }
@@ -304,17 +329,6 @@ const CHOSEONG = /[\u1100-\u115F\uA960-\uA97F]/u;
 const ALL_HANGUL = /^\p{Script=Hangul}+$/u;
 const syllables = (s: string): number => (s.match(/[\u1100-\u115F\uA960-\uA97F]/gu) ?? []).length;
 
-/**
- * Korean (R380): `u`, the folded last word of a Hangul name, begins the token `w` and the rest of
- * the run is Hangul starting on a new syllable: the rest is taken for a particle or honorific
- * ("김민수의", "김민수씨와의"). Never in the middle or at the end of a run.
- */
-const hangulPrefixOf = (w: string, u: string): boolean => {
-  if (w.length <= u.length || !w.startsWith(u)) return false;
-  const rest = w.slice(u.length);
-  return CHOSEONG.test(rest[0]!) && ALL_HANGUL.test(rest);
-};
-
 interface Index {
   /** Patterns by first unit, longest first. */
   byFirst: Map<string, Pattern[]>;
@@ -322,6 +336,8 @@ interface Index {
   prefixes: Map<string, Pattern[]>;
   /** The longest unit in `prefixes` (bounds the prefixes tried per token). */
   maxPrefix: number;
+  /** The longest first unit (bounds the tokens joined across soft boundaries to look one up, R403 a). */
+  maxFirst: number;
 }
 
 /**
@@ -343,6 +359,7 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
   const index = new Map<string, Pattern[]>();
   const prefixes = new Map<string, Pattern[]>();
   let maxPrefix = 0;
+  let maxFirst = 0;
   const seen = new Set<string>();
   const add = (ws: readonly string[], code: string) => {
     const us = ws.flatMap((w) => units(w, split));
@@ -358,6 +375,7 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
     const list = index.get(us[0]!) ?? [];
     list.push(pat);
     index.set(us[0]!, list);
+    maxFirst = Math.max(maxFirst, us[0]!.length);
     if (prefix && us.length === 1) {
       const pl = prefixes.get(last) ?? [];
       pl.push(pat);
@@ -377,7 +395,7 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
     }
   }
   for (const list of index.values()) list.sort((a, b) => b.units.length - a.units.length);
-  return { byFirst: index, prefixes, maxPrefix };
+  return { byFirst: index, prefixes, maxPrefix, maxFirst };
 }
 
 /** The original-text index where the first `n` folded characters of a token starting at `start` end. */
@@ -389,10 +407,10 @@ function origEnd(text: string, start: number, n: number): number {
     got += foldChar(cp).length;
     i += cp.length;
   }
-  // Marks folded away belong to the letter before them.
+  // Marks folded away belong to the letter before them; an invisible character does not (R403 a).
   while (i < text.length) {
     const cp = String.fromCodePoint(text.codePointAt(i)!);
-    if (foldChar(cp) !== "") break;
+    if (foldChar(cp) !== "" || IGNORABLE_ONE.test(cp)) break;
     i += cp.length;
   }
   return i;
@@ -533,57 +551,115 @@ function findAll(text: string, names: Names, opts: ScrubOptions, firstOnly: bool
 
 function findPlain(text: string, indexes: readonly Index[], opts: ScrubOptions, firstOnly: boolean): Hit[] {
   const tokens = tokenize(text, opts.splitDigits ?? false);
+  const n = tokens.length;
+  // The word each token is in (R403 a): tokens joined by soft boundaries. `wordEnd[i]`: its last
+  // token; `hangulRest[i]`: tokens i..wordEnd[i] are all Hangul.
+  const wordEnd = new Int32Array(n);
+  const hangulRest = new Uint8Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    const joined = i + 1 < n && tokens[i + 1]!.soft;
+    wordEnd[i] = joined ? wordEnd[i + 1]! : i;
+    hangulRest[i] = ALL_HANGUL.test(tokens[i]!.w) && (!joined || hangulRest[i + 1] === 1) ? 1 : 0;
+  }
   const hits: Hit[] = [];
+  /** The last token of the unit `u` read from token `i` on across soft boundaries, or -1. */
+  const unitEnd = (i: number, u: string): number => {
+    let pos = 0;
+    for (let j = i; j <= wordEnd[i]!; j++) {
+      const w = tokens[j]!.w;
+      if (!u.startsWith(w, pos)) return -1;
+      pos += w.length;
+      if (pos === u.length) return j;
+    }
+    return -1;
+  };
+  /**
+   * Korean (R380): `u`, the folded last word of a Hangul name, begins the word read from token `j`
+   * and ends on a syllable inside it, and the rest of the word is Hangul ("김민수의", "김ㅤ민수의"):
+   * the end of `u` in the original text, or -1.
+   */
+  const hangulPrefixEnd = (j: number, u: string): number => {
+    let pos = 0;
+    for (let q = j; q <= wordEnd[j]!; q++) {
+      const w = tokens[q]!.w;
+      const need = u.length - pos;
+      if (w.length > need) {
+        if (!w.startsWith(u.slice(pos))) return -1;
+        const rest = w.slice(need);
+        if (!CHOSEONG.test(rest[0]!) || !ALL_HANGUL.test(rest) || (q < wordEnd[j]! && hangulRest[q + 1] !== 1)) return -1;
+        return origEnd(text, tokens[q]!.start, need);
+      }
+      // `u` ending exactly at a token's end is an exact match, not a prefix.
+      if (w.length === need || !u.startsWith(w, pos)) return -1;
+      pos += w.length;
+    }
+    return -1;
+  };
   /** The end of `p` matched at token `i` (exactly, or its last word beginning a Hangul run), or -1. */
   const matchEnd = (p: Pattern, i: number): number => {
     // A single no-space-script character is a name only when it stands alone.
     if (p.single && (tokens[i]!.gluedLeft || tokens[i]!.gluedRight)) return -1;
     const lastK = p.units.length - 1;
-    for (let k = 0; k < lastK; k++) if (tokens[i + k]?.w !== p.units[k]) return -1;
-    const t = tokens[i + lastK];
-    if (!t) return -1;
-    const u = p.units[lastK]!;
-    if (t.w === u) return t.end;
-    return p.prefix && hangulPrefixOf(t.w, u) ? origEnd(text, t.start, u.length) : -1;
-  };
-  /** The longest pattern of `ix` found at token `i`, with its end. */
-  const at = (ix: Index, i: number): { p: Pattern; end: number } | undefined => {
-    const w = tokens[i]!.w;
-    for (const p of ix.byFirst.get(w) ?? []) {
-      const end = matchEnd(p, i);
-      if (end >= 0) return { p, end };
+    let j = i;
+    for (let k = 0; k < lastK; k++) {
+      if (j >= n) return -1;
+      const e = unitEnd(j, p.units[k]!);
+      if (e < 0) return -1;
+      j = e + 1;
     }
-    // A one-word Hangul name at the start of a longer run: the prefixes of the token that end on a
+    if (j >= n) return -1;
+    const u = p.units[lastK]!;
+    const e = unitEnd(j, u);
+    if (e >= 0) return tokens[e]!.end;
+    return p.prefix ? hangulPrefixEnd(j, u) : -1;
+  };
+  type Best = { p: Pattern; end: number } | undefined;
+  /** The longer match wins: the later end, then more words; on a tie the one found first. */
+  const better = (end: number, p: Pattern, best: Best): boolean =>
+    !best || end > best.end || (end === best.end && p.units.length > best.p.units.length);
+  /** The longest pattern of `ix` found at token `i`, with its end. */
+  const at = (ix: Index, i: number): Best => {
+    let best: Best;
+    // The first unit read across soft boundaries: "ana", then "anabel" in "Ana\u200Bbel" (R403 a).
+    let key = "";
+    for (let j = i; j <= wordEnd[i]!; j++) {
+      key += tokens[j]!.w;
+      if (key.length > ix.maxFirst) break;
+      for (const p of ix.byFirst.get(key) ?? []) {
+        const end = matchEnd(p, i);
+        if (end >= 0 && better(end, p, best)) best = { p, end };
+      }
+    }
+    // A one-word Hangul name at the start of a longer run: the prefixes of the word that end on a
     // syllable boundary, longest first, no longer than the longest such name (linear in the text).
-    if (ix.maxPrefix > 0 && CHOSEONG.test(w[0] ?? "")) {
-      for (let n = Math.min(w.length - 1, ix.maxPrefix); n > 0; n--) {
-        if (!CHOSEONG.test(w[n]!)) continue;
-        for (const p of ix.prefixes.get(w.slice(0, n)) ?? []) {
+    const w0 = tokens[i]!.w;
+    if (ix.maxPrefix > 0 && CHOSEONG.test(w0[0] ?? "")) {
+      let s = "";
+      for (let j = i; j <= wordEnd[i]! && s.length <= ix.maxPrefix; j++) s += tokens[j]!.w;
+      for (let m = Math.min(s.length - 1, ix.maxPrefix); m > 0; m--) {
+        if (!CHOSEONG.test(s[m]!)) continue;
+        for (const p of ix.prefixes.get(s.slice(0, m)) ?? []) {
           const end = matchEnd(p, i);
-          if (end >= 0) return { p, end };
+          if (end >= 0 && better(end, p, best)) best = { p, end };
         }
       }
     }
-    return undefined;
+    return best;
   };
-  for (let i = 0; i < tokens.length; ) {
-    let hit: Pattern | undefined;
-    let end = -1;
+  for (let i = 0; i < n; ) {
+    let best: Best;
     // Longest across the indexes; on the same length the first index (the name map) wins.
     for (const ix of indexes) {
       const r = at(ix, i);
-      if (r && (!hit || r.p.units.length > hit.units.length)) {
-        hit = r.p;
-        end = r.end;
-      }
+      if (r && better(r.end, r.p, best)) best = r;
     }
-    if (!hit) {
+    if (!best) {
       i++;
       continue;
     }
-    hits.push({ start: tokens[i]!.start, end, code: hit.code });
+    hits.push({ start: tokens[i]!.start, end: best.end, code: best.p.code });
     if (firstOnly) break;
-    i += hit.units.length;
+    while (i < n && tokens[i]!.start < best.end) i++;
   }
   return hits;
 }
@@ -599,8 +675,9 @@ export function scrubNames(text: string, names: Names, opts: ScrubOptions = {}):
   let pos = 0;
   for (const h of hits) {
     let start = h.start;
-    // An "@" in front goes with the name, and so do invisible characters around it (a bidi isolate).
-    while (start > pos && (text[start - 1] === "@" || IGNORABLE_ONE.test(text[start - 1]!))) start--;
+    // An "@" in front goes with the name. Invisible characters at its edges stay (R403 a: they are
+    // separators, "⁨@maria⁩" gives "⁨P-001⁩"); those inside it are in its span.
+    while (start > pos && text[start - 1] === "@") start--;
     out += text.slice(pos, start) + h.code;
     pos = h.end;
   }
