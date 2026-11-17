@@ -841,7 +841,7 @@ describe("R387 (b): one function makes a name's forms (I1 of the FR-A10 review)"
 });
 
 describe("R387 (c): R88's floor for a lone name, measured by script (I2 of the FR-A10 review)", () => {
-  const cite = (t: string, creator: Creator, key: string, code: string) =>
+  const cite = (t: string, creator: Omit<Creator, "role">, key: string, code: string) =>
     toCslItem(source("interview", mt(["und", "original", t]), [{ role: "interviewee", ...creator }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: new Map([[key, code]]) });
 
   it("a lone given name of two or more characters in a no-space script is replaced, as in the folder name", () => {
@@ -862,5 +862,26 @@ describe("R387 (c): R88's floor for a lone name, measured by script (I2 of the F
   it("Latin script keeps four letters: 'Li family history' is kept in the citation (as ruled)", () => {
     expect(cite("Li family history", { family: "Li", given: "Rose" }, "Rose Li", "P-003").title).toBe("Li family history");
     expect(cite("Rose Li family history", { family: "Li", given: "Rose" }, "Rose Li", "P-003").title).toBe("P-003 family history");
+  });
+});
+
+describe("R387 (e): partial names (I4 of the FR-A10 review)", () => {
+  const story = (t: string) => source("article-journal", mt(["es", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]);
+
+  it("a map entry of three words: a run of two of its words in order is replaced", () => {
+    const map = new Map([["Lucía Fernández Ruiz", "P-001"]]);
+    expect(toCslItem(story("Entrevista a Lucía Fernández"), { ...OPTS, pseudonyms: map }).title).toBe("Entrevista a P-001");
+    expect(toCslItem(story("Fernández Ruiz habla"), { ...OPTS, pseudonyms: map }).title).toBe("P-001 habla");
+  });
+
+  it("a creator with a family name of two words: no 'P-001 Fernández', and each family word counts as a lone family name", () => {
+    const sf = (t: string) =>
+      source("interview", mt(["es", "original", t]), [{ role: "interviewee", given: "Lucía", family: "Fernández Ruiz" }], { participantIds: [PARTICIPANT.id] });
+    const opts = { ...OPTS, pseudonyms: new Map([["Lucía Fernández Ruiz", "P-001"]]) };
+    expect(toCslItem(sf("Entrevista a Lucía Fernández"), opts).title).toBe("Entrevista a P-001");
+    expect(toCslItem(sf("Fernández habla; Ruiz también"), opts).title).toBe("P-001 habla; P-001 también");
+    // Under R88's floor: a short family word alone is kept in a citation.
+    const li = source("interview", mt(["en", "original", "The Li family; Wang Li"]), [{ role: "interviewee", given: "Mei", family: "Wang Li" }], { participantIds: [PARTICIPANT.id] });
+    expect(toCslItem(li, { ...OPTS, pseudonyms: new Map([["Mei Wang Li", "P-002"]]) }).title).toBe("The Li family; P-002");
   });
 });

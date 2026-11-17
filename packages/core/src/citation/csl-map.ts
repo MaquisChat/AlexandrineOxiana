@@ -155,7 +155,10 @@ const lang1 = (tag: string) => tag.trim().toLowerCase().split(/[-_]/)[0] ?? "";
 // participant-names.ts (R378 a). Folder names use the same rule (naming.ts pseudonymize).
 export { normName };
 
-/** The forms under which a creator's name may appear (the lone given and family names marked bare). */
+/**
+ * The names a creator is looked up by in the pseudonym map (handle, literal, "given family",
+ * "family given", family, given). The forms replaced in text are `nameForms` (participant-names.ts).
+ */
 function creatorForms(c: Creator): Array<{ text: string; bare: boolean }> {
   const out: Array<{ text: string; bare: boolean }> = [];
   const add = (t: string | undefined, bare = false) => {
@@ -284,7 +287,7 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
     if (code) {
       anyCoded = true;
       name = { literal: code };
-      for (const f of creatorForms(c)) forms.push(...nameForms(f.text, code, f.bare));
+      forms.push(...nameForms(c, code));
     } else {
       if (requireCodes && c.role !== "interviewer" && creatorForms(c).length > 0) throw new ParticipantCodeMissingError();
       name = cslName(c);

@@ -25,7 +25,15 @@
  *   kept, so ordinary words are not blanked). Folder names have the stricter rule: a lone name of
  *   any length is replaced there, as before (the folder stays on disk in the clear and errs toward
  *   the code). That is the one ruled difference between the two.
- * - Limit: inflected forms in Latin script ("Marian", "Marias") are not matched (FR-657).
+ * - Partial names (R387 e): for a name of three to ten words, every run of two or more of its words
+ *   in order is the name too ("Lucía Fernández" of "Lucía Fernández Ruiz"), unless the run is made
+ *   only of words too short to stand alone ("de la"); each word of a creator's family name of
+ *   several words counts as a lone family name.
+ * - Limits: inflected forms in Latin script ("Marian", "Marias") are not matched (FR-657); nor
+ *   initials ("M. Lopez", "Lopez M."), a middle name present in the text but not in the record
+ *   ("Maria Isabel Lopez" against "Maria Lopez"), a part dropped from the middle ("Siti Ahmad" of
+ *   "Siti binti Ahmad"), an order that is neither a rotation nor the reverse ("Lucía Ruiz
+ *   Fernández"), or runs of a name of more than ten words.
  * Platform-neutral: no node: imports.
  */
 import { NO_SPACE_SCRIPT } from "./verify/evidence.js";
@@ -77,20 +85,16 @@ export interface NameForm {
   variant?: boolean;
 }
 
-/**
- * The forms of one name (R387 b): the ONE place a map entry becomes the forms the matcher looks
- * for, used by citations (csl-map.ts) and folder names (naming.ts) alike. The name as written, then
- * for a name of two or more words every rotation ("Family, Given": "Lopez, Maria", "Fernández Ruiz,
- * Lucía") and the full reverse, and each order with its words joined ("marialopez"). Rotations are
- * made from the words as written ("山田 太郎" gives "太郎山田"), before words of a no-space script
- * are joined into one run.
- */
-export function nameForms(name: string, code: string, bare = false): NameForm[] {
-  const ws = words(name);
-  if (ws.length === 0) return [];
-  const out: NameForm[] = [{ words: ws, code, bare }];
+/** The longest name whose runs of words are made into forms (R387 e); longer names get none. */
+const MAX_RUN_WORDS = 10;
+/** The Latin-script floor of R88 (4 letters), used to tell a run of particles from a name. */
+const LATIN_FLOOR = 4;
+
+/** `ws` in every rotation and reversed, each order also with its words joined. */
+function ordersOf(ws: readonly string[], code: string, bare: boolean, variant: boolean): NameForm[] {
+  const out: NameForm[] = [{ words: [...ws], code, bare, ...(variant ? { variant } : {}) }];
   if (ws.length === 1) return out;
-  const orders: string[][] = [ws];
+  const orders: string[][] = [[...ws]];
   for (let k = 1; k < ws.length; k++) orders.push([...ws.slice(k), ...ws.slice(0, k)]);
   orders.push([...ws].reverse());
   orders.forEach((o, i) => {
@@ -98,6 +102,64 @@ export function nameForms(name: string, code: string, bare = false): NameForm[] 
     // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
     out.push({ words: [o.join("")], code, bare, variant: true });
   });
+  return out;
+}
+
+/**
+ * The forms of one name (R387 b): the ONE place a map entry or a creator's name becomes the forms
+ * the matcher looks for, used by citations (csl-map.ts) and folder names (naming.ts) alike.
+ * - The name as written; for a name of two or more words every rotation ("Family, Given":
+ *   "Lopez, Maria", "Fernández Ruiz, Lucía") and the full reverse, and each order with its words
+ *   joined ("marialopez"). Rotations are made from the words as written ("山田 太郎" gives
+ *   "太郎山田"), before words of a no-space script are joined into one run.
+ * - A name of three to ten words (R387 e): every run of two or more of its words in order is a form
+ *   too, with the same rotations and joins ("Lucía Fernández" and "Fernández Ruiz" of "Lucía
+ *   Fernández Ruiz"), unless every word of the run is shorter than a lone name may be (R88's floor
+ *   by script): "de la" of "Juan de la Cruz" is not a name.
+ * - A creator (`{ given, family, literal, handle }`): the forms of each of `creatorNameTexts`.
+ */
+export function nameForms(name: string | CreatorName, code: string, bare = false): NameForm[] {
+  if (typeof name !== "string") return creatorNameTexts(name).flatMap((t) => nameForms(t.text, code, t.bare));
+  const ws = words(name);
+  if (ws.length === 0) return [];
+  const out = ordersOf(ws, code, bare, false);
+  if (ws.length >= 3 && ws.length <= MAX_RUN_WORDS) {
+    for (let len = ws.length - 1; len >= 2; len--) {
+      for (let at = 0; at + len <= ws.length; at++) {
+        const run = ws.slice(at, at + len);
+        if (run.some((w) => standsAlone(w, LATIN_FLOOR))) out.push(...ordersOf(run, code, bare, true));
+      }
+    }
+  }
+  return out;
+}
+
+/** A creator's name parts (the fields of a source's creator that may name a person). */
+export interface CreatorName {
+  handle?: string;
+  literal?: string;
+  given?: string;
+  family?: string;
+}
+
+/**
+ * The texts a creator's name may appear as (R387 d, e), each marked `bare` when it is a lone given
+ * or family name: the handle, the literal, "given family", the family name, each word of a family
+ * name of several words ("Fernández" and "Ruiz" of "Fernández Ruiz"), the given name. Folder names
+ * (through the library's list of participant names) and citations use the same texts.
+ */
+export function creatorNameTexts(c: CreatorName): Array<{ text: string; bare: boolean }> {
+  const out: Array<{ text: string; bare: boolean }> = [];
+  const add = (t: string | undefined, bare = false) => {
+    if (t?.trim()) out.push({ text: t.trim(), bare });
+  };
+  add(c.handle);
+  add(c.literal);
+  if (c.given?.trim() && c.family?.trim()) add(`${c.given.trim()} ${c.family.trim()}`);
+  add(c.family, true);
+  const fam = words(c.family ?? "");
+  if (fam.length > 1) for (const w of fam) add(w, true);
+  add(c.given, true);
   return out;
 }
 

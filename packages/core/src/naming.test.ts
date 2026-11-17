@@ -545,3 +545,24 @@ describe("R387 (c): the folder replaces a lone given or family name of any lengt
     expect(pseudonymize("Li family history", creatorMap("Rose Li", "P-003", "Rose", "Li"))).toBe("P-003 family history");
   });
 });
+
+describe("R387 (e): partial names (I4 of the FR-A10 review)", () => {
+  it("a run of two or more words of a name of three or more words, in order, is the name too", () => {
+    const map = new Map([["Lucía Fernández Ruiz", "P-001"]]);
+    expect(pseudonymize("Entrevista a Lucía Fernández", map)).toBe("Entrevista a P-001");
+    expect(pseudonymize("Fernández Ruiz habla", map)).toBe("P-001 habla");
+    expect(pseudonymize("Fernández, Lucía: memorias", map)).toBe("P-001: memorias");
+    expect(pseudonymize("luciafernandez video", map)).toBe("P-001 video");
+  });
+
+  it("a run made only of short particles is not a name ('de la' of 'Juan de la Cruz')", () => {
+    const map = new Map([["Juan de la Cruz", "P-002"]]);
+    expect(pseudonymize("Historia de la ciudad", map)).toBe("Historia de la ciudad");
+    expect(pseudonymize("Juan de la ciudad", map)).toBe("P-002 ciudad");
+    expect(pseudonymize("la Cruz del sur", map)).toBe("P-002 del sur");
+  });
+
+  it("stated limit: words dropped from the middle ('Siti Ahmad' of 'Siti binti Ahmad') are not matched", () => {
+    expect(pseudonymize("Siti Ahmad bercerita", new Map([["Siti binti Ahmad", "P-003"]]))).toBe("Siti Ahmad bercerita");
+  });
+});

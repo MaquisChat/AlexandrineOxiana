@@ -201,6 +201,24 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(plain(bib.content)).not.toMatch(/lucia|fernandez|ruiz/u);
   });
 
+  it("R387 (e): a creator with a family name of two words: part of the name is never left beside the code, in the folder or the bibliography", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const sf = await addSource(kit, p, {
+      type: "book",
+      title: "Entrevista a Lucía Fernández y Ruiz habla",
+      creators: [{ given: "Lucía", family: "Fernández Ruiz", role: "interviewee" }],
+      issued: "2025",
+      identifiable: true,
+    });
+    const plain = (s: string) => s.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+    const code = /P-\d{3}/u.exec(sf.source.folder)![0];
+    expect(sf.source.folder).toContain(`Entrevista a ${code} y ${code} habla`);
+    expect(plain(sf.source.folder)).not.toMatch(/lucia|fernandez|ruiz/u);
+    const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text");
+    expect(bib.content).toContain(`Entrevista a ${code} y ${code} habla`);
+    expect(plain(bib.content)).not.toMatch(/lucia|fernandez|ruiz/u);
+  });
+
   it("a custom style renders through the sandbox", async () => {
     const p = await makeProject(kit);
     const xml = `<?xml version="1.0" encoding="utf-8"?>

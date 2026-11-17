@@ -3,7 +3,7 @@
  * `<Project>/keys/pseudonyms.json.enc` (encrypted with the project key).
  */
 import type { Creator, Participant } from "@ao/core";
-import { newId } from "@ao/core";
+import { creatorNameTexts, newId } from "@ao/core";
 import { decryptBytes, readMaybe } from "./io.js";
 import type { Tx } from "./mutate.js";
 import type { ProjectJson, ProjectState, RepoCore } from "./state.js";
@@ -41,8 +41,9 @@ export const NAME_KEY = /name|handle|user|alias|account/iu;
  * The names of this project's participants, name → code (R387 d): ONE list for a source's folder
  * name (repo/sources.ts) and its citation (export/bibliography.ts), so the two cannot drift. The
  * pseudonym map; each participant's identifying details whose key names the person (`NAME_KEY`;
- * "fullName", "handle" …); and `creators` with their codes (the folder name of a new source:
- * each name form — handle with and without "@", literal, family, given, "given family"). The first
+ * "fullName", "handle" …); and `creators` with their codes (the folder name of a new source: each
+ * of core's `creatorNameTexts` — handle, literal, "given family", family, each word of a family name
+ * of several words, given; a folder replaces each of any length, R387 c). The first
  * entry of a name wins. The citation codes its creators itself (toCslItem), so it passes none.
  */
 export function participantNames(
@@ -60,7 +61,7 @@ export function participantNames(
   }
   for (const { creator: c, code } of creators) {
     if (!code) continue;
-    for (const n of [c.handle, c.handle?.replace(/^@+/, ""), c.literal, c.family, c.given, [c.given, c.family].filter(Boolean).join(" ")]) add(n, code);
+    for (const t of creatorNameTexts(c)) add(t.text, code);
   }
   return out;
 }
