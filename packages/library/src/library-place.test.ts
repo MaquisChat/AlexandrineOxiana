@@ -1,0 +1,175 @@
+/**
+ * R447 (Task FR-A23): where "Choose a library" suggests putting a new library, and how much room the disk under a
+ * chosen folder has. The home folder, the location environment and every file-system read are injected, so nothing
+ * here needs a real home folder; the last tests use real temporary folders.
+ */
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import type { LocationEnv } from "./location.js";
+import { FOLDER_ROOM_LOOK_MS, freeRoomFor, suggestedLibraryFolder, type FolderState } from "./library-place.js";
+
+const HOME = "/Users/r";
+const env = (over: Partial<LocationEnv> = {}): LocationEnv => ({ homeDir: HOME, platform: "darwin", mounts: [{ path: "/", removable: false, network: false }], mountsKnown: true, ...over });
+
+/** A file system of folders by state; anything not named is missing. */
+function fsOf(states: Record<string, FolderState>, real: Record<string, string> = {}) {
+  const looked: string[] = [];
+  return {
+    looked,
+    folderState: async (p: string) => {
+      looked.push(p);
+      return states[p] ?? "missing";
+    },
+    realpath: async (p: string) => real[p] ?? p,
+  };
+}
+
+describe("suggestedLibraryFolder (R447 a)", () => {
+  it("Documents there and not kept in step by a cloud service: Documents/Alexandrine Oxiana", async () => {
+    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty" });
+    expect(await suggestedLibraryFolder(env(), fs)).toBe(`${HOME}/Documents/Alexandrine Oxiana`);
+  });
+
+  it("Documents kept in step by iCloud (Desktop and Documents, as classifyLocation tells it): the home folder's", async () => {
+    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty" }, { [`${HOME}/Documents`]: `${HOME}/Library/Mobile Documents/com~apple~CloudDocs/Documents` });
+    expect(await suggestedLibraryFolder(env(), fs)).toBe(`${HOME}/Alexandrine Oxiana`);
+  });
+
+  it("Documents whose real path is in a cloud folder (linked into Dropbox): the home folder's", async () => {
+    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty" }, { [`${HOME}/Documents`]: `${HOME}/Dropbox/Documents` });
+    expect(await suggestedLibraryFolder(env(), fs)).toBe(`${HOME}/Alexandrine Oxiana`);
+  });
+
+  it("no Documents folder (or Documents is a file): the home folder's", async () => {
+    expect(await suggestedLibraryFolder(env(), fsOf({}))).toBe(`${HOME}/Alexandrine Oxiana`);
+    expect(await suggestedLibraryFolder(env(), fsOf({ [`${HOME}/Documents`]: "not-a-folder" }))).toBe(`${HOME}/Alexandrine Oxiana`);
+  });
+
+  it("the folder exists and is empty: itself", async () => {
+    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty", [`${HOME}/Documents/Alexandrine Oxiana`]: "empty" });
+    expect(await suggestedLibraryFolder(env(), fs)).toBe(`${HOME}/Documents/Alexandrine Oxiana`);
+  });
+
+  it("the folder exists and is not empty: the same name with ' 2'; a taken ' 2' gives ' 3'", async () => {
+    const base = `${HOME}/Documents/Alexandrine Oxiana`;
+    expect(await suggestedLibraryFolder(env(), fsOf({ [`${HOME}/Documents`]: "not-empty", [base]: "not-empty" }))).toBe(`${base} 2`);
+    expect(await suggestedLibraryFolder(env(), fsOf({ [`${HOME}/Documents`]: "not-empty", [base]: "not-empty", [`${base} 2`]: "not-a-folder", [`${base} 3`]: "empty" }))).toBe(`${base} 3`);
+  });
+
+  it("an unreadable folder counts as taken", async () => {
+    const base = `${HOME}/Alexandrine Oxiana`;
+    expect(await suggestedLibraryFolder(env(), fsOf({ [base]: "unreadable" }))).toBe(`${base} 2`);
+  });
+
+  it("every name taken (the plain one and ' 2' … ' 9'): no suggestion", async () => {
+    const base = `${HOME}/Alexandrine Oxiana`;
+    const states: Record<string, FolderState> = { [base]: "not-empty" };
+    for (let n = 2; n <= 9; n++) states[`${base} ${n}`] = "not-empty";
+    const fs = fsOf(states);
+    expect(await suggestedLibraryFolder(env(), fs)).toBeUndefined();
+    expect(fs.looked).not.toContain(`${base} 10`);
+  });
+
+  it("no home folder known: no suggestion", async () => {
+    expect(await suggestedLibraryFolder(env({ homeDir: "" }), fsOf({}))).toBeUndefined();
+  });
+
+  describe("with the real file system (a temporary home folder)", () => {
+    let home: string;
+    beforeAll(async () => {
+      home = await mkdtemp(join(tmpdir(), "ao-place-"));
+    });
+    afterAll(async () => {
+      await rm(home, { recursive: true, force: true });
+    });
+
+    it("reads Documents and the candidates, and creates nothing", async () => {
+      const linux = env({ homeDir: home, platform: "linux", mounts: [] });
+      expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Alexandrine Oxiana"));
+      await mkdir(join(home, "Documents", "Alexandrine Oxiana"), { recursive: true });
+      // The Finder's housekeeping files alone leave a folder empty (as createLibrary counts it).
+      await writeFile(join(home, "Documents", "Alexandrine Oxiana", ".DS_Store"), "");
+      expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Documents", "Alexandrine Oxiana"));
+      await writeFile(join(home, "Documents", "Alexandrine Oxiana", "notes.txt"), "x");
+      expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Documents", "Alexandrine Oxiana 2"));
+      expect((await readdir(join(home, "Documents"))).sort()).toEqual(["Alexandrine Oxiana"]);
+    });
+  });
+});
+
+describe("freeRoomFor (R447 b)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const looks = (folders: string[], free: Record<string, number>) => {
+    const asked: string[] = [];
+    return {
+      asked,
+      isFolder: async (p: string) => folders.includes(p),
+      free: async (p: string) => {
+        asked.push(p);
+        return free[p] ?? Number.POSITIVE_INFINITY;
+      },
+    };
+  };
+
+  it("an existing folder: the room of its disk", async () => {
+    const l = looks(["/", "/Volumes/SSD"], { "/Volumes/SSD": 212e9 });
+    expect(await freeRoomFor("/Volumes/SSD", l)).toBe(212e9);
+  });
+
+  it("a folder that does not exist yet: the room of the nearest folder above it that does", async () => {
+    const l = looks(["/", "/Volumes", "/Volumes/SSD"], { "/Volumes/SSD": 9e9 });
+    expect(await freeRoomFor("/Volumes/SSD/Research/New library", l)).toBe(9e9);
+    expect(l.asked).toEqual(["/Volumes/SSD"]);
+  });
+
+  it("cannot tell (statfs's Infinity, an error, a negative figure): none", async () => {
+    expect(await freeRoomFor("/x", looks(["/x"], {}))).toBeUndefined();
+    expect(await freeRoomFor("/x", { isFolder: async () => true, free: async () => Promise.reject(new Error("EIO")) })).toBeUndefined();
+    expect(await freeRoomFor("/x", { isFolder: async () => true, free: async () => Number.NaN })).toBeUndefined();
+    expect(await freeRoomFor("/x", { isFolder: async () => true, free: async () => -1 })).toBeUndefined();
+  });
+
+  it("a relative path, an empty one or one with a NUL: none, and nothing is looked at", async () => {
+    const l = looks(["/"], { "/": 1e12 });
+    for (const p of ["relative/folder", "", "./x", "/a\0b"]) expect(await freeRoomFor(p, l)).toBeUndefined();
+    expect(l.asked).toEqual([]);
+  });
+
+  it("a look that never answers: none, within the bound", async () => {
+    vi.useFakeTimers();
+    const never = () => new Promise<never>(() => {});
+    const room = freeRoomFor("/Volumes/Share/lib", { isFolder: async () => true, free: never });
+    let settled: number | undefined | "pending" = "pending";
+    void room.then((v) => (settled = v));
+    await vi.advanceTimersByTimeAsync(FOLDER_ROOM_LOOK_MS - 1);
+    expect(settled).toBe("pending");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBeUndefined();
+    // A walk up a share that does not answer is bounded the same way.
+    const walk = freeRoomFor("/Volumes/Other share/lib", { isFolder: never, free: async () => 1e9 });
+    await vi.advanceTimersByTimeAsync(FOLDER_ROOM_LOOK_MS);
+    expect(await walk).toBeUndefined();
+  });
+
+  it("is two seconds", () => {
+    expect(FOLDER_ROOM_LOOK_MS).toBe(2000);
+  });
+
+  it("the real disk: a number for the temporary folder, and for a folder below it that does not exist", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ao-room-"));
+    try {
+      const room = await freeRoomFor(dir);
+      expect(typeof room).toBe("number");
+      expect(room).toBeGreaterThan(0);
+      expect(typeof (await freeRoomFor(join(dir, "not", "yet")))).toBe("number");
+      expect(await readdir(dir)).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -48,6 +48,8 @@ export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, readLock, re
 export type { LockInfo } from "./lock.js";
 export { classifyLocation, defaultLocationEnv, parseMacMount, parseProcMounts, parseWindowsDrives } from "./location.js";
 export type { Location, LocationEnv, MountInfo } from "./location.js";
+export { FOLDER_ROOM_LOOK_MS, LIBRARY_FOLDER_NAME, freeRoomFor, suggestedLibraryFolder } from "./library-place.js";
+export type { FolderState, PlaceLooks, RoomLooks } from "./library-place.js";
 export { OldCopiesUnreadableError } from "./old-copies.js";
 export { WatchedFoldersUnreadableError } from "./import/watch.js";
 export { ApprovedFoldersUnreadableError } from "./import/approved-folders.js";
