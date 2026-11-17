@@ -28,7 +28,7 @@ import {
 import { AuditStore } from "./audit-store.js";
 import { appendLibraryRefusal } from "./library-audit.js";
 import { appendChanges } from "./changelog-store.js";
-import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
+import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
@@ -216,8 +216,10 @@ async function readKeyFile(core: RepoCore, st: ProjectState): Promise<ProjectKey
 }
 
 /**
- * Unlocks with the passphrase or, failing that, the recovery code. While it runs it is the project's pending unlock:
- * a lock asked meanwhile is queued after it (R404 c), so "lock, unlock, lock" ends locked.
+ * Unlocks with the passphrase or, failing that, the recovery code. While it runs it is the project's pending unlock.
+ * R435 a: a lock asked meanwhile takes effect at once and OVERTAKES this unlock: the unlock then rejects with
+ * `ProjectLockedError` (its caller is told the project is locked and resumes nothing), its key is not added, its
+ * index reload is not run, and the project ends locked. An unlock asked after a lock waits for it and wins.
  */
 export function unlockProject(core: RepoCore, projectId: string, secret: string): Promise<void> {
   const run = unlockNow(core, projectId, secret);
@@ -235,6 +237,9 @@ export function unlockProject(core: RepoCore, projectId: string, secret: string)
 async function unlockNow(core: RepoCore, projectId: string, secret: string): Promise<void> {
   const st = core.state(projectId);
   if (!core.encrypted(st)) return;
+  // A lock asked from here on overtakes this unlock (R435 a).
+  const asked = core.lockAsks.get(projectId) ?? 0;
+  const overtaken = () => (core.lockAsks.get(projectId) ?? 0) !== asked;
   // Unlocking is audited; that append must wait until the interrupted write is resolved.
   if (st.recoveryPending && core.library.mode === "read-write") throw new RecoveryPendingError(projectId);
   const file = await readKeyFile(core, st);
@@ -250,27 +255,39 @@ async function unlockNow(core: RepoCore, projectId: string, secret: string): Pro
     }
     key = await unwrapWithRecovery(file.recovery, secret);
   }
+  let added = false;
+  // Checked in the same step as the add: a lock asked before it means the key never enters the ring (R435 a).
+  const add = () => {
+    if (overtaken()) return;
+    core.keyRing.add(file.keyId, key);
+    added = true;
+  };
   try {
     // A lock asked before this unlock is done first: then the key is added again (R386 b).
-    for (let p = core.pendingLocks.get(projectId); p; p = core.pendingLocks.get(projectId)) await p.catch(() => {});
+    if (!overtaken()) for (let p = core.pendingLocks.get(projectId); p; p = core.pendingLocks.get(projectId)) await p.catch(() => {});
     // An unlocked project's key is replaced only between turns of the write queue (R379); the same key again
     // changes nothing (KeyRing.add keeps the buffer a change may be sealing with).
-    if (core.keyRing.has(file.keyId) && !core.queueIdle()) await core.serialNext(async () => core.keyRing.add(file.keyId, key));
-    else core.keyRing.add(file.keyId, key);
+    if (core.keyRing.has(file.keyId) && !core.queueIdle()) await core.serialNext(async () => add());
+    else add();
   } finally {
     key.fill(0);
   }
+  if (!added) throw new ProjectLockedError(projectId);
+  // The unlock took effect (the key was in the ring), so it is audited even when a lock overtakes it now.
   if (core.library.mode === "read-write") {
     await core.serial(async () => {
       const at = core.clock().toISOString();
       await core.auditNow(st, { ...core.auditBase(st, at), action: "key.unlock", entity: { type: "project", id: projectId } });
     });
   }
+  // Overtaken by a lock: no reload (a reload a lock cuts short ends as a locked project's, R404), and locked.
+  if (overtaken()) throw new ProjectLockedError(projectId);
   try {
     await core.index.projectUnlocked?.(projectId);
   } catch (error) {
     core.indexErrors.push({ op: "project.unlock", error });
   }
+  if (overtaken()) throw new ProjectLockedError(projectId);
 }
 
 /** The staged key file of a new recovery code (R141), beside the active one until it is activated. */
@@ -507,10 +524,15 @@ export function lockProject(core: RepoCore, projectId: string): Promise<void> {
   } catch (err) {
     return Promise.reject(err);
   }
-  // A lock asked while an unlock is in progress is a NEW lock after that unlock, never the earlier lock's promise
-  // (R404 c): the last thing asked wins.
+  // R435 a: a lock takes effect at once, an unlock in flight included: that unlock is overtaken (it adds no key and
+  // ends as locked), and the returned promise settles once it has ended and the key is wiped.
+  core.lockAsks.set(projectId, (core.lockAsks.get(projectId) ?? 0) + 1);
   const unlocking = core.pendingUnlocks.get(projectId);
-  if (unlocking) return unlocking.then(() => lockProject(core, projectId));
+  const done = lockAtOnce(core, projectId, st);
+  return unlocking ? unlocking.then(() => done) : done;
+}
+
+function lockAtOnce(core: RepoCore, projectId: string, st: ProjectState): Promise<void> {
   const pending = core.pendingLocks.get(projectId);
   if (pending) return pending;
   const keyId = st.project.encryption.keyId;

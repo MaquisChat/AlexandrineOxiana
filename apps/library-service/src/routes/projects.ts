@@ -150,6 +150,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireSession();
     const id = projectParam(ctx, req);
     const secret = str(bodyOf(req), "secret", 1024);
+    // An unlock a lock overtakes rejects as locked (R435 a): 423, and nothing below is resumed.
     await limit.guard(id, () => s.repo.unlockProject(id, secret));
     // Work that waited for the key: viewing proxies, OCR and worker jobs of this project (R142), and its daily backup (R99 I7).
     state.resumeProject(s, id, { workerJobs: true });

@@ -170,6 +170,8 @@ export class RepoCore {
   readonly pendingLocks = new Map<string, Promise<void>>();
   /** Unlocks in progress, per project: a lock asked meanwhile is a new lock after them (R404 c). */
   readonly pendingUnlocks = new Map<string, Promise<void>>();
+  /** Locks asked so far, per project: an unlock that sees this change while it runs was overtaken by a lock (R435 a). */
+  readonly lockAsks = new Map<string, number>();
 
   constructor(
     readonly library: Library,

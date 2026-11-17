@@ -324,13 +324,18 @@ describe("(c) R404: lock, unlock, lock asked while a change is held ends locked"
       await inside;
       const settled: string[] = [];
       const lock1 = kit.repo.lockProject(p.id).then(() => settled.push("lock1"));
-      const unlock = kit.repo.unlockProject(p.id, PASS).then(() => settled.push("unlock"));
+      // R435 a: the unlock is overtaken by lock3 and answers locked (before R435 it resolved).
+      const unlock = kit.repo.unlockProject(p.id, PASS).then(
+        () => settled.push("unlock resolved"),
+        (e: unknown) => settled.push(e instanceof ProjectLockedError ? "unlock" : "unlock failed otherwise"),
+      );
       await ticks(wait);
       const lock3p = kit.repo.lockProject(p.id);
       const lock3 = lock3p.then(() => settled.push("lock3"));
       release();
       await done;
       await Promise.all([lock1, unlock, lock3]);
+      expect(settled).toContain("unlock");
       expect(settled.indexOf("lock3")).toBeGreaterThan(settled.indexOf("unlock"));
       expect(kit.repo.isUnlocked(p.id)).toBe(false);
       expect(kit.ring.has(keyId)).toBe(false);
@@ -381,5 +386,98 @@ describe("(c) the repeat unlock and an unknown project (R386 c)", () => {
     let p: Promise<void> | undefined;
     expect(() => (p = kit.repo.lockProject(newId()))).not.toThrow();
     await expect(p).rejects.toBeInstanceOf(NotFoundError);
+  });
+});
+
+describe("R435 (a): a lock always takes effect at once, an unlock in flight included", () => {
+  /** A change of `p` held on a gate (another project's, for the tests below). */
+  function holdChange(p: Project) {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => (entered = r));
+    const done = importChange(kit.repo, p.id, STORE, async () => {
+      entered();
+      await gate;
+    }, { op: "test.held" });
+    return { done, inside, release };
+  }
+
+  it("the probe: an unlock waiting for its audit turn behind another project's held change, then a lock: locked at once; the unlock answers locked", async () => {
+    const a = await makeProject(kit, GOV, true, "A");
+    const sf = await addSource(kit, a, { title: "Secret A" });
+    const b = await makeProject(kit, GOV, false, "B");
+    const keyId = kit.repo.getProject(a.id).encryption.keyId!;
+    await kit.repo.lockProject(a.id);
+    const h = holdChange(b);
+    await h.inside;
+    const unlock = kit.repo.unlockProject(a.id, PASS);
+    unlock.catch(() => {});
+    while (!kit.repo.isUnlocked(a.id)) await ticks(1); // the key is in; the audit entry waits behind B's change
+    let lockDone = false;
+    const lock = kit.repo.lockProject(a.id).then(() => (lockDone = true));
+    expect(kit.repo.isUnlocked(a.id)).toBe(false);
+    await expect(kit.repo.getSource(a.id, sf.source.id)).rejects.toBeInstanceOf(ProjectLockedError);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(lockDone).toBe(false); // B's change still holds the queue
+    expect(kit.repo.isUnlocked(a.id)).toBe(false);
+    h.release();
+    await h.done;
+    await expect(unlock).rejects.toBeInstanceOf(ProjectLockedError);
+    await lock;
+    expect(kit.repo.isUnlocked(a.id)).toBe(false);
+    expect(kit.ring.has(keyId)).toBe(false);
+    await expect(kit.repo.getSource(a.id, sf.source.id)).rejects.toBeInstanceOf(ProjectLockedError);
+    // An unlock asked after the lock wins.
+    await kit.repo.unlockProject(a.id, PASS);
+    expect((await kit.repo.getSource(a.id, sf.source.id)).source.id).toBe(sf.source.id);
+  });
+
+  it("a lock asked while the unlock is still unwrapping its key: the key never enters the ring; the unlock answers locked", async () => {
+    const a = await makeProject(kit, GOV, true, "A");
+    const keyId = kit.repo.getProject(a.id).encryption.keyId!;
+    await kit.repo.lockProject(a.id);
+    const unlock = kit.repo.unlockProject(a.id, PASS);
+    unlock.catch(() => {});
+    await kit.repo.lockProject(a.id);
+    await expect(unlock).rejects.toBeInstanceOf(ProjectLockedError);
+    expect(kit.repo.isUnlocked(a.id)).toBe(false);
+    expect(kit.ring.has(keyId)).toBe(false);
+  });
+
+  it("a lock asked at the first opening of the unlock's own index reload: locked at once; the reload ends as a locked project's", async () => {
+    const { IndexHandle } = await import("../index/db.js");
+    const { createIndexSink } = await import("../index/sink.js");
+    const { openingSeam } = await import("./testing.js");
+    const handle = new IndexHandle(kit.lib.root);
+    try {
+      await kit.reopen({ index: createIndexSink(handle, { root: kit.lib.root, keyRing: kit.ring }) });
+      const a = await makeProject(kit, GOV, true, "A");
+      const sf = await addSource(kit, a, { title: "Secret A" });
+      const keyId = kit.repo.getProject(a.id).encryption.keyId!;
+      await kit.repo.lockProject(a.id);
+      let atLock: boolean | undefined;
+      let lock: Promise<void> | undefined;
+      openingSeam.onOpen = () => {
+        if (lock) return;
+        lock = kit.repo.lockProject(a.id);
+        lock.catch(() => {});
+        atLock = kit.repo.isUnlocked(a.id);
+      };
+      try {
+        await expect(kit.repo.unlockProject(a.id, PASS)).rejects.toBeInstanceOf(ProjectLockedError);
+      } finally {
+        openingSeam.onOpen = undefined;
+      }
+      expect(lock).toBeDefined();
+      expect(atLock).toBe(false);
+      await lock;
+      expect(kit.repo.isUnlocked(a.id)).toBe(false);
+      expect(kit.ring.has(keyId)).toBe(false);
+      expect(handle.db.prepare("SELECT id FROM temp.t_sources WHERE project_id = ?").all(a.id)).toEqual([]);
+      await expect(kit.repo.getSource(a.id, sf.source.id)).rejects.toBeInstanceOf(ProjectLockedError);
+    } finally {
+      handle.close();
+    }
   });
 });

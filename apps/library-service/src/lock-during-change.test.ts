@@ -7,7 +7,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deviceDeps, type Deps } from "@ao/library";
 import { openLine } from "../../../packages/library/src/repo/io.js";
 import { importChange, projectDataKey } from "../../../packages/library/src/repo/repo.js";
@@ -96,5 +96,49 @@ describe("POST /projects/:id/lock while a change is being saved (R379)", () => {
       return openLine(key, pid, l);
     });
     expect(opened.join("\n")).toContain("Participant Jane Doe, Leeds");
+  });
+});
+
+describe("R435 a: POST /projects/:id/unlock overtaken by a lock", () => {
+  it("answers that the project is locked and resumes nothing; the lock's clean-up is not undone", async () => {
+    const path = join(tmp, "Lib");
+    expect((await call({ method: "POST", url: "/libraries", body: { path, name: "Lib" } })).status).toBe(200);
+    const a = await call({ method: "POST", url: "/projects", body: { name: "A", governanceYaml: GOV, encryption: { enabled: true, passphrase: PASS } } });
+    expect(a.status, a.body).toBe(200);
+    const b = await call({ method: "POST", url: "/projects", body: { name: "B", governanceYaml: GOV, encryption: { enabled: true, passphrase: PASS } } });
+    expect(b.status, b.body).toBe(200);
+    const pid = a.json.project.id as string;
+    const other = b.json.project.id as string;
+    const repo = svc.state.session!.repo;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    // Another project's change is held: the unlock's audit entry waits behind it.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => (entered = r));
+    const change = importChange(repo, other, STORE, async () => {
+      entered();
+      await gate;
+    }, { op: "test.held" });
+    await inside;
+    const state = svc.state;
+    const resumed = [vi.spyOn(state, "resumeProject"), vi.spyOn(state, "resumeFind"), vi.spyOn(state, "runScheduledBackups")];
+    const startWork = vi.spyOn(state, "startWork");
+    const unlock = call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } });
+    while (!repo.isUnlocked(pid)) await new Promise((r) => setTimeout(r, 5));
+    const lock = await call({ method: "POST", url: `/projects/${pid}/lock` });
+    expect(lock.status).toBe(200);
+    expect(repo.isUnlocked(pid)).toBe(false);
+    expect((await call({ url: `/projects/${pid}/review` })).status).toBe(423);
+    const startsBefore = startWork.mock.calls.length;
+    release();
+    await change;
+    const u = await unlock;
+    expect(u.status, u.body).toBe(423);
+    expect(u.json.error.code).toBe("PROJECT_LOCKED");
+    for (const s of resumed) expect(s).not.toHaveBeenCalled();
+    expect(startWork.mock.calls.slice(startsBefore).map((c) => c[0])).not.toContain("backup");
+    expect(repo.isUnlocked(pid)).toBe(false);
+    expect((await call({ url: `/projects/${pid}/review` })).status).toBe(423);
   });
 });
