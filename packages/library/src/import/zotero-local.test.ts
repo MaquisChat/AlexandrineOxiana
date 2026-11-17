@@ -709,6 +709,38 @@ processing:
     expect(byZoteroKey(await sources(p), "AAAA1111").assets[0]!.linked).toBeUndefined();
   });
 
+  it("R394: three items whose PDFs carry junk embedded titles are created, not sent to review for their titles", async () => {
+    // The stored PDF, the linked PDF, and a third stored PDF given to item 3 (the report): each with a title that is no title.
+    await writeFile(fx.storagePdf, await buildPdf({ title: "S0003598X20000800jra 900..915", extra: "junk one" }));
+    await writeFile(fx.linkedPdf, await buildPdf({ title: "JQE-2020-0041.R1", author: "Administrator", extra: "junk two" }));
+    const third = join(dataDir, "storage", "ATTPDF02", "vendors.pdf");
+    await mkdir(join(dataDir, "storage", "ATTPDF02"), { recursive: true });
+    await writeFile(third, await buildPdf({ title: "Microsoft PowerPoint - lecture 4", extra: "junk three" }));
+    zoteroEdit((db) => {
+      const attType = (db.prepare("SELECT itemTypeID AS t FROM itemTypes WHERE typeName = 'attachment'").get() as { t: number }).t;
+      db.prepare("INSERT INTO items (itemID, itemTypeID, dateAdded, dateModified, clientDateModified, libraryID, key, version) VALUES (19, ?, '2024-05-01 10:00:00', '2024-05-02 11:00:00', '2024-05-02 11:00:00', 1, 'ATTPDF02', 1)").run(attType);
+      db.prepare("INSERT INTO itemAttachments (itemID, parentItemID, linkMode, contentType, path) VALUES (19, 3, 0, 'application/pdf', 'storage:vendors.pdf')").run();
+    });
+    const p = await project();
+    const r = await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(r.counts.failed).toBe(0);
+    const sfs = await sources(p);
+    for (const [key, title] of [
+      ["AAAA1111", "Feeding the City: Informal Markets in Lagos"],
+      ["BBBB2222", "Markets and Memory"],
+      ["CCCC3333", "Water Access in Peri-Urban Areas"],
+    ] as const) {
+      const sf = byZoteroKey(sfs, key);
+      expect(sf.assets).toHaveLength(1);
+      expect(titleOf(sf)).toBe(title);
+      expect(sf.verification["/title"]?.status).not.toBe("conflict");
+      expect(sf.fieldEvidence.filter((e) => e.field === "/title").map((e) => e.source.kind)).toEqual(["zotero"]);
+    }
+    // Created, not waiting for review (the journal's outcome per item).
+    const outcomes = Object.fromEntries((await readJournal(repo, p.id, "imports/batch-0001")).map((e) => [e.key, e.outcome]));
+    expect([outcomes["zotero:AAAA1111"], outcomes["zotero:BBBB2222"], outcomes["zotero:CCCC3333"]]).toEqual(["created", "created", "created"]);
+  });
+
   it("R136: the dry run counts the linked attachments the scan found (approved or not)", async () => {
     const p = await project();
     const dry = await bulkImport().dryRun(p.id, zoteroLocalAdapter(dataDir));
