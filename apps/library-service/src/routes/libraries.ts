@@ -14,8 +14,10 @@ import {
   deleteOldCopy,
   executeMove,
   findLibrary,
+  freeRoomFor,
   listLibraries,
   settleDamagedRegistry,
+  suggestedLibraryFolder,
   planMove,
   reconnect,
   relinkMissing,
@@ -23,10 +25,11 @@ import {
   type IntegritySample,
   type Library,
 } from "@ao/library";
+import type { LibraryFolderRoomRequest, LibraryFolderRoomResponse, LibrarySuggestedFolderResponse } from "@ao/shared";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { ndjsonWriter, sseWriter } from "../streams.js";
-import { bodyOf, optStr, queryOf, str, strArray, type Ctx } from "./util.js";
+import { bodyAs, bodyOf, optStr, queryOf, str, strArray, type Ctx } from "./util.js";
 import { isLocalAbsolutePath } from "./local-path.js";
 
 function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
@@ -106,6 +109,20 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const lib = await createLibrary(path, name, state.deps);
     await state.adopt(lib, { newLibrary: true });
     return libraryView(ctx);
+  });
+
+  // R447: for "Choose a library", shown before any library is open. The folder to offer for a new library (nothing is
+  // created; only whether Documents and the few candidate folders exist and are empty is read), and the free room on
+  // the disk under a folder the researcher has typed or picked (the path in the body; only the room is read).
+  app.get("/libraries/suggested-folder", async (): Promise<LibrarySuggestedFolderResponse> => {
+    const folder = await suggestedLibraryFolder(await defaultLocationEnv()).catch(() => undefined);
+    return folder ? { folder } : {};
+  });
+
+  app.post("/libraries/folder-room", async (req): Promise<LibraryFolderRoomResponse> => {
+    const path = absPath(bodyAs<LibraryFolderRoomRequest>(req), "path");
+    const freeBytes = await freeRoomFor(path);
+    return freeBytes === undefined ? {} : { freeBytes };
   });
 
   app.post("/libraries/open", async (req) => {
