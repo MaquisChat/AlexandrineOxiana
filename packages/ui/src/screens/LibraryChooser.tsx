@@ -22,8 +22,8 @@ export interface LibraryChooserProps {
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
 const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
-/** R447 b: the room is asked for this long after the box last changed. */
-const ROOM_PAUSE_MS = 300;
+/** R449 e: the room is asked for this long after the box last changed. */
+const ROOM_PAUSE_MS = 600;
 /** R447 b: under this many free bytes the line adds that it is little room. */
 const LITTLE_ROOM = 10e9;
 /** `n` rounded DOWN to one decimal, without a trailing ".0". */
@@ -68,7 +68,8 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
   // R447: a folder the service offers for a new library (never put in the box by itself), and the free room on the
   // disk under the folder in the box, for the path it was asked for.
   const [suggested, setSuggested] = useState<string | undefined>();
-  const [room, setRoom] = useState<{ path: string; bytes: number } | undefined>();
+  // The room's line, as words (R449 e): kept while a newer answer is awaited, so it changes only when they change.
+  const [roomWords, setRoomWords] = useState("");
   const roomAsk = useRef(0);
 
   useEffect(() => {
@@ -87,16 +88,22 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
   useEffect(() => {
     const p = path.trim();
     const ask = ++roomAsk.current;
-    setRoom(undefined);
-    if (!isAbsolute(p)) return;
+    // Emptied at once only when the box no longer holds a full path; otherwise the last words stay until the answer.
+    if (!isAbsolute(p)) {
+      setRoomWords("");
+      return;
+    }
     const timer = setTimeout(() => {
       api.libraries
         .folderRoom(p)
         .then((r) => {
           // An answer for a path the box no longer holds is dropped; no number, nothing said (never a guess).
-          if (roomAsk.current === ask && typeof r.freeBytes === "number" && Number.isFinite(r.freeBytes) && r.freeBytes >= 0) setRoom({ path: p, bytes: r.freeBytes });
+          if (roomAsk.current !== ask) return;
+          setRoomWords(typeof r.freeBytes === "number" && Number.isFinite(r.freeBytes) && r.freeBytes >= 0 ? roomSentence(r.freeBytes) : "");
         })
-        .catch(() => {});
+        .catch(() => {
+          if (roomAsk.current === ask) setRoomWords("");
+        });
     }, ROOM_PAUSE_MS);
     return () => {
       clearTimeout(timer);
@@ -227,7 +234,7 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
             </button>
           </p>
         )}
-        <p role="status">{room && room.path === path.trim() ? roomSentence(room.bytes) : ""}</p>
+        <p role="status" className="ao-library-room">{roomWords}</p>
       </div>
       <form className="ao-inline-form" onSubmit={(e) => void openTyped(e, true)}>
         <label htmlFor={`${id}-name`}>New library name</label>

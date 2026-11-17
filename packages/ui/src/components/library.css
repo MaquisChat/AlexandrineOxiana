@@ -56,8 +56,9 @@
   margin: 0 0 var(--space-1);
 }
 
-.ao-library-place p:empty {
-  margin: 0;
+/* R449 e: the room's line keeps one line's height, empty or not, so the form below never moves. */
+.ao-library-room {
+  min-height: calc(var(--line-spacing) * 1em);
 }
 
 .ao-pane-title {

@@ -264,4 +264,112 @@ describe("LibraryChooser", () => {
     ];
     for (const [bytes, rest] of rows) expect([bytes, roomSentence(bytes)]).toEqual([bytes, `Free space on that disk: ${rest}`]);
   });
+
+  // ---- R449 e (M5): the line keeps its words until a newer answer; asked 600 ms after the last change ----
+
+  const statusLine = () => document.querySelector(".ao-library-room") as HTMLElement;
+
+  it("R449 e: the line is always in the page, with its line reserved, even before any path", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })));
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByText(/No libraries yet/);
+    expect(statusLine()).toBeTruthy();
+    expect(statusLine().getAttribute("role")).toBe("status");
+    expect(statusLine().textContent).toBe("");
+  });
+
+  it("R449 e: a second path keeps the first figure until its own answer comes; then it is replaced", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let secondAsked = false;
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.post(url("/libraries/folder-room"), async ({ request }) => {
+        const { path } = (await request.json()) as { path: string };
+        if (path === "/Volumes/A") return HttpResponse.json({ freeBytes: 11e9 });
+        secondAsked = true;
+        await held;
+        return HttpResponse.json({ freeBytes: 300e9 });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByText(/No libraries yet/);
+    await user.type(folderBox(), "/Volumes/A");
+    await waitFor(() => expect(statusLine().textContent).toBe("Free space on that disk: 11 GB."));
+    await user.type(folderBox(), "B");
+    expect(statusLine().textContent).toBe("Free space on that disk: 11 GB.");
+    await waitFor(() => expect(secondAsked).toBe(true));
+    expect(statusLine().textContent).toBe("Free space on that disk: 11 GB.");
+    release();
+    await waitFor(() => expect(statusLine().textContent).toBe("Free space on that disk: 300 GB."));
+  });
+
+  it("R449 e: a newer answer with no number empties the line; a box that no longer holds a full path empties it at once", async () => {
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.post(url("/libraries/folder-room"), async ({ request }) => {
+        const { path } = (await request.json()) as { path: string };
+        return HttpResponse.json(path === "/x" ? { freeBytes: 11e9 } : {});
+      }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByText(/No libraries yet/);
+    await user.type(folderBox(), "/x");
+    await waitFor(() => expect(statusLine().textContent).toBe("Free space on that disk: 11 GB."));
+    await user.type(folderBox(), "y");
+    await waitFor(() => expect(statusLine().textContent).toBe(""));
+    await user.clear(folderBox());
+    await user.type(folderBox(), "/x");
+    await waitFor(() => expect(statusLine().textContent).toBe("Free space on that disk: 11 GB."));
+    await user.type(folderBox(), "{Home}r");
+    expect(folderBox().value).toBe("r/x");
+    expect(statusLine().textContent).toBe("");
+  });
+
+  it("R449 e: the same words again do not touch the line (a screen reader is not told twice)", async () => {
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.post(url("/libraries/folder-room"), () => HttpResponse.json({ freeBytes: 11e9 })),
+    );
+    let asks = 0;
+    server.events.on("request:start", ({ request }) => {
+      if (request.url.endsWith("/libraries/folder-room")) asks++;
+    });
+    const user = userEvent.setup();
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByText(/No libraries yet/);
+    await user.type(folderBox(), "/x");
+    await waitFor(() => expect(statusLine().textContent).toBe("Free space on that disk: 11 GB."));
+    const changes: MutationRecord[] = [];
+    const observer = new MutationObserver((m) => changes.push(...m));
+    observer.observe(statusLine(), { childList: true, characterData: true, subtree: true });
+    const before = asks;
+    await user.type(folderBox(), "y");
+    await waitFor(() => expect(asks).toBe(before + 1));
+    await new Promise((r) => setTimeout(r, 100));
+    observer.disconnect();
+    server.events.removeAllListeners();
+    expect(statusLine().textContent).toBe("Free space on that disk: 11 GB.");
+    expect(changes).toEqual([]);
+  });
+
+  it("R449 e (U3): a path typed at 350 ms a key is asked about far fewer than twelve times (at most two)", async () => {
+    const asked: string[] = [];
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
+      http.post(url("/libraries/folder-room"), async ({ request }) => {
+        asked.push(((await request.json()) as { path: string }).path);
+        return HttpResponse.json({ freeBytes: 50e9 });
+      }),
+    );
+    const user = userEvent.setup({ delay: 350 });
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    await screen.findByText(/No libraries yet/);
+    await user.type(folderBox(), "/Volumes/abc");
+    await waitFor(() => expect(statusLine().textContent).toBe("Free space on that disk: 50 GB."));
+    expect(asked.length).toBeLessThanOrEqual(2);
+    expect(asked[asked.length - 1]).toBe("/Volumes/abc");
+  }, 20_000);
 });
