@@ -1730,7 +1730,7 @@ processing:
       oldCopies: [{ movedOn: "2026-12-02", place: oldRoot, canDelete: false }],
     });
     // Its offer is open and the service holds its token: on the Move library screen.
-    svc.state.recordMove({ oldRoot, newRoot: libRoot, confirmToken: "a-token" });
+    svc.state.recordMove({ oldRoot, newRoot: libRoot, confirmToken: "a-token", warnings: [] });
     expect(await entry()).toMatchObject({
       message: "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them on the Move library screen to complete the destruction.",
       oldCopies: [{ movedOn: "2026-12-02", place: oldRoot, canDelete: true }],
