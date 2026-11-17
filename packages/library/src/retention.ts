@@ -410,15 +410,12 @@ async function destroyRawLocked(repo: Repo, hold: MaintenanceHold, projectId: st
       })),
       trashedCopies: strays.map((p) => toRel(root, p)),
       backups: { status: initialStatus, containing, deleted: [] } satisfies CertificateBackups,
-      ...(copiesSaid
-        ? {
-            oldCopies: {
-              status: copies.unchecked ? "unknown-pending" : "pending",
-              notDestroyed: copies.notDestroyed.map((c) => ({ movedAt: c.movedAt, moveId: c.moveId })),
-              note: oldCopiesSentence(copies.notDestroyed, copies.unchecked, tz),
-            },
-          }
-        : {}),
+      // Always said (R409 b): "none known to this computer" when this computer's list names none that holds them.
+      oldCopies: {
+        status: copies.unchecked ? "unknown-pending" : copiesSaid ? "pending" : "none",
+        notDestroyed: copies.notDestroyed.map((c) => ({ movedAt: c.movedAt, moveId: c.moveId })),
+        note: oldCopiesSentence(copies.notDestroyed, copies.unchecked, tz),
+      },
       notice: DESTRUCTION_NOTICE,
     }),
   });
@@ -1216,7 +1213,10 @@ async function holdingOldCopies(repo: Repo, projectId: string, paths: readonly s
   const lib = repoLibrary(repo);
   let records: PendingOldCopy[];
   try {
-    records = (await oldCopiesOfLibrary({ appConfigDir: lib.appConfigDir, clock: repoClock(repo) }, lib.id)).records;
+    const list = await oldCopiesOfLibrary({ appConfigDir: lib.appConfigDir, clock: repoClock(repo) }, lib.id);
+    // A damaged list (or a record without a usable place) is not "none" either (R409 b).
+    if (list.damaged) return { notDestroyed: [], unchecked: true };
+    records = list.records;
   } catch {
     return { notDestroyed: [], unchecked: true };
   }
@@ -1228,12 +1228,16 @@ async function holdingOldCopies(repo: Repo, projectId: string, paths: readonly s
 /** The date of a move, in the project's zone: how a researcher knows which old copy is meant. */
 const moveDate = (movedAt: string, tz: string | undefined) => formatModified(new Date(movedAt), tz).slice(0, 10);
 
+/** The certificate's line when this computer's list names no old copy that holds the destroyed data (R409 b). */
+export const OLD_COPIES_NONE = "Old copies of the library left by a move: none known to this computer.";
+
 /** The certificate's plain words about its old copies (R379). */
 function oldCopiesSentence(copies: readonly OldCopyRef[], unchecked: boolean, tz: string | undefined): string {
   if (unchecked) {
     return "This computer's list of old copies of this library left by a move could not be read, so whether such a copy still holds the destroyed data could not be checked. Any that does was not destroyed.";
   }
   const n = copies.length;
+  if (n === 0) return OLD_COPIES_NONE;
   const dates = [...new Set(copies.map((c) => moveDate(c.movedAt, tz)))].join(", ");
   return `${n === 1 ? "An old copy" : `${n} old copies`} of this library, left by the move of ${dates}, still ${n === 1 ? "holds" : "hold"} the destroyed data and ${n === 1 ? "was" : "were"} not destroyed. Delete ${n === 1 ? "it" : "them"} from the Move library screen (or by hand) to complete the destruction.`;
 }

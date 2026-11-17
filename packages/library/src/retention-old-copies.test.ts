@@ -185,7 +185,7 @@ describe("FR-A16: old copies of the library left by a move, at a destruction", (
     await rm(join(kit.lib.root, ...repo.getProject(p.id).folder.split("/")), { recursive: true, force: true });
     kit.clock.now = DUE;
     const r = await destroyRaw(repo, p.id, [asset.id], "tester");
-    expect(r.original).not.toHaveProperty("oldCopies");
+    expect(r.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: "Old copies of the library left by a move: none known to this computer." }); // the line every certificate has (R409 b)
     expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
   });
 
@@ -200,7 +200,7 @@ describe("FR-A16: old copies of the library left by a move, at a destruction", (
     await markPendingComplete(deps(), rec.id);
     kit.clock.now = DUE;
     const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
-    expect(r.original).not.toHaveProperty("oldCopies");
+    expect(r.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: "Old copies of the library left by a move: none known to this computer." }); // the line every certificate has (R409 b)
     expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
   });
 
@@ -259,7 +259,8 @@ describe("FR-A16: old copies of the library left by a move, at a destruction", (
     const sf = await rawSource(p);
     kit.clock.now = DUE;
     const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
-    expect(Object.keys(r.original)).toEqual(["formatVersion", "kind", "projectId", "at", "actor", "rule", "method", "includeDerived", "assets", "trashedCopies", "backups", "notice"]);
+    expect(Object.keys(r.original)).toEqual(["formatVersion", "kind", "projectId", "at", "actor", "rule", "method", "includeDerived", "assets", "trashedCopies", "backups", "oldCopies", "notice"]); // plus the one line of R409 b
+    expect(r.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: "Old copies of the library left by a move: none known to this computer." });
     const ev = (await events(kit.repo, kit.lib.root, p)).find((e) => e.details?.op === "retention.destroy")!;
     expect(Object.keys(ev.details!).filter((k) => k.startsWith("oldCopies"))).toEqual([]);
     expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
@@ -339,5 +340,42 @@ describe("R409 (a): a copy leaves the warning only when its place was looked at 
     const rec = await readDestruction(repo, p.id, r.certificatePath);
     expect(rec.certificate!.oldCopies).toMatchObject({ status: "no-longer-present" });
     expect((JSON.parse(await readFile(listFile(), "utf8")) as { records: unknown[] }).records).toEqual([]);
+  });
+});
+
+describe("R409 (b): the certificate always says where it stands on old copies", () => {
+  const NONE = "Old copies of the library left by a move: none known to this computer.";
+  const listFile = () => join(kit.lib.appConfigDir, "pending-old-copies.json");
+
+  it("P2: a damaged list at the destruction: 'could not be checked' in the certificate, and the warning is raised", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    await writeFile(listFile(), "{ damaged");
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toEqual({ status: "unknown-pending", notDestroyed: [], note: expect.stringContaining("could not be checked") });
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    expect(await oldCopiesAwaitingDeletion(repo, p.id)).toEqual([{ certificateFile: expect.any(String), oldCopies: [], unchecked: true }]);
+  });
+
+  it("a record without a usable place at the destruction: 'could not be checked', and the warning is raised", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    const list = JSON.parse(await readFile(listFile(), "utf8")) as { records: Array<Record<string, unknown>> };
+    list.records[0]!.oldRoot = 42;
+    await writeFile(listFile(), JSON.stringify(list));
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "unknown-pending", note: expect.stringContaining("could not be checked") });
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+  });
+
+  it("a readable list with no record of this library: the line says none is known to this computer (text and record); no warning", async () => {
+    const p = await makeProject(kit, GOV, false, "Interviews");
+    const sf = await rawSource(p);
+    kit.clock.now = DUE;
+    const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    expect(r.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: NONE });
+    expect(await readFile(r.certificatePath, "utf8")).toContain(NONE);
+    expect((await readDestruction(kit.repo, p.id, r.certificatePath)).certificate!.oldCopies).toMatchObject({ status: "none", note: NONE });
+    expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
   });
 });
