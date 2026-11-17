@@ -458,3 +458,17 @@ describe("the snapshot's address cleaner drops every path parameter (R415 a, rev
     expect(cleanUrl("https://host/plain/path")).toBe("https://host/plain/path");
   });
 });
+
+describe("the snapshot's address cleaner reads an address as a browser does before it looks for user information (R415 c, review 2 M2)", () => {
+  it("the review's two strings: a tab inside the scheme, backslashes for slashes", () => {
+    expect(cleanUrl("h\tttps://ana:hunter2@host/p")).toBe("https://host/p");
+    expect(cleanUrl("https:\\\\ana:hunter2@host\\p")).toBe("https://host\\p");
+    expect(cleanUrl("ht\r\ntps://ana:hunter2@ho\nst/p")).toBe("https://host/p");
+    expect(cleanUrl("\\\\ana:hunter2@host/p")).toBe("//host/p");
+    expect(cleanUrl("https:\\\\host\\p@q")).toBe("https://host\\p@q");
+  });
+  it("in a saved page", async () => {
+    const out = await stripHtmlSnapshot(`<html><body><a href="h\tttps://ana:TABPW@x.org/">a</a><a href="https:\\\\ana:BSPW@x.org/">b</a></body></html>`);
+    expect(out).not.toMatch(/ana|TABPW|BSPW/);
+  });
+});

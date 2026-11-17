@@ -111,18 +111,23 @@ export function secretName(k, value) {
 export function cleanUrl(value) {
   const compact = String(value).replace(/[\u0000- \u007f-\u009f]/g, "").toLowerCase();
   if (/^(javascript|vbscript|data|livescript|mocha|jar):/.test(compact)) return null;
-  const v = String(value);
+  // Read as a browser reads it (R415 c): tabs and line ends inside an address are dropped, and in an
+  // http or https address (or one with no scheme, read against the page's) a backslash before the
+  // host is a slash — `h<TAB>ttps://ana:pw@host/` and `https:\\ana:pw@host\p` carry user information too.
+  const v = String(value).replace(/[\t\n\r]/g, "");
   const q = v.search(/[?#]/);
   const head = q >= 0 ? v.slice(0, q) : v;
-  // The authority runs from `//` to the next `/`; everything up to its last `@` is user information.
-  const noUser = head.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)([^/]*@)/i, "$1");
+  const slashed = head.replace(/^(\s*(?:https?:)?)[\\/]{2}[^\\/]*/i, (m) => m.replace(/\\/g, "/"));
+  // The authority runs from `//` to the next `/` (or `\`, which a browser reads as one); everything up
+  // to its last `@` is user information.
+  const noUser = slashed.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)([^/\\]*@)/i, "$1");
   // Path parameters (R415 a): in every segment of the path, everything from its first `;` goes, whatever
   // its name — a site that rewrites its addresses writes the session id there in every link. The
   // authority is left as it is, and so is an address of a scheme with no `//` (`mailto:` …).
-  const auth = /^\s*(?:[a-z][a-z0-9+.-]*:)?\/\/[^/]*/i.exec(noUser);
+  const auth = /^\s*(?:[a-z][a-z0-9+.-]*:)?\/\/[^/\\]*/i.exec(noUser);
   if (!auth && /^\s*[a-z][a-z0-9+.-]*:/i.test(noUser)) return noUser;
   const start = auth ? auth[0].length : 0;
-  return noUser.slice(0, start) + noUser.slice(start).replace(/;[^/]*/g, "");
+  return noUser.slice(0, start) + noUser.slice(start).replace(/;[^/\\]*/g, "");
 }
 
 function cleanSrcset(value) {
