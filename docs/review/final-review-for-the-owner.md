@@ -178,6 +178,8 @@ These are small flaws a researcher could meet but that lose nothing important: w
 - [ ] Look at the release page where you download the app, and note anything missing or confusing. (FR-272, FR-334)
 - [ ] With the app running, launch it a second time. Note whether the first window simply comes forward. (FR-302)
 - [ ] Note every macOS prompt that asks for access to a folder, and when it appears. (FR-344)
+- [ ] On "Choose a library", look at the line "Free space on that disk" for a folder on your main disk and compare it with what Finder says is available. The app's figure may be lower: Finder counts space macOS can free on demand, the app does not. Note both figures. (FR-706)
+- [ ] On the same screen, press "Use this folder" and note the folder it suggests (it should be in your home folder, not in Documents), and whether any macOS prompt appears before you press anything. (FR-706)
 - [ ] If you can find it, note where on your Mac the app keeps its saved page data; if you cannot tell, say so. (FR-345)
 - [ ] Answer the first-use banner, quit the app and open it again. Note whether the banner comes back. (FR-346)
 - [ ] Move the library to a place whose parent folder does not exist yet. Note whether the app creates it or refuses. (FR-347)
@@ -312,6 +314,8 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 - **The import that stopped with 213 failures.** I reproduced it here: the most likely cause is that **the disk holding the library filled up**. The app first copies the Zotero database into the library and then the files; when no room is left every item fails ("could not be imported") and the import stops. You have since confirmed that this is what happened. Fixed in the code: before an import starts the app checks that the files will fit and says so plainly if they will not; a disk that fills on the way stops the import at once, with a plain sentence, and it can be resumed once there is room; and the report groups failures by their cause instead of 213 identical lines. **Please do not undo that import yet.** Once the fix is in your app, the clean path is to undo it and import again.
 - **"Two sources disagree about the title": the real title against "S0003598X20000800jra 900..915".** That second "title" is a production code a publisher left inside the PDF. Fixed: a title that is plainly a file code, not words, is ignored, so it raises no conflict for you to settle.
 
+**One addition you asked for, built and merged: a suggested folder and the free space on "Choose a library".** Under the "Library folder" box the app now offers a folder in your home folder (`Alexandrine Oxiana`, next to where Zotero keeps its own) with a "Use this folder" button; the box stays empty until you pick, type or press it. Once a folder is in the box the app says how much free space its disk has, rounded down, and adds a note when it is under 10 GB, because an import copies its files into the library. It suggests the home folder, not Documents, for three reasons: iCloud can keep Documents in step without the app being able to tell; a Mac asks your permission the moment a program looks into Documents; and it is the convention Zotero already follows. If the disk does not answer (a network drive that has dropped out) the app shows no figure instead of a guess. <sub>(FR-706; Rulings R447–R450)</sub>
+
 **One more decision**
 
 26. **A log file for the Mac app**
@@ -330,6 +334,6 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 - **So:** the app says how many names it replaced, but it cannot promise that none is left. Read a bibliography or an export once before it leaves your hands.
    <sub>(FR-664, FR-677, FR-698, FR-699, FR-702; Rulings R403, R416, R420, R427, R437, R438, R440)</sub>
 
-<!-- coverage, part 7: FR-664, FR-677, FR-686, FR-698, FR-699, FR-702; defect D31; tasks FR-A21, FR-D31, FR-A22 -->
+<!-- coverage, part 7: FR-664, FR-677, FR-686, FR-698, FR-699, FR-702, FR-706; defect D31; tasks FR-A21, FR-D31, FR-A22 -->
 
 <!-- coverage: FR-591, FR-138, FR-238, FR-197, FR-198, FR-199, FR-369, FR-403, FR-171, FR-356, FR-372, FR-388, FR-575, FR-595, FR-436, FR-506, FR-520, FR-511, FR-522, FR-532, FR-536, FR-551, FR-458, FR-568, FR-607, FR-609, FR-610, FR-446, FR-447, FR-299, FR-326, FR-288, FR-324, FR-289, FR-320, FR-543, FR-236, FR-343, FR-272, FR-334, FR-344, FR-345, FR-346, FR-347, FR-302, FR-310, FR-323, FR-237, FR-353, FR-354, FR-437, FR-455, FR-471, FR-438, FR-439, FR-441, FR-448, FR-479, FR-481, FR-487, FR-444, FR-450, FR-470, FR-480, FR-501, FR-516, FR-608, FR-478, FR-502, FR-505, FR-482, FR-483, FR-492, FR-533, FR-538, FR-541, FR-559, FR-589, FR-590, FR-535, FR-569, FR-585, FR-597 (plus FR-053 from the problems list, in decision 2). FR-543 is a test-set-up choice of the coordinator's and is not on the page. -->
