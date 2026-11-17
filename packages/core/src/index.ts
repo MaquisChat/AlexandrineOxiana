@@ -79,7 +79,7 @@ export * from "./import/index.js";
 export * from "./citation/index.js";
 
 // The address classifier and the browser-session acknowledgement: one definition for the library and the interface (R146).
-export { MAX_ADDRESS_LENGTH, classifyUrl, isCollectionLink, isPostLink, isWebAddress } from "./capture/platforms.js";
+export { MAX_ADDRESS_LENGTH, classifyUrl, cleanAddress, isCollectionLink, isPostLink, isWebAddress } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
 export { COOKIES_ACKNOWLEDGEMENT } from "./capture/acknowledgement.js";
 export { KEY_PREFIXES, ORDINARY_WORDS, SECRET_WORDS, SIGNED_LINK_NAMES, TOKEN_PREFIXES, nameClass, nameWords, secretName } from "./capture/secret-names.js";

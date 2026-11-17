@@ -201,16 +201,35 @@ function tiktok(u: URL, host: string): ClassifiedUrl {
 }
 
 /**
+ * An address safe to store, for the catch-alls (R391 f): the cleaned form of an http(s) address
+ * (`stripTracking`) when it can be made; else the address with everything from the first `?`, `#`
+ * or `;` removed and any `user:pass@` removed. Never the address as given; never throws.
+ */
+export function cleanAddress(url: string): string {
+  const raw = typeof url === "string" ? url.trim() : "";
+  try {
+    const u = new URL(raw);
+    if (u.protocol === "https:" || u.protocol === "http:") return stripTracking(u);
+  } catch {
+    // fall through to the cut-short form
+  }
+  // The user information first (a password may hold a `;`), then the cut.
+  const bare = raw.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, "$1");
+  const cut = bare.search(/[?#;]/);
+  return cut >= 0 ? bare.slice(0, cut) : bare;
+}
+
+/**
  * The platform and kind of `url`. Never throws, for any input (R379): an input that cannot be read
- * as an address, or anything unexpected while reading it, is the generic "other / unknown" with the
- * input as given.
+ * as an address is the generic "other / unknown" with the input as given (no caller stores one that
+ * is not http or https); anything unexpected while reading one gives `cleanAddress` (R391 f).
  */
 export function classifyUrl(url: string): ClassifiedUrl {
   const raw = typeof url === "string" ? url.trim() : "";
   try {
     return classify(raw);
   } catch {
-    return { platform: "other", kind: "unknown", canonicalUrl: raw };
+    return { platform: "other", kind: "unknown", canonicalUrl: cleanAddress(raw) };
   }
 }
 

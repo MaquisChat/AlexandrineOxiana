@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
+import { cleanAddress, recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
 import { InvalidInputError } from "../repo/errors.js";
 import { addCapturedOriginal, projectPolicy, repoLibrary, updateSourceRechecked, type Repo } from "../repo/repo.js";
 import { htmlStripWorkerUrl } from "../resources.js";
@@ -194,7 +194,7 @@ export async function captureBrowserPage(
       creators: ex.handle ? [{ handle: ex.handle, ...(ex.displayName ? { literal: ex.displayName } : {}), role: "author" }] : [],
       ...(day ? { issued: day } : {}),
       // The platform from the URL ("other" for a web page), so a protocol's platform list applies (R99 I8).
-      identifiers: { url: c.canonicalUrl || url.href, platform: c.platform, ...(c.postId ? { platformPostId: c.postId } : {}) },
+      identifiers: { url: c.canonicalUrl || cleanAddress(url.href), platform: c.platform, ...(c.postId ? { platformPostId: c.postId } : {}) },
       caseAttributes: {},
       availability: { status: "available" },
       collectionIds: [],
@@ -204,7 +204,8 @@ export async function captureBrowserPage(
     const provenance: Provenance = {
       captureMethod: "browser_capture",
       capturedAt: at,
-      originalUrl: c.canonicalUrl || url.href,
+      // Never the address as given (R391 f).
+      originalUrl: c.canonicalUrl || cleanAddress(url.href),
       tool: { name: "ao-browser-extension", version: "1" },
       fileHashes: {},
       legal: { status: "unknown", ...(legalBasis ? { basis: legalBasis } : {}) },
