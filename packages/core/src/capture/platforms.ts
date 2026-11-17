@@ -221,8 +221,9 @@ export function cleanAddress(url: string): string {
 
 /**
  * The platform and kind of `url`. Never throws, for any input (R379): an input that cannot be read
- * as an address is the generic "other / unknown" with the input as given (no caller stores one that
- * is not http or https); anything unexpected while reading one gives `cleanAddress` (R391 f).
+ * as an address is the generic "other / unknown" with the input as given, and an address of another
+ * scheme is that too, without its user name and password (R415 e; no caller stores one that is not
+ * http or https); anything unexpected while reading one gives `cleanAddress` (R391 f).
  */
 export function classifyUrl(url: string): ClassifiedUrl {
   const raw = typeof url === "string" ? url.trim() : "";
@@ -233,6 +234,17 @@ export function classifyUrl(url: string): ClassifiedUrl {
   }
 }
 
+/**
+ * An address of another scheme (`ftp:`, `sftp:` …) as given, but without its user name and password
+ * (R415 e: the command line prints it); `cleanAddress` if the URL will not drop them.
+ */
+function withoutUser(u: URL, raw: string): string {
+  if (!u.username && !u.password) return raw;
+  u.username = "";
+  u.password = "";
+  return u.username || u.password ? cleanAddress(raw) : u.href;
+}
+
 function classify(raw: string): ClassifiedUrl {
   let u: URL;
   try {
@@ -240,7 +252,7 @@ function classify(raw: string): ClassifiedUrl {
   } catch {
     return { platform: "other", kind: "unknown", canonicalUrl: raw };
   }
-  if (u.protocol !== "https:" && u.protocol !== "http:") return { platform: "other", kind: "unknown", canonicalUrl: raw };
+  if (u.protocol !== "https:" && u.protocol !== "http:") return { platform: "other", kind: "unknown", canonicalUrl: withoutUser(u, raw) };
   const host = hostOf(u);
   if (host === "youtube.com" || host === "youtu.be" || host === "youtube-nocookie.com") return youtube(u, host);
   if (host === "instagram.com") return instagram(u);

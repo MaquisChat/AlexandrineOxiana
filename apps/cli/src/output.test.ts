@@ -11,3 +11,15 @@ describe("the command line prints the cleaned address (R379, WB1 M7)", () => {
     expect(v.url).toBe("https://portal.example.org/case/7?id=7");
   });
 });
+
+describe("an address of another scheme is printed without its user information (R415 e, FR-A11 review 2 M4)", () => {
+  it("the --json document's item holds no user name or password; plain text is printed as given", () => {
+    const v = itemView({ url: "ftp://ana:hunter2@files.example.org/x", status: "failed", reason: "This link is not a YouTube, Instagram or TikTok post." } as never);
+    const doc = JSON.stringify({ items: [v] }, null, 2);
+    expect(doc).not.toMatch(/ana|hunter2/);
+    expect(v.url).toBe("ftp://files.example.org/x");
+    expect(safeUrl("sftp://ana:hunter2@host/a")).toBe("sftp://host/a");
+    expect(safeUrl("plain words")).toBe("plain words");
+    expect(safeUrl("mailto:ana@example.org")).toBe("mailto:ana@example.org");
+  });
+});

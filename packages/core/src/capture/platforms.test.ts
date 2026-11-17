@@ -388,3 +388,18 @@ describe("a UUID or a long lower-case id under an ordinary name is dropped from 
     expect(classifyUrl(`https://ex.example.org/p?id=${UUID}`).canonicalUrl).toBe(`https://ex.example.org/p?id=${UUID}`);
   });
 });
+
+describe("an address of another scheme loses its user information; what is no address is returned as given (R415 e, review 2 M4)", () => {
+  it.each([
+    ["ftp://user:pass@host/x", "ftp://host/x"],
+    ["ftp://ana:pw@x/?q=1", "ftp://x/?q=1"],
+    ["sftp://ana:hunter2@files.example.org/data/a.csv", "sftp://files.example.org/data/a.csv"],
+    ["ssh://ana@host/repo", "ssh://host/repo"],
+  ])("%s → %s", (input, out) => {
+    const c = classifyUrl(input);
+    expect(c).toEqual({ platform: "other", kind: "unknown", canonicalUrl: out });
+  });
+  it.each(["plain words", "mailto:ana@example.org", "not a link at all", "ftp://host/x"])("%j is returned as given", (input) => {
+    expect(classifyUrl(input).canonicalUrl).toBe(input);
+  });
+});
