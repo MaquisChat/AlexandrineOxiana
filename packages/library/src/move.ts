@@ -1125,5 +1125,17 @@ export async function deleteOldCopy(
     warnings,
     { expectId: rec.libraryId },
   );
+  // A destruction under the retention rule that named this old copy as not destroyed records it as
+  // removed, and its warning ends (R379), in the library open here. Elsewhere, the next retry pass
+  // there finds it no longer listed. (Imported when needed: retention.ts imports backups, which import this module.)
+  const dest = opts.destRepo;
+  if (dest && repoLibrary(dest).id === rec.libraryId) {
+    const { recordOldCopyDeleted } = await import("./retention.js");
+    for (const p of dest.listProjects()) {
+      await recordOldCopyDeleted(dest, p.id, rec.id, root).catch((err: unknown) => {
+        warnings.push(`That the old copy was deleted could not be recorded for a destruction in project ${p.id} yet (${msg(err)}); it is recorded when the library is next opened`);
+      });
+    }
+  }
   return { filesDeleted, kept: kept.sort(), leftovers, movedAwayKept, rootRemoved, warnings };
 }

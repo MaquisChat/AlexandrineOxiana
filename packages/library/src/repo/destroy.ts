@@ -77,6 +77,12 @@ export interface DestroyInput {
    */
   backups: { toRemove: string[]; unreadable: string[] };
   /**
+   * The old copies of the library left by a move that still hold the destroyed files, by the id of
+   * this computer's record of each (never a path), and whether that list could not be read
+   * (R379): recorded in the change's audit event when there is anything to say, as the backups are.
+   */
+  oldCopies?: { notDestroyed: Array<{ id: string; movedAt: string; moveId: string }>; unchecked: boolean };
+  /**
    * Destroy only what is due (R117): checked inside the change against the rules as they are then
    * — the retention date has passed in `tz` at `now`, and each of `originals` is an original of an
    * identifiable source. Otherwise nothing is destroyed (InvalidInputError).
@@ -142,6 +148,8 @@ export async function destroyAssets(
         backupsToRemove: [...input.backups.toRemove],
         backupsUnreadable: [...input.backups.unreadable],
         destroyedAssets: destroyed.map((d) => d.asset.id),
+        ...(input.oldCopies?.notDestroyed.length ? { oldCopiesNotDestroyed: input.oldCopies.notDestroyed.map((c) => ({ ...c })) } : {}),
+        ...(input.oldCopies?.unchecked ? { oldCopiesUnchecked: true } : {}),
       };
       return { certificateRel: rel, certificate, certificateSha256, at: tx.at, destroyed: destroyed.map((d) => d.asset) };
     },

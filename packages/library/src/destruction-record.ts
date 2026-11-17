@@ -57,6 +57,26 @@ export interface Audited {
   reportedProblem?: string;
   /** Listed names a later backup was given: the listed file is gone (a name is never given while a file has it, R138 b). */
   reused: Set<string>;
+  /**
+   * Old copies of the library left by a move that still held destroyed files at the destruction
+   * (R379): the id of this computer's record of each → when the move that left it was made, and its
+   * move id. Never a path: the old copy's place is only in this computer's list.
+   */
+  oldCopies: Map<string, OldCopyRef>;
+  /** This computer's list of old copies could not be read at the destruction: whether one held the files was not checked. */
+  oldCopiesUnchecked: boolean;
+  /** When the list was read and checked since (what it found is in `oldCopies`). */
+  oldCopiesCheckedAt?: string;
+  /** Listed old copy → when the app deleted it (the "Delete the old copy" after a move). */
+  oldCopiesRemoved: Map<string, string>;
+  /** Listed old copy → when it was found to hold none of the destroyed files any more (deleted by hand, or no longer listed). */
+  oldCopiesGone: Map<string, string>;
+}
+
+/** An old copy of the library as a destruction records it (R379). */
+export interface OldCopyRef {
+  movedAt: string;
+  moveId: string;
 }
 
 export const newAudited = (projectId: string, certificate: string, certificateSha256: string, at: string, toRemove: string[], unreadable: string[]): Audited => ({
@@ -73,7 +93,25 @@ export const newAudited = (projectId: string, certificate: string, certificateSh
   notHolding: new Map(),
   amendments: [],
   reused: new Set(),
+  oldCopies: new Map(),
+  oldCopiesUnchecked: false,
+  oldCopiesRemoved: new Map(),
+  oldCopiesGone: new Map(),
 });
+
+/** Old copies (record ids) a destruction lists that are not yet recorded as deleted or as no longer holding the files (R379). */
+export const oldCopiesOutstandingOf = (a: Audited): string[] => [...a.oldCopies.keys()].filter((id) => !a.oldCopiesRemoved.has(id) && !a.oldCopiesGone.has(id));
+/** Whether the destruction still has old copies to see gone, or a list it could not check yet: the warning `destruction-old-copies-pending`. */
+export const oldCopiesPending = (a: Audited): boolean => oldCopiesOutstandingOf(a).length > 0 || (a.oldCopiesUnchecked && a.oldCopiesCheckedAt === undefined);
+
+/** `[{ id, movedAt, moveId }]` as an audit event carries it; anything else is ignored. */
+function oldCopyRefs(v: unknown): Array<[string, OldCopyRef]> {
+  if (!Array.isArray(v)) return [];
+  return v.flatMap((x) => {
+    const o = (x ?? {}) as Record<string, unknown>;
+    return typeof o.id === "string" && typeof o.movedAt === "string" ? [[o.id, { movedAt: o.movedAt, moveId: typeof o.moveId === "string" ? o.moveId : "" }] as [string, OldCopyRef]] : [];
+  });
+}
 
 export const listedIn = (a: Audited, f: string) => a.toRemove.includes(f) || a.unreadable.includes(f);
 export const settledIn = (a: Audited, f: string) => a.removed.has(f) || a.gone.has(f) || a.notHolding.has(f);
@@ -103,6 +141,8 @@ export function auditedDestructions(events: Iterable<AuditEvent | null>): { list
       const a = newAudited(e.projectId ?? "", d.certificate, d.certificateSha256, e.at, strings(d.backupsToRemove).filter(isBackupRel), strings(d.backupsUnreadable).filter(isBackupRel));
       // Which file each listed name stood for at that moment: the backup last made under it.
       for (const f of a.toRemove) if (made.has(f)) a.made.set(f, made.get(f)!);
+      for (const [id, ref] of oldCopyRefs(d.oldCopiesNotDestroyed)) a.oldCopies.set(id, ref);
+      a.oldCopiesUnchecked = d.oldCopiesUnchecked === true;
       bySha.set(a.certificateSha256, a);
       list.push(a);
       continue;
@@ -121,6 +161,14 @@ export function auditedDestructions(events: Iterable<AuditEvent | null>): { list
       }
       for (const f of strings(d.noLongerPresent)) if (listedIn(a, f) && !settledIn(a, f)) a.gone.set(f, at);
       for (const f of strings(d.notHolding)) if (a.unreadable.includes(f) && !settledIn(a, f)) a.notHolding.set(f, at);
+      // The old copies of the library (R379): a list checked later, and copies seen gone.
+      if (a.oldCopiesUnchecked && a.oldCopiesCheckedAt === undefined && typeof d.oldCopiesCheckedAt === "string") {
+        a.oldCopiesCheckedAt = d.oldCopiesCheckedAt;
+        for (const [id, ref] of oldCopyRefs(d.oldCopiesFound)) if (!a.oldCopies.has(id)) a.oldCopies.set(id, ref);
+      }
+      const settledCopy = (id: string) => !a.oldCopies.has(id) || a.oldCopiesRemoved.has(id) || a.oldCopiesGone.has(id);
+      for (const id of strings(d.oldCopiesRemoved)) if (!settledCopy(id)) a.oldCopiesRemoved.set(id, at);
+      for (const id of strings(d.oldCopiesNoLongerHolding)) if (!settledCopy(id)) a.oldCopiesGone.set(id, at);
       if (typeof d.amendment === "string" && typeof d.amendmentSha256 === "string") a.amendments.push({ name: d.amendment, sha256: d.amendmentSha256, at: e.at });
       if (typeof d.freshBackup === "string" && isBackupRel(d.freshBackup)) a.freshBackup ??= d.freshBackup;
       if (a.freshBackup) delete a.freshBackupFailed;

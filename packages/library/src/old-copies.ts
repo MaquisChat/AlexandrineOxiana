@@ -179,6 +179,15 @@ export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<Pend
   return (await load(deps)).find((r) => r.id === id);
 }
 
+/**
+ * Every old copy this computer lists for the library `libraryId`, finished or not, its offer expired
+ * or not (a destruction under the retention rule must know them all, R379). Throws
+ * OldCopiesUnreadableError when the list cannot be read.
+ */
+export async function oldCopiesOfLibrary(deps: CfgDeps, libraryId: string): Promise<PendingOldCopy[]> {
+  return (await load(deps)).filter((r) => r.libraryId === libraryId);
+}
+
 export async function markPendingComplete(deps: CfgDeps, id: string): Promise<void> {
   return changeList(deps, async (all) => {
     const r = all.find((x) => x.id === id);
