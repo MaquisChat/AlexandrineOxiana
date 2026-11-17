@@ -84,10 +84,13 @@
  * every retry pass. Each copy leaves the list as the backups do, by an amendment beside the
  * certificate in a governed change and a `retention.old-copies` report: deleted through the app
  * (`removed`, from deleteOldCopy), or found to hold none of the files any more (`noLongerHolding`:
- * deleted by hand, or no longer listed). The check is cheap and made at every retry pass (at open,
- * at unlock and hourly): one read of this computer's list, and for each noted copy a look for the
- * destroyed files' paths in it. Nothing in an old copy is ever deleted by a destruction, and a
- * destruction is never refused because of one.
+ * deleted by hand) — only when its place was looked at and holds none of the destroyed data (R409
+ * a): a copy this computer's list has no record of, a damaged list, or a place that cannot be
+ * looked at records nothing. The look searches the destroyed files' paths, the old place's
+ * `Backups/` for the project's backups and its `.tmp/trash-*` (R409 c), each place bounded to two
+ * seconds (M4). The check is made at every retry pass (at open, at unlock and hourly). The
+ * certificate always has its line about old copies (R409 b). Nothing in an old copy is ever deleted
+ * by a destruction, and a destruction is never refused because of one.
  *
  * Destruction holds the project's maintenance lock (R138 a). Audited: the change's `delete` event (op `retention.destroy`), `retention.destroyed`
  * (counts and the certificate's sha256), each amendment's `delete` event (op `retention.backups`)
