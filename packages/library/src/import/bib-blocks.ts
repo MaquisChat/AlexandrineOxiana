@@ -26,8 +26,8 @@
 
 /** The doubts a BibTeX record carries when the reader could not take it whole (R362 g). */
 export const BIB_DOUBTS = {
-  cut: 'The BibTeX entry was not closed, so it was cut at a line beginning with "@"; some of its fields may be incomplete.',
-  eof: "The BibTeX entry was not closed before the end of the file; some of its fields may be incomplete.",
+  cut: 'The BibTeX entry was not closed, so it was cut at a line beginning with "@"; its fields may be incomplete or hold text from what followed it.',
+  eof: "The BibTeX entry was not closed before the end of the file; its fields may be incomplete or hold text from what followed it.",
   innerEntry:
     'A line inside one of this BibTeX entry\'s fields begins like another entry ("@type{"); it was read as part of the field. If a closing brace is missing in the file, other entries may be inside this one.',
 } as const;

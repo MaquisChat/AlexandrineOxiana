@@ -1381,6 +1381,11 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
     }
   });
 
+  it("R366 f: the doubts of an unclosed entry say that its fields may also hold text from what followed it", () => {
+    expect(BIB_DOUBTS.cut).toBe('The BibTeX entry was not closed, so it was cut at a line beginning with "@"; its fields may be incomplete or hold text from what followed it.');
+    expect(BIB_DOUBTS.eof).toBe("The BibTeX entry was not closed before the end of the file; its fields may be incomplete or hold text from what followed it.");
+  });
+
   it("stays linear with many '@' lines and pasted entries inside one value (1 MB, < 1 s)", async () => {
     const inside = await writeExport("lin1.bib", `@article{k, title={T}, abstract={${"\n@someuser replied".repeat(MB / 18)}}, doi={10.5555/x}}`);
     expect(await timed(() => collect(bibtexAdapter(inside)))).toBeLessThan(1000);
