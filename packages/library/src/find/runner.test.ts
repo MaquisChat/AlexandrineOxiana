@@ -4178,6 +4178,19 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect((await repo.getSource(p.id, sid)).assets).toHaveLength(0);
   });
 
+  it("R411 c (M3): during the waits after failed downloads the entry keeps the links found, so the row can show them", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    const B = "https://arxiv.org/pdf/2101.00002";
+    oaCopies.set(ZORBLATT.doi!, [A, B]);
+    fileStatus.set(A, { status: 503 });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+    expect((await entryOf(p, eid))!.offers?.map((o) => o.host)).toEqual(["arxiv.org", "arxiv.org"]);
+    timers.advance(FIND_RETRY_DELAYS_MS[0]!);
+    await waitsToRetry(p, eid, 2);
+    expect((await entryOf(p, eid))!.offers?.map((o) => o.host)).toEqual(["arxiv.org", "arxiv.org"]);
+  });
+
   it("R411 a (M1): a service unreachable and every offered file refused for good: 'no open copy' saying a copy may still exist, its links kept, Try again accepted", async () => {
     // Semantic Scholar has no answer in this world (the request fails); OpenAlex offers a link that answers 404.
     settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" || c.id === "semanticscholar" })) };

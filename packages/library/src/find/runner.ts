@@ -2137,7 +2137,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const asked = sources.filter((x) => x !== "unpaywall" || email);
       if (found.failed.length && found.failed.length >= asked.length) {
         debug("find: no free-copy service could be reached");
-        await tryLater("unreachable", {}, {}, found.retryAfter ?? []);
+        // R411 c: any link found is kept during the wait (links an earlier attempt kept stay as they are).
+        const seen = linksOf(found.elsewhere);
+        await tryLater("unreachable", seen?.length ? { offers: seen } : {}, {}, found.retryAfter ?? []);
         return;
       }
       const links = linksOf(found.elsewhere);
@@ -2230,7 +2232,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         // is tried again (services asked again) like an unreachable free-copy lookup (R282 e), on the same delays; once
         // they are spent it rests "no-open-copy" / "copy-not-downloaded", with its links, and "Try again" is accepted.
         debug("find: no free copy could be downloaded this time");
-        await tryLater("copy-not-downloaded", { state: "looking-for-copy" }, { state: "no-open-copy", ...(links?.length ? { offers: links } : {}) }, retryAfter);
+        // R411 c: the links found stay on the entry during the waits, so the researcher can open one meanwhile.
+        const kept = links?.length ? { offers: links } : {};
+        await tryLater("copy-not-downloaded", { state: "looking-for-copy", ...kept }, { state: "no-open-copy", ...kept }, retryAfter);
         return;
       }
       // Every offer refused for good: no open copy here — unless a service could not be reached, which might have had a

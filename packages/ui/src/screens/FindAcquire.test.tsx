@@ -2823,11 +2823,13 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
           entry({ typed: "only refused", ...noc(), offers: refusedOnly }),
           entry({ typed: "unreachable with offers", ...noc("copy-some-unreachable"), offers }),
           entry({ typed: "removed with offers", ...noc("record-removed"), offers }),
+          // R411 c: an entry waiting to look again keeps the links found, and shows them beside Try again.
+          entry({ typed: "waiting with offers", ...withSource({ state: "looking-for-copy", nextTryAt: "2026-11-14T12:00:00.000Z" }), offers }),
         ]),
       },
     });
     show();
-    await waitFor(() => expect(rows()).toHaveLength(4));
+    await waitFor(() => expect(rows()).toHaveLength(5));
     const list = within(row("with offers")).getByRole("list", { name: "Where to get it: “with offers”" });
     const links = within(list).getAllByRole("link");
     expect(links.map((a) => [a.getAttribute("href"), a.getAttribute("aria-label")])).toEqual([
@@ -2851,6 +2853,9 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     expect(within(row("unreachable with offers")).getAllByRole("link")).toHaveLength(2);
     expect(row("removed with offers").textContent).not.toContain("Where to get it");
     expect(within(row("removed with offers")).queryAllByRole("link")).toHaveLength(0);
+    expect(row("waiting with offers").textContent).toContain("Where to get it");
+    expect(within(row("waiting with offers")).getAllByRole("link")).toHaveLength(2);
+    expect(within(row("waiting with offers")).getByRole("button", { name: "Try again: “waiting with offers”" })).toBeTruthy();
   });
 
   describe("R311 a, R340 d: in the desktop app, Where to get it is never a dead link", () => {
