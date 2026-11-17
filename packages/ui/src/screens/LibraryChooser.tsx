@@ -24,6 +24,10 @@ const message = (err: unknown, fallback: string) => errorText(err, fallback);
 const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 /** R449 e: the room is asked for this long after the box last changed. */
 const ROOM_PAUSE_MS = 600;
+/** R450 a: the line is emptied when a newer answer has not come this long after it was asked. */
+const ROOM_ANSWER_LIMIT_MS = 4000;
+/** R450 b: a path that got no figure is asked again after each of these waits, then no more. */
+const ROOM_RETRY_MS = [2000, 4000, 8000];
 /** R447 b: under this many free bytes the line adds that it is little room. */
 const LITTLE_ROOM = 10e9;
 /** `n` rounded DOWN to one decimal, without a trailing ".0". */
@@ -93,20 +97,50 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
       setRoomWords("");
       return;
     }
-    const timer = setTimeout(() => {
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const later = (fn: () => void, ms: number) => {
+      const t = setTimeout(() => {
+        timers.delete(t);
+        fn();
+      }, ms);
+      timers.add(t);
+      return t;
+    };
+    const askRoom = (attempt: number) => {
+      // Not answered in time: the old figure is no longer vouched for. A late answer is still shown below.
+      const limit = later(() => {
+        if (roomAsk.current === ask) setRoomWords("");
+      }, ROOM_ANSWER_LIMIT_MS);
+      const noFigure = () => {
+        const wait = ROOM_RETRY_MS[attempt];
+        if (wait !== undefined) later(() => askRoom(attempt + 1), wait);
+      };
       api.libraries
         .folderRoom(p)
         .then((r) => {
+          clearTimeout(limit);
+          timers.delete(limit);
           // An answer for a path the box no longer holds is dropped; no number, nothing said (never a guess).
           if (roomAsk.current !== ask) return;
-          setRoomWords(typeof r.freeBytes === "number" && Number.isFinite(r.freeBytes) && r.freeBytes >= 0 ? roomSentence(r.freeBytes) : "");
+          if (typeof r.freeBytes === "number" && Number.isFinite(r.freeBytes) && r.freeBytes >= 0) {
+            setRoomWords(roomSentence(r.freeBytes));
+          } else {
+            setRoomWords("");
+            noFigure();
+          }
         })
         .catch(() => {
-          if (roomAsk.current === ask) setRoomWords("");
+          clearTimeout(limit);
+          timers.delete(limit);
+          if (roomAsk.current !== ask) return;
+          setRoomWords("");
+          noFigure();
         });
-    }, ROOM_PAUSE_MS);
+    };
+    later(() => askRoom(0), ROOM_PAUSE_MS);
     return () => {
-      clearTimeout(timer);
+      for (const t of timers) clearTimeout(t);
+      timers.clear();
       roomAsk.current++;
     };
   }, [api, path]);

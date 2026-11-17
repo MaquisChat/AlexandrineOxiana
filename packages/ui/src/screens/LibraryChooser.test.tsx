@@ -1,7 +1,8 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { LIBRARIES, server, serviceError, testApi, url, useMockService } from "../test/service";
 import { LibraryChooser, roomSentence } from "./LibraryChooser";
 
@@ -372,4 +373,111 @@ describe("LibraryChooser", () => {
     expect(asked.length).toBeLessThanOrEqual(2);
     expect(asked[asked.length - 1]).toBe("/Volumes/abc");
   }, 20_000);
+});
+
+// R450 (round 4): the room's line over time. A fake service answers `folderRoom`; the clock is faked, nothing is sent.
+describe("LibraryChooser: the room's line over time (R450)", () => {
+  afterEach(() => vi.useRealTimers());
+  type Answer = { freeBytes?: number } | "fail" | "never";
+  const setup = (answerFor: (path: string, n: number) => Answer) => {
+    vi.useFakeTimers();
+    const asked: string[] = [];
+    const base = testApi();
+    const folderRoom = vi.fn((path: string) => {
+      asked.push(path);
+      const a = answerFor(path, asked.filter((x) => x === path).length);
+      if (a === "never") return new Promise<{ freeBytes?: number }>(() => {});
+      if (a === "fail") return Promise.reject(new Error("failed"));
+      return Promise.resolve(a);
+    });
+    const api = {
+      libraries: {
+        ...base.libraries,
+        list: () => Promise.resolve({ libraries: [] }),
+        suggestedFolder: () => Promise.resolve({}),
+        folderRoom,
+      },
+    } as unknown as ReturnType<typeof testApi>;
+    render(<LibraryChooser api={api} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    return { asked };
+  };
+  const type = (v: string) => fireEvent.change(screen.getByLabelText("Library folder"), { target: { value: v } });
+  const wait = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  const line = () => (document.querySelector(".ao-library-room") as HTMLElement).textContent;
+
+  it("S1: a newer answer that has not come four seconds after it was asked empties the line (not before)", async () => {
+    setup((p) => (p === "/A" ? { freeBytes: 11e9 } : "never"));
+    type("/A");
+    await wait(600);
+    expect(line()).toBe("Free space on that disk: 11 GB.");
+    type("/B");
+    await wait(600);
+    expect(line()).toBe("Free space on that disk: 11 GB.");
+    await wait(3999);
+    expect(line()).toBe("Free space on that disk: 11 GB.");
+    await wait(1);
+    expect(line()).toBe("");
+  });
+
+  it("S1: a late answer for the path the box still holds is shown", async () => {
+    let release!: (r: { freeBytes: number }) => void;
+    vi.useFakeTimers();
+    const base = testApi();
+    const api = {
+      libraries: { ...base.libraries, list: () => Promise.resolve({ libraries: [] }), suggestedFolder: () => Promise.resolve({}), folderRoom: () => new Promise<{ freeBytes: number }>((r) => (release = r)) },
+    } as unknown as ReturnType<typeof testApi>;
+    render(<LibraryChooser api={api} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    type("/A");
+    await wait(600 + 4000);
+    expect(line()).toBe("");
+    await act(async () => release({ freeBytes: 20e9 }));
+    expect(line()).toBe("Free space on that disk: 20 GB.");
+  });
+
+  it("S2: an answer with no number is asked again after 2,000 ms, and a number then shows", async () => {
+    const { asked } = setup((_p, n) => (n === 1 ? {} : { freeBytes: 11e9 }));
+    type("/A");
+    await wait(600);
+    expect(asked).toEqual(["/A"]);
+    await wait(1999);
+    expect(asked).toHaveLength(1);
+    await wait(1);
+    expect(asked).toHaveLength(2);
+    expect(line()).toBe("Free space on that disk: 11 GB.");
+    await wait(60_000);
+    expect(asked).toHaveLength(2);
+  });
+
+  it("S2: four answers with no number (and failures) make exactly four requests, none after", async () => {
+    const { asked } = setup((_p, n) => (n % 2 ? {} : "fail"));
+    type("/A");
+    await wait(600);
+    await wait(2000);
+    await wait(4000);
+    await wait(8000);
+    expect(asked).toEqual(["/A", "/A", "/A", "/A"]);
+    await wait(120_000);
+    expect(asked).toHaveLength(4);
+  });
+
+  it("S2: a box changed during a wait makes no further request for the old path", async () => {
+    const { asked } = setup(() => ({}));
+    type("/A");
+    await wait(600);
+    expect(asked).toEqual(["/A"]);
+    await wait(1000);
+    type("not a path");
+    await wait(60_000);
+    expect(asked).toEqual(["/A"]);
+  });
+
+  it("an error for a new path after a figure empties the line", async () => {
+    setup((p) => (p === "/A" ? { freeBytes: 11e9 } : "fail"));
+    type("/A");
+    await wait(600);
+    expect(line()).toBe("Free space on that disk: 11 GB.");
+    type("/B");
+    await wait(600);
+    expect(line()).toBe("");
+  });
 });
