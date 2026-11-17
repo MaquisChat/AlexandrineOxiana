@@ -84,3 +84,21 @@ Worktree `.claude/worktrees/fr-a23`, branch `fr-a23-library-place`, from dd3d122
 - minor (deferred): a figure just under 10 GB (e.g. 9.96e9) shows as "10 GB." followed by "That is little room…".
 - minor (deferred): the guard against looking at a share again while a look is still running is keyed by the exact path asked for. Different paths under the same unresponsive share each start a new look.
 - minor (deferred): the suggestion's reads (whether Documents and each candidate folder exist and are empty) are not bounded in time. They read only the home folder.
+
+## Round 2 (R448)
+Commit 4d571dd, one commit; the branch head is now 4d571dd.
+
+- **Screen:** `packages/ui/src/screens/LibraryChooser.tsx` (offer block, about lines 198-215).
+  - The button no longer has an `aria-label`. Its visible text, "Use this folder", is also its accessible name.
+  - The line "Suggested: <folder>" is now a `<span id="…-suggested">`, and the button points at it with `aria-describedby`. The folder inside it is still shown with `UserText`.
+- **Tests** (`LibraryChooser.test.tsx`):
+  - The offer test now finds the button by `{ name: "Use this folder", description: "Suggested: <folder>" }`.
+  - It also asserts that the button has no `aria-label`, and that exactly one button on the screen is named "Use this folder".
+  - The no-suggestion test and the keyboard test now look for the button by "Use this folder".
+  - Before the code changed, 2 of the 12 tests failed with `Unable to find role="button" and name "Use this folder"`.
+- **Guide:** no change. It already names the button by its visible words, **Use this folder**.
+- **Runs:**
+  - The three LibraryChooser test files: 19 passed.
+  - `pnpm -r typecheck`: exit 0.
+  - `lint:css`: exit 0.
+  - `lint:colours`: "ok: no hard-coded colours".
