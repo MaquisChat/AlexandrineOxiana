@@ -113,6 +113,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WatchedFolderOptions, isId, type WatchedFolder, type WatchedFolderOptions as WatchedFolderOptionsT } from "@ao/core";
 import { raiseDeviceNotice } from "../device-notices.js";
 import { writeSmallFileAtomic } from "../fs/atomic.js";
+import { overlapsLibrary, within } from "../fs/inside-library.js";
 import { isClosed, type Library } from "../library.js";
 import type { LocationEnv } from "../location.js";
 import type { HttpClient } from "../lookup/index.js";
@@ -421,18 +422,6 @@ export interface FolderWatch {
    * is in another state, it has not been judged yet, or the check could not tell.
    */
   presence(key: string): ContentPresence;
-}
-
-const within = (folder: string, p: string) => {
-  const rel = relative(folder, p);
-  // A name that merely starts with ".." (`..inner`) is inside (R233 M2): only ".." itself or "../…" is outside.
-  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-};
-
-/** Whether `dir` (a real path) is the library, inside it, or holds it. */
-async function overlapsLibrary(dir: string, lib: Pick<Library, "root">): Promise<boolean> {
-  const root = await fsp.realpath(lib.root).catch(() => resolve(lib.root));
-  return dir === root || within(root, dir) || within(dir, root);
 }
 
 /** A call on the folder did not answer in time (or the folder is waiting for one that did not). */

@@ -139,6 +139,8 @@ import {
 import { BatchDedupe } from "./dedupe.js";
 import { applyMerge, missingFields, type MarkRecord, type MergeRecord } from "./merge.js";
 import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./outside.js";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRealRoot, onFolderPath, realOrNearest } from "../../fs/inside-library.js";
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
@@ -160,7 +162,58 @@ export const ENGINE_FILE_NOTES = {
    * (retention; the asset entry says so): it is not downloaded and not brought back.
    */
   removedHere: "an attached file you removed here was not brought in again",
+  /** R362 c: a file whose real path is inside this library's own folder (outside this batch's work folder). */
+  inLibrary: "attached file is inside this library's own folder and was not imported",
 } as const;
+
+/**
+ * Kinds whose source is a folder the researcher chose (R362 c; Zotero's data folder, R368 a): never the library's own
+ * folder, inside it or holding it.
+ */
+const FOLDER_KINDS: ReadonlySet<string> = new Set(["folder", "device", "calibre", "zotero-local"]);
+/** Kinds that read a FILE of their own (R368 a): never one inside the library (its backups above all, which hold the held files). */
+const FILE_KINDS: ReadonlySet<string> = new Set(["zip", "bibtex", "ris", "csl-json", "zotero-rdf"]);
+/** A Zotero data folder's location may name another of its libraries (zotero-local.ts): the folder is what comes before. */
+const ZOTERO_LIBRARY_SUFFIX = /#library=\d{1,9}$/u;
+
+/**
+ * R362 c, R368 a: an import whose own source lies inside the library (by real path) is refused whole — a folder inside
+ * it or holding it, a file inside it — at the dry run, the start and the resume, before anything is read. Zotero Web
+ * and the attach kinds have no file or folder of their own here.
+ */
+async function refuseLibrarySource(repo: Repo, adapter: ImportSourceAdapter): Promise<void> {
+  if (FOLDER_KINDS.has(adapter.kind)) {
+    const dir = adapter.kind === "zotero-local" ? adapter.location.replace(ZOTERO_LIBRARY_SUFFIX, "") : adapter.location;
+    if (await importOverlapsLibrary(await realOrNearest(dir), repoLibrary(repo))) throw new BatchRefusedError(IN_LIBRARY_TEXT.folder);
+  } else if (FILE_KINDS.has(adapter.kind)) {
+    if (await insideLibrary(adapter.location, repoLibrary(repo))) throw new BatchRefusedError(IN_LIBRARY_TEXT.importFile);
+  }
+}
+
+/**
+ * Kinds whose run itself writes the files it imports into the batch's work folder (R368 a): a ZIP's entries (a folder's
+ * ZIPs too) are unpacked there and Zotero Web's files downloaded there. No other kind's files are ever there.
+ */
+const WORK_KINDS: ReadonlySet<string> = new Set(["zip", "folder", "zotero-web"]);
+
+/** R362 c, R368 a: whether a file (as the adapter gave it, and its real path) is one of the library's own. */
+type LibraryFileTest = (file: { path: string; link?: boolean }, real: string) => Promise<boolean>;
+
+/**
+ * R362 c: a test of a file's real path — inside the library's own folder. The batch's own work folder `work` is exempt
+ * only for what the run wrote there itself (R368 a): a kind that writes there, a file the adapter gave by a path in that
+ * folder (not a link to it from elsewhere) and not a file a source links in place (a path named by the source's data).
+ * So no caller can name it: an export's file field, a Zotero linked file or a link in a folder pointing into the work
+ * folder is the library's like any other.
+ */
+async function libraryFileTest(repo: Repo, work: string, kind: string): Promise<LibraryFileTest> {
+  const [root, rootId, own] = await Promise.all([libraryRealRoot(repoLibrary(repo).root), folderId(repoLibrary(repo).root), realOrNearest(work)]);
+  const ownAsWritten = resolve(work);
+  const written = (f: { path: string; link?: boolean }, real: string) =>
+    WORK_KINDS.has(kind) && f.link !== true && (insideFolder(ownAsWritten, resolve(f.path)) || insideFolder(own, resolve(f.path))) && insideFolder(own, real);
+  // By name, or by device and inode (a folder on the real path is the library's folder; R368 d).
+  return async (f, real) => !written(f, real) && (insideFolder(root, real) || (await onFolderPath(real, rootId)));
+}
 
 /** The run's note on files removed here and not brought back (Z4), counted over the batch's lines. */
 const removedNote = (n: number) => (n === 1 ? "An attached file you removed here was not brought in again." : `${n} attached files you removed here were not brought in again.`);
@@ -548,6 +601,8 @@ class Run {
   private fileNotes = new Map<string, string[]>();
   /** Files outside the adapter's roots need approval (R67); undefined when the adapter declares no roots. */
   private outside: OutsidePolicy | undefined;
+  /** R362 c: whether a real path is inside the library's own folder (and not in this run's work folder). */
+  private inLibrary: LibraryFileTest = async () => false;
   /** Real path of each file attached in this run → the item it went to (a second item gets a note). */
   private fileOwners = new Map<string, string>();
   private readonly workName: string;
@@ -755,6 +810,7 @@ class Run {
         this.rec.secret,
         this.rec.outsideApprovals ?? [],
       );
+      this.inLibrary = await libraryFileTest(this.repo, join(repoLibrary(this.repo).root, ".tmp", this.workName), this.rec.source.kind);
       if (this.adapter.incremental) {
         this.known = await knownVersions(this.repo, this.projectId, this.rec.source.kind, this.marks);
         await this.refreshDeleted();
@@ -1211,6 +1267,11 @@ class Run {
       // From here on the file is read through its checked real path (R70 I-2).
       const checked = this.outside ? await this.outside.check(f.path) : { real: await fsp.realpath(f.path).catch(() => resolve(f.path)), ok: true };
       const real = checked.real;
+      // R362 c: never a file of the library's own folder, whatever was approved (before it is read).
+      if (await this.inLibrary(f, real)) {
+        out.dropped.push({ note: ENGINE_FILE_NOTES.inLibrary, reason: IN_LIBRARY_TEXT.file });
+        continue;
+      }
       if (!checked.ok) {
         out.dropped.push({ note: OUTSIDE_NOTE, reason: OUTSIDE_REASON });
         continue;
@@ -1448,7 +1509,7 @@ class Run {
     for (const f of inputs) {
       const r = await fsp.realpath(f.path).catch(() => null);
       const st = r === f.path ? await fsp.lstat(f.path).catch(() => null) : null;
-      if (st?.isFile() && (!this.outside || (await this.outside.check(f.path)).ok)) kept.push(f);
+      if (st?.isFile() && r !== null && !(await this.inLibrary({ path: f.path }, r)) && (!this.outside || (await this.outside.check(f.path)).ok)) kept.push(f);
       else changed++;
     }
     if (!changed) return { inputs, fail: false };
@@ -2225,6 +2286,7 @@ export async function startBatch(
   const id = newId();
   active.add(id);
   try {
+    await refuseLibrarySource(deps.repo, adapter);
     const { approveOutside, ...options } = acceptOptions(input);
     const governance = await preflight(deps.repo, projectId, adapter.kind, options);
     await preflightDeleted(deps.repo, projectId, adapter, options);
@@ -2293,6 +2355,7 @@ export async function resumeBatch(deps: BulkImportDeps, projectId: string, batch
     if (rec.source.kind === "profile-capture") throw new BatchRefusedError("Profile captures are resumed by capturing the profile again.");
     const source = adapter ?? adapterFor(rec.source.kind, rec.source.location, rec.adapterOptions);
     if (!source) throw new BatchRefusedError("The source of this import is needed to resume it.");
+    await refuseLibrarySource(deps.repo, source);
     const governance = await preflight(deps.repo, projectId, rec.source.kind, rec.options);
     await preflightDeleted(deps.repo, projectId, source, rec.options);
     if (rec.fieldwork) {
@@ -2394,6 +2457,7 @@ export async function dryRun(
 ): Promise<ScanSummary> {
   const repo = deps.repo;
   repo.getProject(projectId);
+  await refuseLibrarySource(repo, adapter);
   await dryRunPolicy(repo, projectId, adapter.kind);
   const dedupe = new BatchDedupe(deps.index.db, projectId, (id) => hasSource(repo, projectId, id));
   const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [], notes: [], outsideFiles: [], linkedFiles: 0 };
@@ -2421,6 +2485,7 @@ export async function dryRun(
     // The approvals the batch would be given count here too (kept in memory only, under a throwaway secret).
     const secret = randomBytes(32).toString("hex");
     const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))], secret, await approvalHashes(secret, opts.approveOutside));
+    const inLibrary = await libraryFileTest(repo, dir, adapter.kind);
     for await (const scanned of scan) {
       let item = scanned;
       if (item.gone) continue; // gone at its source: nothing to import
@@ -2428,6 +2493,19 @@ export async function dryRun(
       if (item.unreadable) {
         summary.unreadable.push({ path: item.key, reason: item.unreadable });
         continue;
+      }
+      // R362 c: a file inside the library's own folder is left out whatever is approved, as the batch will (not read).
+      if (item.files.length) {
+        const kept: ScanItem["files"] = [];
+        for (const x of item.files) if (!(await inLibrary(x, await realOrNearest(x.path)))) kept.push(x);
+        if (kept.length < item.files.length) {
+          if (!item.referenceMetadata && !kept.length) {
+            summary.unreadable.push({ path: item.key, reason: IN_LIBRARY_TEXT.file });
+            continue;
+          }
+          if (!summary.notes.includes(IN_LIBRARY_TEXT.file)) summary.notes.push(IN_LIBRARY_TEXT.file);
+          item = { ...item, files: kept };
+        }
       }
       summary.linkedFiles += item.files.filter((x) => x.link === true).length;
       if (policy && item.files.length) {

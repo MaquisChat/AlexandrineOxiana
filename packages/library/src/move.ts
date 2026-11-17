@@ -25,7 +25,7 @@ import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { copyFileAtomic, writeFileAtomic } from "./fs/atomic.js";
 import { checkpointTruncate, INDEX_FILE, type IndexHandle } from "./index/db.js";
-import { MOVED_MARKER, MOVE_JOURNAL, isClosed, openLibraryInternal, projectMovedAway, type Library, type LibraryJson } from "./library.js";
+import { FINDER_FILES, MOVED_MARKER, MOVE_JOURNAL, entriesBesidesFinderFiles, isClosed, openLibraryInternal, projectMovedAway, type Library, type LibraryJson } from "./library.js";
 import { classifyLocation, type Location, type LocationEnv } from "./location.js";
 import { acquireLock, peekLock, readLock, releaseLock } from "./lock.js";
 import {
@@ -332,7 +332,7 @@ async function preflight(lib: Library, destRoot: string, repo?: Repo): Promise<J
   try {
     const st = await fsp.stat(destRoot);
     if (!st.isDirectory()) throw new MoveNotAllowedError("destination-not-empty", "The destination exists and is not a folder");
-    names = await fsp.readdir(destRoot);
+    names = await entriesBesidesFinderFiles(destRoot); // the Finder's own files count as empty (FR-047)
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
@@ -650,7 +650,8 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   }
   const dirSet = new Set([...src.dirs.map((d) => d.rel), ...LIBRARY_DIRS]);
   const atDest = await walk(dest, (rel) => rel === MOVE_JOURNAL || rel === ".tmp");
-  for (const f of atDest.files) if (!expected.has(f.rel)) bad.push(f.rel);
+  // The Finder's own files at the destination's top (there before the move, which counted the folder as empty; FR-047) are left.
+  for (const f of atDest.files) if (!expected.has(f.rel) && !FINDER_FILES.has(f.rel)) bad.push(f.rel);
   for (const d of atDest.dirs) if (!dirSet.has(d.rel)) bad.push(d.rel);
   bad.push(...atDest.odd);
   if (bad.length > 0) {

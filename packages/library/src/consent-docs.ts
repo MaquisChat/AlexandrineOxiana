@@ -3,7 +3,8 @@
  * stored as an identifiable source of the project, linked to the participant, and its file is
  * recorded as the consent's `documentAssetId` (only this path sets it).
  *
- * The file goes through attach's rules (I4): content sniffed (PDF or an image), at most 100 MB, a
+ * The file goes through attach's rules (I4): never a file inside the open library's own folder (by real path, links
+ * followed; R368 b — a found file held for the researcher's check comes in only through the review queue), content sniffed (PDF or an image), at most 100 MB, a
  * regular file (no folder or symbolic link), location metadata governed like any dropped photo
  * (a located file in a project that hides locations but is not encrypted is refused; under a
  * location rule a viewing proxy is queued, R83).
@@ -27,7 +28,9 @@ import { pendingFor, proxyQueueFor, proxyTypeFor, type ProxyPlan, type ProxyQueu
 import { LOCATED_MEDIA, mayHaveLocation } from "./import/resolve.js";
 import { InvalidInputError, NotFoundError } from "./repo/errors.js";
 import { DETACHED_FORM, DETACH_FIRST } from "./repo/fieldwork.js";
-import { createSourceRefusing, onProjectOpened, setConsentDocumentAsset, type Repo } from "./repo/repo.js";
+import { createSourceRefusing, onProjectOpened, repoLibrary, setConsentDocumentAsset, type Repo } from "./repo/repo.js";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { insideLibrary } from "./fs/inside-library.js";
 
 const VERSION: string = libraryVersion();
 
@@ -70,6 +73,8 @@ export async function attachConsentDocument(
   if (c.documentAssetId) throw new InvalidInputError(DETACH_FIRST);
 
   const name = basename(path);
+  // R368 b: nothing inside the library's own folder (before the file is looked at; nothing is changed).
+  if (await insideLibrary(path, repoLibrary(repo))) throw new InvalidInputError(IN_LIBRARY_TEXT.file);
   const st = await fsp.lstat(path).catch(() => null);
   if (!st) throw new InvalidInputError(`${name} could not be found`);
   if (st.isSymbolicLink()) throw new InvalidInputError(`${name} is a shortcut (symbolic link); drop the form itself`);

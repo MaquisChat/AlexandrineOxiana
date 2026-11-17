@@ -366,6 +366,22 @@ describe("planMove", () => {
     await expect(planMove(lib, dest, env)).resolves.toBeDefined();
   });
 
+  it("FR-047: a destination holding only the Finder's .DS_Store / .localized counts as empty; a link of that name does not", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await mkdir(dest);
+    await writeFile(join(dest, ".DS_Store"), "finder");
+    await writeFile(join(dest, ".localized"), "");
+    await expect(planMove(lib, dest, env)).resolves.toBeDefined();
+    await rm(join(dest, ".DS_Store"));
+    await symlink(join(dest, ".localized"), join(dest, ".DS_Store"));
+    await expect(planMove(lib, dest, env)).rejects.toMatchObject({ code: "destination-not-empty" });
+    await rm(join(dest, ".DS_Store"));
+    await writeFile(join(dest, ".DS_Store"), "finder");
+    await writeFile(join(dest, ".hidden"), "mine");
+    await expect(planMove(lib, dest, env)).rejects.toMatchObject({ code: "destination-not-empty" });
+  });
+
   it("aborts on a symbolic link inside the library, naming it", async () => {
     const { lib, a } = await fixture();
     await symlink(pdf, join(lib.root, a.folder, "link.pdf"));
@@ -378,6 +394,19 @@ describe("planMove", () => {
 });
 
 describe("executeMove", () => {
+  it("FR-047: moves into a folder that holds only the Finder's .DS_Store, and leaves that file", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Finder", "Lib");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, ".DS_Store"), "finder");
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    expect(res.verified).toBe(true);
+    expect(await readFile(join(dest, ".DS_Store"), "utf8")).toBe("finder");
+    const moved = await openLibrary(dest, mkDeps());
+    expect(moved.mode).toBe("read-write");
+    await moved.close();
+  });
+
   it("copies, verifies and switches a library with two projects", async () => {
     const { lib, a, b } = await fixture();
     const before = await hashes(lib.root, notLock);

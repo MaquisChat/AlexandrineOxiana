@@ -2,6 +2,7 @@
  * Protocol approval documents (spec 6.3(9), Task 36, R117 I6): files the researcher drops onto the
  * protocol record are copied into `<Project>/protocol/`.
  *
+ * - Never a file inside the open library's own folder (by real path, links followed; R368 b).
  * - Only PDF, Word (DOCX), OpenDocument text, plain text and images (by content, not by name), each
  *   at most 100 MB, regular files only (no folder or symbolic link).
  * - Unencrypted projects keep the document's name; a name in use gets " (2)", " (3)", ….
@@ -19,6 +20,8 @@ import { InvalidInputError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibra
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import type { Tx } from "./repo/mutate.js";
 import { noteIntegrityWarning, projectDataKey, projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { insideLibrary } from "./fs/inside-library.js";
 
 /** Test seam (package-internal): a smaller cap for the check made on what was copied. */
 export const protocolSeams: { copyMaxBytes?: number } = {};
@@ -108,8 +111,10 @@ async function isPlainText(path: string): Promise<boolean> {
 }
 
 /** Why the file cannot be a protocol document, or undefined when it can. */
-async function refusal(path: string): Promise<string | undefined> {
+async function refusal(repo: Repo, path: string): Promise<string | undefined> {
   const name = basename(path);
+  // R368 b: nothing inside the library's own folder (before the file is looked at).
+  if (await insideLibrary(path, repoLibrary(repo))) return IN_LIBRARY_TEXT.file;
   const st = await fsp.lstat(path).catch(() => null);
   if (!st) return `${name} could not be found.`;
   if (st.isSymbolicLink()) return `${name} is a shortcut (symbolic link); drop the document itself.`;
@@ -194,7 +199,7 @@ export async function addProtocolDocuments(repo: Repo, projectId: string, paths:
   const out: ProtocolDocumentResult[] = [];
   for (const path of paths) {
     const file = basename(path);
-    const why = await refusal(path);
+    const why = await refusal(repo, path);
     if (why) {
       out.push({ file, outcome: "failed", reason: why });
       continue;

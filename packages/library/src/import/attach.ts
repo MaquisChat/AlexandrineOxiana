@@ -4,6 +4,11 @@
  * (never moved or deleted), encrypted at rest in encrypted projects by the repository's asset APIs.
  *
  * Per dropped path:
+ *   0. a path whose real path lies inside the open library's own folder → `failed`, IN_LIBRARY_TEXT.file, before
+ *      anything is read (R362 c; a found file held for the researcher's check comes in only through the review queue).
+ *      The real path is resolved ONCE and every later open (the stat, the sniff, the hash, the metadata, the copy) goes
+ *      through it (R368 c), so a link re-pointed after the check changes nothing; the file's name as the researcher
+ *      dropped it (a link's own name) is what names the item;
  *   1. a folder → `failed`, "Use Bulk Import for folders" (Task 23 handles folders);
  *   2. the type is sniffed from the content with `file-type` (the extension is never trusted);
  *      only PDF, EPUB, MOBI/AZW, DOCX, images, audio and video are accepted;
@@ -38,6 +43,7 @@
  * locked (`HttpClient.purgeSensitive`); the Repo has no lock hook or event yet (carried to Task 30).
  */
 import * as fsp from "node:fs/promises";
+import { basename } from "node:path";
 import { libraryVersion } from "../resources.js";
 import { fileTypeFromFile } from "file-type";
 import { findDuplicate, type DupKey, type FileNamePattern, type SourceFile } from "@ao/core";
@@ -46,7 +52,9 @@ import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
-import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectCollectionsAndTags, type Repo } from "../repo/repo.js";
+import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectCollectionsAndTags, repoLibrary, type Repo } from "../repo/repo.js";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { realInsideLibrary, realOrNearest } from "../fs/inside-library.js";
 import type { CreateInTx } from "../repo/sources.js";
 import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
 import { pendingFor, proxyQueueFor, proxyTypeFor, type ProxyPlan, type ProxyQueue } from "./proxies.js";
@@ -245,7 +253,10 @@ export function createAttach(deps: AttachDeps): Attach {
 
   type Stored = { ext: string; mime: string; kind: string };
 
-  async function ontoSource(projectId: string, path: string, sf: SourceFile, mime: string, stored: Stored, sha256: string): Promise<AttachOutcome> {
+  /** A dropped file: `path` as given (it names the outcome and the item), `real` what is read (R368 c). */
+  type Dropped = { path: string; real: string };
+
+  async function ontoSource(projectId: string, { path, real }: Dropped, sf: SourceFile, mime: string, stored: Stored, sha256: string): Promise<AttachOutcome> {
     const sourceId = sf.source.id;
     // Files added in this call count too.
     const current = await repo.getSource(projectId, sourceId);
@@ -255,13 +266,13 @@ export function createAttach(deps: AttachDeps): Attach {
     let hasLocation = false;
     if (LOCATED_MEDIA.test(mime)) {
       if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the metadata read
-      hasLocation = mayHaveLocation(mime, await extractMetadata(path, mime));
+      hasLocation = mayHaveLocation(mime, await extractMetadata(real, mime));
     }
     const plan = locatedPlan(hasLocation, mime);
     const rule = locationRule();
     const { ext, kind } = stored;
     if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the copy
-    await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, mime: stored.mime, label: addedLabel(kind, new Date()) }, "manual_upload", {
+    await addCapturedOriginal(repo, projectId, sourceId, { fromPath: real, kind, ext, mime: stored.mime, label: addedLabel(kind, new Date()) }, "manual_upload", {
       hasLocation,
       refuse: rule.hook,
       pendingProxies: (asset) => pendingFor(plan, [asset], rule.mode()),
@@ -286,7 +297,7 @@ export function createAttach(deps: AttachDeps): Attach {
     return { note: LOCATION_REASON };
   }
 
-  async function ontoLibrary(projectId: string, path: string, mime: string, stored: Stored, sha256: string, s: Session, opts: AttachOpts): Promise<AttachOutcome> {
+  async function ontoLibrary(projectId: string, { path, real }: Dropped, mime: string, stored: Stored, sha256: string, s: Session, opts: AttachOpts): Promise<AttachOutcome> {
     const keys = await s.keys();
     const same = keys.find((k) => k.sha256s.includes(sha256));
     if (same) return { path, outcome: "duplicate", sourceId: same.sourceId };
@@ -294,7 +305,7 @@ export function createAttach(deps: AttachDeps): Attach {
     const sidecarPaths = await findSidecars(path, deps.readable);
     if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the metadata read (resolveItem's first step)
     const r = await resolveItem(
-      { path, mime, sidecarPaths, ...(deps.readable ? { sidecarReadable: deps.readable } : {}) },
+      { path: real, fileName: basename(path), mime, sidecarPaths, ...(deps.readable ? { sidecarReadable: deps.readable } : {}) },
       { projectId, patterns, lookup: await s.lookup() },
     );
     const dup = findDuplicate(candidateKey(r, [sha256]), keys);
@@ -320,7 +331,7 @@ export function createAttach(deps: AttachDeps): Attach {
         repo,
         projectId,
         { ...r.draft, collectionIds },
-        [{ path, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind }],
+        [{ path: real, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind, ...(!deps.readable ? { noFollow: true } : {}) }],
         {
           provenance,
           fieldEvidence: r.fieldEvidence,
@@ -366,19 +377,27 @@ export function createAttach(deps: AttachDeps): Attach {
   async function attachOne(projectId: string, path: string, opts: AttachOpts, s: Session, freshKeys = false): Promise<AttachOutcome> {
     const toSourceId = opts.toSourceId;
     if (freshKeys) s.refreshKeys();
-    const st = await fsp.stat(path).catch(() => null);
+    // R362 c (defect D27): nothing inside the library's own folder (by real path) is attached — not a project's file,
+    // not a found file held for the researcher's check (it comes in only through "Use this file"). Before anything is
+    // read. A watched folder (`readable` given) is not asked here: its folder is refused when it is inside the library
+    // or holds it, and a link in it to anywhere else is refused, both by real path (watch.ts); and every call it makes
+    // on its folder goes through that folder's one gate, which a call made here would bypass.
+    // R368 c: resolved once; checked; read through (a watched folder reads `path` itself, through its gate).
+    const real = deps.readable ? path : await realOrNearest(path);
+    if (!deps.readable && (await realInsideLibrary(real, repoLibrary(repo)))) return failed(path, IN_LIBRARY_TEXT.file);
+    const st = await fsp.stat(real).catch(() => null);
     if (!st) return failed(path, REASONS.missing);
     if (st.isDirectory()) return failed(path, FOLDER_REASON);
     if (!st.isFile()) return failed(path, REASONS.notAFile);
     // Before the first byte is read (the type sniff below), and again before EACH later open (the hash, the
     // metadata, the copy): a file that is not on this computer, or no longer as it was checked, is not read (A6).
-    // These opens (by file-type, the hash stream, the metadata worker, the copy, readSidecar) follow a symbolic link:
-    // they rely on the comparison made immediately before each (a link swapped in fails it); only the watched
-    // folder's own hash refuses a link outright (O_NOFOLLOW).
+    // Every open goes through `real`, the path checked above (no link on the way when it was resolved); a watched
+    // folder's opens follow a link and rely on the comparison made immediately before each (a link swapped in fails
+    // it); only the watched folder's own hash refuses a link outright (O_NOFOLLOW).
     if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON);
     let type: { ext: string; mime: string } | undefined;
     try {
-      type = await fileTypeFromFile(path);
+      type = await fileTypeFromFile(real);
     } catch {
       return failed(path, REASONS.missing);
     }
@@ -389,9 +408,10 @@ export function createAttach(deps: AttachDeps): Attach {
     const denied = await s.policy();
     if (denied) return failed(path, denied);
     if (await notReadable(path)) return failed(path, NOT_DOWNLOADED_REASON); // before the hash
-    const sha256 = await sha256File(path);
-    if (target) return ontoSource(projectId, path, target, type.mime, stored, sha256);
-    return ontoLibrary(projectId, path, type.mime, stored, sha256, s, opts);
+    const sha256 = await sha256File(real);
+    const file = { path, real };
+    if (target) return ontoSource(projectId, file, target, type.mime, stored, sha256);
+    return ontoLibrary(projectId, file, type.mime, stored, sha256, s, opts);
   }
 
   async function attachFiles(projectId: string, paths: string[], opts: AttachOpts = {}): Promise<AttachOutcome[]> {
