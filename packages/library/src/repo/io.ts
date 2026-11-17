@@ -141,7 +141,10 @@ export async function appendDurable(
   const fd = fs.openSync(path, "a", mode);
   try {
     if (mode !== undefined && process.platform !== "win32") fs.fchmodSync(fd, mode);
-    fs.writeSync(fd, text);
+    // A write can be cut short (a full disk writes part of it and says how much): the rest is written, and the
+    // next write's error (ENOSPC) undoes the whole append below, so no torn line is left (R393 c).
+    const bytes = Buffer.from(text, "utf8");
+    for (let off = 0; off < bytes.length; ) off += fs.writeSync(fd, bytes, off, bytes.length - off);
     fs.fsyncSync(fd);
   } catch (err) {
     try {
