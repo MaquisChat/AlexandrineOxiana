@@ -4,21 +4,16 @@
  *  - (a) before a batch that copies files starts, the size of the files to be copied, plus a margin (10% of that
  *    size, at least MIN_MARGIN), plus for a Zotero local import the copy of its database, is compared with the
  *    free room on the disk that holds the library; too little refuses the start (`fitSentence`). The size is what
- *    the dry run of the same source found (`rememberScan`, kept in memory only), else the source's own cheap total
- *    (`cheapEstimate`): a folder, a device folder and a Calibre library by the sizes of their files (a ZIP archive
- *    in them by the sizes its entries declare), a ZIP archive by the sizes its entries declare, a Zotero data folder
- *    by the sizes of the files under its `storage` folder. Reference-manager exports and Zotero Web have no cheap
- *    total: their check is skipped (the per-file check in the run still protects);
+ *    a dry run of the same source found within the last 30 minutes (`rememberScan`, kept in memory only): only what
+ *    the run would copy (R436 b). With no such dry run the start is not refused: the per-file check protects;
  *  - (b) during the run, before an item's files are copied, the free room must be at least their size plus
  *    FILE_MARGIN (`fileMargin`), or the batch stops (run.ts).
  *
  * The free room is read with statfs (`statfsFree`, as the Zotero copy and Zotero Web's downloads do); a disk that
  * cannot tell skips the checks.
  */
-import type { Dirent } from "node:fs";
 import * as fsp from "node:fs/promises";
-import { extname, join } from "node:path";
-import yauzl from "yauzl";
+import { join } from "node:path";
 import { statfsFree } from "../sqlite-copy.js";
 import type { ImportSourceAdapter } from "./scan.js";
 
@@ -79,101 +74,47 @@ export class NoRoomError extends Error {
   }
 }
 
-/** What is known of a source's files before a batch starts: their total size, and of it the files the source links in place. */
+/** What a dry run found of a source's files: their total size to be copied, and of it the files the source links in place. */
 export interface SpaceEstimate {
   totalBytes: number;
   linkedBytes: number;
 }
 
-/** The latest dry run of each source, by project, kind and location (in memory only, never written). */
-const lastScans = new Map<string, SpaceEstimate>();
-const MAX_REMEMBERED = 64;
-const scanKey = (projectId: string, a: Pick<ImportSourceAdapter, "kind" | "location">) => `${projectId}\u0000${a.kind}\u0000${a.location}`;
+/** R436 b: how long a dry run is used for the start's check. */
+export const SCAN_FRESH_MS = 30 * 60_000;
 
-/** Remembers what a dry run found (R413 a): a batch from the same source then starts by this number. */
-export function rememberScan(projectId: string, a: Pick<ImportSourceAdapter, "kind" | "location">, est: SpaceEstimate): void {
-  const k = scanKey(projectId, a);
+/** The files and folders approved outside the source (they change what a scan counts), in one canonical form. */
+export interface ScanApprovals {
+  folders?: string[];
+  files?: string[];
+  rememberFolders?: string[];
+}
+const approvalsKey = (ap: ScanApprovals | undefined) =>
+  JSON.stringify([[...new Set([...(ap?.folders ?? []), ...(ap?.rememberFolders ?? [])])].sort(), [...new Set(ap?.files ?? [])].sort()]);
+
+/** The latest dry run of each source, by project, kind, location and approvals, with when it was made (in memory only, never written). */
+const lastScans = new Map<string, SpaceEstimate & { at: number }>();
+const MAX_REMEMBERED = 64;
+const scanKey = (projectId: string, a: Pick<ImportSourceAdapter, "kind" | "location">, ap: ScanApprovals | undefined) =>
+  `${projectId}\u0000${a.kind}\u0000${a.location}\u0000${approvalsKey(ap)}`;
+
+/** Remembers what a dry run found at `at` (ms, the repo's clock; R413 a, R436 b): a start from the same source then goes by it. */
+export function rememberScan(projectId: string, a: Pick<ImportSourceAdapter, "kind" | "location">, ap: ScanApprovals | undefined, est: SpaceEstimate, at: number): void {
+  const k = scanKey(projectId, a, ap);
   lastScans.delete(k);
-  lastScans.set(k, est);
+  lastScans.set(k, { ...est, at });
   while (lastScans.size > MAX_REMEMBERED) lastScans.delete(lastScans.keys().next().value!);
 }
 
-export function rememberedScan(projectId: string, a: Pick<ImportSourceAdapter, "kind" | "location">): SpaceEstimate | undefined {
-  return lastScans.get(scanKey(projectId, a));
-}
-
-/** Entries walked at most for a cheap total; a folder with more has no cheap total. */
-const MAX_ENTRIES = 1_000_000;
-const MAX_DEPTH = 64;
-
-/** The uncompressed sizes a ZIP archive's entries declare (no extraction); 0 when it cannot be read. */
-function zipDeclaredBytes(path: string): Promise<number> {
-  return new Promise((done) => {
-    yauzl.open(path, { lazyEntries: true, autoClose: false }, (err, zf) => {
-      if (err || !zf) return done(0);
-      let n = 0;
-      zf.on("entry", (e: yauzl.Entry) => {
-        if (!e.fileName.endsWith("/")) n += e.uncompressedSize;
-        zf.readEntry();
-      });
-      zf.on("end", () => {
-        zf.close();
-        done(n);
-      });
-      zf.on("error", () => {
-        zf.close();
-        done(0);
-      });
-      zf.readEntry();
-    });
-  });
-}
-
-/** The sizes of a folder's files (hidden ones and links to folders left out, as a folder scan does); undefined past MAX_ENTRIES. */
-async function folderBytes(root: string, signal?: AbortSignal): Promise<number | undefined> {
-  let entries = 0;
-  const walk = async (dir: string, depth: number): Promise<number> => {
-    if (depth > MAX_DEPTH) return 0;
-    let list: Dirent[];
-    try {
-      list = await fsp.readdir(dir, { withFileTypes: true });
-    } catch {
-      return 0;
-    }
-    let n = 0;
-    for (const e of list) {
-      signal?.throwIfAborted();
-      if (++entries > MAX_ENTRIES) throw new RangeError("too many entries");
-      if (e.name.startsWith(".")) continue;
-      const p = join(dir, e.name);
-      if (e.isDirectory()) n += await walk(p, depth + 1);
-      else if (e.isFile() || e.isSymbolicLink()) {
-        const st = await fsp.stat(p).catch(() => null);
-        if (!st?.isFile()) continue;
-        n += extname(e.name).toLowerCase() === ".zip" ? await zipDeclaredBytes(p) : st.size;
-      }
-    }
-    return n;
-  };
-  try {
-    return await walk(root, 0);
-  } catch (err) {
-    if ((err as Error)?.name === "AbortError") throw err;
-    return undefined;
-  }
+/** R436 b: the dry run of the same source and approvals made within SCAN_FRESH_MS before `now`; undefined otherwise (no check). */
+export function rememberedScan(projectId: string, a: Pick<ImportSourceAdapter, "kind" | "location">, ap: ScanApprovals | undefined, now: number): SpaceEstimate | undefined {
+  const s = lastScans.get(scanKey(projectId, a, ap));
+  if (!s || now - s.at > SCAN_FRESH_MS || now < s.at) return undefined;
+  return { totalBytes: s.totalBytes, linkedBytes: s.linkedBytes };
 }
 
 /** A Zotero data folder's location may name another of its libraries (zotero-local.ts): the folder is what comes before. */
 export const zoteroDataDir = (location: string) => location.replace(/#library=\d{1,9}$/u, "");
-
-/** R413 a: the source's own cheap total, by kind (see the header); undefined when it has none. */
-export async function cheapEstimate(a: Pick<ImportSourceAdapter, "kind" | "location">, signal?: AbortSignal): Promise<SpaceEstimate | undefined> {
-  let total: number | undefined;
-  if (a.kind === "folder" || a.kind === "device" || a.kind === "calibre") total = await folderBytes(a.location, signal);
-  else if (a.kind === "zip") total = await zipDeclaredBytes(a.location);
-  else if (a.kind === "zotero-local") total = await folderBytes(join(zoteroDataDir(a.location), "storage"), signal);
-  return total === undefined ? undefined : { totalBytes: total, linkedBytes: 0 };
-}
 
 /** R413 a, d: the size of a Zotero local import's database copy (the files copyDatabases copies, with their companions). */
 export async function zoteroCopyBytes(dataDir: string): Promise<number> {

@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project } from "@ao/core";
-import { buildPdf, buildZip } from "../../../../../tests/fixtures/generate.mjs";
+import { buildPdf } from "../../../../../tests/fixtures/generate.mjs";
 import { buildZoteroFixture } from "../../../tests/fixtures/zotero/build-fixture.mjs";
 import { KeyRing } from "../../crypto/keys.js";
 import type { Deps } from "../../deps.js";
@@ -22,8 +22,8 @@ import { HttpClient } from "../../lookup/index.js";
 import type { Repo } from "../../repo/repo.js";
 import { openTestRepo } from "../../repo/testing.js";
 import { ZOTERO_REASONS, zoteroLocalAdapter } from "../zotero-local.js";
-import { createBulkImport, folderAdapter, zipAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
-import { bulkSpaceSeams, fitSentence, sizeWords, zoteroCopyBytes } from "./space.js";
+import { createBulkImport, folderAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
+import { DISK_FULL_NOTE, bulkSpaceSeams, fitSentence, sizeWords, zoteroCopyBytes } from "./space.js";
 
 const GOV = `identifiability:
   containsIdentifiable: false
@@ -42,6 +42,8 @@ let handle: IndexHandle;
 let agent: MockAgent;
 let bulk: BulkImport;
 let free: number;
+/** The repo's clock (R436 b: a dry run is used for 30 minutes). */
+let now: number;
 
 function deps(): Deps {
   return {
@@ -62,11 +64,17 @@ async function project(): Promise<Project> {
   return project;
 }
 
-/** A folder of `n` files of `bytes` each (text: their content does not matter to the room). */
+/** A PDF of exactly `bytes` bytes (padded), different for each `tag`. */
+async function pdfOf(tag: string, bytes: number): Promise<Buffer> {
+  const pdf = await buildPdf({ extra: tag });
+  return Buffer.concat([pdf, Buffer.alloc(Math.max(0, bytes - pdf.length), 32)]);
+}
+
+/** A folder of `n` PDFs of `bytes` each, each different (R436 b: only files the run would copy count, so real PDFs). */
 async function folder(name: string, n: number, bytes: number): Promise<string> {
   const dir = join(tmp, name);
   await mkdir(dir, { recursive: true });
-  for (let i = 0; i < n; i++) await writeFile(join(dir, `file-${i}.txt`), Buffer.alloc(bytes, 97));
+  for (let i = 0; i < n; i++) await writeFile(join(dir, `file-${i}.pdf`), await pdfOf(`${name} ${i}`, bytes));
   return dir;
 }
 
@@ -90,7 +98,8 @@ beforeEach(async () => {
   ring = new KeyRing();
   lib = await createLibrary(join(tmp, "Lib"), "Lib", deps());
   handle = new IndexHandle(lib.root);
-  repo = await openTestRepo(lib, ring, { scryptN: 2 ** 10, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+  now = Date.parse("2026-11-17T09:00:00Z");
+  repo = await openTestRepo(lib, ring, { scryptN: 2 ** 10, actor: "tester", clock: () => new Date(now), index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
   agent = new MockAgent();
   agent.disableNetConnect();
   const http = new HttpClient({ libraryRoot: lib.root, dispatcher: agent, sleep: async () => {}, maxRetries: 0 });
@@ -130,6 +139,8 @@ describe("before a batch that copies files starts (R413 a)", () => {
     const p = await project();
     const src = await folder("Papers", 3, 1e6);
     free = 100e6;
+    // R436 b: the start goes by the dry run of the same source.
+    await bulk.dryRun(p.id, folderAdapter(src));
     await expect(bulk.startBatch(p.id, folderAdapter(src))).rejects.toMatchObject({
       name: "BatchRefusedError",
       reason: "This import would copy about 3 MB of files into the library, but its disk has only 100 MB free. Free some space, or choose to leave the files where they are, and start again.",
@@ -141,33 +152,90 @@ describe("before a batch that copies files starts (R413 a)", () => {
     expect((await h.done).state).toBe("finished");
   });
 
-  it("the margin is 10% of a large import's size", async () => {
+  it("the margin is 10% of the size when that is more than the least margin", async () => {
     const p = await project();
-    const zip = join(tmp, "big.zip");
-    // An archive whose entries declare 8 GB in all (the archive itself is small).
-    await writeFile(zip, buildZip([{ name: "a.pdf", data: "x", declaredSize: 4e9 }, { name: "b.pdf", data: "y", declaredSize: 4e9 }]));
-    free = 8e9 + 0.8e9 - 1;
-    await expect(bulk.startBatch(p.id, zipAdapter(zip))).rejects.toMatchObject({
-      // A ZIP's files are unpacked and always copied: there is no "leave them where they are".
-      reason: "This import would copy about 8 GB of files into the library, but its disk has only 8.8 GB free. Free some space and start again.",
-    });
+    bulkSpaceSeams.minMargin = 1e6;
+    const src = await folder("Papers", 3, 4e6);
+    free = 12e6 + 1.2e6 - 1;
+    await bulk.dryRun(p.id, folderAdapter(src));
+    await expect(bulk.startBatch(p.id, folderAdapter(src))).rejects.toMatchObject({ reason: fitSentence(12e6, free, true) });
     await nothingWritten(p);
+    free = 12e6 + 1.2e6;
+    expect((await (await bulk.startBatch(p.id, folderAdapter(src))).done).state).toBe("finished");
   });
 
-  it("goes by the dry run of the same source, else by the source's own total", async () => {
+  it("goes by a dry run of the same source; with none, the start is not refused (the check before each item's files protects)", async () => {
     const p = await project();
     bulkSpaceSeams.minMargin = 1e6;
     const src = await folder("Papers", 3, 1e6);
     free = 5e6;
     const summary = await bulk.dryRun(p.id, folderAdapter(src));
     expect(summary.totalBytes).toBe(3e6);
-    // A file added after the dry run: the folder's own total (7 MB with the margin) would not fit; the scan's does.
-    await writeFile(join(src, "late.txt"), Buffer.alloc(3e6, 98));
+    // A file added after the dry run: the start still goes by the scan's number (the run's own check is not this test's:
+    // the room is made ample once the start has been let through).
+    await writeFile(join(src, "late.pdf"), await pdfOf("late", 3e6));
+    const h = await bulk.startBatch(p.id, folderAdapter(src));
+    free = Number.POSITIVE_INFINITY;
+    expect((await h.done).state).toBe("finished");
+    // Another source of the project has no dry run: the start is not refused (no walk of the folder in the request).
+    free = 5e6;
+    const other = await folder("More", 6, 1e6);
+    const h2 = await bulk.startBatch(p.id, folderAdapter(other));
+    free = Number.POSITIVE_INFINITY;
+    expect((await h2.done).state).toBe("finished");
+  });
+
+  it("a dry run older than 30 minutes is not used (R436 b)", async () => {
+    const p = await project();
+    bulkSpaceSeams.minMargin = 1e6;
+    const src = await folder("Papers", 6, 1e6);
+    free = 5e6;
+    expect((await bulk.dryRun(p.id, folderAdapter(src))).spaceWarning).toBeDefined();
+    now += 29 * 60_000;
+    await expect(bulk.startBatch(p.id, folderAdapter(src))).rejects.toMatchObject({ name: "BatchRefusedError" });
+    now += 2 * 60_000;
+    // Older: not used, so the start is not refused (how far the run gets on 5 MB is not what this test checks).
+    const h = await bulk.startBatch(p.id, folderAdapter(src));
+    expect(["finished", "failed"]).toContain((await h.done).state);
+  });
+
+  it("with no dry run the start is allowed, and a disk too small stops the batch at the check before the files (R413 b)", async () => {
+    const p = await project();
+    bulkSpaceSeams.minMargin = 1e6;
+    bulkSpaceSeams.fileMargin = 2e6;
+    const src = await folder("Papers", 6, 1e6);
+    free = 2.5e6;
+    const h = await bulk.startBatch(p.id, folderAdapter(src));
+    const res = await h.done;
+    expect(res.state).toBe("failed");
+    expect(res.counts.failed).toBe(0);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain(DISK_FULL_NOTE);
+  });
+
+  it("a re-import of a folder already imported, one small file added, is not refused: only what would be copied counts (R436 b, the review's P2)", async () => {
+    const p = await project();
+    bulkSpaceSeams.minMargin = 1e6;
+    const src = await folder("Papers", 3, 2e6);
+    expect((await (await bulk.startBatch(p.id, folderAdapter(src))).done).state).toBe("finished");
+    await writeFile(join(src, "new.pdf"), await pdfOf("new", 5000));
+    free = 4e6;
+    const s = await bulk.dryRun(p.id, folderAdapter(src));
+    expect(s.alreadyImported).toBe(3);
+    expect(s.totalBytes).toBe(5000);
+    expect(s.copyBytes).toBe(5000);
+    expect(s.spaceWarning).toBeUndefined();
     const h = await bulk.startBatch(p.id, folderAdapter(src));
     expect((await h.done).state).toBe("finished");
-    // Another source of the project has no scan to go by: its own total counts.
-    const other = await folder("More", 6, 1e6);
-    await expect(bulk.startBatch(p.id, folderAdapter(other))).rejects.toMatchObject({ reason: fitSentence(6e6, 5e6, true) });
+  });
+
+  it("the dry run's total leaves out files of a kind not imported and a second copy of the same file within the scan (R436 b)", async () => {
+    const p = await project();
+    const src = await folder("Papers", 1, 1e6);
+    await writeFile(join(src, "copy.pdf"), await readFile(join(src, "file-0.pdf")));
+    await writeFile(join(src, "notes.txt"), Buffer.alloc(3e6, 97));
+    const s = await bulk.dryRun(p.id, folderAdapter(src));
+    expect(s.totalBytes).toBe(1e6);
+    expect(s.copyBytes).toBe(1e6);
   });
 
   it("is never refused for room when the files are left where they are", async () => {
@@ -201,9 +269,9 @@ describe("before a batch that copies files starts (R413 a)", () => {
     buildZoteroFixture(dataDir, { pdf: await buildPdf({ extra: "okafor" }), linkedPdf: await buildPdf({ extra: "linked" }), linkedDir: join(tmp, "Elsewhere") });
     const db = await zoteroCopyBytes(dataDir);
     expect(db).toBeGreaterThan(0);
-    // The cheap total of a Zotero data folder: the files under its storage folder.
-    let files = 0;
-    for (const e of await readdir(join(dataDir, "storage"), { withFileTypes: true, recursive: true })) if (e.isFile()) files += (await stat(join(e.parentPath, e.name))).size;
+    // R436 b: the start goes by the dry run (what it would copy: the stored files; linked ones stay links).
+    const files = (await bulk.dryRun(p.id, zoteroLocalAdapter(dataDir))).copyBytes!;
+    expect(files).toBeGreaterThan(0);
     const need = files + Math.ceil(files / 10) + db;
     free = need - 1;
     await expect(bulk.startBatch(p.id, zoteroLocalAdapter(dataDir))).rejects.toMatchObject({ reason: fitSentence(files, need - 1, true) });

@@ -146,7 +146,7 @@ import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRe
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
-import { DISK_FULL_NOTE, NoRoomError, RECOVERY_NOTE, cheapEstimate, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir } from "./space.js";
+import { DISK_FULL_NOTE, NoRoomError, RECOVERY_NOTE, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir, type ScanApprovals } from "./space.js";
 import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = libraryVersion();
@@ -470,6 +470,10 @@ export interface BatchHandle {
 export interface ScanSummary {
   items: number;
   byType: Record<string, number>;
+  /**
+   * R436 b: the bytes of the files a batch would copy or link: only files of a kind that is imported, each once, and
+   * none of an item already in the project or a second copy within the scan (what the run would take as a duplicate).
+   */
   totalBytes: number;
   /** Items that are likely duplicates of another item in the scan or of a source in the project. */
   likelyDuplicates: number;
@@ -622,16 +626,16 @@ async function preflightDeleted(repo: Repo, projectId: string, adapter: { increm
 const COPY_ONLY_KINDS: ReadonlySet<string> = new Set(["zip", "zotero-web"]);
 
 /**
- * R413 a: before a batch that copies files starts, whether they fit. The bytes to be copied are what the dry run of
- * the same source found (else the source's own cheap total, space.ts; neither: no check, the run's per-file check
+ * R413 a: before a batch that copies files starts, whether they fit. The bytes to be copied are what a dry run of
+ * the same source (and approvals) found within the last 30 minutes (R436 b; none: no check, the run's per-file check
  * still protects), less the files the source links in place when they stay links; with the margin (10%, at least
  * 500 MB) and, for a Zotero local import, its database copy, they must fit in the free room on the library's disk, or
  * the start is refused (BatchRefusedError, nothing written). Returns the room the scan's own temporary copies must
  * leave free beyond themselves (ScanContext.reserveBytes): the files and the margin.
  */
-async function preflightSpace(repo: Repo, projectId: string, adapter: ImportSourceAdapter, options: ImportOptions): Promise<number> {
+async function preflightSpace(repo: Repo, projectId: string, adapter: ImportSourceAdapter, options: ImportOptions, approvals: ScanApprovals | undefined): Promise<number> {
   if (options.fileHandling === "link") return spaceMargin(0);
-  const est = rememberedScan(projectId, adapter) ?? (await cheapEstimate(adapter).catch(() => undefined));
+  const est = rememberedScan(projectId, adapter, approvals, repoClock(repo)().getTime());
   if (!est) return spaceMargin(0);
   const linkRefused = await preflightLink(repo, projectId);
   const copy = Math.max(0, est.totalBytes - (options.linkedFiles === "link" && !linkRefused ? est.linkedBytes : 0));
@@ -2479,7 +2483,7 @@ export async function startBatch(
     const { approveOutside, ...options } = acceptOptions(input);
     deps.repo.getProject(projectId); // NotFoundError for an unknown project, before its disk is asked
     // R413 a: before anything is evaluated or written (a refusal leaves nothing, not even an audited decision).
-    const reserve = await preflightSpace(deps.repo, projectId, adapter, options);
+    const reserve = await preflightSpace(deps.repo, projectId, adapter, options, approveOutside);
     const governance = await preflight(deps.repo, projectId, adapter.kind, options);
     await preflightDeleted(deps.repo, projectId, adapter, options);
     const number = await allocateBatchNumber(deps.repo, projectId);
@@ -2641,8 +2645,8 @@ async function dryRunPolicy(repo: Repo, projectId: string, kind: ImportBatch["so
  * the library's disk and, when they do not fit (with the margin and a Zotero local import's database copy), the
  * sentence the start would be refused with. The scan's numbers are remembered for a start from the same source.
  */
-async function spaceOfScan(repo: Repo, projectId: string, adapter: ImportSourceAdapter, summary: ScanSummary, linkedBytes: number): Promise<void> {
-  rememberScan(projectId, adapter, { totalBytes: summary.totalBytes, linkedBytes });
+async function spaceOfScan(repo: Repo, projectId: string, adapter: ImportSourceAdapter, summary: ScanSummary, linkedBytes: number, approvals: ScanApprovals | undefined): Promise<void> {
+  rememberScan(projectId, adapter, approvals, { totalBytes: summary.totalBytes, linkedBytes }, repoClock(repo)().getTime());
   const linkRefused = await preflightLink(repo, projectId);
   const copy = Math.max(0, summary.totalBytes - (linkRefused ? 0 : linkedBytes));
   summary.copyBytes = copy;
@@ -2676,6 +2680,15 @@ export async function dryRun(
   const seenSha = new Set<string>();
   const seenIds = new Set<string>();
   let linkedBytes = 0;
+  // R436 b: what the total counts (as the run decides): each real file's first item, the files copied by their sha.
+  const fileOwners = new Map<string, string>();
+  const copiedShas = new Set<string>();
+  const shas = new Map<string, string>();
+  const shaOf = async (real: string): Promise<string> => {
+    let h = shas.get(real);
+    if (h === undefined) shas.set(real, (h = await sha256File(real)));
+    return h;
+  };
   const ac = new AbortController();
   try {
     const scan = adapter.scan(ac.signal, {
@@ -2741,13 +2754,31 @@ export async function dryRun(
         if (inScan || inProject) summary.likelyDuplicates++;
         continue;
       }
-      let bytes = 0;
+      // R436 b: the total counts only what the run would copy (prepareFiles, importItem): files of a kind that is
+      // imported, each real file once over the scan, and nothing of an item whose first such file is already in the
+      // project or is a second copy of a file earlier in the scan (the run takes it for a duplicate and copies nothing).
+      const counted: Array<{ path: string; bytes: number; link: boolean }> = [];
       for (const x of item.files) {
-        const b = (await fsp.stat(x.path).catch(() => null))?.size ?? x.bytes;
-        bytes += b;
-        if (x.link === true) linkedBytes += b;
+        const st = await fsp.stat(x.path).catch(() => null);
+        if (!st?.isFile()) continue;
+        const real = await fsp.realpath(x.path).catch(() => resolve(x.path));
+        const owner = fileOwners.get(real);
+        if (owner !== undefined && owner !== item.key) continue;
+        const t = await fileTypeFromFile(real).catch(() => undefined);
+        if (!t || !acceptedType(t)) continue;
+        fileOwners.set(real, item.key);
+        counted.push({ path: real, bytes: st.size, link: x.link === true && !item.key.includes("!/") });
       }
-      summary.totalBytes += bytes;
+      if (counted.length) {
+        const sha = await shaOf(counted[0]!.path);
+        if (!dedupe.bySha(sha) && !copiedShas.has(sha)) {
+          copiedShas.add(sha);
+          for (const c of counted) {
+            summary.totalBytes += c.bytes;
+            if (c.link) linkedBytes += c.bytes;
+          }
+        }
+      }
       const type = await fileTypeFromFile(f.path).catch(() => undefined);
       const stored = type ? acceptedType(type) : undefined;
       if (!type || !stored) {
@@ -2758,12 +2789,12 @@ export async function dryRun(
       if (stored.mime === "application/pdf") {
         if ((await extractMetadata(f.path, stored.mime)).readFailed) summary.unreadable.push({ path: item.key, reason: REASONS.unreadable });
       }
-      const sha = await sha256File(f.path);
+      const sha = await shaOf(await fsp.realpath(f.path).catch(() => resolve(f.path)));
       if (dedupe.bySha(sha)) summary.alreadyImported++;
       else if (seenSha.has(sha)) summary.likelyDuplicates++;
       seenSha.add(sha);
     }
-    await spaceOfScan(repo, projectId, adapter, summary, linkedBytes);
+    await spaceOfScan(repo, projectId, adapter, summary, linkedBytes, opts.approveOutside);
   } finally {
     if (made) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     activeTemp.delete(name);
