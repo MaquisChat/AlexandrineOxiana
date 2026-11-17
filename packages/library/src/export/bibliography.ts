@@ -42,6 +42,7 @@ import {
 import { renderBibliographyIn, renderCitationIn } from "../citation/custom-styles.js";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { NotFoundError } from "../repo/errors.js";
+import { participantNames } from "../repo/pseudonyms.js";
 import { foldName, namesIn } from "../repo/io.js";
 import {
   appendLibraryEvent,
@@ -85,9 +86,6 @@ const escapeHtml = (s: string) => s.replace(/[&<>"']/gu, (c) => ESC[c]!);
 const escapeRtf = (s: string) =>
   [...s].map((c) => (c === "\\" || c === "{" || c === "}" ? `\\${c}` : c.charCodeAt(0) > 126 ? `\\u${(c.codePointAt(0)! << 16) >> 16}?` : c)).join("");
 
-/** Detail keys of a participant that name the person (mapped to their code like the pseudonym map). */
-const NAME_KEY = /name|handle|user|alias|account/iu;
-
 /**
  * The participant rules from the project's governance (R88 I2): the pseudonym map plus the
  * participants' identifying names, and whether identifiable sources must cite codes only.
@@ -95,11 +93,8 @@ const NAME_KEY = /name|handle|user|alias|account/iu;
 async function participantRules(repo: Repo, projectId: string): Promise<{ pseudonyms: Map<string, string>; requireCodes: boolean }> {
   // The engine's own condition decides (unreadable governance: the strictest reading).
   const requireCodes = await pseudonymizesIdentifiable(repo, projectId);
-  const pseudonyms = await projectPseudonymMap(repo, projectId);
-  const fw = await repo.getFieldwork(projectId);
-  for (const p of fw.participants) {
-    for (const [k, v] of Object.entries(p.details ?? {})) if (NAME_KEY.test(k) && v.trim().length >= 2 && !pseudonyms.has(v.trim())) pseudonyms.set(v.trim(), p.code);
-  }
+  // The list the folder names use too (repo/pseudonyms.ts participantNames, R387 d).
+  const pseudonyms = participantNames(await projectPseudonymMap(repo, projectId), (await repo.getFieldwork(projectId)).participants);
   return { pseudonyms, requireCodes };
 }
 

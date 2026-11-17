@@ -34,6 +34,37 @@ export function creatorKey(c: Creator): string | undefined {
   return k ? k.normalize("NFC") : undefined;
 }
 
+/** Detail keys of a participant that name the person (mapped to their code like the pseudonym map). */
+export const NAME_KEY = /name|handle|user|alias|account/iu;
+
+/**
+ * The names of this project's participants, name → code (R387 d): ONE list for a source's folder
+ * name (repo/sources.ts) and its citation (export/bibliography.ts), so the two cannot drift. The
+ * pseudonym map; each participant's identifying details whose key names the person (`NAME_KEY`;
+ * "fullName", "handle" …); and `creators` with their codes (the folder name of a new source:
+ * each name form — handle with and without "@", literal, family, given, "given family"). The first
+ * entry of a name wins. The citation codes its creators itself (toCslItem), so it passes none.
+ */
+export function participantNames(
+  map: ReadonlyMap<string, string>,
+  participants: readonly Participant[],
+  creators: ReadonlyArray<{ creator: Creator; code: string | undefined }> = [],
+): Map<string, string> {
+  const out = new Map(map);
+  const add = (n: string | undefined, code: string) => {
+    const t = n?.trim();
+    if (t && !out.has(t)) out.set(t, code);
+  };
+  for (const p of participants) {
+    for (const [k, v] of Object.entries(p.details ?? {})) if (NAME_KEY.test(k) && v.trim().length >= 2) add(v, p.code);
+  }
+  for (const { creator: c, code } of creators) {
+    if (!code) continue;
+    for (const n of [c.handle, c.handle?.replace(/^@+/, ""), c.literal, c.family, c.given, [c.given, c.family].filter(Boolean).join(" ")]) add(n, code);
+  }
+  return out;
+}
+
 /**
  * Next free `P-NNN` code: one past the highest numeric code ever given — of the participants, the
  * retired codes of deleted ones and the pseudonym map's codes (`taken`), so none is reissued (R117 C1).

@@ -182,6 +182,25 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(bib.content).toContain(`Entrevista a ${luciaCode}`);
   });
 
+  it("R387 (d): a participant named only in the fieldwork details is coded in the folder name and the bibliography alike", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const part = await kit.repo.createParticipant(p.id, { details: { fullName: "Lucía Fernández Ruiz" }, legalBasis: "consent" });
+    // A news story ABOUT her, by another author.
+    const story = await addSource(kit, p, {
+      type: "book",
+      title: "Lucía Fernández Ruiz habla; entrevista a Lucia Fernandez Ruiz",
+      creators: [person("Chen", "Wei")],
+      issued: "2025",
+      identifiable: true,
+    });
+    const plain = (s: string) => s.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+    expect(story.source.folder).toContain(`${part.code} habla`);
+    expect(plain(story.source.folder)).not.toMatch(/lucia|fernandez|ruiz/u);
+    const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [story.source.id] }, "apa", "text");
+    expect(bib.content).toContain(`${part.code} habla`);
+    expect(plain(bib.content)).not.toMatch(/lucia|fernandez|ruiz/u);
+  });
+
   it("a custom style renders through the sandbox", async () => {
     const p = await makeProject(kit);
     const xml = `<?xml version="1.0" encoding="utf-8"?>
