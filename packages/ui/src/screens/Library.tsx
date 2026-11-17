@@ -742,6 +742,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               selectedId={filter.collection}
               readOnly={readOnly}
               onSelect={(collection) => setFilter((f) => ({ ...f, collection }))}
+              encrypted={project.encrypted}
               onCreate={(name, parentId) => edit("Creating the collection", () => api.collections.create(project.id, name, parentId))}
               onRename={(cid, name) => edit("Renaming the collection", () => api.collections.update(project.id, cid, { name }))}
               onDelete={(cid) =>
@@ -757,6 +758,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               selectedId={filter.tag}
               readOnly={readOnly}
               onSelect={(tag) => setFilter((f) => ({ ...f, tag }))}
+              encrypted={project.encrypted}
               onCreate={(name, scope) => edit("Creating the tag", () => api.tags.create(project.id, name, scope))}
               onRename={(tid, name) => edit("Renaming the tag", () => api.tags.rename(project.id, tid, name))}
               onRenameWorkspace={(tid, name) => edit("Renaming the workspace tag", () => api.tags.renameWorkspace(tid, name))}

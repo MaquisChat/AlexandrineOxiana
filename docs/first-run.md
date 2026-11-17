@@ -72,7 +72,7 @@ The library is the folder you chose. It is an ordinary folder: you can see it in
 - `Exports/` and `Backups/`: where exports and backups go.
 - Two hidden folders, `.cache` and `.tmp`, for the app's own use.
 
-In an encrypted project the files are stored scrambled (their names end in `.enc`) and can be opened only through the app with the passphrase or recovery code. The project's names and structure stay readable.
+In an encrypted project the files are stored scrambled (their names end in `.enc`) and can be opened only through the app with the passphrase or recovery code. The project's names and structure stay readable. The names of an encrypted project, its collections and its tags, and the text of a consent's scope, are not sealed: they can be read without the passphrase.
 
 **Backing up or moving the library.** Because it is an ordinary folder, you can back it up by copying the whole folder to another drive, but only while the app is closed. Do not drag or rename the folder while the app is open. To move the library to another place, use the app's own function: in the library, select a project, click **Governance and records**, then **Move library**. It copies the library, checks every file at the new place, switches to it, and deletes the old copy only when you confirm. If you rename or move the folder yourself while the app is closed, the app shows **Library not found** the next time you open it and offers **Locate library…** and **Search for library** to find it again. For an encrypted project, keep a copy of the passphrase or recovery code separate from the backup.
 

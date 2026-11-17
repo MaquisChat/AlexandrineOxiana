@@ -10,6 +10,7 @@ import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type Keybo
 import type { Collection } from "../api/library";
 import { UserText } from "./UserText";
 import "./library.css";
+import { useReadableNote } from "./ReadableNameNote";
 
 interface Row {
   id: string | undefined;
@@ -51,9 +52,12 @@ export interface CollectionTreeProps {
   onCreate?: (name: string, parentId: string | undefined) => void;
   onRename?: (id: string, name: string) => void;
   onDelete?: (id: string) => void;
+  /** R362 h: the project is encrypted: the name field says its names can be read without the passphrase. */
+  encrypted?: boolean;
 }
 
-export function CollectionTree({ collections, selectedId, onSelect, readOnly = false, onCreate, onRename, onDelete }: CollectionTreeProps) {
+export function CollectionTree({ collections, selectedId, onSelect, readOnly = false, onCreate, onRename, onDelete, encrypted }: CollectionTreeProps) {
+  const readable = useReadableNote(encrypted);
   const all = useMemo<Row[]>(() => [{ id: undefined, name: "All sources", level: 1, parent: undefined, hasChildren: false }, ...flattenCollections(collections)], [collections]);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // Visible rows: nothing under a collapsed parent.
@@ -195,12 +199,14 @@ export function CollectionTree({ collections, selectedId, onSelect, readOnly = f
             id={fieldId}
             dir="auto"
             value={name}
+            aria-describedby={readable.describedBy}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Escape") setMode("none");
             }}
           />
           <button type="submit">{mode === "rename" ? "Save" : "Create"}</button>
+          {readable.note}
         </form>
       )}
       {mode === "delete" && selected?.id && !readOnly && (

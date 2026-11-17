@@ -10,6 +10,7 @@ import { useCallback, useEffect, useId, useState, type ReactNode } from "react";
 import type { ConsentRecord, GovernanceApi, Participant, Session } from "../api/governance";
 import { ApiClientError } from "../api/client";
 import { FileDrop } from "../components/FileDrop";
+import { READABLE_SCOPE_TEXT, useReadableNote } from "../components/ReadableNameNote";
 import { ChoiceDialog, ReasonOptionalDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import { inAppLink, PATHS } from "../navigation";
@@ -25,12 +26,12 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-function Field({ label, value, onChange, type = "text", required }: { label: string; value: string; onChange: (v: string) => void; type?: "text" | "date"; required?: boolean }) {
+function Field({ label, value, onChange, type = "text", required, describedBy }: { label: string; value: string; onChange: (v: string) => void; type?: "text" | "date"; required?: boolean; describedBy?: string | undefined }) {
   const id = useId();
   return (
     <>
       <label htmlFor={id}>{label}</label>
-      <input id={id} type={type} required={required} value={value} onChange={(e) => onChange(e.target.value)} />
+      <input id={id} type={type} required={required} value={value} aria-describedby={describedBy} onChange={(e) => onChange(e.target.value)} />
     </>
   );
 }
@@ -58,8 +59,10 @@ function SessionEditor({ s, onSave, onCancel }: { s: Session; onSave: (patch: { 
   );
 }
 
-function ConsentEditor({ c, onSave, onCancel }: { c: ConsentRecord; onSave: (patch: { scope: string; date: string; expires: string | null }) => void; onCancel: () => void }) {
+function ConsentEditor({ c, onSave, onCancel, encrypted }: { c: ConsentRecord; onSave: (patch: { scope: string; date: string; expires: string | null }) => void; onCancel: () => void; encrypted?: boolean | undefined }) {
   const [v, setV] = useState({ scope: c.scope, date: c.date, expires: c.expires ?? "" });
+  // R362 h: in an encrypted project the scope is kept where it can be read without the passphrase.
+  const readable = useReadableNote(encrypted, READABLE_SCOPE_TEXT);
   return (
     <form
       className="ao-field"
@@ -68,7 +71,8 @@ function ConsentEditor({ c, onSave, onCancel }: { c: ConsentRecord; onSave: (pat
         onSave({ scope: v.scope.trim(), date: v.date, expires: v.expires || null });
       }}
     >
-      <Field label="Scope of this consent" required value={v.scope} onChange={(scope) => setV({ ...v, scope })} />
+      <Field label="Scope of this consent" required value={v.scope} describedBy={readable.describedBy} onChange={(scope) => setV({ ...v, scope })} />
+      {readable.note}
       <Field type="date" label="Date of this consent" required value={v.date} onChange={(date) => setV({ ...v, date })} />
       <Field type="date" label="Expiry of this consent" value={v.expires} onChange={(expires) => setV({ ...v, expires })} />
       <button type="submit" disabled={!v.scope.trim() || !v.date}>
@@ -81,7 +85,9 @@ function ConsentEditor({ c, onSave, onCancel }: { c: ConsentRecord; onSave: (pat
   );
 }
 
-export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: string }) {
+/** `encrypted`: the project is encrypted (R362 h: a consent's scope typed here says it can be read without the passphrase). */
+export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; projectId: string; encrypted?: boolean | undefined }) {
+  const readableScope = useReadableNote(encrypted, READABLE_SCOPE_TEXT);
   const [participants, setParticipants] = useState<Participant[] | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [consents, setConsents] = useState<ConsentRecord[]>([]);
@@ -276,6 +282,7 @@ export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: s
             <li key={c.id}>
               {editing === c.id ? (
                 <ConsentEditor
+                  encrypted={encrypted}
                   c={c}
                   onCancel={() => setEditing(null)}
                   onSave={(patch) => {
@@ -381,7 +388,8 @@ export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: s
               ))}
             </select>
             <label htmlFor={`${ids}-cs`}>Scope</label>
-            <input id={`${ids}-cs`} type="text" required value={consent.scope} onChange={(e) => setConsent({ ...consent, scope: e.target.value })} />
+            <input id={`${ids}-cs`} type="text" required value={consent.scope} aria-describedby={readableScope.describedBy} onChange={(e) => setConsent({ ...consent, scope: e.target.value })} />
+            {readableScope.note}
           </div>
           <div className="ao-field">
             <label htmlFor={`${ids}-cd`}>Consent date</label>
