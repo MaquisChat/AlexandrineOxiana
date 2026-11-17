@@ -30,7 +30,7 @@ import { decryptBytes, deepEqual, foldName, kindFor, mimeFor, namesIn, readMaybe
 import { runMutation, type RefuseHook, type MutateRequest, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
-import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
+import { assignCodes, loadPseudonyms, participantNames, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
 import { appendReviewEntry, queueUnlistedConflicts, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type QueuedConflicts, type ReexaminedBy, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
@@ -478,17 +478,9 @@ async function writeNewSource(
       await writeProjectData(core, tx, data);
     }
     creator = codes.find((c) => c !== undefined) ?? (draft.creators.length ? "Unknown" : undefined);
-    // Every name form of each creator (handle with and without "@", literal, family, given,
-    // "given family") maps to its code; pseudonymize() matches the longest first.
-    const text = new Map(map);
-    draft.creators.forEach((c, i) => {
-      const code = codes[i];
-      if (!code) return;
-      const bare = c.handle?.replace(/^@+/, "");
-      for (const n of [c.handle, bare, c.literal, c.family, c.given, [c.given, c.family].filter(Boolean).join(" ")]) {
-        if (n?.trim() && !text.has(n.trim())) text.set(n.trim(), code);
-      }
-    });
+    // The project's participant names (the map, the participants' name details) and every name
+    // form of each creator, the list citations use too (R387 d); pseudonymize() matches the longest first.
+    const text = participantNames(map, data.participants, draft.creators.map((c, i) => ({ creator: c, code: codes[i] })));
     title = pseudonymize(title, text);
   }
   const folderBase = sourceFolderName({ dateOrYear: folderDate(draft, provenance), primaryCreator: creator, shortTitle: title, shortId: short });
