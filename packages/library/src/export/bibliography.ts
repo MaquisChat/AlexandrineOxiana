@@ -39,9 +39,11 @@ import {
   type SourceFile,
   type ToCslOptions,
 } from "@ao/core";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { renderBibliographyIn, renderCitationIn } from "../citation/custom-styles.js";
 import { writeFileAtomic } from "../fs/atomic.js";
-import { NotFoundError } from "../repo/errors.js";
+import { insideLibrary } from "../fs/inside-library.js";
+import { InvalidInputError, NotFoundError } from "../repo/errors.js";
 import { foldName, namesIn } from "../repo/io.js";
 import {
   appendLibraryEvent,
@@ -221,7 +223,8 @@ function document(body: string, format: CitationFormat, notes: string[]): string
 
 /**
  * The bibliography of `selection` in `styleId`, written to Exports/ (or the folder `dest`) under a
- * dated name. Throws PolicyDeniedError when the project's rules refuse it (nothing is written).
+ * dated name. Throws PolicyDeniedError when the project's rules refuse it (nothing is written), and InvalidInputError
+ * when `dest` lies inside the open library's own folder (R390 c; nothing is made or written).
  */
 export async function exportBibliography(
   repo: Repo,
@@ -233,6 +236,9 @@ export async function exportBibliography(
   opts: CiteOptions = {},
 ): Promise<BibliographyResult> {
   if (!(format in EXT)) throw new TypeError(`unknown format "${String(format)}"`);
+  // A folder the researcher names is never inside the open library's own folder (R390 c, the reference export's check:
+  // by real path, links followed): refused before anything is evaluated, made, written or audited.
+  if (dest !== undefined && (await insideLibrary(dest, repoLibrary(repo)))) throw new InvalidInputError(IN_LIBRARY_TEXT.exportFile);
   const project = repo.getProject(projectId);
   const ids = await selected(repo, projectId, selection);
   const prep = await prepare(repo, projectId, ids, "export.bibliography", opts.lang);

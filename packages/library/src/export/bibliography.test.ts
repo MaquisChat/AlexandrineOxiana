@@ -1,8 +1,9 @@
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile, readdir, stat, symlink } from "node:fs/promises";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { addCustomStyle, bundleAvailable } from "../citation/custom-styles.js";
-import { PolicyDeniedError } from "../repo/errors.js";
+import { InvalidInputError, PolicyDeniedError } from "../repo/errors.js";
 import { citeSources, exportBibliography, WITHHELD_NOTE } from "./bibliography.js";
 import { DEID_GOV, OPEN_GOV, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./test-kit.js";
 
@@ -167,5 +168,41 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(await citeSources(kit.repo, p.id, [{ sourceId: a.source.id }], id, "text")).toBe("[Diaz 2020]");
     const r = await exportBibliography(kit.repo, p.id, { sourceIds: [a.source.id] }, id, "text");
     expect(r.content.trim()).toBe("Rosa Diaz. Lab notes");
+  });
+});
+
+describe("R390 (c): the bibliography's destination folder is never inside the library", () => {
+  const exported = async (p: { id: string; folder: string } & Parameters<typeof auditEvents>[1]) =>
+    (await auditEvents(kit, p)).filter((e) => e.action === "export.bibliography").length;
+
+  it("the reviewer's probe: <project>/sources/zz-new in an encrypted project is refused before anything is made; nothing audited as an export", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const sf = await addSource(kit, p, { title: "A paper", creators: [person("Adams", "Ann")], issued: "2020" });
+    const dest = join(kit.lib.root, p.folder, "sources", "zz-new");
+    await expect(exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", dest)).rejects.toThrow(new InvalidInputError(IN_LIBRARY_TEXT.exportFile));
+    await expect(stat(dest)).rejects.toThrow();
+    expect(await exported(p)).toBe(0);
+  });
+
+  it("a link outside the library that leads into it is refused; the library's own Exports/ named as the folder is refused too", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const sf = await addSource(kit, p, { title: "A paper", creators: [person("Adams", "Ann")], issued: "2020" });
+    const link = join(kit.tmp, "into-project");
+    await symlink(join(kit.lib.root, p.folder), link);
+    for (const dest of [join(link, "zz-new"), link, join(kit.lib.root, "Exports")]) {
+      await expect(exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", dest), dest).rejects.toThrow(new InvalidInputError(IN_LIBRARY_TEXT.exportFile));
+    }
+    await expect(stat(join(kit.lib.root, p.folder, "zz-new"))).rejects.toThrow();
+    expect(await exported(p)).toBe(0);
+  });
+
+  it.skipIf(!HAVE_BUNDLE)("a destination outside the library still works", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const sf = await addSource(kit, p, { title: "A paper", creators: [person("Adams", "Ann")], issued: "2020" });
+    const dest = join(kit.tmp, "outside", "bibs");
+    const r = await exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", dest);
+    expect(r.path!.startsWith(dest)).toBe(true);
+    expect(await readFile(r.path!, "utf8")).toContain("Adams");
+    expect(await exported(p)).toBe(1);
   });
 });
