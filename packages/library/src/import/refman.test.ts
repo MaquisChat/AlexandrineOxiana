@@ -28,6 +28,7 @@ import { adapterFor, createBulkImport, folderAdapter, zipAdapter, type ImportSou
 import { reportLabel } from "./bulk/report.js";
 import { CALIBRE_FILE_NOTE, CALIBRE_REASONS, MAX_CALIBRE_DB_BYTES, calibreAdapter, copyCalibreDb } from "./calibre.js";
 import { BIB_DOUBTS } from "./bib-blocks.js";
+import { ITEM_REASONS } from "./common.js";
 import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_EXPORT_RECORDS, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, exportIdentity, parseBibtexEntries, risAdapter } from "./refman.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
 
@@ -98,6 +99,16 @@ async function writeExport(name: string, text: string): Promise<string> {
   await writeFile(p, text);
   return p;
 }
+
+/** The review's 50-entry file: entry 10 lost its closing brace, entry 40 ends with an extra one. */
+const brokenFifty = () => {
+  const parts: string[] = ["% Exported by a reference manager", ""];
+  for (let n = 1; n <= 50; n++) {
+    const end = n === 10 ? "" : n === 40 ? "}}" : "}";
+    parts.push(`@article{e${n},\n  title = {Entry Number ${n}},\n  author = {Doe, Jane and Roe, Rick},\n  year = {${2000 + n}},\n  abstract = {An abstract for entry ${n}.},\n  doi = {10.5555/e.${n}}\n${end}\n`);
+  }
+  return parts.join("\n");
+};
 
 describe("bibtexAdapter", () => {
   it("yields every entry with titles, creators, citation keys and resolved files", async () => {
@@ -1273,6 +1284,87 @@ processing:
     expect(primary(sf.source.title)).toBe("Broken Record");
     expect(report.pendingReview.flatMap((e) => e.reasons)).not.toContain(BIB_DOUBTS.eof);
   });
+
+  it("R366 a: the 50-entry file with one closing brace missing and one extra later imports 50 records; the broken one waits for review with the cut's doubt", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, bibtexAdapter(await writeExport("fifty-broken.bib", brokenFifty())));
+    const r = await h.done;
+    expect(r.counts.items).toBe(50);
+    expect(r.counts.created + r.counts.needsReview).toBe(50);
+    expect(repo.listSourceIds(p.id)).toHaveLength(50);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    const cut = report.pendingReview.filter((e) => e.reasons.includes(BIB_DOUBTS.cut));
+    expect(cut).toHaveLength(1);
+    const sf = await repo.getSource(p.id, cut[0]!.sourceId!);
+    expect(primary(sf.source.title)).toBe("Entry Number 10");
+    expect(sf.source.identifiers?.doi).toBe("10.5555/e.10");
+  });
+
+  it("R366 h: a COMPLETE record (title, creators, year) with a doubt waits for review; the same record whole does not", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const complete = (k: string, t: string, y: number) => `@article{${k},\n  title = {${t}},\n  author = {Doe, Jane and Roe, Rick},\n  journal = {Journal of Threads},\n  year = {${y}}`;
+    const src = `${complete("whole", "A Whole Record", 2020)}\n}\n${complete("broken", "A Broken Record", 2021)}\n\n${complete("after", "An After Record", 2022)}\n}\n`;
+    const h = await bulk.startBatch(p.id, bibtexAdapter(await writeExport("complete.bib", src)));
+    const r = await h.done;
+    expect(r.counts.items).toBe(3);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    const titles = await Promise.all(report.pendingReview.map(async (e) => primary((await repo.getSource(p.id, e.sourceId!)).source.title)));
+    expect(titles).toEqual(["A Broken Record"]);
+    expect(report.pendingReview[0]!.reasons).toEqual([BIB_DOUBTS.cut]);
+  });
+
+  describe("R366 b: a record with a BibTeX doubt is never merged into an existing source", () => {
+    const cleanX = "@article{x, title={Clean X}, author={Doe, Jane}, doi={10.5555/x}, year={2020}}\n";
+    const cutX = "@article{x, title={Clean X}, doi={10.5555/x}, journal={Journal of X, volume={3}\n@article{y, title={Y}}\n";
+
+    for (const [way, options] of [["merge", { duplicates: "merge" as const }], ["the default (merge, as the command line's)", {}], ["keep-both", { duplicates: "keep-both" as const }]] as const) {
+      it(`${way}: the existing source is untouched; a new record waits for review with the doubt`, async () => {
+        const p = await project();
+        const bulk = bulkImport();
+        await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("clean.bib", cleanX)))).done;
+        const [xId] = repo.listSourceIds(p.id);
+        const before = await repo.getSource(p.id, xId!);
+        const h = await bulk.startBatch(p.id, bibtexAdapter(await writeExport("cut-dup.bib", cutX)), options);
+        const r = await h.done;
+        expect(r.counts).toMatchObject({ items: 2, merged: 0, duplicates: 0, failed: 0 });
+        expect(r.counts.created + r.counts.needsReview).toBe(2);
+        expect(r.counts.needsReview).toBeGreaterThanOrEqual(1);
+        const after = await repo.getSource(p.id, xId!);
+        expect(after.source).toEqual(before.source);
+        expect(after.assets).toEqual(before.assets);
+        expect(repo.listSourceIds(p.id)).toHaveLength(3);
+        const report = await bulk.batchReport(p.id, h.batchId);
+        const entry = report.pendingReview.find((e) => e.reasons.includes(BIB_DOUBTS.cut));
+        expect(entry?.sourceId).toBeDefined();
+        expect(entry!.sourceId).not.toBe(xId);
+        expect(primary((await repo.getSource(p.id, entry!.sourceId!)).source.title)).toBe("Clean X");
+        if (way !== "keep-both") expect(entry!.reasons).toContain(ITEM_REASONS.likelyDuplicate);
+      });
+    }
+
+    it("skip: skipped as before; the existing source is untouched", async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("clean.bib", cleanX)))).done;
+      const [xId] = repo.listSourceIds(p.id);
+      const before = await repo.getSource(p.id, xId!);
+      const r = await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("cut-dup.bib", cutX)), { duplicates: "skip" })).done;
+      expect(r.counts).toMatchObject({ items: 2, merged: 0, duplicates: 1 });
+      expect((await repo.getSource(p.id, xId!)).source).toEqual(before.source);
+      expect(repo.listSourceIds(p.id)).toHaveLength(2);
+    });
+
+    it("a clean record with the same DOI is still merged (the rule is only for doubted records)", async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("clean.bib", cleanX)))).done;
+      const r = await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("clean2.bib", "@article{x, title={Clean X}, doi={10.5555/x}, journal={Journal of X}}\n")))).done;
+      expect(r.counts.merged).toBe(1);
+      expect(repo.listSourceIds(p.id)).toHaveLength(1);
+    });
+  });
 });
 
 describe("review round 2 (R82): tables never reach Object.prototype", () => {
@@ -1413,16 +1505,6 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
       }
     });
   });
-
-  /** The review's 50-entry file: entry 10 lost its closing brace, entry 40 ends with an extra one. */
-  const brokenFifty = () => {
-    const parts: string[] = ["% Exported by a reference manager", ""];
-    for (let n = 1; n <= 50; n++) {
-      const end = n === 10 ? "" : n === 40 ? "}}" : "}";
-      parts.push(`@article{e${n},\n  title = {Entry Number ${n}},\n  author = {Doe, Jane and Roe, Rick},\n  year = {${2000 + n}},\n  abstract = {An abstract for entry ${n}.},\n  doi = {10.5555/e.${n}}\n${end}\n`);
-    }
-    return parts.join("\n");
-  };
 
   describe("R366 a: an entry line between an entry's fields ends that entry", () => {
     it("the 50-entry file with one closing brace missing and one extra later gives 50 records; the broken one is cut, with its own fields only", async () => {
