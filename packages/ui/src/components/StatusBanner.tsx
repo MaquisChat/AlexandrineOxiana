@@ -5,7 +5,7 @@
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
 import { useRef, useState } from "react";
-import { isDeviceNoticeKind, type DeviceNoticeKind } from "@ao/shared";
+import { DESTRUCTION_OLD_COPIES_PENDING_TEXT, DESTRUCTION_OLD_COPIES_PENDING_WARNING, isDeviceNoticeKind, type DeviceNoticeKind } from "@ao/shared";
 import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
@@ -108,6 +108,8 @@ const WARNINGS: Record<string, (p: string) => string> = {
     `Changes to ${p} that could not be recorded at the time were recorded in the audit log of ${p} now. They are marked as recorded late.`,
   "refusal-unrecorded": () => "A refused request could not be recorded in the library's audit log. Nothing was changed.",
   "retention-due": (p) => `${p} has reached its retention date. Review which raw data must now be destroyed or kept.`,
+  // The sentence is the service's too (R379): one text, in @ao/shared.
+  [DESTRUCTION_OLD_COPIES_PENDING_WARNING]: () => DESTRUCTION_OLD_COPIES_PENDING_TEXT,
 };
 
 /** The sentence for a warning kind; an unknown kind gets a generic sentence (never the detail). */

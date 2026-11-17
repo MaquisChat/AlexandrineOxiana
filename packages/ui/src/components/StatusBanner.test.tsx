@@ -168,6 +168,12 @@ describe("StatusBanner", () => {
     }
     expect(seen.size).toBe(kinds.length);
   });
+
+  it("FR-A16 (R379): old copies of the library still holding destroyed data have the sentence the researcher reads", () => {
+    expect(warningText("destruction-old-copies-pending", "P")).toBe(
+      "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them from the Move library screen (or by hand) to complete the destruction.",
+    );
+  });
 });
 
 describe("bannersFor", () => {
