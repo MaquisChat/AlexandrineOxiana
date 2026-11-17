@@ -13,7 +13,7 @@
  * described in the Task 45 report.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, relative, resolve, sep } from "node:path";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
@@ -333,6 +333,106 @@ test("a plain Accept in the review queue clears the library row's “Needs revie
   await expect(row).toHaveCount(1);
   // R137: the badge means "an item waits in the review queue"; nothing is asserted about field-level verification.
   await expect(row.getByText("Needs review")).toHaveCount(0);
+});
+
+// ---------- an import that merges, and its undo (FR-214) ----------
+
+/** The first export: two articles, each with its DOI, title, author, year and journal, and nothing more. */
+const FIRST_BIB = [
+  "@article{okafor2024feeding, title={Feeding the City: Informal Markets in Lagos}, author={Okafor, Ngozi}, year={2024}, journal={Urban Studies}, doi={10.5555/ao.urban.2024.017}}",
+  "@article{mensah2019street, title={Street Vendors and the State}, author={Mensah, Kofi}, year={2019}, journal={African Affairs}, doi={10.5555/ao.street.2019.042}}",
+].join("\n");
+/**
+ * A later export from elsewhere: the same two articles (the same DOIs) carrying details the library's
+ * sources lack — volume, issue, pages, publisher, a keyword — and one article that is new.
+ */
+const SECOND_BIB = [
+  "@article{okafor2024city, title={Feeding the City: Informal Markets in Lagos}, author={Okafor, Ngozi}, year={2024}, journal={Urban Studies}, volume={61}, number={4}, pages={812--830}, publisher={Sage}, keywords={food systems}, doi={10.5555/ao.urban.2024.017}}",
+  "@article{mensah2019vendors, title={Street Vendors and the State}, author={Mensah, Kofi}, year={2019}, journal={African Affairs}, volume={118}, pages={1--22}, doi={10.5555/ao.street.2019.042}}",
+  "@article{asante2021water, title={Water Access in Peri-Urban Accra}, author={Asante, Ama}, year={2021}, journal={Habitat International}, volume={9}, doi={10.5555/ao.water.2021.003}}",
+].join("\n");
+
+/** A source as the service stores it, without the stamp of its last change (an undo is itself a change). */
+interface StoredForCompare {
+  source: Record<string, unknown> & { tagIds: string[] };
+  assets: unknown[];
+}
+const unstamped = (s: StoredForCompare) => {
+  const { modifiedAt: _a, modifiedBy: _b, ...rest } = s.source;
+  return { source: rest, assets: s.assets };
+};
+
+test("an import that merges into existing sources, undone: the merged sources are restored as they were before it (FR-214)", async ({ page, app }) => {
+  test.slow();
+  const dir = join(app.root, "sources", "references");
+  mkdirSync(dir, { recursive: true });
+  const first = join(dir, "first.bib");
+  const second = join(dir, "second.bib");
+  writeFileSync(first, FIRST_BIB);
+  writeFileSync(second, SECOND_BIB);
+  const { projectId } = await libraryWithProject(app, page, { library: "Merge library", project: "Street markets" });
+  const listed = async () => (await app.api<SourceList>("GET", `/projects/${projectId}/sources?limit=500`)).body;
+  const stored = async (id: string) => (await app.api<StoredForCompare>("GET", `/projects/${projectId}/sources/${id}`)).body;
+  const tags = async () => (await app.api<{ tags: Array<{ id: string; name: string }> }>("GET", `/projects/${projectId}/tags`)).body;
+  const batches = async () => (await app.api<{ batches: Array<Batch & { counts: Batch["counts"] & { merged: number } }> }>("GET", `/projects/${projectId}/imports`)).body.batches;
+  const importBib = async (path: string) => {
+    await openWizard(page, "Reference file", "File path", path);
+    await expect(page.getByRole("combobox", { name: "Format" })).toHaveValue("bibtex");
+    await scanAndRun(page);
+  };
+
+  const before = new Map<string, ReturnType<typeof unstamped>>();
+  await test.step("the first import makes two sources; what the service holds of them is kept for comparison", async () => {
+    await importBib(first);
+    await expect(page.getByText("Import 1. The import finished.")).toBeVisible();
+    await expect(reportRow(page, "Created")).toHaveAccessibleName("Created 2");
+    const list = await listed();
+    expect(list.items.map((i) => i.title).sort()).toEqual(["Feeding the City: Informal Markets in Lagos", "Street Vendors and the State"]);
+    for (const i of list.items) before.set(i.id, unstamped(await stored(i.id)));
+    // What the second import will fill in is absent now.
+    for (const s of before.values()) {
+      expect(s.source.volume).toBeUndefined();
+      expect(s.source.page).toBeUndefined();
+      expect(s.source.tagIds).toEqual([]);
+    }
+  });
+
+  await test.step("the second import, with its default “Merge into the existing source”: one created, two merged", async () => {
+    await page.goto(`${APP_ORIGIN}/?project=${projectId}`);
+    await importBib(second);
+    await expect(page.getByText("Import 2. The import finished.")).toBeVisible();
+    await expect(reportRow(page, "Created")).toHaveAccessibleName("Created 1");
+    await expect(reportRow(page, "Merged into existing sources")).toHaveAccessibleName("Merged into existing sources 2");
+    expect((await batches())[0]).toMatchObject({ number: 2, state: "finished", counts: { created: 1, merged: 2 } });
+    const list = await listed();
+    expect(list.total).toBe(3);
+    // The merge filled in what the sources lacked.
+    const okafor = list.items.find((i) => i.title === "Feeding the City: Informal Markets in Lagos")!;
+    const mensah = list.items.find((i) => i.title === "Street Vendors and the State")!;
+    const o = (await stored(okafor.id)).source;
+    expect(o).toMatchObject({ volume: "61", issue: "4", page: "812–830", publisher: "Sage" });
+    expect(o.tagIds).toHaveLength(1);
+    expect((await stored(mensah.id)).source).toMatchObject({ volume: "118", page: "1–22" });
+    expect((await tags()).tags.map((t) => t.name)).toContain("food systems");
+  });
+
+  await test.step("undo the second import: the new source goes, and the two merged sources are restored exactly as before it", async () => {
+    await page.getByRole("button", { name: "Undo import" }).click();
+    const dialog = page.getByRole("alertdialog", { name: "Remove 1 imported source and restore 2 merged sources?" });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "Undo import" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByRole("status").filter({ hasText: "Removed 1 imported source and restored 2 merged sources." })).toBeVisible();
+    await expect(page.getByText("Import 2. This import was undone.")).toBeVisible();
+    expect((await batches()).map((b) => [b.number, b.state])).toEqual([
+      [2, "undone"],
+      [1, "finished"],
+    ]);
+    const list = await listed();
+    expect(list.items.map((i) => i.id).sort()).toEqual([...before.keys()].sort());
+    for (const [id, was] of before) expect(unstamped(await stored(id)), id).toEqual(was);
+    expect((await tags()).tags.map((t) => t.name)).not.toContain("food systems");
+  });
 });
 
 // ---------- scenario 4 ----------

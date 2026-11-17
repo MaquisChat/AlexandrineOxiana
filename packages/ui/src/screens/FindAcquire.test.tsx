@@ -3864,6 +3864,58 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       expect(posts("/library/cancel")).toHaveLength(1);
     });
 
+    // ---- R342 b inside the retry (R344 N4, FR-562): the row must still be the same when the shell is asked again ----
+
+    /** The project is locked now: the queue's reads are refused, and an event makes the page read it. */
+    async function lockNow(e: FindEntryView) {
+      queues[PID] = () => refusal(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
+      progress(e, "waiting-sign-in");
+      expect(await screen.findByRole("heading", { name: /is locked/ })).toBeTruthy();
+    }
+
+    it("FR-562: a lock between the shell's refusal and the close: the leftover is not closed by the retry and the shell is not asked again", async () => {
+      const e = serveOne("locked before the close");
+      let refuse!: (v: boolean) => void;
+      fake.shell!.openLibraryWindow.mockImplementationOnce(() => new Promise<boolean>((r) => (refuse = r))).mockResolvedValue(true);
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(events.open()).toBe(true));
+      await user.click(btn("locked before the close", "Get through my library"));
+      await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+      await lockNow(e);
+      // The lock ends the page's ticket (R342 a): its window is closed, once.
+      await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      // The shell's answer arrives after the lock: refused (a leftover). The retry must stop here.
+      act(() => refuse(false));
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(posts("/library/start")).toHaveLength(1);
+    });
+
+    it("FR-562: a lock while the retry waits for the leftover to close: the shell is not asked again, no window is opened", async () => {
+      const e = serveOne("locked during the wait");
+      fake.shell!.openLibraryWindow.mockResolvedValueOnce(false).mockResolvedValue(true);
+      // The leftover's close is reported only when the test says so.
+      let reportClosed!: () => void;
+      fake.shell!.closeLibraryWindow.mockImplementation(async () => {
+        reportClosed = () => fake.shell!.libraryWindow({ ticket: null, state: "closed" });
+      });
+      const user = userEvent.setup();
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(events.open()).toBe(true));
+      await user.click(btn("locked during the wait", "Get through my library"));
+      await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      await lockNow(e);
+      // The leftover reports its close after the lock (well within LIBRARY_CLOSE_WAIT_MS).
+      act(() => reportClosed());
+      await quiet();
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+      expect(posts("/library/start")).toHaveLength(1);
+    });
+
     // ---- R342 c (M1): the focus after a start ----
 
     it("R342 c: Enter held or pressed twice on Get through my library starts once and takes nothing; the focus is on the row's own words", async () => {
