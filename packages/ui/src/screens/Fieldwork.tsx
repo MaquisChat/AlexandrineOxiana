@@ -470,7 +470,17 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
 
       {deletingSession ? (
         <ChoiceDialog
-          title={`Delete the session of ${deletingSession.date}${deletingSession.place ? `, ${deletingSession.place}` : ""}`}
+          title={
+            // The place is the researcher's text: isolated, so that its direction marks cannot reorder the heading (R399 e).
+            <>
+              Delete the session of {deletingSession.date}
+              {deletingSession.place ? (
+                <>
+                  , <UserText>{deletingSession.place}</UserText>
+                </>
+              ) : null}
+            </>
+          }
           action="Delete session"
           busy={busy}
           onCancel={() => setDeletingSession(null)}

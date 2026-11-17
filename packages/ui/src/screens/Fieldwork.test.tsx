@@ -627,6 +627,22 @@ describe("deleting a session asks first (R379, I4)", () => {
     expect(deletes()).toBe(0);
   });
 
+  it("the title's place goes through UserText: a right-to-left override in it stays isolated; the dialog is still named by the date and the place (R399 e)", async () => {
+    const place = "Lima‮odaguh";
+    db.sessions = [{ id: id(), date: "2026-01-02", place, notes: "", participantIds: [] }];
+    const user = userEvent.setup();
+    await user.click(await opener());
+    const name = `Delete the session of 2026-01-02, ${place}`;
+    const dialog = screen.getByRole("dialog", { name });
+    const heading = within(dialog).getByRole("heading", { name });
+    const isolated = heading.querySelector('[dir="auto"]');
+    expect(isolated?.textContent).toBe(place);
+    expect(heading.textContent).toBe(name);
+    expect(heading.id).toBe(dialog.getAttribute("aria-labelledby"));
+    expect(heading.tabIndex).toBe(-1);
+    expect(document.activeElement).toBe(heading);
+  });
+
   it("a session something links to says why, as before; the session stays", async () => {
     linked = true;
     const user = userEvent.setup();

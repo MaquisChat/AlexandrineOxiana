@@ -165,9 +165,10 @@ export function ConfirmDialog({
 }
 
 /** A yes/no confirmation (deleting a record that can be deleted). */
-export function ChoiceDialog({ title, children, action, onConfirm, onCancel, busy }: { title: string; children: ReactNode; action: string; onConfirm: () => void; onCancel: () => void; busy?: boolean }) {
+export function ChoiceDialog({ title, children, action, onConfirm, onCancel, busy }: { title: ReactNode; children: ReactNode; action: string; onConfirm: () => void; onCancel: () => void; busy?: boolean }) {
   const id = useId();
   // First focus on the heading (R376 c): a held or repeated Enter on the opener must not confirm.
+  // `title` may carry user text through UserText (R399 e); the heading names the dialog either way.
   const heading = useRef<HTMLHeadingElement>(null);
   return (
     <DialogShell labelledBy={`${id}-t`} onCancel={onCancel} busy={!!busy} initialFocus={heading}>
