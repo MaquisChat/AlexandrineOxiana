@@ -2229,8 +2229,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const links = linksOf(found.elsewhere, found.offers);
       if (passing) {
         // R379 (FR-A17): a copy WAS found, and at least one download may pass: not "no open copy" — the entry waits and
-        // is tried again (services asked again) like an unreachable free-copy lookup (R282 e), on the same delays; once
-        // they are spent it rests "no-open-copy" / "copy-not-downloaded", with its links, and "Try again" is accepted.
+        // its copy part runs again like an unreachable free-copy lookup (R282 e), on the same delays (R411 b: or later,
+        // as a service asked). The look-up's kept answer usually serves that run, so the same offers are downloaded
+        // again. Once the delays are spent it rests "no-open-copy" / "copy-not-downloaded", with its links, and "Try
+        // again" is accepted.
         debug("find: no free copy could be downloaded this time");
         // R411 c: the links found stay on the entry during the waits, so the researcher can open one meanwhile.
         const kept = links?.length ? { offers: links } : {};
