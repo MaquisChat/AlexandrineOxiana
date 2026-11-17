@@ -247,10 +247,13 @@ export const STOCK_AUTHORS: readonly string[] = [
 const STOCK_AUTHOR_SET = new Set(STOCK_AUTHORS);
 /** A single word ending in "PC" or "Laptop": a computer's name ("DELL-PC", "JohnsLaptop"). */
 const MACHINE_NAME = /^\S*(?:PC|-pc|_pc|laptop)$/u;
-/** Windows's default computer name ("DESKTOP-ABC123"). */
-const WINDOWS_MACHINE = /^desktop-[a-z0-9]{4,}$/iu;
-/** A version or a platform after a program's name ("user1", "pdfTeX-1.40.21", "Adobe InDesign CS6 (Macintosh)"). */
-const VERSION_SUFFIX = /(?:[-\s]*(?:v?\d[\d.]*|cs\d+))?(?:\s*\([^()]*\))?$/iu;
+/** Windows's default computer name ("DESKTOP-ABC123"): a code holding a digit (R425 c: not "DESKTOP-PUBLISHING"). */
+const WINDOWS_MACHINE = /^desktop-(?=[a-z]*\d)[a-z0-9]{4,}$/iu;
+/**
+ * A version or a platform after a program's name ("user1", "pdfTeX-1.40.21", "Adobe InDesign CS6 (Macintosh)"); a
+ * parenthesis only when it names a platform (R425 c: "Owner (ed.)", "IT Department (University of Oslo)" are kept).
+ */
+const VERSION_SUFFIX = /(?:[-\s]*(?:v?\d[\d.]*|cs\d+))?(?:\s*\((?:windows|macintosh|mac|macos|os x|linux|x64|x86|64-bit|32-bit)\))?$/iu;
 
 export function isStockAuthor(raw: string): boolean {
   const s = fold(raw.slice(0, EXAMINED_CHARS));

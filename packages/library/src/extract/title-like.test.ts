@@ -279,6 +279,14 @@ describe("stock authors (R394 b)", () => {
   it.each(["Maria Lopez", "User Friendly Press", "Okafor, Ngozi", "World Health Organization", "Anonymous Four Collective", "Tex Avery", "Anonymous", "Will Owner", "Anne Unknown", "Dorothy Pc", "Desktop Publishing Group"])("%j is a person's or a body's name", (name) =>
     expect(isStockAuthor(name)).toBe(false),
   );
+  // R425 c: a parenthesis is stripped only when it names a platform; the DESKTOP- machine code needs a digit.
+  it.each(["Adobe InDesign CS6 (Macintosh)", "Acrobat (Windows)", "pdfTeX-1.40.21", "DESKTOP-ABC123"])("%j is still a stock name (R425 c)", (name) =>
+    expect(isStockAuthor(name)).toBe(true),
+  );
+  it.each(["IT Department (University of Oslo)", "Owner (ed.)", "Unknown (2019)", "Admin (IT)", "DESKTOP-PUBLISHING", "Desktop-Team", "Mary Word", "Jane Canon", "Michael Dell", "Anonymous"])(
+    "%j is kept (R425 c)",
+    (name) => expect(isStockAuthor(name)).toBe(false),
+  );
   it("keepCreators drops parsed stock names and keeps real ones", () => {
     expect(
       keepCreators([
