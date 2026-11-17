@@ -1133,6 +1133,18 @@ describe("FR-A18 round 2 (R397 b–d): the issues are bounded, scrubbed, on one 
     for (const i of issues) expect(i).not.toMatch(/[\n\r]/);
   });
 
+  it("R421 d: thirty exceptions that waive nothing → twenty warnings, then \"and 10 more.\"", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const ex = Array.from({ length: 30 }, (_, i) => `  - control: unknown${i}.allowed\n    value: [local]\n    reason: x\n    by: y\n    at: 2026-01-01T09:30:00Z\n`).join("");
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), `${OPEN_GOV}exceptions:\n${ex}`);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json.readable).toBe(true);
+    expect(g.json.warnings).toHaveLength(21);
+    expect(g.json.warnings.slice(0, 20).every((w: string) => /unknown\d+\.allowed/.test(w))).toBe(true);
+    expect(g.json.warnings[20]).toBe("and 10 more.");
+  });
+
   it("R421 c: the soft hyphen, a tag character, the Hangul filler and a variation selector are taken out too", async () => {
     const issues = await issuesOf(`"ab\\u00ADc\\U000E0041d\\u3164e\\uFE0Ff\\u034Fg\\u115Fh\\u1160i": 1\n`);
     expect(issues[0]).toMatch(/^abcdefghi: unknown key/);
