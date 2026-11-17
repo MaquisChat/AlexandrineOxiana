@@ -1,0 +1,37 @@
+# FR-A13 — a fresh review of the WHOLE task as it stands (third reviewer)
+
+Read the common brief first, all of it: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task54-fix-review-common.md`. Then this.
+
+## The task
+FR-A13 answers finding **C1 (Critical)** of the whole-branch review, part 2: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task54-wb2-review.md` — in an ENCRYPTED project, locking (or unlocking again) while a change was being committed sealed that change's change-log lines under an all-zero key, readable by anyone holding the folder, and the change committed. **Re-run that review's probe first, against the code as it stands.**
+
+What was built, over three rounds: a lock runs as the next turn of the project's (rewritten) write queue, so it waits for the change in progress; the sealing AND the opening primitives refuse an all-zero key (a wiped key is "locked", never a skipped line or "damaged"); nothing read under a wiped key is kept; the kept copies (the watched folders' register, the Find queue) are emptied at a lock; locking is immediate for everyone but the change in progress (a "locking" mark); `lockProject` returns a promise.
+
+**This task failed two reviews and was then re-scoped by the coordinator (Ruling R404).** Each review had found more READERS that went wrong when a lock landed in the middle of a read (a sealed list called "damaged", intact originals called "mismatched", an index left short). R404 changed the method: a HARNESS (`packages/library/src/repo/lock-mid-read.test.ts`) locks the project at the Nth opening of EVERY way of reading an encrypted project, for every N; the outcome must be the right result or "locked" — never "damaged", "mismatched", "missing" or a shorter result — and no trace may be left (no integrity warning, no audit or attention entry, no kept copy, no index row changed); after an unlock the same reading gives the full right result. Round 3 built it (39 rows) and mended the ten readers it caught.
+
+You are the third reviewer and you review everything, not the last round only (the earlier reviewers have no room left). A ruling can be wrong: if the code does what a ruling says and the result harms a participant or a researcher, say so.
+
+## Where
+Worktree `/home/user/AlexandrineOxiana/.claude/worktrees/agent-a8f81b7c97773ed6a`, branch `fr-a13-key-ring`, base 7b81976, head d3141b1 (fourteen commits).
+- The whole task as one package: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/review-FRA13-whole.diff` (3,312 lines; read it once, in full). The last round only: `review-FRA13-round3.diff`.
+- Briefs: `task-FRA13-brief.md`, `task-FRA13-round3-brief.md` (same folder; round 2 was asked by a message — Ruling R386 is its text). The implementers' report: `task-FRA13-report.md` (its last section, "Round 3 (R404)", has the harness's table, the readers mended, and "every user of the opening primitives and the row that covers it").
+- The two earlier reviews: `task-FRA13-review.md`, `task-FRA13-review2.md`. For EACH of their findings: closed now?
+- Rulings to read in full (`docs/handoff/LEDGER.md` in `/home/user/AlexandrineOxiana`): R379 (FR-A13's part), R384, R386, R402, R404, R432.
+
+## Attack hardest
+1. **The Critical finding itself, every way in.** Can ANYTHING still be sealed under a wiped or all-zero key — a change-log line, an audit reason, a sealed register, a Find queue, a journal line, a proxy, a backup, a temporary file — by a lock, an unlock, a second unlock, a lock–unlock–lock, a passphrase change, a project deleted or restored, a service shutting down, two libraries open, while a change, a bulk import, a worker job, a Find run or a backup is in flight? Is there any seal OUTSIDE a turn of the write queue that does not fail on the guard?
+2. **Is the harness complete?** It is only as good as its list of readings. Find a way of reading an encrypted project that is NOT a row: grep every user of the opening primitives (`crypto/format.ts`: `decryptBytes` and its siblings; `core.key(`) across `packages/library/src` and compare with the report's "every user … and the row that covers it"; then the callers above the library — the service's routes (`apps/library-service/src/routes/**`), the command line, background work (the Find runner, watched folders, the job journal's resume, retention's hourly pass, the integrity schedule). For three readings of your choice that are rows, and for any you find that are not, write your own probe that locks in the middle: right result or "locked", and no trace?
+3. **"No trace" — check it yourself.** After a lock lands mid-read: the audit log (a false entry), the attention list / integrity warnings (a false "damaged"), the index (rows missing or stale after the next unlock), the kept copies, temporary files in the project's folder or the library's work folder (plaintext left behind is Critical), the file system (anything written).
+4. **Damage must still be damage.** Round 3's last commit: only a WIPED key counts as a lock; a file sealed under another key id, a truncated file, a file with a flipped byte must still be reported as damaged (not hidden as "locked", not retried forever). Round 2's guards in `export/project-export.ts` and `import/proxies.ts` still take ANY `KeyNotAvailableError` for a lock (the report says so): can real damage hide there?
+5. **Locking and the queue.** A lock is immediate for everyone but the change in progress; a lock asked while a change is stuck; "lock, unlock, lock" ends locked (R404 c) — and the side effect the implementer names: a lock asked while any unlock is in flight now waits for that unlock (can a lock be DELAYED without bound — a researcher who presses Lock and walks away must end up locked); the turn identity (`admitsOnlyRunningTurn`) — can a continuation left by an earlier turn, or a callback of another project, pass as the running turn? Starvation and deadlock: thousands of mixed turns; an error thrown inside a turn; a turn that never ends.
+6. **What an honest researcher loses.** Locking while a long read runs (an export, an integrity check, a backup): does the read end cleanly with "locked", and can it be run again after unlocking? The implementer's point, accepted by R432 and put to you: a backup cut short by a lock leaves its audited "allow" decision (written before anything is read) and no backup — is that ever read as "a backup exists"?
+7. **Guards and their tests.** Each guard named in the report's "(d)": take it out, does its test fail? (If your edits of tracked files are refused, say which you could not check and judge by reading.)
+
+## Known and listed — do not report again
+FR-663, FR-679 (an unlock asked after a lock waits while a change is stuck). If you think one is in truth Critical or Important, say so with the evidence.
+
+## Rules for you
+Probes next to the code, named `*.probeFRA13c.test.ts`, run alone at `nice -n 10` (`pnpm --filter @ao/library exec vitest run <path>`); every one deleted before you finish; `git status --short` empty at the end; no commits, no `git stash` (one list shared by every worktree), no installs, no whole suites. The harness itself takes 4–5 minutes at load: run it once if you wish, not more. A time-limit failure is re-run alone before you believe it and is not a finding in an untouched timing test.
+
+## Report
+`/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task-FRA13-review3.md`, as the common brief says. Final message of at most 150 words.

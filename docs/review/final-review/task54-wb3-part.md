@@ -1,0 +1,9 @@
+## WB3 — imports and capture: `packages/library/src/import`, `capture`, `lookup`, `extract` (about 23,000 lines)
+You are reviewer number 3. Your part: `packages/library/src/import/**` (the attach, the bulk import and its adapters: folder, device, ZIP, Calibre, BibTeX, RIS, CSL-JSON, Zotero RDF, Zotero local, Zotero web; watched folders), `capture/**`, `lookup/**`, `extract/**`.
+Where a mistake costs most: a batch that is paused, crashed and resumed (is anything imported twice, lost, or reported as done when it is not?); the batch record and the report (what they keep of the researcher's disk: paths, file names, Zotero keys); ZIP handling (entry names with `..`, absolute names, links, a zip bomb, a name differing only by case); parsers on hostile input (time and memory bounds); the duplicate decision; watched folders (the one-call gate, R208 d; a file still being written; a file that is in the cloud and not on this computer); capture of a web page (the snapshot: scripts, outside requests, what is stored of cookies or the signed-in page); network lookups (what leaves the computer: is a title or a name of an identifiable source sent to an outside service when the project's rules forbid it?).
+Specific checks:
+1. R64, R69, R75: do batch records, linked paths and Zotero keys respect pseudonymisation and the "no absolute path stored" rule — in the record, the journal, the report shown and the report exported? Follow one import of each kind.
+2. Ledger line 134 (Task 16's deferred points on grounding a creator or a date in evidence): for each, still open? any that lets a wrong author or year be recorded as verified?
+3. Ledger line 212 (Task 27): the re-run after a rule changed; the proxy queue's key and disposal; the encrypted Zotero-web allowed path under a location rule — each fixed or open?
+4. Every place that fetches from the network in your part: the host allow-list, redirects, size and time bounds, and what is logged.
+
