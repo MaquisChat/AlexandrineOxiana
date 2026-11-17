@@ -1001,6 +1001,41 @@ describe("R427 (b): inside a creator who gets no code, whole names and runs are 
   });
 });
 
+describe("R437 (a): in a creator written as given and family names, a run counts only when it takes words from both (I1 of the FR-A10 fourth review)", () => {
+  const page = (creators: Creator[], map: ReadonlyMap<string, string>) =>
+    toCslItem(source("webpage", mt(["es", "original", "A page"]), creators), { ...OPTS, pseudonyms: map });
+  const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
+
+  it.each<[string, string, string]>([
+    ["Juan Carlos", "Onetti", "Juan Carlos Pérez"],
+    ["María José", "Ortega", "María José Quispe"],
+    ["Anna Maria", "Schmidt", "Anna Maria Weber"],
+    ["Pedro", "Fernández Ruiz", "Lucía Fernández Ruiz"],
+  ])("given %j + family %j, the participant %j: a run wholly inside one field is another person's name, left as it is; the key is kept", (given, family, participant) => {
+    const item = page([{ role: "author", given, family }], new Map([[participant, "P-002"]]));
+    expect(item.author).toEqual([{ family, given }]);
+    expect(item["citation-key"]).toBe("key");
+  });
+
+  it("the same through a coded creator's forms", () => {
+    const coded: Creator = { role: "interviewee", handle: "@jc.perez", given: "Juan Carlos", family: "Pérez" };
+    const item = page([coded, { role: "author", given: "Juan Carlos", family: "Onetti" }], new Map([["@jc.perez", "P-002"]]));
+    expect(item.author).toEqual([{ literal: "P-002" }, { family: "Onetti", given: "Juan Carlos" }]);
+  });
+
+  it("guards: a run across the two fields (either way round) is coded; a whole name inside one field is coded; a creator of only one field takes no run", () => {
+    expect(page([{ role: "author", given: "Lucía", family: "Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", given: "Fernández", family: "Lucía" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", given: "Dr. Maria", family: "Cocina" }], new Map([["Maria Cocina", "P-001"]])).author).toEqual([{ literal: "Dr. P-001" }]);
+    expect(page([{ role: "author", family: "Fernández Ruiz" }], LUCIA).author).toEqual([{ family: "Fernández Ruiz" }]);
+    expect(page([{ role: "author", family: "Lucía Fernández Ruiz" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+  });
+
+  it("a creator written as one text: the run counts (R427 b stands)", () => {
+    expect(page([{ role: "author", literal: "Fernández Ruiz Abogados" }], LUCIA).author).toEqual([{ literal: "P-005 Abogados" }]);
+  });
+});
+
 describe("R427 (a): the more exact match wins (I1 of the FR-A10 third review)", () => {
   // Two records an older library may hold, whose names the strict key now makes equal:
   // [the spelling coded P-001, the spelling coded P-002, a spelling equal to neither as written but

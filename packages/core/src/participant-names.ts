@@ -260,6 +260,12 @@ export interface ScrubOptions {
   bareMinLength?: number;
   /** Split a run of letters and digits where letters meet digits (addresses: "lucia2024"). */
   splitDigits?: boolean;
+  /**
+   * R437 a: where a RUN of a longer name (a `part` form, never a whole name) may be matched: called
+   * with the span (start, end exclusive) in the text; a run whose span it refuses is not a match
+   * there. Inside a bidi override's reversed reading it is not asked (runs count there, the closed side).
+   */
+  runSpan?: (start: number, end: number) => boolean;
 }
 
 const WORD = /[\p{L}\p{N}]/u;
@@ -402,6 +408,8 @@ interface Pattern {
   cands: Candidate[];
   /** The candidates have more than one code (only then is the span compared). */
   mixed: boolean;
+  /** Every candidate is a run of a longer name (R387 e), none a whole name (R437 a). */
+  part: boolean;
   /** One no-space-script character: matched only as a run of its own. */
   single: boolean;
   /** A Hangul name of two or more syllables: its last word may begin a longer run of Hangul (R380). */
@@ -462,6 +470,7 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
       if (!had.cands.some((c) => c.code === code && c.strict === cand.strict && c.full === cand.full && c.written === cand.written)) {
         had.cands.push(cand);
         if (code !== had.code) had.mixed = true;
+        if (!f.part) had.part = false;
       }
       return;
     }
@@ -469,7 +478,7 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
     // A Hangul name of one syllable stays whole-run only, like a one-character no-space name.
     const last = us[us.length - 1]!;
     const prefix = ALL_HANGUL.test(last) && syllables(us.join("")) >= 2;
-    const pat: Pattern = { units: us, code, cands: [cand], mixed: false, single, prefix };
+    const pat: Pattern = { units: us, code, cands: [cand], mixed: false, part: f.part === true, single, prefix };
     seen.set(key, pat);
     const list = index.get(us[0]!) ?? [];
     list.push(pat);
@@ -718,7 +727,8 @@ function findAll(text: string, names: Names, opts: ScrubOptions, firstOnly: bool
   if (indexes.length === 0) return [];
   const hits = findPlain(text, indexes, opts, firstOnly);
   if ((firstOnly && hits.length) || !/[\u202D\u202E]/u.test(text)) return hits;
-  return mergeHits(hits, overrideHits(text, (t) => findPlain(t, indexes, opts, firstOnly)));
+  const { runSpan: _ignored, ...plainOpts } = opts;
+  return mergeHits(hits, overrideHits(text, (t) => findPlain(t, indexes, plainOpts, firstOnly)));
 }
 
 function findPlain(text: string, indexes: readonly Index[], opts: ScrubOptions, firstOnly: boolean): Hit[] {
@@ -786,6 +796,9 @@ function findPlain(text: string, indexes: readonly Index[], opts: ScrubOptions, 
     return p.prefix ? hangulPrefixEnd(j, u) : -1;
   };
   type Best = { p: Pattern; end: number } | undefined;
+  /** R437 a: a run of a longer name counts at token `i` only where `runSpan` allows its span. */
+  const runSpan = opts.runSpan;
+  const allowed = (p: Pattern, i: number, end: number): boolean => !runSpan || !p.part || runSpan(tokens[i]!.start, end);
   /** The longer match wins: the later end, then more words; on a tie the one found first. */
   const better = (end: number, p: Pattern, best: Best): boolean =>
     !best || end > best.end || (end === best.end && p.units.length > best.p.units.length);
@@ -799,7 +812,7 @@ function findPlain(text: string, indexes: readonly Index[], opts: ScrubOptions, 
       if (key.length > ix.maxFirst) break;
       for (const p of ix.byFirst.get(key) ?? []) {
         const end = matchEnd(p, i);
-        if (end >= 0 && better(end, p, best)) best = { p, end };
+        if (end >= 0 && allowed(p, i, end) && better(end, p, best)) best = { p, end };
       }
     }
     // A one-word Hangul name at the start of a longer run: the prefixes of the word that end on a
@@ -812,7 +825,7 @@ function findPlain(text: string, indexes: readonly Index[], opts: ScrubOptions, 
         if (!CHOSEONG.test(s[m]!)) continue;
         for (const p of ix.prefixes.get(s.slice(0, m)) ?? []) {
           const end = matchEnd(p, i);
-          if (end >= 0 && better(end, p, best)) best = { p, end };
+          if (end >= 0 && allowed(p, i, end) && better(end, p, best)) best = { p, end };
         }
       }
     }

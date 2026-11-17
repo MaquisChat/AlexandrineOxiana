@@ -214,24 +214,31 @@ function urlNamesParticipant(url: string, names: NameSet): boolean {
  * R420 a, corrected by R427 b: a creator who is not a participant, whose name holds a participant's
  * WHOLE name (a map entry, a name or a handle; a coded creator's handle, literal, "given family",
  * "family given") or a RUN of two or more words of one that is a form by R403 c ("Lucía Fernández"
- * of "Lucía Fernández Ruiz"): the text that cslName would print (the literal, else the handle; for a
+ * of "Lucía Fernández Ruiz"; in a creator written as given and family names only a run that takes
+ * words from both fields, R437 a): the text that cslName would print (the literal, else the handle; for a
  * given/family creator the joined "given family", else "family given"), with each such name replaced
  * by its code (by the shared rule, R416's choice included). Single names (a lone given or family
  * name, one word of a compound name) are not looked for: an author who shares a first name with a
  * participant is not rewritten (the stated limit FR-699). Undefined when nothing was replaced.
  */
 function creatorWithWholeNames(c: Creator, whole: NameSet): string | undefined {
-  const tryText = (t: string | undefined): string | undefined => {
+  const tryText = (t: string | undefined, runSpan?: (start: number, end: number) => boolean): string | undefined => {
     const v = t?.trim();
     if (!v) return undefined;
-    const out = scrubNames(v, whole);
+    const out = scrubNames(v, whole, runSpan ? { runSpan } : {});
     return out !== v ? out : undefined;
   };
   const given = c.given?.trim();
   const family = c.family?.trim();
   if (given || family) {
-    const joined = [given, family].filter(Boolean).join(" ");
-    return tryText(joined) ?? (given && family ? tryText(`${family} ${given}`) : undefined);
+    // R437 a: in a creator written as given and family names, a run of a participant's name counts
+    // only when its span takes words from BOTH fields ("Lucía Fernández"); one lying wholly inside
+    // the given name ("Juan Carlos" of Juan Carlos Onetti) or the family name ("Fernández Ruiz" of
+    // Pedro Fernández Ruiz) is another person's name. A creator of one field takes no run. A whole
+    // name counts anywhere (R420 a).
+    const across = (first: string) => (start: number, end: number) => start < first.length && end > first.length + 1;
+    if (!given || !family) return tryText(given ?? family, () => false);
+    return tryText(`${given} ${family}`, across(given)) ?? tryText(`${family} ${given}`, across(family));
   }
   return tryText(c.literal) ?? (c.literal?.trim() ? undefined : tryText(c.handle));
 }
