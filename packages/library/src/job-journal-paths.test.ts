@@ -20,7 +20,7 @@ import { openIndex } from "./index/db.js";
 import { appendJobRecords, journalPath, markLegacyJobs, readJobJournal, upgradeLegacyJobs, type JobRecord } from "./job-journal.js";
 import { createLinkCapture } from "./capture/link-capture.js";
 import { createLibrary, openLibrary, type Library } from "./library.js";
-import { editPendingProxies, projectDataKey, relinkLinkedAsset, type Repo } from "./repo/repo.js";
+import { editPendingProxies, importChange, projectDataKey, relinkLinkedAsset, type Repo } from "./repo/repo.js";
 import { openTestRepo } from "./repo/testing.js";
 import { transcriptionJob, transcriptionRerun } from "./transcription-jobs.js";
 import { WorkerClient, WorkerJobError, WorkerUnavailableError } from "./worker-client.js";
@@ -526,5 +526,52 @@ describe("R400 (c): a stored path holding a control character is refused before 
     expect(out[0]!.error).toBeInstanceOf(Error);
     expect(String((out[0]!.error as Error).message)).not.toContain(lib.root);
     expect((out[0]!.error as { path?: unknown }).path).toBeUndefined();
+  });
+});
+
+describe("R400 (d): the stored paths' validation, and a destroyed linked asset", () => {
+  it("hand-written relative lines with `..`, a leading `/`, a drive letter or a backslash: each failed once as a missing input, nothing sent or written outside", async () => {
+    const p = await makeProject(false);
+    const sf = await withOriginal(p, "photo.png", "png");
+    const input = sf.assets[0]!.path;
+    const out = ".tmp/worker-proxy-e/proxy.jpg";
+    const outside = join(tmp, "outside");
+    await mkdir(outside, { recursive: true });
+    await expectEachRefused(p, [
+      relLine(p, input, "../outside/x.jpg"),
+      relLine(p, input, ".tmp/../../outside/x.jpg"),
+      relLine(p, input, "/x.jpg"),
+      relLine(p, input, "C:\\x.jpg"),
+      relLine(p, input, ".tmp\\w\\x.jpg"),
+      relLine(p, input, ".tmp/./w/x.jpg"),
+      relLine(p, "../outside/y.png", out),
+      relLine(p, "/y.png", out),
+      relLine(p, "C:\\y.png", out),
+      relLine(p, "C:/y.png", out),
+      relLine(p, "a\\..\\..\\y.png", out),
+      relLine(p, `${input.split("/")[0]}\\${input.split("/").slice(1).join("\\")}`, out),
+    ]);
+    expect(await readdir(outside)).toEqual([]);
+    expect(existsSync(join(lib.root, ".tmp", "worker-proxy-e"))).toBe(false);
+  });
+
+  it("a pending job on a linked asset destroyed meanwhile is not run: failed once as a missing input", async () => {
+    const p = await makeProject(false);
+    const sf = await withOriginal(p, "linked.png", "png", "link");
+    const asset = sf.assets[0]!;
+    await appendJobRecords(lib.root, p.folder, null, [
+      relLine(p, "", ".tmp/worker-proxy-f/proxy.jpg", { job: { type: "image.proxy", input: "", inputAsset: { sourceId: sf.source.id, assetId: asset.id }, output: ".tmp/worker-proxy-f/proxy.jpg", params: {} } }),
+    ]);
+    await importChange(repo, p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, async (ops) => {
+      const cur = await ops.readSource(sf.source.id);
+      await ops.writeSource(cur, { ...cur, assets: cur.assets.map((a) => (a.id === asset.id ? { ...a, status: "destroyed" as const, destroyedAt: new Date().toISOString() } : a)) });
+    }, { op: "test.destroy" });
+    expect(existsSync(asset.linked!.absolutePath)).toBe(true); // the linked file itself is still there
+    const seen: StubJob[] = [];
+    const out = await clientOf(await okWorker(seen)).resumePending(p.id);
+    expect(seen).toEqual([]);
+    expect(out.map((o) => (o.error as WorkerJobError).code)).toEqual(["INPUT_NOT_FOUND"]);
+    expect((await journalOf(p)).records.map((r) => [r.status, r.error])).toEqual([["failed", "INPUT_NOT_FOUND"]]);
+    expect(await clientOf(await okWorker(seen)).resumePending(p.id)).toEqual([]);
   });
 });
