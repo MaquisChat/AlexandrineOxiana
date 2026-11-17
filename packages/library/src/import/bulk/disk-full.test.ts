@@ -14,6 +14,7 @@ import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Project } from "@ao/core";
 import { buildPdf, buildZip } from "../../../../../tests/fixtures/generate.mjs";
+import { buildCalibreLibrary } from "../../../tests/fixtures/refman/calibre.mjs";
 import { buildZoteroFixture } from "../../../tests/fixtures/zotero/build-fixture.mjs";
 import { KeyRing } from "../../crypto/keys.js";
 import type { Deps } from "../../deps.js";
@@ -24,6 +25,7 @@ import { createLibrary, openLibrary, type Library } from "../../library.js";
 import { HttpClient } from "../../lookup/index.js";
 import type { Repo } from "../../repo/repo.js";
 import { openTestRepo, seams } from "../../repo/testing.js";
+import { calibreAdapter } from "../calibre.js";
 import { zoteroLocalAdapter } from "../zotero-local.js";
 import { createBulkImport, folderAdapter, type BatchHandle, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
 import { DISK_FULL_NOTE, RECOVERY_NOTE, bulkSpaceSeams } from "./space.js";
@@ -153,7 +155,7 @@ const GOV = `identifiability:
   containsIdentifiable: false
 encryption:
   atRest: optional
-captureMethods: [manual_upload, refman_import, zotero_import]
+captureMethods: [manual_upload, refman_import, zotero_import, calibre_import]
 processing:
   metadata_lookup: []
 `;
@@ -526,5 +528,24 @@ describe("the stop sentences name what exists when a change could not be undone 
     await reopen();
     await resumedAll(p, h, adapter(KEYS.map(item)), KEYS);
     expect((await bulk.batchReport(p.id, h.batchId)).notes).not.toContain(REFUSING);
+  });
+});
+
+describe("a full disk while copying Calibre's database stops the batch (R439 4, as R436 a)", () => {
+  it("stopped with the sentence, not \"missing or damaged\", nothing failed; a resume imports", async () => {
+    const p = await project();
+    const dir = join(tmp, "Calibre Library");
+    buildCalibreLibrary(dir, { pdf: await buildPdf({ extra: "calibre pdf" }), epub: await buildPdf({ extra: "calibre second" }) });
+    faults.dbCopy = 1;
+    const h = await bulk.startBatch(p.id, calibreAdapter(dir));
+    await stoppedFull(p, h);
+    expect(await journal(p)).toEqual([]);
+    expect((await bulk.batchReport(p.id, h.batchId)).failures).toEqual([]);
+    const res = await (await bulk.resumeBatch(p.id, h.batchId)).done;
+    expect(res.state).toBe("finished");
+    expect(res.counts.failed).toBe(0);
+    const lines = await journal(p);
+    expect(new Set(lines.map((e) => e.key)).size).toBe(lines.length);
+    expect(lines.filter((e) => e.outcome === "created" || e.outcome === "needs-review").length).toBeGreaterThan(0);
   });
 });
