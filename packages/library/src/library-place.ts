@@ -3,7 +3,7 @@
  * "Choose a library". Both only read: whether a few folders exist and are empty, and the free room of one disk.
  * Nothing is created, and nothing read leaves here but the suggested path or a number.
  */
-import { realpath as fsRealpath, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { dirname, isAbsolute, posix, win32 } from "node:path";
 import { statfsFree } from "./import/sqlite-copy.js";
 import { entriesBesidesFinderFiles } from "./library.js";
@@ -18,8 +18,6 @@ export type FolderState = "missing" | "empty" | "not-empty" | "not-a-folder" | "
 export interface PlaceLooks {
   /** What is at `p` (default: the real file system; the Finder's housekeeping files alone leave a folder empty). */
   folderState?: (p: string) => Promise<FolderState>;
-  /** The real path of an existing `p`, links resolved (default: realpath). */
-  realpath?: (p: string) => Promise<string>;
 }
 
 async function realFolderState(p: string): Promise<FolderState> {
@@ -33,26 +31,19 @@ async function realFolderState(p: string): Promise<FolderState> {
 }
 
 /**
- * The folder "Choose a library" suggests for a new library (R447 a), or undefined when there is none:
- * `<home>/Documents/Alexandrine Oxiana` when Documents is there and is not a place a cloud service keeps in step (by
- * its path or its real path, as classifyLocation tells it), else `<home>/Alexandrine Oxiana`; when that folder exists
- * and is not empty, the same name with " 2" … " 9", the first that is missing or empty.
+ * The folder "Choose a library" suggests for a new library (R447 a as R449 a corrects it), or undefined when there is
+ * none: `<home>/Alexandrine Oxiana`; when that is taken, the same name with " 2" … " 9", the first that is free.
+ * Nothing under Documents is looked at (R449 a: iCloud's keeping of Documents cannot be told from its path, and a Mac
+ * asks the researcher's permission the moment a program looks into it). None when the home folder is not known, or
+ * when its own path is a cloud-synced place by classifyLocation (the path and the environment alone; no look).
  */
 export async function suggestedLibraryFolder(env: LocationEnv, looks: PlaceLooks = {}): Promise<string | undefined> {
   const home = env.homeDir;
   if (!home) return undefined;
+  if (classifyLocation(home, env).kind === "cloud_folder") return undefined;
   const P = env.platform === "win32" ? win32 : posix;
   const folderState = looks.folderState ?? realFolderState;
-  const realpath = looks.realpath ?? fsRealpath;
-  const documents = P.join(home, "Documents");
-  let base = home;
-  const docs = await folderState(documents);
-  if (docs !== "missing" && docs !== "not-a-folder") {
-    const real = await realpath(documents).catch(() => documents);
-    const cloud = [documents, real].some((p) => classifyLocation(p, env).kind === "cloud_folder");
-    if (!cloud) base = documents;
-  }
-  const first = P.join(base, LIBRARY_FOLDER_NAME);
+  const first = P.join(home, LIBRARY_FOLDER_NAME);
   for (const candidate of [first, ...[2, 3, 4, 5, 6, 7, 8, 9].map((n) => `${first} ${n}`)]) {
     const s = await folderState(candidate);
     if (s === "missing" || s === "empty") return candidate;

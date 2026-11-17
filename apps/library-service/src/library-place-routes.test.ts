@@ -52,19 +52,22 @@ describe("R447: the suggested folder and the free room, for the library chooser"
   const suggest = (headers: Record<string, string> = auth) => svc.app.inject({ method: "GET", url: "/libraries/suggested-folder", headers });
   const room = (body: unknown, headers: Record<string, string> = auth) => svc.app.inject({ method: "POST", url: "/libraries/folder-room", headers: { ...headers, ...json }, payload: JSON.stringify(body) });
 
-  it("the suggestion: no library open, no Documents: the home folder's; with Documents: Documents'; a used one: ' 2'; nothing created", async () => {
+  it("the suggestion: no library open: the home folder's, whatever Documents holds; a used one: ' 2'; nothing created", async () => {
+    await mkdir(join(home, "Documents"));
+    await writeFile(join(home, "Documents", "notes.txt"), "x");
     let before = await tree(home);
     let res = await suggest();
     expect([res.statusCode, res.json()]).toEqual([200, { folder: join(home, "Alexandrine Oxiana") }]);
     expect(await tree(home)).toEqual(before);
 
-    await mkdir(join(home, "Documents", "Alexandrine Oxiana"), { recursive: true });
-    await writeFile(join(home, "Documents", "Alexandrine Oxiana", "notes.txt"), "x");
+    await mkdir(join(home, "Alexandrine Oxiana"));
+    await writeFile(join(home, "Alexandrine Oxiana", "notes.txt"), "x");
     before = await tree(home);
     res = await suggest();
-    expect([res.statusCode, res.json()]).toEqual([200, { folder: join(home, "Documents", "Alexandrine Oxiana 2") }]);
+    expect([res.statusCode, res.json()]).toEqual([200, { folder: join(home, "Alexandrine Oxiana 2") }]);
     expect(await tree(home)).toEqual(before);
     await rm(join(home, "Documents"), { recursive: true });
+    await rm(join(home, "Alexandrine Oxiana"), { recursive: true });
   });
 
   it("every name taken: an answer with no folder", async () => {

@@ -13,8 +13,8 @@ import { FOLDER_ROOM_LOOK_MS, freeRoomFor, suggestedLibraryFolder, type FolderSt
 const HOME = "/Users/r";
 const env = (over: Partial<LocationEnv> = {}): LocationEnv => ({ homeDir: HOME, platform: "darwin", mounts: [{ path: "/", removable: false, network: false }], mountsKnown: true, ...over });
 
-/** A file system of folders by state; anything not named is missing. */
-function fsOf(states: Record<string, FolderState>, real: Record<string, string> = {}) {
+/** A file system of names by state; anything not named is missing. Every path asked is kept. */
+function fsOf(states: Record<string, FolderState>) {
   const looked: string[] = [];
   return {
     looked,
@@ -22,58 +22,50 @@ function fsOf(states: Record<string, FolderState>, real: Record<string, string> 
       looked.push(p);
       return states[p] ?? "missing";
     },
-    realpath: async (p: string) => real[p] ?? p,
   };
 }
 
-describe("suggestedLibraryFolder (R447 a)", () => {
-  it("Documents there and not kept in step by a cloud service: Documents/Alexandrine Oxiana", async () => {
-    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty" });
-    expect(await suggestedLibraryFolder(env(), fs)).toBe(`${HOME}/Documents/Alexandrine Oxiana`);
+describe("suggestedLibraryFolder (R447 a as R449 a corrects it: in the home folder)", () => {
+  const base = `${HOME}/Alexandrine Oxiana`;
+
+  it("the home folder known: <home>/Alexandrine Oxiana, and nothing under Documents is ever looked at", async () => {
+    // Even a Documents that is there and plain is not used, nor looked at.
+    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty", [`${HOME}/Documents/Alexandrine Oxiana`]: "empty" });
+    expect(await suggestedLibraryFolder(env(), fs)).toBe(base);
+    expect(fs.looked).toEqual([base]);
+    expect(fs.looked.some((p) => p.includes("Documents"))).toBe(false);
   });
 
-  it("Documents kept in step by iCloud (Desktop and Documents, as classifyLocation tells it): the home folder's", async () => {
-    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty" }, { [`${HOME}/Documents`]: `${HOME}/Library/Mobile Documents/com~apple~CloudDocs/Documents` });
-    expect(await suggestedLibraryFolder(env(), fs)).toBe(`${HOME}/Alexandrine Oxiana`);
+  it("the home folder's own path in a cloud-synced place (by the path and the environment alone): no suggestion, nothing looked at", async () => {
+    const fs = fsOf({});
+    expect(await suggestedLibraryFolder(env({ vars: { OneDrive: HOME } }), fs)).toBeUndefined();
+    expect(await suggestedLibraryFolder(env({ vars: { OneDriveCommercial: "/Users" } }), fs)).toBeUndefined();
+    expect(fs.looked).toEqual([]);
   });
 
-  it("Documents whose real path is in a cloud folder (linked into Dropbox): the home folder's", async () => {
-    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty" }, { [`${HOME}/Documents`]: `${HOME}/Dropbox/Documents` });
-    expect(await suggestedLibraryFolder(env(), fs)).toBe(`${HOME}/Alexandrine Oxiana`);
-  });
-
-  it("no Documents folder (or Documents is a file): the home folder's", async () => {
-    expect(await suggestedLibraryFolder(env(), fsOf({}))).toBe(`${HOME}/Alexandrine Oxiana`);
-    expect(await suggestedLibraryFolder(env(), fsOf({ [`${HOME}/Documents`]: "not-a-folder" }))).toBe(`${HOME}/Alexandrine Oxiana`);
+  it("no home folder known: no suggestion", async () => {
+    expect(await suggestedLibraryFolder(env({ homeDir: "" }), fsOf({}))).toBeUndefined();
   });
 
   it("the folder exists and is empty: itself", async () => {
-    const fs = fsOf({ [`${HOME}/Documents`]: "not-empty", [`${HOME}/Documents/Alexandrine Oxiana`]: "empty" });
-    expect(await suggestedLibraryFolder(env(), fs)).toBe(`${HOME}/Documents/Alexandrine Oxiana`);
+    expect(await suggestedLibraryFolder(env(), fsOf({ [base]: "empty" }))).toBe(base);
   });
 
   it("the folder exists and is not empty: the same name with ' 2'; a taken ' 2' gives ' 3'", async () => {
-    const base = `${HOME}/Documents/Alexandrine Oxiana`;
-    expect(await suggestedLibraryFolder(env(), fsOf({ [`${HOME}/Documents`]: "not-empty", [base]: "not-empty" }))).toBe(`${base} 2`);
-    expect(await suggestedLibraryFolder(env(), fsOf({ [`${HOME}/Documents`]: "not-empty", [base]: "not-empty", [`${base} 2`]: "not-a-folder", [`${base} 3`]: "empty" }))).toBe(`${base} 3`);
+    expect(await suggestedLibraryFolder(env(), fsOf({ [base]: "not-empty" }))).toBe(`${base} 2`);
+    expect(await suggestedLibraryFolder(env(), fsOf({ [base]: "not-empty", [`${base} 2`]: "not-a-folder", [`${base} 3`]: "empty" }))).toBe(`${base} 3`);
   });
 
   it("an unreadable folder counts as taken", async () => {
-    const base = `${HOME}/Alexandrine Oxiana`;
     expect(await suggestedLibraryFolder(env(), fsOf({ [base]: "unreadable" }))).toBe(`${base} 2`);
   });
 
   it("every name taken (the plain one and ' 2' … ' 9'): no suggestion", async () => {
-    const base = `${HOME}/Alexandrine Oxiana`;
     const states: Record<string, FolderState> = { [base]: "not-empty" };
     for (let n = 2; n <= 9; n++) states[`${base} ${n}`] = "not-empty";
     const fs = fsOf(states);
     expect(await suggestedLibraryFolder(env(), fs)).toBeUndefined();
     expect(fs.looked).not.toContain(`${base} 10`);
-  });
-
-  it("no home folder known: no suggestion", async () => {
-    expect(await suggestedLibraryFolder(env({ homeDir: "" }), fsOf({}))).toBeUndefined();
   });
 
   describe("with the real file system (a temporary home folder)", () => {
@@ -85,16 +77,18 @@ describe("suggestedLibraryFolder (R447 a)", () => {
       await rm(home, { recursive: true, force: true });
     });
 
-    it("reads Documents and the candidates, and creates nothing", async () => {
+    it("the home folder's candidates only, and nothing created", async () => {
       const linux = env({ homeDir: home, platform: "linux", mounts: [] });
+      await mkdir(join(home, "Documents"));
+      await writeFile(join(home, "Documents", "notes.txt"), "x");
       expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Alexandrine Oxiana"));
-      await mkdir(join(home, "Documents", "Alexandrine Oxiana"), { recursive: true });
+      await mkdir(join(home, "Alexandrine Oxiana"));
       // The Finder's housekeeping files alone leave a folder empty (as createLibrary counts it).
-      await writeFile(join(home, "Documents", "Alexandrine Oxiana", ".DS_Store"), "");
-      expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Documents", "Alexandrine Oxiana"));
-      await writeFile(join(home, "Documents", "Alexandrine Oxiana", "notes.txt"), "x");
-      expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Documents", "Alexandrine Oxiana 2"));
-      expect((await readdir(join(home, "Documents"))).sort()).toEqual(["Alexandrine Oxiana"]);
+      await writeFile(join(home, "Alexandrine Oxiana", ".DS_Store"), "");
+      expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Alexandrine Oxiana"));
+      await writeFile(join(home, "Alexandrine Oxiana", "notes.txt"), "x");
+      expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Alexandrine Oxiana 2"));
+      expect((await readdir(home)).sort()).toEqual(["Alexandrine Oxiana", "Documents"]);
     });
   });
 });
