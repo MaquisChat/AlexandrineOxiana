@@ -49,6 +49,7 @@ import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
+import { AUDIT_REASONS_FILE, reasonSha256, sealedReasonLine } from "./audit-reasons.js";
 import { TxnLog } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
 
@@ -87,6 +88,14 @@ export interface InternalMutateOptions extends MutateOptions {
   unauditedDeny?: boolean;
   /** More details recorded on the allow audit event(s), e.g. the reason given for loosening governance; a function is called once `fn` has run. */
   auditDetails?: Record<string, unknown> | (() => Record<string, unknown>);
+  /**
+   * R362 b: the reason the researcher typed, whose audit details (`auditedReason`) record only that it was given and
+   * its SHA-256 in an encrypted project. There its text is sealed into `<Project>/audit-reasons/reasons.jsonl`, keyed by the
+   * entry's seq and hash, in this change, under the write-ahead marker and before the entry (the commit point): a
+   * crash before the entry undoes the line with the change, a crash after it keeps both. Ignored in a project that is
+   * not encrypted (the details carry the reason as typed) and when empty.
+   */
+  sealedReason?: string;
   /**
    * Only for repairing an unreadable governance.yaml (governance edit, R98): the policy evaluated
    * when the file cannot be read or parsed, instead of denying everything.
@@ -487,15 +496,26 @@ export async function runMutation<T>(
       await tx.guard(join(st.audit.dir, "x"));
       await appendChanges(core.abs(`${st.rel}/changes`), tx.changes, seal, seal ? undefined : CHANGE_LOG_MODE, onPlan);
       maybeCrash("before-audit");
+      const sealedReason = seal && opts.sealedReason ? opts.sealedReason : undefined;
       for (const [i, { req, d }] of allowed.entries()) {
         if (i > 0) maybeCrash("between-audit");
-        await st.audit.append({
+        const input: AuditInput = {
           ...core.auditBase(st, at),
           action: req.action,
           entity: opts.entityFor?.(i) ?? tx.auditEntity,
           decision: auditDecision(d),
           details: { op, ...(typeof opts.auditDetails === "function" ? opts.auditDetails() : opts.auditDetails), txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
-        }, onPlan);
+        };
+        if (sealedReason !== undefined) {
+          // Only for an entry that records the reason by its SHA-256 (R177 b's form); never beside one that has it as typed.
+          const sha = (input.details as Record<string, unknown>).reasonSha256;
+          if (sha !== reasonSha256(sealedReason) || (input.details as Record<string, unknown>).reason !== undefined) throw new Error("a sealed reason needs an audit entry that records only its SHA-256");
+          const next = st.audit.peek(input);
+          const { key, keyId } = core.key(st);
+          await tx.appendLine(`${st.rel}/${AUDIT_REASONS_FILE}`, sealedReasonLine(key, keyId, projectId, { seq: next.seq, hash: next.hash, reasonSha256: sha, text: sealedReason }));
+          maybeCrash("after-sealed-reason");
+        }
+        await st.audit.append(input, onPlan);
       }
       maybeCrash("before-marker-delete");
     } catch (err) {

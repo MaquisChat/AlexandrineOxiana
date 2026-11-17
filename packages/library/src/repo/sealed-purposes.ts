@@ -18,6 +18,8 @@ export const PURPOSE_IMPORT_JOURNAL = "ao-import-journal";
 export const PURPOSE_WATCH_REGISTER = "ao-watch-register";
 /** The Find and acquire queue (`find/queue.jsonl`). */
 export const PURPOSE_FIND_QUEUE = "ao-find-queue";
+/** The sealed store of reasons the audit log names only by SHA-256 (`audit-reasons.jsonl`, R362 b). */
+export const PURPOSE_AUDIT_REASONS = "ao-audit-reasons";
 
 /** Every purpose a line of a project's files can be sealed with: what a restore tries on a sealed line. */
-export const SEALED_LINE_PURPOSES: readonly string[] = [PURPOSE_CHANGES, PURPOSE_REVIEW, PURPOSE_IMPORT_JOURNAL, PURPOSE_WATCH_REGISTER, PURPOSE_FIND_QUEUE];
+export const SEALED_LINE_PURPOSES: readonly string[] = [PURPOSE_CHANGES, PURPOSE_REVIEW, PURPOSE_IMPORT_JOURNAL, PURPOSE_WATCH_REGISTER, PURPOSE_FIND_QUEUE, PURPOSE_AUDIT_REASONS];

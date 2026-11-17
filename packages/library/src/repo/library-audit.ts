@@ -24,6 +24,9 @@ import { verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
 import { AuditStore, checkAnchor, type AuditInput, type Head } from "./audit-store.js";
 import type { IncompleteLine } from "./incomplete-lines.js";
 import type { RepoCore } from "./state.js";
+import { LIBRARY_AUDIT_REASONS_FILE, libraryReasonLine, reasonSha256 } from "./audit-reasons.js";
+import { appendDurable, assertContained, readMaybe, truncateDurable, undoAppend } from "./io.js";
+import { SimulatedCrash, maybeCrash } from "./seams.js";
 
 export const LIBRARY_AUDIT_DIR = "audit";
 
@@ -61,6 +64,60 @@ export async function appendLibraryAudit(core: RepoCore, input: AuditInput): Pro
 }
 
 type Shown = Pick<AuditEvent, "at" | "actor" | "device" | "action" | "decision" | "details" | "projectId">;
+
+/**
+ * R362 b: appends an entry about an encrypted project whose details record a reason by its SHA-256 only, after
+ * sealing the text under the project's key into `<Library>/audit-reasons.jsonl` (the entry's seq and hash in the
+ * clear). The line is written first, durably: a crash before the entry leaves it as the store's last line, with a
+ * seq past the log's head, and `trimOrphanReasons` removes it at the next writable open; after the entry, both stand.
+ */
+export async function appendLibraryAuditWithReason(core: RepoCore, input: AuditInput, k: { key: Uint8Array; keyId: string }, text: string): Promise<AuditEvent> {
+  const s = await store(core);
+  const sha = (input.details as Record<string, unknown> | undefined)?.reasonSha256;
+  if (sha !== reasonSha256(text) || input.projectId === undefined) throw new Error("a sealed reason needs an audit entry that records only its SHA-256");
+  const next = s.peek(input);
+  const path = join(core.root, LIBRARY_AUDIT_REASONS_FILE);
+  await assertContained(core.root, path);
+  const u = await appendDurable(path, `${libraryReasonLine(k.key, k.keyId, input.projectId, { seq: next.seq, hash: next.hash, reasonSha256: sha, text })}\n`, 0o600);
+  try {
+    maybeCrash("library-reason-before-entry");
+    return await appendLibraryAudit(core, input);
+  } catch (err) {
+    // In-process failure: the line goes again (a crash leaves it for the next open).
+    if (!(err instanceof SimulatedCrash)) await undoAppend(u).catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * At a writable open (R362 b): a sealed reason left without its entry in the library's log by a crash (its seq past
+ * the log's head, or its hash not the entry's at that seq), and a cut-off last line, are removed. Only the last lines
+ * can be such: each line is written just before its entry, in the write queue.
+ */
+async function trimOrphanReasons(core: RepoCore, events: Array<AuditEvent | null>): Promise<void> {
+  const path = join(core.root, LIBRARY_AUDIT_REASONS_FILE);
+  const raw = await readMaybe(path);
+  if (!raw) return;
+  const text = raw.toString("utf8");
+  let keep = text.length;
+  for (;;) {
+    const body = text.slice(0, keep);
+    const end = body.endsWith("\n") ? body.length - 1 : body.length;
+    if (end <= 0) break;
+    const start = body.lastIndexOf("\n", end - 1) + 1;
+    const line = body.slice(start, end);
+    let ok = false;
+    try {
+      const o = JSON.parse(line) as { seq?: unknown; hash?: unknown };
+      ok = body.endsWith("\n") && typeof o.seq === "number" && events[o.seq - 1]?.hash === o.hash;
+    } catch {
+      ok = false;
+    }
+    if (ok) break;
+    keep = start;
+  }
+  if (keep < text.length) await truncateDurable(path, Buffer.byteLength(text.slice(0, keep), "utf8"));
+}
 
 /** The same refusal on the same UTC day: every field the entry shows is equal (N6). */
 export function sameRefusal(a: Shown, b: Shown): boolean {
@@ -104,6 +161,8 @@ export async function checkLibraryAudit(core: RepoCore, anchor: Head | undefined
   const problem = events.length === 0 && !anchor ? null : checkAnchor(events, verify, anchor, core.device);
   if (problem) core.integrityWarnings.push({ projectId: "*", kind: problem.kind, detail: `the library's audit log: ${problem.detail}` });
   if (!writable) return;
+  // Only against a log whose chain verifies: otherwise its entries cannot say which reason is whose.
+  if (verify.ok) await trimOrphanReasons(core, events).catch(() => {});
   const at = core.clock().toISOString();
   const base = { at, actor: core.actor, device: core.device };
   try {

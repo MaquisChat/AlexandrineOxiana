@@ -47,6 +47,8 @@ import {
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
+import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonView } from "./audit-reasons.js";
+import type { AuditReasonView } from "@ao/shared";
 import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import {
   RECOVERY_CODE_UNSHOWN_WARNING,
@@ -84,7 +86,7 @@ import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegi
 import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
-import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
+import { RepoCore, loadProjects, type ProjectState, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
@@ -123,7 +125,7 @@ import {
   type AttentionRecord,
 } from "./attention.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
-import { LIBRARY_AUDIT_DIR, appendLibraryAudit, checkLibraryAudit, libraryAnchorKey, readLibraryAudit } from "./library-audit.js";
+import { LIBRARY_AUDIT_DIR, appendLibraryAudit, appendLibraryAuditWithReason, checkLibraryAudit, libraryAnchorKey, readLibraryAudit } from "./library-audit.js";
 
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
@@ -171,11 +173,11 @@ export class Repo {
   }
 
   /** A page of the library's own audit log, newest first (like `readAudit`). */
-  async readLibraryAuditPage(opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: AuditEvent[]; total: number }> {
+  async readLibraryAuditPage(opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: ShownAuditEvent[]; total: number }> {
     const { events: all } = await readLibraryAudit(this.core.root);
     const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
     const older = opts.beforeSeq === undefined ? all : all.filter((e) => e.seq < opts.beforeSeq!);
-    return { events: older.slice(-limit).reverse(), total: all.length };
+    return { events: await withLibraryReasons(this.core, older.slice(-limit).reverse()), total: all.length };
   }
 
   /** Checks the library's own audit log against its anchor, like `verifyAudit` for a project (R154 a). Reads only. */
@@ -343,13 +345,13 @@ export class Repo {
    * A page of the project's audit events, newest first: at most `limit` events with a sequence
    * number below `beforeSeq` (default: from the newest). Reads only.
    */
-  async readAudit(projectId: string, opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: AuditEvent[]; total: number }> {
+  async readAudit(projectId: string, opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: ShownAuditEvent[]; total: number }> {
     const st = this.core.state(projectId);
     const all = (await AuditStore.read(st.audit.dir)).filter((e): e is AuditEvent => !!e);
     const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
     const before = opts.beforeSeq;
     const older = before === undefined ? all : all.filter((e) => e.seq < before);
-    return { events: older.slice(-limit).reverse(), total: all.length };
+    return { events: await withProjectReasons(this.core, st, older.slice(-limit).reverse()), total: all.length };
   }
 
   /** Records (and audits) that the researcher acknowledged a one-time capture explanation (spec 5.1). */
@@ -1590,6 +1592,62 @@ export function noteIntegrityWarning(repo: Repo, w: IntegrityWarning): void {
 
 const SET_ASIDE_OP = "attention.set-aside";
 
+/** An audit event as the audit screen reads it: with the reason the researcher typed, when it carries one (R362 b). */
+export type ShownAuditEvent = AuditEvent & { reasonShown?: AuditReasonView };
+
+/** The project's key, or "locked". */
+function keyOrLocked(core: RepoCore, st: ProjectState): { key: Uint8Array; keyId: string } | "locked" {
+  try {
+    return core.key(st);
+  } catch {
+    return "locked";
+  }
+}
+
+/**
+ * R362 b: each event of a project's log with the reason it carries: as typed; or, sealed, read with the project key
+ * (from the review entry for "Reviewed after the withdrawal", R177 b; else from the store of reasons, by the entry's
+ * seq and hash), shown only when its SHA-256 is the entry's. Locked: the sentence; nothing is read without the key.
+ */
+async function withProjectReasons(core: RepoCore, st: ProjectState, events: AuditEvent[]): Promise<ShownAuditEvent[]> {
+  const sealed = events.filter(hasSealedReason);
+  let k: { key: Uint8Array; keyId: string } | "locked" = "locked";
+  let store = new Map<string, { text: string }>();
+  let review: ReviewEntry[] = [];
+  if (sealed.length && core.encrypted(st)) {
+    k = keyOrLocked(core, st);
+    if (k !== "locked") {
+      store = await readProjectReasons(core.abs(`${st.rel}/${AUDIT_REASONS_FILE}`), k.key, st.project.id);
+      if (sealed.some((e) => typeof e.details?.reviewEntry === "string")) review = await readReviewEntries(core, st).catch(() => []);
+    }
+  }
+  return events.map((e) => {
+    const shown = reasonView(e, () => {
+      if (k === "locked") return "locked";
+      const entry = e.details?.reviewEntry;
+      if (typeof entry === "string") return review.find((r) => r.id === entry)?.reason;
+      return store.get(reasonKey(e.seq, e.hash))?.text;
+    });
+    return shown ? { ...e, reasonShown: shown } : e;
+  });
+}
+
+/** R362 b: the library's log: a sealed reason is read with the key of the project the entry names. */
+async function withLibraryReasons(core: RepoCore, events: AuditEvent[]): Promise<ShownAuditEvent[]> {
+  const lines = events.some(hasSealedReason) ? await readLibraryReasonLines(join(core.root, LIBRARY_AUDIT_REASONS_FILE)) : [];
+  return events.map((e) => {
+    const shown = reasonView(e, () => {
+      const st = e.projectId ? core.projects.get(e.projectId) : undefined;
+      if (!st) return undefined;
+      const k = keyOrLocked(core, st);
+      if (k === "locked") return "locked";
+      const line = lines.find((l) => l.seq === e.seq && l.hash === e.hash && l.projectId === e.projectId);
+      return line ? openLibraryReason(line.sealed, k.key, st.project.id)?.text : undefined;
+    });
+    return shown ? { ...e, reasonShown: shown } : e;
+  });
+}
+
 async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string, reason: string): Promise<{ recordedIn: "project" | "library" }> {
   core.assertWritable();
   // The policy engine decides on the reason itself (N7): a blank one is refused there, and audited.
@@ -1602,18 +1660,31 @@ async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string,
     const m = await markForSetAside(core, st, markId);
     if (!m) throw new NotFoundError("Mark", markId);
     // Decided and audited in the project's log (a deny is audited there and thrown).
-    await authorizeOnly(
-      core,
-      projectId,
-      { action: "set-aside", setAside: { reason: why } },
-      { op: SET_ASIDE_OP, entity: { type: "project", id: projectId }, auditAllow: { details: { reason: why, mark: m.summary } } },
-    );
+    if (core.encrypted(st)) {
+      // R362 b: the entry records the reason's SHA-256; its text is sealed in the same change, under the marker (R26).
+      await runMutation(core, projectId, { action: "set-aside", setAside: { reason: why } }, async () => undefined, {
+        op: SET_ASIDE_OP,
+        entity: { type: "project", id: projectId },
+        auditDetails: { ...auditedReason(true, why), mark: m.summary },
+        sealedReason: why,
+      });
+    } else {
+      await authorizeOnly(
+        core,
+        projectId,
+        { action: "set-aside", setAside: { reason: why } },
+        { op: SET_ASIDE_OP, entity: { type: "project", id: projectId }, auditAllow: { details: { reason: why, mark: m.summary } } },
+      );
+    }
     await core.serial(() => m.remove());
     return { recordedIn: "project" };
   }
   // The project's log cannot take it: decided against the project's governance, recorded in the library's log.
   return core.serial(async () => {
     core.assertWritable();
+    // R362 b: an encrypted project's reason is sealed with its key; locked, nothing is written.
+    const encrypted = core.encrypted(st);
+    if (encrypted) core.assertUnlocked(st);
     const m = await markForSetAside(core, st, markId);
     if (!m) throw new NotFoundError("Mark", markId);
     const at = core.clock().toISOString();
@@ -1627,16 +1698,18 @@ async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string,
       // Never an error message here: it can name an absolute path (N5).
       decision = { result: "deny", reason: `Policy could not be evaluated (${reasonOf(e)})` };
     }
-    await appendLibraryAudit(core, {
+    const input = {
       at,
       actor: core.actor,
       device: core.device,
       projectId,
       action: "set-aside",
-      entity: { type: "project", id: projectId },
+      entity: { type: "project" as const, id: projectId },
       decision,
-      details: { op: SET_ASIDE_OP, reason: why, mark: m.summary, projectLogNotIntact: true },
-    });
+      details: { op: SET_ASIDE_OP, ...(encrypted && why === "" ? {} : auditedReason(encrypted, why)), mark: m.summary, projectLogNotIntact: true },
+    };
+    if (encrypted && why !== "") await appendLibraryAuditWithReason(core, input, core.key(st), why);
+    else await appendLibraryAudit(core, input);
     if (decision.result === "deny") throw new PolicyDeniedError(decision.reason, "set-aside");
     await m.remove();
     return { recordedIn: "library" as const };

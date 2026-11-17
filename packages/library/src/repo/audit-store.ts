@@ -160,6 +160,11 @@ export class AuditStore {
     return `${String(Math.ceil(seq / this.segmentSize)).padStart(4, "0")}.jsonl`;
   }
 
+  /** The event `append(input)` would write next (its seq and hash), without writing anything (R362 b). */
+  peek(input: AuditInput): AuditEvent {
+    return sealEvent(stripUndefined(input), this.head);
+  }
+
   /** Seals and durably appends one event. Returns an undo that removes it again. */
   async append(
     input: AuditInput,
