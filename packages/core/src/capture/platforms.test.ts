@@ -181,3 +181,63 @@ describe("the browser-session acknowledgement", () => {
     );
   });
 });
+
+describe("classifyUrl never throws (R379, WB1 I4)", () => {
+  it("a handle that cannot be decoded is the platform's unrecognised path", () => {
+    expect(classifyUrl("https://www.tiktok.com/@%ZZ")).toEqual({ platform: "tiktok", kind: "unknown", canonicalUrl: "https://www.tiktok.com/@%ZZ" });
+    expect(classifyUrl("https://www.youtube.com/@%E0%A4%A")).toEqual({ platform: "youtube", kind: "unknown", canonicalUrl: "https://www.youtube.com/@%E0%A4%A" });
+    expect(classifyUrl("https://www.tiktok.com/@%ZZ/video/123")).toEqual({ platform: "tiktok", kind: "unknown", canonicalUrl: "https://www.tiktok.com/@%ZZ/video/123" });
+  });
+
+  /** Thirty malformed strings: none throws, and each gets a classification. */
+  const MALFORMED: string[] = [
+    "%",
+    "https://www.tiktok.com/@%",
+    "https://www.youtube.com/@%",
+    "https://www.tiktok.com/@%E0%A4",
+    "https://www.youtube.com/@%E0%A4",
+    "https://www.tiktok.com/@%E0%A4/photo/7234567890",
+    "https://www.youtube.com/@%ZZ/videos",
+    "https://www.tiktok.com/@%C0%AF",
+    "https://www.youtube.com/@%ED%A0%80",
+    "https://www.tiktok.com/@%FF%FE",
+    "https://www.tiktok.com/@\u0000\u0001",
+    "https://www.youtube.com/@a\u0007b",
+    "\u0000\u0001\u0002",
+    "https://\u0000www.youtube.com/",
+    "\t\n\r",
+    `https://www.tiktok.com/@${"%".repeat(10_000)}`,
+    `https://www.youtube.com/@${"%E0".repeat(3_333)}`,
+    "x".repeat(10_000),
+    "@",
+    "https://www.tiktok.com/@",
+    "https://www.youtube.com/@@",
+    "https://",
+    "http://[",
+    "https://%%%/",
+    "::::",
+    "javascript:decodeURIComponent('%')",
+    "https://www.youtube.com/watch?v=%ZZ",
+    "https://www.instagram.com/%ZZ/",
+    "https://vm.tiktok.com/%ZZ/",
+    "\ud800",
+  ];
+
+  it("has thirty malformed strings", () => {
+    expect(MALFORMED).toHaveLength(30);
+  });
+
+  it.each(MALFORMED.map((s) => [s.length > 60 ? `${s.slice(0, 60)}… (${s.length})` : s, s]))("%j does not throw", (_label, s) => {
+    let c: ReturnType<typeof classifyUrl> | undefined;
+    expect(() => (c = classifyUrl(s))).not.toThrow();
+    expect(typeof c!.canonicalUrl).toBe("string");
+    expect(c!.kind === "unknown" || c!.platform !== "other").toBe(true);
+  });
+
+  it("a non-string input is the generic unknown address", () => {
+    for (const v of [undefined, null, 42, {}, []] as unknown[]) {
+      expect(() => classifyUrl(v as string)).not.toThrow();
+      expect(classifyUrl(v as string)).toEqual({ platform: "other", kind: "unknown", canonicalUrl: "" });
+    }
+  });
+});

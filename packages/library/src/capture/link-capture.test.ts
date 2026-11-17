@@ -150,6 +150,11 @@ describe("stripSnapshot", () => {
     });
     expect(s).toEqual({ id: "x", title: "t", nested: { ok: 1, list: [{ keep: 2 }] } });
   });
+
+  it("an address in the metadata that cannot be decoded is kept without its query; the rest is stripped as usual (R379, WB1 I4)", () => {
+    const s = stripSnapshot({ uploader_url: "https://www.tiktok.com/@%ZZ?x=1", channel_url: "https://www.youtube.com/@%E0%A4%A", webpage_url: "https://www.tiktok.com/@%ZZ/video/123", title: "t" });
+    expect(s).toEqual({ uploader_url: "https://www.tiktok.com/@%ZZ", channel_url: "https://www.youtube.com/@%E0%A4%A", webpage_url: "https://www.tiktok.com/@%ZZ/video/123", title: "t" });
+  });
 });
 
 describe("captureUrl", () => {

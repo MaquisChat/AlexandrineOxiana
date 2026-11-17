@@ -710,6 +710,29 @@ describe("captureProfile fix round 1 (R43)", { timeout: 120_000 }, () => {
     expect(nested).toMatchObject({ entries: [], nested: true });
   });
 
+  it("a listing entry whose address cannot be decoded does not fail the others (R379, WB1 I4)", async () => {
+    const { readEnumeration } = await import("./profile-snapshot.js");
+    const c = { platform: "tiktok" as const, kind: "profile" as const, canonicalUrl: "https://www.tiktok.com/@fake.dancer", handle: "@fake.dancer" };
+    const e = readEnumeration(
+      [
+        {
+          _type: "playlist",
+          uploader: "fake.dancer",
+          webpage_url: "https://www.tiktok.com/@%ZZ",
+          entries: [
+            { id: "7000000000000000001", url: "https://www.tiktok.com/@fake.dancer/video/7000000000000000001" },
+            { id: "7000000000000000002", url: "https://www.tiktok.com/@%ZZ/video/7000000000000000002" },
+            { id: "7000000000000000003", url: "https://www.tiktok.com/@%E0%A4%A" },
+          ],
+        },
+      ],
+      c,
+      "yt-dlp",
+    );
+    expect(e.entries.map((x) => x.id)).toEqual(["7000000000000000001", "7000000000000000002", "7000000000000000003"]);
+    expect(e.entries[1]!.url).toBe("https://www.tiktok.com/@fake.dancer/video/7000000000000000002");
+  });
+
   it("I1: an old profile.json with only knownPostIds is migrated", async () => {
     const p = await project();
     await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });

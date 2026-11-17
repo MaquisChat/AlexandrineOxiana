@@ -66,6 +66,15 @@ function stripTracking(u: URL): string {
   return out.href;
 }
 
+/** A handle segment decoded, or undefined when its percent escapes are malformed (R379: not a handle). */
+function decodeHandle(seg: string): string | undefined {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return undefined;
+  }
+}
+
 function youtube(u: URL, host: string): ClassifiedUrl {
   const seg = u.pathname.split("/").filter(Boolean);
   const unknown: ClassifiedUrl = { platform: "youtube", kind: "unknown", canonicalUrl: stripTracking(u) };
@@ -90,8 +99,8 @@ function youtube(u: URL, host: string): ClassifiedUrl {
   if (seg[0] === "playlist" && list) {
     return { platform: "youtube", kind: "playlist", canonicalUrl: `https://www.youtube.com/playlist?list=${encodeURIComponent(list)}` };
   }
-  if (seg[0]?.startsWith("@") && seg[0].length > 1) {
-    const handle = decodeURIComponent(seg[0]);
+  const handle = seg[0]?.startsWith("@") && seg[0].length > 1 ? decodeHandle(seg[0]) : undefined;
+  if (handle !== undefined) {
     return { platform: "youtube", kind: "profile", canonicalUrl: `https://www.youtube.com/${seg[0]}`, handle };
   }
   if ((seg[0] === "channel" || seg[0] === "c" || seg[0] === "user") && seg[1]) {
@@ -125,7 +134,8 @@ function tiktok(u: URL, host: string): ClassifiedUrl {
   }
   const unknown: ClassifiedUrl = { platform: "tiktok", kind: "unknown", canonicalUrl: stripTracking(u) };
   if (!seg[0]?.startsWith("@") || seg[0].length < 2) return unknown;
-  const handle = decodeURIComponent(seg[0]);
+  const handle = decodeHandle(seg[0]);
+  if (handle === undefined) return unknown;
   if ((seg[1] === "video" || seg[1] === "photo") && seg[2] && /^\d+$/.test(seg[2])) {
     return {
       platform: "tiktok",
@@ -139,8 +149,21 @@ function tiktok(u: URL, host: string): ClassifiedUrl {
   return unknown;
 }
 
+/**
+ * The platform and kind of `url`. Never throws, for any input (R379): an input that cannot be read
+ * as an address, or anything unexpected while reading it, is the generic "other / unknown" with the
+ * input as given.
+ */
 export function classifyUrl(url: string): ClassifiedUrl {
   const raw = typeof url === "string" ? url.trim() : "";
+  try {
+    return classify(raw);
+  } catch {
+    return { platform: "other", kind: "unknown", canonicalUrl: raw };
+  }
+}
+
+function classify(raw: string): ClassifiedUrl {
   let u: URL;
   try {
     u = new URL(raw);

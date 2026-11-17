@@ -162,6 +162,22 @@ describe("capture: links", () => {
     expect(previewLink("https://example.org/a").label).not.toMatch(/cannot capture/);
     expect(previewLink("nonsense").label).toMatch(/not a web address/);
   });
+
+  it("never throws on a malformed link, even half typed (R379, WB1 I4)", () => {
+    const bad = [
+      "https://www.tiktok.com/@%",
+      "https://www.tiktok.com/@%ZZ",
+      "https://www.youtube.com/@%E0%A4%A",
+      "https://www.tiktok.com/@%ZZ/video/123",
+      "https://www.youtube.com/@%ZZ/videos",
+      "%",
+      "\u0000",
+      "x".repeat(10_000),
+      "@",
+    ];
+    for (const s of bad) expect(() => previewLink(s), s).not.toThrow();
+    expect(previewLink("https://www.tiktok.com/@%ZZ").label).toBe("TikTok — kind not recognised here; the app will check it");
+  });
 });
 describe("capture: reasons in plain words", () => {
   it("LOGIN_REQUIRED says to use the browser session", () => {
