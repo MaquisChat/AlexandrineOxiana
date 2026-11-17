@@ -5,8 +5,10 @@
  * bounded, so malformed input can neither crash the parser nor make it loop.
  */
 import * as fsp from "node:fs/promises";
+import { basename } from "node:path";
 import type { Creator } from "@ao/core";
 import { clean, normalizeDate, parseName } from "./names.js";
+import { embeddedTitle, keepCreators } from "./title-like.js";
 import type { RawExtract } from "./types.js";
 
 const PALMDB_HEADER = 78;
@@ -80,7 +82,8 @@ export async function extractMobi(path: string): Promise<RawExtract> {
     const head = await readAt(fh, 0, PALMDB_HEADER);
     if (head.length < PALMDB_HEADER) return {};
     const nameEnd = head.indexOf(0);
-    const palmName = clean(head.toString("latin1", 0, nameEnd >= 0 && nameEnd < 32 ? nameEnd : 32)) || undefined;
+    // R394 a: the PalmDB name and the EXTH title count only when they look like a title.
+    const palmName = embeddedTitle(clean(head.toString("latin1", 0, nameEnd >= 0 && nameEnd < 32 ? nameEnd : 32)) || undefined, basename(path));
     const fallback: RawExtract = palmName ? { title: palmName } : {};
 
     const numRecords = head.readUInt16BE(76);
@@ -95,9 +98,9 @@ export async function extractMobi(path: string): Promise<RawExtract> {
 
     const m = parseRecord0(rec0);
     const out: RawExtract = {};
-    const title = m.title ?? palmName;
+    const title = embeddedTitle(m.title, basename(path)) ?? palmName;
     if (title) out.title = title;
-    const creators = m.authors.map((a) => parseName(a)).filter((c): c is Creator => !!c);
+    const creators = keepCreators(m.authors.map((a) => parseName(a)).filter((c): c is Creator => !!c));
     if (creators.length) out.creators = creators;
     const issued = normalizeDate(m.date);
     if (issued) out.issued = issued;

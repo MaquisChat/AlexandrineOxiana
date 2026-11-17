@@ -325,9 +325,10 @@ describe("review round 2", () => {
 
   it("text survives a page with no </head> and no <body>", async () => {
     const f = join(tmp, "nohead.html");
-    await writeFile(f, "<html><head><title>T</title><p>Paragraph text here</p>");
+    // A title that looks like one (R394 a: a one-letter "T" is no title any more).
+    await writeFile(f, "<html><head><title>Market Days</title><p>Paragraph text here</p>");
     const x = await extractMetadata(f, "text/html");
-    expect(x.title).toBe("T");
+    expect(x.title).toBe("Market Days");
     expect(x.text).toContain("Paragraph text here");
   });
 
@@ -380,5 +381,68 @@ describe("dispatch", () => {
     const f = join(tmp, "notes.bin");
     await writeFile(f, "binary");
     expect(await extractMetadata(f, "application/octet-stream")).toEqual({ identifiers: { dois: [], isbns: [], arxiv: [] } });
+  });
+});
+
+describe("R394: an embedded title or author is kept only when it looks like one", () => {
+  /** A PDF with the given Info Title/Author and, optionally, an XMP dc:title. */
+  async function pdfWith(o: { info?: string; author?: string; xmpTitle?: string }): Promise<Buffer> {
+    const { PDFDocument, PDFName, StandardFonts } = await import("pdf-lib");
+    const doc = await PDFDocument.create({ updateMetadata: false });
+    if (o.info) doc.setTitle(o.info);
+    if (o.author) doc.setAuthor(o.author);
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    doc.addPage([595, 842]).drawText("Subsistence and persistence: agriculture in the Central Plains of China", { x: 50, y: 780, size: 11, font });
+    if (o.xmpTitle) {
+      const xmp = `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title><rdf:Alt><rdf:li xml:lang="x-default">${o.xmpTitle}</rdf:li></rdf:Alt></dc:title></rdf:Description></rdf:RDF></x:xmpmeta>`;
+      doc.catalog.set(PDFName.of("Metadata"), doc.context.register(doc.context.stream(Buffer.from(xmp, "utf8"), { Type: "Metadata", Subtype: "XML" })));
+    }
+    return Buffer.from(await doc.save({ useObjectStreams: false }));
+  }
+
+  it("the owner's case: an Info Title that is a production code, no XMP title → no title", async () => {
+    const p = join(tmp, "r394-owner.pdf");
+    await writeFile(p, await pdfWith({ info: "S0003598X20000800jra 900..915" }));
+    const x = await extractMetadata(p, "application/pdf");
+    expect(x.title).toBeUndefined();
+    expect(x.text).toContain("Subsistence and persistence");
+  });
+
+  it("an XMP title that is junk and an Info Title that is real → the real one", async () => {
+    const p = join(tmp, "r394-xmp-junk.pdf");
+    await writeFile(p, await pdfWith({ xmpTitle: "JQE-2020-0041.R1", info: "Subsistence and persistence" }));
+    expect((await extractMetadata(p, "application/pdf")).title).toBe("Subsistence and persistence");
+  });
+
+  it("an embedded title that is the file's own name is dropped", async () => {
+    const p = join(tmp, "Field Notes Draft.pdf");
+    await writeFile(p, await pdfWith({ info: "field notes draft" }));
+    expect((await extractMetadata(p, "application/pdf")).title).toBeUndefined();
+  });
+
+  it("stock authors are dropped; a real name is kept", async () => {
+    const a = join(tmp, "r394-admin.pdf");
+    await writeFile(a, await pdfWith({ info: "On Liberty", author: "Administrator" }));
+    const xa = await extractMetadata(a, "application/pdf");
+    expect(xa.title).toBe("On Liberty");
+    expect(xa.creators).toBeUndefined();
+    const b = join(tmp, "r394-maria.pdf");
+    await writeFile(b, await pdfWith({ author: "Maria Lopez; Microsoft Office User" }));
+    expect((await extractMetadata(b, "application/pdf")).creators).toEqual([{ given: "Maria", family: "Lopez", role: "author" }]);
+  });
+
+  it("DOCX core properties: 'Document1' by 'User' gives no title and no author", async () => {
+    const f = join(tmp, "r394.docx");
+    const core = `<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Document1</dc:title><dc:creator>User</dc:creator></cp:coreProperties>`;
+    await writeFile(f, buildZip([{ name: "docProps/core.xml", data: core }, { name: "word/document.xml", data: "<w:document><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>" }]));
+    const x = await extractMetadata(f, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    expect(x.title).toBeUndefined();
+    expect(x.creators).toBeUndefined();
+  });
+
+  it("HTML: a <title> that is a file name is dropped", async () => {
+    const f = join(tmp, "r394.html");
+    await writeFile(f, "<html><head><title>chapter3.pdf</title></head><body>x</body></html>");
+    expect((await extractMetadata(f, "text/html")).title).toBeUndefined();
   });
 });

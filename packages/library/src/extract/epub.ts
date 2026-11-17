@@ -1,7 +1,9 @@
 /** EPUB: OPF metadata (dc:title, dc:creator, dc:date, dc:identifier, dc:language) and the first spine items' text. */
+import { basename } from "node:path";
 import type { Creator } from "@ao/core";
 import { clean, decodeEntities, markupToText, normalizeDate, parseName } from "./names.js";
 import { attrValue, elements, firstElement, startTags, textOf } from "./scan.js";
+import { embeddedTitle, keepCreators } from "./title-like.js";
 import { MAX_TEXT_CHARS, type RawExtract } from "./types.js";
 import { openZip } from "./zip.js";
 
@@ -54,11 +56,14 @@ export async function extractEpub(path: string): Promise<RawExtract> {
     const meta = firstElement(opf, "metadata")?.inner ?? opf;
 
     const out: RawExtract = {};
-    const title = dcValues(meta, "title")[0]?.value;
+    // R394: an OPF title that does not look like one and stock authors are dropped.
+    const title = embeddedTitle(dcValues(meta, "title")[0]?.value, basename(path));
     if (title) out.title = title;
-    const creators = dcValues(meta, "creator")
-      .map((c) => parseName(attr(c.attrs, "opf:file-as") && !c.value.includes(" ") ? attr(c.attrs, "opf:file-as")! : c.value))
-      .filter((c): c is Creator => !!c);
+    const creators = keepCreators(
+      dcValues(meta, "creator")
+        .map((c) => parseName(attr(c.attrs, "opf:file-as") && !c.value.includes(" ") ? attr(c.attrs, "opf:file-as")! : c.value))
+        .filter((c): c is Creator => !!c),
+    );
     if (creators.length) out.creators = creators;
     const issued = normalizeDate(dcValues(meta, "date")[0]?.value);
     if (issued) out.issued = issued;
