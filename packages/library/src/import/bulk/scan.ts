@@ -132,6 +132,11 @@ export interface ScanItem {
    * none); the notes are journaled with its outcome and listed in the batch report (R66).
    */
   fileNotes?: string[];
+  /**
+   * Doubts about the record as the source gave it (e.g. a BibTeX entry that was not closed, R362 g):
+   * plain sentences. The item still imports, and waits in the review queue with them as its reasons.
+   */
+  doubts?: string[];
   /** The item could not be read at all (e.g. a refused archive): it fails with this plain reason. */
   unreadable?: string;
   /**

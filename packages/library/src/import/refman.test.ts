@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Project } from "@ao/core";
+import { primary, type Project } from "@ao/core";
 import { buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
 import { buildCalibreLibrary } from "../../tests/fixtures/refman/calibre.mjs";
 import { writeCraftedJournal } from "../../tests/fixtures/sqlite/crafted-journal.mjs";
@@ -27,7 +27,9 @@ import { approvedFolders, rememberApprovedFolders } from "./approved-folders.js"
 import { adapterFor, createBulkImport, folderAdapter, zipAdapter, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
 import { reportLabel } from "./bulk/report.js";
 import { CALIBRE_FILE_NOTE, CALIBRE_REASONS, MAX_CALIBRE_DB_BYTES, calibreAdapter, copyCalibreDb } from "./calibre.js";
-import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_EXPORT_RECORDS, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, exportIdentity, risAdapter } from "./refman.js";
+import { BIB_DOUBTS, BibBlocks } from "./bib-blocks.js";
+import { ITEM_REASONS } from "./common.js";
+import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_EXPORT_RECORDS, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, exportIdentity, parseBibtexEntries, risAdapter } from "./refman.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/refman");
@@ -97,6 +99,16 @@ async function writeExport(name: string, text: string): Promise<string> {
   await writeFile(p, text);
   return p;
 }
+
+/** The review's 50-entry file: entry 10 lost its closing brace, entry 40 ends with an extra one. */
+const brokenFifty = () => {
+  const parts: string[] = ["% Exported by a reference manager", ""];
+  for (let n = 1; n <= 50; n++) {
+    const end = n === 10 ? "" : n === 40 ? "}}" : "}";
+    parts.push(`@article{e${n},\n  title = {Entry Number ${n}},\n  author = {Doe, Jane and Roe, Rick},\n  year = {${2000 + n}},\n  abstract = {An abstract for entry ${n}.},\n  doi = {10.5555/e.${n}}\n${end}\n`);
+  }
+  return parts.join("\n");
+};
 
 describe("bibtexAdapter", () => {
   it("yields every entry with titles, creators, citation keys and resolved files", async () => {
@@ -1252,6 +1264,107 @@ processing:
     expect(tags.map((t) => t.name).sort()).toEqual(["Lagos", "food systems"]);
     expect(u.kept).toContainEqual(expect.objectContaining({ kind: "tag", id: foodId }));
   });
+
+  it("R362 g: a record the BibTeX recovery cut waits in the review queue with the doubt; a whole one does not", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const bib = await writeExport(
+      "cut.bib",
+      "@article{whole, title={Whole Record}, abstract={A thread.\n@someuser replied to the thread\nand more.}, year={2021}}\n" +
+        "@article{broken, title={Broken Record}, abstract={never closed\n@article{after, title={After Record}, year={2022}}\n",
+    );
+    const h = await bulk.startBatch(p.id, bibtexAdapter(bib));
+    const r = await h.done;
+    expect(r.state).toBe("finished");
+    expect(r.counts.items).toBe(3);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    const withDoubt = report.pendingReview.filter((e) => e.reasons.includes(BIB_DOUBTS.cut));
+    expect(withDoubt).toHaveLength(1);
+    const sf = await repo.getSource(p.id, withDoubt[0]!.sourceId!);
+    expect(primary(sf.source.title)).toBe("Broken Record");
+    expect(report.pendingReview.flatMap((e) => e.reasons)).not.toContain(BIB_DOUBTS.eof);
+  });
+
+  it("R366 a: the 50-entry file with one closing brace missing and one extra later imports 50 records; the broken one waits for review with the cut's doubt", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, bibtexAdapter(await writeExport("fifty-broken.bib", brokenFifty())));
+    const r = await h.done;
+    expect(r.counts.items).toBe(50);
+    expect(r.counts.created + r.counts.needsReview).toBe(50);
+    expect(repo.listSourceIds(p.id)).toHaveLength(50);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    const cut = report.pendingReview.filter((e) => e.reasons.includes(BIB_DOUBTS.cut));
+    expect(cut).toHaveLength(1);
+    const sf = await repo.getSource(p.id, cut[0]!.sourceId!);
+    expect(primary(sf.source.title)).toBe("Entry Number 10");
+    expect(sf.source.identifiers?.doi).toBe("10.5555/e.10");
+  });
+
+  it("R366 h: a COMPLETE record (title, creators, year) with a doubt waits for review; the same record whole does not", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const complete = (k: string, t: string, y: number) => `@article{${k},\n  title = {${t}},\n  author = {Doe, Jane and Roe, Rick},\n  journal = {Journal of Threads},\n  year = {${y}}`;
+    const src = `${complete("whole", "A Whole Record", 2020)}\n}\n${complete("broken", "A Broken Record", 2021)}\n\n${complete("after", "An After Record", 2022)}\n}\n`;
+    const h = await bulk.startBatch(p.id, bibtexAdapter(await writeExport("complete.bib", src)));
+    const r = await h.done;
+    expect(r.counts.items).toBe(3);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    const titles = await Promise.all(report.pendingReview.map(async (e) => primary((await repo.getSource(p.id, e.sourceId!)).source.title)));
+    expect(titles).toEqual(["A Broken Record"]);
+    expect(report.pendingReview[0]!.reasons).toEqual([BIB_DOUBTS.cut]);
+  });
+
+  describe("R366 b: a record with a BibTeX doubt is never merged into an existing source", () => {
+    const cleanX = "@article{x, title={Clean X}, author={Doe, Jane}, doi={10.5555/x}, year={2020}}\n";
+    const cutX = "@article{x, title={Clean X}, doi={10.5555/x}, journal={Journal of X, volume={3}\n@article{y, title={Y}}\n";
+
+    for (const [way, options] of [["merge", { duplicates: "merge" as const }], ["the default (merge, as the command line's)", {}], ["keep-both", { duplicates: "keep-both" as const }]] as const) {
+      it(`${way}: the existing source is untouched; a new record waits for review with the doubt`, async () => {
+        const p = await project();
+        const bulk = bulkImport();
+        await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("clean.bib", cleanX)))).done;
+        const [xId] = repo.listSourceIds(p.id);
+        const before = await repo.getSource(p.id, xId!);
+        const h = await bulk.startBatch(p.id, bibtexAdapter(await writeExport("cut-dup.bib", cutX)), options);
+        const r = await h.done;
+        expect(r.counts).toMatchObject({ items: 2, merged: 0, duplicates: 0, failed: 0 });
+        expect(r.counts.created + r.counts.needsReview).toBe(2);
+        expect(r.counts.needsReview).toBeGreaterThanOrEqual(1);
+        const after = await repo.getSource(p.id, xId!);
+        expect(after.source).toEqual(before.source);
+        expect(after.assets).toEqual(before.assets);
+        expect(repo.listSourceIds(p.id)).toHaveLength(3);
+        const report = await bulk.batchReport(p.id, h.batchId);
+        const entry = report.pendingReview.find((e) => e.reasons.includes(BIB_DOUBTS.cut));
+        expect(entry?.sourceId).toBeDefined();
+        expect(entry!.sourceId).not.toBe(xId);
+        expect(primary((await repo.getSource(p.id, entry!.sourceId!)).source.title)).toBe("Clean X");
+        if (way !== "keep-both") expect(entry!.reasons).toContain(ITEM_REASONS.likelyDuplicate);
+      });
+    }
+
+    it("skip: skipped as before; the existing source is untouched", async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("clean.bib", cleanX)))).done;
+      const [xId] = repo.listSourceIds(p.id);
+      const before = await repo.getSource(p.id, xId!);
+      const r = await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("cut-dup.bib", cutX)), { duplicates: "skip" })).done;
+      expect(r.counts).toMatchObject({ items: 2, merged: 0, duplicates: 1 });
+      expect((await repo.getSource(p.id, xId!)).source).toEqual(before.source);
+      expect(repo.listSourceIds(p.id)).toHaveLength(2);
+    });
+
+    it("a clean record with the same DOI is still merged (the rule is only for doubted records)", async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("clean.bib", cleanX)))).done;
+      const r = await (await bulk.startBatch(p.id, bibtexAdapter(await writeExport("clean2.bib", "@article{x, title={Clean X}, doi={10.5555/x}, journal={Journal of X}}\n")))).done;
+      expect(r.counts.merged).toBe(1);
+      expect(repo.listSourceIds(p.id)).toHaveLength(1);
+    });
+  });
 });
 
 describe("review round 2 (R82): tables never reach Object.prototype", () => {
@@ -1263,5 +1376,321 @@ describe("review round 2 (R82): tables never reach Object.prototype", () => {
     expect(cslFields({ type: "constructor", title: "T" }).type).toBe("other");
     expect(risFields(new Map([["TY", ["CONSTRUCTOR"]], ["TI", ["T"]]])).type).toBe("other");
     expect(risFields(new Map([["TY", ["__proto__"]]])).type).toBe("other");
+  });
+});
+
+describe("R362 g: a line beginning with @ inside a field's value", () => {
+  const entries = (src: string) => [...parseBibtexEntries(src)];
+  const later = "  keywords = {social media, replies},\n  doi = {10.5555/ao.thread.2021},\n  url = {https://example.org/thread},\n  file = {files/okafor2024feeding.pdf}\n}\n";
+
+  it("belongs to the value when the entry closes properly after it (braces): every later field is kept, no doubt", async () => {
+    const src = `@article{k1,\n  title = {Replies in a thread\n@someuser replied to the thread\nand the end},\n  abstract = {We read replies.\n@someuser replied to the thread\n@other_user then wrote back.},\n${later}`;
+    const [e, ...rest] = entries(src);
+    expect(rest).toEqual([]);
+    expect(e!.fields.get("title")).toBe("Replies in a thread\n@someuser replied to the thread\nand the end");
+    expect([...e!.fields.keys()]).toEqual(["title", "keywords", "doi", "url", "file"]);
+    expect(e!.doubt).toBeUndefined();
+    const [i] = await collect(bibtexAdapter(await writeExport("at.bib", src)));
+    expect(i!.referenceMetadata?.identifiers).toMatchObject({ doi: "10.5555/ao.thread.2021", url: "https://example.org/thread" });
+    expect(i!.tags).toEqual(["social media", "replies"]);
+    expect(i!.files).toHaveLength(1);
+    expect(i!.doubts).toBeUndefined();
+  });
+
+  it("belongs to the value when the entry closes properly after it (quotes): every later field is kept, no doubt", async () => {
+    const src = `@article{k2,\n  title = "Replies\n@someuser replied to the thread",\n  abstract = "We read replies.\n  @someuser replied to the thread\nThe end.",\n${later}`;
+    const [e, ...rest] = entries(src);
+    expect(rest).toEqual([]);
+    expect(e!.fields.get("title")).toBe("Replies\n@someuser replied to the thread");
+    expect([...e!.fields.keys()]).toEqual(["title", "keywords", "doi", "url", "file"]);
+    expect(e!.doubt).toBeUndefined();
+    const [i] = await collect(bibtexAdapter(await writeExport("atq.bib", src)));
+    expect(i!.referenceMetadata?.identifiers?.doi).toBe("10.5555/ao.thread.2021");
+    expect(i!.doubts).toBeUndefined();
+  });
+
+  it("a citation pasted inside a balanced value is part of it: the entry is kept whole and is not split", async () => {
+    const src = `@article{k3,\n  title = {Citing},\n  abstract = {As in\n@article{smith2020, title={Pasted}, year={2020}}\nwe find more.},\n${later}@book{k4, title={Next Book}}\n`;
+    const es = entries(src);
+    expect(es.map((x) => x.key)).toEqual(["k3", "k4"]);
+    expect([...es[0]!.fields.keys()]).toEqual(["title", "keywords", "doi", "url", "file"]);
+    expect(es[0]!.fields.get("title")).toBe("Citing");
+    expect(es[1]!.fields.get("title")).toBe("Next Book");
+    expect(es[1]!.doubt).toBeUndefined();
+    // Not silent either way: had a closing brace been lost there, other entries would be inside this one.
+    expect(es[0]!.doubt).toBe(BIB_DOUBTS.innerEntry);
+  });
+
+  it("an entry that is truly not closed is cut at the next entry as before: the first carries the doubt, the second is whole", async () => {
+    const src = "@article{a,\n  title = {First},\n  abstract = {opens\n@someuser replied\n},\n  year = {2020},\n\n@article{b, title={Second}, year={2021}, doi={10.5555/b}}\n";
+    const es = entries(src);
+    expect(es.map((x) => x.key)).toEqual(["a", "b"]);
+    // The line "@someuser replied" is no entry: the cut is at "@article{b", so the year before it is kept.
+    expect(es[0]!.fields.get("year")).toBe("2020");
+    expect(es[0]!.doubt).toBe(BIB_DOUBTS.cut);
+    expect([...es[1]!.fields.keys()]).toEqual(["title", "year", "doi"]);
+    expect(es[1]!.doubt).toBeUndefined();
+    const items = await collect(bibtexAdapter(await writeExport("unclosed.bib", src)));
+    expect(items.map(title)).toEqual(["First", "Second"]);
+    expect(items[0]!.doubts).toEqual([BIB_DOUBTS.cut]);
+    expect(items[1]!.doubts).toBeUndefined();
+    expect(items[1]!.referenceMetadata?.identifiers?.doi).toBe("10.5555/b");
+  });
+
+  it("an unclosed last entry runs to the end of the file and carries the doubt", async () => {
+    const src = "@article{ok, title={Fine}}\n@article{last,\n  title = {Last One},\n  year = {2019},\n  abstract = {cut off\n@someuser said";
+    const es = entries(src);
+    expect(es.map((x) => x.key)).toEqual(["ok", "last"]);
+    expect(es[0]!.doubt).toBeUndefined();
+    expect(es[1]!.fields.get("year")).toBe("2019");
+    expect(es[1]!.doubt).toBe(BIB_DOUBTS.eof);
+    const items = await collect(bibtexAdapter(await writeExport("eof.bib", src)));
+    expect(items[1]!.doubts).toEqual([BIB_DOUBTS.eof]);
+  });
+
+  it("a real-looking 50-entry file with three such abstracts imports 50 records with the right fields", async () => {
+    const parts: string[] = ["% Exported by a reference manager", "@comment{jabref-meta: databaseType:biblatex;}", ""];
+    for (let n = 1; n <= 50; n++) {
+      const abstract = n % 17 === 0 || n === 50 ? `{Replies to a post.\n@user${n} replied to the thread\n@user${n + 1} wrote: {quoted} text.\nEnd.}` : `{An abstract for entry ${n}.}`;
+      parts.push(
+        `@article{e${n},\n  title = {Entry Number ${n}},\n  author = {Doe, Jane and Roe, Rick},\n  journal = {Journal of Threads},\n  year = {${2000 + n}},\n  abstract = ${abstract},\n  keywords = {threads, entry ${n}},\n  doi = {10.5555/e.${n}},\n  url = {https://example.org/e/${n}},\n  pages = {1--${n}}\n}\n`,
+      );
+    }
+    const src = parts.join("\n");
+    expect(src.match(/\n@user/gu)).toHaveLength(6);
+    const items = await collect(bibtexAdapter(await writeExport("fifty.bib", src)));
+    expect(items).toHaveLength(50);
+    for (const [k, i] of items.entries()) {
+      const n = k + 1;
+      expect(title(i)).toBe(`Entry Number ${n}`);
+      expect(i.referenceMetadata?.creators).toHaveLength(2);
+      expect(i.referenceMetadata?.issued).toBe(String(2000 + n));
+      expect(i.referenceMetadata?.container?.variants[0]?.value).toBe("Journal of Threads");
+      expect(i.referenceMetadata?.identifiers).toMatchObject({ doi: `10.5555/e.${n}`, url: `https://example.org/e/${n}` });
+      expect(i.tags).toEqual(["threads", `entry ${n}`]);
+      expect(i.referenceMetadata?.page).toBe(`1–${n}`);
+      expect(i.doubts).toBeUndefined();
+    }
+  });
+
+  describe("R366 c: a line begins an entry only as '@type{key,'", () => {
+    const lines = ["@jdoe (2021) wrote back", "@jdoe {at} the meeting"];
+    const shapes = (line: string) => ({
+      braces: `@article{k,\n  title = {Replies},\n  abstract = {We read.\n${line}\nEnd.},\n  doi = {10.5555/k},\n  year = {2021}\n}\n@book{n, title={Next}}\n`,
+      quotes: `@article{k,\n  title = {Replies},\n  abstract = "We read.\n${line}\nEnd.",\n  doi = {10.5555/k},\n  year = {2021}\n}\n@book{n, title={Next}}\n`,
+      parens: `@article(k,\n  title = {Replies},\n  abstract = {We read.\n${line}\nEnd.},\n  doi = {10.5555/k},\n  year = {2021}\n)\n@book{n, title={Next}}\n`,
+      parensQuoted: `@article(k,\n  title = {Replies},\n  abstract = "We read.\n${line}\nEnd.",\n  doi = {10.5555/k},\n  year = {2021}\n)\n@book{n, title={Next}}\n`,
+    });
+    for (const line of lines) {
+      for (const [shape, src] of Object.entries(shapes(line))) {
+        it(`"${line}" in ${shape}: no doubt, no cut, every field, no spurious record`, async () => {
+          const es = entries(src);
+          expect(es.map((x) => x.key)).toEqual(["k", "n"]);
+          expect([...es[0]!.fields.keys()]).toEqual(["title", "doi", "year"]);
+          expect(es[0]!.doubt).toBeUndefined();
+          const items = await collect(bibtexAdapter(await writeExport("strict.bib", src)));
+          expect(items.map(title)).toEqual(["Replies", "Next"]);
+          expect(items[0]!.referenceMetadata?.identifiers?.doi).toBe("10.5555/k");
+          expect(items[0]!.doubts).toBeUndefined();
+        });
+      }
+    }
+
+    it('"@article { smith2020 ," still begins an entry: it cuts an unclosed entry; @comment{ and @string{x = lines end one too', () => {
+      for (const next of ["@article { smith2020 ,\n  title={Smith}}", "@comment{jabref-meta: x}\n@article{smith2020, title={Smith}}", '@string{x = "y"}\n@article{smith2020, title={Smith}}']) {
+        const es = entries(`@article{a, title={A}, abstract={never closed\n${next}\n`);
+        expect(es.map((x) => x.key)).toEqual(["a", "smith2020"]);
+        expect(es[0]!.doubt).toBe(BIB_DOUBTS.cut);
+        expect(es[1]!.fields.get("title")).toBe("Smith");
+      }
+    });
+  });
+
+  describe("R366 a: an entry line between an entry's fields ends that entry", () => {
+    it("the 50-entry file with one closing brace missing and one extra later gives 50 records; the broken one is cut, with its own fields only", async () => {
+      const src = brokenFifty();
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(Array.from({ length: 50 }, (_, k) => `e${k + 1}`));
+      expect(es[9]!.doubt).toBe(BIB_DOUBTS.cut);
+      expect(es.filter((x) => x.doubt).map((x) => x.key)).toEqual(["e10"]);
+      const items = await collect(bibtexAdapter(await writeExport("fifty-broken.bib", src)));
+      expect(items).toHaveLength(50);
+      for (const [k, i] of items.entries()) {
+        const n = k + 1;
+        expect(title(i)).toBe(`Entry Number ${n}`);
+        expect(i.referenceMetadata?.issued).toBe(String(2000 + n));
+        expect(i.referenceMetadata?.identifiers?.doi).toBe(`10.5555/e.${n}`);
+        expect(i.doubts).toEqual(n === 10 ? [BIB_DOUBTS.cut] : undefined);
+      }
+    });
+
+    it("missingThenExtra: a, b and c, b's DOI on b (not on a)", () => {
+      const src = "@article{a, title={A}, year={2001}\n@article{b, title={B}, doi={10.5555/b}, year={2002}}}\n@article{c, title={C}, year={2003}}\n";
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(["a", "b", "c"]);
+      expect([...es[0]!.fields.entries()]).toEqual([["title", "A"], ["year", "2001"]]);
+      expect(es[0]!.doubt).toBe(BIB_DOUBTS.cut);
+      expect(es[1]!.fields.get("doi")).toBe("10.5555/b");
+      expect(es[1]!.doubt).toBeUndefined();
+      expect(es[2]!.doubt).toBeUndefined();
+    });
+
+    it("a citation pasted inside a balanced value (braces or quotes) still keeps its record whole, with the third doubt", () => {
+      for (const abstract of ["{As in\n@article{smith2020, title={Pasted}, year={2020}}\nwe find more.}", '"As in\n@article{smith2020, title={Pasted}, year={2020}}\nwe find more."']) {
+        const es = entries(`@article{k3,\n  title = {Citing},\n  abstract = ${abstract},\n  doi = {10.5555/k3},\n  year = {2021}\n}\n@book{k4, title={Next Book}}\n`);
+        expect(es.map((x) => x.key)).toEqual(["k3", "k4"]);
+        expect([...es[0]!.fields.keys()]).toEqual(["title", "doi", "year"]);
+        expect(es[0]!.doubt).toBe(BIB_DOUBTS.innerEntry);
+        expect(es[1]!.doubt).toBeUndefined();
+      }
+    });
+  });
+
+  describe("R366 d: in an entry delimited by parentheses, a ')' inside a value does not close it", () => {
+    it("every field is kept", async () => {
+      for (const abstract of ["{We ask 1) why and 2) how.}", '"We ask 1) why and 2) how."']) {
+        const src = `@article(a, title={T}, abstract=${abstract}, doi={10.5555/a}, year={2001})\n@book{n, title={Next}}\n`;
+        const es = entries(src);
+        expect(es.map((x) => x.key)).toEqual(["a", "n"]);
+        expect([...es[0]!.fields.entries()]).toEqual([["title", "T"], ["doi", "10.5555/a"], ["year", "2001"]]);
+        expect(es[0]!.doubt).toBeUndefined();
+        const items = await collect(bibtexAdapter(await writeExport("paren.bib", src)));
+        expect(items.map(title)).toEqual(["T", "Next"]);
+        expect(items[0]!.doubts).toBeUndefined();
+      }
+    });
+  });
+
+  describe("R366 g, h: what is tracked is bounded, and closed inner openers are forgotten", () => {
+    it("a one-entry file with over a million 'a@b{c}' inside a note is read, not refused as too many references", async () => {
+      const src = `@article{k, title={T}, note={${"a@b{c} ".repeat(1_100_000)}}, doi={10.5555/k}, year={2020}}\n`;
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(["k"]);
+      expect(es[0]!.fields.get("doi")).toBe("10.5555/k");
+      // Openers by parentheses, which never close, inside a value: not tracked either.
+      const paren = entries(`@article{k, title={T}, note={${"x@c(".repeat(2_100_000)}}, doi={10.5555/k}}\n`);
+      expect(paren.map((x) => x.key)).toEqual(["k"]);
+    });
+
+    it("a file nesting more unclosed entries than any export can hold is refused as too many references (the bound on tracked blocks)", () => {
+      const src = "@a{k, t={\n".repeat(5 * MAX_EXPORT_RECORDS + 1);
+      expect(() => parseBibtexEntries(src).next()).toThrow(expect.objectContaining({ reason: expect.stringMatching(/too many references/) }));
+    });
+  });
+
+  describe("R366 e: text after an entry's closing brace", () => {
+    it("an unmatched '}' inside a quoted value closes the entry with text after it: the record carries the doubt", async () => {
+      const src = '@article{a, title="a } c", doi={10.5555/a}, year={2020}}\n@book{n, title={Next}}\n';
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(["a", "n"]);
+      expect(es[0]!.doubt).toBe(BIB_DOUBTS.textAfter);
+      expect(BIB_DOUBTS.textAfter).toBe("There is text after this BibTeX entry's closing brace that belongs to no entry; some of the entry's fields may be incomplete.");
+      expect(es[1]!.doubt).toBeUndefined();
+      const items = await collect(bibtexAdapter(await writeExport("after.bib", src)));
+      expect(items[0]!.doubts).toEqual([BIB_DOUBTS.textAfter]);
+      expect(items[1]!.doubts).toBeUndefined();
+    });
+
+    it("% comment lines, blank lines and an extra '}' between entries give none; nor does the sample export", async () => {
+      const src = "@article{a, title={A}}\n\n% a comment, with words = {x}\n  % another\n@article{b, title={B}}}\n\n@article{c, title={C}} % trailing\n@article{d, title={D}}";
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(["a", "b", "c", "d"]);
+      expect(es.map((x) => x.doubt)).toEqual([undefined, undefined, undefined, undefined]);
+      const items = await collect(bibtexAdapter(join(exp, "sample.bib")));
+      expect(items).toHaveLength(4);
+      expect(items.map((i) => i.doubts)).toEqual([undefined, undefined, undefined, undefined]);
+    });
+  });
+
+  describe("R374 b: free text between entries is not a doubt; the remains of an entry's fields are", () => {
+    /** The doubt the scanner gives the first entry of `src` (its "{" is the first one). */
+    const scanDoubt = (src: string) => {
+      const b = new BibBlocks(src).block(src.indexOf("{"));
+      return b.state === "closed" && b.textAfter ? BIB_DOUBTS.textAfter : undefined;
+    };
+    const NOTES = "@article{a, title={One}, year={2020}}\n\n==== Chapter 2 ====\nSome notes the exporter wrote here.\n\n@book{b, title={Two}, year={2021}}\n";
+
+    it("section headers and notes between entries give no doubt, through both readers", async () => {
+      const es = entries(NOTES);
+      expect(es.map((x) => x.key)).toEqual(["a", "b"]);
+      expect(es.map((x) => x.doubt)).toEqual([undefined, undefined]);
+      expect(es[0]!.fields.get("year")).toBe("2020");
+      expect(es[1]!.fields.get("year")).toBe("2021");
+      const items = await collect(bibtexAdapter(await writeExport("notes.bib", NOTES)));
+      expect(items).toHaveLength(2);
+      expect(items.map((i) => i.doubts)).toEqual([undefined, undefined]);
+    });
+
+    it("a prose line with a comma and an equals sign in the middle is not an assignment", () => {
+      const src = "@article{a, title={One}}\nSorted by year, descending. ==== 2020 ====\n@book{b, title={Two}}\n";
+      expect(entries(src).map((x) => x.doubt)).toEqual([undefined, undefined]);
+      expect(scanDoubt(src)).toBeUndefined();
+    });
+
+    it("the remains of an entry closed early are a doubt, through both readers", async () => {
+      const src = '@article{a, title="a } c", year=2020}\n@book{n, title={Next}}\n';
+      expect(scanDoubt(src)).toBe(BIB_DOUBTS.textAfter);
+      expect(entries(src)[0]!.doubt).toBe(BIB_DOUBTS.textAfter);
+      const items = await collect(bibtexAdapter(await writeExport("early.bib", src)));
+      expect(items[0]!.doubts).toEqual([BIB_DOUBTS.textAfter]);
+    });
+
+    it("remains over two lines, remains ending with a comma, and remains ending with a brace after text are doubts", () => {
+      expect(scanDoubt('@article{a, title="a } c",\ndoi = {10.1/x}}\n')).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt('@article{a, title="a } c",\n')).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt('@article{a, title="a } c",')).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt("@article{a, title={A}}\nmore text}\n@book{b}")).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt("@article{a, title={A}} doi = 10\n")).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt('@article{a, title={A}} x = "y"\n')).toBe(BIB_DOUBTS.textAfter);
+    });
+
+    it("an extra brace alone, comments, blank lines and a trailing comment give none", () => {
+      expect(scanDoubt("@article{a, title={A}}\n}\n@book{b}")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}}}  \n  }\n")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}}\n% a comment, with = {braces}\n  % another, = {x}\n@book{b}")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}}\n\n   \n\n@book{b}")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}} % note, = {x}\n@book{b}")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}} % note")).toBeUndefined();
+    });
+
+    it("a 2 MB line of prose after an entry is read in well under a second", () => {
+      for (const line of ["word ".repeat(400_000), "= ".repeat(1_000_000), "a ".repeat(1_000_000) + "=", "}".repeat(2_000_000), "x}".repeat(1_000_000)]) {
+        const src = `@article{a, title={A}}\n${line}\n@book{b}`;
+        const t = performance.now();
+        scanDoubt(src);
+        expect(performance.now() - t).toBeLessThan(1000);
+      }
+    });
+  });
+
+  describe("R374 c: a block resolved inside another open block is forgotten", () => {
+    it("a one-entry text with many closed pasted blocks in its value is one closed entry, not refused, with a small bound", () => {
+      const src = `@article{k, note={\n${"@a{p,}\n".repeat(100)}}, year={2020}}\n`;
+      const open = src.indexOf("{");
+      const r = new BibBlocks(src, 10).block(open);
+      expect(r.state).toBe("closed");
+      expect(r.end).toBe(src.length - 1);
+    });
+  });
+
+  it("R366 f: the doubts of an unclosed entry say that its fields may also hold text from what followed it", () => {
+    expect(BIB_DOUBTS.cut).toBe('The BibTeX entry was not closed, so it was cut at a line beginning with "@"; its fields may be incomplete or hold text from what followed it.');
+    expect(BIB_DOUBTS.eof).toBe("The BibTeX entry was not closed before the end of the file; its fields may be incomplete or hold text from what followed it.");
+  });
+
+  // A generous bound (R366 h): quadratic work on these 1 MB files takes minutes, and a loaded machine a few seconds at most.
+  it("stays linear with many '@' lines, pasted entries and unclosed entries (1 MB each, < 5 s)", async () => {
+    const LIMIT = 5000;
+    const inside = await writeExport("lin1.bib", `@article{k, title={T}, abstract={${"\n@someuser replied".repeat(MB / 18)}}, doi={10.5555/x}}`);
+    expect(await timed(() => collect(bibtexAdapter(inside)))).toBeLessThan(LIMIT);
+    const pasted = await writeExport("lin2.bib", `@article{k, title={T}, abstract={${"\n@article{p, title={x}}".repeat(MB / 23)}}, doi={10.5555/x}}`);
+    expect(await timed(() => collect(bibtexAdapter(pasted)))).toBeLessThan(LIMIT);
+    const unclosed = await writeExport("lin3.bib", "@article{k, title={T}, abstract={x\n@someuser\n".repeat(MB / 44));
+    expect(await timed(() => collect(bibtexAdapter(unclosed)))).toBeLessThan(LIMIT);
+    // Unclosed entries nested in each other's values, and one unclosed entry around many closed ones (each read on its own).
+    const nested = await writeExport("lin4.bib", "@a{k, t={\n".repeat(MB / 10));
+    expect(await timed(() => collect(bibtexAdapter(nested)))).toBeLessThan(LIMIT);
+    const around = await writeExport("lin5.bib", `@article{k, title={x\n${"@misc{m, title={M}}\n".repeat(MB / 20)}`);
+    expect(await timed(() => collect(bibtexAdapter(around)))).toBeLessThan(LIMIT);
   });
 });

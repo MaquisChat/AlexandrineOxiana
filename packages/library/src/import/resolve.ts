@@ -105,6 +105,11 @@ export interface ResolveInput {
    * runs them under a watchdog, R49d). Given: used instead of the user patterns in `ctx.patterns`.
    */
   userParsedName?: ParsedFileName;
+  /**
+   * Doubts about the reference metadata as its source gave it (ScanItem.doubts, R362 g): the item
+   * goes to review with them as reasons. A sidecar that is used adds its own (SidecarMetadata.doubt).
+   */
+  doubts?: string[];
 }
 
 export interface ResolveContext {
@@ -258,6 +263,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   const hints: string[] = [];
   /** The item's identity rests on an unconfirmed identifier: it goes to review. */
   let unconfirmed = false;
+  /** Doubts about the metadata as its source gave it (R362 g): it goes to review with them. */
+  const doubts = [...(input.doubts ?? [])];
   /** Upper bound on the final confidence (R58 near match). */
   let cap = 1;
   const done = () => confidence >= AUTO_ACCEPT_THRESHOLD;
@@ -448,6 +455,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       const m = await readSidecar(p);
       if (!m) continue;
       step(scoreConfidence({ method: "sidecar" }), { method: "sidecar" }, fromSidecar(m), { kind: "refman", ref: `sidecar${extname(p).toLowerCase()}` });
+      if (m.doubt) doubts.push(m.doubt);
       break;
     }
   }
@@ -531,6 +539,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       "An identifier found in the file could not be confirmed as this item's own (it may belong to a cited work), so it was not recorded.",
     );
   }
+  for (const d of new Set(doubts)) if (!report.reasons.includes(d)) report.reasons.push(d);
+  if (doubts.length) report.overall = "needs-review";
   return {
     draft,
     confidence: Math.min(applyVerification(confidence, report), cap),

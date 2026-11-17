@@ -107,6 +107,7 @@ import { acceptedType } from "../attach.js";
 import { LOCATION_REASON, MANUAL_UPLOAD_CATEGORY, candidateKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs, type LocationMode } from "../common.js";
 import { pendingFor, planProxies, proxyQueueFor, type ProxyPlan, type ProxyQueue } from "../proxies.js";
 import { resolveItem, type Resolution } from "../resolve.js";
+import { BIB_DOUBTS } from "../bib-blocks.js";
 import { approvedFolders, rememberApprovedFolders } from "../approved-folders.js";
 import { serialStore, storeTurn } from "../project-queue.js";
 import { findSidecars } from "../sidecar.js";
@@ -584,6 +585,9 @@ interface Queued {
 }
 
 /** One running (or resumed) batch. */
+/** The BibTeX doubts (R362 g, R366): a record carrying one is never merged into an existing source (R366 b). */
+const BIB_DOUBT_SET: ReadonlySet<string> = new Set(Object.values(BIB_DOUBTS));
+
 class Run {
   readonly feed = new ProgressFeed();
   private paused = false;
@@ -1311,6 +1315,15 @@ class Run {
     return this.linkRefusedCache;
   }
 
+  /**
+   * R366 b: whether the item's resolution carries a BibTeX doubt (its export's, or a sidecar's). Such a
+   * record is never merged into an existing source, whatever the way with duplicates: it is created as
+   * its own record, waiting in the review queue with its doubt (and as a likely duplicate).
+   */
+  private static doubted(r: Resolution): boolean {
+    return r.verification.reasons.some((x) => BIB_DOUBT_SET.has(x));
+  }
+
   private async importItem(item: ScanItem, dedupe: BatchDedupe, watchdog: PatternWatchdog): Promise<JournalEntry | null> {
     const opts = this.rec.options;
     const method = CAPTURE_METHOD[this.rec.source.kind];
@@ -1340,6 +1353,7 @@ class Run {
         ...(primaryFile ? { path: primaryFile.path, mime, sidecarPaths: await findSidecars(names[0]!), fileName: name } : {}),
         ...(item.referenceMetadata ? { referenceMetadata: item.referenceMetadata } : {}),
         ...(item.referenceSource ? { referenceSource: item.referenceSource } : {}),
+        ...(item.doubts?.length ? { doubts: item.doubts } : {}),
         ...(userParsedName ? { userParsedName } : {}),
       },
       { projectId: this.projectId, patterns: [], lookup: this.lookup },
@@ -1357,6 +1371,7 @@ class Run {
       if (dup.reason === "same-file") return this.queue({ key: item.key, outcome: "duplicate", sourceId: dup.sourceId, reason: REASONS.duplicateFile });
       if (opts.duplicates === "skip") return this.queue({ key: item.key, outcome: "duplicate", sourceId: dup.sourceId, reason: REASONS.duplicateId });
       if (opts.duplicates === "merge") {
+        if (Run.doubted(r)) return this.create(item, r, prep, method, reviewFor(r, dup, opts.autoAcceptThreshold), dedupe);
         await this.flush();
         return this.merge(item, dup.sourceId, r, prep, method, dedupe);
       }
@@ -1554,7 +1569,8 @@ class Run {
     if (dup.reason === "same-file") return this.queue({ key: q.item.key, outcome: "duplicate", sourceId: dup.sourceId, reason: REASONS.duplicateFile });
     const how = this.rec.options.duplicates;
     if (how === "skip") return this.queue({ key: q.item.key, outcome: "duplicate", sourceId: dup.sourceId, reason: REASONS.duplicateId });
-    if (how === "merge") return this.merge(q.item, dup.sourceId, q.r, q.prep, CAPTURE_METHOD[this.rec.source.kind], dedupe);
+    // A doubted record is stored as planned: its own record, waiting for review (R366 b).
+    if (how === "merge" && !Run.doubted(q.r)) return this.merge(q.item, dup.sourceId, q.r, q.prep, CAPTURE_METHOD[this.rec.source.kind], dedupe);
     return null;
   }
 

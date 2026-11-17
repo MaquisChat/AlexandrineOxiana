@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { fileTypeFromFile } from "file-type";
 import { biblioOf, toIsbn13, type Biblio, type Creator, type ImportBatch, type SourceDraft, type SourceType } from "@ao/core";
 import { clean, normalizeDate, parseName } from "../extract/names.js";
+import { BibBlocks, TooManyBibBlocks, bibDoubt, type BibBlock } from "./bib-blocks.js";
 import type { ImportSourceAdapter, ScanFile, ScanItem } from "./bulk/scan.js";
 import { bibtexBiblio, cslBiblio, risPages } from "./sidecar.js";
 
@@ -394,7 +395,7 @@ export async function recordItem(
   key: string,
   f: RecordFields,
   links: Array<Link | undefined>,
-  extra: Pick<ScanItem, "folderPath"> & { externalKeys?: Record<string, string>; notes?: string[] } = {},
+  extra: Pick<ScanItem, "folderPath" | "doubts"> & { externalKeys?: Record<string, string>; notes?: string[] } = {},
 ): Promise<ScanItem | undefined> {
   const real = links.filter((l): l is Link => !!l).slice(0, MAX_FILES);
   if (isEmptyRecord(f, [...real, ...(extra.notes ?? [])])) return undefined;
@@ -409,6 +410,7 @@ export async function recordItem(
     ...(extra.folderPath?.length ? { folderPath: extra.folderPath } : {}),
     ...(Object.keys(externalKeys).length ? { externalKeys } : {}),
     ...(notes.length ? { fileNotes: notes } : {}),
+    ...(extra.doubts?.length ? { doubts: extra.doubts } : {}),
   };
 }
 
@@ -480,6 +482,8 @@ export interface BibEntry {
   key: string;
   /** Raw field values (macros expanded, braces kept), lower-case names, first occurrence wins. */
   fields: Map<string, string>;
+  /** The entry could not be taken whole (not closed, or closed around a line beginning an entry): BIB_DOUBTS, R362 g. */
+  doubt?: string;
 }
 
 const MAX_MACROS = 10_000;
@@ -487,6 +491,8 @@ const MAX_MACROS = 10_000;
 export const MAX_MACRO_BYTES = 4 * 1024 * 1024;
 export const MAX_EXPANDED_BYTES = 32 * 1024 * 1024;
 const MAX_FIELDS_PER_ENTRY = 64;
+/** Blocks held open or closed ahead of the reader at once (bib-blocks); past it, the export has too many references. */
+const MAX_TRACKED_BLOCKS = 5 * MAX_EXPORT_RECORDS;
 /** The only fields kept (bibFields and the `file` field); others are skipped unexpanded. */
 const KNOWN_FIELDS = new Set([
   "title", "author", "editor", "translator", "year", "month", "date", "journal", "journaltitle", "booktitle",
@@ -500,9 +506,13 @@ const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n"
 
 /**
  * Entries of a BibTeX file (linear; no recursion). @comment and @preamble are skipped, @string
- * macros are defined and expanded. A block that does not close before a line starting with "@"
- * ends there (the same recovery rule as the sidecar reader, R57/R58), so one broken entry never
- * swallows the rest of the file. Only KNOWN_FIELDS are kept (at most 64 per entry); other values
+ * macros are defined and expanded. Where a block ends is the rule both BibTeX readers share
+ * (bib-blocks.ts, R362 g, R366): at its own closing delimiter, so a line beginning with "@" inside a
+ * field's value belongs to the value; a line that begins an entry between an entry's fields, or after
+ * an entry that never closes, cuts it, so one broken entry never swallows the rest of the file — and
+ * an entry so cut, or left unclosed at the end of the file, carries a `doubt` (BIB_DOUBTS), as do one
+ * closed with stray text after it and one closed around an entry line inside a value. Only
+ * KNOWN_FIELDS are kept (at most 64 per entry); other values
  * are scanned past without expanding macros. All @string values together are at most 4 MB and all
  * kept values of the file at most 32 MB: past either budget, ExportUnreadable (R68).
  */
@@ -511,11 +521,16 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
   let macroBytes = 0;
   let expandedBytes = 0;
   const macros = new Map<string, string>();
-  /** Positions of "@" that start a line (after spaces/tabs): block boundaries. */
-  const lineAt = (i: number) => {
-    let j = i + 1;
-    while (src[j] === " " || src[j] === "\t") j++;
-    return src[j] === "@" ? j : -1;
+  const blocks = new BibBlocks(src, MAX_TRACKED_BLOCKS);
+  /** Where a block opening at `open` is read up to (R362 g, R366). */
+  const extent = (open: number): { blk: BibBlock; lim: number } => {
+    try {
+      const blk = blocks.block(open);
+      return { blk, lim: blk.end };
+    } catch (err) {
+      if (err instanceof TooManyBibBlocks) throw new ExportUnreadable(REFMAN_REASONS.tooMany);
+      throw err;
+    }
   };
   let i = src.indexOf("@");
   while (i >= 0 && i < n) {
@@ -528,62 +543,37 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
       continue;
     }
     const close = src[j] === "(" ? ")" : "}";
-    j++;
-    /** Index where the block stopped (just past its closing delimiter, or at a line-start "@"). */
-    let stop = n;
+    const { blk, lim } = extent(j);
     if (type === "comment" || type === "preamble") {
-      let depth = 1;
-      for (; j < n; j++) {
-        const c = src[j];
-        if (c === "\n" && lineAt(j) >= 0) {
-          stop = lineAt(j);
-          break;
-        }
-        if (c === "{" || c === "(") depth++;
-        else if ((c === "}" || c === ")") && --depth === 0) {
-          stop = j + 1;
-          break;
-        }
-      }
-      i = src.indexOf("@", stop === n ? n : stop);
+      i = src.indexOf("@", blk.end);
       continue;
     }
+    j++;
     // Key (entries only).
     let key = "";
     if (type !== "string") {
       const ks = j;
-      while (j < n && src[j] !== "," && src[j] !== close && src[j] !== "\n" && j - ks < 1000) j++;
+      while (j < lim && src[j] !== "," && src[j] !== close && src[j] !== "\n" && j - ks < 1000) j++;
       key = text(src.slice(ks, j));
       if (src[j] === "\n") {
         // "@type{key\n  field = ..." with the comma on the next line, or a key-less entry.
         let k = j;
-        while (isSpace(src[k])) k++;
+        while (k < lim && isSpace(src[k])) k++;
         if (src[k] === ",") j = k;
       }
-      if (src[j] === ",") j++;
+      if (j < lim && src[j] === ",") j++;
     }
     const fields = new Map<string, string>();
-    let ended = false;
     // Fields: name = value [# value ...], separated by commas.
-    while (j < n && !ended) {
-      while (j < n && (isSpace(src[j]) || src[j] === ",")) {
-        if (src[j] === "\n" && lineAt(j) >= 0) {
-          stop = lineAt(j);
-          ended = true;
-          break;
-        }
-        j++;
-      }
-      if (ended || j >= n) break;
-      if (src[j] === close) {
-        stop = j + 1;
-        break;
-      }
+    while (j < lim) {
+      while (j < lim && (isSpace(src[j]) || src[j] === ",")) j++;
+      if (j >= lim) break;
+      if (src[j] === close) break;
       const ns = j;
-      while (j < n && isNameChar(src[j]) && j - ns < 200) j++;
+      while (j < lim && isNameChar(src[j]) && j - ns < 200) j++;
       const name = src.slice(ns, j).toLowerCase();
-      while (j < n && isSpace(src[j]) && !(src[j] === "\n" && lineAt(j) >= 0)) j++;
-      if (src[j] !== "=" || !name) {
+      while (j < lim && isSpace(src[j])) j++;
+      if (j >= lim || src[j] !== "=" || !name) {
         // Not a field: skip to the next separator.
         if (j === ns) j++;
         continue;
@@ -600,22 +590,17 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
         }
       };
       for (;;) {
-        while (j < n && isSpace(src[j]) && !(src[j] === "\n" && lineAt(j) >= 0)) j++;
-        const c = src[j];
+        while (j < lim && isSpace(src[j])) j++;
+        const c = j < lim ? src[j] : undefined;
         if (c === "{" || c === '"') {
           // Braced or quoted value; braces nest (counted, not recursed).
           const vs = j + 1;
           let depth = c === "{" ? 1 : 0;
           j++;
-          for (; j < n; j++) {
+          for (; j < lim; j++) {
             const d = src[j];
-            if (d === "\n" && lineAt(j) >= 0) {
-              ended = true;
-              stop = lineAt(j);
-              break;
-            }
             if (d === "\\") {
-              if (src[j + 1] !== "\n") j++; // a backslash never hides a line break (recovery)
+              if (src[j + 1] !== "\n") j++; // a backslash never hides a line break (bib-blocks counts the same way)
               continue;
             }
             if (d === "{") depth++;
@@ -625,24 +610,23 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
               if (depth === 0 && c === "{") break;
             } else if (d === '"' && c === '"' && depth === 0) break;
           }
-          push(src.slice(vs, Math.min(j, n)));
+          push(src.slice(vs, Math.min(j, lim)));
           // Step past the closing brace or quote, but not past a stray "}" ending a quoted value
           // that never closed (that brace closes the entry).
           const strayClose = c === '"' && src[j] === "}";
-          if (!ended && j < n && !strayClose) j++;
+          if (j < lim && !strayClose) j++;
         } else if (c !== undefined && isNameChar(c)) {
           // Number or macro name.
           const ms = j;
-          while (j < n && isNameChar(src[j]) && j - ms < 200) j++;
+          while (j < lim && isNameChar(src[j]) && j - ms < 200) j++;
           const word = src.slice(ms, j);
           if (keep) {
             const lw = word.toLowerCase();
             push(/^\d+$/u.test(word) ? word : (macros.get(lw) ?? own(MONTH_MACROS, lw) ?? word));
           }
         }
-        if (ended) break;
-        while (j < n && isSpace(src[j]) && !(src[j] === "\n" && lineAt(j) >= 0)) j++;
-        if (src[j] === "#") {
+        while (j < lim && isSpace(src[j])) j++;
+        if (j < lim && src[j] === "#") {
           j++;
           continue;
         }
@@ -661,10 +645,15 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
         }
       }
       // Anything else up to the next separator is skipped by the loop above.
-      while (j < n && !ended && src[j] !== "," && src[j] !== close && !isSpace(src[j])) j++;
+      while (j < lim && src[j] !== "," && src[j] !== close && !isSpace(src[j])) j++;
     }
-    if (type !== "string") yield { type, key, fields };
-    i = src.indexOf("@", stop > i ? stop : i + 1);
+    if (type !== "string") {
+      const doubt = bibDoubt(blk);
+      yield { type, key, fields, ...(doubt ? { doubt } : {}) };
+    }
+    // The reader resumes after the block's own end (its closing delimiter, or where it was cut).
+    const next = blk.end;
+    i = src.indexOf("@", next > i ? next : i + 1);
   }
 }
 
@@ -917,7 +906,7 @@ export function bibtexAdapter(path: string): ImportSourceAdapter {
   return exportAdapter("bibtex", path, parseBibtexEntries, async (e, keys, baseDir) => {
     const f = bibFields(e);
     const raw = e.fields.get("file");
-    return recordItem(keys.next(f.citekey), f, raw ? fileFieldLinks(raw, baseDir) : []);
+    return recordItem(keys.next(f.citekey), f, raw ? fileFieldLinks(raw, baseDir) : [], e.doubt ? { doubts: [e.doubt] } : {});
   }, true);
 }
 
