@@ -8,10 +8,27 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewItem } from "../../api/import";
 import { http, HttpResponse } from "msw";
 import { BASE as SERVICE, B1, mockService, P1, P2, server, type ServiceSetup } from "../../test/importService";
-import { ReviewQueue } from "./ReviewQueue";
+import { DECIDE_SETTLE_MS, ReviewQueue } from "./ReviewQueue";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
+
+/**
+ * R362 d: the panel's deciding controls take a mouse press only where the pointer really moved over them (their client
+ * coordinates changed), and none in the panel's quiet after the list changed. user-event's own click moves to the
+ * element without new coordinates, so a press here travels: from a point on the page to a new point on the control, then
+ * the button goes down and up there (`clicks` times). `settle` lets the panel's quiet pass first (after a decision).
+ */
+let travel = 0;
+const settle = () => new Promise((r) => setTimeout(r, DECIDE_SETTLE_MS + 20));
+const pressPanel = async (user: ReturnType<typeof userEvent.setup>, el: Element, clicks = 1) => {
+  travel += 10;
+  await user.pointer([
+    { target: document.body, coords: { clientX: travel, clientY: travel } },
+    { target: el, coords: { clientX: travel + 3, clientY: travel + 2 } },
+    ...Array.from({ length: clicks }, () => ({ keys: "[MouseLeft]", target: el })),
+  ]);
+};
 
 const entry = (n: number, group: NonNullable<ReviewItem["group"]>, extra: Partial<ReviewItem> = {}): ReviewItem => ({
   id: `r${n}`,
@@ -117,7 +134,7 @@ describe("the project's whole review queue (Task 67)", () => {
     await user.click(await screen.findByRole("button", { name: "Show Entry 2" }));
     const panel = await screen.findByRole("region", { name: "Imported record" });
     await within(panel).findByText("Entry 2");
-    await user.click(within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
+    await pressPanel(user, within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
     await waitFor(() => expect(m.bodies("POST /review/r2/decide")).toEqual([{ projectId: P1, decision: { action: "accept" } }]));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Show Entry 2" })).toBeNull());
     expect(screen.queryByRole("heading", { name: "Added by hand" })).toBeNull();
@@ -127,7 +144,7 @@ describe("the project's whole review queue (Task 67)", () => {
     const { m, user } = setup();
     await within(await screen.findByRole("region", { name: "Imported record" })).findByText("Entry 1");
     const accept = within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" });
-    await user.dblClick(accept);
+    await pressPanel(user, accept, 2);
     await waitFor(() => expect(screen.queryByRole("button", { name: "Show Entry 1" })).toBeNull());
     expect(m.bodies("POST /review/r1/decide")).toHaveLength(1);
   });
@@ -159,7 +176,7 @@ describe("the project's whole review queue (Task 67)", () => {
     await user.click(within(dialog).getByRole("button", { name: "Confirm this value" }));
     expect(await screen.findByRole("button", { name: "Title: Confirmed by you" })).toBeTruthy();
     expect(m.bodies(`PATCH /projects/${P1}/sources/s6/fields`)).toHaveLength(1);
-    await user.click(within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
+    await pressPanel(user, within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
     await waitFor(() => expect(m.bodies("POST /review/r6/decide")).toHaveLength(1));
   });
 
@@ -195,7 +212,7 @@ describe("the project's whole review queue (Task 67)", () => {
   it("a decision refused because the project was locked meanwhile forgets every entry shown", async () => {
     const { user } = setup({ ...BASE, decideLocked: true });
     await within(await screen.findByRole("region", { name: "Imported record" })).findByText("Entry 1");
-    await user.click(within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
+    await pressPanel(user, within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
     await screen.findByLabelText(/passphrase/i);
     expect(screen.queryByText(/Entry \d/)).toBeNull();
   });
@@ -228,7 +245,8 @@ describe("the project's whole review queue (Task 67)", () => {
     await waitFor(() => expect(screen.queryByRole("heading", { name: "From captures" })).toBeNull());
     // The view asked the service which of that source's entries are left (the library resolved this one).
     expect(m.calls.filter((c) => c.path === `/projects/${P1}/review`)).toHaveLength(3);
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Show Entry 4" })));
+    // R362 d: to the next entry's heading, never to a control that decides.
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Entry 4" })));
     expect(screen.getByRole("status").textContent).toMatch(/Every field is confirmed/);
   });
 

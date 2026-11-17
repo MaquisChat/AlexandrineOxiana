@@ -12,6 +12,23 @@ import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, ReviewQueue } from "./Revie
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
 
+/**
+ * R362 d: the panel's deciding controls take a mouse press only where the pointer really moved over them (their client
+ * coordinates changed), and none in the panel's quiet after the list changed. user-event's own click moves to the
+ * element without new coordinates, so a press here travels: from a point on the page to a new point on the control, then
+ * the button goes down and up there (`clicks` times). `settle` lets the panel's quiet pass first (after a decision).
+ */
+let travel = 0;
+const settle = () => new Promise((r) => setTimeout(r, DECIDE_SETTLE_MS + 20));
+const pressPanel = async (user: ReturnType<typeof userEvent.setup>, el: Element, clicks = 1) => {
+  travel += 10;
+  await user.pointer([
+    { target: document.body, coords: { clientX: travel, clientY: travel } },
+    { target: el, coords: { clientX: travel + 3, clientY: travel + 2 } },
+    ...Array.from({ length: clicks }, () => ({ keys: "[MouseLeft]", target: el })),
+  ]);
+};
+
 const item = (n: number, extra: Partial<ReviewItem> = {}): ReviewItem => ({
   id: `r${n}`,
   projectId: P1,
@@ -138,15 +155,17 @@ describe("Review queue", () => {
   it("per-item Accept, Skip and Keep both decide with the project in the body", async () => {
     const { m, user } = setup();
     await screen.findByRole("region", { name: "Imported record" });
-    await user.click(screen.getByRole("button", { name: "Accept" }));
+    await pressPanel(user, screen.getByRole("button", { name: "Accept" }));
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toEqual([{ projectId: P1, decision: { action: "accept" } }]));
     // r1 is gone; r2 is now shown.
     await waitFor(() => expect(screen.queryByRole("checkbox", { name: "Select kinship herat draft" })).toBeNull());
     await within(screen.getByRole("region", { name: "Imported record" })).findByText("Second paper");
-    await user.click(screen.getByRole("button", { name: "Skip" }));
+    await settle();
+    await pressPanel(user, screen.getByRole("button", { name: "Skip" }));
     await waitFor(() => expect(m.bodies("POST /review/r2/decide")).toEqual([{ projectId: P1, decision: { action: "skip" } }]));
     await within(screen.getByRole("region", { name: "Imported record" })).findByText("Third paper");
-    await user.click(screen.getByRole("button", { name: "Keep both" }));
+    await settle();
+    await pressPanel(user, screen.getByRole("button", { name: "Keep both" }));
     await waitFor(() => expect(m.bodies("POST /review/r3/decide")).toEqual([{ projectId: P1, decision: { action: "keep-both" } }]));
     expect(await screen.findByText(/Nothing is waiting for review/)).toBeTruthy();
     everyBodyHasProject(m);
@@ -155,7 +174,7 @@ describe("Review queue", () => {
   it("accepting a candidate sends its index", async () => {
     const { m, user } = setup();
     const candidates = await screen.findByRole("region", { name: "Candidate matches" });
-    await user.click(within(candidates).getAllByRole("button", { name: /Use this match/ })[1]!);
+    await pressPanel(user, within(candidates).getAllByRole("button", { name: /Use this match/ })[1]!);
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toEqual([{ projectId: P1, decision: { action: "accept-candidate", index: 1 } }]));
   });
 
@@ -167,7 +186,7 @@ describe("Review queue", () => {
     await user.clear(title);
     await user.type(title, "Kinship in Herat");
     await user.selectOptions(screen.getByRole("combobox", { name: "Type" }), "book");
-    await user.click(screen.getByRole("button", { name: "Save and accept" }));
+    await pressPanel(user, screen.getByRole("button", { name: "Save and accept" }));
     await waitFor(() =>
       expect(m.bodies("POST /review/r1/decide")).toEqual([
         { projectId: P1, decision: { action: "accept", draft: { type: "book", title: { variants: [{ lang: "en", kind: "original", value: "Kinship in Herat" }] } } } },
@@ -181,14 +200,14 @@ describe("Review queue", () => {
     await user.click(screen.getByRole("button", { name: "Merge" }));
     await user.type(screen.getByRole("searchbox", { name: "Find the source to merge into" }), "older");
     await user.click(screen.getByRole("button", { name: "Search" }));
-    await user.click(await screen.findByRole("button", { name: "Merge into An older edition" }));
+    await pressPanel(user, await screen.findByRole("button", { name: "Merge into An older edition" }));
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toEqual([{ projectId: P1, decision: { action: "merge", sourceId: "s-old" } }]));
   });
 
   it("offers the likely duplicate as the merge target", async () => {
     const { m, user } = setup({ ...BASE, review: [item(1, { duplicateOf: { sourceId: "s9", reason: "Same DOI" } })] });
     await screen.findByText(/Same DOI/);
-    await user.click(screen.getByRole("button", { name: "Merge into the likely duplicate" }));
+    await pressPanel(user, screen.getByRole("button", { name: "Merge into the likely duplicate" }));
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toEqual([{ projectId: P1, decision: { action: "merge", sourceId: "s9" } }]));
   });
 
@@ -297,7 +316,7 @@ describe("Review queue", () => {
     const sourceCalls = () => m.calls.filter((c) => c.method === "GET" && /\/sources\/s\d+$/.test(c.path));
     expect(sourceCalls()[0]!.path).toMatch(/\/sources\/s1$/);
     expect(sourceCalls().length).toBeLessThan(n); // not waiting for the whole queue
-    await user.click(accept);
+    await pressPanel(user, accept);
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toHaveLength(1));
     // Polled (not waitFor, which re-runs on every DOM change of a 2,000-row list).
     for (const end = Date.now() + 30000; sourceCalls().length < n && Date.now() < end; ) await new Promise((r) => setTimeout(r, 100));
@@ -324,12 +343,12 @@ describe("Review queue", () => {
     expect(m.calls.filter((c) => c.path.includes("/sources/")).length).toBe(before);
   });
 
-  it("after a decision, focus moves to the next item", async () => {
+  it("after a decision, focus moves to the next item's heading (R362 d: never to a control that decides)", async () => {
     const { user } = setup();
     await within(await screen.findByRole("region", { name: "Imported record" })).findByText("kinship herat draft");
     screen.getByRole("button", { name: "Accept" }).focus();
     await user.keyboard("{Enter}");
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Show Second paper" })));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Second paper" })));
   });
 
   it("shows hints as user text", async () => {
@@ -377,6 +396,155 @@ describe("Review queue", () => {
     screen.getByRole("button", { name: "Show Second paper" }).focus();
     await user.keyboard("{Enter}");
     await within(screen.getByRole("region", { name: "Imported record" })).findByText("Second paper");
+  });
+});
+
+describe("R362 d (D28): the panel's deciding controls are guarded as the found files' are", () => {
+  const ENTRY = {
+    moved: "Not taken. Look at the entry, then move the pointer and press again.",
+    quiet: "Not taken: the list had just changed. Look at the entry, then press again.",
+  };
+  beforeEach(() => void vi.useFakeTimers({ toFake: ["Date"] }));
+  afterEach(() => void vi.useRealTimers());
+  const passGuard = () => vi.setSystemTime(Date.now() + DECIDE_SETTLE_MS + 1);
+  const decided = (m: ReturnType<typeof mockService>) => m.calls.filter((c) => /^\/review\/r\d+\/decide$/u.test(c.path)).map((c) => c.path);
+  const accept = () => within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" });
+  /** The panel beside the list (its line of a press not taken; the polite region says the same words). */
+  const panel = () => document.querySelector<HTMLElement>(".ao-review__panel")!;
+  const pointer = { x: 1, y: 1 };
+  /** The pointer really moves onto the control (from where it was to a new point). */
+  const moveOver = (el: Element) => {
+    fireEvent.pointerMove(document.body, { pointerType: "mouse", pointerId: 1, clientX: pointer.x, clientY: pointer.y });
+    pointer.x += 3;
+    pointer.y += 2;
+    fireEvent.pointerMove(el, { pointerType: "mouse", pointerId: 1, clientX: pointer.x, clientY: pointer.y });
+  };
+  /** A mouse press where the pointer rests (no movement before it). */
+  const pressBy = (el: Element) => {
+    fireEvent.pointerDown(el, { pointerType: "mouse", button: 0 });
+    fireEvent.pointerUp(el, { pointerType: "mouse", button: 0 });
+    fireEvent.click(el);
+  };
+  const shownTitle = (t: string) => waitFor(() => within(screen.getByRole("region", { name: "Imported record" })).getByText(t));
+  const listenSaid = () => {
+    const said: string[] = [];
+    const region = screen.getAllByRole("status").find((x) => x.classList.contains("ao-visually-hidden"))!;
+    const mo = new MutationObserver((recs) => {
+      for (const r of recs) for (const n of r.addedNodes) if (n.textContent) said.push(n.textContent);
+    });
+    mo.observe(region, { childList: true, subtree: true });
+    return { said, stop: () => mo.disconnect() };
+  };
+  const ready = async () => {
+    await shownTitle("kinship herat draft");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    passGuard();
+  };
+
+  it("two presses at one spot in one moment decide ONE entry: the second falls on the next entry's Accept, which the pointer never moved over", async () => {
+    const { m } = setup();
+    await ready();
+    const first = accept();
+    moveOver(first);
+    pressBy(first);
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    pressBy(accept());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+  });
+
+  it("a second press after the next entry slid in is not taken, and says why (on the panel and in the polite region); after a movement over it, it is taken", async () => {
+    const { m } = setup();
+    await ready();
+    moveOver(accept());
+    pressBy(accept());
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    passGuard();
+    const h = listenSaid();
+    pressBy(accept());
+    await waitFor(() => expect(h.said).toContain(ENTRY.moved));
+    const note = within(panel()).getByText(ENTRY.moved);
+    expect(accept().getAttribute("aria-describedby")).toBe(note.id);
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+    moveOver(accept());
+    pressBy(accept());
+    await waitFor(() => expect(decided(m)).toEqual(["/review/r1/decide", "/review/r2/decide"]));
+    h.stop();
+  });
+
+  it("a key press inside the quiet after the list changed is not taken and says so; after the quiet it is taken", async () => {
+    const { m } = setup();
+    await ready();
+    moveOver(accept());
+    pressBy(accept());
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    const a = accept();
+    a.focus();
+    fireEvent.keyDown(a, { key: "Enter", code: "Enter" });
+    fireEvent.click(a);
+    fireEvent.keyUp(a, { key: "Enter", code: "Enter" });
+    expect(await within(panel()).findByText(ENTRY.quiet)).toBeTruthy();
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+    passGuard();
+    fireEvent.keyDown(a, { key: "Enter", code: "Enter" });
+    fireEvent.click(a);
+    fireEvent.keyUp(a, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(decided(m)).toEqual(["/review/r1/decide", "/review/r2/decide"]));
+  });
+
+  it("Enter held down on Accept decides ONE entry (the repeated keydowns and the clicks a browser makes of them)", async () => {
+    const { m } = setup();
+    await ready();
+    const a = accept();
+    a.focus();
+    fireEvent.keyDown(a, { key: "Enter", code: "Enter" });
+    fireEvent.click(a);
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    passGuard();
+    // The key is still down: its repeats reach whatever holds focus, here the next entry's Accept at the same place.
+    const b = accept();
+    for (let i = 0; i < 5; i++) {
+      fireEvent.keyDown(b, { key: "Enter", code: "Enter", repeat: true });
+      fireEvent.click(b);
+    }
+    fireEvent.keyUp(b, { key: "Enter", code: "Enter" });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+  });
+
+  it("after a decision focus goes to the next entry's heading, never to a deciding control; after the last, to the message that nothing waits", async () => {
+    const { m } = setup();
+    await ready();
+    const a = accept();
+    a.focus();
+    fireEvent.keyDown(a, { key: "Enter", code: "Enter" });
+    fireEvent.click(a);
+    fireEvent.keyUp(a, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Second paper" })));
+    // One Tab at a time leads on to the controls; the heading itself decides nothing.
+    fireEvent.keyDown(document.activeElement!, { key: "Enter", code: "Enter" });
+    fireEvent.click(document.activeElement!);
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+    for (const [title, id] of [["Third paper", "r2"]] as const) {
+      passGuard();
+      const b = accept();
+      b.focus();
+      fireEvent.keyDown(b, { key: "Enter", code: "Enter" });
+      fireEvent.click(b);
+      fireEvent.keyUp(b, { key: "Enter", code: "Enter" });
+      await waitFor(() => expect(decided(m)).toContain(`/review/${id}/decide`));
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: title })));
+    }
+    passGuard();
+    const c = accept();
+    c.focus();
+    fireEvent.keyDown(c, { key: "Enter", code: "Enter" });
+    fireEvent.click(c);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByText(/Nothing is waiting for review/)));
   });
 });
 
