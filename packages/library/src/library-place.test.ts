@@ -3,10 +3,12 @@
  * chosen folder has. The home folder, the location environment and every file-system read are injected, so nothing
  * here needs a real home folder; the last tests use real temporary folders.
  */
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { deviceDeps } from "./app-settings.js";
+import { createLibrary } from "./library.js";
 import type { LocationEnv } from "./location.js";
 import { FOLDER_ROOM_LOOK_MS, freeRoomFor, suggestedLibraryFolder, type FolderState } from "./library-place.js";
 
@@ -89,6 +91,24 @@ describe("suggestedLibraryFolder (R447 a as R449 a corrects it: in the home fold
       await writeFile(join(home, "Alexandrine Oxiana", "notes.txt"), "x");
       expect(await suggestedLibraryFolder(linux)).toBe(join(home, "Alexandrine Oxiana 2"));
       expect((await readdir(home)).sort()).toEqual(["Alexandrine Oxiana", "Documents"]);
+    });
+
+    it("R449 c: anything present at a name that is not an empty folder is taken — a link to nowhere, a link to an empty folder, a file", async () => {
+      const h = await mkdtemp(join(tmpdir(), "ao-place-links-"));
+      try {
+        const linux = env({ homeDir: h, platform: "linux", mounts: [] });
+        await symlink(join(h, "nowhere"), join(h, "Alexandrine Oxiana"));
+        await mkdir(join(h, "empty"));
+        await symlink(join(h, "empty"), join(h, "Alexandrine Oxiana 2"));
+        await writeFile(join(h, "Alexandrine Oxiana 3"), "x");
+        const suggested = await suggestedLibraryFolder(linux);
+        expect(suggested).toBe(join(h, "Alexandrine Oxiana 4"));
+        // The suggestion is a folder creating a library accepts (the review's probe P4).
+        const lib = await createLibrary(suggested!, "New", deviceDeps(join(h, "config")));
+        expect(lib.root).toBe(suggested);
+      } finally {
+        await rm(h, { recursive: true, force: true });
+      }
     });
   });
 });

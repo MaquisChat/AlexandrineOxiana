@@ -3,7 +3,7 @@
  * "Choose a library". Both only read: whether a few folders exist and are empty, and the free room of one disk.
  * Nothing is created, and nothing read leaves here but the suggested path or a number.
  */
-import { stat } from "node:fs/promises";
+import { lstat, stat } from "node:fs/promises";
 import { dirname, isAbsolute, posix, win32 } from "node:path";
 import { statfsFree } from "./import/sqlite-copy.js";
 import { entriesBesidesFinderFiles } from "./library.js";
@@ -20,9 +20,13 @@ export interface PlaceLooks {
   folderState?: (p: string) => Promise<FolderState>;
 }
 
+/**
+ * What is at `p`, by lstat (R449 c): nothing at all is "missing"; a link (to somewhere or to nowhere) or a file is
+ * "not-a-folder"; a folder is "empty" or "not-empty". Only a missing name or an empty folder is free.
+ */
 async function realFolderState(p: string): Promise<FolderState> {
   try {
-    if (!(await stat(p)).isDirectory()) return "not-a-folder";
+    if (!(await lstat(p)).isDirectory()) return "not-a-folder";
     // As createLibrary counts it (FR-047): a folder holding only .DS_Store or .localized is empty.
     return (await entriesBesidesFinderFiles(p)).length === 0 ? "empty" : "not-empty";
   } catch (err) {
