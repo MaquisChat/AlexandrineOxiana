@@ -78,7 +78,9 @@ function textOf(path: string): string {
 class Gated extends Dispatcher {
   private readonly holds = new Map<string, Promise<void>>();
   private all: { gate: Promise<void>; release: () => void } | undefined;
-  readonly sent: Array<{ service: string; text: string }> = [];
+  /** FR-531: requests held by where they go (any service), until released. */
+  private readonly where: Array<{ match: (origin: string, path: string) => boolean; gate: Promise<void>; release: () => void }> = [];
+  readonly sent: Array<{ service: string; text: string; origin: string; path: string }> = [];
   constructor(private readonly inner: MockAgent) {
     super();
   }
@@ -98,16 +100,29 @@ class Gated extends Dispatcher {
     const gate = new Promise<void>((r) => (release = r));
     this.all = { gate, release };
   }
+  /** Holds every request `match` picks (by its origin and path) until the returned function is called. */
+  holdWhere(match: (origin: string, path: string) => boolean): () => void {
+    let release!: () => void;
+    const h = { match, gate: new Promise<void>((r) => (release = r)), release: () => release() };
+    this.where.push(h);
+    return () => {
+      const i = this.where.indexOf(h);
+      if (i >= 0) this.where.splice(i, 1);
+      h.release();
+    };
+  }
   releaseAll(): void {
     this.all?.release();
     this.all = undefined;
     for (const k of [...this.holds.keys()]) this.holds.delete(k);
+    for (const h of this.where.splice(0)) h.release();
   }
   override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
     const service = String(opts.origin).includes("crossref") ? "crossref" : "openalex";
     const text = textOf(String(opts.path));
-    this.sent.push({ service, text });
-    const gate = (service === "crossref" ? this.holds.get(text) : undefined) ?? this.all?.gate;
+    this.sent.push({ service, text, origin: String(opts.origin), path: String(opts.path) });
+    const gate =
+      (service === "crossref" ? this.holds.get(text) : undefined) ?? this.where.find((h) => h.match(String(opts.origin), String(opts.path)))?.gate ?? this.all?.gate;
     if (!gate) return this.inner.dispatch(opts, handler);
     void gate.then(() => this.inner.dispatch(opts, handler));
     return true;
@@ -1048,6 +1063,35 @@ describe("R247: the index, the cache, and work under way at a close or a move", 
     releaseB();
     await sleep(300);
     expect(existsSync(pathB)).toBe(false);
+  });
+
+  it("(c, R320 c) FR-531: a free-copy lookup in flight at the close is not waited for; its late answer writes nothing into the library, and nothing of it is left open", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    // The free-copy services' first question (OpenAlex, by the record's DOI) is held open.
+    const freeCopy = (origin: string, p: string) => origin.includes("api.openalex.org") && p.startsWith("/works/doi:");
+    const release = gated.holdWhere(freeCopy);
+    const [e] = await add(pid, [LINE]);
+    await until(async () => gated.sent.some((s) => freeCopy(s.origin, s.path)), "the free-copy lookup to be sent");
+    expect((await entry(pid, e!.id))!.state).toBe("looking-for-copy");
+    const cache = join(path, ".cache", "lookups");
+    const cached = async () => (existsSync(cache) ? (await readdir(cache)).sort() : []);
+    // The close does not wait for the answer (the runner lets it go; the lookup ends by its own time limit).
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect(svc!.state.session).toBeUndefined();
+    const before = await snapshot(path);
+    const cachedBefore = await cached();
+    // The answer comes after the library's lock is released: nothing of it is written, the lookup cache included.
+    release();
+    await sleep(300);
+    expect(await cached()).toEqual(cachedBefore);
+    expect(await snapshot(path)).toEqual(before);
+    // Nothing of it is left open: no work folder of the entry, and the library opens again; the entry, left looking for a
+    // copy, is taken up again and ends as this made-up world says (no open copy).
+    expect((await readdir(join(path, ".tmp")).catch(() => [] as string[])).filter((n) => n.startsWith("find-"))).toEqual([]);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    expect((await settled(pid, e!.id)).state).toBe("no-open-copy");
   });
 
   it("(d) a creation held inside its turn while the library closes: the close waits; the record and the entry's line are both there; nothing is written after the release", async () => {
