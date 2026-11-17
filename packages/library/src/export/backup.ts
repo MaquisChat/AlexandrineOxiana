@@ -603,6 +603,15 @@ export async function listBackups(repo: Repo, projectId: string): Promise<Backup
 }
 
 /**
+ * Package-internal (here, and retention's look into an old copy, R429 d): whether the sealed backup
+ * at `abs` is sealed with the key `keyId` (read from its header; false when it cannot be read or
+ * the project has no key).
+ */
+export async function sealedWithKey(abs: string, keyId: string | undefined): Promise<boolean> {
+  return !!keyId && (await readKeyId(abs).catch(() => undefined)) === keyId;
+}
+
+/**
  * Package-internal (retention, R92 I2): backup files that could not be read when the manifest was
  * rebuilt and whose name is the project's — they may hold its data.
  */
@@ -622,7 +631,7 @@ export async function unresolvedBackupsOf(repo: Repo, projectId: string): Promis
     const owner = Object.hasOwn(state.owners, f) ? state.owners[f] : undefined;
     let mine: boolean;
     if (owner) mine = owner === projectId;
-    else if (f.endsWith(".enc")) mine = !!project.encryption.keyId && (await readKeyId(abs).catch(() => undefined)) === project.encryption.keyId;
+    else if (f.endsWith(".enc")) mine = await sealedWithKey(abs, project.encryption.keyId);
     else mine = f.startsWith(`${stem} - modified `);
     if (mine) out.push(f);
   }

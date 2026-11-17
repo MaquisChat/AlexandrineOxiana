@@ -138,6 +138,7 @@ import {
   setDestructionNotes,
   setOldCopiesNotes,
   setRetentionRetry,
+  sealedWithKey,
   unresolvedBackupsOf,
   withProjectMaintenance,
   DEFAULT_KEEP,
@@ -384,7 +385,7 @@ async function destroyRawLocked(repo: Repo, hold: MaintenanceHold, projectId: st
   const containing = [...toRemove, ...unreadable];
   const initialStatus: BackupsStepStatus = !containing.length ? "none" : unreadable.length ? "unknown-pending" : "pending";
   // Decided once, here too (R379): the old copies of the library left by a move that hold any of these files.
-  const copies = await holdingOldCopies(repo, { projectId, paths: [...paths], assetIds: allIds, projectName: repo.getProject(projectId).name });
+  const copies = await holdingOldCopies(repo, { projectId, paths: [...paths], assetIds: allIds, projectName: repo.getProject(projectId).name, keyId: repo.getProject(projectId).encryption.keyId });
   const copiesSaid = copies.notDestroyed.length > 0 || copies.unchecked;
   const res = await destroyProjectAssets(repo, projectId, {
     plan: [...plan.entries()].map(([sourceId, ids]) => ({ sourceId, assetIds: [...ids] })),
@@ -1136,6 +1137,8 @@ interface DestroyedData {
   assetIds: ReadonlySet<string>;
   /** The project's name now (how a backup without a manifest or owner entry is told, by its name). */
   projectName: string;
+  /** The project's key id, when it is encrypted (how a sealed backup without a manifest or owner entry is told, R429 d). */
+  keyId?: string | undefined;
 }
 
 const readJson = (p: string): Promise<Record<string, unknown> | undefined> =>
@@ -1147,11 +1150,11 @@ const readJson = (p: string): Promise<Record<string, unknown> | undefined> =>
 /**
  * The backups in an old place's `Backups/` folder that `mine` says are wanted (R409 c), told as in
  * the current library (holdingBackups, unresolvedBackupsOf): by the backups' manifest entry (its
- * project and the assets it holds), else by the owner the backups' state file records, else by the
- * backup's name. Only files named as the app names its backups. Read only: nothing is rebuilt or
- * written there.
+ * project and the assets it holds), else by the owner the backups' state file records, else (in
+ * `mine`) by the key a sealed backup is sealed with or by the backup's name. Only files named as the
+ * app names its backups. Read only: nothing is rebuilt or written there.
  */
-async function oldBackupsLook(root: string, mine: (owner: { projectId?: string; assets?: unknown; file: string }) => boolean | "cannot-tell"): Promise<OldPlaceLook> {
+async function oldBackupsLook(root: string, mine: (owner: { projectId?: string; assets?: unknown; file: string; abs: string }) => boolean | "cannot-tell" | Promise<boolean | "cannot-tell">): Promise<OldPlaceLook> {
   const dir = join(root, "Backups");
   let files: string[];
   try {
@@ -1167,8 +1170,9 @@ async function oldBackupsLook(root: string, mine: (owner: { projectId?: string; 
   let unsure = false;
   for (const f of files) {
     const e = entries.find((x) => x?.file === f);
-    const owner = e && typeof e.projectId === "string" ? { projectId: e.projectId, assets: e.assets, file: f } : typeof owners[f] === "string" && Object.hasOwn(owners, f) ? { projectId: owners[f] as string, file: f } : { file: f };
-    const m = mine(owner);
+    const abs = join(dir, f);
+    const owner = e && typeof e.projectId === "string" ? { projectId: e.projectId, assets: e.assets, file: f, abs } : typeof owners[f] === "string" && Object.hasOwn(owners, f) ? { projectId: owners[f] as string, file: f, abs } : { file: f, abs };
+    const m = await mine(owner);
     if (m === true) return "holds";
     if (m === "cannot-tell") unsure = true;
   }
@@ -1243,9 +1247,15 @@ async function lookAtPlace(root: string, what: DestroyedData): Promise<OldPlaceL
   // This project's backups left in the old place's Backups/ (a split move does not take them, FR-682),
   // and its files in the old place's trash (R409 c).
   const stem = datedFileName(`${what.projectName} - backup`, new Date(0), "zip").replace(/ - modified .*$/u, "");
-  const backups = await oldBackupsLook(root, (o) =>
-    o.projectId !== undefined ? o.projectId === what.projectId && (!Array.isArray(o.assets) || o.assets.some((id) => what.assetIds.has(id as string))) : o.file.startsWith(`${stem} - modified `),
-  );
+  // A backup with neither entry is told as the current library tells it (unresolvedBackupsOf): sealed,
+  // by the key it is sealed with; else by its name. One that still cannot be told is "cannot tell",
+  // never "not this project's" (R429 d).
+  const backups = await oldBackupsLook(root, async (o) => {
+    if (o.projectId !== undefined) return o.projectId === what.projectId && (!Array.isArray(o.assets) || o.assets.some((id) => what.assetIds.has(id as string)));
+    if (o.file.startsWith(`${stem} - modified `)) return true;
+    if (o.file.endsWith(".enc") && (await sealedWithKey(o.abs, what.keyId))) return true;
+    return "cannot-tell";
+  });
   if (backups === "holds") return "holds";
   const trash = await oldTrashLook(root, new Set(what.paths.map(baseName)));
   if (trash === "holds") return "holds";
@@ -1502,7 +1512,7 @@ async function settleOldCopies(
   if (!left.length && !needCheck) return;
   const paths = destroyedPaths(opts.certificate);
   if (!paths.length) return; // nothing to look for: cannot tell, so nothing is recorded
-  const what: DestroyedData = { projectId: a.projectId, paths, assetIds: destroyedAssetIds(opts.certificate), projectName: repo.getProject(projectId).name };
+  const what: DestroyedData = { projectId: a.projectId, paths, assetIds: destroyedAssetIds(opts.certificate), projectName: repo.getProject(projectId).name, keyId: repo.getProject(projectId).encryption.keyId };
   const lib = repoLibrary(repo);
   let records: PendingOldCopy[];
   try {

@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AuditEvent, Project, SourceFile } from "@ao/core";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "@ao/shared";
+import { buildHeader, CHUNK_SIZE } from "./crypto/format.js";
 import type { Deps } from "./deps.js";
 import { backupProject, restoreBackup } from "./export/backup.js";
 import { addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
@@ -662,5 +663,34 @@ describe("R429: old copies of a moved library and a destruction's certificate (r
     } finally {
       oldCopyLookSeams.locationEnv = undefined;
     }
+  });
+
+  it("(d) N6: a backup in the old place with no manifest or owner entry, named otherwise and not sealed with this project's key, is 'cannot tell', never 'not this project's'", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    await rm(join(kit.lib.root, ...repo.getProject(p.id).folder.split("/")), { recursive: true, force: true });
+    await mkdir(join(kit.lib.root, "Backups"), { recursive: true });
+    await writeFile(join(kit.lib.root, "Backups", "Renamed - backup - modified 2026-11-01 0900.zip"), "a backup that cannot be told");
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending", notDestroyed: [{ movedAt: MOVED_AT }], note: expect.stringContaining("may still hold") });
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+  });
+
+  it("(d) N6: a sealed backup in the old place with no manifest or owner entry is told by its key id, as the current library does: sealed with this project's key, it holds the data", async () => {
+    const p = await makeProject(kit, GOV, true, "Interviews");
+    const asset = (await rawSource(p)).assets[0]!;
+    const dest = join(kit.tmp, "Moved");
+    await executeMove(kit.lib, dest, { deps: deps(), env: env(), sourceRepo: kit.repo });
+    const repo = await openAt(dest);
+    const keyId = repo.getProject(p.id).encryption.keyId!;
+    await rm(join(kit.lib.root, ...repo.getProject(p.id).folder.split("/")), { recursive: true, force: true });
+    await mkdir(join(kit.lib.root, "Backups"), { recursive: true });
+    const sealed = Buffer.concat([buildHeader(keyId, Buffer.alloc(12, 7), CHUNK_SIZE), Buffer.from("sealed bytes")]);
+    await writeFile(join(kit.lib.root, "Backups", "Renamed - backup - modified 2026-11-01 0900.zip.enc"), sealed);
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending", note: expect.stringContaining("still holds the destroyed data and was not destroyed") });
   });
 });
