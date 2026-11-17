@@ -317,6 +317,8 @@ export class ProxyQueue {
         type: job.type,
         input,
         inputEncrypted: asset.encrypted,
+        // A linked file is recorded as its asset, never by its path (R379).
+        ...(asset.linked ? { inputAsset: { sourceId, assetId: asset.id } } : {}),
         output: join(work, `proxy.${ext}`),
         params: { location: mode },
         entity: { type: "asset", id: asset.id },
