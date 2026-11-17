@@ -1098,6 +1098,16 @@ describe("rules the engine cannot read are said (R379 FR-A18, R58)", () => {
     expect(screen.queryByText(ALERT)).toBeNull();
   });
 
+  it("R397 d: an issue quoting markup is shown as text, never as markup", async () => {
+    const issue = "<img src=x onerror=alert(1)>: unknown key (check spelling) in governance.yaml";
+    serveRead({ yaml: PROBE, readable: false, issues: [issue], warnings: [] });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const alert = screen.getAllByRole("alert").find((a) => a.textContent?.includes(ALERT))!;
+    expect(within(alert).getByRole("listitem").textContent).toBe(issue);
+    expect(document.querySelector("img")).toBeNull();
+  });
+
   it("readable without warnings: nothing new is shown", async () => {
     serveRead({ yaml: YAML, readable: true, issues: [], warnings: [] });
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);

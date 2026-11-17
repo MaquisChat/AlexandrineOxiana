@@ -1059,6 +1059,13 @@ describe("FR-A18 round 2 (R397 b–d): the issues are bounded, scrubbed, on one 
     expect(issues.some((i) => i.includes("first line second line"))).toBe(true);
     for (const i of issues) expect(i).not.toMatch(/[\n\r]/);
   });
+
+  it("d: control characters and the marks that reorder or hide text are taken out; angle brackets stay", async () => {
+    const issues = await issuesOf(`"<img src=x onerror=alert(1)>\\u202E\\a\\u200B\\u2066": 1\n`);
+    const i = issues.find((x) => x.includes("<img src=x onerror=alert(1)>"))!;
+    expect(i).toBeTruthy();
+    expect(i).not.toMatch(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/);
+  });
 });
 
 describe("review round 1: errors, query credentials, pairing (R98, R99)", () => {
