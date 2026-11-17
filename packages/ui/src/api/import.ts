@@ -319,14 +319,21 @@ const bid = (s: string) => id("batch", s);
  * strictest reading (pseudonymise, encrypt), as the service denies everything then.
  */
 export function importPolicyFromYaml(yaml: string): ImportPolicy {
+  const { readable: _readable, ...policy } = readImportPolicy(yaml);
+  return policy;
+}
+
+/** As `importPolicyFromYaml`, and whether the rules could be read here at all. */
+function readImportPolicy(yaml: string): ImportPolicyRead {
   try {
     const p = effectivePolicy(parseGovernance(yaml)).policy;
     return {
       pseudonymizeNames: p.identifiability.containsIdentifiable && p.identifiability.pseudonymizeFileNames,
       encryptionRequired: p.encryption.atRest === "required",
+      readable: true,
     };
   } catch {
-    return { pseudonymizeNames: true, encryptionRequired: true };
+    return { pseudonymizeNames: true, encryptionRequired: true, readable: false };
   }
 }
 
@@ -334,10 +341,15 @@ export function importApi(client: ApiClient) {
   const r = client.request;
   return {
     projects: async () => (await r<{ projects: ProjectInfo[] }>("GET", "/projects")).projects,
-    /** The service's `readable: false` reads the rules strictly and says so (R379 FR-A18). */
+    /**
+     * The service's `readable: false` reads the rules strictly and says so (R379 FR-A18); an answer
+     * without the field (an older or partial one) is readable only if the rules read here (R397 f).
+     */
     policy: async (projectId: string): Promise<ImportPolicyRead> => {
       const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`);
-      return g.readable === false ? { pseudonymizeNames: true, encryptionRequired: true, readable: false } : { ...importPolicyFromYaml(g.yaml), readable: true };
+      if (g.readable === false) return { pseudonymizeNames: true, encryptionRequired: true, readable: false };
+      const read = readImportPolicy(g.yaml);
+      return g.readable === undefined ? read : { ...read, readable: true };
     },
 
     dryRun: (projectId: string, adapter: ImportAdapter, approveOutside?: ApproveOutside) =>
