@@ -749,6 +749,23 @@ describe("Paired browsers", () => {
     expect(screen.getByRole("status", { name: "Revoke result" }).textContent).toMatch(/revoked/i);
   });
 
+  it("a held or repeated Enter on Revoke opens the dialog on its heading and revokes nothing; Tab then Enter revokes once (R376 c)", async () => {
+    const svc = pairingService({ pairings: [BROWSER_A, BROWSER_B] });
+    server.use(...svc.handlers);
+    const user = userEvent.setup();
+    render(<ExtensionPairing api={makeApi()} />);
+    const btn = await screen.findByRole("button", { name: `Revoke ${BROWSER_A.origin}` });
+    btn.focus();
+    await user.keyboard("{Enter>4}{/Enter}{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "Revoke this browser?" });
+    expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Revoke this browser?" }));
+    expect(svc.state.deleted).toEqual([]);
+    await user.tab();
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Revoke pairing" }));
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(svc.state.deleted).toEqual([BROWSER_A.id]));
+  });
+
   it("Cancel and Escape change nothing and return focus to the Revoke button", async () => {
     const svc = pairingService({ pairings: [BROWSER_A] });
     server.use(...svc.handlers);

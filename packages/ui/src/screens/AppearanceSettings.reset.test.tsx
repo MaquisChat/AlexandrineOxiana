@@ -118,6 +118,22 @@ describe("the appearance settings cannot be read (Task 68)", () => {
     expect(state.resets).toEqual([]);
   });
 
+  it("a held or repeated Enter on the reset button opens the dialog on its heading and resets nothing; Tab then Enter resets once (R376 c)", async () => {
+    const { state } = setup({ appearanceUnreadable: true });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("radio", { name: "Dark" }));
+    const btn = await screen.findByRole("button", { name: RESET });
+    btn.focus();
+    await user.keyboard("{Enter>4}{/Enter}{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "Reset appearance settings?" });
+    expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Reset appearance settings?" }));
+    expect(state.resets).toEqual([]);
+    await user.tab();
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Reset appearance" }));
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(state.resets).toEqual([{ file: "appearance", confirm: true }]));
+  });
+
   it("confirmed: one reset, then the change that was refused is saved; the notice goes and focus lands on the heading", async () => {
     const { state, put } = setup({ appearanceUnreadable: true });
     const user = userEvent.setup();
@@ -170,6 +186,21 @@ describe("the list of added fonts cannot be read (Task 68)", () => {
     await user.click(within(r).getByRole("button", { name: "Remove Brill" }));
     expect(await within(r).findByRole("button", { name: RESET })).toBeTruthy();
     expect(within(r).getByText("Brill")).toBeTruthy(); // nothing removed from the list shown
+  });
+
+  it("a held or repeated Enter on the list reset opens the dialog on its heading and resets nothing; Tab then Enter resets once (R376 c)", async () => {
+    const { state } = setup({ fontsUnreadable: true });
+    const user = userEvent.setup();
+    const btn = await within(await region()).findByRole("button", { name: RESET });
+    btn.focus();
+    await user.keyboard("{Enter>4}{/Enter}{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "Reset the list of added fonts?" });
+    expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Reset the list of added fonts?" }));
+    expect(state.resets).toEqual([]);
+    await user.tab();
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Reset the list" }));
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(state.resets).toEqual([{ file: "fonts", confirm: true }]));
   });
 
   it("the reset asks first: what is lost, what happens to the kept copies; focus is managed; confirmed, the list starts empty", async () => {
