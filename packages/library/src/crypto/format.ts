@@ -60,6 +60,13 @@ export class KeyNotAvailableError extends Error {
   }
 }
 
+/**
+ * The key a reader holds was wiped (zero-filled) by a lock: the project was locked mid-read. A KeyNotAvailableError
+ * (the same name, so every caller that maps that to "locked" still does), told apart from a key that is unknown
+ * (a file sealed under another key id), which is damage, not a lock (R404).
+ */
+export class KeyWipedError extends KeyNotAvailableError {}
+
 export function assertKeyId(keyId: string): void {
   if (typeof keyId !== "string" || !UUID_PATTERN.test(keyId)) {
     throw new TypeError(`keyId must be a lowercase UUID string, got ${JSON.stringify(keyId)}`);
@@ -93,7 +100,7 @@ export function assertLiveKey(key: Uint8Array, keyId: string): void {
   assertKey(key);
   let any = 0;
   for (const b of key) any |= b;
-  if (any === 0) throw new KeyNotAvailableError(keyId);
+  if (any === 0) throw new KeyWipedError(keyId);
 }
 
 function keyIdToBytes(keyId: string): Buffer {
