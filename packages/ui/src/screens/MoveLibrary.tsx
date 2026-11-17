@@ -89,7 +89,9 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
       }
       if (!alive.current) return;
       if (st) {
+        // The service answered: the lost-connection sentence goes; what this answer says is shown below.
         setChecking(false);
+        setError(null);
         const { pending, failed } = st;
         if (pending && sameRoot(pending.newRoot, target)) {
           setError(null);

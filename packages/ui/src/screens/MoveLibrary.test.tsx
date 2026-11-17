@@ -322,6 +322,33 @@ describe("Move library", () => {
       expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
     });
 
+    it("the lost-connection sentence goes as soon as any status answer arrives, and comes back only when the service is lost again (second review, M-a)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      const shown: Array<{ alert: string | null; waiting: boolean }> = [];
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          shown.push({ alert: screen.queryByRole("alert")?.textContent ?? null, waiting: screen.queryByText("Waiting for the move to finish…") !== null });
+          if (polls === 1 || polls === 3) return HttpResponse.error();
+          if (polls === 2) return HttpResponse.json({ pending: null, running: true, failed: null });
+          if (polls <= 6) return HttpResponse.json({ pending: null, running: false, failed: null });
+          return HttpResponse.json({ pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-back", expiresAt: "2026-11-11T10:15:00.000Z" }, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("status", { name: "Verification" }, { timeout: 3000 })).textContent).toMatch(/finished and was verified/);
+      // shown[k] is what the screen showed after answer k (polls are 1-based, shown is 0-based).
+      expect(shown[1]).toEqual({ alert: LOST, waiting: false }); // lost
+      expect(shown[2]).toEqual({ alert: null, waiting: true }); // a move is running: the sentence is gone
+      expect(shown[3]).toEqual({ alert: LOST, waiting: true }); // lost again: it is back
+      expect(shown[4]).toEqual({ alert: null, waiting: true }); // an empty answer after "running": gone, still waiting
+      expect(shown[5]).toEqual({ alert: null, waiting: true });
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
     it("the first status question waits one polling interval (R399 b)", async () => {
       const user = userEvent.setup();
       const seen: { body?: any } = {};
