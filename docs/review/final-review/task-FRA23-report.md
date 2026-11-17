@@ -166,3 +166,13 @@ The branch head is now **b32595e**. There is one commit per point, plus one smal
 **For a ruling:**
 - The room guard is process-wide. Because it is held until the look settles, one hung share keeps every room answer at "cannot tell", even for a healthy disk, until that share answers. That is what R449 b asks for; I am naming the consequence.
 - The suggestion's "join" also joins calls with different environments. Only the service calls it, always with this machine's environment.
+
+## Round 4 (R450)
+
+- (a) S1: `packages/ui/src/screens/LibraryChooser.tsx` — `ROOM_ANSWER_LIMIT_MS = 4000`; each ask starts a limit timer that empties the line if the box still holds the path; the answer or failure cancels it; a late answer for the held path is still shown. Test "S1: a newer answer ..." failed first (line still showed the figure), passes now; "S1: a late answer" passes.
+- (b) S2: `ROOM_RETRY_MS = [2000, 4000, 8000]`; no number or failure asks again, then stops; one Set of timers, all cleared on clean-up. Tests: retry after 2,000 ms (failed first: one request), four answers with no number/failure give exactly four requests (failed first), box changed during a wait gives no further request (passes before and after; it guards the clean-up).
+- (c) Test "an error for a new path after a figure empties the line": passed with the existing code; fails when the `setRoomWords("")` in the failure branch is removed (checked, then restored).
+- Tests are a new describe in `LibraryChooser.test.tsx` (fake clock, fake service object; the file had no fake timers elsewhere). No existing expectation changed.
+- (d) S4: `watched-folders.ts` — new exported `cheapLocationEnv()` (the former body of `locationEnv`, which now calls it after the test seam); `libraries.ts` route `GET /libraries/suggested-folder` uses it; `defaultLocationEnv` is still used by other routes there. No new test: the existing suggestion test under the temporary home covers the route.
+- (e) S3: comment reworded as specified.
+- Runs: ui chooser tests 3 files, 31 passed; library-service 2 files, 59 passed; `pnpm -r typecheck` all Done; `lint:css` (stylelint) and `lint:colours` ("ok: no hard-coded colours") pass; both scripts live in `@ao/ui`, so run with `pnpm --filter @ao/ui`.
