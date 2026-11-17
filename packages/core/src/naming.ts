@@ -2,7 +2,7 @@
  * Human-readable, cross-platform file naming (spec 4.2, 4.4).
  * Platform-neutral: no node: imports.
  */
-import { nameForms, scrubNames } from "./participant-names.js";
+import { scrubNames } from "./participant-names.js";
 
 export interface NamingTemplates {
   /** Placeholders: {date} {creator} {title} {id}. */
@@ -191,8 +191,8 @@ export function withCollisionSuffix(
  * handle → code. The result is NFC.
  */
 export function pseudonymize(text: string, map: ReadonlyMap<string, string>): string {
-  const forms = [...map].flatMap(([name, code]) => nameForms(name, code));
-  return scrubNames(text.normalize("NFC"), forms);
+  // The map's forms (participant-names.ts nameForms) are indexed once per map (R387 M2).
+  return scrubNames(text.normalize("NFC"), { map });
 }
 
 export function encName(name: string): string {

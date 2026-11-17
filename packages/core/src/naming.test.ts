@@ -566,3 +566,61 @@ describe("R387 (e): partial names (I4 of the FR-A10 review)", () => {
     expect(pseudonymize("Siti Ahmad bercerita", new Map([["Siti binti Ahmad", "P-003"]]))).toBe("Siti Ahmad bercerita");
   });
 });
+
+describe("R387 (f): minor points of the FR-A10 review", () => {
+  it("M1: a name's own exact form wins over another name's rotation or joined form, whatever the map's order", () => {
+    for (const map of [
+      new Map([["Maria Lopez", "P-001"], ["Lopez Maria", "P-002"]]),
+      new Map([["Lopez Maria", "P-002"], ["Maria Lopez", "P-001"]]),
+    ]) {
+      expect(pseudonymize("Maria Lopez; Lopez Maria", map)).toBe("P-001; P-002");
+    }
+    for (const map of [
+      new Map([["Ann Marie", "P-001"], ["Annmarie", "P-002"]]),
+      new Map([["Annmarie", "P-002"], ["Ann Marie", "P-001"]]),
+    ]) {
+      expect(pseudonymize("Annmarie and Ann Marie", map)).toBe("P-002 and P-001");
+    }
+  });
+
+  it("M2: the forms of a map are built once: 20 folder names with a map of 5,000 names", () => {
+    const map = new Map<string, string>();
+    for (let i = 0; i < 5_000; i++) map.set(`Given${i} Middle${i} Family${i}`, `P-${i}`);
+    pseudonymize("warm up", map);
+    const t = performance.now();
+    for (let i = 0; i < 20; i++) expect(pseudonymize(`Interview ${i} with Middle${i} Family${i}`, map)).toBe(`Interview ${i} with P-${i}`);
+    expect(performance.now() - t).toBeLessThan(1000);
+    // The time limit covers the one build of the map's forms (the warm-up), timed apart from the calls.
+  }, 120_000);
+
+  it("M2: a map changed after use is read afresh (the cache is never stale)", () => {
+    const map = new Map([["Maria Lopez", "P-001"]]);
+    expect(pseudonymize("Rosa Diaz", map)).toBe("Rosa Diaz");
+    map.set("Rosa Diaz", "P-002");
+    expect(pseudonymize("Rosa Diaz", map)).toBe("P-002");
+    map.set("Rosa Diaz", "P-003");
+    expect(pseudonymize("Rosa Diaz", map)).toBe("P-003");
+    map.delete("Rosa Diaz");
+    expect(pseudonymize("Rosa Diaz", map)).toBe("Rosa Diaz");
+  });
+
+  it("M3: a name of several Hangul words is not taken where its last word ends inside a syllable ('김 미' in '김 민의')", () => {
+    expect(pseudonymize("김 민의 이야기", new Map([["김 미", "P-001"]]))).toBe("김 민의 이야기");
+  });
+
+  it("M3: a final sigma is the same letter as sigma (ΝΙΚΟΣ = Νίκος)", () => {
+    expect(pseudonymize("ΝΙΚΟΣ talks", new Map([["Νίκος", "P-001"]]))).toBe("P-001 talks");
+    expect(pseudonymize("Νίκος talks", new Map([["ΝΙΚΟΣ", "P-001"]]))).toBe("P-001 talks");
+  });
+
+  it("M5: Arabic tatweel folds away; hiragana and katakana are one script", () => {
+    expect(pseudonymize("مقابلة مـحـمـد", new Map([["محمد", "P-001"]]))).toBe("مقابلة P-001");
+    expect(pseudonymize("ヤマダタロウの話", new Map([["やまだ たろう", "P-002"]]))).toBe("P-002の話");
+    expect(pseudonymize("やまだたろうの話", new Map([["ヤマダ タロウ", "P-002"]]))).toBe("P-002の話");
+  });
+
+  it("M6: a Hangul name written apart equals the same name written together", () => {
+    expect(pseudonymize("김 민수의 인터뷰", new Map([["김민수", "P-001"]]))).toBe("P-001의 인터뷰");
+    expect(pseudonymize("김민수의 인터뷰", new Map([["김 민수", "P-001"]]))).toBe("P-001의 인터뷰");
+  });
+});

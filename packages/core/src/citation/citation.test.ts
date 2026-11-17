@@ -885,3 +885,54 @@ describe("R387 (e): partial names (I4 of the FR-A10 review)", () => {
     expect(toCslItem(li, { ...OPTS, pseudonyms: new Map([["Mei Wang Li", "P-002"]]) }).title).toBe("The Li family; P-002");
   });
 });
+
+describe("R387 (f): minor points of the FR-A10 review", () => {
+  const story = (t: string, url?: string) =>
+    source("article-journal", mt(["en", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }], url ? { identifiers: { url } } : {});
+
+  it("M1: a name's own exact form wins, whatever the map's order; a creator's code and the title agree", () => {
+    for (const map of [
+      new Map([["Maria Lopez", "P-001"], ["Lopez Maria", "P-002"]]),
+      new Map([["Lopez Maria", "P-002"], ["Maria Lopez", "P-001"]]),
+    ]) {
+      expect(toCslItem(story("Maria Lopez; Lopez Maria"), { ...OPTS, pseudonyms: map }).title).toBe("P-001; P-002");
+      const sf = source("interview", mt(["en", "original", "Lopez Maria talks"]), [{ role: "interviewee", literal: "Lopez Maria" }], { participantIds: [PARTICIPANT.id] });
+      const item = toCslItem(sf, { ...OPTS, pseudonyms: map });
+      expect(item.author).toEqual([{ literal: "P-002" }]);
+      expect(item.title).toBe("P-002 talks");
+    }
+    for (const map of [new Map([["Ann Marie", "P-001"], ["Annmarie", "P-002"]]), new Map([["Annmarie", "P-002"], ["Ann Marie", "P-001"]])]) {
+      expect(toCslItem(story("Annmarie and Ann Marie"), { ...OPTS, pseudonyms: map }).title).toBe("P-002 and P-001");
+    }
+  });
+
+  it("M2: the forms of a map are built once: 200 citations with a map of 5,000 three-word names", () => {
+    const map = new Map<string, string>();
+    for (let i = 0; i < 5_000; i++) map.set(`Given${i} Middle${i} Family${i}`, `P-${i}`);
+    toCslItem(story("warm up"), { ...OPTS, pseudonyms: map });
+    const t = performance.now();
+    for (let i = 0; i < 200; i++) expect(toCslItem(story(`About Family${i}, Middle${i}`), { ...OPTS, pseudonyms: map }).title).toBe(`About P-${i}`);
+    expect(performance.now() - t).toBeLessThan(3000);
+    // The time limit covers the one build of the map's forms (the warm-up), timed apart from the calls.
+  }, 120_000);
+
+  it("M3: an NFD title: the combining mark after a name goes with it", () => {
+    expect(toCslItem(story("Habla Luciá"), { ...OPTS, pseudonyms: new Map([["Lucía", "P-002"]]) }).title).toBe("Habla P-002");
+  });
+
+  it("M3: a malformed escape run: its ASCII escapes are still decoded and the name found", () => {
+    expect(toCslItem(story("A story", "https://news.example/%4D%61%72%69%61%E0%A4"), { ...OPTS, pseudonyms: new Map([["Maria", "P-001"]]) }).URL).toBeUndefined();
+  });
+
+  it("M6: a Korean creator written as family and given finds the map key written together, and is coded", () => {
+    const sf = source("interview", mt(["ko", "original", "김민수의 인터뷰"]), [{ role: "interviewee", family: "김", given: "민수" }], { participantIds: [PARTICIPANT.id] });
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: new Map([["김민수", "P-001"]]) });
+    expect(item.author).toEqual([{ literal: "P-001" }]);
+    expect(item.title).toBe("P-001의 인터뷰");
+  });
+
+  it("M5: tatweel and kana through the citation", () => {
+    expect(toCslItem(story("مقابلة مـحـمـد"), { ...OPTS, pseudonyms: new Map([["محمد", "P-001"]]) }).title).toBe("مقابلة P-001");
+    expect(toCslItem(story("ヤマダタロウの話"), { ...OPTS, pseudonyms: new Map([["やまだ たろう", "P-002"]]) }).title).toBe("P-002の話");
+  });
+});

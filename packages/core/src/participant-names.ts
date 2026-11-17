@@ -56,7 +56,7 @@ const TRANSLIT: Readonly<Record<string, string>> = {
 const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
 /**
  * Name comparison key: default-ignorable characters removed, ł ø đ ß æ œ þ ı transliterated, then
- * NFKD, combining marks removed, lowercase.
+ * NFKD, combining marks and tatweel removed, katakana read as hiragana, lowercase.
  */
 export const fold = (s: string): string =>
   s
@@ -64,17 +64,25 @@ export const fold = (s: string): string =>
     .replace(/[łŁøØđĐßẞæÆœŒþÞı]/gu, (c) => TRANSLIT[c] ?? c)
     .normalize("NFKD")
     .replace(/\p{M}+/gu, "")
+    // Arabic tatweel (kashida) only stretches a word (R387 M5).
+    .replace(/\u0640/gu, "")
+    // Katakana and hiragana spell the same sounds: one script for names (R387 M5).
+    .replace(/[\u30A1-\u30F6]/gu, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60))
     .toLowerCase()
     .replace(/ς/gu, "σ"); // final sigma: the same letter, and a character folded alone cannot know it is final
 /** The words of a name or text, folded ("@Lucía.Cocina" → ["lucia", "cocina"]). */
 export const words = (s: string): string[] => fold(s).match(/[\p{L}\p{N}]+/gu) ?? [];
+const HANGUL = /\p{Script=Hangul}/u;
+const joinsWithout = (a: string | undefined, b: string | undefined): boolean =>
+  (isNoSpace(a) && isNoSpace(b)) || (a !== undefined && b !== undefined && HANGUL.test(a) && HANGUL.test(b));
 /**
  * A name's comparison form: its folded words joined by single spaces (no "@", no punctuation). Words
  * of a script written without spaces are joined without one ("山田 太郎" = "山田太郎"): a space there
- * is not part of the name.
+ * is not part of the name. So are Hangul words (R387 M6: "김 민수" = "김민수", a family and a given
+ * name written apart or together).
  */
 export const normName = (s: string): string =>
-  words(s).reduce((acc, w) => (acc === "" ? w : acc + (isNoSpace(acc.at(-1)) && isNoSpace(w[0]) ? "" : " ") + w), "");
+  words(s).reduce((acc, w) => (acc === "" ? w : acc + (joinsWithout(acc.at(-1), w[0]) ? "" : " ") + w), "");
 
 /** A name to look for: its folded words, the code that replaces it; `bare`: a lone given or family name. */
 export interface NameForm {
@@ -91,16 +99,16 @@ const MAX_RUN_WORDS = 10;
 const LATIN_FLOOR = 4;
 
 /** `ws` in every rotation and reversed, each order also with its words joined. */
-function ordersOf(ws: readonly string[], code: string, bare: boolean, variant: boolean): NameForm[] {
+function ordersOf(ws: readonly string[], code: string, bare: boolean, variant: boolean, join = true): NameForm[] {
   const out: NameForm[] = [{ words: [...ws], code, bare, ...(variant ? { variant } : {}) }];
   if (ws.length === 1) return out;
   const orders: string[][] = [[...ws]];
   for (let k = 1; k < ws.length; k++) orders.push([...ws.slice(k), ...ws.slice(0, k)]);
-  orders.push([...ws].reverse());
+  if (ws.length > 2) orders.push([...ws].reverse()); // of two words, the reverse is the rotation
   orders.forEach((o, i) => {
     if (i > 0) out.push({ words: o, code, bare, variant: true });
     // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
-    out.push({ words: [o.join("")], code, bare, variant: true });
+    if (join) out.push({ words: [o.join("")], code, bare, variant: true });
   });
   return out;
 }
@@ -123,6 +131,12 @@ export function nameForms(name: string | CreatorName, code: string, bare = false
   const ws = words(name);
   if (ws.length === 0) return [];
   const out = ordersOf(ws, code, bare, false);
+  // A Hangul name written together is the same name written apart at any syllable (R387 M6:
+  // "김민수" = "김 민수" = "민수 김").
+  if (ws.length === 1 && !bare && ALL_HANGUL.test(ws[0]!)) {
+    const w = ws[0]!;
+    for (let k = 1; k < w.length; k++) if (CHOSEONG.test(w[k]!)) out.push(...ordersOf([w.slice(0, k), w.slice(k)], code, bare, true, false));
+  }
   if (ws.length >= 3 && ws.length <= MAX_RUN_WORDS) {
     for (let len = ws.length - 1; len >= 2; len--) {
       for (let at = 0; at + len <= ws.length; at++) {
@@ -351,11 +365,16 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
       maxPrefix = Math.max(maxPrefix, last.length);
     }
   };
-  for (const f of forms) {
-    const ws = f.words.filter(Boolean);
-    if (ws.length === 0) continue;
-    if (min > 0 && f.bare && !f.variant && ws.length === 1 && !standsAlone(ws[0]!, min)) continue;
-    add(ws, f.code);
+  // Every name's exact form before any variant (R387 M1): a name's own form wins over another
+  // name's rotation or joined form, whatever the order of the map.
+  for (const pass of [false, true]) {
+    for (const f of forms) {
+      if ((f.variant ?? false) !== pass) continue;
+      const ws = f.words.filter(Boolean);
+      if (ws.length === 0) continue;
+      if (min > 0 && f.bare && !f.variant && ws.length === 1 && !standsAlone(ws[0]!, min)) continue;
+      add(ws, f.code);
+    }
   }
   for (const list of index.values()) list.sort((a, b) => b.units.length - a.units.length);
   return { byFirst: index, prefixes, maxPrefix };
@@ -437,17 +456,82 @@ function mergeHits(hits: Hit[], extra: Hit[]): Hit[] {
   return all.sort((x, y) => x.start - y.start);
 }
 
-/** The non-overlapping matches, left to right, longest first at each position. Linear in the text. */
-function findAll(text: string, forms: readonly NameForm[], opts: ScrubOptions, firstOnly: boolean): Hit[] {
-  const hits = findPlain(text, forms, opts, firstOnly);
-  if ((firstOnly && hits.length) || !/[\u202D\u202E]/u.test(text)) return hits;
-  return mergeHits(hits, overrideHits(text, (t) => findPlain(t, forms, opts, firstOnly)));
+/**
+ * The names to look for: a name map (name or handle → code; its forms are made by `nameForms` and
+ * indexed once per map, R387 M2) and/or forms made by the caller (a source's creators). On the same
+ * length, the map's forms win.
+ */
+export interface NameSet {
+  map?: ReadonlyMap<string, string>;
+  forms?: readonly NameForm[];
+}
+export type Names = readonly NameForm[] | NameSet;
+
+interface MapCache {
+  /** The entries the cache was built from: a map changed since is read afresh (never stale). */
+  entries: Array<[string, string]>;
+  forms: NameForm[];
+  indexes: Map<string, Index>;
+  keys?: Map<string, string>;
+}
+const mapCache = new WeakMap<ReadonlyMap<string, string>, MapCache>();
+function cacheOf(map: ReadonlyMap<string, string>): MapCache {
+  let c = mapCache.get(map);
+  if (c && c.entries.length === map.size) {
+    let i = 0;
+    for (const [k, v] of map) {
+      const e = c.entries[i++]!;
+      if (e[0] !== k || e[1] !== v) {
+        c = undefined;
+        break;
+      }
+    }
+  } else c = undefined;
+  if (!c) {
+    const entries = [...map];
+    c = { entries, forms: entries.flatMap(([n, code]) => nameForms(n, code)), indexes: new Map() };
+    mapCache.set(map, c);
+  }
+  return c;
 }
 
-function findPlain(text: string, forms: readonly NameForm[], opts: ScrubOptions, firstOnly: boolean): Hit[] {
-  if (forms.length === 0) return [];
-  const { byFirst, prefixes, maxPrefix } = patterns(forms, opts);
-  if (byFirst.size === 0) return [];
+/** A name map's comparison keys (normName → code, the first entry of a key wins), built once per map. */
+export function mapKeys(map: ReadonlyMap<string, string>): ReadonlyMap<string, string> {
+  const c = cacheOf(map);
+  if (!c.keys) {
+    c.keys = new Map();
+    for (const [k, code] of c.entries) {
+      const n = normName(k);
+      if (n && !c.keys.has(n)) c.keys.set(n, code);
+    }
+  }
+  return c.keys;
+}
+
+function indexesOf(names: Names, opts: ScrubOptions): Index[] {
+  const set: NameSet = Array.isArray(names) ? { forms: names as readonly NameForm[] } : (names as NameSet);
+  const out: Index[] = [];
+  if (set.map && set.map.size) {
+    const c = cacheOf(set.map);
+    const key = `${opts.bareMinLength ?? 0}|${opts.splitDigits ? 1 : 0}`;
+    let ix = c.indexes.get(key);
+    if (!ix) c.indexes.set(key, (ix = patterns(c.forms, opts)));
+    out.push(ix);
+  }
+  if (set.forms && set.forms.length) out.push(patterns(set.forms, opts));
+  return out.filter((ix) => ix.byFirst.size > 0);
+}
+
+/** The non-overlapping matches, left to right, longest first at each position. Linear in the text. */
+function findAll(text: string, names: Names, opts: ScrubOptions, firstOnly: boolean): Hit[] {
+  const indexes = indexesOf(names, opts);
+  if (indexes.length === 0) return [];
+  const hits = findPlain(text, indexes, opts, firstOnly);
+  if ((firstOnly && hits.length) || !/[\u202D\u202E]/u.test(text)) return hits;
+  return mergeHits(hits, overrideHits(text, (t) => findPlain(t, indexes, opts, firstOnly)));
+}
+
+function findPlain(text: string, indexes: readonly Index[], opts: ScrubOptions, firstOnly: boolean): Hit[] {
   const tokens = tokenize(text, opts.splitDigits ?? false);
   const hits: Hit[] = [];
   /** The end of `p` matched at token `i` (exactly, or its last word beginning a Hangul run), or -1. */
@@ -462,29 +546,35 @@ function findPlain(text: string, forms: readonly NameForm[], opts: ScrubOptions,
     if (t.w === u) return t.end;
     return p.prefix && hangulPrefixOf(t.w, u) ? origEnd(text, t.start, u.length) : -1;
   };
-  for (let i = 0; i < tokens.length; ) {
+  /** The longest pattern of `ix` found at token `i`, with its end. */
+  const at = (ix: Index, i: number): { p: Pattern; end: number } | undefined => {
     const w = tokens[i]!.w;
-    let hit: Pattern | undefined;
-    let end = -1;
-    for (const p of byFirst.get(w) ?? []) {
-      end = matchEnd(p, i);
-      if (end >= 0) {
-        hit = p;
-        break;
-      }
+    for (const p of ix.byFirst.get(w) ?? []) {
+      const end = matchEnd(p, i);
+      if (end >= 0) return { p, end };
     }
     // A one-word Hangul name at the start of a longer run: the prefixes of the token that end on a
     // syllable boundary, longest first, no longer than the longest such name (linear in the text).
-    if (!hit && maxPrefix > 0 && CHOSEONG.test(w[0] ?? "")) {
-      for (let n = Math.min(w.length - 1, maxPrefix); n > 0 && !hit; n--) {
+    if (ix.maxPrefix > 0 && CHOSEONG.test(w[0] ?? "")) {
+      for (let n = Math.min(w.length - 1, ix.maxPrefix); n > 0; n--) {
         if (!CHOSEONG.test(w[n]!)) continue;
-        for (const p of prefixes.get(w.slice(0, n)) ?? []) {
-          end = matchEnd(p, i);
-          if (end >= 0) {
-            hit = p;
-            break;
-          }
+        for (const p of ix.prefixes.get(w.slice(0, n)) ?? []) {
+          const end = matchEnd(p, i);
+          if (end >= 0) return { p, end };
         }
+      }
+    }
+    return undefined;
+  };
+  for (let i = 0; i < tokens.length; ) {
+    let hit: Pattern | undefined;
+    let end = -1;
+    // Longest across the indexes; on the same length the first index (the name map) wins.
+    for (const ix of indexes) {
+      const r = at(ix, i);
+      if (r && (!hit || r.p.units.length > hit.units.length)) {
+        hit = r.p;
+        end = r.end;
       }
     }
     if (!hit) {
@@ -502,8 +592,8 @@ function findPlain(text: string, forms: readonly NameForm[], opts: ScrubOptions,
  * Replaces every participant name form in `text` by its code (the rule above). An "@" in front of a
  * name goes with it. Longer forms win.
  */
-export function scrubNames(text: string, forms: readonly NameForm[], opts: ScrubOptions = {}): string {
-  const hits = findAll(text, forms, opts, false);
+export function scrubNames(text: string, names: Names, opts: ScrubOptions = {}): string {
+  const hits = findAll(text, names, opts, false);
   if (hits.length === 0) return text;
   let out = "";
   let pos = 0;
@@ -518,8 +608,8 @@ export function scrubNames(text: string, forms: readonly NameForm[], opts: Scrub
 }
 
 /** Whether `text` names any of the forms (the rule above). */
-export function namesAny(text: string, forms: readonly NameForm[], opts: ScrubOptions = {}): boolean {
-  return findAll(text, forms, opts, true).length > 0;
+export function namesAny(text: string, names: Names, opts: ScrubOptions = {}): boolean {
+  return findAll(text, names, opts, true).length > 0;
 }
 
 /** Percent-escapes decoded where they are valid UTF-8; a malformed one is left as written. */
@@ -540,12 +630,12 @@ function safeDecode(s: string): string {
  * above, so every separator is alike (space, "+", "-", ".", "_", "/", none) in either word order.
  * No length floor: every form counts. Letters and digits are split ("lopezmaria2024").
  */
-export function urlNamesAny(url: string, forms: readonly NameForm[]): boolean {
+export function urlNamesAny(url: string, names: Names): boolean {
   let u = url;
   for (let k = 0; k < 3; k++) {
     const d = safeDecode(u);
     if (d === u) break;
     u = d;
   }
-  return namesAny(u.replace(/\+/gu, " "), forms, { splitDigits: true });
+  return namesAny(u.replace(/\+/gu, " "), names, { splitDigits: true });
 }

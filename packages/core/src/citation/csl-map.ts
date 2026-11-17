@@ -34,7 +34,7 @@
 import type { Anchor } from "../model/anchor.js";
 import type { BiblioField, Creator, SourceFile, SourceType } from "../model/source.js";
 import type { MultiText } from "../model/text.js";
-import { nameForms, normName, scrubNames, urlNamesAny, type NameForm } from "../participant-names.js";
+import { mapKeys, nameForms, normName, scrubNames, urlNamesAny, type NameForm, type NameSet } from "../participant-names.js";
 
 export interface CslName {
   family?: string;
@@ -193,16 +193,16 @@ function codeFor(c: Creator, keys: ReadonlyMap<string, string>): string | undefi
  * names are always replaced, even where the word means something else ("Rose gardens"):
  * over-scrubbing a title is the fail-safe side (R88).
  */
-function scrubText(text: string, forms: readonly NameForm[]): string {
-  return scrubNames(text, forms, { bareMinLength: 4 });
+function scrubText(text: string, names: NameSet): string {
+  return scrubNames(text, names, { bareMinLength: 4 });
 }
 
 /**
  * Whether a URL carries any participant name form, by the shared rule (participant-names.ts): decoded
  * safely, any separator (space, %20, +, -, ., _, none), either word order, no length floor.
  */
-function urlNamesParticipant(url: string, forms: readonly NameForm[]): boolean {
-  return urlNamesAny(url, forms);
+function urlNamesParticipant(url: string, names: NameSet): boolean {
+  return urlNamesAny(url, names);
 }
 
 function cslName(c: Creator): CslName | undefined {
@@ -268,14 +268,10 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   if (mapped.medium) item.medium = mapped.medium;
 
   // Creators, coded where the pseudonym map knows them (names compared folded, R88 I1).
-  const keys = new Map<string, string>();
+  // The map's comparison keys and forms are built once per map (participant-names.ts, R387 M2).
+  const map = opts.pseudonyms ?? new Map<string, string>();
+  const keys = mapKeys(map);
   const forms: NameForm[] = [];
-  for (const [k, code] of opts.pseudonyms ?? []) {
-    const n = normName(k);
-    if (!n) continue;
-    if (!keys.has(n)) keys.set(n, code);
-    forms.push(...nameForms(k, code));
-  }
   // Sources linked to participants fail closed: every creator but the interviewer needs a code (R88 I2).
   const requireCodes = opts.requireParticipantCodes === true || s.participantIds.length > 0;
   // Participants but no pseudonym map to code them with: nothing about them can be cited safely (R89).
@@ -296,7 +292,8 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
     const role = ROLE_MAP[c.role];
     (item[role] ??= []).push(name);
   }
-  const scrub = (text: string) => (forms.length ? scrubText(text, forms) : text);
+  const names: NameSet = { map, forms };
+  const scrub = (text: string) => (keys.size || forms.length ? scrubText(text, names) : text);
 
   const title = pickTitle(s.title, opts, true);
   if (title.value) item.title = scrub(title.value);
@@ -328,7 +325,7 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   if (accessed) item.accessed = accessed;
 
   const url = s.identifiers.url;
-  if (url && !urlNamesParticipant(url, forms)) item.URL = url;
+  if (url && !urlNamesParticipant(url, names)) item.URL = url;
   if (s.identifiers.doi) item.DOI = s.identifiers.doi;
   const isbn = s.identifiers.isbn?.[0];
   if (isbn) item.ISBN = isbn;

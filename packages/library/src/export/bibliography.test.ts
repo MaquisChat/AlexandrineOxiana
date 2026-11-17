@@ -219,6 +219,15 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(plain(bib.content)).not.toMatch(/lucia|fernandez|ruiz/u);
   });
 
+  it("R387 (M6): a creator written without accents is the participant already coded with them (assignCodes folds)", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const a = await addSource(kit, p, { type: "book", title: "Primera", creators: [{ given: "Lucía", family: "Fernández", role: "interviewee" }], issued: "2025", identifiable: true });
+    const b = await addSource(kit, p, { type: "book", title: "Segunda", creators: [{ given: "LUCIA", family: "Fernandez", role: "interviewee" }], issued: "2025", identifiable: true });
+    const codeOf = (folder: string) => /P-\d{3}/u.exec(folder)?.[0];
+    expect(codeOf(b.source.folder)).toBe(codeOf(a.source.folder));
+    expect((await kit.repo.getFieldwork(p.id)).participants).toHaveLength(1);
+  });
+
   it("a custom style renders through the sandbox", async () => {
     const p = await makeProject(kit);
     const xml = `<?xml version="1.0" encoding="utf-8"?>

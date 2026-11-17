@@ -3,7 +3,7 @@
  * `<Project>/keys/pseudonyms.json.enc` (encrypted with the project key).
  */
 import type { Creator, Participant } from "@ao/core";
-import { creatorNameTexts, newId } from "@ao/core";
+import { creatorNameTexts, newId, normName } from "@ao/core";
 import { decryptBytes, readMaybe } from "./io.js";
 import type { Tx } from "./mutate.js";
 import type { ProjectJson, ProjectState, RepoCore } from "./state.js";
@@ -93,7 +93,14 @@ export function assignCodes(
   let changed = false;
   const codes: Array<string | undefined> = [];
   const participantIds: string[] = [];
-  const lookup = (key: string) => [...map.entries()].find(([k]) => k.toLowerCase() === key.toLowerCase())?.[1];
+  // An existing participant is found by the name folded as citations and folder names compare it
+  // (core's normName: case, accents, width, invisible characters; Hangul written apart or together;
+  // R387 M6), so "Lucia Fernandez" is the "Lucía Fernández" already coded, not a new participant.
+  const lookup = (key: string) => {
+    const n = normName(key);
+    // A key with no letters or digits at all is compared as written (lowercased), as before.
+    return [...map.entries()].find(([k]) => (n ? normName(k) === n : k.toLowerCase() === key.toLowerCase()))?.[1];
+  };
   for (const c of creators) {
     // The interviewer is the researcher, not a research participant.
     const key = c.role === "interviewer" ? undefined : creatorKey(c);
