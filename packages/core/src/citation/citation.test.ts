@@ -752,6 +752,32 @@ describe.skipIf(!HAVE_BUNDLE)("rendering with the bundled styles", () => {
   });
 });
 
+describe("R380: a Korean name with a particle or honorific joined to it", () => {
+  const t = (title: string, key = "김민수") =>
+    toCslItem(source("article-journal", mt(["ko", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: new Map([[key, "P-001"]]) }).title;
+
+  it("is replaced at the start of a run of Hangul; the particle stays", () => {
+    expect(t("김민수의 인터뷰")).toBe("P-001의 인터뷰");
+    expect(t("김민수씨와의 대화")).toBe("P-001씨와의 대화");
+  });
+
+  it("is not replaced in the middle or at the end of a longer run; one syllable only alone; Latin unchanged", () => {
+    expect(t("박김민수 인터뷰")).toBe("박김민수 인터뷰");
+    expect(t("민수의 인터뷰", "민")).toBe("민수의 인터뷰");
+    expect(t("Marianne", "Maria")).toBe("Marianne");
+  });
+
+  it("in a creator's own title, and in an address that holds Hangul", () => {
+    const sf = source("interview", mt(["ko", "original", "김민수씨와의 대화"]), [{ role: "interviewee", literal: "김민수" }], {
+      participantIds: [PARTICIPANT.id],
+      identifiers: { url: "https://news.example/%EA%B9%80%EB%AF%BC%EC%88%98%EC%9D%98-%EC%9D%B4%EC%95%BC%EA%B8%B0" },
+    });
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: new Map([["김민수", "P-001"]]) });
+    expect(item.title).toBe("P-001씨와의 대화");
+    expect(item.URL).toBeUndefined();
+  });
+});
+
 describe("toCslItem: linear in the title (FR-A10)", () => {
   it("a 100,000-character title with a map of 500 names is scrubbed in well under a second", () => {
     const map = new Map<string, string>();

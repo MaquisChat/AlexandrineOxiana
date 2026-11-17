@@ -16,6 +16,11 @@
  * - Word order: a name of two or more words also matches in any rotation ("Lopez, Maria",
  *   "Fernández Ruiz, Lucía") and fully reversed, and with its words joined ("marialopez",
  *   "lopezmaria"); any separator may stand between the words.
+ * - Korean (R380): a Hangul name of two or more syllables also matches at the START of a run of
+ *   Hangul, the rest of the run taken for a particle or honorific and kept ("김민수의" → "P-001의");
+ *   for a name of several words, on its last word. Never in the middle or at the end of a run
+ *   ("박김민수": a compound or another name, kept); a one-syllable name only as a run of its own.
+ * - Limit: inflected forms in Latin script ("Marian", "Marias") are not matched (FR-657).
  * Platform-neutral: no node: imports.
  */
 import { NO_SPACE_SCRIPT } from "./verify/evidence.js";
@@ -168,13 +173,42 @@ interface Pattern {
   code: string;
   /** One no-space-script character: matched only as a run of its own. */
   single: boolean;
+  /** A Hangul name of two or more syllables: its last word may begin a longer run of Hangul (R380). */
+  prefix: boolean;
+}
+
+/** A Hangul leading consonant (choseong) as NFKD gives it: where a folded syllable begins. */
+const CHOSEONG = /[\u1100-\u115F\uA960-\uA97F]/u;
+const ALL_HANGUL = /^\p{Script=Hangul}+$/u;
+const syllables = (s: string): number => (s.match(/[\u1100-\u115F\uA960-\uA97F]/gu) ?? []).length;
+
+/**
+ * Korean (R380): `u`, the folded last word of a Hangul name, begins the token `w` and the rest of
+ * the run is Hangul starting on a new syllable: the rest is taken for a particle or honorific
+ * ("김민수의", "김민수씨와의"). Never in the middle or at the end of a run.
+ */
+const hangulPrefixOf = (w: string, u: string): boolean => {
+  if (w.length <= u.length || !w.startsWith(u)) return false;
+  const rest = w.slice(u.length);
+  return CHOSEONG.test(rest[0]!) && ALL_HANGUL.test(rest);
+};
+
+interface Index {
+  /** Patterns by first unit, longest first. */
+  byFirst: Map<string, Pattern[]>;
+  /** One-unit Hangul patterns that may begin a longer run, by that unit. */
+  prefixes: Map<string, Pattern[]>;
+  /** The longest unit in `prefixes` (bounds the prefixes tried per token). */
+  maxPrefix: number;
 }
 
 /** Every form's patterns (its order variants and joined forms), indexed by first unit, longest first. */
-function patterns(forms: readonly NameForm[], opts: ScrubOptions): Map<string, Pattern[]> {
+function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
   const min = opts.bareMinLength ?? 0;
   const split = opts.splitDigits ?? false;
   const index = new Map<string, Pattern[]>();
+  const prefixes = new Map<string, Pattern[]>();
+  let maxPrefix = 0;
   const seen = new Set<string>();
   const add = (ws: readonly string[], code: string) => {
     const us = ws.flatMap((w) => units(w, split));
@@ -183,9 +217,19 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Map<string, P
     if (seen.has(key)) return;
     seen.add(key);
     const single = us.length === 1 && [...us[0]!].length === 1 && isNoSpace(us[0]);
+    // A Hangul name of one syllable stays whole-run only, like a one-character no-space name.
+    const last = us[us.length - 1]!;
+    const prefix = ALL_HANGUL.test(last) && syllables(us.join("")) >= 2;
+    const pat: Pattern = { units: us, code, single, prefix };
     const list = index.get(us[0]!) ?? [];
-    list.push({ units: us, code, single });
+    list.push(pat);
     index.set(us[0]!, list);
+    if (prefix && us.length === 1) {
+      const pl = prefixes.get(last) ?? [];
+      pl.push(pat);
+      prefixes.set(last, pl);
+      maxPrefix = Math.max(maxPrefix, last.length);
+    }
   };
   for (const f of forms) {
     const ws = f.words.filter(Boolean);
@@ -204,7 +248,25 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Map<string, P
     }
   }
   for (const list of index.values()) list.sort((a, b) => b.units.length - a.units.length);
-  return index;
+  return { byFirst: index, prefixes, maxPrefix };
+}
+
+/** The original-text index where the first `n` folded characters of a token starting at `start` end. */
+function origEnd(text: string, start: number, n: number): number {
+  let i = start;
+  let got = 0;
+  while (i < text.length && got < n) {
+    const cp = String.fromCodePoint(text.codePointAt(i)!);
+    got += foldChar(cp).length;
+    i += cp.length;
+  }
+  // Marks folded away belong to the letter before them.
+  while (i < text.length) {
+    const cp = String.fromCodePoint(text.codePointAt(i)!);
+    if (foldChar(cp) !== "") break;
+    i += cp.length;
+  }
+  return i;
 }
 
 interface Hit {
@@ -216,23 +278,52 @@ interface Hit {
 /** The non-overlapping matches, left to right, longest first at each position. Linear in the text. */
 function findAll(text: string, forms: readonly NameForm[], opts: ScrubOptions, firstOnly: boolean): Hit[] {
   if (forms.length === 0) return [];
-  const index = patterns(forms, opts);
-  if (index.size === 0) return [];
+  const { byFirst, prefixes, maxPrefix } = patterns(forms, opts);
+  if (byFirst.size === 0) return [];
   const tokens = tokenize(text, opts.splitDigits ?? false);
   const hits: Hit[] = [];
+  /** The end of `p` matched at token `i` (exactly, or its last word beginning a Hangul run), or -1. */
+  const matchEnd = (p: Pattern, i: number): number => {
+    // A single no-space-script character is a name only when it stands alone.
+    if (p.single && (tokens[i]!.gluedLeft || tokens[i]!.gluedRight)) return -1;
+    const lastK = p.units.length - 1;
+    for (let k = 0; k < lastK; k++) if (tokens[i + k]?.w !== p.units[k]) return -1;
+    const t = tokens[i + lastK];
+    if (!t) return -1;
+    const u = p.units[lastK]!;
+    if (t.w === u) return t.end;
+    return p.prefix && hangulPrefixOf(t.w, u) ? origEnd(text, t.start, u.length) : -1;
+  };
   for (let i = 0; i < tokens.length; ) {
-    const cands = index.get(tokens[i]!.w);
-    const hit = cands?.find(
-      (p) =>
-        p.units.every((u, k) => tokens[i + k]?.w === u) &&
-        // A single no-space-script character is a name only when it stands alone.
-        !(p.single && (tokens[i]!.gluedLeft || tokens[i]!.gluedRight)),
-    );
+    const w = tokens[i]!.w;
+    let hit: Pattern | undefined;
+    let end = -1;
+    for (const p of byFirst.get(w) ?? []) {
+      end = matchEnd(p, i);
+      if (end >= 0) {
+        hit = p;
+        break;
+      }
+    }
+    // A one-word Hangul name at the start of a longer run: the prefixes of the token that end on a
+    // syllable boundary, longest first, no longer than the longest such name (linear in the text).
+    if (!hit && maxPrefix > 0 && CHOSEONG.test(w[0] ?? "")) {
+      for (let n = Math.min(w.length - 1, maxPrefix); n > 0 && !hit; n--) {
+        if (!CHOSEONG.test(w[n]!)) continue;
+        for (const p of prefixes.get(w.slice(0, n)) ?? []) {
+          end = matchEnd(p, i);
+          if (end >= 0) {
+            hit = p;
+            break;
+          }
+        }
+      }
+    }
     if (!hit) {
       i++;
       continue;
     }
-    hits.push({ start: tokens[i]!.start, end: tokens[i + hit.units.length - 1]!.end, code: hit.code });
+    hits.push({ start: tokens[i]!.start, end, code: hit.code });
     if (firstOnly) break;
     i += hit.units.length;
   }

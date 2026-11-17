@@ -421,3 +421,48 @@ describe("pseudonymize: linear in the text (FR-A10)", () => {
     expect(out).not.toMatch(/family12/iu);
   });
 });
+
+describe("pseudonymize: Korean particles and honorifics (R380)", () => {
+  const map = new Map([["김민수", "P-001"]]);
+
+  it("a Hangul name of two or more syllables is replaced at the start of a run; the particle stays", () => {
+    expect(pseudonymize("김민수의 인터뷰", map)).toBe("P-001의 인터뷰");
+    expect(pseudonymize("김민수씨와의 대화", map)).toBe("P-001씨와의 대화");
+    expect(pseudonymize("김민수 인터뷰", map)).toBe("P-001 인터뷰");
+  });
+
+  it("never in the middle or at the end of a longer run; a one-syllable name only as a run of its own", () => {
+    expect(pseudonymize("박김민수 인터뷰", map)).toBe("박김민수 인터뷰");
+    expect(pseudonymize("대화박김민수의", map)).toBe("대화박김민수의");
+    const one = new Map([["민", "P-002"]]);
+    expect(pseudonymize("민수의 인터뷰", one)).toBe("민수의 인터뷰");
+    expect(pseudonymize("민 인터뷰", one)).toBe("P-002 인터뷰");
+    // A name ending inside a syllable is not a prefix: "김미" is not at the start of "김민".
+    expect(pseudonymize("김민의 이야기", new Map([["김미", "P-003"]]))).toBe("김민의 이야기");
+  });
+
+  it("family and given written apart: the allowance holds on the last word only", () => {
+    const apart = new Map([["김 민수", "P-004"]]);
+    expect(pseudonymize("김 민수의 인터뷰", apart)).toBe("P-004의 인터뷰");
+    expect(pseudonymize("김씨 민수", apart)).toBe("김씨 민수");
+  });
+
+  it("a Latin-script name is still never matched at the start of a longer word", () => {
+    expect(pseudonymize("Marianne and Marias", new Map([["Maria", "P-005"]]))).toBe("Marianne and Marias");
+  });
+});
+
+describe("pseudonymize: linear with Hangul names (R380)", () => {
+  it("100,000 characters of Hangul (one run, and short runs) with 500 Hangul names in well under a second", () => {
+    const map = new Map<string, string>();
+    for (let i = 0; i < 500; i++) map.set(`김${String.fromCodePoint(0xac00 + i * 3)}${String.fromCodePoint(0xb000 + i)}`, `P-${String(i).padStart(3, "0")}`);
+    map.set("김민수", "P-999");
+    const run = "김민수의대화".repeat(Math.ceil(50_000 / 6)).slice(0, 50_000);
+    const words = "김민수씨와의 대화 ".repeat(Math.ceil(50_000 / 10)).slice(0, 50_000);
+    const t = performance.now();
+    const out = pseudonymize(run + " " + words, map);
+    expect(performance.now() - t).toBeLessThan(1000);
+    expect(out.startsWith("P-999의대화김민수의대화")).toBe(true);
+    expect(out).toContain(" P-999씨와의 대화");
+  });
+});
