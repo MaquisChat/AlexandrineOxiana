@@ -92,6 +92,9 @@ export type FindReasonCode =
   // the record was removed from the library ("no-open-copy", removal only); the rules' store part, or a missing
   // legal basis, refused the file ("record-complete", like "copy-not-allowed").
   | "copy-some-unreachable"
+  // R379 (FR-A17): offers found, none downloaded, at least one for a passing reason: retried like an unreachable
+  // lookup, then "no-open-copy" with "Try again".
+  | "copy-not-downloaded"
   | "record-removed"
   | "copy-store-not-allowed"
   | "copy-no-legal-basis"

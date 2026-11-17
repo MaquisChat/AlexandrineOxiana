@@ -2758,6 +2758,8 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     ...["file-looks-right", "file-other-doi", "file-title-absent", "file-no-text", "file-other-version", "file-other-kind"].map((code) => ({ typed: `nc ${code}`, o: nc(code), phrase: "Needs your check", sentence: FIND_REASON_TEXT[code as keyof typeof FIND_REASON_TEXT], controls: ["check", "open", "remove"] })),
     { typed: "no copy", o: noc(), phrase: "No open copy", controls: ["open", "remove"] },
     { typed: "no copy unreachable", o: noc("copy-some-unreachable"), phrase: "No open copy", sentence: FIND_REASON_TEXT["copy-some-unreachable"], controls: ["try", "open", "remove"] },
+    // R379 (FR-A17): a copy found but not downloaded, its retries spent: its own sentence, and "Try again".
+    { typed: "no copy not downloaded", o: noc("copy-not-downloaded"), phrase: "No open copy", sentence: FIND_REASON_TEXT["copy-not-downloaded"], controls: ["try", "open", "remove"] },
     { typed: "no copy not this file", o: noc("not-this-file"), phrase: "No open copy", sentence: FIND_REASON_TEXT["not-this-file"], controls: ["open", "remove"] },
     { typed: "no copy removed", o: noc("record-removed"), phrase: "No open copy", sentence: FIND_REASON_TEXT["record-removed"], controls: ["remove"] },
     { typed: "failed unreachable", o: withSource({ state: "failed", reason: { code: "unreachable" } }), phrase: `Could not be done: ${FIND_REASON_TEXT.unreachable}`, controls: ["try", "remove"] },
@@ -2821,11 +2823,13 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
           entry({ typed: "only refused", ...noc(), offers: refusedOnly }),
           entry({ typed: "unreachable with offers", ...noc("copy-some-unreachable"), offers }),
           entry({ typed: "removed with offers", ...noc("record-removed"), offers }),
+          // R411 c: an entry waiting to look again keeps the links found, and shows them beside Try again.
+          entry({ typed: "waiting with offers", ...withSource({ state: "looking-for-copy", nextTryAt: "2026-11-14T12:00:00.000Z" }), offers }),
         ]),
       },
     });
     show();
-    await waitFor(() => expect(rows()).toHaveLength(4));
+    await waitFor(() => expect(rows()).toHaveLength(5));
     const list = within(row("with offers")).getByRole("list", { name: "Where to get it: “with offers”" });
     const links = within(list).getAllByRole("link");
     expect(links.map((a) => [a.getAttribute("href"), a.getAttribute("aria-label")])).toEqual([
@@ -2849,6 +2853,9 @@ describe("FindAcquire: the copy part (F11; R282, R296, R301, R303)", () => {
     expect(within(row("unreachable with offers")).getAllByRole("link")).toHaveLength(2);
     expect(row("removed with offers").textContent).not.toContain("Where to get it");
     expect(within(row("removed with offers")).queryAllByRole("link")).toHaveLength(0);
+    expect(row("waiting with offers").textContent).toContain("Where to get it");
+    expect(within(row("waiting with offers")).getAllByRole("link")).toHaveLength(2);
+    expect(within(row("waiting with offers")).getByRole("button", { name: "Try again: “waiting with offers”" })).toBeTruthy();
   });
 
   describe("R311 a, R340 d: in the desktop app, Where to get it is never a dead link", () => {
@@ -3051,6 +3058,7 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
   const cases: Case[] = [
     { typed: "startable", o: startable(), phrase: "No open copy", controls: ["library", "open", "remove"] },
     { typed: "startable unreachable", o: startable({ reason: { code: "copy-some-unreachable" } }), phrase: "No open copy", sentence: FIND_REASON_TEXT["copy-some-unreachable"], controls: ["try", "library", "open", "remove"] },
+    { typed: "startable not downloaded", o: startable({ reason: { code: "copy-not-downloaded" } }), phrase: "No open copy", sentence: FIND_REASON_TEXT["copy-not-downloaded"], controls: ["try", "library", "open", "remove"] },
     { typed: "startable rules", o: withSource({ state: "record-complete", reason: { code: "copy-not-allowed" }, library: { canStart: true } }), phrase: "Record complete", sentence: FIND_REASON_TEXT["copy-not-allowed"], controls: ["try", "library", "open", "remove"] },
     { typed: "startable switched off", o: withSource({ state: "record-complete", reason: { code: "switched-off", by: "settings" }, library: { canStart: true } }), phrase: "Record complete", sentence: FIND_REASON_TEXT["switched-off"], controls: ["try", "library", "open", "remove"] },
     { typed: "no library", o: noc({ library: { canStart: false, reason: "no-library" } }), phrase: "No open copy", libText: FIND_LIBRARY_TEXT.noLibrary, controls: ["open", "remove"] },

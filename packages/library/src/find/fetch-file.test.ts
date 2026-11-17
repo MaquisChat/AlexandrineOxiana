@@ -19,7 +19,7 @@ import { createLibrary } from "../library.js";
 import { USER_AGENT } from "../lookup/http.js";
 import { openTestRepo } from "../repo/testing.js";
 import { activeTemp, isStaleWorkDir } from "../tmp-registry.js";
-import { FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FetchFileError, fetchFile, holdFindTemp } from "./fetch-file.js";
+import { FETCH_FILE_DEADLINE_MS, FETCH_FILE_HEADERS_MS, FetchFileError, downloadFailurePasses, fetchFile, holdFindTemp } from "./fetch-file.js";
 import { FREE_COPY_MAX_BYTES } from "./free-copy.js";
 
 const PDF = Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
@@ -300,6 +300,34 @@ describe("fetchFile: refusals leave the folder empty", () => {
     reply("https://arxiv.org", "/r", 302, "");
     expect((await refusal(get("https://arxiv.org/r"))).code).toBe("redirect-refused");
     await empty();
+  });
+
+  it("R379 (FR-A17): a refusal for its answer keeps the answer's status, and every refusal is sorted passing or final", async () => {
+    reply("https://arxiv.org", "/busy", 503, "");
+    expect((await refusal(get("https://arxiv.org/busy"))).status).toBe(503);
+    reply("https://arxiv.org", "/gone", 404, "");
+    expect((await refusal(get("https://arxiv.org/gone"))).status).toBe(404);
+    const e = (code: ConstructorParameters<typeof FetchFileError>[0], status?: number) => new FetchFileError(code, "x", status);
+    // Passing: the time, the network, and the answers that say "later" (408, 425, 429, 5xx).
+    for (const s of [408, 425, 429, 500, 502, 503, 504, 599]) expect(downloadFailurePasses(e("status", s)), String(s)).toBe(true);
+    for (const c of ["headers-timeout", "deadline", "unreachable", "write-failed"] as const) expect(downloadFailurePasses(e(c)), c).toBe(true);
+    // Final: every other answer, and the refusals by the fetcher's own rules or by what was sent.
+    for (const s of [400, 401, 403, 404, 410, 451, 206, 300]) expect(downloadFailurePasses(e("status", s)), String(s)).toBe(false);
+    for (const c of ["address", "redirect-refused", "too-many-redirects", "encoded", "too-large", "not-pdf-or-epub"] as const) expect(downloadFailurePasses(e(c)), c).toBe(false);
+    // Anything else (a time-out of the caller's own, an error not foreseen) passes.
+    expect(downloadFailurePasses(new Error("boom"))).toBe(true);
+    expect(downloadFailurePasses(e("status"))).toBe(true);
+    await empty();
+  });
+
+  it("R411 b (review 2, M1): a refusal's Retry-After is kept but never enumerable (no serialising shows it)", async () => {
+    const e = new FetchFileError("status", "x", 429, "3600");
+    expect(e.retryAfter).toBe("3600");
+    expect(Object.keys(e)).not.toContain("retryAfter");
+    expect(JSON.stringify(e)).not.toContain("3600");
+    expect({ ...e }).not.toHaveProperty("retryAfter");
+    expect(new FetchFileError("status", "x", 503, "y".repeat(500)).retryAfter).toHaveLength(100);
+    expect(new FetchFileError("status", "x", 503).retryAfter).toBeUndefined();
   });
 
   it("a service that cannot be reached is a refusal in plain words", async () => {

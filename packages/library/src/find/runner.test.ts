@@ -3187,6 +3187,10 @@ describe("F11: the free copy of a record the queue completed", () => {
   let saved: Dispatcher;
   /** R282 e: OpenAlex's free-copy answers fail (503). */
   let oaDown: boolean;
+  /** R411 b: OpenAlex's free-copy answers are this status and headers (a 429 or a 503 with a Retry-After). */
+  let oaAnswer: { status: number; headers: Record<string, string> } | undefined;
+  /** R379 (FR-A17): file addresses that answer with this status (and headers) instead of their file. */
+  let fileStatus: Map<string, { status: number; headers?: Record<string, string> }>;
 
   const COPY_ONLY_OPENALEX = (): SearchSettings => ({ ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" })) });
   /** Ordinary text of a first page, so that a made-up file has readable text (the file check asks for 200 characters, R282). */
@@ -3233,6 +3237,7 @@ describe("F11: the free copy of a record the queue completed", () => {
         const doi = decodeURIComponent(String(o.path).slice("/works/doi:".length));
         copyRequests.push(String(o.path));
         if (oaDown) return { statusCode: 503, data: "unavailable" };
+        if (oaAnswer) return { statusCode: oaAnswer.status, data: "wait", responseOptions: { headers: oaAnswer.headers } };
         const urls = oaCopies.get(doi) ?? [];
         const [best, ...rest] = urls;
         return {
@@ -3249,6 +3254,8 @@ describe("F11: the free copy of a record the queue completed", () => {
         .get(origin)
         .intercept({ path: () => true, method: "GET" })
         .reply((o) => {
+          const st = fileStatus.get(`${origin}${String(o.path)}`);
+          if (st) return { statusCode: st.status, data: "", responseOptions: { headers: st.headers ?? {} } };
           const body = files.get(`${origin}${String(o.path)}`);
           return body ? { statusCode: 200, data: body } : { statusCode: 404, data: "" };
         })
@@ -3266,6 +3273,8 @@ describe("F11: the free copy of a record the queue completed", () => {
     fileRequests = [];
     copyRequests = [];
     oaDown = false;
+    fileStatus = new Map();
+    oaAnswer = undefined;
     settings = COPY_ONLY_OPENALEX();
     mockCopies();
   });
@@ -3992,9 +4001,219 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect(FIND_DOWNLOAD_TIMEOUT_MS).toBe(240_000);
     timers.advance(FIND_DOWNLOAD_TIMEOUT_MS);
     await until(() => heldFiles[0]!.aborted, "the download to be aborted");
-    await copyDone(p, eid);
-    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", offers: [{ host: "arxiv.org" }] });
+    // R379 (FR-A17): a copy was found but not fetched this time — not "no open copy": the entry waits to be tried again.
+    await waitsToRetry(p, eid, 1);
     expect(await exists(folderOf(eid))).toBe(false);
+  });
+
+  /** The entry waits, its retry timer set and its download folder gone (R379: like an unreachable free-copy lookup). */
+  const waitsToRetry = async (p: Project, eid: string, attempts: number, delay = FIND_RETRY_DELAYS_MS[attempts - 1]!) => {
+    await until(async () => (await entryOf(p, eid))?.attempts === attempts && !!(await entryOf(p, eid))?.nextTryAt, `attempt ${attempts} waiting`);
+    await until(async () => !activeTemp.has(`find-${eid}`) && !(await exists(folderOf(eid))), "its folder to go");
+    await until(() => timers.pending.size > 0, "the retry's timer");
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "looking-for-copy", attempts });
+    expect(e.reason).toBeUndefined();
+    expect(e.nextTryAt).toBe(new Date(timers.now + delay).toISOString());
+  };
+  /** Every retry's delay waited out (`each` after each retry started), until the entry rests. */
+  const retriesRunOut = async (p: Project, eid: string, each: (i: number) => Promise<void> = async () => {}) => {
+    for (const [i, d] of FIND_RETRY_DELAYS_MS.entries()) {
+      const before = fileRequests.length;
+      timers.advance(d - 1);
+      await new Promise((res) => setTimeout(res, 30));
+      expect(fileRequests.length, "nothing downloaded before the delay").toBe(before);
+      timers.advance(1);
+      await until(() => fileRequests.length > before, `try ${i + 2}`);
+      await each(i);
+      if (i < FIND_RETRY_DELAYS_MS.length - 1) await waitsToRetry(p, eid, i + 2);
+    }
+    await copyDone(p, eid);
+  };
+
+  it("R379 (FR-A17): every download timed out: tried again like an unreachable lookup, then 'no open copy' saying a copy was found, with Try again; a later file is held for the researcher", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    holdFiles.add(A);
+    const { p, r, eid, sid } = await recordMade();
+    await until(() => heldFiles.length === 1, "the download to start");
+    timers.advance(FIND_DOWNLOAD_TIMEOUT_MS);
+    await waitsToRetry(p, eid, 1);
+    await retriesRunOut(p, eid, async (i) => {
+      await until(() => heldFiles.length === i + 2, `download ${i + 2} to start`);
+      timers.advance(FIND_DOWNLOAD_TIMEOUT_MS);
+    });
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "no-open-copy", attempts: FIND_RETRY_DELAYS_MS.length + 1, reason: { code: "copy-not-downloaded" }, offers: [{ host: "arxiv.org" }] });
+    expect(e.nextTryAt).toBeUndefined();
+    expect(timers.pending.size).toBe(0);
+    // Try again: the copy is looked for again; the file comes now and is HELD for the researcher's check, nothing attached.
+    holdFiles.clear();
+    files.set(A, await good());
+    expect(await r.retry(p.id, eid)).toMatchObject({ state: "looking-for-copy", attempts: 0 });
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    expect(await pendingReviews(p)).toHaveLength(1);
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(0);
+  });
+
+  it("R379 (FR-A17): one offer 503 and another 404: a copy was found but not fetched (one may pass) — the same waits, then Try again", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    const B = "https://arxiv.org/pdf/2101.00002";
+    oaCopies.set(ZORBLATT.doi!, [A, B]);
+    fileStatus.set(A, { status: 503 });
+    const { p, r, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+    await retriesRunOut(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", reason: { code: "copy-not-downloaded" }, offers: [{ host: "arxiv.org" }, { host: "arxiv.org" }] });
+    expect(await r.retry(p.id, eid)).toMatchObject({ state: "looking-for-copy" });
+  });
+
+  it("R379 (FR-A17): a second attempt that gets the file holds it for the researcher's check exactly as a first would", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 502 });
+    const { p, eid, sid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+    fileStatus.clear();
+    files.set(A, await good());
+    timers.advance(FIND_RETRY_DELAYS_MS[0]!);
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    const [rev] = await pendingReviews(p);
+    expect(rev).toBeDefined();
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(0);
+  });
+
+  it("R379, R411 b (M6): a download's Retry-After shorter than the usual delay (5 s): the usual delay (60 s), nothing sooner", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "5" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+    const n = fileRequests.length;
+    timers.advance(FIND_RETRY_DELAYS_MS[0]! - 1);
+    await new Promise((res) => setTimeout(res, 30));
+    expect(fileRequests.length).toBe(n);
+  });
+
+  const HOUR = 3_600_000;
+  /** Nothing is requested before `ms` from now; at `ms`, the next try goes by itself. */
+  const nothingBefore = async (ms: number) => {
+    const n = fileRequests.length;
+    const c = copyRequests.length;
+    timers.advance(ms - 1);
+    await new Promise((res) => setTimeout(res, 30));
+    expect(fileRequests.length, "no file asked before the wait").toBe(n);
+    expect(copyRequests.length, "no service asked before the wait").toBe(c);
+    timers.advance(1);
+    await until(() => fileRequests.length > n || copyRequests.length > c, "the next try at its time");
+  };
+
+  it("R411 b (M2): a download answered 429 with Retry-After 3600: the next try by itself an hour ahead, nothing requested before", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "3600" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, HOUR);
+    await nothingBefore(HOUR);
+    // The number of tries is unchanged: the second waits the longer of its own delay and the hour again.
+    await waitsToRetry(p, eid, 2, HOUR);
+  });
+
+  it("R411 b (M2): a Retry-After longer than an hour (7200) is cut to the hour", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "7200" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, HOUR);
+  });
+
+  it("R411 b (M2): a Retry-After as an HTTP date, on a 503: honoured; several offers: the longest counts", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    const B = "https://arxiv.org/pdf/2101.00002";
+    oaCopies.set(ZORBLATT.doi!, [A, B]);
+    fileStatus.set(A, { status: 503, headers: { "retry-after": new Date(timers.now + 1_800_000).toUTCString() } });
+    fileStatus.set(B, { status: 429, headers: { "retry-after": "600" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, 1_800_000);
+    await nothingBefore(1_800_000);
+  });
+
+  it("R411 b (M2): a download's unreadable Retry-After is ignored (the usual delay)", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 503, headers: { "retry-after": "soon, please" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+  });
+
+  it("R411 b (M2): a copy service answering 429 with Retry-After 3600 (every service asked): the wait honours it", async () => {
+    oaAnswer = { status: 429, headers: { "retry-after": "3600" } };
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, HOUR);
+    await nothingBefore(HOUR);
+  });
+
+  it("R411 b (M2): a copy service answering 503 with Retry-After 900: the wait honours it", async () => {
+    oaAnswer = { status: 503, headers: { "retry-after": "900" } };
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1, 900_000);
+    await nothingBefore(900_000);
+  });
+
+  it("R411 b (M2): the researcher's Try again during an hour's wait goes at once", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "3600" } });
+    const { p, r, eid, sid } = await recordMade();
+    await waitsToRetry(p, eid, 1, HOUR);
+    fileStatus.clear();
+    files.set(A, await good());
+    const n = fileRequests.length;
+    expect(await r.retry(p.id, eid)).toMatchObject({ state: "looking-for-copy", attempts: 0 });
+    await until(() => fileRequests.length > n, "the file asked at once");
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check" });
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(0);
+  });
+
+  it("R411 c (M3): during the waits after failed downloads the entry keeps the links found, so the row can show them", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    const B = "https://arxiv.org/pdf/2101.00002";
+    oaCopies.set(ZORBLATT.doi!, [A, B]);
+    fileStatus.set(A, { status: 503 });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+    expect((await entryOf(p, eid))!.offers?.map((o) => o.host)).toEqual(["arxiv.org", "arxiv.org"]);
+    timers.advance(FIND_RETRY_DELAYS_MS[0]!);
+    await waitsToRetry(p, eid, 2);
+    expect((await entryOf(p, eid))!.offers?.map((o) => o.host)).toEqual(["arxiv.org", "arxiv.org"]);
+  });
+
+  it("R411 a (M1): a service unreachable and every offered file refused for good: 'no open copy' saying a copy may still exist, its links kept, Try again accepted", async () => {
+    // Semantic Scholar has no answer in this world (the request fails); OpenAlex offers a link that answers 404.
+    settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" || c.id === "semanticscholar" })) };
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "no-open-copy", reason: { code: "copy-some-unreachable" }, offers: [{ host: "arxiv.org" }] });
+    expect(e.nextTryAt).toBeUndefined();
+    expect(await r.retry(p.id, eid)).toMatchObject({ state: "looking-for-copy" });
+  });
+
+  it("R379 (FR-A17): every offer refused for good (404): no open copy as before, its links kept, nothing tried again", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001", "https://arxiv.org/pdf/2101.00002"]);
+    fileStatus.set("https://arxiv.org/pdf/2101.00002", { status: 410 });
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "no-open-copy", offers: [{ host: "arxiv.org" }, { host: "arxiv.org" }] });
+    expect(e.reason).toBeUndefined();
+    expect(e.nextTryAt).toBeUndefined();
+    expect(timers.pending.size).toBe(0);
+    await expect(r.retry(p.id, eid)).rejects.toBeInstanceOf(FindEntryStateError);
   });
 
   // ------------------------------------------------------------------------------------------------------------

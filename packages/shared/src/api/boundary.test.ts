@@ -110,6 +110,8 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "file-looks-right",
       // R282 e–g: some free-copy services could not be reached; the record removed; the rules' store part refused.
       "copy-some-unreachable",
+      // R379 (FR-A17): a copy found but not downloaded this time (retried by itself, then "Try again").
+      "copy-not-downloaded",
       "record-removed",
       "copy-store-not-allowed",
       "copy-no-legal-basis",
@@ -117,6 +119,7 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "library-unfinished",
     ]);
     expect(FIND_REASON_TEXT["copy-some-unreachable"]).toBe("Some services could not be reached, so a free copy may still exist. “Try again” looks again.");
+    expect(FIND_REASON_TEXT["copy-not-downloaded"]).toBe("A free copy was found, but it could not be downloaded just now. Try again later, or open one of the links.");
     expect(FIND_REASON_TEXT["record-removed"]).toBe("The record was removed from the library.");
     // R347 e: after a link's start too — so it names no library.
     expect(FIND_REASON_TEXT["library-unfinished"]).toBe("A fetch in the app's window was not finished, and what this entry said before could not be read back. Nothing was added.");
