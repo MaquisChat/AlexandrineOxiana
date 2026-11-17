@@ -19,8 +19,9 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # A healthy run takes about 15 minutes; a stuck one must not burn build minutes for hours.
-    timeout-minutes: 45
+    # A healthy run takes about 70 minutes on GitHub's machines (measured on 2026-11-17: the unit tests 19 minutes, the
+    # steps before and after them about 11, the app's end-to-end scenarios about 40); a stuck one must not run for hours.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
