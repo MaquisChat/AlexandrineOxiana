@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -117,6 +117,40 @@ describe("createLibrary / openLibrary", () => {
     const root2 = join(tmp, "Lib2");
     await (await createLibrary(root2, "X", mkDeps())).close();
     await expect(createLibrary(root2, "Y", mkDeps())).rejects.toBeInstanceOf(AlreadyALibraryError);
+  });
+
+  it("FR-047: a folder holding only the Finder's .DS_Store and/or .localized counts as empty; those files are left", async () => {
+    for (const names of [[".DS_Store"], [".localized"], [".DS_Store", ".localized"]]) {
+      const dir = join(tmp, `Finder-${names.join("+")}`);
+      await mkdir(dir, { recursive: true });
+      for (const n of names) await writeFile(join(dir, n), `finder ${n}`);
+      const lib = await createLibrary(dir, "X", mkDeps());
+      await lib.close();
+      for (const n of names) expect(await readFile(join(dir, n), "utf8")).toBe(`finder ${n}`);
+      await (await openLibrary(dir, mkDeps())).close();
+    }
+  });
+
+  it("FR-047: anything else still refuses — another hidden file, a folder or a link of that name, or one more entry", async () => {
+    const cases: Array<[string, (dir: string) => Promise<void>]> = [
+      ["other hidden file", (d) => writeFile(join(d, ".hidden"), "x")],
+      ["folder named .DS_Store", (d) => mkdir(join(d, ".DS_Store"))],
+      ["folder named .localized", (d) => mkdir(join(d, ".localized"))],
+      ["link named .DS_Store", (d) => symlink(join(tmp, "elsewhere.txt"), join(d, ".DS_Store"))],
+      ["DS_Store and a file", async (d) => {
+        await writeFile(join(d, ".DS_Store"), "x");
+        await writeFile(join(d, "notes.txt"), "x");
+      }],
+      ["case variant", (d) => writeFile(join(d, ".ds_store"), "x")],
+    ];
+    await writeFile(join(tmp, "elsewhere.txt"), "x");
+    for (const [what, make] of cases) {
+      const dir = join(tmp, `NotEmpty-${what.replaceAll(" ", "-")}`);
+      await mkdir(dir, { recursive: true });
+      await make(dir);
+      await expect(createLibrary(dir, "X", mkDeps()), what).rejects.toBeInstanceOf(FolderNotEmptyError);
+      expect(await readdir(dir), what).not.toContain("library.json");
+    }
   });
 
   it("NotALibraryError without library.json", async () => {
