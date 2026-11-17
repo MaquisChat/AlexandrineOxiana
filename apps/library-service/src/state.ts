@@ -208,8 +208,9 @@ export interface PendingMove {
 export const MOVE_TOKEN_TTL_MS = 15 * 60_000;
 /**
  * The last move that stopped with an error, for the screen that lost its connection to it (R379):
- * kept for MOVE_TOKEN_TTL_MS or until the next move starts. `attempt` is the screen's own id for
- * the request, so an earlier failure is never taken for this one; the message is scrubbed.
+ * kept for MOVE_TOKEN_TTL_MS or until a later move finishes or fails (a refused request without an
+ * attempt of its own never erases it, R399 c). `attempt` is the screen's own id for the request, so
+ * an earlier failure is never taken for this one; the message is scrubbed.
  */
 export interface FailedMove {
   newRoot: string;
@@ -278,6 +279,11 @@ export class ServiceState {
   private moveFailure: FailedMove | undefined;
   /** A library move is running: every change is refused (503 MOVE_IN_PROGRESS), background work waits (R102 N2). */
   moving = false;
+  /**
+   * Move requests asked for (marked in the move route's own onRequest hook) and not yet ended or
+   * refused: move/status says `running` from the earliest point of the request (R399 b).
+   */
+  movesAsked = 0;
   /** Shutdown has started: no library may be opened or adopted any more (R101 M7). */
   shuttingDown = false;
 

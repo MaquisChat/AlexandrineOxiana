@@ -37,6 +37,7 @@ import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
 import { shredSeams } from "../../../packages/library/src/fs/shred.js";
 import { seams as repoSeams } from "../../../packages/library/src/repo/seams.js";
 import * as authModule from "./auth.js";
+import { ApiError } from "./errors.js";
 import { CREDENTIAL_QUERY_KEYS, IN_LIBRARY_TEXT } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
@@ -2767,6 +2768,52 @@ describe("move/status says what is true after a lost connection (R379, FR-A19)",
     fail = false;
     expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-3" } })).body).toContain('"done":true');
     expect((await call({ url: "/libraries/move/status" })).json.failed).toBeNull();
+  });
+
+  it("a status asked in the same tick as the move request already says running (R399 b)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await start({ beforeExecuteMove: async () => gate });
+    await openNewLibrary();
+    await newProject();
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "a-1" } });
+    const st = call({ url: "/libraries/move/status" });
+    try {
+      expect((await st).json).toMatchObject({ pending: null, running: true });
+    } finally {
+      release();
+    }
+    expect((await moving).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json.running).toBe(false);
+  });
+
+  it("a move refused after it was asked for (background work that could not be paused) keeps its reason under its attempt (R399 c)", async () => {
+    let fail = true;
+    await start({
+      beforeExecuteMove: async () => {
+        if (fail) throw new Error("the copy failed");
+      },
+    });
+    await openNewLibrary();
+    await newProject();
+    const dest = join(tmp, "Moved");
+    // An earlier failure, kept.
+    await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-1" } });
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toMatchObject({ attempt: "a-1" });
+    // A request refused with no attempt of its own does not erase it.
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: 7 } })).status).toBe(400);
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, failed: { attempt: "a-1" } });
+    // Background work that could not be paused: the 409 before the stream, kept with its reason.
+    fail = false;
+    const quiesce = svc.state.quiesce.bind(svc.state);
+    svc.state.quiesce = async () => {
+      throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
+    };
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-2" } });
+    expect(r.status).toBe(409);
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st).toMatchObject({ running: false, pending: null, failed: { newRoot: dest, attempt: "a-2", error: { code: "CONFLICT", message: expect.stringMatching(/^Some background work could not be paused/) } } });
+    svc.state.quiesce = quiesce;
   });
 
   it("an attempt that is not a short plain string is refused before anything starts", async () => {
