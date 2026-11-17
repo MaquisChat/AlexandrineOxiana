@@ -87,7 +87,7 @@ import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find
 import type { FindEntry } from "../find/types.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
 import { RepoCore, loadProjects, type ProjectState, type RepoOptions } from "./state.js";
-import { loadPseudonyms } from "./pseudonyms.js";
+import { loadPseudonyms, participantCodeOf } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
@@ -1255,16 +1255,19 @@ export function updateSourceRechecked(
 }
 
 /**
- * Package-internal (profile capture): the participant code the project's pseudonym map gives one
- * of `names` (compared case-insensitively), if any. Needs the unlocked project key.
+ * Package-internal (profile capture): the participant code the project's pseudonym map gives the
+ * first of `names` that names one, by the SAME identity look-up as `assignCodes` (`participantCodeOf`:
+ * as written, then the strict key; R427 a), if any. Needs the unlocked project key.
  */
 export async function pseudonymCodeFor(repo: Repo, projectId: string, names: string[]): Promise<string | undefined> {
   const core = cores.get(repo)!;
   const st = core.state(projectId);
   if (!core.encrypted(st)) return undefined;
   const map = await loadPseudonyms(core, st);
-  const wanted = new Set(names.filter(Boolean).map((n) => n.normalize("NFC").toLowerCase()));
-  for (const [k, code] of map) if (wanted.has(k.normalize("NFC").toLowerCase())) return code;
+  for (const n of names) {
+    const code = n?.trim() ? participantCodeOf(map, n) : undefined;
+    if (code) return code;
+  }
   return undefined;
 }
 

@@ -111,6 +111,8 @@ export function identityKey(s: string): string {
     .trim()
     .replace(/(.) (?=(.))/gsu, (m, a: string, b: string) => (joinsStrict(a, b) ? a : m));
 }
+/** A name as written, for the first comparison of R427 a: NFC, the ends trimmed. */
+const asWritten = (s: string): string => s.normalize("NFC").trim();
 /** The strict words of a name (NFKC, lowercase, invisible characters removed; accents kept), aligned with `words`. */
 const strictWords = (s: string): string[] =>
   s.normalize("NFKC").toLowerCase().replace(IGNORABLE, "").split(/[^\p{L}\p{N}\p{M}]+/u).filter(Boolean);
@@ -128,6 +130,8 @@ export interface NameForm {
   strict?: string;
   /** R416: the strict key of the name as written (the form as written only). */
   full?: string;
+  /** R427 a: the name as written, NFC, ends trimmed (the form as written only). */
+  written?: string;
   /** A run of some of a longer name's words (R387 e): a part, not the whole name (R420 a). */
   part?: boolean;
 }
@@ -141,10 +145,12 @@ const LATIN_FLOOR = 4;
  * `ws` in every rotation and reversed, each order also with its words joined. `ss`: the same words'
  * strict forms (R416), permuted alike; left out when they do not line up with `ws`.
  */
-function ordersOf(ws: readonly string[], code: string, bare: boolean, variant: boolean, join = true, ss?: readonly string[], full?: string): NameForm[] {
+function ordersOf(ws: readonly string[], code: string, bare: boolean, variant: boolean, join = true, ss?: readonly string[], full?: string, written?: string): NameForm[] {
   const st = (o: readonly number[]) => (ss ? { strict: o.map((k) => ss[k]!).join("") } : {});
   const idx = ws.map((_, k) => k);
-  const out: NameForm[] = [{ words: [...ws], code, bare, ...(variant ? { variant } : {}), ...st(idx), ...(full !== undefined ? { full } : {}) }];
+  const out: NameForm[] = [
+    { words: [...ws], code, bare, ...(variant ? { variant } : {}), ...st(idx), ...(full !== undefined ? { full } : {}), ...(written !== undefined ? { written } : {}) },
+  ];
   if (ws.length === 1) return out;
   const orders: number[][] = [idx];
   for (let k = 1; k < ws.length; k++) orders.push([...idx.slice(k), ...idx.slice(0, k)]);
@@ -178,7 +184,7 @@ export function nameForms(name: string | CreatorName, code: string, bare = false
   // The strict words, for choosing among names that fold alike (R416); unused if they do not line up.
   const sw = strictWords(name);
   const ss = sw.length === ws.length ? sw : undefined;
-  const out = ordersOf(ws, code, bare, false, true, ss, identityKey(name));
+  const out = ordersOf(ws, code, bare, false, true, ss, identityKey(name), asWritten(name));
   // A Hangul name written together is the same name written apart at any syllable (R387 M6:
   // "김민수" = "김 민수" = "민수 김").
   if (ws.length === 1 && !bare && ALL_HANGUL.test(ws[0]!)) {
@@ -371,11 +377,12 @@ function tokenize(text: string, splitDigits: boolean): Token[] {
   return tokens;
 }
 
-/** A participant a pattern may stand for (R416): its code and its form's strict letters and key. */
+/** A participant a pattern may stand for (R416): its code, its form's strict letters and key, its name as written (R427 a). */
 interface Candidate {
   code: string;
   strict?: string;
   full?: string;
+  written?: string;
 }
 
 interface Pattern {
@@ -436,11 +443,16 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
     const us = ws.flatMap((w) => units(w, split));
     if (us.length === 0) return;
     const key = us.join("\u0000");
-    const cand: Candidate = { code, ...(f.strict !== undefined ? { strict: f.strict } : {}), ...(f.full !== undefined ? { full: f.full } : {}) };
+    const cand: Candidate = {
+      code,
+      ...(f.strict !== undefined ? { strict: f.strict } : {}),
+      ...(f.full !== undefined ? { full: f.full } : {}),
+      ...(f.written !== undefined ? { written: f.written } : {}),
+    };
     const had = seen.get(key);
     if (had) {
       // Another form that folds alike (R416): kept as a candidate, chosen at the match.
-      if (!had.cands.some((c) => c.code === code && c.strict === cand.strict && c.full === cand.full)) {
+      if (!had.cands.some((c) => c.code === code && c.strict === cand.strict && c.full === cand.full && c.written === cand.written)) {
         had.cands.push(cand);
         if (code !== had.code) had.mixed = true;
       }
@@ -479,14 +491,19 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
 }
 
 /**
- * R416: of the participants whose forms fold to the matched span, the one whose name is exactly what
- * the text says by the strict key: the name as written (with an "@" in front, as the span takes it)
- * first, then a form's strict words in its order (a rotation "Pena, Ana"); when none is exact, the
- * first candidate (the folded match, by the map's order, as before).
+ * R416, R427 a: of the participants whose forms fold to the matched span, the one whose name is
+ * exactly what the text says: first a name equal to the span AS WRITTEN (NFC; with an "@" in front,
+ * as the span takes it: "Ana  Peña" is not "Ana Peña" here, when an older library holds both); then
+ * by the strict key, the name as written, then a form's strict words in its order (a rotation "Pena,
+ * Ana"); when none is exact, the first candidate (the folded match, by the map's order, as before).
  */
 function exactCode(text: string, p: Pattern, start: number, end: number): string {
   const span = text.slice(start, end);
-  const full = identityKey((start > 0 && text[start - 1] === "@" ? "@" : "") + span);
+  const at = start > 0 && text[start - 1] === "@" ? "@" : "";
+  const written = asWritten(at + span);
+  const byWritten = p.cands.find((c) => c.written !== undefined && c.written === written);
+  if (byWritten) return byWritten.code;
+  const full = identityKey(at + span);
   const byFull = p.cands.find((c) => c.full !== undefined && c.full === full);
   if (byFull) return byFull.code;
   const letters = strictLetters(span);
@@ -612,6 +629,7 @@ interface MapCache {
   indexes: Map<string, Index>;
   keys?: Map<string, string>;
   strictKeys?: Map<string, string>;
+  writtenKeys?: Map<string, string>;
 }
 const mapCache = new WeakMap<ReadonlyMap<string, string>, MapCache>();
 function cacheOf(map: ReadonlyMap<string, string>): MapCache {
@@ -648,20 +666,25 @@ export function mapKeys(map: ReadonlyMap<string, string>): ReadonlyMap<string, s
 }
 
 /**
- * The code of the map entry `text` names (R416): the entry whose STRICT key (`identityKey`) is the
- * text's, else the first entry whose folded name (`normName`) is the text's, as before. Both key
- * maps are built once per map.
+ * The code of the map entry `text` names (R427 a, the more exact match wins): the entry equal to the
+ * text AS WRITTEN (NFC, ends trimmed); else the first whose STRICT key (`identityKey`, R416) is the
+ * text's; else the first whose folded name (`normName`) is the text's. An older library may hold two
+ * entries the strict key makes equal ("김 민수", "김민수"): each keeps its own code. The key maps are
+ * built once per map.
  */
 export function mapCode(map: ReadonlyMap<string, string>, text: string): string | undefined {
   const c = cacheOf(map);
-  if (!c.strictKeys) {
+  if (!c.strictKeys || !c.writtenKeys) {
     c.strictKeys = new Map();
+    c.writtenKeys = new Map();
     for (const [k, code] of c.entries) {
+      const w = asWritten(k);
+      if (w && !c.writtenKeys.has(w)) c.writtenKeys.set(w, code);
       const n = identityKey(k);
       if (n && !c.strictKeys.has(n)) c.strictKeys.set(n, code);
     }
   }
-  return c.strictKeys.get(identityKey(text)) ?? mapKeys(map).get(normName(text));
+  return c.writtenKeys.get(asWritten(text)) ?? c.strictKeys.get(identityKey(text)) ?? mapKeys(map).get(normName(text));
 }
 
 function indexesOf(names: Names, opts: ScrubOptions): Index[] {

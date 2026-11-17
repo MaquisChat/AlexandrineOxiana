@@ -967,6 +967,35 @@ describe("R420 (a): a participant's WHOLE name inside the name of a creator who 
   });
 });
 
+describe("R427 (a): the more exact match wins (I1 of the FR-A10 third review)", () => {
+  // Two records an older library may hold, whose names the strict key now makes equal:
+  // [the spelling coded P-001, the spelling coded P-002, a spelling equal to neither as written but
+  // to both by the strict key, a title naming P-001 as written, the same naming P-002 as written].
+  const pairs: Array<[string, string, string, string, string]> = [
+    ["김 민수", "김민수", "김 민 수", "김 민수의 인터뷰", "김민수의 인터뷰"],
+    ["Ana  Peña", "Ana Peña", "ANA PEÑA", "Entrevista a Ana  Peña", "Entrevista a Ana Peña"],
+    ["ＡＮＡ", "ana", "Ana", "ＡＮＡ habla", "ana habla"],
+  ];
+  const cite = (t: string, literal: string, map: ReadonlyMap<string, string>) =>
+    toCslItem(source("interview", mt(["und", "original", t]), [{ role: "interviewee", literal }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: map });
+
+  it.each(pairs)("%j (P-001) and %j (P-002): each spelling as written gives its own code, author and title alike, in either map order", (a, b, _s, ta, tb) => {
+    for (const map of [new Map([[a, "P-001"], [b, "P-002"]]), new Map([[b, "P-002"], [a, "P-001"]])]) {
+      const byB = cite(tb, b, map);
+      expect(byB.author).toEqual([{ literal: "P-002" }]);
+      expect(byB.title).toBe(tb.replace(b, "P-002"));
+      const byA = cite(ta, a, map);
+      expect(byA.author).toEqual([{ literal: "P-001" }]);
+      expect(byA.title).toBe(ta.replace(a, "P-001"));
+    }
+  });
+
+  it.each(pairs)("%j / %j: a spelling equal to neither as written but to both by the strict key takes the map's first", (a, b, s) => {
+    expect(cite("x", s, new Map([[a, "P-001"], [b, "P-002"]])).author).toEqual([{ literal: "P-001" }]);
+    expect(cite("x", s, new Map([[b, "P-002"], [a, "P-001"]])).author).toEqual([{ literal: "P-002" }]);
+  });
+});
+
 describe("R387 (b): one function makes a name's forms (I1 of the FR-A10 review)", () => {
   const title = (t: string, map: ReadonlyMap<string, string>) =>
     toCslItem(source("article-journal", mt(["ja", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;

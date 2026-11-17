@@ -87,6 +87,23 @@ export function nextParticipantCode(participants: Participant[], taken: Iterable
 // deciding WHO a person is (Hương and Hường, Peña and Pena, ハナコ and バナコ are different people).
 
 /**
+ * The code of the existing participant `key` names (R403 b, R427 a), the ONE identity look-up for
+ * `assignCodes` and the profile capture (`pseudonymCodeFor`): the map entry equal to `key` AS
+ * WRITTEN (NFC, ends trimmed) first; else the first equal by the strict key (`identityKey`). An older
+ * library may hold two entries the strict key makes equal ("김 민수" P-001, "김민수" P-002: it compared
+ * by lower case only): each spelling keeps its own record. Never the folded key: that is for
+ * replacing names, not for deciding who a person is.
+ */
+export function participantCodeOf(map: ReadonlyMap<string, string>, key: string): string | undefined {
+  const w = key.normalize("NFC").trim();
+  for (const [k, code] of map) if (k.normalize("NFC").trim() === w) return code;
+  const n = identityKey(key);
+  // A key that is nothing but invisible characters and spaces is compared as written (lowercased).
+  for (const [k, code] of map) if (n ? identityKey(k) === n : k.toLowerCase() === key.toLowerCase()) return code;
+  return undefined;
+}
+
+/**
  * Ensures every creator has a code, creating a (detail-less) participant for
  * each new person. Returns the codes of `creators` in order and whether the
  * map or the project data changed.
@@ -100,13 +117,9 @@ export function assignCodes(
   let changed = false;
   const codes: Array<string | undefined> = [];
   const participantIds: string[] = [];
-  // An existing participant is found by the strict identity key (R403 b): "LUCIA FERNANDEZ" is the
-  // "Lucia Fernandez" already coded; "Lucia Fernandez" is not "Lucía Fernández".
-  const lookup = (key: string) => {
-    const n = identityKey(key);
-    // A key that is nothing but invisible characters and spaces is compared as written (lowercased).
-    return [...map.entries()].find(([k]) => (n ? identityKey(k) === n : k.toLowerCase() === key.toLowerCase()))?.[1];
-  };
+  // An existing participant is found as written, else by the strict identity key (R403 b, R427 a):
+  // "LUCIA FERNANDEZ" is the "Lucia Fernandez" already coded; "Lucia Fernandez" is not "Lucía Fernández".
+  const lookup = (key: string) => participantCodeOf(map, key);
   for (const c of creators) {
     // The interviewer is the researcher, not a research participant.
     const key = c.role === "interviewer" ? undefined : creatorKey(c);
