@@ -1010,6 +1010,50 @@ async function* scanWeb(
   let groupLinked = 0;
   const work = join(await ctx.workDir(), "zotero-web");
   await fsp.mkdir(work, { recursive: true, mode: 0o700 });
+  // Gone from Zotero: only items known here (an item never imported is neither content nor gone), and
+  // only after every page was read (a failure has returned above). Decided here, before the items, from what the
+  // listing read (nothing the items below fetch changes it), so that the total below counts them (R392).
+  const gone = new Map<string, { gone: "deleted" | "bin"; version: string }>();
+  /** A full run not finished for lack of a whole key list (A7): said once in the run's notes. */
+  let notConfirmed = false;
+  for (const t of tree.trashed.values()) if (!tree.parentOf(t) && knownHere.has(t.key)) gone.set(t.key, { gone: "bin", version: `bin:${t.version}` });
+  /** Top-level items known here that Zotero says it deleted (the note counts these, A5). */
+  let deletedHere = 0;
+  if (since !== undefined) {
+    // Incremental: only what Zotero said. Keys of items known here (child keys never are: they are counted only).
+    for (const k of deletedKeys) {
+      if (!knownHere.has(k) || tree.has(k)) continue;
+      deletedHere++;
+      gone.set(k, { gone: "deleted", version: "deleted" });
+    }
+  } else if (!api.lossy) {
+    // Full: absence alone never makes an item gone (A5). A known item not seen is gone only when its key is
+    // also missing from the library's complete key list, whole by its own evidence (A6), taken before the
+    // downloads at the scan's version (A7).
+    const unseen = [...knownHere].filter((k) => !tree.has(k));
+    if (unseen.length) {
+      if (keyListAsked && keyList) {
+        for (const k of unseen) if (!keyList.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
+      } else {
+        // No whole key list: this full run is not finished (A6). Nobody is gone by absence and the version is not
+        // recorded, so the next run is full again and makes the check again; the run says so (A7).
+        api.lossy = true;
+        notConfirmed = keyListAsked;
+      }
+    }
+  }
+  for (const k of [...gone.keys()]) if (skip(`zotero:${k}`)) gone.delete(k);
+
+  // R392: every page is read, so the number of items this scan will yield is known before the first: the top-level
+  // items below (children, notes, annotations and what the engine passes by left out) and the gone ones. An item
+  // found empty below (known only once its files are looked at) lowers it when it is passed by.
+  let told = gone.size;
+  for (const it of tree.byKey.values()) {
+    if (tree.parentOf(it) || (tops && !tops.has(it.key)) || skip(`zotero:${it.key}`)) continue;
+    const type = str(it.data.itemType);
+    if (type !== "note" && type !== "annotation") told++;
+  }
+  ctx.total?.(told);
 
   try {
     for (const it of tree.byKey.values()) {
@@ -1130,7 +1174,10 @@ async function* scanWeb(
       const attached = new Set(files.map((f) => f.path));
       const annotations = anns.map((a) => (a.file && !attached.has(a.file) ? (({ file: _f, anchor: _a, ...rest }) => rest)(a) : a));
       const hasParts = Object.keys(parts).length > 0;
-      if (!fields.title && !files.length && !annotations.length && !fileNotes.length && !hasParts && !(isAtt && ctx.dryRun)) continue;
+      if (!fields.title && !files.length && !annotations.length && !fileNotes.length && !hasParts && !(isAtt && ctx.dryRun)) {
+        ctx.total?.(--told); // an empty item: not one after all
+        continue;
+      }
 
       const tagColors: Record<string, string> = {};
       for (const t of fields.tags ?? []) {
@@ -1175,38 +1222,6 @@ async function* scanWeb(
     return;
   }
 
-  // Gone from Zotero: only items known here (an item never imported is neither content nor gone), and
-  // only after every page was read (a failure has returned above).
-  const gone = new Map<string, { gone: "deleted" | "bin"; version: string }>();
-  /** A full run not finished for lack of a whole key list (A7): said once in the run's notes. */
-  let notConfirmed = false;
-  for (const t of tree.trashed.values()) if (!tree.parentOf(t) && knownHere.has(t.key)) gone.set(t.key, { gone: "bin", version: `bin:${t.version}` });
-  /** Top-level items known here that Zotero says it deleted (the note counts these, A5). */
-  let deletedHere = 0;
-  if (since !== undefined) {
-    // Incremental: only what Zotero said. Keys of items known here (child keys never are: they are counted only).
-    for (const k of deletedKeys) {
-      if (!knownHere.has(k) || tree.has(k)) continue;
-      deletedHere++;
-      gone.set(k, { gone: "deleted", version: "deleted" });
-    }
-  } else if (!api.lossy) {
-    // Full: absence alone never makes an item gone (A5). A known item not seen is gone only when its key is
-    // also missing from the library's complete key list, whole by its own evidence (A6), taken before the
-    // downloads at the scan's version (A7).
-    const unseen = [...knownHere].filter((k) => !tree.has(k));
-    if (unseen.length) {
-      if (keyListAsked && keyList) {
-        for (const k of unseen) if (!keyList.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
-      } else {
-        // No whole key list: this full run is not finished (A6). Nobody is gone by absence and the version is not
-        // recorded, so the next run is full again and makes the check again; the run says so (A7).
-        api.lossy = true;
-        notConfirmed = keyListAsked;
-      }
-    }
-  }
-  for (const k of [...gone.keys()]) if (skip(`zotero:${k}`)) gone.delete(k);
   if (gone.size) {
     // The key must still read this library now: a key revoked half-way yields no gone item.
     try {

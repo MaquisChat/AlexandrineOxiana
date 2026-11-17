@@ -1729,6 +1729,27 @@ processing:
 
   const batchJson = (p: Project, n: number) => join(lib.root, p.folder, "imports", `batch-${String(n).padStart(4, "0")}`, "batch.json");
 
+  it("FR-A21 (R392): a Web import's progress carries the stand-in's real total, the dry run's items, and a sync the changed items'", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three"]) await addWithFile(t);
+    z.addItem(U, { itemType: "note", note: "<p>standalone, not an item here</p>" });
+    const dry = await createBulkImport(deps()).dryRun(p.id, zoteroWebAdapter(web()));
+    expect(dry.items).toBe(3);
+    const totals = async (h: Awaited<ReturnType<typeof startZoteroWebImport>>) => {
+      const seen: Array<number | undefined> = [];
+      for await (const e of h.progress) if (e.done > 0) seen.push(e.total);
+      await h.done;
+      return seen;
+    };
+    const first = await totals(await startZoteroWebImport(deps(), p.id, web()));
+    expect(first.length).toBeGreaterThan(0);
+    expect(first.every((t) => t === 3)).toBe(true);
+    for (const t of ["Four", "Five"]) await addWithFile(t);
+    const sync = await totals(await startZoteroWebImport(deps(), p.id, web()));
+    expect(sync.length).toBeGreaterThan(0);
+    expect(sync.every((t) => t === 2)).toBe(true);
+  });
+
   it("a resumed Web batch asks since its recorded version and records the new one", async () => {
     const { p, batchId, v1, journaled } = await cancelledIncremental();
     const rec = JSON.parse(await readFile(batchJson(p, 2), "utf8"));
