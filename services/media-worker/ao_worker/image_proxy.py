@@ -141,6 +141,10 @@ def run(job: Job, ctx: JobContext) -> dict:
         tmp = out.with_name(f".{out.name}.{os.getpid()}.part")
         try:
             extra = {"icc_profile": icc} if icc else {}
+            # Pillow's JPEG writer falls back to `im.info` for comment, dpi, jfif, adobe, photoshop, xmp ...
+            # (copied from the source by exif_transpose/convert). Empty it so that only the EXIF built above
+            # and the colour profile passed here (kept on purpose, R379) reach the proxy.
+            img.info.clear()
             img.save(tmp, "JPEG", quality=int(p["quality"]), exif=new_exif.tobytes(), optimize=True, **extra)
             os.replace(tmp, out)
         finally:
