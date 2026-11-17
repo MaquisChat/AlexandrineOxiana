@@ -1,5 +1,7 @@
 # The final review — what I need from you
 
+*Updated 17 November 2026: part 6, at the end, is new — four more decisions (22–25) after the last review of the whole branch.*
+
 *15 November 2026. How to answer: reply in the chat with the numbers of part 2 (for example "1: no author; 4: 12 characters; 13: keep the check") and a yes or no to part 3. The checklist of part 4 needs a new Mac build and can wait for it.*
 
 ## 1. Where things stand
@@ -255,5 +257,49 @@ These are small flaws a researcher could meet but that lose nothing important: w
 - Then comes a last review of the whole working branch, package by package, against the project's rules.
 - Nothing is merged into the approved version (`main`) without your word.
 - A Mac build can be requested once GitHub's runs are available again (the repository made public, or its billing settled).
+
+## 6. Added on 17 November: the last review of the whole branch
+
+**Where things stand now.** The seven problems of part 1 are fixed, re-reviewed, tested together and merged on the working branch (eight pieces of work; 7,986 unit tests, 222 browser scenarios and 10 desktop scenarios passed). A ninth small fix is being tested: some older confirmation boxes (delete a participant, revoke a pairing, stop watching a folder, and a few more) could be confirmed by holding the Enter key on the button that opens them.
+
+**Then seven independent reviewers each read one part of the whole program, as it stands, looking for anything the task-by-task reviews missed.** Much held up under attack: who may call the service, the desktop shell, the browser extension, secrets, backups and restores. But they found **3 critical and 18 important problems**. The most serious, in plain words:
+
+- **A participant's name could still appear where a code should.** Names written in Chinese, Japanese or Thai, names typed without their accents, and names in reversed order ("Lopez, Maria") were not always replaced by the participant's code in a title, a web address or a folder's name; and the BibTeX, RIS and CSL-JSON exports did not apply the rule at all.
+- **A recording's file name could be sent to an online service.** When a file is imported, the app tries to identify it; for a file named like "Author Year Title" it sent that title and author to OpenAlex as a search. For a paper that is harmless. For a recording named "Gonzalez 2024 Interview about her eviction.m4a" it sends a participant's name and circumstances to a third party — and it happened under the default rules.
+- **In an encrypted project, locking the project at the very moment a change was being saved** could save that change's history line under an empty key, readable by anyone holding the folder.
+- **A reference export could be told to write over a file inside the library**, even an original.
+- Others: a photo's free-text comment survived into the copies made with the location removed; the certificate of a destruction did not mention an old copy of the library left behind by a move; rules the app cannot read looked normal on the Rules screen; "Move library" could say "Nothing was copied or changed" when the move was in fact running; on the Fieldwork screen a doubled press could create a second consent record that can never be deleted; and a few more.
+
+All are confirmed by a test that shows the problem. **The four most serious are being fixed now.** Nothing here has reached the approved version (`main`).
+
+### Four more decisions
+
+22. **Looking titles up online**
+   **What it is:** To stop the leak above, the fix makes the app stricter: for audio, video and photos it never searches online by title; and in a project that says it holds identifiable data (which is the default for a new project) it no longer searches by title for documents either. Look-ups by an identifier found in the file (DOI, ISBN) continue. The cost: in such a project, a paper with no DOI in it is no longer recognised from its title; you fill in or confirm its details yourself.
+   **Your options:** (a) Leave it strict. (b) Add a tick box at each import: "These are published works: look their titles up online", off unless you tick it. (c) Make it a setting of the project.
+   **My recommendation:** (b): you decide per import, knowing what the files are.
+   <sub>(FR-643)</sub>
+
+23. **Two switches on the Rules screen that change nothing**
+   **What it is:** "Every source records its consent status" and "Keep an append-only, hash-chained audit log" are shown as switches, but the app does both always, whatever the switch says. Nothing unsafe follows, but unticking the second suggests the log stops, which it does not.
+   **Your options:** (a) Show both as fixed facts ("always on"). (b) Give the first one teeth: refuse to store an identifiable source whose consent status is "unknown".
+   **My recommendation:** (a) now; (b) only if your ethics board expects it.
+   <sub>(FR-634, FR-635)</sub>
+
+24. **What the open-format export holds**
+   **What it is:** The export of a whole project in open formats names its folders by participant codes, but the records inside (each source's data file and its readable page) hold the real names: the export is your own data, complete. After the fix its reference lists (BibTeX and CSL-JSON) will use codes.
+   **Your options:** (a) Leave it so and say it plainly in the export's own read-me and in the guide. (b) Plan a separate de-identified export for sharing with others (new work, for later).
+   **My recommendation:** (a) now; (b) as a later feature if you share exports.
+   <sub>(FR-649)</sub>
+
+25. **The size of this last round**
+   **What it is:** Fixing the 3 critical and 18 important findings is about eleven pieces of work, each built, re-reviewed and tested like the earlier ones — clearly more than the single extra fix I expected. The four most serious are under way.
+   **Your options:** (a) Carry on with the other seven at the same pace. (b) Finish the four, then stop and wait for you.
+   **My recommendation:** (a). They are all problems a researcher or a participant could meet.
+   <sub>(Rulings R378, R379)</sub>
+
+**One more thing only a Mac build can settle:** the helper program for audio, video and text recognition is built from Python packages whose exact versions are not all fixed. They will be fixed, with checksums, when the first Mac build can run (it cannot be proved without one). <sub>(FR-650)</sub>
+
+**For your checklist (part 4):** open "Stop watching" and "Delete participant" with the keyboard and see that the box's title is highlighted when it opens. <sub>(FR-633)</sub>
 
 <!-- coverage: FR-591, FR-138, FR-238, FR-197, FR-198, FR-199, FR-369, FR-403, FR-171, FR-356, FR-372, FR-388, FR-575, FR-595, FR-436, FR-506, FR-520, FR-511, FR-522, FR-532, FR-536, FR-551, FR-458, FR-568, FR-607, FR-609, FR-610, FR-446, FR-447, FR-299, FR-326, FR-288, FR-324, FR-289, FR-320, FR-543, FR-236, FR-343, FR-272, FR-334, FR-344, FR-345, FR-346, FR-347, FR-302, FR-310, FR-323, FR-237, FR-353, FR-354, FR-437, FR-455, FR-471, FR-438, FR-439, FR-441, FR-448, FR-479, FR-481, FR-487, FR-444, FR-450, FR-470, FR-480, FR-501, FR-516, FR-608, FR-478, FR-502, FR-505, FR-482, FR-483, FR-492, FR-533, FR-538, FR-541, FR-559, FR-589, FR-590, FR-535, FR-569, FR-585, FR-597 (plus FR-053 from the problems list, in decision 2). FR-543 is a test-set-up choice of the coordinator's and is not on the page. -->
