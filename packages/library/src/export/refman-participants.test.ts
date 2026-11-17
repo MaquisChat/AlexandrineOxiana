@@ -53,8 +53,8 @@ describe("R379 (FR-A14, I2): R88's participant rules reach the reference exports
       expect(r.text, format).toContain("P-001");
       expect(r.text.toLowerCase(), format).not.toContain("maria");
       expect(r.text.toLowerCase(), format).not.toContain("mariacocina2026");
-      // The withheld key is replaced by one the writer makes, holding no name.
-      expect(r.text, format).toContain("ref1");
+      // The withheld key is replaced by one the writer makes from the source's id, holding no name (R390 e, M1).
+      expect(r.text, format).toContain(`ref-${post.slice(-8)}`);
       expect(r.text, format).toContain("adams2001published");
       expect(r.text, format).toContain("Adams");
     }
@@ -300,5 +300,30 @@ describe("R390 (d): a source involving a participant in a project that keeps no 
     const open = await exportProjectOpenFormats(kit.repo, p.id, dest);
     expect(open.notes.join(" ")).toMatch(/2 sources are not in sources\.bib and sources\.csl\.json because they involve a participant and this project keeps no list of participants' names/u);
     expect(open.notes.join(" ")).not.toContain("no participant code");
+  });
+});
+
+describe("R390 (e): a coded source's plain key is made from its own id; a note says names were replaced by codes", () => {
+  it("M1: the key is ref- and eight characters of the source's id, the same from one export to the next and whatever else is exported", async () => {
+    const { p, post, repost, video } = await r390Project();
+    const keyOf = (text: string, id: string) => JSON.parse(text).find((o: { id: string }) => o.id.startsWith("ref-") && o.id.includes(id.slice(-8)))?.id as string | undefined;
+    const all = await exportRefman(kit.repo, p.id, [post, repost, video], "csl-json");
+    const alone = await exportRefman(kit.repo, p.id, [video], "csl-json");
+    for (const id of [post, repost, video]) expect(keyOf(all.text, id)).toBe(`ref-${id.slice(-8).toLowerCase()}`);
+    expect(keyOf(alone.text, video)).toBe(`ref-${video.slice(-8).toLowerCase()}`);
+    // The note that a key was withheld stays.
+    expect(all.notes.join(" ")).toMatch(/citation keys were not exported because the source involves a participant \(a key is often made from a name\); a plain key was used instead\./u);
+  });
+
+  it("M3: when any source was coded or scrubbed, the notes say so, exactly; an export the rules do not touch has no such note", async () => {
+    const { p, post, repost, video, book } = await r390Project();
+    const lee = (await addSource(kit, p, { type: "book", title: "Other", creators: [{ family: "Lee", given: "Ann", role: "author" }], citationKey: "lee" })).source.id;
+    // The book's only change is its withheld key (its own note): no name in it was replaced by a code.
+    const many = await exportRefman(kit.repo, p.id, [post, repost, video, book, lee], "bibtex");
+    expect(many.notes).toContain("In 3 sources participants' names were replaced by their codes.");
+    const one = await exportRefman(kit.repo, p.id, [repost, lee], "ris");
+    expect(one.notes).toContain("In 1 source participants' names were replaced by their codes.");
+    const none = await exportRefman(kit.repo, p.id, [lee], "ris");
+    expect(none.notes.join(" ")).not.toContain("replaced by their codes");
   });
 });

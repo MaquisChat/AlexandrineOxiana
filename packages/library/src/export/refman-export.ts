@@ -20,9 +20,11 @@
  * bibliographic field scrubbed (the source's own container and publisher kept, not a platform's name); creators coded
  * as `toCslItem` codes them, in their order and roles; the address and the identifiers withheld when they name a
  * participant. Where the rules touch a source (it is linked to participants, a creator is coded, any of its text
- * changes, or its own key names a participant), its citation key is withheld: the writer makes its own, holding no
- * name. A source that fails closed (a participant without a code where codes are required) is left out, named by its
- * id in `excluded` and counted in a note. A source the rules do not touch is written exactly as before.
+ * changes, or its own key names a participant), its citation key is withheld: the writer makes its own from the
+ * source's id (`ref-` and eight characters of it), holding no name and the same in every export; a note says when
+ * names were replaced by codes. A source that fails closed (a participant without a code where codes are required, or
+ * any participant where the project keeps no list of names) is left out, named by its id in `excluded` and counted in
+ * a note. A source the rules do not touch is written exactly as before.
  *
  * Exported: type, title, creators (author / editor / translator), date, container, publisher,
  * DOI, ISBN, ISSN, URL, arXiv id (BibTeX), the citation key, and tags only with `includeTags`; and
@@ -89,6 +91,7 @@ const EXPORT_NOTES = {
     `${plural(n, "source was", "sources were")} left out because a participant in ${n === 1 ? "it has" : "them has"} no participant code yet.`,
   noList: (n: number) =>
     `${plural(n, "source was", "sources were")} left out because ${n === 1 ? "it involves" : "they involve"} a participant and this project keeps no list of participants' names (it is not encrypted), so the app cannot tell which names to replace. Cite them by hand, or keep such sources in an encrypted project.`,
+  namesReplaced: (n: number) => `In ${plural(n, "source", "sources")} participants' names were replaced by their codes.`,
   keyWithheld: (n: number) =>
     `${plural(n, "citation key was", "citation keys were")} not exported because the source involves a participant (a key is often made from a name); a plain key was used instead.`,
 };
@@ -351,11 +354,12 @@ function scrubbedRef(ref: Omit<Ref, "key">, rule: ReturnType<typeof nameRule>, c
   return out;
 }
 
-/** One source under the participant rules: the reference to write, whether it was coded, whether a tag name was scrubbed. */
+/** One source under the participant rules: the reference to write, whether it was coded, whether any name in it was replaced. */
 interface RuledRef {
   ref: Omit<Ref, "key">;
   coded: boolean;
-  tagsScrubbed: boolean;
+  /** A creator coded, or a text or tag name scrubbed (or withheld for naming a participant): told in a note (R390 e). */
+  replaced: boolean;
 }
 
 /**
@@ -374,16 +378,20 @@ function underParticipantRules(sf: SourceFile, opts: ToCslOptions, ref: Omit<Ref
     throw err;
   }
   // No names to replace (no map): nothing can be touched, the reference is written as it is.
-  if (!opts.pseudonyms?.size && sf.source.participantIds.length === 0) return { ref, coded: false, tagsScrubbed: false };
+  if (!opts.pseudonyms?.size && sf.source.participantIds.length === 0) return { ref, coded: false, replaced: false };
   const rule = nameRule(sf, opts);
   const tags = ref.tags.map(rule.scrub);
   const tagsScrubbed = tags.some((t, i) => t !== ref.tags[i]);
   const coded = { ...scrubbedRef(ref, rule, sf.source.creators.map(rule.creator).filter((c): c is Creator => !!c)), tags };
-  if (sf.source.participantIds.length > 0) return { ref: coded, coded: true, tagsScrubbed };
-  const plain = toCslItem(sf, { ...opts, pseudonyms: new Map(), requireParticipantCodes: false });
+  // The same source read with no names to replace (and no participant link, which needs them): what toCslItem changed.
+  const plain = toCslItem({ ...sf, source: { ...sf.source, participantIds: [] } }, { ...opts, pseudonyms: new Map(), requireParticipantCodes: false });
+  const cslOf = (i: CslItem) => JSON.stringify({ ...i, "citation-key": undefined });
   const textOf = (r: Omit<Ref, "key">) => JSON.stringify({ ...r, creators: [], tags: [] });
-  const same = JSON.stringify(item) === JSON.stringify(plain) && textOf(coded) === textOf(ref) && !rule.names(sf.source.citationKey);
-  return same ? { ref: { ...ref, tags }, coded: false, tagsScrubbed } : { ref: coded, coded: true, tagsScrubbed };
+  const changed = cslOf(item) !== cslOf(plain) || textOf(coded) !== textOf(ref);
+  const replaced = changed || tagsScrubbed;
+  if (sf.source.participantIds.length > 0) return { ref: coded, coded: true, replaced };
+  const same = !changed && !rule.names(sf.source.citationKey);
+  return same ? { ref: { ...ref, tags }, coded: false, replaced } : { ref: coded, coded: true, replaced };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -433,6 +441,7 @@ export async function buildExport(
   let withheldKeys = 0;
   let codeMissing = 0;
   let noList = 0;
+  let replacedNames = 0;
   // The bibliography's participant rules (R88 I2), read once per export.
   const rules = await participantRules(repo, projectId);
   const project = repo.getProject(projectId);
@@ -471,9 +480,13 @@ export async function buildExport(
       continue;
     }
     const coded = ruled.coded;
+    if (ruled.replaced) replacedNames++;
     // A coded source's own key is withheld (it is usually made from a name): the writer makes a plain one.
     if (coded && s.citationKey.trim()) withheldKeys++;
-    const wanted = (coded ? "" : s.citationKey.trim()) || `ref${refs.length + 1}`;
+    // A coded source's plain key is made from its own id (R390 e, M1): the same from one export to the next, whatever
+    // else is exported, and holding no name. The id's last eight characters: a UUIDv7 begins with its creation time, so
+    // its first eight are shared by every source made within about a minute; its last eight are random.
+    const wanted = coded ? `ref-${id.slice(-8).toLowerCase()}` : s.citationKey.trim() || `ref${refs.length + 1}`;
     let key = format === "bibtex" ? bibKey(wanted) : oneLine(wanted);
     if (used.has(key.toLowerCase())) {
       let n = 0;
@@ -491,6 +504,7 @@ export async function buildExport(
   if (codeMissing) notes.push(EXPORT_NOTES.codeMissing(codeMissing));
   if (noList) notes.push(EXPORT_NOTES.noList(noList));
   if (changedKeys) notes.push(EXPORT_NOTES.keyChanged(changedKeys));
+  if (replacedNames) notes.push(EXPORT_NOTES.namesReplaced(replacedNames));
   if (withheldKeys) notes.push(EXPORT_NOTES.keyWithheld(withheldKeys));
   return { text, exported: refs.length, excluded, notes };
 }
