@@ -72,6 +72,18 @@ export function assertKey(key: Uint8Array): void {
   }
 }
 
+/**
+ * A key fit to seal with: 32 bytes, not all zero. A key ring zero-fills a key when the project is locked; a buffer
+ * that reads as zeros is a wiped key, and anything sealed under it would open for anyone (R379). Refused here, in
+ * the primitives that seal (`encryptStream`, and `sealLine` in repo/io.ts), as the last line of defence.
+ */
+export function assertSealingKey(key: Uint8Array, keyId: string): void {
+  assertKey(key);
+  let any = 0;
+  for (const b of key) any |= b;
+  if (any === 0) throw new KeyNotAvailableError(keyId);
+}
+
 function keyIdToBytes(keyId: string): Buffer {
   assertKeyId(keyId);
   return Buffer.from(keyId.replaceAll("-", ""), "hex");
@@ -191,7 +203,7 @@ function toBuffer(chunk: unknown): Buffer {
  * is zeroed when the stream ends or is destroyed.
  */
 export function encryptStream(key: Uint8Array, keyId: string): Transform {
-  assertKey(key);
+  assertSealingKey(key, keyId);
   assertKeyId(keyId);
   const k = Buffer.from(key);
   const baseNonce = randomBytes(NONCE_LEN);

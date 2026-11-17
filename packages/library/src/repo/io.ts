@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 import { LibraryRelativePath } from "@ao/core";
-import { decryptStream, encryptStream } from "../crypto/format.js";
+import { assertSealingKey, decryptStream, encryptStream } from "../crypto/format.js";
 import { PathEscapeError, TornFileError } from "./errors.js";
 
 /** Absolute path of a library-relative path; validates it first. */
@@ -215,6 +215,7 @@ export async function undoAppend(u: AppendUndo): Promise<void> {
  */
 /** Seals one JSON line with the project key; `purpose` binds it to its file kind (AAD `<purpose>|<projectId>`). */
 export function sealLine(key: Uint8Array, keyId: string, projectId: string, json: string, purpose = "ao-changes"): string {
+  assertSealingKey(key, keyId); // never under a wiped (all-zero) key (R379)
   const nonce = randomBytes(12);
   const c = createCipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
   c.setAAD(Buffer.from(`${purpose}|${projectId}`, "utf8"));
