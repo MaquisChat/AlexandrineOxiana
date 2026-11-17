@@ -2061,4 +2061,13 @@ describe("FR-A21 (R392): the progress tells the truth about the total", () => {
     for (const e of seen) expect(e.done).toBeLessThanOrEqual(5);
     expect(seen.at(-1)).toEqual({ done: 5, total: 5 });
   });
+
+  for (const bad of [2.5, Number.NaN, -1]) {
+    it(`R426 c: a total of ${bad} is not a total: no event carries one`, async () => {
+      const p = await project();
+      const seen = await events(await bulk.startBatch(p.id, synthetic(3, { at: 0, total: bad })));
+      expect(seen.at(-1)!.done).toBe(3);
+      for (const e of seen) expect(e.total).toBeUndefined();
+    });
+  }
 });
