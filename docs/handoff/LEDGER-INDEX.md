@@ -345,3 +345,4 @@ R421 (2026-11-17): FR-A18 approved after round 2; small round — an invisible-o
 R422 (2026-11-17): FR-A22 round 2 built; in Find's file check the kind/version signs and the evidence read the embedded title as found, the 'another document's title' rule reads the filtered title (corrects R410 b's wording)
 R423 (2026-11-17): FR-A21 built — Zotero web tells the exact number its scan will yield once the listing is read (not the first page's total-results, which counts attachments, notes and the bin); FR-693, FR-694 listed; fresh reviewer dispatched
 R424 (2026-11-17): FR-A17 approved after its small round; one last point — FetchFileError.retryAfter made non-enumerable; then done
+R425 (2026-11-17): FR-A22 approved after round 2; small round — kind/version signs read every embedded title (XMP and Info), scanner stamps are stock, the two author patterns narrowed; FR-695, FR-696 listed
