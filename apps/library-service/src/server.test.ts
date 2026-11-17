@@ -316,7 +316,11 @@ describe("governance, audit, citations", () => {
     expect(ok.json.loosened).toEqual([]); // the effective policy still requires encryption: only the violation is new
     expect((await call({ url: `/projects/${pid}/governance` })).json.yaml).toBe(looser);
     const audit = await call({ url: `/projects/${pid}/audit?limit=5` });
-    expect(audit.json.events.some((e: { details?: { reason?: string } }) => e.details?.reason === "IRB amendment 7")).toBe(true);
+    // An encrypted project (R362 b): the record holds the reason's SHA-256, the screen's reading the text (unlocked).
+    const ev = audit.json.events.find((e: { details?: { op?: string } }) => e.details?.op === "project.governance");
+    expect(ev.details).toMatchObject({ reasonGiven: true, reasonSha256: (await import("node:crypto")).createHash("sha256").update("IRB amendment 7", "utf8").digest("hex") });
+    expect(ev.details.reason).toBeUndefined();
+    expect(ev.reasonShown).toEqual({ state: "text", text: "IRB amendment 7" });
   });
 
   it("PUT governance: invalid YAML, custom tags, alias bombs and oversize text are refused", async () => {
