@@ -18,7 +18,7 @@ import { openDecrypted } from "../crypto/random-access.js";
 import { exportProjectOpenFormats } from "../export/project-export.js";
 import { PASS, addSource, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
 import type { FindEntry } from "../find/types.js";
-import { parseJobJournal } from "../job-journal.js";
+import { journalPath, parseJobJournal, refreshJobRows } from "../job-journal.js";
 import { NotFoundError, ProjectLockedError } from "./errors.js";
 import { decryptBytes, encryptBytes, openLine, sealLine } from "./io.js";
 import { appendFindEntriesIn, importChange, projectDataKey, readFindQueueIn } from "./repo.js";
@@ -92,6 +92,25 @@ describe("(a) the opening primitives refuse a wiped key as locked (R386 a)", () 
     const k = Buffer.alloc(32, 9);
     const line = sealLine(k, KEY_ID, "p", JSON.stringify({ id: "x" }), "ao-jobs");
     expect(() => parseJobJournal(`${line}\n`, "p", ZERO)).toThrow(KeyNotAvailableError);
+  });
+});
+
+describe("(a) the job journal's rows are not rewritten from a read under a wiped key (R386 a)", () => {
+  it("refreshJobRows refuses as locked and never touches the rows", async () => {
+    const p = await makeProject(kit, GOV, true);
+    const real = projectDataKey(kit.repo, p.id)!;
+    const rel = kit.repo.getProject(p.id).folder;
+    const path = journalPath(kit.lib.root, rel);
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(join(path, ".."), { recursive: true });
+    await writeFile(path, `${sealLine(real.key, real.keyId, p.id, JSON.stringify({ v: 1, id: "j1" }), "ao-jobs")}\n`);
+    let touched = 0;
+    const db = () => {
+      touched++;
+      return undefined;
+    };
+    await expect(refreshJobRows(db, kit.lib.root, rel, p.id, { key: Buffer.alloc(32), keyId: real.keyId })).rejects.toBeInstanceOf(KeyNotAvailableError);
+    expect(touched).toBe(0);
   });
 });
 

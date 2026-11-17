@@ -21,7 +21,7 @@ import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { Asset, PendingProxy, SourceFile } from "@ao/core";
 import { newId } from "@ao/core";
-import { decryptStream } from "../crypto/format.js";
+import { KeyNotAvailableError, decryptStream } from "../crypto/format.js";
 import { extractMetadata } from "../extract/index.js";
 import { checkProxyLocation } from "../extract/exif.js";
 import { copyFileAtomic } from "../fs/atomic.js";
@@ -361,8 +361,8 @@ export class ProxyQueue {
       );
       return { ...base, ok: true, assetId: added.id };
     } catch (err) {
-      // No worker reachable, or the project locked: the job stays pending and runs later.
-      if (err instanceof WorkerUnavailableError || err instanceof ProjectLockedError) return { ...base, ok: false, code: "PENDING" };
+      // No worker reachable, or the project locked (also while its check was read, R386 a): the job stays pending.
+      if (err instanceof WorkerUnavailableError || err instanceof ProjectLockedError || err instanceof KeyNotAvailableError) return { ...base, ok: false, code: "PENDING" };
       if (err instanceof ProxyRecordRefusedError) {
         // RULE_CHANGED: stays pending and is made again under the stricter rule; ALREADY_RECORDED: another run did it.
         if (err.code === "ORIGINAL_GONE") await editPendingProxies(this.repo, projectId, sourceId, (list) => list.filter((j) => j.id !== job.id)).catch(() => {});
