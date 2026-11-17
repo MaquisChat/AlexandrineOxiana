@@ -86,3 +86,22 @@ describe("R427 (a): a library holding both spellings, as the older code left it"
     expect((await kit.repo.getFieldwork(p.id)).participants).toHaveLength(2);
   });
 });
+
+describe("R427 (d): the guards of the strict identity key each have a test (M8 of the FR-A10 third review)", () => {
+  it("a creator whose name holds an invisible character finds the existing participant (no new one)", () => {
+    const r = codesFor([by("Ma​ria Cocina")], new Map([["Maria Cocina", "P-001"]]), ["P-001"]);
+    expect(r.codes).toEqual(["P-001"]);
+    expect(r.changed).toBe(false);
+    expect(r.all).toHaveLength(1);
+  });
+
+  it("a key made only of invisible characters and spaces is compared as written", () => {
+    const map = new Map([["​ ​", "P-001"]]);
+    expect(codesFor([by("​ ​")], new Map(map), ["P-001"]).codes).toEqual(["P-001"]);
+    // Another key that is nothing but invisible characters is another person, not P-001.
+    const other = codesFor([by("⁠ ⁠")], new Map(map), ["P-001"]);
+    expect(other.codes).toEqual(["P-002"]);
+    expect(other.changed).toBe(true);
+    expect(other.all).toHaveLength(2);
+  });
+});
