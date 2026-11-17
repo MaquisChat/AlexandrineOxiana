@@ -3,7 +3,7 @@
  * `<Project>/keys/pseudonyms.json.enc` (encrypted with the project key).
  */
 import type { Creator, Participant } from "@ao/core";
-import { creatorNameTexts, newId, normName } from "@ao/core";
+import { creatorNameTexts, newId } from "@ao/core";
 import { decryptBytes, readMaybe } from "./io.js";
 import type { Tx } from "./mutate.js";
 import type { ProjectJson, ProjectState, RepoCore } from "./state.js";
@@ -79,6 +79,34 @@ export function nextParticipantCode(participants: Participant[], taken: Iterable
   return `P-${String(max + 1).padStart(3, "0")}`;
 }
 
+const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+/** Scripts written without spaces (core's NO_SPACE_SCRIPT, the set title verification uses). */
+const NO_SPACE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+const HANGUL = /\p{Script=Hangul}/u;
+
+/**
+ * The key by which `assignCodes` decides that a creator is a participant already coded (R403 b):
+ * compatibility forms (NFKC) and case folded, invisible (default-ignorable) characters removed, white
+ * space collapsed and trimmed, and a space between two characters of a script written without spaces,
+ * or between two Hangul characters, removed ("김 민수" = "김민수", "山田 太郎" = "山田太郎": a family and
+ * a given name written apart or together). Accents, voicing marks, "@" and punctuation are KEPT.
+ * It is deliberately NOT core's `fold`/`normName`, by which names are found in text: over-matching
+ * is the safe side for REPLACING a name, and the unsafe side for deciding WHO a person is — Hương
+ * and Hường, Peña and Pena, ハナコ and バナコ, "@maria" and "María" are different people, and one
+ * participant for both would hang the second person's source on the first person's consent.
+ */
+export function identityKey(s: string): string {
+  return s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(IGNORABLE, "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/(.) (?=(.))/gsu, (m, a: string, b: string) =>
+      (NO_SPACE.test(a) && NO_SPACE.test(b)) || (HANGUL.test(a) && HANGUL.test(b)) ? a : m,
+    );
+}
+
 /**
  * Ensures every creator has a code, creating a (detail-less) participant for
  * each new person. Returns the codes of `creators` in order and whether the
@@ -93,13 +121,12 @@ export function assignCodes(
   let changed = false;
   const codes: Array<string | undefined> = [];
   const participantIds: string[] = [];
-  // An existing participant is found by the name folded as citations and folder names compare it
-  // (core's normName: case, accents, width, invisible characters; Hangul written apart or together;
-  // R387 M6), so "Lucia Fernandez" is the "Lucía Fernández" already coded, not a new participant.
+  // An existing participant is found by the strict identity key (R403 b): "LUCIA FERNANDEZ" is the
+  // "Lucia Fernandez" already coded; "Lucia Fernandez" is not "Lucía Fernández".
   const lookup = (key: string) => {
-    const n = normName(key);
-    // A key with no letters or digits at all is compared as written (lowercased), as before.
-    return [...map.entries()].find(([k]) => (n ? normName(k) === n : k.toLowerCase() === key.toLowerCase()))?.[1];
+    const n = identityKey(key);
+    // A key that is nothing but invisible characters and spaces is compared as written (lowercased).
+    return [...map.entries()].find(([k]) => (n ? identityKey(k) === n : k.toLowerCase() === key.toLowerCase()))?.[1];
   };
   for (const c of creators) {
     // The interviewer is the researcher, not a research participant.

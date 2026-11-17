@@ -219,13 +219,15 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(plain(bib.content)).not.toMatch(/lucia|fernandez|ruiz/u);
   });
 
-  it("R387 (M6): a creator written without accents is the participant already coded with them (assignCodes folds)", async () => {
+  it("R403 (b), changed from R387 (M6): a creator written without accents is a participant of her own (identity is strict)", async () => {
     const p = await makeProject(kit, PSEUDO_GOV, true);
     const a = await addSource(kit, p, { type: "book", title: "Primera", creators: [{ given: "Lucía", family: "Fernández", role: "interviewee" }], issued: "2025", identifiable: true });
     const b = await addSource(kit, p, { type: "book", title: "Segunda", creators: [{ given: "LUCIA", family: "Fernandez", role: "interviewee" }], issued: "2025", identifiable: true });
-    const codeOf = (folder: string) => /P-\d{3}/u.exec(folder)?.[0];
-    expect(codeOf(b.source.folder)).toBe(codeOf(a.source.folder));
-    expect((await kit.repo.getFieldwork(p.id)).participants).toHaveLength(1);
+    const fw = await kit.repo.getFieldwork(p.id);
+    expect(fw.participants).toHaveLength(2);
+    expect(a.source.participantIds).toHaveLength(1);
+    expect(b.source.participantIds).toHaveLength(1);
+    expect(b.source.participantIds[0]).not.toBe(a.source.participantIds[0]);
   });
 
   it("a custom style renders through the sandbox", async () => {
@@ -241,5 +243,46 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(await citeSources(kit.repo, p.id, [{ sourceId: a.source.id }], id, "text")).toBe("[Diaz 2020]");
     const r = await exportBibliography(kit.repo, p.id, { sourceIds: [a.source.id] }, id, "text");
     expect(r.content.trim()).toBe("Rosa Diaz. Lab notes");
+  });
+});
+
+describe("R403 (b): who is the same participant is decided by a strict key (I1 of the FR-A10 second review)", () => {
+  type C = { given?: string; family?: string; literal?: string; handle?: string };
+  /** Adds one source per creator, in turn, to an encrypted project that pseudonymises; the participants and each source's link. */
+  const addInTurn = async (creators: C[]) => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const links: string[][] = [];
+    for (const [i, c] of creators.entries()) {
+      const sf = await addSource(kit, p, { type: "book", title: `Fuente ${i + 1}`, creators: [{ ...c, role: "interviewee" }], issued: "2025", identifiable: true });
+      links.push(sf.source.participantIds);
+    }
+    return { participants: (await kit.repo.getFieldwork(p.id)).participants, links };
+  };
+
+  it.each<[string, C, C]>([
+    ["Lê Thị Hương / Lê Thị Hường", { literal: "Lê Thị Hương" }, { literal: "Lê Thị Hường" }],
+    ["Ana Peña / Ana Pena", { given: "Ana", family: "Peña" }, { given: "Ana", family: "Pena" }],
+    ["@maria / María", { handle: "@maria" }, { literal: "María" }],
+    ["ハナコ / バナコ", { literal: "ハナコ" }, { literal: "バナコ" }],
+    ["@maria.cocina / Maria Cocina", { handle: "@maria.cocina" }, { given: "Maria", family: "Cocina" }],
+  ])("%s: two participants, each source linked to its own", async (_label, first, second) => {
+    const { participants, links } = await addInTurn([first, second]);
+    expect(participants).toHaveLength(2);
+    expect(links[0]).toHaveLength(1);
+    expect(links[1]).toHaveLength(1);
+    expect(links[0]![0]).toBe(participants[0]!.id);
+    expect(links[1]![0]).toBe(participants[1]!.id);
+    expect(participants[0]!.code).not.toBe(participants[1]!.code);
+  });
+
+  it.each<[string, C, C]>([
+    ["case only", { given: "LUCIA", family: "FERNANDEZ" }, { given: "Lucia", family: "Fernandez" }],
+    ["two spaces / one space", { literal: "Lucía  Fernández" }, { literal: "Lucía Fernández" }],
+    ["Hangul written apart / together", { literal: "김 민수" }, { literal: "김민수" }],
+    ["Han written apart / together", { literal: "山田 太郎" }, { literal: "山田太郎" }],
+  ])("%s: one participant", async (_label, first, second) => {
+    const { participants, links } = await addInTurn([first, second]);
+    expect(participants).toHaveLength(1);
+    expect(links[1]).toEqual(links[0]);
   });
 });
