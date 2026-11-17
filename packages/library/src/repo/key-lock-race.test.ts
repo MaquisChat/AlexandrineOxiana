@@ -4,6 +4,7 @@
  * lock waits its turn in the write queue (after the change in progress, ahead of the changes waiting behind it),
  * adding the same key again keeps the ring's buffer, and sealing with an all-zero key is refused outright.
  */
+import { statSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { newId, type Project } from "@ao/core";
@@ -14,6 +15,7 @@ import { ProjectLockedError } from "./errors.js";
 import { encryptBytes, openLine, sealLine } from "./io.js";
 import { importChange, projectDataKey } from "./repo.js";
 import { PURPOSE_CHANGES, PURPOSE_WATCH_REGISTER, SEALED_LINE_PURPOSES } from "./sealed-purposes.js";
+import { seams } from "./testing.js";
 import type { WatchRegisterEntry } from "./watch-register.js";
 
 const GOV = `identifiability:
@@ -32,6 +34,7 @@ beforeEach(async () => {
   kit = await makeKit("ao-key-lock-race-");
 });
 afterEach(async () => {
+  seams.failUndo = undefined;
   await kit.close();
 });
 
@@ -196,6 +199,38 @@ describe("a lock or a second unlock while a change is being saved (R379)", () =>
     const lines = await sealedLines(join(folderOf(p), "watched"));
     expect(lines).toHaveLength(30);
     expectOpensWithRealKey(p, key, lines, PURPOSE_WATCH_REGISTER);
+  });
+
+  it("a key wiped outside the queue (the ring cleared) mid-write: the change fails closed and no line under zeros is left, even when its rollback fails", async () => {
+    const p = await makeProject(kit, GOV, true);
+    const key = realKey(p);
+    const entries: WatchRegisterEntry[] = Array.from({ length: 30 }, (_, i) => ({
+      key: `f-${i}.pdf`,
+      file: `f-${i}.pdf`,
+      sourceId: newId(),
+      sha256: "a".repeat(64),
+      size: 10,
+      mtimeNs: "1763000000123456789",
+      state: "in-library",
+      at: "2026-11-10T09:30:00.000Z",
+    }));
+    const watchId = newId();
+    await kit.repo.recordWatchedFiles(p.id, watchId, entries.slice(0, 1));
+    const file = join(folderOf(p), "watched", `${watchId}.jsonl`);
+    const size = statSync(file).size;
+    seams.failUndo = "append";
+    const write = kit.repo.recordWatchedFiles(p.id, watchId, entries.slice(1));
+    // The ring is cleared (as at app exit) once the write has appended its first line.
+    const poll = () => (statSync(file).size > size ? kit.ring.clear() : setImmediate(poll));
+    setImmediate(poll);
+    await expect(write).rejects.toThrow();
+    const lines = await sealedLines(join(folderOf(p), "watched"));
+    expect(lines.length).toBeGreaterThan(1);
+    // Whatever the failed rollback left: sealed under the real key, never under zeros.
+    for (const l of lines) {
+      expect(() => openLine(ZERO, p.id, l, PURPOSE_WATCH_REGISTER)).toThrow();
+      openLine(key, p.id, l, PURPOSE_WATCH_REGISTER);
+    }
   });
 
   it("the lock zeroes the ring's buffer once the change in progress is done (no key outlives the lock)", async () => {
