@@ -2218,8 +2218,9 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         await tryLater("copy-not-downloaded", { state: "looking-for-copy" }, { state: "no-open-copy", ...(links?.length ? { offers: links } : {}) });
         return;
       }
-      // Every offer refused for good: no open copy here.
-      await finish({ state: "no-open-copy", ...(links?.length ? { offers: links } : {}) }, ["nextTryAt", "reason", "offers"]);
+      // Every offer refused for good: no open copy here — unless a service could not be reached, which might have had a
+      // working copy: then, as when nothing was offered (R282 e), it says so and accepts "Try again" (R411 a).
+      await finish({ state: "no-open-copy", ...(found.failed.length ? { reason: { code: "copy-some-unreachable" } } : {}), ...(links?.length ? { offers: links } : {}) }, ["nextTryAt", "reason", "offers"]);
     } finally {
       timers.clearTimeout(watch);
       if (downloads.get(dk) === stop) downloads.delete(dk);

@@ -4094,6 +4094,18 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect(fileRequests.length).toBe(n);
   });
 
+  it("R411 a (M1): a service unreachable and every offered file refused for good: 'no open copy' saying a copy may still exist, its links kept, Try again accepted", async () => {
+    // Semantic Scholar has no answer in this world (the request fails); OpenAlex offers a link that answers 404.
+    settings = { ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" || c.id === "semanticscholar" })) };
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001"]);
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "no-open-copy", reason: { code: "copy-some-unreachable" }, offers: [{ host: "arxiv.org" }] });
+    expect(e.nextTryAt).toBeUndefined();
+    expect(await r.retry(p.id, eid)).toMatchObject({ state: "looking-for-copy" });
+  });
+
   it("R379 (FR-A17): every offer refused for good (404): no open copy as before, its links kept, nothing tried again", async () => {
     oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001", "https://arxiv.org/pdf/2101.00002"]);
     fileStatus.set("https://arxiv.org/pdf/2101.00002", { status: 410 });
