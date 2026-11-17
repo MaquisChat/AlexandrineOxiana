@@ -118,6 +118,23 @@ describe("Fieldwork", () => {
     await waitFor(() => expect(within(section("Participants")).queryByText("P-001")).toBeNull());
   });
 
+  it("a held or repeated Enter on Delete opens the dialog on its heading and deletes nothing; Tab then Enter deletes once (R376 c)", async () => {
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    await screen.findByRole("region", { name: "Participants" });
+    const user = userEvent.setup();
+    await addParticipant(user);
+    const opener = within(section("Participants")).getByRole("button", { name: "Delete P-001" });
+    opener.focus();
+    await user.keyboard("{Enter>4}{/Enter}{Enter}");
+    const dialog = screen.getByRole("dialog", { name: "Delete participant P-001" });
+    expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Delete participant P-001" }));
+    expect(db.calls.some((c) => c.method === "DELETE")).toBe(false);
+    await user.tab();
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Delete" }));
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(db.calls.filter((c) => c.method === "DELETE")).toHaveLength(1));
+  });
+
   it("edits a session's and a consent record's details (never the participant's code)", async () => {
     render(<Fieldwork api={makeApi()} projectId={PID} />);
     await screen.findByRole("region", { name: "Participants" });

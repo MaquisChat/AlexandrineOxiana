@@ -118,7 +118,9 @@ function AckDialog({ busy, error, onConfirm, onCancel }: { busy: boolean; error:
   // What had focus before the dialog, read while rendering: before the background is made inert,
   // which in a browser can move focus to <body> before useTrap's passive effect reads it (review M9).
   const [before] = useState(() => document.activeElement as HTMLElement | null);
-  const { ref, onKeyDown } = useTrap(onCancel, busy);
+  // First focus on the heading (R376 c): a held or repeated key on the opener must not acknowledge.
+  const heading = useRef<HTMLHeadingElement>(null);
+  const { ref, onKeyDown } = useTrap(onCancel, busy, heading);
   // Declared after useTrap: its cleanup runs after useTrap's, so this restore is the one that stays.
   useEffect(() => () => before?.focus?.(), [before]);
   const [host] = useState(() => document.createElement("div"));
@@ -135,7 +137,9 @@ function AckDialog({ busy, error, onConfirm, onCancel }: { busy: boolean; error:
   return createPortal(
     <div className="ao-capture-dialog-backdrop">
       <div ref={ref} role="dialog" aria-modal="true" aria-labelledby={`${id}-t`} aria-describedby={`${id}-d`} aria-busy={busy || undefined} className="ao-capture-dialog" onKeyDown={onKeyDown}>
-        <h2 id={`${id}-t`}>Use your browser session?</h2>
+        <h2 id={`${id}-t`} ref={heading} tabIndex={-1}>
+          Use your browser session?
+        </h2>
         <p id={`${id}-d`}>{COOKIES_ACKNOWLEDGEMENT}</p>
         <p>You are asked this once for this project.</p>
         {error && (

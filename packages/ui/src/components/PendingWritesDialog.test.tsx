@@ -47,6 +47,40 @@ describe("PendingWritesDialog", () => {
     expect(dialog.contains(document.activeElement)).toBe(true);
   });
 
+  it("a held or repeated Enter on \"Roll it back\" opens the question and rolls nothing back; Tab then Enter rolls back once (R376 c)", async () => {
+    const svc = serve([[pw({})], []]);
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    const open = await within(dialog).findByRole("button", { name: "Roll it back" });
+    open.focus();
+    await user.keyboard("{Enter>4}{/Enter}{Enter}");
+    const yes = within(dialog).getByRole("button", { name: "Yes, roll it back" });
+    expect(svc.posted).toHaveLength(0);
+    expect(document.activeElement).not.toBe(yes);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect((document.activeElement as HTMLElement).textContent).toMatch(/Roll this change back\?/);
+    await user.tab();
+    expect(document.activeElement).toBe(yes);
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(svc.posted).toHaveLength(1));
+  });
+
+  it("an unconfirmable change: the question has focus first, then the acknowledgement; nothing is acknowledged by the key that opened it (R376 c)", async () => {
+    serve([[pw({ status: "unverifiable", canRollBack: true, canKeep: false })], []]);
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    const open = await within(dialog).findByRole("button", { name: "Roll it back" });
+    open.focus();
+    await user.keyboard("[Space]{Enter>3}{/Enter}[Space]");
+    const box = within(dialog).getByRole("checkbox", { name: /I understand/ }) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    expect(document.activeElement).not.toBe(box);
+    await user.tab();
+    expect(document.activeElement).toBe(box);
+  });
+
   it("reloads the list when the library's state changes while it is open", async () => {
     const svc = serve([[pw({})], []]);
     const api = testApi();
