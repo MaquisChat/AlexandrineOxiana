@@ -80,3 +80,80 @@ describe("index.html content-security policy (exact)", () => {
     expect(policyOf(tag("media-src http://localhost:* blob:")).get("media-src")).toEqual(["blob:", "http://localhost:*"]);
   });
 });
+
+/**
+ * Whether `address` is allowed by a directive's source list, as CSP Level 3 matches the source forms
+ * this policy uses: 'self', 'none', a scheme (`blob:`, `data:`) and `scheme://host[:port|:*]`. Any
+ * other form (`*`, `https:`, `*.host`, a nonce...) throws, so a widening cannot pass unexamined.
+ */
+function allows(sources: string[], address: string, self: string): boolean {
+  const url = new URL(address);
+  const defaultPort = (scheme: string) => (scheme === "https:" ? "443" : "80");
+  return sources.some((src) => {
+    if (src === "'none'") return false;
+    if (src === "'self'") return url.origin !== "null" && url.origin === new URL(self).origin;
+    if (/^(blob|data):$/i.test(src)) return url.protocol === src.toLowerCase();
+    const m = /^(https?):\/\/([a-z0-9.-]+)(?::(\d+|\*))?$/i.exec(src);
+    if (!m) throw new Error(`a source this check does not know: ${src}`);
+    const scheme = `${m[1]!.toLowerCase()}:`;
+    if (url.protocol !== scheme || url.hostname !== m[2]!.toLowerCase()) return false;
+    return m[3] === "*" || (url.port || defaultPort(scheme)) === (m[3] ?? defaultPort(scheme));
+  });
+}
+
+describe("media-src: recordings come only from the service on this computer (FR-227, FR-228)", () => {
+  const page = policyOf(readFileSync(join(here, "..", "index.html"), "utf8"));
+  const shell = policyOf(`<meta http-equiv="Content-Security-Policy" content="${shellPolicy()}" />`);
+  /** The app's own origin in the shell and under a browser: neither is a source of media. */
+  const SELVES = ["tauri://localhost", "http://localhost:5173"];
+  /** Addresses of other origins: a recording or a picture from any of them is refused. */
+  const ELSEWHERE = [
+    "https://media.example.org/interview.mp3",
+    "http://example.org/clip.mp4",
+    "http://192.168.1.20:4100/media/tk_abc",
+    "http://10.0.0.5/video.webm",
+    "http://127.0.0.1.example.org:4100/media/tk_abc",
+    "http://localhost.example.org/media/tk_abc",
+    "https://127.0.0.1.nip.io/media/tk_abc",
+    "http://[::1]:4100/media/tk_abc",
+  ];
+
+  for (const [where, policy] of [
+    ["the page (index.html)", page],
+    ["the shell (tauri.conf.json)", shell],
+  ] as const) {
+    const media = policy.get("media-src")!;
+
+    it(`${where}: media-src is exactly http://127.0.0.1:* http://localhost:* blob:`, () => {
+      expect(media).toEqual(["blob:", "http://127.0.0.1:*", "http://localhost:*"]);
+    });
+
+    it(`${where}: a media ticket from the service on loopback, and a blob:, are allowed`, () => {
+      for (const self of SELVES) {
+        expect(allows(media, "http://127.0.0.1:4100/media/tk_abc", self)).toBe(true);
+        expect(allows(media, "http://localhost:51234/media/tk_abc", self)).toBe(true);
+        expect(allows(media, "blob:tauri://localhost/5f0c-11aa", self)).toBe(true);
+      }
+    });
+
+    it(`${where}: a recording or a picture from any other origin is refused`, () => {
+      for (const self of SELVES) {
+        for (const address of ELSEWHERE) {
+          expect(allows(media, address, self), `media-src must refuse ${address}`).toBe(false);
+          expect(allows(policy.get("img-src")!, address, self), `img-src must refuse ${address}`).toBe(false);
+        }
+        // Media has no data:: only the service's tickets and blob: copies play.
+        expect(allows(media, "data:audio/mpeg;base64,SUQz", self)).toBe(false);
+      }
+      // Nor 'self': in the shell, the app's own files are not a source of media.
+      expect(allows(media, "tauri://localhost/assets/clip.mp3", "tauri://localhost")).toBe(false);
+    });
+  }
+
+  it("the check itself refuses a source form it does not know, such as a wildcard", () => {
+    expect(() => allows(["*"], "https://example.org/a.mp3", "tauri://localhost")).toThrow(/does not know/);
+    expect(() => allows(["https:"], "https://example.org/a.mp3", "tauri://localhost")).toThrow(/does not know/);
+    expect(allows(["http://127.0.0.1:4100"], "http://127.0.0.1:4101/m", "tauri://localhost")).toBe(false);
+    expect(allows(["http://127.0.0.1:4100"], "http://127.0.0.1:4100/m", "tauri://localhost")).toBe(true);
+  });
+});
