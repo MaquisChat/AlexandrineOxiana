@@ -107,7 +107,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     let h: Awaited<ReturnType<typeof startZoteroWebImport>>;
     try {
       h = spec.web
-        ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
+        ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo), debug: state.importLog }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
         : await s.bulk.startBatch(projectId, spec.adapter, options);
     } catch (err) {
       release?.();
@@ -150,7 +150,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
       try {
         h =
           listed?.kind === "zotero-web"
-            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, batchId)
+            ? await resumeZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo), debug: state.importLog }, projectId, batchId)
             : await s.bulk.resumeBatch(projectId, batchId);
       } catch (err) {
         release?.();

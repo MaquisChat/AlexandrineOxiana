@@ -29,6 +29,20 @@ export function undoCounts(r: ImportReport): { remove: number; restore: number; 
   };
 }
 
+/** R393: a group of failures with more items than this is collapsed under its reason. */
+const GROUP_OPEN_MAX = 10;
+
+/** R393: failures by reason, in the order each reason first occurs, with their items in order. */
+export function failureGroups(failures: ImportReport["failures"]): Array<{ reason: string; items: string[] }> {
+  const groups = new Map<string, string[]>();
+  for (const f of failures) {
+    const items = groups.get(f.reason);
+    if (items) items.push(f.item);
+    else groups.set(f.reason, [f.item]);
+  }
+  return [...groups].map(([reason, items]) => ({ reason, items }));
+}
+
 /** Parts joined as a sentence: "a, b and c", its first letter a capital. */
 function sentence(parts: string[]): string {
   const last = parts[parts.length - 1]!;
@@ -211,6 +225,17 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
             </tbody>
           </table>
 
+          {/* R393: the notes (where a stopped batch says why) right under the summary, so that they cannot be missed. */}
+          {report.notes.length > 0 && (
+            <ul className="ao-import__notes">
+              {report.notes.map((n, i) => (
+                <li key={`${i}:${n}`}>
+                  <UserText>{n}</UserText>
+                </li>
+              ))}
+            </ul>
+          )}
+
           {(report.annotationsDeletedHere ?? 0) > 0 && (
             <p>
               {report.annotationsDeletedHere === 1
@@ -231,11 +256,35 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
             <details className="ao-import__details" open>
               <summary>Failures ({fmt(report.failures.length)})</summary>
               <ul>
-                {report.failures.map((f, i) => (
-                  <li key={`${i}:${f.item}`}>
-                    <UserText>{f.item}</UserText>: {f.reason}
-                  </li>
-                ))}
+                {failureGroups(report.failures).map((g) => {
+                  const label = `${g.reason} (${count(g.items.length, "item")})`;
+                  const items = (
+                    <ul>
+                      {g.items.map((item, i) => (
+                        <li key={`${i}:${item}`}>
+                          <UserText>{item}</UserText>
+                        </li>
+                      ))}
+                    </ul>
+                  );
+                  return (
+                    <li key={g.reason}>
+                      {g.items.length > GROUP_OPEN_MAX ? (
+                        <details className="ao-import__details">
+                          <summary>
+                            <UserText>{label}</UserText>
+                          </summary>
+                          {items}
+                        </details>
+                      ) : (
+                        <>
+                          <UserText>{label}</UserText>
+                          {items}
+                        </>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             </details>
           )}
@@ -275,13 +324,6 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
                 ))}
               </ul>
             </Section>
-          )}
-          {report.notes.length > 0 && (
-            <ul className="ao-import__notes">
-              {report.notes.map((n, i) => (
-                <li key={`${i}:${n}`}>{n}</li>
-              ))}
-            </ul>
           )}
 
           {undone ? (

@@ -857,6 +857,7 @@ export class ServiceState {
             // Awaited by the batch: one governed change per group, recorded before the batch moves on (R106).
             await ocr.enqueueMany(p, ids);
           },
+          debug: this.importLog,
         }) : undefined;
     s.unsubscribe.push(proxies.onResult((r) => this.events.publish("job.progress", { kind: "proxy", ...r })));
     s.unsubscribe.push(ocr.onResult((r) => this.events.publish("job.progress", { kind: "ocr", ...r })));
@@ -1365,6 +1366,15 @@ export class ServiceState {
     });
     this.resumeFind(s);
   }
+
+  /**
+   * R393 b: the import's debug sink. Only the engine's own notes ("bulk import …": an unexpected error's kind, code and
+   * the program's stack frames, built without the error's message) are logged; other notes that reach the sink (a
+   * lookup's error text) are not, since they may hold a title or an address.
+   */
+  readonly importLog = (note: string): void => {
+    if (note.startsWith("bulk import")) this.opts.log.warn({ note }, "import");
+  };
 
   /** Resumes the queue of every unlocked project (or of `projectId`), whatever the index's state (R247 a). */
   resumeFind(s: Session, projectId?: string): void {

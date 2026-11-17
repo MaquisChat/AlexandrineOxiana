@@ -68,6 +68,11 @@ export interface JournalEntry {
   outcome: ItemOutcome | string;
   sourceId?: string;
   reason?: string;
+  /**
+   * R393 a: a `failed` line of an unexpected error: what kind it was — the system's code (`EMFILE`, `SQLITE_BUSY`) or
+   * the error's class (`TypeError`); never its message or a path.
+   */
+  cause?: string;
   /** Merges: the existing source the item was merged into, and the pre-merge snapshot (project-relative). */
   mergedInto?: string;
   snapshot?: string;
@@ -163,6 +168,8 @@ export interface BatchRecord extends ImportBatch {
   governance: GovernanceNote[];
   /** Plain-language notes for the report (pattern timeouts, OCR not available, ...). */
   notes: string[];
+  /** R393 a: the kind of the unexpected error that stopped the batch's last run (as JournalEntry.cause); absent otherwise. */
+  stopCause?: string;
   /** Total items, when the source could count them. */
   total?: number;
   ocrQueued?: number;

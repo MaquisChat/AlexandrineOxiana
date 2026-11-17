@@ -102,6 +102,17 @@ export function reportLabel(key: string, secret: string | null | undefined): str
 const droppedNote = (n: number): string[] =>
   n ? [`${n.toLocaleString("en-US")} ${n === 1 ? "annotation" : "annotations"} over the per-source limit (10,000 annotations or 16 MB of text) ${n === 1 ? "was" : "were"} not imported.`] : [];
 
+/** R393: failures by reason, in the order each reason first occurs, with their items in order. */
+export function failureGroups(failures: ImportReport["failures"]): Array<{ reason: string; items: string[] }> {
+  const groups = new Map<string, string[]>();
+  for (const f of failures) {
+    const items = groups.get(f.reason);
+    if (items) items.push(f.item);
+    else groups.set(f.reason, [f.item]);
+  }
+  return [...groups].map(([reason, items]) => ({ reason, items }));
+}
+
 function markdown(r: ImportReport): string {
   const lines = [
     `# Import report: batch ${r.number}`,
@@ -132,9 +143,19 @@ function markdown(r: ImportReport): string {
     `- Files left as links: ${r.files.linked}`,
     "",
   ];
+  // R393: the notes (where a stopped batch says why) right under the counts, so that they cannot be missed.
+  if (r.notes.length) {
+    lines.push("## Notes", "");
+    for (const n of r.notes) lines.push(`- ${n}`);
+    lines.push("");
+  }
+  // R393: failures that share a reason are one entry, with their number and the items under it.
   if (r.failures.length) {
     lines.push("## Failures", "");
-    for (const f of r.failures) lines.push(`- ${f.item}: ${f.reason}`);
+    for (const g of failureGroups(r.failures)) {
+      lines.push(`- ${g.reason} (${g.items.length} ${g.items.length === 1 ? "item" : "items"})`);
+      for (const item of g.items) lines.push(`  - ${item}`);
+    }
     lines.push("");
   }
   if (r.fileNotes.length) {
@@ -156,11 +177,6 @@ function markdown(r: ImportReport): string {
       const what = g.result === "deny" ? `denied${g.reason ? ` (${g.reason})` : ""}` : g.result === "allow_with_conditions" ? "allowed with conditions" : "allowed";
       lines.push(`- ${g.action}: ${what}${g.items !== undefined ? ` for ${g.items} item(s)` : ""}`);
     }
-    lines.push("");
-  }
-  if (r.notes.length) {
-    lines.push("## Notes", "");
-    for (const n of r.notes) lines.push(`- ${n}`);
     lines.push("");
   }
   return lines.join("\n");

@@ -256,6 +256,106 @@ export const REASONS = {
 } as const;
 
 /**
+ * R393: what an UNEXPECTED error was, said in plain words. Each kind (the system's error code) has what happened,
+ * for an item and for the batch, and what the researcher can do about it where there is something. SQLite codes can
+ * come from Zotero's database (read while the source is scanned) or from the library's own index (dedupe keys), so
+ * the sentence names both.
+ */
+interface CauseText {
+  item: string;
+  batch: string;
+  itemAction?: string;
+  batchAction?: string;
+}
+const NO_FILES: CauseText = {
+  item: "the computer would not open more files at once",
+  batch: "the computer would not open more files at once",
+  itemAction: "Close other programs and import again.",
+  batchAction: "close other programs and resume the batch to continue",
+};
+const UNREADABLE: CauseText = {
+  item: "a file of the item could not be read",
+  batch: "a file could not be read",
+  itemAction: "Check that the app may read the folder the file is in, then import again.",
+  batchAction: "check that the app may read the folder the import comes from, then resume the batch to continue",
+};
+const DB_BUSY: CauseText = {
+  item: "a database was busy (Zotero's, or the library's own index)",
+  batch: "a database was busy (Zotero's, or the library's own index)",
+  itemAction: "Close Zotero and import again.",
+  batchAction: "close Zotero and resume the batch to continue",
+};
+const DB_UNREADABLE: CauseText = {
+  item: "a database could not be read (Zotero's, or the library's own index)",
+  batch: "a database could not be read (Zotero's, or the library's own index)",
+};
+const CAUSE_TEXTS: Readonly<Record<string, CauseText>> = {
+  ENOSPC: { item: "the disk is full", batch: "the disk is full", itemAction: "Free some space and import again.", batchAction: "free some space and resume the batch to continue" },
+  EDQUOT: { item: "the disk is full", batch: "the disk is full", itemAction: "Free some space and import again.", batchAction: "free some space and resume the batch to continue" },
+  EMFILE: NO_FILES,
+  ENFILE: NO_FILES,
+  ENOENT: { item: "a file of the item was not found", batch: "a file was not found" },
+  EACCES: UNREADABLE,
+  EPERM: UNREADABLE,
+  EIO: { item: "the disk reported an error", batch: "the disk reported an error", itemAction: "Check the disk and import again.", batchAction: "check the disk and resume the batch to continue" },
+  ENAMETOOLONG: { item: "a file's name is too long", batch: "a file's name is too long" },
+  SQLITE_BUSY: DB_BUSY,
+  SQLITE_LOCKED: DB_BUSY,
+};
+
+/** A system code (`EMFILE`), a SQLite code (`SQLITE_BUSY_SNAPSHOT`) or a Node code (`ERR_…`): never free text. */
+const CODE_FORM = /^(?:E[A-Z0-9]{2,15}|SQLITE_[A-Z_]{2,40}|ERR_[A-Z0-9_]{2,60})$/u;
+/** An error class's name (`TypeError`, `SqliteError`): an identifier, never free text. */
+const CLASS_FORM = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
+
+/**
+ * R393 a: the kind of an unexpected error — its system code where it (or an error it wraps as `cause`) has one, else
+ * its class name; "unknown" for something thrown that is not an error. Never the message, never a path.
+ */
+export function causeOf(err: unknown): string {
+  for (let e: unknown = err, depth = 0; e && typeof e === "object" && depth < 4; e = (e as { cause?: unknown }).cause, depth++) {
+    const code = (e as { code?: unknown }).code;
+    if (typeof code === "string" && CODE_FORM.test(code)) return code;
+  }
+  if (!(err instanceof Error)) return "unknown";
+  return CLASS_FORM.test(err.name) ? err.name : "Error";
+}
+
+const causeText = (kind: string): CauseText | undefined => CAUSE_TEXTS[kind] ?? (kind.startsWith("SQLITE_BUSY") || kind.startsWith("SQLITE_LOCKED") ? DB_BUSY : kind.startsWith("SQLITE_") ? DB_UNREADABLE : undefined);
+
+/** R393 a: an item's failure of the given kind, as the report says it. */
+export function failedReason(kind: string): string {
+  const t = causeText(kind);
+  if (!t) return `The item could not be imported: an unexpected error (${kind}).`;
+  return `The item could not be imported: ${t.item}.${t.itemAction ? ` ${t.itemAction}` : ""}`;
+}
+
+/** R393 a: the note of a batch stopped by an error of the given kind. */
+export function stoppedNote(kind: string): string {
+  const t = causeText(kind);
+  if (!t) return `The import stopped because of an unexpected error (${kind}); resume the batch to continue.`;
+  return `The import stopped because ${t.batch}; ${t.batchAction ?? "resume the batch to continue"}.`;
+}
+
+/** Every note `stoppedNote` writes (and the one written before R393): a resumed run drops them. */
+const STOPPED_NOTE = /^The import stopped because .*; .*resume the batch to continue\.$/u;
+
+/**
+ * R393 b: an unexpected error for the log — its kind, code, syscall and errno, and the program's stack frames (the
+ * lines that start with "at"); never its message, which may hold a path, a title or a name.
+ */
+export function errorForLog(err: unknown): string {
+  const e = (err ?? {}) as { code?: unknown; syscall?: unknown; errno?: unknown; name?: unknown; stack?: unknown };
+  const parts = [`kind=${causeOf(err)}`];
+  if (err instanceof Error) parts.push(`class=${CLASS_FORM.test(err.name) ? err.name : "Error"}`);
+  if (typeof e.code === "string" && CODE_FORM.test(e.code)) parts.push(`code=${e.code}`);
+  if (typeof e.syscall === "string" && /^[a-z_]{1,32}$/u.test(e.syscall)) parts.push(`syscall=${e.syscall}`);
+  if (typeof e.errno === "number") parts.push(`errno=${e.errno}`);
+  const frames = typeof e.stack === "string" ? e.stack.split("\n").filter((l) => /^\s+at /u.test(l)).slice(0, 20) : [];
+  return [parts.join(" "), ...frames].join("\n");
+}
+
+/**
  * Why a batch was refused, for callers that map it (R106): `denied` the project's rules; `running`
  * the batch is running (or being paused or undone) now; `finished` it has already finished or been
  * undone; `locked` the project is locked (R108); `invalid` the options, the source or the record.
@@ -803,6 +903,9 @@ class Run {
     runListeners.set(this.rec.id, (line) => this.latest.set(line.key, line));
     const watchdog = new PatternWatchdog(this.rec.options.fileNamePatterns, this.deps.patternBudgetMs ?? PATTERN_BUDGET_MS);
     let state: BatchState = "finished";
+    // R393: a stop of an earlier run of this batch is no longer the news; this run says its own.
+    this.rec.notes = this.rec.notes.filter((n) => !STOPPED_NOTE.test(n));
+    delete this.rec.stopCause;
     try {
       const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, (id) => hasSource(this.repo, this.projectId, id));
       this.dedupe = dedupe;
@@ -894,9 +997,11 @@ class Run {
             ? "The project was locked during the import; unlock it and resume the batch."
             : err instanceof BatchRefusedError || err instanceof PolicyDeniedError
               ? err.reason
-              : "The import stopped because of an unexpected error; resume the batch to continue.",
+              : stoppedNote(causeOf(err)),
         );
-        this.deps.debug?.(`bulk import stopped: ${err instanceof Error ? err.name : "error"}`);
+        // R393 a, b: the stopping error's kind is kept with the batch and logged with the program's stack.
+        if (!(err instanceof ProjectLockedError || err instanceof BatchRefusedError || err instanceof PolicyDeniedError)) this.rec.stopCause = causeOf(err);
+        this.deps.debug?.(`bulk import stopped: ${errorForLog(err)}`);
       }
     } finally {
       await watchdog.close();
@@ -929,7 +1034,7 @@ class Run {
       await this.checkpoint(state, true);
       await writeBatchReport(this.repo, this.projectId, this.rec.id);
     } catch (err) {
-      this.deps.debug?.(`bulk import: the batch record could not be saved (${err instanceof Error ? err.name : "error"})`);
+      this.deps.debug?.(`bulk import: the batch record could not be saved: ${errorForLog(err)}`);
     } finally {
       runListeners.delete(this.rec.id);
       active.delete(this.rec.id);
@@ -992,9 +1097,11 @@ class Run {
     if (err instanceof UnsafeFileError) return failed(REASONS.unsafe);
     if (err instanceof ProjectLockedError) throw err;
     if ((err as Error)?.name === "AbortError") throw err;
-    if (err instanceof NotFoundError) return failed(REASONS.failed);
-    this.deps.debug?.(`bulk import item failed: ${err instanceof Error ? err.name : "error"}`);
-    return failed(REASONS.failed);
+    // Anything else is unexpected (R393 a, b): the line keeps its kind and the report says it; the log gets the
+    // kind and the program's stack, never the error's message (it may hold a path, a title or a name).
+    const cause = causeOf(err);
+    this.deps.debug?.(`bulk import item failed: ${errorForLog(err)}`);
+    return this.queue({ key: item.key, outcome: "failed", reason: failedReason(cause), cause });
   }
 
   /**
@@ -1646,6 +1753,7 @@ class Run {
       if (needOcr.length) await this.ocr(needOcr);
     } catch (err) {
       if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError") throw err;
+      if (!(err instanceof PolicyDeniedError)) this.deps.debug?.(`bulk import group store failed, storing item by item: ${errorForLog(err)}`);
       // The group as a whole was refused (e.g. the rules changed during the run) or failed: each
       // item on its own, so only the items concerned fail, each with its own audited decision.
       dedupe.dropPending(group.map((q) => q.placeholder));
