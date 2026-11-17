@@ -559,6 +559,85 @@ describe("one request at a time (R379, I3)", () => {
   });
 });
 
+describe("deleting a session asks first (R379, I4)", () => {
+  const TITLE = "Delete the session of 2026-01-02, Lima";
+  let linked = false;
+  beforeEach(() => {
+    linked = false;
+    db.sessions.push({ id: id(), date: "2026-01-02", place: "Lima", notes: "Market stalls", participantIds: [] });
+    server.use(
+      http.delete(P("/sessions/:fid"), ({ params }) => {
+        db.calls.push({ method: "DELETE", path: `/sessions/${String(params.fid)}`, body: undefined });
+        if (linked) return HttpResponse.json({ error: { code: "CONFLICT", message: "The session of 2026-01-02 cannot be deleted: 1 source still links to it. Remove those links first" } }, { status: 409 });
+        db.sessions = db.sessions.filter((x) => x.id !== params.fid);
+        return HttpResponse.json({ deleted: true });
+      }),
+    );
+  });
+  const deletes = () => db.calls.filter((c) => c.method === "DELETE").length;
+  async function opener() {
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    return within(await screen.findByRole("region", { name: "Sessions" })).findByRole("button", { name: "Delete the session of 2026-01-02" });
+  }
+
+  it("one click opens the question, worded like the participant's; nothing is sent", async () => {
+    const user = userEvent.setup();
+    await user.click(await opener());
+    const dialog = screen.getByRole("dialog", { name: TITLE });
+    expect(dialog.textContent).toMatch(/The session of 2026-01-02 in Lima will be deleted, with its date, place and notes/);
+    expect(within(dialog).getByRole("button", { name: "Delete session" })).toBeTruthy();
+    expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: TITLE }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(deletes()).toBe(0);
+  });
+
+  it("Enter held on the button: the dialog, on its heading; nothing is sent", async () => {
+    const btn = await opener();
+    btn.focus();
+    await userEvent.setup().keyboard("{Enter>5}{/Enter}{Enter}");
+    const dialog = screen.getByRole("dialog", { name: TITLE });
+    expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: TITLE }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(deletes()).toBe(0);
+  });
+
+  it("confirm: exactly one DELETE; focus goes to the Sessions heading", async () => {
+    const user = userEvent.setup();
+    await user.click(await opener());
+    const confirm = within(screen.getByRole("dialog", { name: TITLE })).getByRole("button", { name: "Delete session" });
+    await user.click(confirm);
+    fireEvent.click(confirm);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(within(section("Sessions")).queryByRole("button", { name: "Delete the session of 2026-01-02" })).toBeNull());
+    expect(deletes()).toBe(1);
+    await waitFor(() => expect(document.activeElement).toBe(within(section("Sessions")).getByRole("heading", { name: "Sessions" })));
+  });
+
+  it("Cancel or Escape: nothing is sent, focus back on the button", async () => {
+    const user = userEvent.setup();
+    const btn = await opener();
+    await user.click(btn);
+    await user.click(within(screen.getByRole("dialog", { name: TITLE })).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(btn);
+    await user.click(btn);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(btn);
+    expect(deletes()).toBe(0);
+  });
+
+  it("a session something links to says why, as before; the session stays", async () => {
+    linked = true;
+    const user = userEvent.setup();
+    await user.click(await opener());
+    await user.click(within(screen.getByRole("dialog", { name: TITLE })).getByRole("button", { name: "Delete session" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/cannot be deleted: 1 source still links to it/);
+    expect(within(section("Sessions")).getByRole("button", { name: "Delete the session of 2026-01-02" })).toBeTruthy();
+    expect(deletes()).toBe(1);
+  });
+});
+
 describe("R362 h: a consent's scope typed in an encrypted project", () => {
   const SCOPE_NOTE = "In an encrypted project this text can be read without the passphrase. Do not put a person's name in it.";
   const describedText = (el: HTMLElement) =>

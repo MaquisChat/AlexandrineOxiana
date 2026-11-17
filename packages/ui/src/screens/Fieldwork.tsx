@@ -6,7 +6,7 @@
  * nothing is deleted. A participant or session can be deleted only when nothing links to it (asked
  * first); otherwise the service says what still does.
  */
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { ConsentRecord, GovernanceApi, Participant, Session } from "../api/governance";
 import { ApiClientError } from "../api/client";
 import { FileDrop } from "../components/FileDrop";
@@ -16,11 +16,14 @@ import { UserText } from "../components/UserText";
 import { inAppLink, PATHS } from "../navigation";
 import "./GovernanceScreens.css";
 
-function Section({ title, children }: { title: string; children: ReactNode }) {
+/** `headingRef`: the heading can take focus (tabIndex -1), e.g. after what had it was deleted. */
+function Section({ title, children, headingRef }: { title: string; children: ReactNode; headingRef?: RefObject<HTMLHeadingElement | null> }) {
   const id = useId();
   return (
     <section className="ao-card" aria-labelledby={id}>
-      <h2 id={id}>{title}</h2>
+      <h2 id={id} ref={headingRef} tabIndex={headingRef ? -1 : undefined}>
+        {title}
+      </h2>
       {children}
     </section>
   );
@@ -96,6 +99,14 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
   const [result, setResult] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Participant | null>(null);
+  /** The session whose deletion is asked about (R379, I4: never deleted at one press). */
+  const [deletingSession, setDeletingSession] = useState<Session | null>(null);
+  const sessionsHeading = useRef<HTMLHeadingElement>(null);
+  /** Bumped after a session was deleted: focus goes to the Sessions heading (its button is gone). */
+  const [sessionGone, setSessionGone] = useState(0);
+  useEffect(() => {
+    if (sessionGone) sessionsHeading.current?.focus();
+  }, [sessionGone]);
   const [busy, setBusy] = useState(false);
   const [withdrawing, setWithdrawing] = useState<ConsentRecord | null>(null);
   /** A dropped form the service refused because it was detached from this record before (R119): offered for an explicit re-attach. */
@@ -226,7 +237,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
         <p className="ao-hint">Each participant gets the next code (P-001, P-002, …). A code is never changed or given to anyone else; identifying details stay out of citations and file names.</p>
       </Section>
 
-      <Section title="Sessions">
+      <Section title="Sessions" headingRef={sessionsHeading}>
         <ul className="ao-list">
           {sessions.map((s) =>
             editing === s.id ? (
@@ -253,7 +264,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
                 <button type="button" aria-label={`Edit the session of ${s.date}`} onClick={() => setEditing(s.id)}>
                   Edit
                 </button>
-                <button type="button" aria-label={`Delete the session of ${s.date}`} onClick={() => void run(async () => void (await api.deleteSession(projectId, s.id)))}>
+                <button type="button" aria-label={`Delete the session of ${s.date}`} disabled={busy} onClick={() => setDeletingSession(s)}>
                   Delete
                 </button>
               </li>
@@ -453,6 +464,37 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
           <p>
             <UserText>{deleting.code}</UserText> will be deleted. Its code is retired and never given to anyone else. A participant that consent records, sessions, sources or the
             pseudonym map refer to cannot be deleted; withdraw their consent instead.
+          </p>
+        </ChoiceDialog>
+      ) : null}
+
+      {deletingSession ? (
+        <ChoiceDialog
+          title={`Delete the session of ${deletingSession.date}${deletingSession.place ? `, ${deletingSession.place}` : ""}`}
+          action="Delete session"
+          busy={busy}
+          onCancel={() => setDeletingSession(null)}
+          onConfirm={() => {
+            const s = deletingSession;
+            let gone = false;
+            void run(async () => {
+              await api.deleteSession(projectId, s.id);
+              gone = true;
+            }).finally(() => {
+              setDeletingSession(null);
+              if (gone) setSessionGone((n) => n + 1);
+            });
+          }}
+        >
+          <p>
+            The session of <UserText>{deletingSession.date}</UserText>
+            {deletingSession.place ? (
+              <>
+                {" "}
+                in <UserText>{deletingSession.place}</UserText>
+              </>
+            ) : null}{" "}
+            will be deleted, with its date, place and notes. A session that sources refer to cannot be deleted.
           </p>
         </ChoiceDialog>
       ) : null}
