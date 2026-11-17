@@ -183,7 +183,9 @@ export async function captureBrowserPage(
     const identifiable = policy?.identifiability.containsIdentifiable ?? true;
     const legalBasis = text(input.legalBasis, 2000) ?? policy?.consent.defaultLegalBasis?.["social-media"]?.trim() ?? undefined;
     const social = c.platform !== "other";
-    const title = ex.caption?.split("\n")[0]?.slice(0, 500) || (c.postId ? `${c.platform} post ${c.postId}` : url.hostname + url.pathname);
+    // The title (and so the folder name) from the CLEANED address: a `;jsessionid=…` in the path never reaches it (R391 a).
+    const shown = URL.canParse(c.canonicalUrl) ? new URL(c.canonicalUrl) : undefined;
+    const title = ex.caption?.split("\n")[0]?.slice(0, 500) || (c.postId ? `${c.platform} post ${c.postId}` : shown ? shown.hostname + shown.pathname : url.hostname);
     const day = ex.postedAt ? DAY.exec(ex.postedAt)?.[1] : undefined;
     const draft: SourceDraft = {
       projectIds: [projectId],

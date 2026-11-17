@@ -252,7 +252,7 @@ describe("the stored address holds no credentials and no secret parameters (R379
   });
 
   it("ordinary parameters stay, in their order, so the address still leads to the page", () => {
-    expect(classifyUrl("https://user:pw@example.org/a/b?id=7&token=T0K&page=2&utm_source=x&lang=en#top").canonicalUrl).toBe("https://example.org/a/b?id=7&page=2&lang=en");
+    expect(classifyUrl("https://user:pw@example.org/a/b?id=7&token=aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY&page=2&utm_source=x&lang=en#top").canonicalUrl).toBe("https://example.org/a/b?id=7&page=2&lang=en");
   });
 
   const SECRET_PARAMS = [
@@ -260,7 +260,7 @@ describe("the stored address holds no credentials and no secret parameters (R379
     "sessionid", "PHPSESSID", "jsessionid", "access_token", "id_token", "refresh_token", "password", "client_secret", "AWSAccessKeyId",
   ];
   it.each(SECRET_PARAMS)("the parameter %s goes", (name) => {
-    const c = classifyUrl(`https://files.example.org/doc.pdf?id=7&${name}=S3CR3T&page=2`);
+    const c = classifyUrl(`https://files.example.org/doc.pdf?id=7&${name}=aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY&page=2`);
     expect(c.canonicalUrl).toBe("https://files.example.org/doc.pdf?id=7&page=2");
   });
 
@@ -270,9 +270,9 @@ describe("the stored address holds no credentials and no secret parameters (R379
 
   it("a user name alone goes too, on every platform's unrecognised path", () => {
     expect(classifyUrl("https://ana@example.org/x").canonicalUrl).toBe("https://example.org/x");
-    expect(classifyUrl("https://ana:pw@www.youtube.com/feed/trending?token=T").canonicalUrl).toBe("https://www.youtube.com/feed/trending");
+    expect(classifyUrl("https://ana:pw@www.youtube.com/feed/trending?token=aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY").canonicalUrl).toBe("https://www.youtube.com/feed/trending");
     expect(classifyUrl("https://ana:pw@www.instagram.com/explore/?sessionid=S").canonicalUrl).toBe("https://www.instagram.com/explore/");
-    expect(classifyUrl("https://ana:pw@www.tiktok.com/t/ZTabc/?sig=S").canonicalUrl).toBe("https://www.tiktok.com/t/ZTabc/");
+    expect(classifyUrl("https://ana:pw@www.tiktok.com/t/ZTabc/?sig=aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY").canonicalUrl).toBe("https://www.tiktok.com/t/ZTabc/");
   });
 
   it("platform addresses are unchanged", () => {
@@ -281,5 +281,98 @@ describe("the stored address holds no credentials and no secret parameters (R379
     expect(classifyUrl("https://www.tiktok.com/@someone/video/7234567890").canonicalUrl).toBe("https://www.tiktok.com/@someone/video/7234567890");
     expect(classifyUrl("https://www.instagram.com/p/Cabc123/").canonicalUrl).toBe("https://www.instagram.com/p/Cabc123/");
     expect(classifyUrl("https://vm.tiktok.com/ZMabc/").canonicalUrl).toBe("https://vm.tiktok.com/ZMabc/");
+  });
+});
+
+describe("two classes of secret name, in the query and in path parameters (R391 a; review I1, M1)", () => {
+  const HEX32 = "5f2b8c9e0a1d4e7f9b3c6a8d2e1f0b7c";
+  const MIXED32 = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY";
+  const clean = (u: string) => classifyUrl(u).canonicalUrl;
+
+  it("the review's probes: a path session id, a phpBB sid, a Zoom passcode and a OneDrive share key go", () => {
+    expect(clean("https://forum.example.org/app;jsessionid=JSESSPATH1/viewtopic.php?t=2&sid=" + HEX32)).toBe("https://forum.example.org/app/viewtopic.php?t=2");
+    expect(clean("https://us02web.zoom.us/j/8512345678?pwd=" + MIXED32)).toBe("https://us02web.zoom.us/j/8512345678");
+    expect(clean("https://onedrive.live.com/redir?resid=ABC&authkey=!ONEDRIVEKEY1")).toBe("https://onedrive.live.com/redir?resid=ABC");
+  });
+
+  // Names that are always a secret: dropped whatever the value, in any case, in the query or as a path parameter.
+  const ALWAYS = [
+    "jsessionid", "JSESSIONID", "phpsessid", "PHPSESSID", "sessionid", "session_id", "sessionId", "SessionID",
+    "accesstoken", "access_token", "accessToken", "authtoken", "AuthToken", "sessiontoken", "session-token", "idtoken", "id_token",
+    "refresh_token", "csrftoken", "xsrf-token", "bearer_token", "authkey", "AuthKey", "apikey", "api_key", "access_key", "secret_key",
+    "private_key", "client_secret", "clientSecret", "password", "PassWord", "passwd", "secret", "bearer", "jwt", "credential",
+    "credentials", "otp", "passcode", "X-Amz-Signature", "x-amz-credential", "X-Amz-Security-Token", "Key-Pair-Id", "AWSAccessKeyId",
+    "csrf", "nonce",
+  ];
+  it.each(ALWAYS)("%s goes from the query and from the path, even with a short value", (name) => {
+    expect(clean(`https://ex.example.org/a/b?id=7&${name}=12&page=2`)).toBe("https://ex.example.org/a/b?id=7&page=2");
+    expect(clean(`https://ex.example.org/a;${name}=12/b;v=1?id=7`)).toBe("https://ex.example.org/a/b;v=1?id=7");
+  });
+
+  // Names that are also ordinary words (and the review's short forms): dropped only with a key-shaped value.
+  const ORDINARY = [
+    "token", "Token", "TOKEN", "tOkEn", "tokens", "auth", "session", "sid", "SID", "signature", "Signature", "sig", "pwd", "pass",
+    "key", "code", "hash", "ticket", "sess", "sessid", "CFID", "CFTOKEN", "apitoken", "usertoken", "sharetoken", "csrfmiddlewaretoken",
+    "oauth_verifier", "subscription-key", "form_session", "pageToken",
+  ];
+  it.each(ORDINARY)("%s goes with a key-shaped value, in the query and as a path parameter", (name) => {
+    for (const v of [HEX32, MIXED32]) {
+      expect(clean(`https://ex.example.org/a/b?id=7&${name}=${v}&page=2`)).toBe("https://ex.example.org/a/b?id=7&page=2");
+      expect(clean(`https://ex.example.org/a;${name}=${v}/b?id=7`)).toBe("https://ex.example.org/a/b?id=7");
+    }
+  });
+
+  it("the review's M1 examples stay as written", () => {
+    for (const u of [
+      "https://conf.example.org/programme.php?session=12",
+      "https://parl.example.org/bills?session=2023-24",
+      "https://conftool.example.org/index.php?page=browse&form_session=356",
+      "https://corpus.example.org/search?token=verb",
+      "https://archive.example.org/item?signature=MS-123",
+      "https://uni.example.org/course?code=CS101",
+      "https://ex.example.org/x?key=value",
+      "https://ex.example.org/x?sid=7&pwd=x&ticket=42&hash=abc",
+      "https://ex.example.org/a;v=1;page=3/b",
+    ]) expect(clean(u), u).toBe(u);
+  });
+
+  it("their twins with key-shaped values go", () => {
+    expect(clean("https://maps.example.org/api?key=AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY&q=x")).toBe("https://maps.example.org/api?q=x");
+    expect(clean("https://ex.example.org/cb?code=4/0AX4XfWhAbCdEfGhIjKlMnOpQrStUvWxYz0123456789&state=1")).toBe("https://ex.example.org/cb?state=1");
+    expect(clean("https://ex.example.org/cb?code=4%2F0AX4XfWhAbCdEfGhIjKlMnOpQrStUvWxYz0123456789&state=1")).toBe("https://ex.example.org/cb?state=1");
+    expect(clean(`https://forum.example.org/viewtopic.php?t=2&sid=${HEX32}`)).toBe("https://forum.example.org/viewtopic.php?t=2");
+    expect(clean(`https://ex.example.org/j/1?pwd=${MIXED32}`)).toBe("https://ex.example.org/j/1");
+    expect(clean(`https://conf.example.org/programme.php?session=${HEX32}`)).toBe("https://conf.example.org/programme.php");
+    expect(clean("https://cdn.example.org/f.pdf?Signature=Nql641NHEUkUaXQHZINK1FZ~SYeUSoBJMxjdgqrzIdzV2gyEXPDNv0pYdWJkfl&x=1")).toBe("https://cdn.example.org/f.pdf?x=1");
+    expect(clean("https://ex.example.org/x?Token=aB3dE5fG7hJ9kL1mN3pQ5r&TOKEN=aB3dE5fG7hJ9kL1mN3pQ5s&tOkEn=aB3dE5fG7hJ9kL1mN3pQ5t&k=1")).toBe("https://ex.example.org/x?k=1");
+  });
+
+  it("a value shaped like a signed token goes whatever its name", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl";
+    expect(clean(`https://ex.example.org/x?state=${jwt}&p=1`)).toBe("https://ex.example.org/x?p=1");
+    expect(clean(`https://ex.example.org/a;s=${jwt}/b`)).toBe("https://ex.example.org/a/b");
+    expect(clean("https://ex.example.org/x?v=eyJ.notatoken")).toBe("https://ex.example.org/x?v=eyJ.notatoken");
+  });
+
+  it("platform addresses are unchanged", () => {
+    expect(clean(`https://www.youtube.com/watch?v=dQw4w9WgXcQ&sid=${HEX32}`)).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    expect(clean("https://www.instagram.com/reel/Cabc123/?igsh=abc")).toBe("https://www.instagram.com/reel/Cabc123/");
+    expect(clean("https://www.tiktok.com/@someone/video/7234567890?is_from_webapp=1")).toBe("https://www.tiktok.com/@someone/video/7234567890");
+  });
+});
+
+describe("removing a parameter leaves the rest of the query as written (R391 b; review M2)", () => {
+  const KEY = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY";
+  it("the review's probe: the kept pairs byte for byte, in order", () => {
+    expect(classifyUrl(`https://ex.example.org/p?print&ids=1,2,3&path=/a/b&q=a%20b&t=~x&token=${KEY}`).canonicalUrl).toBe("https://ex.example.org/p?print&ids=1,2,3&path=/a/b&q=a%20b&t=~x");
+    expect(classifyUrl("https://ex.example.org/p?q=a+b&utm_source=x&empty=&print").canonicalUrl).toBe("https://ex.example.org/p?q=a+b&empty=&print");
+  });
+
+  it("10,000 parameters are cleaned in one pass, well under a second", () => {
+    const q = Array.from({ length: 10_000 }, (_, i) => (i % 2 ? `p${i}_token=${KEY}` : `utm_x${i}=1`)).join("&");
+    const t0 = performance.now();
+    const c = classifyUrl(`https://ex.example.org/p?keep=1&${q}`);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(c.canonicalUrl).toBe("https://ex.example.org/p?keep=1");
   });
 });

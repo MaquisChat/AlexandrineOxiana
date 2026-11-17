@@ -10,3 +10,7 @@ export declare const PRESCAN_LIMITS: { depth: number; attributes: number; elemen
 export declare class SnapshotRefused extends Error {}
 export declare const SECRET_WORDS: ReadonlySet<string>;
 export declare const KEY_PREFIXES: ReadonlySet<string>;
+export declare const TOKEN_PREFIXES: ReadonlySet<string>;
+export declare const SIGNED_LINK_NAMES: ReadonlySet<string>;
+export declare const ORDINARY_WORDS: ReadonlySet<string>;
+export declare function secretName(name: string, value?: string): boolean;

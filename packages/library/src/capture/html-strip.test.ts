@@ -5,9 +5,15 @@
  */
 import { parse } from "parse5";
 import { describe, expect, it } from "vitest";
-import { KEY_PREFIXES as CORE_KEY_PREFIXES, SECRET_WORDS as CORE_SECRET_WORDS } from "@ao/core";
+import {
+  KEY_PREFIXES as CORE_KEY_PREFIXES,
+  ORDINARY_WORDS as CORE_ORDINARY_WORDS,
+  SECRET_WORDS as CORE_SECRET_WORDS,
+  SIGNED_LINK_NAMES as CORE_SIGNED_LINK_NAMES,
+  TOKEN_PREFIXES as CORE_TOKEN_PREFIXES,
+} from "@ao/core";
 import { BROWSER_CAPTURE_LIMITS, stripHtmlSnapshot } from "./browser-capture.js";
-import { KEY_PREFIXES, SECRET_WORDS } from "./html-strip.mjs";
+import { KEY_PREFIXES, ORDINARY_WORDS, SECRET_WORDS, SIGNED_LINK_NAMES, TOKEN_PREFIXES } from "./html-strip.mjs";
 
 const S = "SECRETX";
 const BYPASSES: Array<[string, string]> = [
@@ -370,5 +376,8 @@ describe("one word rule for secret names (R379)", () => {
   it("the snapshot cleaner's word lists equal core's (it runs as plain JavaScript in a worker and keeps its own copy)", () => {
     expect([...SECRET_WORDS].sort()).toEqual([...CORE_SECRET_WORDS].sort());
     expect([...KEY_PREFIXES].sort()).toEqual([...CORE_KEY_PREFIXES].sort());
+    expect([...TOKEN_PREFIXES].sort()).toEqual([...CORE_TOKEN_PREFIXES].sort());
+    expect([...SIGNED_LINK_NAMES].sort()).toEqual([...CORE_SIGNED_LINK_NAMES].sort());
+    expect([...ORDINARY_WORDS].sort()).toEqual([...CORE_ORDINARY_WORDS].sort());
   });
 });

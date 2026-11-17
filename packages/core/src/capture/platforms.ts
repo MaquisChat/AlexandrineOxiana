@@ -62,19 +62,59 @@ function hostOf(u: URL): string {
   return u.hostname.toLowerCase().replace(/^(www|m|mobile|music)\./, "");
 }
 
+/** A piece of an address decoded for judging (`+` is a space in a query), or as written when its escapes are malformed. */
+function decodePart(s: string, query: boolean): string {
+  const t = query ? s.replace(/\+/g, " ") : s;
+  try {
+    return decodeURIComponent(t);
+  } catch {
+    return t;
+  }
+}
+
+/** True when the raw `name=value` (or bare `name`) part carries a secret (`secretName`, R391) or, in a query, tracks sharing. */
+function dropPart(part: string, query: boolean): boolean {
+  const eq = part.indexOf("=");
+  const name = decodePart(eq < 0 ? part : part.slice(0, eq), query);
+  const value = eq < 0 ? "" : decodePart(part.slice(eq + 1), query);
+  return (query && TRACKING.test(name)) || secretName(name, value);
+}
+
 /**
- * The address as stored and printed (R379; R41 C1, R99 I8: no secret in a stored address): without
- * the user name and password, the fragment, tracking parameters and parameters whose name is
- * secret-like (`secretName`). The path and every other parameter stay, so it still leads to the page.
+ * The path without its secret path parameters (R391 a): in each segment, `;name=value` parts judged by
+ * the same rule as the query and removed when secret (`/app;jsessionid=…/x` → `/app/x`); the rest of
+ * the path is kept as written.
+ */
+function cleanPath(path: string): string {
+  if (!path.includes(";")) return path;
+  return path
+    .split("/")
+    .map((seg) => {
+      if (!seg.includes(";")) return seg;
+      const [head, ...params] = seg.split(";");
+      return [head, ...params.filter((p) => !dropPart(p, false))].join(";");
+    })
+    .join("/");
+}
+
+/**
+ * The query without tracking and secret parameters (R379, R391 b): one pass over the raw `&`-separated
+ * parts; every part kept is kept byte for byte and in its order (no re-serialising).
+ */
+function cleanQuery(search: string): string {
+  if (search.length <= 1) return "";
+  const kept = search.slice(1).split("&").filter((p) => !dropPart(p, true));
+  return kept.length === 0 || (kept.length === 1 && kept[0] === "") ? "" : `?${kept.join("&")}`;
+}
+
+/**
+ * The address as stored and printed (R379, R391; R41 C1, R99 I8: no secret in a stored address):
+ * without the user name and password, the fragment, tracking parameters and secret parameters, in the
+ * query and in the path (`secretName`). The rest of the path and every other parameter stay as
+ * written, so it still leads to the page.
  */
 function stripTracking(u: URL): string {
-  const out = new URL(u.href);
-  out.hash = "";
-  out.username = "";
-  out.password = "";
-  for (const k of [...out.searchParams.keys()]) if (TRACKING.test(k) || secretName(k)) out.searchParams.delete(k);
-  out.hostname = out.hostname.toLowerCase();
-  return out.href;
+  return `${u.protocol}//${u.host.toLowerCase()}${cleanPath(u.pathname)}${cleanQuery(u.search)}`;
 }
 
 /** A handle segment decoded, or undefined when its percent escapes are malformed (R379: not a handle). */

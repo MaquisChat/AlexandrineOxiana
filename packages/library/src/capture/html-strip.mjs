@@ -27,27 +27,73 @@ const URL_ATTRS = new Set([
 ]);
 const SRCSET_ATTRS = new Set(["srcset", "imagesrcset"]);
 const DROP_ATTRS = new Set(["srcdoc", "nonce", "integrity", "formtarget"]);
-// The word rule for secret names is defined in @ao/core (capture/secret-names.ts, R379). This file
-// runs as plain JavaScript in a worker thread, where @ao/core's TypeScript source cannot be loaded,
-// so it keeps a copy of the two lists; html-strip.test.ts keeps them equal to core's.
+// The rule for secret names is defined in @ao/core (capture/secret-names.ts and key-shape.ts, R379,
+// R391). This file runs as plain JavaScript in a worker thread (html-strip-worker.mjs), where @ao/core's
+// TypeScript source cannot be loaded, so it keeps a copy of the lists and the functions;
+// html-strip.test.ts runs both copies over one table of names and values. Here names are judged
+// without a value (an attribute, a form field, a JSON key), so an ordinary word counts as secret.
 export const SECRET_WORDS = new Set([
-  "csrf", "xsrf", "token", "tokens", "auth", "authorization", "authentication", "authenticity", "bearer",
-  "session", "sessionid", "phpsessid", "jsessionid", "password", "passwd", "secret", "signature", "sig", "nonce", "otp", "jwt",
-  "credential", "credentials", "apikey", "accesskey", "privatekey", "secretkey", "cookie", "cookies",
+  "csrf", "xsrf", "authorization", "authentication", "authenticity", "bearer", "sessionid", "phpsessid", "jsessionid",
+  "password", "passwd", "secret", "nonce", "otp", "jwt", "credential", "credentials", "passcode",
+  "apikey", "accesskey", "privatekey", "secretkey", "authkey", "clientsecret", "cookie", "cookies",
 ]);
-export const KEY_PREFIXES = new Set(["api", "access", "private", "secret"]);
+export const KEY_PREFIXES = new Set(["api", "auth", "access", "private", "secret"]);
+export const TOKEN_PREFIXES = new Set(["access", "auth", "id", "refresh", "session", "csrf", "xsrf", "bearer"]);
+export const SIGNED_LINK_NAMES = new Set(["xamzsignature", "xamzcredential", "xamzsecuritytoken", "keypairid"]);
+export const ORDINARY_WORDS = new Set([
+  "token", "tokens", "auth", "session", "sid", "signature", "sig", "pwd", "pass", "key", "code", "hash", "ticket",
+  "sess", "sessid", "cfid", "verifier",
+]);
+const ALWAYS_SUFFIXES = [
+  "secret", "password", "passwd", "sessionid", "passcode", "credential", "credentials",
+  ...[...TOKEN_PREFIXES].flatMap((p) => [`${p}token`, `${p}tokens`]),
+  ...[...KEY_PREFIXES].map((p) => `${p}key`),
+];
+const RUN = 4;
+const HEX_KEY = /^[0-9A-Fa-f]{16,}$/u;
+const MIXED_KEY = /^[A-Za-z0-9_-]{20,}$/u;
+const ASPNET_KEY = /^\((?:[A-Z]\([^()/]+\))+\)$/u;
+const sessionLike = (seg) =>
+  HEX_KEY.test(seg) || (MIXED_KEY.test(seg) && /[a-z]/u.test(seg) && /[A-Z]/u.test(seg) && /\d/u.test(seg)) || ASPNET_KEY.test(seg);
+const keyLikeValue = (value) => {
+  const v = String(value);
+  return sessionLike(v) || v.split(/[^A-Za-z0-9_-]+/u).some(sessionLike);
+};
+const signedTokenValue = (value) => /^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(String(value).trim());
 
 function words(k) {
   return String(k)
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-    .split(/[\s_.:-]+/)
+    .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
     .map((w) => w.toLowerCase());
 }
-function secretName(k) {
+function classOfRun(run) {
+  if (SECRET_WORDS.has(run) || SIGNED_LINK_NAMES.has(run) || ALWAYS_SUFFIXES.some((s) => run.endsWith(s))) return "always";
+  if (ORDINARY_WORDS.has(run) || /tokens?$/u.test(run)) return "ordinary";
+  return "none";
+}
+function nameClass(k) {
   const ws = words(k);
-  return ws.some((w, i) => SECRET_WORDS.has(w) || (w === "key" && i > 0 && KEY_PREFIXES.has(ws[i - 1])));
+  let out = "none";
+  const runs = [];
+  for (let i = 0; i < ws.length; i++) for (let j = i + 1; j <= Math.min(ws.length, i + RUN); j++) runs.push(ws.slice(i, j).join(""));
+  if (ws.length > RUN) runs.push(ws.join(""));
+  for (const r of runs) {
+    const c = classOfRun(r);
+    if (c === "always") return "always";
+    if (c === "ordinary") out = "ordinary";
+  }
+  return out;
+}
+/** True when the name `k` (with its decoded value, when there is one) carries a secret: core's secretName. */
+export function secretName(k, value) {
+  if (value !== undefined && signedTokenValue(value)) return true;
+  const c = nameClass(k);
+  if (c === "always") return true;
+  if (c === "ordinary") return value === undefined || keyLikeValue(value);
+  return false;
 }
 
 /** null: an unsafe scheme (the attribute is dropped); else the URL without query and fragment. */

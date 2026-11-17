@@ -370,7 +370,7 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     // A web page is platform "other": outside a protocol limited to YouTube.
     await expect(captureBrowserPage(kit.repo, scoped.id, input)).rejects.toBeInstanceOf(PolicyDeniedError);
     const open = await makeProject(kit, OPEN_GOV.replace("downloader]", "downloader, browser_capture]"));
-    const r = await captureBrowserPage(kit.repo, open.id, { ...input, extracted: { caption: "Hello", canonicalUrl: "https://example.org/a?token=SECRETTOKEN" } });
+    const r = await captureBrowserPage(kit.repo, open.id, { ...input, extracted: { caption: "Hello", canonicalUrl: "https://example.org/a?token=SECRETTOKENaB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY" } });
     const sf = await kit.repo.getSource(open.id, r.sourceId);
     expect(sf.source.identifiers.platform).toBe("other");
     const page = sf.assets.find((a) => a.kind === "html-snapshot")!;
@@ -390,10 +390,28 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     const all = JSON.stringify(sf) + JSON.stringify(await auditEvents(kit, open));
     for (const bad of ["ana", "hunter2", "SECRETTOKEN", "SESS", "frag"]) expect(all, bad).not.toContain(bad);
     // The token in `url` itself, the extension's own canonical address holding one too.
-    const r2 = await captureBrowserPage(kit.repo, open.id, { url: "https://example.org/a?token=SECRETTOKEN2&x=1", screenshotPng: tinyPng().toString("base64"), extracted: { canonicalUrl: "https://example.org/a?token=SECRETTOKEN3" } });
+    const r2 = await captureBrowserPage(kit.repo, open.id, { url: "https://example.org/a?token=SECRETTOKEN2aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY&x=1", screenshotPng: tinyPng().toString("base64"), extracted: { canonicalUrl: "https://example.org/a?token=SECRETTOKEN3aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY" } });
     const sf2 = await kit.repo.getSource(open.id, r2.sourceId);
     expect(sf2.source.identifiers.url).toBe("https://example.org/a?x=1");
     expect(JSON.stringify(sf2)).not.toMatch(/SECRETTOKEN/);
+  });
+
+  it("a session id in a path parameter or a key-shaped sid reaches neither the stored address, the title nor the folder name (R391 a, review I1)", async () => {
+    const open = await makeProject(kit, OPEN_GOV.replace("downloader]", "downloader, browser_capture]"));
+    const HEX = "5f2b8c9e0a1d4e7f9b3c6a8d2e1f0b7c";
+    const url = `https://forum.example.org/app;jsessionid=JSESSPATH1/viewtopic.php;Sid=${HEX}?t=2&sid=${HEX}&session=12`;
+    const r = await captureBrowserPage(kit.repo, open.id, { url, screenshotPng: tinyPng().toString("base64") });
+    const sf = await kit.repo.getSource(open.id, r.sourceId);
+    expect(sf.source.identifiers.url).toBe("https://forum.example.org/app/viewtopic.php?t=2&session=12");
+    expect(sf.source.provenance.originalUrl).toBe("https://forum.example.org/app/viewtopic.php?t=2&session=12");
+    expect(sf.source.title.variants[0]!.value).toBe("forum.example.org/app/viewtopic.php");
+    const { readdir } = await import("node:fs/promises");
+    const names = (await readdir(kit.lib.root, { recursive: true })).map(String);
+    expect(names.length).toBeGreaterThan(0);
+    for (const bad of ["JSESSPATH1", "jsessionid", HEX]) {
+      expect(names.join("\n"), bad).not.toContain(bad);
+      expect(JSON.stringify(sf) + JSON.stringify(await auditEvents(kit, open)), bad).not.toContain(bad);
+    }
   });
 
   it("scrubPaths removes whole paths with spaces, non-ASCII letters and Windows forms", () => {

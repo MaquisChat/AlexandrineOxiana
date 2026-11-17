@@ -81,4 +81,5 @@ export * from "./citation/index.js";
 export { MAX_ADDRESS_LENGTH, classifyUrl, isCollectionLink, isPostLink, isWebAddress } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
 export { COOKIES_ACKNOWLEDGEMENT } from "./capture/acknowledgement.js";
-export { KEY_PREFIXES, SECRET_WORDS, nameWords, secretName } from "./capture/secret-names.js";
+export { KEY_PREFIXES, ORDINARY_WORDS, SECRET_WORDS, SIGNED_LINK_NAMES, TOKEN_PREFIXES, nameClass, nameWords, secretName } from "./capture/secret-names.js";
+export { ASPNET_KEY, HEX_KEY, MIXED_KEY, keyLikeValue, sessionLike, signedTokenValue } from "./capture/key-shape.js";

@@ -40,6 +40,7 @@
  * host parsed from the address itself — never taken from a service's answer or a setting — and at most
  * WHERE_TO_GET_IT_MAX links in all.
  */
+import { sessionLike } from "@ao/core";
 import { normalizeIsbn13 } from "../index/db.js";
 import type { WorkCandidate } from "./candidates.js";
 import { canonDoi } from "./search.js";
@@ -92,15 +93,9 @@ const addressOk = (u: URL): boolean => hostOk(u.hostname) && u.port !== "0";
 const authorityOf = (u: URL): string => u.host;
 
 /**
- * R328 b, narrowed by R333 b: a path segment that looks like a session's key — 16 or more hexadecimal digits alone, or
- * 20 or more characters of letters, digits, `-` and `_` holding a lower-case letter, an upper-case letter and a digit,
- * or ASP.NET's cookieless form (`(S(…))`, `(A(…)S(…))`, …). A long plain word is not one.
+ * R328 b, narrowed by R333 b: a path segment that looks like a session's key — `sessionLike`, defined once in core
+ * (capture/key-shape.ts, R391) and used there for the stored address's parameter values too.
  */
-const HEX_KEY = /^[0-9A-Fa-f]{16,}$/u;
-const MIXED_KEY = /^[A-Za-z0-9_-]{20,}$/u;
-const ASPNET_KEY = /^\((?:[A-Z]\([^()/]+\))+\)$/u;
-const sessionLike = (seg: string): boolean =>
-  HEX_KEY.test(seg) || (MIXED_KEY.test(seg) && /[a-z]/u.test(seg) && /[A-Z]/u.test(seg) && /\d/u.test(seg)) || ASPNET_KEY.test(seg);
 const holdsSessionKey = (path: string): boolean => path.split("/").some(sessionLike);
 
 /** The labels of an EZproxy hyphenated first label, or null when it does not read as a host with dots. */
