@@ -74,12 +74,16 @@ export function DialogShell({ labelledBy, describedBy, onCancel, busy, className
   );
 }
 
+/** Whether the text holds something a person can see: not only white space and invisible format characters (R421 a). */
+const seen = (t: string): boolean => t.replace(/[\s\p{Cf}]/gu, "") !== "";
+
 export function ReasonDialog({ message, fieldNote, onConfirm, onCancel }: { message: ReactNode; /** Said under the message and tied to both fields (R369 a). */ fieldNote?: string; onConfirm: (reason: string, by: string) => void; onCancel: () => void }) {
   const id = useId();
   const noteId = fieldNote ? `${id}-n` : undefined;
   const [reason, setReason] = useState("");
   const [by, setBy] = useState("");
-  const ok = reason.trim() !== "" && by.trim() !== "";
+  // R421 a: a field of only white space and invisible format characters counts as empty.
+  const ok = seen(reason) && seen(by);
   return (
     <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel}>
       <h2 id={`${id}-t`}>Record a reason</h2>

@@ -324,6 +324,20 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     expect(ev.at(-1)!.details).toMatchObject({ reason: "repairing a damaged rules file", repairedUnreadable: true, rulesFile: "unreadable" });
   });
 
+  it("R421 a: a reason of only white space and invisible characters is no reason (a repair and an ordinary loosening)", async () => {
+    const file = join(kit.lib.root, p.folder, "governance.yaml");
+    const invisible = " \u200B\u2060\uFEFF\u00AD\n";
+    // An ordinary loosening: the current file is OPEN_GOV, the new one turns the audit log off.
+    const looser = `${OPEN_GOV}audit:\n  enabled: false\n`;
+    const base0 = (await kit.repo.getGovernance(p.id)).sha256;
+    await expect(kit.repo.setGovernance(p.id, looser, { baseSha256: base0, reason: invisible })).rejects.toBeInstanceOf(GovernanceLooseningError);
+    await rm(file);
+    const g = await kit.repo.getGovernance(p.id);
+    const err = await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: g.sha256, reason: invisible }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GovernanceLooseningError);
+    expect((err as GovernanceLooseningError).repair).toBe("missing");
+  });
+
   it("R397 a: a missing governance.yaml refuses every other change; readable rules put it back, only with a reason, audited as such", async () => {
     const file = join(kit.lib.root, p.folder, "governance.yaml");
     await rm(file);

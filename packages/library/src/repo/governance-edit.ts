@@ -124,7 +124,9 @@ export async function setGovernance(core: RepoCore, projectId: string, yamlText:
   if (typeof opts?.baseSha256 !== "string" || !/^[0-9a-f]{64}$/.test(opts.baseSha256)) {
     throw new InvalidInputError("the version of the rules this change was made from (baseSha256) is required");
   }
-  const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+  // R421 a: a reason that holds nothing a person can see (white space and invisible format
+  // characters only) is no reason, for a repair and an ordinary loosening alike.
+  const reason = typeof opts.reason === "string" && opts.reason.replace(/[\s\p{Cf}]/gu, "") !== "" ? opts.reason.trim() : "";
   if (reason.length > 2000) throw new InvalidInputError("the reason must be at most 2000 characters");
   const next = parseGovernance(yamlText); // GovernanceParseError for invalid text
   const effective = effectivePolicy(next);

@@ -4,11 +4,11 @@
  * inside, Escape closes, focus returns to the opener, the background is inert while it is open,
  * and all of it holds under StrictMode's double effects.
  */
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { ChoiceDialog, ConfirmDialog } from "./ReasonDialog";
+import { ChoiceDialog, ConfirmDialog, ReasonDialog } from "./ReasonDialog";
 
 function Host({ kind = "choice" }: { kind?: "choice" | "confirm" }) {
   const [open, setOpen] = useState(false);
@@ -165,5 +165,25 @@ describe.each(variants)("ChoiceDialog opened from the keyboard (%s)", (_name, wr
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(opener);
+  });
+});
+
+describe("the reason dialog (R421 a)", () => {
+  it("a reason or an approver of only white space and invisible characters keeps the button off", () => {
+    const onConfirm = vi.fn();
+    render(<ReasonDialog message="Needs a reason." onConfirm={onConfirm} onCancel={() => {}} />);
+    const reason = screen.getByRole("textbox", { name: "Reason" });
+    const by = screen.getByRole("textbox", { name: "Approved by" });
+    const button = screen.getByRole("button", { name: "Record reason" }) as HTMLButtonElement;
+    fireEvent.change(reason, { target: { value: " \u200B\u2060\uFEFF " } });
+    fireEvent.change(by, { target: { value: "Ana" } });
+    expect(button.disabled).toBe(true);
+    fireEvent.change(reason, { target: { value: "Pilot" } });
+    fireEvent.change(by, { target: { value: "\u200B\u00AD" } });
+    expect(button.disabled).toBe(true);
+    fireEvent.submit(button.closest("form")!);
+    expect(onConfirm).not.toHaveBeenCalled();
+    fireEvent.change(by, { target: { value: "Ana" } });
+    expect(button.disabled).toBe(false);
   });
 });

@@ -974,6 +974,17 @@ describe("FR-A18 round 2 (R397 a): a missing or unreadable rules file is said, a
     await repairs(pid, (i) => expect(i).toEqual([MISSING]), { rulesFile: "missing" });
   });
 
+  it("R421 a: a repair whose reason holds only invisible characters is answered as one without a reason", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await rm(await govFile());
+    const g = await call({ url: `/projects/${pid}/governance` });
+    const r = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "\u200B\u2060 \uFEFF" } });
+    expect(r.status, r.body).toBe(400);
+    expect(r.json.error.message).toMatch(/needs a reason/i);
+    expect((await call({ url: `/projects/${pid}/governance` })).json.readable).toBe(false);
+  });
+
   it("a symbolic link that leads nowhere is missing too", async () => {
     await openNewLibrary();
     const pid = await newProject();
