@@ -30,7 +30,7 @@ const DROP_ATTRS = new Set(["srcdoc", "nonce", "integrity", "formtarget"]);
 // The rule for secret names is defined in @ao/core (capture/secret-names.ts and key-shape.ts, R379,
 // R391). This file runs as plain JavaScript in a worker thread (html-strip-worker.mjs), where @ao/core's
 // TypeScript source cannot be loaded, so it keeps a copy of the lists and the functions;
-// html-strip.test.ts runs both copies over one table of names and values. Here names are judged
+// html-strip.test.ts runs both copies over one table of names and values (R391 e). Here names are judged
 // without a value (an attribute, a form field, a JSON key), so an ordinary word counts as secret.
 export const SECRET_WORDS = new Set([
   "csrf", "xsrf", "authorization", "authentication", "authenticity", "bearer", "sessionid", "phpsessid", "jsessionid",

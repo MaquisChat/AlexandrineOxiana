@@ -11,9 +11,10 @@ import {
   SECRET_WORDS as CORE_SECRET_WORDS,
   SIGNED_LINK_NAMES as CORE_SIGNED_LINK_NAMES,
   TOKEN_PREFIXES as CORE_TOKEN_PREFIXES,
+  secretName as coreSecretName,
 } from "@ao/core";
 import { BROWSER_CAPTURE_LIMITS, stripHtmlSnapshot } from "./browser-capture.js";
-import { KEY_PREFIXES, ORDINARY_WORDS, SECRET_WORDS, SIGNED_LINK_NAMES, TOKEN_PREFIXES, cleanUrl } from "./html-strip.mjs";
+import { KEY_PREFIXES, ORDINARY_WORDS, SECRET_WORDS, SIGNED_LINK_NAMES, TOKEN_PREFIXES, cleanUrl, secretName } from "./html-strip.mjs";
 
 const S = "SECRETX";
 const BYPASSES: Array<[string, string]> = [
@@ -397,4 +398,33 @@ describe("the snapshot's address cleaner drops a user name and password too (R39
     expect(cleanUrl("/a/b@c?x")).toBe("/a/b@c");
     expect(cleanUrl("mailto:ana@example.org")).toBe("mailto:ana@example.org");
   });
+});
+
+describe("the two copies of the secret-name rule decide alike, on one table of names and values (R391 e, review M5)", () => {
+  const HEX = "5f2b8c9e0a1d4e7f9b3c6a8d2e1f0b7c";
+  const MIXED = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY";
+  const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl";
+  // [name, value (undefined: judged by the name alone), secret?]
+  const TABLE: Array<[string, string | undefined, boolean]> = [
+    ["access_token", "1", true], ["accessToken", "1", true], ["accesstoken", "1", true], ["ACCESS-TOKEN", "1", true],
+    ["AuthToken", "x", true], ["id_token", "x", true], ["sessionToken", "x", true], ["refresh.token", "x", true],
+    ["X-Amz-Signature", "1", true], ["x-amz-credential", "1", true], ["X-Amz-Security-Token", "1", true], ["Key-Pair-Id", "1", true],
+    ["AWSAccessKeyId", "1", true], ["api_key", "1", true], ["apiKey", "1", true], ["authkey", "1", true], ["client_secret", "1", true],
+    ["clientSecret", "1", true], ["JSESSIONID", "1", true], ["phpsessid", "1", true], ["session_id", "1", true], ["password", "", true],
+    ["adminPassword", "x", true], ["passcode", "1", true], ["otp", "1", true], ["jwt", "1", true], ["csrf:token", "1", true],
+    ["token", "verb", false], ["token", MIXED, true], ["tOkEn", MIXED, true], ["tOkEn", "verb", false], ["session", "12", false],
+    ["session", HEX, true], ["form_session", "356", false], ["sid", HEX, true], ["sid", "7", false], ["pwd", MIXED, true],
+    ["signature", "MS-123", false], ["code", "CS101", false], ["code", "4/0AX4XfWhAbCdEfGhIjKlMnOpQrStUvWxYz0123456789", true],
+    ["key", "value", false], ["key", "AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY", true], ["usertoken", MIXED, true], ["usertoken", "a", false],
+    ["oauth_verifier", MIXED, true], ["subscription-key", HEX, true], ["state", JWT, true], ["state", "abc", false],
+    ["id", HEX, false], ["page", "2", false], ["tokenizer", MIXED, false], ["monkey", MIXED, false], ["keywords", MIXED, false],
+    // The splitting itself: at every character that is not a letter or digit, and at a digit before a capital.
+    ["access~token", "1", true], ["api[key]", "1", true], ["session/id", "1", true], ["api2Key", MIXED, true], ["page2Token", MIXED, true],
+    ["token", undefined, true], ["key", undefined, true], ["code", undefined, true], ["author", undefined, false], ["header_image", undefined, false],
+  ];
+  it.each(TABLE)("%s = %s: %s in both copies", (name, value, secret) => {
+    expect(coreSecretName(name, value)).toBe(secret);
+    expect(secretName(name, value)).toBe(secret);
+  });
+  it("the table is large enough", () => expect(TABLE.length).toBeGreaterThanOrEqual(40));
 });
