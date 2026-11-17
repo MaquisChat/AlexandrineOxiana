@@ -150,7 +150,7 @@
 These are small flaws a researcher could meet but that lose nothing important: wrong or confusing wording, a missing next step in a message, a screen that does not refresh, focus that lands in the wrong place, a few small gaps in what is shown. Examples:
 
 - Creating a library in a Mac folder that holds only the Finder's hidden `.DS_Store` file is refused as "not empty". **Fixing now regardless.**
-- An export of a restored copy can state as fact that a file "was destroyed under the retention rule" when the evidence is unverified. **Fixing now regardless.**
+- An export of a restored copy can state as fact that a file "was destroyed under the retention rule" when the evidence is unverified. (I tried to fix this now; it needs the restore to record more first, so it stays in this list.)
 - A source whose linked original file is missing is treated as already having a file, so Find and acquire never fetches a copy for it. (This was left so on purpose: the file may only be on a drive that is not connected. Say if you want it changed.)
 - The list of collections cannot be opened or closed by clicking its little arrow with a mouse.
 - A project name written right to left flips the whole banner sentence.
