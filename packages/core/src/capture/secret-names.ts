@@ -55,14 +55,17 @@ const ALWAYS_SUFFIXES: readonly string[] = [
   ...[...KEY_PREFIXES].map((p) => `${p}key`),
 ];
 
+/** ALWAYS_SUFFIXES as one pattern (one test per run, R391 b: 10,000 parameters in well under a second). */
+const ALWAYS_END = new RegExp(`(?:${ALWAYS_SUFFIXES.join("|")})$`, "u");
+
 /** The longest run of consecutive words looked at together. */
 const RUN = 4;
 
 /** The words of a name: split at camelCase and at every character that is not a letter or digit, lower-cased. */
 export function nameWords(name: string): string[] {
-  return String(name)
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+  const s = String(name);
+  // The camel-case splits only when there is a capital (most names have none: cheaper, same words).
+  return (/[A-Z]/.test(s) ? s.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2") : s)
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
     .map((w) => w.toLowerCase());
@@ -71,7 +74,7 @@ export function nameWords(name: string): string[] {
 type NameClass = "always" | "ordinary" | "none";
 
 function classOfRun(run: string): NameClass {
-  if (SECRET_WORDS.has(run) || SIGNED_LINK_NAMES.has(run) || ALWAYS_SUFFIXES.some((s) => run.endsWith(s))) return "always";
+  if (SECRET_WORDS.has(run) || SIGNED_LINK_NAMES.has(run) || ALWAYS_END.test(run)) return "always";
   if (ORDINARY_WORDS.has(run) || /tokens?$/u.test(run)) return "ordinary";
   return "none";
 }

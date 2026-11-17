@@ -49,6 +49,7 @@ const ALWAYS_SUFFIXES = [
   ...[...TOKEN_PREFIXES].flatMap((p) => [`${p}token`, `${p}tokens`]),
   ...[...KEY_PREFIXES].map((p) => `${p}key`),
 ];
+const ALWAYS_END = new RegExp(`(?:${ALWAYS_SUFFIXES.join("|")})$`, "u");
 const RUN = 4;
 const HEX_KEY = /^[0-9A-Fa-f]{16,}$/u;
 const MIXED_KEY = /^[A-Za-z0-9_-]{20,}$/u;
@@ -62,15 +63,15 @@ const keyLikeValue = (value) => {
 const signedTokenValue = (value) => /^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(String(value).trim());
 
 function words(k) {
-  return String(k)
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+  const s = String(k);
+  // The camel-case splits only when there is a capital (most names have none: cheaper, same words).
+  return (/[A-Z]/.test(s) ? s.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2") : s)
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
     .map((w) => w.toLowerCase());
 }
 function classOfRun(run) {
-  if (SECRET_WORDS.has(run) || SIGNED_LINK_NAMES.has(run) || ALWAYS_SUFFIXES.some((s) => run.endsWith(s))) return "always";
+  if (SECRET_WORDS.has(run) || SIGNED_LINK_NAMES.has(run) || ALWAYS_END.test(run)) return "always";
   if (ORDINARY_WORDS.has(run) || /tokens?$/u.test(run)) return "ordinary";
   return "none";
 }
