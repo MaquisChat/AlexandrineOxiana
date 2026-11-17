@@ -144,7 +144,12 @@ export async function appendDurable(
     // A write can be cut short (a full disk writes part of it and says how much): the rest is written, and the
     // next write's error (ENOSPC) undoes the whole append below, so no torn line is left (R393 c).
     const bytes = Buffer.from(text, "utf8");
-    for (let off = 0; off < bytes.length; ) off += fs.writeSync(fd, bytes, off, bytes.length - off);
+    for (let off = 0; off < bytes.length; ) {
+      const n = fs.writeSync(fd, bytes, off, bytes.length - off);
+      // R436 f: a write that takes nothing of a non-empty buffer would never end: it fails, and the append is undone.
+      if (n <= 0) throw new Error("a write to the file wrote nothing");
+      off += n;
+    }
     fs.fsyncSync(fd);
   } catch (err) {
     try {

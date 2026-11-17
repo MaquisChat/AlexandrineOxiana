@@ -7,11 +7,27 @@
  * does not exist (it is part of util-linux; not on macOS).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { appendDurable } from "./io.js";
+
+/** R436 f: an injected writer that reports no bytes written (at most `left` times, then it gives up loudly). */
+const writer = vi.hoisted(() => ({ zero: false, calls: 0, left: 0 }));
+vi.mock("node:fs", async (importOriginal) => {
+  const m = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...m,
+    writeSync: ((...a: Parameters<typeof m.writeSync>) => {
+      if (!writer.zero) return (m.writeSync as (...x: unknown[]) => number)(...a);
+      writer.calls++;
+      if (writer.left-- <= 0) throw new Error("the write loop kept spinning");
+      return 0;
+    }) as typeof m.writeSync,
+  };
+});
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TSX = resolve(HERE, "../../../../node_modules/.bin/tsx");
@@ -29,7 +45,25 @@ beforeEach(async () => {
   tmp = await mkdtemp(join(tmpdir(), "ao-append-"));
 });
 afterEach(async () => {
+  writer.zero = false;
   await rm(tmp, { recursive: true, force: true });
+});
+
+describe("appendDurable when a write reports nothing written (R436 f)", () => {
+  it("gives up with an error at the first such write instead of spinning, and leaves the file as it was", async () => {
+    const file = join(tmp, "log.jsonl");
+    await writeFile(file, "first line\n");
+    Object.assign(writer, { zero: true, calls: 0, left: 1000 });
+    const err = await appendDurable(file, "second line\n").then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    writer.zero = false;
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).not.toBe("the write loop kept spinning");
+    expect(writer.calls).toBe(1);
+    expect(await readFile(file, "utf8")).toBe("first line\n");
+  });
 });
 
 /** Runs appendDurable(file, line) in a child whose files may grow to `limit` bytes; what it threw and the file's size. */
