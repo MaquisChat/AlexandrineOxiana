@@ -545,6 +545,28 @@ describe("one request at a time (R379, I3)", () => {
     expect(count("POST", /\/withdraw$/)).toBe(1);
   });
 
+  it("the openers of \"Delete participant\" and \"Delete session\" are disabled while a request runs, and enabled again after it (R399 f)", async () => {
+    db.sessions.push({ id: id(), date: "2026-03-14", place: "Lima", participantIds: [] });
+    const h = hold();
+    server.use(
+      heldPost("/participants", h.gate, () => {
+        const p = { id: id(), code: `P-00${db.participants.length + 1}`, consentIds: [] };
+        db.participants.push(p);
+        return p;
+      }),
+    );
+    await withParticipant();
+    const delP = within(section("Participants")).getByRole("button", { name: "Delete P-001" }) as HTMLButtonElement;
+    const delS = (await within(section("Sessions")).findByRole("button", { name: "Delete the session of 2026-03-14" })) as HTMLButtonElement;
+    expect([delP.disabled, delS.disabled]).toEqual([false, false]);
+    fireEvent.click(within(section("Participants")).getByRole("button", { name: "Add participant" }));
+    await waitFor(() => expect(count("POST", /^\/participants$/)).toBe(1));
+    expect([delP.disabled, delS.disabled]).toEqual([true, true]);
+    h.release();
+    await waitFor(() => expect((within(section("Participants")).getByRole("button", { name: "Delete P-001" }) as HTMLButtonElement).disabled).toBe(false));
+    expect((within(section("Sessions")).getByRole("button", { name: "Delete the session of 2026-03-14" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("a failed \"Add participant\" re-enables it and shows its error as before", async () => {
     server.use(http.post(P("/participants"), async ({ request }) => {
       db.calls.push({ method: "POST", path: "/participants", body: await request.json() });
