@@ -309,6 +309,62 @@ describe("Move library", () => {
     });
   });
 
+  describe("the move's own warnings are shown (R379, I2)", () => {
+    const W1 = "The library.move audit event could not be recorded for project p1; it could not be kept for later either (disk full)";
+    const W2 = "The library.move audit event could not be recorded for project p3; the project is marked as needing attention and the event is recorded when the library is next opened";
+    const HEAD = "The move finished, with these warnings:";
+
+    it("a done line with two warnings shows both under the heading, after the summary", async () => {
+      const user = userEvent.setup();
+      const s = controlledStream();
+      server.use(http.post(url("/libraries/move"), () => s.response()));
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      s.line({ done: true, result: { ...RESULT, warnings: [W1, W2] } });
+      s.end();
+      const ok = await screen.findByRole("status", { name: "Verification" });
+      expect(ok.textContent).toMatch(/^All 120 files were copied and verified\./);
+      const head = await screen.findByText(HEAD);
+      const list = screen.getByRole("list", { name: HEAD });
+      expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual([W1, W2]);
+      expect(head.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(ok.compareDocumentPosition(head) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it("no warnings: no heading", async () => {
+      const user = userEvent.setup();
+      const s = controlledStream();
+      server.use(http.post(url("/libraries/move"), () => s.response()));
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      s.line({ done: true, result: RESULT });
+      s.end();
+      await screen.findByRole("status", { name: "Verification" });
+      expect(screen.queryByText(HEAD)).toBeNull();
+    });
+
+    it("the cut-off path gets them from move/status", async () => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(url("/libraries/move"), () => new HttpResponse("", { headers: { "content-type": "application/x-ndjson" } })),
+        http.get(url("/libraries/move/status"), () => HttpResponse.json({ pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-w", expiresAt: "2026-11-11T10:15:00.000Z", warnings: [W2] }, running: false, failed: null })),
+      );
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      await screen.findByRole("status", { name: "Verification" });
+      expect(within(screen.getByRole("list", { name: HEAD })).getAllByRole("listitem").map((li) => li.textContent)).toEqual([W2]);
+    });
+
+    it("a plan shows each project's decision warnings beside that project", async () => {
+      const user = userEvent.setup();
+      const warned = { ...PLAN.perProject[0]!, decision: { result: "allow_with_conditions", warnings: ["This destination is removable: keep the drive encrypted."] } };
+      const plan = await planFor(user, { ...PLAN, perProject: [warned, PLAN.perProject[1]!] } as unknown as typeof PLAN);
+      const row = within(plan).getByRole("row", { name: /Coastal kinship/ });
+      expect(row.textContent).toMatch(/This destination is removable: keep the drive encrypted\./);
+      expect(within(plan).getByRole("row", { name: /Clinic interviews/ }).textContent).not.toMatch(/removable/);
+    });
+  });
+
   it("matches the finished move by its destination the way the service compares paths (Windows separators and case)", async () => {
     const user = userEvent.setup();
     server.use(

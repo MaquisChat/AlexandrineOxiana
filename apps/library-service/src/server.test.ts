@@ -35,6 +35,7 @@ import { existsSync } from "node:fs";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
 // Test seam of the library (same module instance as @ao/library's): makes overwriting a file fail.
 import { shredSeams } from "../../../packages/library/src/fs/shred.js";
+import { seams as repoSeams } from "../../../packages/library/src/repo/seams.js";
 import * as authModule from "./auth.js";
 import { CREDENTIAL_QUERY_KEYS, IN_LIBRARY_TEXT } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
@@ -2774,5 +2775,25 @@ describe("move/status says what is true after a lost connection (R379, FR-A19)",
     const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "x".repeat(200) } });
     expect(r.status).toBe(400);
     expect((await call({ url: "/libraries/move/status" })).json.running).toBe(false);
+  });
+
+  it("a finished move's warnings are kept with its status, as long as its token (R379, I2)", async () => {
+    let pid = "";
+    await start({ beforeExecuteMove: async () => void (repoSeams.failAuditAppendFor = pid) });
+    await openNewLibrary();
+    pid = await newProject();
+    const dest = join(tmp, "Moved");
+    let moved;
+    try {
+      moved = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    } finally {
+      repoSeams.failAuditAppendFor = undefined;
+    }
+    const done = JSON.parse(moved.body.trim().split("\n").at(-1)!);
+    expect(done.done, moved.body).toBe(true);
+    expect(done.result.warnings.join(" ")).toMatch(/library\.move audit event could not be recorded/);
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st.pending).toMatchObject({ newRoot: dest, confirmToken: done.result.confirmToken, warnings: done.result.warnings });
+    expect(JSON.stringify(st.pending.warnings)).not.toContain(tmp);
   });
 });

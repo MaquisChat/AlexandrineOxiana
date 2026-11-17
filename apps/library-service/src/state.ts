@@ -193,12 +193,17 @@ export interface StateOptions {
 /** How long GET /libraries waits, once, for the reopen at start (D5, I1). */
 export const STARTUP_WAIT_MS = 30_000;
 
-/** A finished move whose old copy may still be deleted: its single-use token, for 15 minutes (R99). */
+/**
+ * A finished move whose old copy may still be deleted: its single-use token, for 15 minutes (R99),
+ * or until the old copy is deleted; with the move's own warnings (scrubbed), so that a screen that
+ * lost the move's stream shows them too (R379, I2).
+ */
 export interface PendingMove {
   oldRoot: string;
   newRoot: string;
   confirmToken: string;
   expiresAt: string;
+  warnings: string[];
 }
 export const MOVE_TOKEN_TTL_MS = 15 * 60_000;
 /**

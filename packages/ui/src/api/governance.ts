@@ -185,6 +185,8 @@ export interface PendingMove {
   newRoot: string;
   confirmToken: string;
   expiresAt: string;
+  /** The finished move's own warnings (R379, I2); absent from an older service. */
+  warnings?: string[];
 }
 
 /**

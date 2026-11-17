@@ -41,7 +41,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
   const [stage, setStage] = useState<Stage>("pick");
   const [plan, setPlan] = useState<MovePlan | null>(null);
   const [progress, setProgress] = useState<MoveProgress | null>(null);
-  const [verified, setVerified] = useState<{ token: string; newRoot: string; message: string } | null>(null);
+  const [verified, setVerified] = useState<{ token: string; newRoot: string; message: string; warnings: string[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [waiting, setWaiting] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -81,7 +81,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
         if (pending && sameRoot(pending.newRoot, target)) {
           setError(null);
           setWaiting(false);
-          setVerified({ token: pending.confirmToken, newRoot: pending.newRoot, message: note });
+          setVerified({ token: pending.confirmToken, newRoot: pending.newRoot, message: note, warnings: pending.warnings ?? [] });
           setStage("verified");
           return;
         }
@@ -151,7 +151,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
           return;
         } else if ("done" in line) {
           const r = line.result;
-          setVerified({ token: r.confirmToken, newRoot: r.newRoot, message: `All ${r.fileCount.toLocaleString("en-US")} files were copied and verified.` });
+          setVerified({ token: r.confirmToken, newRoot: r.newRoot, message: `All ${r.fileCount.toLocaleString("en-US")} files were copied and verified.`, warnings: r.warnings ?? [] });
           setStage("verified");
           return;
         }
@@ -256,7 +256,19 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
                   <td>
                     <UserText>{p.name}</UserText>
                   </td>
-                  <td className={p.decision.result === "deny" ? "ao-deny" : undefined}>{p.decision.result === "deny" ? `Not allowed: ${p.decision.reason ?? ""}` : "Allowed"}</td>
+                  <td className={p.decision.result === "deny" ? "ao-deny" : undefined}>
+                    {p.decision.result === "deny" ? <>Not allowed: <UserText>{p.decision.reason ?? ""}</UserText></> : "Allowed"}
+                    {/* The project's own decision warnings, beside it (R379, I2). */}
+                    {p.decision.warnings?.length ? (
+                      <ul className="ao-warning">
+                        {p.decision.warnings.map((w, i) => (
+                          <li key={i}>
+                            <UserText>{w}</UserText>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -295,6 +307,19 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
             <p role="status" aria-label="Verification" className="ao-ok">
               {verified.message} The library now opens from <UserText>{verified.newRoot}</UserText>.
             </p>
+          ) : null}
+          {/* The move's own warnings (an audit event not recorded among them), never dropped (R379, I2). */}
+          {verified?.warnings.length ? (
+            <div className="ao-warning">
+              <p id={`${ids}-warn`}>The move finished, with these warnings:</p>
+              <ul aria-labelledby={`${ids}-warn`}>
+                {verified.warnings.map((w, i) => (
+                  <li key={i}>
+                    <UserText>{w}</UserText>
+                  </li>
+                ))}
+              </ul>
+            </div>
           ) : null}
           {deletedNote ? <p role="status">{deletedNote}</p> : null}
           {stage !== "deleted" ? (

@@ -232,7 +232,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         return;
       }
       const r = moved;
-      const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken });
+      const warnings = r.warnings.map((w) => scrubPaths(w, state.roots));
+      const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken, warnings });
       // The library now lives at the destination (the move closed the old copy): open it there, retrying once.
       // If it still cannot be opened, what was paused resumes once it is (R106).
       state.resumeWhenOpened(r.newRoot, paused, oldRoot);
@@ -259,7 +260,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       await state.adopt(lib);
       await write({
         done: true,
-        result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) },
+        result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings },
       });
       reply.raw.end();
     } finally {
