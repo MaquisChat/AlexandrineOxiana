@@ -1797,6 +1797,11 @@ impl Library {
     /// id and write it. True when all of it was done.
     fn renew(&self, host: &dyn Host, stay: bool) -> bool {
         host.close_window_and_wait();
+        self.renew_closed(host, stay)
+    }
+
+    /// The emptying after the window's closing has been waited for.
+    fn renew_closed(&self, host: &dyn Host, stay: bool) -> bool {
         let removed = host.remove_data_stores();
         let Some(store) = new_store_id() else { return false };
         let state = DeviceState { stay_signed_in: stay, store, sign_in_hosts: Vec::new() };
@@ -1830,13 +1835,20 @@ impl Library {
     }
 
     /// `sign_out_of_library()`: from the main window only; the emptying now, whether or not the
-    /// store is otherwise kept ("Stay signed in" stays as it was chosen).
+    /// store is otherwise kept ("Stay signed in" stays as it was chosen). When the window is still
+    /// there after the wait (R361), its session lives on with it: the sign-out does not complete —
+    /// the store is not renewed, the sign-in hosts are kept, nothing is written — and it answers
+    /// false, as its other failures do. A later sign-out, once the window has gone, completes.
     pub fn sign_out(&self, host: &dyn Host, caller: &str) -> bool {
         if caller != MAIN {
             return false;
         }
+        host.close_window_and_wait();
+        if host.window_exists() {
+            return false;
+        }
         let stay = self.stay_signed_in() && host.store_can_stay();
-        self.renew(host, stay)
+        self.renew_closed(host, stay)
     }
 
     /// `set_stay_signed_in(on)`: from the main window only; `true` only where the store can be kept
@@ -2989,6 +3001,8 @@ process.stdout.write(JSON.stringify({{
         jobs: Mutex<Vec<Job>>,
         stopping: AtomicBool,
         close_asked: AtomicUsize,
+        /// The window refuses to close within the wait (R361).
+        close_refused: AtomicBool,
         device: Option<PathBuf>,
         can_stay: bool,
         removed: AtomicUsize,
@@ -3008,6 +3022,7 @@ process.stdout.write(JSON.stringify({{
                 jobs: Mutex::default(),
                 stopping: AtomicBool::new(false),
                 close_asked: AtomicUsize::new(0),
+                close_refused: AtomicBool::new(false),
                 device,
                 can_stay,
                 removed: AtomicUsize::new(0),
@@ -3052,7 +3067,9 @@ process.stdout.write(JSON.stringify({{
         }
         fn close_window_and_wait(&self) {
             self.close_asked.fetch_add(1, Ordering::SeqCst);
-            self.exists.store(false, Ordering::SeqCst);
+            if !self.close_refused.load(Ordering::SeqCst) {
+                self.exists.store(false, Ordering::SeqCst);
+            }
         }
         fn emit(&self, event: &LibraryEvent) {
             self.events.lock().unwrap().push(event.clone());
@@ -3788,6 +3805,55 @@ process.stdout.write(JSON.stringify({{
             assert!(lib.open(&host, "main", T4, LINK, Start::Link));
             host.at(OWN_PDF);
             assert!(lib.take_pdf(&host, "main", t0 + Duration::from_secs(90)));
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_sign_out_whose_window_does_not_close_keeps_the_sign_in_hosts_and_does_not_complete() {
+        // R361 (the review's N1 probe), on both platform forms: the window is still there after the
+        // wait, so its session lives on; the store is not renewed and the hosts are kept.
+        for can_stay in [false, true] {
+            let d = tmp(&format!("stuck-{can_stay}"));
+            let path = d.join(DEVICE_FILE);
+            let host = FakeHost::new(Some(path.clone()), can_stay);
+            let lib = Library::default();
+            assert!(lib.at_start(&host));
+            if can_stay {
+                assert!(lib.set_stay(&host, "main", true));
+            }
+            let t0 = Instant::now();
+            library_handed_over(&lib, &host, TICKET, START, t0);
+            let before = lib.lock().device.clone().unwrap();
+            assert_eq!(before.sign_in_hosts, vec!["ezproxy.lib.edu"]);
+            let on_disk = read_device(&path).unwrap();
+            let removed = host.removed.load(Ordering::SeqCst);
+            host.close_refused.store(true, Ordering::SeqCst);
+            assert!(!lib.sign_out(&host, "main"), "the sign-out did not complete (can_stay {can_stay})");
+            assert!(host.window_exists());
+            assert_eq!(lib.lock().device.clone().unwrap(), before, "the hosts, the store and the choice unchanged");
+            assert_eq!(read_device(&path).unwrap(), on_disk, "nothing written");
+            assert_eq!(host.removed.load(Ordering::SeqCst), removed, "no store removed");
+            // A link's start re-using that window: nothing is fetched from the library's host.
+            let later = t0 + Duration::from_secs(30);
+            assert!(lib.open(&host, "main", TICKET2, LINK, Start::Link));
+            assert_eq!(host.created.lock().unwrap().len(), 1, "the window is re-used");
+            lib.page_loaded(&host, &u(OWN_PDF), later);
+            assert_eq!(host.jobs(), 0, "can_stay {can_stay}");
+            host.at(OWN_PDF);
+            assert!(!lib.take_pdf(&host, "main", later));
+            assert_eq!(host.last(), LibraryEvent::refused(Some(TICKET2), State::NotAPdf, Reason::SignIn));
+            assert_eq!(host.jobs(), 0);
+            // Once the window closes, a later sign-out completes as before.
+            host.close_refused.store(false, Ordering::SeqCst);
+            assert!(lib.sign_out(&host, "main"));
+            assert!(!host.window_exists());
+            let after = lib.lock().device.clone().unwrap();
+            assert_eq!(after.sign_in_hosts, Vec::<String>::new());
+            assert_ne!(after.store, before.store);
+            assert_eq!(after.stay_signed_in, can_stay, "the choice stays as it was");
+            assert_eq!(read_device(&path).unwrap(), after);
+            assert_eq!(host.removed.load(Ordering::SeqCst), removed + 1);
             fs::remove_dir_all(d).unwrap();
         }
     }
