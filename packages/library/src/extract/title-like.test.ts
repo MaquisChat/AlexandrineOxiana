@@ -215,11 +215,34 @@ describe("looksLikeTitle (R394 a)", () => {
 });
 
 describe("stock authors (R394 b)", () => {
-  it.each(["Administrator", "admin", "User", "Owner", "Author", "Unknown", "Anonymous", "CamScanner", "Adobe InDesign", "LaTeX with hyperref", "Microsoft Office User", "TeX", "DELL-PC", "JohnsLaptop"])(
+  it.each(["Administrator", "admin", "User", "Owner", "Author", "Unknown", "CamScanner", "Adobe InDesign", "LaTeX with hyperref", "Microsoft Office User", "TeX", "DELL-PC", "JohnsLaptop"])(
     "%j is a stock name",
     (name) => expect(isStockAuthor(name)).toBe(true),
   );
-  it.each(["Maria Lopez", "User Friendly Press", "Okafor, Ngozi", "World Health Organization", "Anonymous Four Collective", "Tex Avery"])("%j is a person's or a body's name", (name) =>
+  // R410 e: program and machine names the review found kept (exact words, a version after a program's name, a Windows machine's default name).
+  it.each([
+    "user1",
+    "DELL",
+    "HP",
+    "Lenovo",
+    "IT Department",
+    "Canon",
+    "Xerox",
+    "ABBYY",
+    "Acrobat",
+    "Adobe Acrobat Pro",
+    "pdfTeX-1.40.21",
+    "Word",
+    "InDesign",
+    "Adobe InDesign CS6 (Macintosh)",
+    "calibre",
+    "Preview",
+    "DESKTOP-ABC123",
+    "SPi",
+    "Aptara",
+    "Arbortext",
+  ])("%j is a stock name (R410 e)", (name) => expect(isStockAuthor(name)).toBe(true));
+  it.each(["Maria Lopez", "User Friendly Press", "Okafor, Ngozi", "World Health Organization", "Anonymous Four Collective", "Tex Avery", "Anonymous", "Will Owner", "Anne Unknown", "Dorothy Pc", "Desktop Publishing Group"])("%j is a person's or a body's name", (name) =>
     expect(isStockAuthor(name)).toBe(false),
   );
   it("keepCreators drops parsed stock names and keeps real ones", () => {

@@ -198,7 +198,6 @@ export const STOCK_AUTHORS: readonly string[] = [
   "owner",
   "author",
   "unknown",
-  "anonymous",
   "default",
   "guest",
   "windows user",
@@ -222,15 +221,39 @@ export const STOCK_AUTHORS: readonly string[] = [
   "quarkxpress",
   "libreoffice",
   "openoffice",
+  // R410 e: machine makers, scanners, office and typesetting programs and services ("Anonymous" is a real attribution
+  // and is kept).
+  "dell",
+  "hp",
+  "lenovo",
+  "it department",
+  "canon",
+  "xerox",
+  "abbyy",
+  "acrobat",
+  "adobe acrobat pro",
+  "word",
+  "indesign",
+  "calibre",
+  "preview",
+  "spi",
+  "aptara",
+  "arbortext",
 ];
 const STOCK_AUTHOR_SET = new Set(STOCK_AUTHORS);
 /** A single word ending in "PC" or "Laptop": a computer's name ("DELL-PC", "JohnsLaptop"). */
 const MACHINE_NAME = /^\S*(?:PC|-pc|_pc|laptop)$/u;
+/** Windows's default computer name ("DESKTOP-ABC123"). */
+const WINDOWS_MACHINE = /^desktop-[a-z0-9]{4,}$/iu;
+/** A version or a platform after a program's name ("user1", "pdfTeX-1.40.21", "Adobe InDesign CS6 (Macintosh)"). */
+const VERSION_SUFFIX = /(?:[-\s]*(?:v?\d[\d.]*|cs\d+))?(?:\s*\([^()]*\))?$/iu;
 
 export function isStockAuthor(raw: string): boolean {
   const s = fold(raw);
   if (!s) return true;
-  return STOCK_AUTHOR_SET.has(s.toLowerCase()) || (!/\s/u.test(s) && (MACHINE_NAME.test(s) || /laptop$/iu.test(s)));
+  const lower = s.toLowerCase();
+  if (STOCK_AUTHOR_SET.has(lower) || STOCK_AUTHOR_SET.has(lower.replace(VERSION_SUFFIX, ""))) return true;
+  return !/\s/u.test(s) && (MACHINE_NAME.test(s) || WINDOWS_MACHINE.test(s) || /laptop$/iu.test(s));
 }
 
 /** The creators without the stock names (R394 b); a parsed name is checked as written ("Given Family") and as a literal. */
