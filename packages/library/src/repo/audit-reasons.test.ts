@@ -11,7 +11,7 @@ import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path";
 import type { AuditEvent, Project } from "@ao/core";
 import { REASON_SEALED_LOCKED, REASON_SEALED_MISMATCH, REASON_SEALED_MISSING } from "@ao/shared";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { attachConsentDocument } from "../consent-docs.js";
 import { OPEN_GOV, PASS, makeKit, makeProject, type Kit } from "../export/test-kit.js";
 import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, libraryReasonLine, sealedReasonLine } from "./audit-reasons.js";
@@ -269,6 +269,82 @@ describe("the keyed digest (R369 b)", () => {
     const { key, keyId } = projectDataKey(kit.repo, p.id)!;
     await writeFile(join(kit.lib.root, LIBRARY_AUDIT_REASONS_FILE), `${libraryReasonLine(key, keyId, p.id, { seq: ev.seq, hash: ev.hash, reasonSha256: sha(old), text: old })}\n`, { flag: "a" });
     expect((await kit.repo.readLibraryAuditPage()).events.find((e) => e.seq === ev.seq)!.reasonShown).toEqual({ state: "text", text: old });
+  });
+});
+
+describe("the guards of the sealed reason (R369 c)", () => {
+  const coreOf = () => (kit.repo as unknown as { core: import("./state.js").RepoCore }).core;
+  const text = reasonText("guarded");
+  /** Details that must be refused beside a sealed reason: the text itself, another text's digest, an unkeyed digest. */
+  const WRONG: Array<[string, (p: Project) => Record<string, unknown>]> = [
+    ["the reason as typed beside its keyed digest", (p) => ({ reason: text, reasonGiven: true, reasonMac: mac(p, text) })],
+    ["another text's keyed digest", (p) => ({ reasonGiven: true, reasonMac: mac(p, "another text") })],
+    ["the unkeyed SHA-256 (R177 b's form)", () => ({ reasonGiven: true, reasonSha256: sha(text) })],
+  ];
+
+  it.each(WRONG)("a change of the project's log is refused when its entry carries %s; nothing is written", async (_what, details) => {
+    const { runMutation } = await import("./mutate.js");
+    const p = await makeProject(kit, GOV, true);
+    const before = await auditBytes(p);
+    const storeBefore = await storeLines(p);
+    await expect(
+      runMutation(coreOf(), p.id, { action: "set-aside", setAside: { reason: text } }, async () => undefined, {
+        op: "attention.set-aside",
+        entity: { type: "project", id: p.id },
+        auditDetails: { ...details(p), mark: { kind: "test" } },
+        sealedReason: text,
+      }),
+    ).rejects.toThrow("a sealed reason needs an audit entry that records only its keyed digest");
+    expect(await auditBytes(p)).toBe(before);
+    expect(await storeLines(p)).toEqual(storeBefore);
+    expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
+  });
+
+  const libraryInput = (p: Project, details: Record<string, unknown>) => ({
+    at: kit.clock.now.toISOString(),
+    actor: coreOf().actor,
+    device: coreOf().device,
+    projectId: p.id,
+    action: "set-aside",
+    entity: { type: "project" as const, id: p.id },
+    decision: { result: "allow" as const },
+    details: { op: "attention.set-aside", ...details, mark: { kind: "test" }, projectLogNotIntact: true },
+  });
+  const libraryState = async () => ({
+    log: await readdir(join(kit.lib.root, "audit"))
+      .then(async (fs) => (await Promise.all(fs.sort().map((f) => readFile(join(kit.lib.root, "audit", f), "utf8")))).join(""))
+      .catch(() => ""),
+    store: await readFile(join(kit.lib.root, LIBRARY_AUDIT_REASONS_FILE), "utf8").catch(() => ""),
+  });
+
+  it.each(WRONG)("an entry of the library's log is refused when it carries %s; nothing is written", async (_what, details) => {
+    const { appendLibraryAuditWithReason } = await import("./library-audit.js");
+    const p = await makeProject(kit, GOV, true);
+    const before = await libraryState();
+    const k = projectDataKey(kit.repo, p.id)!;
+    await expect(coreOf().serial(() => appendLibraryAuditWithReason(coreOf(), libraryInput(p, details(p)), k, text))).rejects.toThrow(
+      "a sealed reason needs an audit entry that records only its keyed digest",
+    );
+    expect(await libraryState()).toEqual(before);
+  });
+
+  it("the library's log: when its entry cannot be appended (in process), the sealed line written for it is taken back at once", async () => {
+    const { appendLibraryAuditWithReason } = await import("./library-audit.js");
+    const { AuditStore } = await import("./audit-store.js");
+    const p = await makeProject(kit, GOV, true);
+    const before = await libraryState();
+    const k = projectDataKey(kit.repo, p.id)!;
+    const spy = vi.spyOn(AuditStore.prototype, "append").mockRejectedValueOnce(new Error("disk full"));
+    try {
+      await expect(coreOf().serial(() => appendLibraryAuditWithReason(coreOf(), libraryInput(p, { reasonGiven: true, reasonMac: mac(p, text) }), k, text))).rejects.toThrow("disk full");
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await libraryState()).toEqual(before);
+    // And the next one is written as usual.
+    await coreOf().serial(() => appendLibraryAuditWithReason(coreOf(), libraryInput(p, { reasonGiven: true, reasonMac: mac(p, text) }), k, text));
+    expect((await libraryState()).store.split("\n").filter((l) => l.trim())).toHaveLength(1);
   });
 });
 
