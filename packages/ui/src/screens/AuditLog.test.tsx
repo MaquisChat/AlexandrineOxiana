@@ -317,6 +317,34 @@ describe("N3, N8: set-asides in the project's log; stale answers and double clic
     expect(row.textContent).toMatch(/Reason: Recorded on paper/);
   });
 
+  it("R362 b: a sealed reason is shown as the service reads it: the text while unlocked, a sentence while locked or when it cannot be shown; never the SHA-256", async () => {
+    const sha = "a".repeat(64);
+    const sealed = { reasonGiven: true, reasonSha256: sha };
+    server.use(
+      http.get(url(`/projects/${PID}/audit`), () =>
+        HttpResponse.json({
+          events: [
+            { ...ev(4), action: "store", entity: { type: "project", id: PID }, details: { op: "project.governance", ...sealed }, reasonShown: { state: "text", text: "IRB amendment 7" } },
+            { ...ev(3), action: "set-aside", entity: { type: "project", id: PID }, decision: { result: "allow" }, details: { op: "attention.set-aside", ...sealed, mark: { kind: "unrecognised", name: "x.json", entry: "file" } }, reasonShown: { state: "locked", message: "A reason was given. It can be read when the project is unlocked." } },
+            { ...ev(2), action: "store", entity: { type: "consent", id: "c" }, details: { op: "consent.document-detach", ...sealed }, reasonShown: { state: "mismatch", message: "A reason was given, but the text kept for it does not match what the audit log recorded, so it is not shown." } },
+            { ...ev(1), action: "store", entity: { type: "consent", id: "c" }, details: { op: "consent.document-detach", reason: "wrong form" } },
+          ],
+          total: 4,
+        }),
+      ),
+    );
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows[0]!.textContent).toMatch(/Reason: IRB amendment 7/);
+    expect(rows[1]!.textContent).toMatch(/A mark was set aside/);
+    expect(rows[1]!.textContent).toMatch(/Reason: A reason was given\. It can be read when the project is unlocked\./);
+    expect(rows[2]!.textContent).toMatch(/does not match what the audit log recorded/);
+    // A reason audited as typed (a project that is not encrypted) is shown as before.
+    expect(rows[3]!.textContent).toMatch(/Reason: wrong form/);
+    expect(table.textContent).not.toContain(sha);
+  });
+
   it("N8: the library's verify button sends one request on a double click", async () => {
     serveAudit(0);
     let calls = 0;

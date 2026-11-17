@@ -191,13 +191,39 @@ function MarkSummary({ mark }: { mark: unknown }) {
   }
 }
 
+/** The operations whose entry carries a reason the researcher typed (R362 b). */
+const REASON_OPS = new Set(["attention.set-aside", "project.governance", "consent.document-detach", "review.withdrawal-reviewed"]);
+
+/**
+ * The reason, as the service reads it (R362 b): the text (through UserText), or, for an encrypted project's sealed
+ * reason it cannot show, its plain sentence. Without a reading (an older service), the reason as audited.
+ */
+function ReasonText({ e }: { e: AuditEvent }) {
+  const r = e.reasonShown;
+  if (r) return r.state === "text" ? <UserText>{r.text}</UserText> : <UserText>{r.message}</UserText>;
+  return <UserText>{String(e.details?.reason ?? "")}</UserText>;
+}
+
 /** For a set-aside event: which mark and the reason (who and when are the row's own columns). */
 function SetAsideDetails({ e }: { e: AuditEvent }) {
   if (e.details?.op !== "attention.set-aside") return null;
   return (
     <>
       {" "}
-      — <MarkSummary mark={e.details.mark} />. Reason: <UserText>{String(e.details.reason ?? "")}</UserText>
+      — <MarkSummary mark={e.details.mark} />. Reason: <ReasonText e={e} />
+    </>
+  );
+}
+
+/** For the other operations that carry a reason: the reason. */
+function OtherReason({ e }: { e: AuditEvent }) {
+  const op = e.details?.op;
+  if (typeof op !== "string" || op === "attention.set-aside" || !REASON_OPS.has(op)) return null;
+  if (!e.reasonShown && typeof e.details?.reason !== "string") return null;
+  return (
+    <>
+      {" "}
+      — Reason: <ReasonText e={e} />
     </>
   );
 }
@@ -509,6 +535,7 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
                   <td>
                     <UserText>{whatOf(e)}</UserText>
                     <SetAsideDetails e={e} />
+                    <OtherReason e={e} />
                   </td>
                   <td className={e.decision?.result === "deny" ? "ao-deny" : undefined}>
                     <Decision e={e} />
