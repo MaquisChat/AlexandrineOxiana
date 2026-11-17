@@ -303,6 +303,7 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
   // project has been unlocked since.
   if (m.unresolved?.length) {
     const still: string[] = [];
+    const added: BackupEntry[] = [];
     let moved = false;
     for (const f of m.unresolved) {
       if (!(await fsp.stat(join(dir, f)).then((x) => x.isFile(), () => false))) {
@@ -312,10 +313,16 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
       const e = await readEntry(repo, f);
       if (e && !m.backups.some((b) => b.file === f)) {
         m.backups.push(e);
+        added.push(e);
         moved = true;
       } else if (e) moved = true;
       else still.push(f);
     }
+    // Read before a lock that came meanwhile: unreadable now, as the rest (R435 e).
+    const back: string[] = [];
+    await asLockedNow(repo, dir, added, back);
+    if (back.length) m.backups = m.backups.filter((b) => !back.includes(b.file));
+    still.push(...back);
     if (moved) {
       if (still.length) m.unresolved = still;
       else delete m.unresolved;
@@ -500,7 +507,24 @@ async function rebuildManifest(repo: Repo): Promise<BackupManifest> {
     if (e) m.backups.push(e);
     else m.unresolved!.push(file);
   }
+  await asLockedNow(repo, dir, m.backups, m.unresolved!);
   return m;
+}
+
+/**
+ * R435 e: a project locked (or being locked) while the manifest was being read: its sealed backups read before the
+ * lock count as unreadable now, as all of them would had it been locked from the start, so the listing is never a
+ * part of its backups (they are read again at the next load, as every unresolved file is). Moves them from
+ * `entries` to `unresolved`.
+ */
+async function asLockedNow(repo: Repo, dir: string, entries: BackupEntry[], unresolved: string[]): Promise<void> {
+  for (const e of [...entries]) {
+    if (!e.encrypted) continue;
+    const keyId = await readKeyId(join(dir, e.file)).catch(() => undefined);
+    if (keyId === undefined || keyFromRing(repo, keyId)) continue;
+    entries.splice(entries.indexOf(e), 1);
+    unresolved.push(e.file);
+  }
 }
 
 /** A backup's manifest entry, read back from its own backup.json (undefined: unreadable now). */

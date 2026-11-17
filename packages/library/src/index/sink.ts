@@ -74,6 +74,10 @@ export async function indexUnlockedProject(
     }
     out.errors.push({ folder: `${entry.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
   }
+  if (!still()) {
+    purgeProject(db, projectId); // locked just after the last read (R435 e): as above
+    return { indexed: 0, errors: [] };
+  }
   return out;
 }
 

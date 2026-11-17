@@ -10,10 +10,16 @@
  * project's integrity warnings unchanged, no file of the library changed (audit, attention, review entries, kept
  * files: the folder is hashed before and after), and after an unlock the same reading gives the unlocked result
  * again (no kept copy, no index row poisoned).
+ *
+ * R435 e: each row is also locked just AFTER its last opening (the lock scheduled by a microtask from it), and a
+ * second way at the first, a middle and the last opening and after the last: through the "locking" MARK, the lock
+ * asked while a change of another project is running (so the key is not yet wiped, and a reader that looks the key up
+ * lazily gets nothing). After every lock the kept copies (the Find queue's, the watched folders' register's) must be
+ * empty. Rows for reading sealed backups: a restore, a listing with the manifest rebuilt, and `backupFilesNow`.
  */
 import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { newId, type Project, type SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -21,10 +27,11 @@ import { addProtocolDocuments, listProtocolDocuments } from "../protocol-docs.js
 import { attachConsentDocument } from "../consent-docs.js";
 import { KeyNotAvailableError } from "../crypto/format.js";
 import { exportBibliography, citeSources } from "../export/bibliography.js";
-import { backupProject } from "../export/backup.js";
+import { BACKUPS_MANIFEST, backupFilesNow, backupProject, listBackups, restoreBackup } from "../export/backup.js";
 import { exportProjectOpenFormats } from "../export/project-export.js";
 import { buildExport, exportRefman } from "../export/refman-export.js";
-import { PASS, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
+import { OPEN_GOV, PASS, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
+import { findCacheSize } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
 import { IndexHandle } from "../index/db.js";
 import { rebuildIndex } from "../index/rebuild.js";
@@ -40,6 +47,7 @@ import { openAssetContent } from "../asset-content.js";
 import { readTranscript } from "../transcript-segments.js";
 import { TRANSCRIBE_KIND, transcriptionRecords } from "../transcription-jobs.js";
 import { ProjectLockedError } from "./errors.js";
+import { RestoreError } from "./restore.js";
 import { encryptBytes } from "./io.js";
 import { readPlain } from "../destruction-record.js";
 import { newAttentionId } from "./attention.js";
@@ -53,9 +61,10 @@ import {
   readFindQueueDetailedIn,
   readFindQueueIn,
   appendFindEntriesIn,
+  importChange,
 } from "./repo.js";
 import { openingSeam } from "./testing.js";
-import type { WatchRegisterEntry } from "./watch-register.js";
+import { watchCacheSize, type WatchRegisterEntry } from "./watch-register.js";
 
 /** The harness's own time limit per row (the machine is shared and heavily loaded). */
 const ROW_MS = 30 * 60_000;
@@ -91,6 +100,11 @@ interface Ctx {
   exportsDir: string;
   /** The project's audit events below this seq are the ones the audit rows read (unlocks append more). */
   auditSeq: number;
+  /** Another project (not encrypted), whose change is held running for the mark path (R435 e). */
+  other: Project;
+  /** The project's sealed backup (in Backups/) and a copy of it outside the library (restored by the restore row). */
+  backupFile: string;
+  backupCopy: string;
 }
 
 interface Row {
@@ -109,6 +123,13 @@ interface Row {
    * read under the wiped key).
    */
   decisionAudited?: string;
+  /** A refusal that is the locked answer of this reading (besides ProjectLockedError / KeyNotAvailableError). */
+  lockedAnswer?: (err: unknown) => boolean;
+  /**
+   * The files this reading writes when the project is locked from the start (a backup manifest listing the sealed
+   * backup as unresolved): the same changes are allowed when the outcome is that locked result.
+   */
+  lockedWrites?: boolean;
 }
 
 let c: Ctx;
@@ -194,38 +215,117 @@ function lockPoints(k: number): number[] {
   return [...out];
 }
 
+/** A lock point: at the Nth opening, or just after it (a microtask from it); by the wipe, or through the mark. */
+interface Point {
+  n: number;
+  after: boolean;
+  mark: boolean;
+}
+
+/**
+ * R435 e: every lock point of the wipe path (at most CAP openings, and just after the last), and for the mark path the
+ * first, a middle and the last opening and just after the last (doubling every point made the run too long).
+ */
+function pointsOf(k: number): Point[] {
+  const out: Point[] = lockPoints(k).map((n) => ({ n, after: false, mark: false }));
+  out.push({ n: k, after: true, mark: false });
+  for (const n of new Set([1, Math.ceil(k / 2), k])) out.push({ n, after: false, mark: true });
+  out.push({ n: k, after: true, mark: true });
+  return out;
+}
+
+/** A change of the other project, held on a gate (the write queue busy): a lock asked meanwhile only MARKS the project. */
+function holdOther(): { release: () => void; done: Promise<void>; inside: Promise<void> } {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let entered!: () => void;
+  const inside = new Promise<void>((r) => (entered = r));
+  const done = importChange(c.kit.repo, c.other.id, { action: "store" as const, store: { identifiable: false, hasLocation: false } }, async () => {
+    entered();
+    await gate;
+  }, { op: "test.held" });
+  return { release, done: done.then(() => undefined), inside };
+}
+
+const keptCopies = () => findCacheSize(c.kit.repo) + watchCacheSize(c.kit.repo);
+
 async function exercise(row: Row): Promise<void> {
   const base = await cold(row);
   if ("err" in base.outcome) throw new Error(`${row.name}: the unlocked reading failed: ${String((base.outcome as { err: unknown }).err)}`);
   const want = base.outcome.ok;
   expect(base.openings, `${row.name} makes no opening with the key`).toBeGreaterThan(0);
   let lockedWant: unknown;
+  let lockedDiff = new Set<string>();
   if (row.locked) {
     await c.kit.repo.lockProject(c.p.id);
     await row.prepare?.(c);
+    const before = await tree(c.kit.lib.root);
     try {
       lockedWant = norm(await row.run(c));
     } catch (err) {
       lockedWant = { lockedRunFailed: String(err) };
     }
+    if (row.lockedWrites) lockedDiff = new Set(treeDiff(before, await tree(c.kit.lib.root)));
     await c.kit.repo.unlockProject(c.p.id, PASS);
   }
   await relock();
   const rowsWant = indexRows();
+  const otherFolder = `Projects/${c.kit.repo.getProject(c.other.id).folder.split("/").pop()}/`;
   const problems: string[] = [];
-  for (const n of lockPoints(base.openings)) {
+  let marked = 0;
+  for (const pt of pointsOf(base.openings)) {
+    const n = pt.n;
     await relock();
     await row.prepare?.(c);
     const warnings = JSON.stringify(c.kit.repo.integrityWarnings);
     const before = await tree(c.kit.lib.root);
     const eventsBefore = (await auditEvents(c.kit, c.p)).length;
+    const helds: Array<ReturnType<typeof holdOther>> = [];
+    let holding = false;
+    let rehold = false;
+    const releaseAll = () => {
+      holding = false;
+      for (const h of helds) h.release();
+    };
+    if (pt.mark) {
+      helds.push(holdOther());
+      await helds[0]!.inside;
+      holding = true;
+    }
     let openings = 0;
     let lock: Promise<void> | undefined;
+    const ask = () => {
+      const size = c.kit.ring.size;
+      lock = c.kit.repo.lockProject(c.p.id);
+      lock.catch(() => {});
+      // The mark path: the key is not wiped at once (it is answered only to the change in progress, which for a
+      // reading made inside its own turn is that reading).
+      if (pt.mark && c.kit.ring.size === size) marked++;
+      if (pt.mark) setTimeout(releaseAll, 300);
+    };
+    // A reading that waits for a turn of its own before (or between) its openings would wait for the held change for
+    // ever: when no opening has come for a while and the lock is not yet asked, the held change is let go, and another
+    // is held from the reading's next opening (before the lock point), so that the lock still finds the queue busy.
+    let seen = -1;
+    const stall = pt.mark
+      ? setInterval(() => {
+          if (!lock && holding && openings === seen) {
+            releaseAll();
+            rehold = true;
+          }
+          seen = openings;
+        }, 500)
+      : undefined;
     openingSeam.onOpen = () => {
       openings++;
+      if (rehold && !lock && openings < n) {
+        rehold = false;
+        holding = true;
+        helds.push(holdOther());
+      }
       if (openings === n) {
-        lock = c.kit.repo.lockProject(c.p.id);
-        lock.catch(() => {});
+        if (pt.after) queueMicrotask(ask);
+        else ask();
       }
     };
     let outcome: { ok: unknown } | { err: unknown };
@@ -235,20 +335,29 @@ async function exercise(row: Row): Promise<void> {
       outcome = { err };
     } finally {
       openingSeam.onOpen = undefined;
+      if (stall) clearInterval(stall);
     }
+    await new Promise((r) => setImmediate(r));
+    releaseAll();
+    await Promise.all(helds.map((h) => h.done));
     await lock?.catch(() => {});
-    const tag = `${row.name} @${n}/${base.openings}`;
+    const tag = `${row.name} @${pt.after ? "after " : ""}${n}/${base.openings}${pt.mark ? " (mark)" : ""}`;
+    if (lock && keptCopies() !== 0) problems.push(`${tag}: a decrypted copy kept behind the lock (find ${findCacheSize(c.kit.repo)}, watch ${watchCacheSize(c.kit.repo)})`);
     let succeeded = false;
+    let asLocked = false;
     if ("err" in outcome) {
-      if (!isLocked(outcome.err)) problems.push(`${tag}: rejected with ${(outcome.err as Error)?.name}: ${(outcome.err as Error)?.message}`);
+      if (!isLocked(outcome.err) && !row.lockedAnswer?.(outcome.err)) problems.push(`${tag}: rejected with ${(outcome.err as Error)?.name}: ${(outcome.err as Error)?.message}`);
     } else if (JSON.stringify(outcome.ok) === JSON.stringify(want)) {
       succeeded = true;
-    } else if (!(row.locked && JSON.stringify(outcome.ok) === JSON.stringify(lockedWant))) {
+    } else if (row.locked && JSON.stringify(outcome.ok) === JSON.stringify(lockedWant)) {
+      asLocked = true;
+    } else {
       problems.push(`${tag}: a different result: ${JSON.stringify(outcome.ok).slice(0, 600)}`);
     }
     if (JSON.stringify(c.kit.repo.integrityWarnings) !== warnings) problems.push(`${tag}: an integrity warning was left: ${JSON.stringify(c.kit.repo.integrityWarnings.slice(-1))}`);
     if (!(row.writes && succeeded)) {
-      let diff = treeDiff(before, await tree(c.kit.lib.root));
+      let diff = treeDiff(before, await tree(c.kit.lib.root)).filter((d) => !d.includes(otherFolder));
+      if (asLocked) diff = diff.filter((d) => !lockedDiff.has(d));
       if (row.decisionAudited) {
         const added = (await auditEvents(c.kit, c.p)).slice(eventsBefore);
         if (added.every((e) => e.details?.op === row.decisionAudited)) diff = diff.filter((d) => !/^changed Projects\/[^/]+\/audit\/\d+\.jsonl$/.test(d));
@@ -268,6 +377,7 @@ async function exercise(row: Row): Promise<void> {
     await relock();
     if (JSON.stringify(indexRows()) !== JSON.stringify(rowsWant)) problems.push(`${tag}: the index's rows changed: ${JSON.stringify(indexRows()).slice(0, 400)}`);
   }
+  if (!marked) problems.push(`${row.name}: the mark path was never taken (no lock landed while the key was still in the ring)`);
   if (problems.length) throw new Error(`${row.name}: ${problems.length} problem(s):\n${problems.join("\n")}`);
 }
 
@@ -406,8 +516,12 @@ async function build(): Promise<Ctx> {
   const retention = join(kit.lib.root, kit.repo.getProject(p.id).folder, "retention");
   await mkdir(retention, { recursive: true });
   await writeFile(join(retention, "probe.json.enc"), await encryptBytes(key.key, key.keyId, JSON.stringify({ probe: true })));
-  // A backup.
-  await backupProject(kit.repo, p.id);
+  // A backup, and a copy of it outside the library (for the restore row).
+  const made = await backupProject(kit.repo, p.id);
+  const backupCopy = join(await mkdtemp(join(kit.tmp, "backup-copy-")), basename(made.path));
+  await copyFile(made.path, backupCopy);
+  // Another project, not encrypted: its change is held running for the mark path.
+  const other = await makeProject(kit, OPEN_GOV, false, "Other");
   // An encrypted original to relink: a copy of it in a search folder; the original is removed by the relink row.
   const relinkTarget = join(kit.lib.root, ...sources[2]!.assets[0]!.path.split("/"));
   const relinkDir = await mkdtemp(join(kit.tmp, "relink-"));
@@ -432,6 +546,9 @@ async function build(): Promise<Ctx> {
     relinkDir,
     exportsDir,
     auditSeq: 0,
+    other,
+    backupFile: basename(made.path),
+    backupCopy,
   };
   ctx.sources = [];
   for (const id of kit.repo.listSourceIds(p.id).sort()) ctx.sources.push(await kit.repo.getSource(p.id, id));
@@ -579,6 +696,38 @@ const ROWS: Row[] = [
     run: async () => {
       const r = await relinkMissing(c.kit.lib, c.relinkDir, c.kit.repo, { keyRing: c.kit.ring });
       return r;
+    },
+  },
+  // ---- reading sealed backups (R435 e) ----
+  {
+    name: "listBackups (the manifest rebuilt)",
+    where: "export/backup.ts:554 (loadManifest :279 → rebuildManifest :483 → readEntry :507 → openSealedZip)",
+    locked: true,
+    lockedWrites: true,
+    writes: true,
+    prepare: async (x) => {
+      await rm(join(x.kit.lib.root, "Backups", BACKUPS_MANIFEST), { force: true });
+    },
+    run: async () => listBackups(c.kit.repo, c.p.id),
+  },
+  {
+    name: "backupFilesNow (a backup the manifest does not know)",
+    where: "export/backup.ts:1396 (readEntry :1406 → openSealedZip)",
+    locked: true,
+    prepare: async (x) => {
+      await writeFile(join(x.kit.lib.root, "Backups", BACKUPS_MANIFEST), `${JSON.stringify({ formatVersion: 1, backups: [] }, null, 2)}\n`, { mode: 0o600 });
+    },
+    run: async () => backupFilesNow(c.kit.repo, [c.backupFile]),
+  },
+  {
+    name: "restoreBackup (a sealed backup, from outside the library)",
+    where: "export/backup.ts:1720 (projectIdIn → openBackup; restoreOpened → openSealedZip; restoreRequestOf → openBackup)",
+    writes: true,
+    decisionAudited: "project.restore",
+    lockedAnswer: (e) => e instanceof RestoreError && /unlock its project, or give the project's passphrase/u.test(e.message),
+    run: async () => {
+      await restoreBackup(c.kit.repo, c.backupCopy, { locationEnv: { homeDir: c.kit.tmp, platform: "linux", mounts: [{ path: "/", removable: false, network: false }] } });
+      return "restored";
     },
   },
 ];
