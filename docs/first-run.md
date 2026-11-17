@@ -48,7 +48,7 @@ When the app starts you may see "Connecting to the library…" for a moment. On 
 
 A **library** is the folder that holds all your projects. To make one:
 
-1. In the box labelled **Library folder**, click **Choose folder…** and pick a folder in the window that opens. Or type the full path of a new folder, for example `/Users/yourname/Research library` (it must start with `/`). If the folder does not exist, the app creates it. If it exists, it must be empty (otherwise the app says the folder is not empty).
+1. In the box labelled **Library folder**, click **Choose folder…** and pick a folder in the window that opens. Or type the full path of a new folder, for example `/Users/yourname/Research library` (it must start with `/`). If the folder does not exist, the app creates it. If it exists, it must be empty (otherwise the app says the folder is not empty). Under the box the app suggests a folder ("Suggested: …"); click **Use this folder** to put it in the box. Once a folder is in the box, the app says how much free space its disk has ("Free space on that disk: …"): an import copies its files into the library, so choose a disk with room for them.
 2. In the box labelled **New library name**, type a name.
 3. Click **Create a new library in that folder**.
 
