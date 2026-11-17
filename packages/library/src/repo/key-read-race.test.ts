@@ -481,3 +481,69 @@ describe("R435 (a): a lock always takes effect at once, an unlock in flight incl
     }
   });
 });
+
+describe("R435 c: nothing decrypted is kept past a lock that lands just after the last opening", () => {
+  const schedulers: Array<[string, (fn: () => void) => void]> = [
+    ["a microtask", (fn) => queueMicrotask(fn)],
+    ["setImmediate", (fn) => void setImmediate(fn)],
+    ["setTimeout(0)", (fn) => void setTimeout(fn, 0)],
+  ];
+  /** Runs `read` with a lock scheduled (by `later`) from its last opening (the count K taken from a first read). */
+  async function lockAfterLast(p: Project, read: () => Promise<unknown>, later: (fn: () => void) => void): Promise<unknown> {
+    const { openingSeam } = await import("./testing.js");
+    await kit.repo.lockProject(p.id);
+    await kit.repo.unlockProject(p.id, PASS);
+    let k = 0;
+    openingSeam.onOpen = () => void k++;
+    await read().finally(() => (openingSeam.onOpen = undefined));
+    await kit.repo.lockProject(p.id);
+    await kit.repo.unlockProject(p.id, PASS);
+    let seen = 0;
+    let lock: Promise<void> | undefined;
+    openingSeam.onOpen = () => {
+      if (++seen === k) later(() => {
+        lock = kit.repo.lockProject(p.id);
+        lock.catch(() => {});
+      });
+    };
+    const got = await read().then(
+      (v) => v,
+      (e: unknown) => e,
+    ).finally(() => (openingSeam.onOpen = undefined));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(lock, "the lock was asked").toBeDefined();
+    await lock;
+    return got;
+  }
+
+  for (const [name, later] of schedulers) {
+    it(`the Find queue, the lock scheduled by ${name}: the kept copy is empty while locked`, async () => {
+      const { findCacheSize } = await import("../find/queue-store.js");
+      const p = await makeProject(kit, GOV, true);
+      await appendFindEntriesIn(kit.repo, p.id, Array.from({ length: 3 }, () => findEntry(p)), "add");
+      const got = await lockAfterLast(p, async () => (await readFindQueueIn(kit.repo, p.id)).size, later);
+      expect(kit.repo.isUnlocked(p.id)).toBe(false);
+      expect(findCacheSize(kit.repo)).toBe(0);
+      if (typeof got !== "number") expect(got).toBeInstanceOf(ProjectLockedError);
+      else expect(got).toBe(3);
+    });
+
+    it(`the watched-folders register (its last line torn), the lock scheduled by ${name}: the kept copy is empty while locked`, async () => {
+      const { watchCacheSize } = await import("./watch-register.js");
+      const { appendFile } = await import("node:fs/promises");
+      const p = await makeProject(kit, GOV, true);
+      const watchId = newId();
+      await kit.repo.recordWatchedFiles(p.id, watchId, [regEntry(0), regEntry(1), regEntry(2)]);
+      const dir = join(folderOf(p), "watched");
+      const files = await readdir(dir).catch(() => [] as string[]);
+      const reg = files.find((f) => f.includes(watchId));
+      expect(reg, `the register in ${files.join(", ")}`).toBeDefined();
+      await appendFile(join(dir, reg!), "torn");
+      const got = await lockAfterLast(p, async () => (await kit.repo.watchRegister(p.id, watchId)).size, later);
+      expect(kit.repo.isUnlocked(p.id)).toBe(false);
+      expect(watchCacheSize(kit.repo)).toBe(0);
+      if (typeof got !== "number") expect(got).toBeInstanceOf(ProjectLockedError);
+      else expect(got).toBe(3);
+    });
+  }
+});

@@ -244,6 +244,12 @@ export async function readWatchRegister(core: RepoCore, projectId: string, watch
     lines.close();
     stream.destroy();
   }
+  // R435 c: locked (key wiped) or being locked since the last line was opened: nothing decrypted is kept, nor handed
+  // out after the lock: refused as locked.
+  if (key && (!key.some((b) => b !== 0) || !core.keyRing.has(st.project.encryption.keyId ?? ""))) {
+    cache.delete(abs);
+    throw new ProjectLockedError(projectId);
+  }
   cache.set(abs, { sig, map });
   return new Map(map);
 }

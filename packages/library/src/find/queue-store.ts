@@ -487,6 +487,12 @@ async function loadFolded(core: RepoCore, st: ProjectState): Promise<Folded> {
     cache.delete(abs);
     throw new FindQueueUnreadableError();
   }
+  // R435 c: locked (key wiped) or being locked since the last line was opened: nothing decrypted is kept, nor handed
+  // out after the lock: refused as locked.
+  if (key && (!key.some((b) => b !== 0) || !core.keyRing.has(st.project.encryption.keyId ?? ""))) {
+    cache.delete(abs);
+    throw new ProjectLockedError(st.project.id);
+  }
   cache.set(abs, { sig, folded });
   return folded;
 }
