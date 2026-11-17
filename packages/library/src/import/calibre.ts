@@ -210,6 +210,10 @@ async function* scanCalibre(libraryDir: string, signal: AbortSignal, ctx: ScanCo
     yield err instanceof CalibreUnreadable ? { ...fail(), unreadable: err.reason } : fail();
     return;
   }
+  // R392: the books read from the database's copy are the total, told before the first; a book with nothing to
+  // import (passed by below) lowers it.
+  let told = books.length;
+  ctx.total?.(told);
   let skipped = 0;
   for (const b of books) {
     signal.throwIfAborted();
@@ -218,7 +222,10 @@ async function* scanCalibre(libraryDir: string, signal: AbortSignal, ctx: ScanCo
     const { paths, outside } = await locate(root, realRoot, b.files);
     const item = await recordItem(key, b.fields, paths.map((p) => ({ paths: [p] })), { externalKeys, notes: Array<string>(outside).fill(CALIBRE_FILE_NOTE) });
     if (item) yield item;
-    else skipped++;
+    else {
+      skipped++;
+      ctx.total?.(--told);
+    }
   }
   if (skipped) ctx.note?.(skippedNote(skipped));
 }

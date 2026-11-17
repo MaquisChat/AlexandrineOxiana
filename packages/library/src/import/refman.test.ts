@@ -896,6 +896,27 @@ processing:
     (await repo.createProject({ name: `P${Math.random().toString(36).slice(2, 7)}`, governanceYaml: GOV, encryption: { enabled: false } })).project;
   const bulkImport = () => createBulkImport({ repo, http: new HttpClient({ libraryRoot: lib.root, dispatcher: agent, sleep: async () => {}, maxRetries: 0 }), index: handle });
 
+  it("FR-A21 (R392): the dry run's items are the run's total (BibTeX, RIS, CSL-JSON, Calibre)", async () => {
+    const calibre = buildCalibreLibrary(join(tmp, "Calibre Library"), { pdf: pdfs["files/okafor2024feeding.pdf"]!, epub: pdfs["files/adebayo-notes.pdf"]! });
+    const sources: Array<() => ImportSourceAdapter> = [
+      () => bibtexAdapter(join(exp, "sample.bib")),
+      () => risAdapter(join(exp, "sample.ris")),
+      () => cslJsonAdapter(join(exp, "sample.json")),
+      () => calibreAdapter(calibre.dir),
+    ];
+    for (const make of sources) {
+      const p = await project();
+      const bulk = bulkImport();
+      const dry = await bulk.dryRun(p.id, make());
+      const h = await bulk.startBatch(p.id, make());
+      const totals: Array<number | undefined> = [];
+      for await (const e of h.progress) if (e.done > 0) totals.push(e.total);
+      await h.done;
+      expect(totals.length).toBeGreaterThan(0);
+      expect(totals.every((t) => t === dry.items)).toBe(true);
+    }
+  });
+
   it("a BibTeX export creates sources with refman_import provenance, citation keys, tags and files", async () => {
     const p = await project();
     const bulk = bulkImport();
@@ -1692,5 +1713,37 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
     expect(await timed(() => collect(bibtexAdapter(nested)))).toBeLessThan(LIMIT);
     const around = await writeExport("lin5.bib", `@article{k, title={x\n${"@misc{m, title={M}}\n".repeat(MB / 20)}`);
     expect(await timed(() => collect(bibtexAdapter(around)))).toBeLessThan(LIMIT);
+  });
+});
+
+describe("FR-A21 (R392): a reference file and a Calibre library tell their totals", () => {
+  async function scanWithTotal(a: ImportSourceAdapter): Promise<{ items: ScanItem[]; told: Array<{ n: number; after: number }> }> {
+    const items: ScanItem[] = [];
+    const told: Array<{ n: number; after: number }> = [];
+    for await (const i of a.scan(new AbortController().signal, { ...ctx, total: (n) => told.push({ n, after: items.length }) })) items.push(i);
+    return { items, told };
+  }
+
+  it("BibTeX, RIS, CSL-JSON and Zotero RDF: the records, told once the file is read, before the first item", async () => {
+    for (const a of [bibtexAdapter(join(exp, "sample.bib")), risAdapter(join(exp, "sample.ris")), cslJsonAdapter(join(exp, "sample.json")), zoteroRdfAdapter(join(exp, "sample.rdf"))]) {
+      const { items, told } = await scanWithTotal(a);
+      expect(items.length).toBeGreaterThan(0);
+      expect(told).toEqual([{ n: items.length, after: 0 }]);
+    }
+  });
+
+  it("an empty record the scan passes by lowers the total to the items it yields", async () => {
+    const text = `${await readFile(join(exp, "sample.json"), "utf8")}`.replace(/^\s*\[/u, '[{"id": "empty", "type": "book"},');
+    const { items, told } = await scanWithTotal(cslJsonAdapter(await writeExport("with-empty.json", text)));
+    expect(told[0]).toEqual({ n: items.length + 1, after: 0 });
+    expect(told.at(-1)!.n).toBe(items.length);
+  });
+
+  it("Calibre: the books, told before the first", async () => {
+    const calibre = buildCalibreLibrary(join(tmp, "Calibre Library"), { pdf: pdfs["files/okafor2024feeding.pdf"]!, epub: pdfs["files/adebayo-notes.pdf"]! });
+    const { items, told } = await scanWithTotal(calibreAdapter(calibre.dir));
+    expect(items).toHaveLength(6);
+    expect(told[0]).toEqual({ n: 6, after: 0 });
+    expect(told.at(-1)!.n).toBe(6);
   });
 });
