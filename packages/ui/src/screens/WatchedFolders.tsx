@@ -1173,9 +1173,11 @@ function DownloadDialog({ d, live, said, onConfirm, onCancel }: { d: Extract<Dia
 
 function RemoveDialog({ d, said, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "remove" }>; said: Said; onConfirm: () => void; onCancel: () => void }) {
   const id = useId();
+  // First focus on the heading (R376 c): a held or repeated Enter on the opener must not stop the watch.
+  const heading = useRef<HTMLHeadingElement>(null);
   return (
-    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog">
-      <h2 id={`${id}-t`}>
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog" initialFocus={heading}>
+      <h2 id={`${id}-t`} ref={heading} tabIndex={-1}>
         Stop watching “<UserText>{d.label}</UserText>”?
       </h2>
       <p id={`${id}-d`}>{WATCH_TEXT.removeBody}</p>

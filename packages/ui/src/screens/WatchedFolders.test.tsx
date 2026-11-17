@@ -800,6 +800,8 @@ describe("WatchedFolders", () => {
     await user.click(remove);
     dialog = await screen.findByRole("dialog");
     const stop = within(dialog).getByRole("button", { name: "Stop watching" });
+    expect(document.activeElement).toBe(within(dialog).getByRole("heading", { level: 2 })); // R376 c: the heading, not the confirming button
+    await user.tab();
     expect(document.activeElement).toBe(stop);
     await user.tab();
     expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" }));
@@ -810,6 +812,54 @@ describe("WatchedFolders", () => {
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(document.activeElement).toBe(remove);
+  });
+
+  describe("a held or repeated key on the opener confirms nothing (R376 c)", () => {
+    const DL_TITLE = /^Download 2 files \(.+\) to this Mac and import them\?/;
+    const bodiesOf = () => {
+      const patches: unknown[] = [];
+      const deletes: number[] = [];
+      server.use(
+        http.patch(url("/projects/p1/watched-folders/w1"), async ({ request }) => {
+          patches.push(await request.json());
+          return HttpResponse.json(folder({ counts: { notDownloaded: 2, notDownloadedBytes: 5000 }, choices: { paused: false, notDownloaded: "download" } }));
+        }),
+        http.delete(url("/projects/p1/watched-folders/w1"), () => {
+          deletes.push(1);
+          return HttpResponse.json({ removed: true });
+        }),
+      );
+      return { patches, deletes };
+    };
+
+    it("Stop watching: held Enter then Enter again leaves it open on the heading; Tab then Enter stops once; Shift+Tab reaches Cancel; Escape returns to the opener", async () => {
+      useService([folder()]);
+      const user = userEvent.setup();
+      const { deletes } = bodiesOf();
+      show();
+      const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+      const opener = within(c).getByRole("button", { name: "Remove “Fieldwork scans”…" });
+      opener.focus();
+      await user.keyboard("{Enter>4}{/Enter}{Enter}");
+      const dialog = await screen.findByRole("dialog", { name: "Stop watching “Fieldwork scans”?" });
+      expect(deletes).toHaveLength(0);
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Stop watching “Fieldwork scans”?" }));
+      await user.tab({ shift: true });
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" }));
+      await user.tab(); // wraps to the first control
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Stop watching" }));
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(document.activeElement).toBe(opener);
+      expect(deletes).toHaveLength(0);
+      opener.focus();
+      await user.keyboard("{Enter}");
+      await screen.findByRole("dialog", { name: "Stop watching “Fieldwork scans”?" });
+      await user.tab();
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(screen.queryByRole("region", { name: "Fieldwork scans" })).toBeNull());
+      expect(deletes).toHaveLength(1);
+    });
   });
 
   it("the live region speaks only a state change", async () => {
