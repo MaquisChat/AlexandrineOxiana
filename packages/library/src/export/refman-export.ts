@@ -13,13 +13,16 @@
  *   - CSL-JSON: `JSON.stringify` (standard escaping); `id` and `citation-key` = the citation key.
  * Citation keys are made unique within one export (a, b, c … appended, noted).
  *
- * Participants (R88, R379 FR-A14): every source goes through the bibliography's participant rules (`participantRules`
- * and core's `toCslItem`, one code path). Where they touch a source (it is linked to participants, or a creator is
- * coded, or a name is scrubbed from its text), the creators, title, container, publisher, the bibliographic text
- * (address included) and the URL written are the ones `toCslItem` gives — participants as their codes — and its
- * citation key is withheld: the writer makes its own (`ref<n>`, holding no name), as for a source without a key. A
- * source that fails closed (a participant without a code where codes are required) is left out, named by its id in
- * `excluded` and counted in a note. A source the rules do not touch is written exactly as before.
+ * Participants (R88, R379 FR-A14, R390): every source goes through the bibliography's participant rules
+ * (`participantRules` and core's `toCslItem`, one code path). In a project with participants' names to replace, EVERY
+ * text the writers emit goes through the same name rule (`scrubText` with the project's names, taken from `toCslItem`)
+ * whether or not `toCslItem` emits that field for that kind of source: title, container, publisher and every
+ * bibliographic field scrubbed (the source's own container and publisher kept, not a platform's name); creators coded
+ * as `toCslItem` codes them, in their order and roles; the address and the identifiers withheld when they name a
+ * participant. Where the rules touch a source (it is linked to participants, a creator is coded, any of its text
+ * changes, or its own key names a participant), its citation key is withheld: the writer makes its own, holding no
+ * name. A source that fails closed (a participant without a code where codes are required) is left out, named by its
+ * id in `excluded` and counted in a note. A source the rules do not touch is written exactly as before.
  *
  * Exported: type, title, creators (author / editor / translator), date, container, publisher,
  * DOI, ISBN, ISSN, URL, arXiv id (BibTeX), the citation key, and tags only with `includeTags`; and
@@ -39,7 +42,7 @@
  * symbolic link. A refused destination is an invalid input: nothing is evaluated, written or audited.
  */
 import type { Biblio, BiblioField, CslItem, CslName, Creator, Source, SourceFile, SourceType, ToCslOptions } from "@ao/core";
-import { ParticipantCodeMissingError, biblioOf, primary, toCslItem } from "@ao/core";
+import { BIBLIO_FIELDS, ParticipantCodeMissingError, biblioOf, primary, toCslItem } from "@ao/core";
 import { lstat } from "node:fs/promises";
 import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { writeFileAtomic } from "../fs/atomic.js";
@@ -299,41 +302,54 @@ function toCslJson(refs: Ref[]): string {
 // ------------------------------------------------------------------------------------------
 // Participants (R88, R379 FR-A14)
 
-/** A source's bibliographic field → the CSL variable `toCslItem` writes it to (scrubbed). */
-const BIBLIO_CSL: Readonly<Record<BiblioField, keyof CslItem>> = {
-  volume: "volume", issue: "issue", page: "page", edition: "edition", numberOfPages: "number-of-pages",
-  publisherPlace: "publisher-place", collectionTitle: "collection-title", collectionNumber: "collection-number",
-  number: "number", genre: "genre", medium: "medium",
-};
 const CSL_ROLES = ["author", "interviewer", "contributor", "editor", "translator"] as const;
 
 const creatorOf = (n: CslName, role: Creator["role"]): Creator =>
   n.literal !== undefined ? { literal: n.literal, role } : { ...(n.family ? { family: n.family } : {}), ...(n.given ? { given: n.given } : {}), role };
 
 /**
- * The reference as the participant rules give it: creators (participants as their codes), title, container, publisher,
- * bibliographic text and URL from `item` (toCslItem's output); type, date and identifiers as the source has them.
+ * The name rule of the participant rules for one source (R390 a), taken from `toCslItem` itself so it is the
+ * bibliography's rule exactly: `scrub` is `scrubText` with the project's names and the source's coded creators (a text
+ * set as the publisher of the same source as a plain document, which `toCslItem` scrubs whatever the source's kind);
+ * `names` is the address rule (a text set as its URL, which `toCslItem` leaves out when it names a participant).
  */
-function codedRef(base: Omit<Ref, "key">, item: CslItem): Omit<Ref, "key"> {
-  const creators = CSL_ROLES.flatMap((role) => (item[role] ?? []).map((n) => creatorOf(n, role)));
-  const out: Omit<Ref, "key"> = { ...base, title: item.title ?? "", creators };
-  delete out.container;
-  delete out.publisher;
-  delete out.url;
-  if (item["container-title"]) out.container = item["container-title"];
-  if (item.publisher) out.publisher = item.publisher;
-  if (item.URL) out.url = item.URL;
-  for (const k of Object.keys(BIBLIO_CSL) as BiblioField[]) {
-    if (out[k] === undefined) continue;
-    const v = item[BIBLIO_CSL[k]];
-    if (typeof v === "string" && v) out[k] = v;
-    else delete out[k];
+function nameRule(sf: SourceFile, opts: ToCslOptions) {
+  const probe = (patch: Partial<Source>) => toCslItem({ ...sf, source: { ...sf.source, type: "other", ...patch } }, opts);
+  return {
+    scrub: (t: string) => (t ? (probe({ publisher: t }).publisher ?? t) : t),
+    names: (t: string) => !!t.trim() && probe({ identifiers: { url: t } }).URL === undefined,
+    /** A creator as `toCslItem` writes it (a participant as their code), with the source's own role kept. */
+    creator: (c: Creator): Creator | undefined => {
+      const item = probe({ creators: [c] });
+      const n = CSL_ROLES.map((r) => item[r]?.[0]).find((x) => !!x);
+      return n ? creatorOf(n, c.role) : undefined;
+    },
+  };
+}
+
+/**
+ * The reference with every text it writes put through the name rule (R390 a): title, container, publisher and every
+ * bibliographic field scrubbed; the creators coded (in their order and roles); the address and the identifiers (DOI,
+ * ISBN, ISSN, arXiv id) withheld when they name a participant (scrubbing one would make a false identifier).
+ */
+function scrubbedRef(ref: Omit<Ref, "key">, rule: ReturnType<typeof nameRule>, creators: Creator[]): Omit<Ref, "key"> {
+  const out: Omit<Ref, "key"> = { ...ref, title: rule.scrub(ref.title), creators, isbn: ref.isbn.filter((i) => !rule.names(i)) };
+  if (out.container) out.container = rule.scrub(out.container);
+  if (out.publisher) out.publisher = rule.scrub(out.publisher);
+  for (const k of BIBLIO_FIELDS) {
+    const v = out[k];
+    if (typeof v === "string" && v) out[k] = rule.scrub(v);
   }
+  for (const k of ["doi", "issn", "url", "arxiv"] as const) if (out[k] && rule.names(out[k])) delete out[k];
   return out;
 }
 
-/** The participant rules' reading of one source: unchanged (null), coded, or failing closed. */
-function underParticipantRules(sf: SourceFile, opts: ToCslOptions): CslItem | null | "code-missing" {
+/**
+ * The participant rules' reading of one source: unchanged (null), coded (the reference to write), or failing closed.
+ * Touched when the source is linked to participants, `toCslItem` codes or scrubs anything, any text the writers emit
+ * changes under the name rule, or its own citation key names a participant (R390 a: the key by the address rule).
+ */
+function underParticipantRules(sf: SourceFile, opts: ToCslOptions, ref: Omit<Ref, "key">): Omit<Ref, "key"> | null | "code-missing" {
   let item: CslItem;
   try {
     item = toCslItem(sf, opts);
@@ -341,9 +357,14 @@ function underParticipantRules(sf: SourceFile, opts: ToCslOptions): CslItem | nu
     if (err instanceof ParticipantCodeMissingError) return "code-missing";
     throw err;
   }
-  if (sf.source.participantIds.length > 0) return item;
+  // No names to replace (no map): nothing can be touched, the reference is written as it is.
+  if (!opts.pseudonyms?.size && sf.source.participantIds.length === 0) return null;
+  const rule = nameRule(sf, opts);
+  const coded = scrubbedRef(ref, rule, sf.source.creators.map(rule.creator).filter((c): c is Creator => !!c));
+  if (sf.source.participantIds.length > 0) return coded;
   const plain = toCslItem(sf, { ...opts, pseudonyms: new Map(), requireParticipantCodes: false });
-  return JSON.stringify(item) === JSON.stringify(plain) ? null : item;
+  const same = JSON.stringify(item) === JSON.stringify(plain) && JSON.stringify({ ...coded, creators: [] }) === JSON.stringify({ ...ref, creators: [] }) && !rule.names(sf.source.citationKey);
+  return same ? null : coded;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -416,7 +437,8 @@ export async function buildExport(
       excluded.push({ sourceId: id, reason: DEIDENTIFIED_NOTE });
       continue;
     }
-    const coded = underParticipantRules(sf, cslOptions(sf));
+    const ref = refOf(s, tagNames, opts.includeTags === true);
+    const coded = underParticipantRules(sf, cslOptions(sf), ref);
     if (coded === "code-missing") {
       excluded.push({ sourceId: id, reason: PARTICIPANT_CODE_MISSING_NOTE });
       codeMissing++;
@@ -434,8 +456,7 @@ export async function buildExport(
     }
     if (!coded && key !== s.citationKey) changedKeys++;
     used.add(key.toLowerCase());
-    const ref = refOf(s, tagNames, opts.includeTags === true);
-    refs.push({ key, ...(coded ? codedRef(ref, coded) : ref) });
+    refs.push({ key, ...(coded ?? ref) });
   }
   const text = format === "bibtex" ? toBibtex(refs) : format === "ris" ? toRis(refs) : toCslJson(refs);
   const notes: string[] = [];

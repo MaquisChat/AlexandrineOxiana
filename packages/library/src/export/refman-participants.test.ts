@@ -135,3 +135,120 @@ describe("R379 (FR-A14, I2): R88's participant rules reach the reference exports
     expect(csl[0]).toMatchObject({ id: "mariacocina2026", "citation-key": "mariacocina2026", author: [{ literal: "@maria.cocina" }] });
   });
 });
+
+/**
+ * R390 (a): in a project with participants' names to replace, EVERY text the reference export writes goes through the
+ * name rule — whether or not `toCslItem` emits that field for that kind of source — and the source's own key is withheld
+ * when it names a participant. The project's map knows "@maria.cocina" (P-001) from an identifiable post whose own text
+ * holds nothing else of the name, so "cocina" can be asserted absent from the whole output.
+ */
+async function r390Project(): Promise<{ p: Project; post: string; repost: string; video: string; book: string }> {
+  const p = await makeProject(kit, PSEUDO_GOV, true);
+  const post = await addSource(kit, p, {
+    type: "social-post",
+    title: "A post",
+    creators: [{ literal: "@maria.cocina", handle: "@maria.cocina", role: "uploader" }],
+    issued: "2026-03-14",
+    identifiers: { platform: "instagram" },
+    identifiable: true,
+  });
+  const repost = await addSource(kit, p, {
+    type: "social-post",
+    title: "Brand post",
+    creators: [{ literal: "BrandCo", role: "uploader" }],
+    container: "Repost from Maria Cocina",
+    citationKey: "brandco2026",
+    identifiers: { platform: "instagram" },
+  });
+  const video = await addSource(kit, p, {
+    type: "video",
+    title: "Brand video",
+    creators: [{ literal: "BrandCo", role: "channel" }],
+    citationKey: "brandvideo",
+    identifiers: { platform: "youtube" },
+  });
+  await kit.repo.updateSource(p.id, video.source.id, { publisher: "Maria Cocina" });
+  const book = await addSource(kit, p, {
+    type: "book",
+    title: "Field notes",
+    creators: [{ family: "Adams", given: "Ann", role: "author" }],
+    issued: "2001",
+    citationKey: "maria.cocina-notes",
+  });
+  return { p, post: post.source.id, repost: repost.source.id, video: video.source.id, book: book.source.id };
+}
+
+describe("R390 (a): every text the reference export writes goes through the name rule", () => {
+  it("the reviewer's probes: a repost's container, a video's publisher and a book's own key hold the code, never the name", async () => {
+    const { p, repost, video, book } = await r390Project();
+    for (const format of FORMATS) {
+      const r = await exportRefman(kit.repo, p.id, [repost, video, book], format);
+      expect(r.exported, format).toBe(3);
+      const low = r.text.toLowerCase();
+      expect(low, format).not.toContain("maria");
+      expect(low, format).not.toContain("cocina");
+      // The source's own container and publisher are kept, scrubbed — not replaced by the platform's name.
+      expect(r.text, format).toContain("Repost from P-001");
+      expect(r.text, format).not.toContain("YouTube");
+      expect(r.text, format).toContain("Adams");
+    }
+    const ris = (await exportRefman(kit.repo, p.id, [repost, video, book], "ris")).text;
+    expect(ris).toContain("T2  - Repost from P-001");
+    expect(ris).toContain("PB  - P-001");
+    // Creators keep their roles (BrandCo stays the author of the repost and of the video).
+    expect(ris.match(/^AU {2}- BrandCo$/gmu)).toHaveLength(2);
+  });
+
+  it("the open-format export's sources.bib and sources.csl.json hold the code and never the name", async () => {
+    const { p } = await r390Project();
+    const dest = join(kit.tmp, "out");
+    await mkdir(dest, { recursive: true });
+    const r = await exportProjectOpenFormats(kit.repo, p.id, dest);
+    for (const f of ["sources.bib", "sources.csl.json"]) {
+      const text = await readFile(join(r.path, f), "utf8");
+      expect(text, f).toContain("Repost from P-001");
+      expect(text.toLowerCase(), f).not.toContain("maria");
+      expect(text.toLowerCase(), f).not.toContain("cocina");
+    }
+  });
+
+  it("every bibliographic field, the identifiers and the address: scrubbed, or withheld when they name a participant", async () => {
+    const { p, book } = await r390Project();
+    await kit.repo.updateSource(p.id, book, {
+      publisherPlace: "Casa Maria Cocina",
+      collectionTitle: "Maria Cocina series",
+      edition: "Maria Cocina edition",
+      genre: "Notes of Maria Cocina",
+      medium: "Maria Cocina tapes",
+      identifiers: { doi: "10.1234/maria.cocina", url: "https://example.org/maria-cocina/notes", isbn: ["978-mariacocina"], issn: "maria-cocina", arxiv: "maria.cocina" },
+    });
+    for (const format of FORMATS) {
+      const r = await exportRefman(kit.repo, p.id, [book], format);
+      expect(r.text.toLowerCase(), format).not.toContain("maria");
+      expect(r.text.toLowerCase(), format).not.toContain("cocina");
+      expect(r.text, format).toContain("P-001 series");
+    }
+  });
+
+  it("a source no rule touches is written exactly as the same source in a project without participants", async () => {
+    const { p } = await r390Project();
+    const plain = await makeProject(kit, OPEN_GOV);
+    const spec = {
+      type: "book" as const,
+      title: "Rivers -- & {braces} 100%",
+      creators: [{ family: "Smith", given: "Jane", role: "author" as const }, { family: "Ode", given: "Ola", role: "editor" as const }],
+      issued: "2001-02",
+      container: "Series of rivers",
+      citationKey: "smith2001rivers",
+      identifiers: { doi: "10.1/x y", url: "https://example.org/a b" },
+    };
+    const a = (await addSource(kit, p, spec)).source.id;
+    const b = (await addSource(kit, plain, spec)).source.id;
+    for (const format of FORMATS) {
+      const ra = await exportRefman(kit.repo, p.id, [a], format);
+      const rb = await exportRefman(kit.repo, plain.id, [b], format);
+      expect(ra.text, format).toBe(rb.text);
+      expect(ra.notes, format).toEqual(rb.notes);
+    }
+  });
+});
