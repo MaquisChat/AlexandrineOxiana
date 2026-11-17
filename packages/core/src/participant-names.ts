@@ -9,7 +9,7 @@
  *   "lucia.cocina" and "Lucía Cocina" are the same two words). A name matches whole words only,
  *   so "Ann" is not found in "Annual".
  * - Invisible characters (R403 a: the default-ignorable ones — zero-width space and joiners, word
- *   joiner, direction marks and isolates, soft hyphen …) inside a run of letters are both nothing and
+ *   joiner, direction marks and isolates, soft hyphen … — and every format character, R427 c) inside a run of letters are both nothing and
  *   a boundary: a name may run across one ("Luc\u00ADía" is "Lucía") and may also begin or end at one
  *   ("Lucía\u200Bhabla", "\u2068Maria\u2069\u2068Lopez\u2069"); the longer match wins. The price:
  *   "Ana" is found in "Ana\u200Bbel" when no longer name is.
@@ -44,7 +44,13 @@
  */
 import { NO_SPACE_SCRIPT } from "./verify/evidence.js";
 
-const IGNORABLE_ONE = /^\p{Default_Ignorable_Code_Point}$/u;
+/**
+ * An invisible character for finding names in text (R403 a, R427 c): a default-ignorable one, or any
+ * format character (`\p{Cf}`: also U+0600–U+0605, U+FFF9–U+FFFB and the rest). Inside a run of
+ * letters it is a soft boundary; `fold` drops it.
+ */
+const SOFT_ONE = /^[\p{Default_Ignorable_Code_Point}\p{Cf}]$/u;
+const SOFT = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu;
 const isNoSpace = (ch: string | undefined): boolean => ch !== undefined && NO_SPACE_SCRIPT.test(ch);
 
 /** Letters NFKD leaves whole, spelled the way names are commonly written without them (R89). */
@@ -66,7 +72,8 @@ const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
  */
 export const fold = (s: string): string =>
   s
-    .replace(IGNORABLE, "")
+    // Default-ignorable and format characters (R387 a, R427 c).
+    .replace(SOFT, "")
     .replace(/[łŁøØđĐßẞæÆœŒþÞı]/gu, (c) => TRANSLIT[c] ?? c)
     .normalize("NFKD")
     .replace(/\p{M}+/gu, "")
@@ -334,7 +341,7 @@ function tokenize(text: string, splitDigits: boolean): Token[] {
     const next = i + cp.length;
     const f = foldChar(cp);
     if (f === "") {
-      if (IGNORABLE_ONE.test(cp)) {
+      if (SOFT_ONE.test(cp)) {
         // An invisible character: a soft boundary inside a run of letters (R403 a).
         if (cur) {
           flush();
@@ -522,7 +529,7 @@ function origEnd(text: string, start: number, n: number): number {
   // Marks folded away belong to the letter before them; an invisible character does not (R403 a).
   while (i < text.length) {
     const cp = String.fromCodePoint(text.codePointAt(i)!);
-    if (foldChar(cp) !== "" || IGNORABLE_ONE.test(cp)) break;
+    if (foldChar(cp) !== "" || SOFT_ONE.test(cp)) break;
     i += cp.length;
   }
   return i;

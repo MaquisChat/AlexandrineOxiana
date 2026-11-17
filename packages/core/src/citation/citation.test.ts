@@ -967,6 +967,16 @@ describe("R420 (a): a participant's WHOLE name inside the name of a creator who 
   });
 });
 
+describe("R427 (c): every format character (\\p{Cf}) inside a run of letters is a soft boundary (M5 of the FR-A10 third review)", () => {
+  it.each([
+    ["Ma\uFFFBria habla", "P-001 habla"],
+    ["Ma\u0605ria habla", "P-001 habla"],
+  ])("%j is replaced in the title", (text, expected) => {
+    const sf = source("article-journal", mt(["es", "original", text]), [{ role: "author", given: "Wei", family: "Chen" }]);
+    expect(toCslItem(sf, { ...OPTS, pseudonyms: new Map([["Maria", "P-001"]]) }).title).toBe(expected);
+  });
+});
+
 describe("R427 (b): inside a creator who gets no code, whole names and runs are replaced, single names are not (I3 of the FR-A10 third review)", () => {
   const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
   const page = (t: string, creators: Creator[], map: ReadonlyMap<string, string> = LUCIA) =>

@@ -671,6 +671,20 @@ describe("R403 (a): an invisible character is both nothing and a boundary (C1 of
   });
 });
 
+describe("R427 (c): every format character (\\p{Cf}) inside a run of letters is a soft boundary (M5 of the FR-A10 third review)", () => {
+  const folder = (title: string, map: ReadonlyMap<string, string>) =>
+    sourceFolderName({ dateOrYear: "2026", primaryCreator: "P-009", shortTitle: pseudonymize(title, map), shortId: "ab12" });
+  it.each([
+    ["Ma\uFFFBria habla", "P-001 habla"],
+    ["Ma\u0605ria habla", "P-001 habla"],
+  ])("%j: replaced, and the folder name holds no part of the name", (text, expected) => {
+    const map = new Map([["Maria", "P-001"]]);
+    expect(pseudonymize(text, map)).toBe(expected);
+    const f = folder(text, map);
+    expect(f).toBe("2026 P-009 - P-001 habla [ab12]");
+  });
+});
+
 describe("R403 (c): a part of a name stands for the name only when it could be a name by itself (I2, M1 of the FR-A10 second review)", () => {
   const texts = (c: Parameters<typeof creatorNameTexts>[0]) => creatorNameTexts(c).map((t) => t.text);
 
