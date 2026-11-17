@@ -31,7 +31,7 @@ import {
 import type { LocationEnv } from "./location.js";
 import { listUnfinishedMoves, movedToFor } from "./old-copies.js";
 import { recordLocation } from "./registry.js";
-import { ReadOnlyLibraryError } from "./repo/errors.js";
+import { ReadOnlyLibraryError, isLockedRefusal } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
 import { holdsLock, newAttentionId, projectFolders, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
 import {
@@ -441,6 +441,7 @@ async function expectedFiles(
           });
         }
       } catch (err) {
+        if (isLockedRefusal(err)) throw err; // locked during the walk: the caller decides (R404), never an error row
         errors.push({ path: folder, message: msg(err) });
       }
     }
@@ -470,6 +471,19 @@ export async function checkIntegrity(lib: Pick<Library, "id" | "root">, sample: 
   if (sample !== "full" && !(typeof sample === "number" && sample >= 0 && sample <= 1)) {
     throw new TypeError("sample must be a fraction between 0 and 1, or 'full'");
   }
+  // A project locked while it is checked (its key wiped mid-read) is never reported "mismatched" or in error
+  // (R404): the check is made again, that project now checked as a locked project is (presence only). Retries are
+  // bounded; then the refusal stands.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await checkOnce(lib, sample, opts);
+    } catch (err) {
+      if (!isLockedRefusal(err) || attempt >= 3) throw err;
+    }
+  }
+}
+
+async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySample, opts: IntegrityOptions): Promise<IntegrityReport> {
   const stat: StatFn = opts.stat ?? ((p) => fsp.lstat(p));
   const openRead = opts.openRead ?? defaultOpenRead;
   const report = emptyReport();
@@ -512,6 +526,7 @@ export async function checkIntegrity(lib: Pick<Library, "id" | "root">, sample: 
     try {
       if ((await hashStream(abs, openRead, a.encrypted ? f.key : undefined)) !== a.sha256) report.mismatched.push(entry);
     } catch (err) {
+      if (isLockedRefusal(err)) throw err; // locked meanwhile: checked again (see checkIntegrity)
       if (isGone(err)) report.missing.push(entry);
       else report.mismatched.push(entry); // unreadable or fails to decrypt
     }
@@ -854,7 +869,11 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
     const k = `${key?.keyId ?? ""}:${c.abs}`;
     let h = memo.get(k);
     if (!h) {
-      h = hashStream(c.abs, openRead, key).catch(() => null);
+      // A key a lock wiped mid-read is "locked", not a candidate that does not match (R404).
+      h = hashStream(c.abs, openRead, key).catch((err: unknown) => {
+        if (isLockedRefusal(err)) throw err;
+        return null;
+      });
       memo.set(k, h);
     }
     return h;
@@ -958,7 +977,11 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
         if (placeholderOfSize(size)) result.skipped.push({ path: f.path, reason: "placeholder" });
         continue;
       }
-      const verify = async (staged: string) => (await hashStream(staged, defaultOpenRead, key).catch(() => null)) === a.sha256;
+      const verify = async (staged: string) =>
+        (await hashStream(staged, defaultOpenRead, key).catch((err: unknown) => {
+          if (isLockedRefusal(err)) throw err; // locked, not "verify-failed" (R404)
+          return null;
+        })) === a.sha256;
       const mode = f.identifiable || a.encrypted || f.keyId ? 0o600 : undefined;
       // Nothing is copied into a project that cannot first be marked (fail closed). The record
       // names this file before it is copied (M8), so a crash right after the copy still counts it.
@@ -997,7 +1020,9 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
         }
       }
     } catch (err) {
-      result.warnings.push(`${f.path}: ${msg(err)}`);
+      // Its project was locked meanwhile: skipped as a locked project's file is (R35), never a warning (R404).
+      if (isLockedRefusal(err)) result.skipped.push({ path: f.path, reason: "project-locked" });
+      else result.warnings.push(`${f.path}: ${msg(err)}`);
     }
   }
   result.stillMissing = missing.length - result.relinked;

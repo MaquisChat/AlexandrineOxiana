@@ -1,4 +1,5 @@
 import type { PolicyAction } from "@ao/core";
+import { KeyNotAvailableError } from "../crypto/format.js";
 
 /** The library is open read-only; nothing was evaluated or written. */
 export class ReadOnlyLibraryError extends Error {
@@ -25,6 +26,15 @@ export class ProjectLockedError extends Error {
   constructor(readonly projectId: string) {
     super(`Project ${projectId} is locked; unlock it with its passphrase or recovery code`);
   }
+}
+
+/**
+ * A refusal because the project is locked: `ProjectLockedError`, or `KeyNotAvailableError` from an opening whose key a
+ * lock wiped mid-read (R386 a). A reader that tolerates what it cannot read lets these through: a lock is "locked",
+ * never "damaged", "not found" or a shorter result (R404).
+ */
+export function isLockedRefusal(err: unknown): boolean {
+  return err instanceof ProjectLockedError || err instanceof KeyNotAvailableError;
 }
 
 /** Provenance is immutable once captured (spec 3.2). */

@@ -16,7 +16,7 @@ import * as fsp from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import { newId } from "@ao/core";
-import { InvalidInputError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError } from "./repo/errors.js";
+import { InvalidInputError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError, isLockedRefusal } from "./repo/errors.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import type { Tx } from "./repo/mutate.js";
 import { noteIntegrityWarning, projectDataKey, projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
@@ -73,7 +73,9 @@ async function readManifest(repo: Repo, projectId: string, abs: string, key: { k
     const m = JSON.parse(plain.toString("utf8")) as Manifest;
     if (m?.formatVersion !== 1 || typeof m.documents !== "object" || m.documents === null) throw new Error("not a manifest");
     return m;
-  } catch {
+  } catch (err) {
+    // A key a lock wiped mid-read: the project is locked, the list is not damaged (R404); no warning is noted.
+    if (isLockedRefusal(err)) throw new ProjectLockedError(projectId);
     noteIntegrityWarning(repo, { projectId, kind: "protocol-manifest-unreadable", detail: "the sealed list of protocol document names cannot be read" });
     throw new InvalidInputError(MANIFEST_UNREADABLE);
   }

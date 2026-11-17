@@ -19,6 +19,7 @@ import { decryptBytes, namesIn, openLine, readMaybe, sealLine } from "../../repo
 import type { MutateRequest, Tx } from "../../repo/mutate.js";
 import { projectDataKey, repoLibrary, type Repo } from "../../repo/repo.js";
 import { KeyNotAvailableError } from "../../crypto/format.js";
+import { isLockedRefusal } from "../../repo/errors.js";
 
 /** Batches running (or being undone) in this process (a `running` batch.json not listed here was interrupted, R45). */
 export const activeBatches = new Set<string>();
@@ -241,7 +242,8 @@ export async function findBatch(repo: Repo, projectId: string, batchId: string):
     try {
       const r = await readBatchAt(repo, projectId, d.name);
       if (r?.id === batchId) return r;
-    } catch {
+    } catch (err) {
+      if (isLockedRefusal(err)) throw err; // locked, not "not found" (R404)
       // an unreadable batch record is not this one
     }
   }

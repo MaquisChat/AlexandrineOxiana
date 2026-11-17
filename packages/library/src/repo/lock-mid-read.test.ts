@@ -12,27 +12,29 @@
  * again (no kept copy, no index row poisoned).
  */
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { newId, type Project, type SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { addProtocolDocuments } from "../protocol-docs.js";
+import { addProtocolDocuments, listProtocolDocuments } from "../protocol-docs.js";
 import { attachConsentDocument } from "../consent-docs.js";
 import { KeyNotAvailableError } from "../crypto/format.js";
 import { exportBibliography, citeSources } from "../export/bibliography.js";
 import { backupProject } from "../export/backup.js";
 import { exportProjectOpenFormats } from "../export/project-export.js";
 import { buildExport, exportRefman } from "../export/refman-export.js";
-import { PASS, PSEUDO_GOV, addSource, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
+import { PASS, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
 import type { FindEntry } from "../find/types.js";
 import { IndexHandle } from "../index/db.js";
-import { createIndexSink } from "../index/sink.js";
+import { rebuildIndex } from "../index/rebuild.js";
+import { createIndexSink, indexUnlockedProject } from "../index/sink.js";
 import { createBulkImport, type BulkImport } from "../import/bulk/index.js";
-import { findBatch } from "../import/bulk/batch.js";
+import { findBatch, readJournal } from "../import/bulk/batch.js";
 import { bibtexAdapter } from "../import/refman.js";
 import { appendJobRecords, readJobJournal, refreshJobRows, type JobRecord } from "../job-journal.js";
 import { HttpClient } from "../lookup/index.js";
+import { checkIntegrity, relinkMissing } from "../reconnect.js";
 import { readAssetText, transcriptVersions } from "../source-actions.js";
 import { openAssetContent } from "../asset-content.js";
 import { readTranscript } from "../transcript-segments.js";
@@ -97,6 +99,12 @@ interface Row {
   /** The reading writes on success (an export's audit entry, a backup, a relink): files are compared only when it did not succeed. */
   writes?: boolean;
   prepare?(c: Ctx): Promise<void>;
+  /**
+   * The governed decision (this audit op) is audited BEFORE the reading starts, as every decision is: when the
+   * reading is then cut short by the lock, that entry is the one change allowed (it records the decision, nothing
+   * read under the wiped key).
+   */
+  decisionAudited?: string;
 }
 
 let c: Ctx;
@@ -206,6 +214,7 @@ async function exercise(row: Row): Promise<void> {
     await row.prepare?.(c);
     const warnings = JSON.stringify(c.kit.repo.integrityWarnings);
     const before = await tree(c.kit.lib.root);
+    const eventsBefore = (await auditEvents(c.kit, c.p)).length;
     let openings = 0;
     let lock: Promise<void> | undefined;
     openingSeam.onOpen = () => {
@@ -235,7 +244,12 @@ async function exercise(row: Row): Promise<void> {
     }
     if (JSON.stringify(c.kit.repo.integrityWarnings) !== warnings) problems.push(`${tag}: an integrity warning was left: ${JSON.stringify(c.kit.repo.integrityWarnings.slice(-1))}`);
     if (!(row.writes && succeeded)) {
-      const diff = treeDiff(before, await tree(c.kit.lib.root));
+      let diff = treeDiff(before, await tree(c.kit.lib.root));
+      if (row.decisionAudited) {
+        const added = (await auditEvents(c.kit, c.p)).slice(eventsBefore);
+        if (added.every((e) => e.details?.op === row.decisionAudited)) diff = diff.filter((d) => !/^changed Projects\/[^/]+\/audit\/\d+\.jsonl$/.test(d));
+        else problems.push(`${tag}: audit entries added: ${added.map((e) => `${e.action}/${String(e.details?.op)}`).join(", ")}`);
+      }
       if (diff.length) problems.push(`${tag}: files changed: ${diff.join(", ")}`);
     }
     // After an unlock the same reading gives the full right result; the index holds the same rows.
@@ -443,6 +457,7 @@ const ROWS: Row[] = [
   { name: "getFieldwork", where: "repo/repo.ts:475 → repo/fieldwork.ts:159", run: async () => c.kit.repo.getFieldwork(c.p.id) },
   { name: "projectPseudonymMap", where: "repo/repo.ts:1562 → repo/pseudonyms.ts:22", run: async () => projectPseudonymMap(c.kit.repo, c.p.id) },
   { name: "projectReviewEntries", where: "repo/repo.ts:1113 → repo/review.ts:438", run: async () => projectReviewEntries(c.kit.repo, c.p.id) },
+  { name: "bulk.listProjectReview", where: "import/bulk/review.ts (listProjectReview)", run: async () => c.bulk.listProjectReview(c.p.id) },
   { name: "readFindQueueIn", where: "repo/repo.ts:1321 → find/queue-store.ts:331", run: async () => readFindQueueIn(c.kit.repo, c.p.id) },
   { name: "readFindQueueDetailedIn", where: "repo/repo.ts:1326 → find/queue-store.ts", run: async () => readFindQueueDetailedIn(c.kit.repo, c.p.id) },
   { name: "heldWaitingCountIn", where: "repo/repo.ts:1344 → repo/review.ts:560", run: async () => heldWaitingCountIn(c.kit.repo, c.p.id) },
@@ -465,8 +480,19 @@ const ROWS: Row[] = [
   },
   { name: "transcriptionRecords", where: "transcription-jobs.ts:112", run: async () => transcriptionRecords(c.kit.repo, c.p.id) },
   // ---- import batches ----
+  { name: "bulk.listBatches", where: "import/bulk/batch.ts:221 (readProjectText :206)", run: async () => c.bulk.listBatches(c.p.id) },
   { name: "bulk.listReview (the batch)", where: "import/bulk/review.ts", run: async () => c.bulk.listReview(c.p.id, c.batchId) },
+  { name: "bulk.batchReport", where: "import/bulk/report.ts", run: async () => c.bulk.batchReport(c.p.id, c.batchId) },
+  {
+    name: "findBatch and readJournal",
+    where: "import/bulk/batch.ts:239, :273 (open :282)",
+    run: async () => {
+      const rec = await findBatch(c.kit.repo, c.p.id, c.batchId);
+      return { rec, journal: await readJournal(c.kit.repo, c.p.id, (rec as { dir?: string } | undefined)?.dir ?? "") };
+    },
+  },
   // ---- protocol and consent documents, attention, warnings ----
+  { name: "listProtocolDocuments", where: "protocol-docs.ts:139 (readManifest :68)", run: async () => listProtocolDocuments(c.kit.repo, c.p.id) },
   { name: "listCollectionsAndTags", where: "repo/repo.ts:480", run: async () => c.kit.repo.listCollectionsAndTags(c.p.id) },
   // ---- the audit log and its sealed reasons ----
   {
@@ -494,7 +520,41 @@ const ROWS: Row[] = [
       return treeOf(d);
     },
   },
+  { name: "backupProject (a backup made)", where: "export/backup.ts:1038", writes: true, decisionAudited: "backup.create", run: async () => ((await backupProject(c.kit.repo, c.p.id, { prune: false })) ? "made" : "none") },
   // ---- integrity, relinking, the index ----
+  { name: "checkIntegrity (quick)", where: "reconnect.ts:469 (expectedFiles :428)", locked: true, run: async () => checkIntegrity(c.kit.lib, 0.05, { keyRing: c.kit.ring }) },
+  { name: "checkIntegrity (full)", where: "reconnect.ts:469 (hashStream :512)", locked: true, run: async () => checkIntegrity(c.kit.lib, "full", { keyRing: c.kit.ring }) },
+  {
+    name: "rebuildIndex",
+    where: "index/rebuild.ts:83 (populate :274)",
+    locked: true,
+    run: async () => {
+      const r = await rebuildIndex(c.handle, c.kit.ring, c.kit.lib);
+      return { result: r, rows: indexRows() };
+    },
+  },
+  {
+    name: "indexUnlockedProject",
+    where: "index/sink.ts:18",
+    locked: true,
+    run: async () => {
+      const r = await indexUnlockedProject(c.handle.db, c.kit.lib.root, c.kit.ring, c.p.id);
+      return { result: r, rows: indexRows() };
+    },
+  },
+  {
+    name: "relinkMissing (an encrypted original)",
+    where: "reconnect.ts:823 (hashOf :857, verify :961)",
+    locked: true,
+    writes: true,
+    prepare: async (x) => {
+      await rm(x.relinkTarget, { force: true });
+    },
+    run: async () => {
+      const r = await relinkMissing(c.kit.lib, c.relinkDir, c.kit.repo, { keyRing: c.kit.ring });
+      return r;
+    },
+  },
 ];
 
 beforeAll(async () => {

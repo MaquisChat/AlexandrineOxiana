@@ -13,7 +13,7 @@
  */
 import { join } from "node:path";
 import { BIBLIO_FIELDS, biblioOf, newId, primary, recheckSourceFile, type FieldEvidence, type LookupEvidence, type SourceDraft, type SourceFile, type SourceType } from "@ao/core";
-import { NotFoundError } from "../../repo/errors.js";
+import { NotFoundError, isLockedRefusal } from "../../repo/errors.js";
 import type { ReviewEntry } from "../../repo/review.js";
 import { storeRequest } from "../../repo/sources.js";
 import { importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
@@ -82,7 +82,8 @@ async function withTitles(repo: Repo, projectId: string, entries: ReviewEntry[])
       try {
         const title = primary((await repo.getSource(projectId, e.sourceId)).source.title);
         if (title) e.title = title;
-      } catch {
+      } catch (err) {
+        if (isLockedRefusal(err)) throw err; // locked, not a list without titles (R404)
         // a source that cannot be read is listed without its title
       }
     }
