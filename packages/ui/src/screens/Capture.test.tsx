@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { COOKIES_ACKNOWLEDGEMENT } from "../api/capture";
 import type { CaptureQueueDetail } from "@ao/shared";
-import { ANON_RULES, errorResponse, mockCapture, P1, P2, server, STRICT_RULES, type CaptureSetup } from "../test/captureService";
+import { http } from "msw";
+import { ANON_RULES, BASE, errorResponse, mockCapture, P1, P2, server, STRICT_RULES, type CaptureSetup } from "../test/captureService";
 import { Capture, CaptureRoute } from "./Capture";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -170,6 +171,31 @@ describe("Capture screen — links", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/read-only/);
     expect(alert.textContent).not.toMatch(/locked-by-other-device/);
+  });
+
+  const UNREADABLE = "This project's rules cannot be read, so nothing can be captured here. Correct them on the Governance screen.";
+
+  it("says why nothing can be captured when the service cannot read the rules (R379 FR-A18)", async () => {
+    await setup({ unreadable: [P1] });
+    expect(screen.getByText(UNREADABLE)).toBeTruthy();
+    expect(screen.queryByText(/rules do not allow capture with the downloader/)).toBeNull();
+  });
+
+  it("says it too for rules the screen itself cannot read (R379 FR-A18)", async () => {
+    await setup({ governance: { [P1]: "encryption: {atRest: optional}\nresidencey: {allowed: [local]}\n" } });
+    expect(screen.getByText(UNREADABLE)).toBeTruthy();
+  });
+
+  it("does not say it for readable rules (R379 FR-A18)", async () => {
+    await setup();
+    expect(screen.queryByText(UNREADABLE)).toBeNull();
+  });
+
+  it("does not say it when the rules' request failed: that failure is said instead (R379 FR-A18)", async () => {
+    const m = mockCapture({ extra: [http.get(`${BASE}/projects/:id/governance`, () => errorResponse(500, "INTERNAL", "Something went wrong in the library service."))] });
+    render(<Capture client={m.client} projectId={P1} />);
+    await screen.findByText(/Something went wrong in the library service/);
+    expect(screen.queryByText(UNREADABLE)).toBeNull();
   });
 
   it("says when the project's rules do not allow the downloader", async () => {
