@@ -263,6 +263,45 @@ describe("another document's title reads the filtered embedded title (R422)", ()
   });
 });
 
+/**
+ * R425 a (the second review's M4): the kind and version signs read EVERY embedded title the file carries. A PDF's XMP
+ * title "untitled" does not hide an Info title "Front Matter".
+ */
+describe("every embedded title as found is read for the kind and version signs (R425 a)", () => {
+  /** A PDF with an XMP dc:title and an Info Title, the given lines on page 1. */
+  async function pdfXmp(o: { xmpTitle: string; info: string; lines: string[] }): Promise<string> {
+    const { PDFDocument, PDFName, StandardFonts } = await import("pdf-lib");
+    const doc = await PDFDocument.create({ updateMetadata: false });
+    doc.setTitle(o.info);
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const page = doc.addPage([595, 842]);
+    o.lines.forEach((l, i) => page.drawText(l, { x: 50, y: 780 - i * 22, size: 11, font }));
+    const xmp = `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title><rdf:Alt><rdf:li xml:lang="x-default">${o.xmpTitle}</rdf:li></rdf:Alt></dc:title></rdf:Description></rdf:RDF></x:xmpmeta>`;
+    doc.catalog.set(PDFName.of("Metadata"), doc.context.register(doc.context.stream(Buffer.from(xmp, "utf8"), { Type: "Metadata", Subtype: "XML" })));
+    const p = join(tmp, `x${++n}.pdf`);
+    await writeFile(p, Buffer.from(await doc.save({ useObjectStreams: false })));
+    return p;
+  }
+  const why = (r: Awaited<ReturnType<typeof checkFileAgainstRecord>>) => ({ match: r.match, ...(r.match ? { by: r.by } : { why: r.why }) });
+  it("XMP 'untitled' and Info 'Front Matter' → other-kind; the evidence shows the first title as found", async () => {
+    const r = await checkFileAgainstRecord(await pdfXmp({ xmpTitle: "untitled", info: "Front Matter", lines: [T, A, ...BODY] }), NO_DOI);
+    expect(why(r)).toEqual({ match: false, why: "other-kind" });
+    expect(r.evidence.embeddedTitle).toBe("untitled");
+  });
+  it("XMP 'Front Matter' and Info a real title → other-kind", async () => {
+    const r = await checkFileAgainstRecord(await pdfXmp({ xmpTitle: "Front Matter", info: T, lines: [T, A, ...BODY] }), NO_DOI);
+    expect(why(r)).toEqual({ match: false, why: "other-kind" });
+  });
+  it("a right download with XMP junk and Info junk still matches by its text", async () => {
+    const r = await checkFileAgainstRecord(await pdfXmp({ xmpTitle: "untitled", info: "S0003598X20000800jra 900..915", lines: [T, A, ...BODY] }), NO_DOI);
+    expect(why(r)).toEqual({ match: true, by: "title" });
+  });
+  it("Info 'Capital, Volume 2' behind an XMP 'untitled' is a sign of another version", async () => {
+    const r = await checkFileAgainstRecord(await pdfXmp({ xmpTitle: "untitled", info: "Capital, Volume 2", lines: ["CAPITAL", "Wendel Brakkenridge", ...BODY] }), CAPITAL);
+    expect(why(r)).toEqual({ match: false, why: "other-version" });
+  });
+});
+
 describe("files that cannot be read", () => {
   it("a scanned PDF without text needs a check", async () => {
     const p = join(tmp, "scan.pdf");

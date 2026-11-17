@@ -56,7 +56,7 @@ export async function extractDocx(path: string): Promise<RawExtract> {
       const rawTitle = dcValues(core, "title")[0]?.value;
       const title = embeddedTitle(rawTitle, basename(path));
       if (title) out.title = title;
-      if (rawTitle) out.rawTitle = rawTitle;
+      if (rawTitle) out.rawTitles = [rawTitle];
       const creator = dcValues(core, "creator")[0]?.value;
       const creators = creator ? keepCreators(parseNameList(creator)) : [];
       if (creators.length) out.creators = creators;

@@ -60,7 +60,7 @@ export async function extractEpub(path: string): Promise<RawExtract> {
     const rawTitle = dcValues(meta, "title")[0]?.value;
     const title = embeddedTitle(rawTitle, basename(path));
     if (title) out.title = title;
-    if (rawTitle) out.rawTitle = rawTitle;
+    if (rawTitle) out.rawTitles = [rawTitle];
     const creators = keepCreators(
       dcValues(meta, "creator")
         .map((c) => parseName(attr(c.attrs, "opf:file-as") && !c.value.includes(" ") ? attr(c.attrs, "opf:file-as")! : c.value))

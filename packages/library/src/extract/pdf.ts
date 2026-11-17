@@ -55,8 +55,8 @@ export async function extractPdf(path: string): Promise<RawExtract> {
     const infoTitle = str(inf.Title);
     const title = embeddedTitle(xmpTitle, name) ?? embeddedTitle(infoTitle, name);
     if (title) out.title = title;
-    const rawTitle = xmpTitle ?? infoTitle;
-    if (rawTitle) out.rawTitle = rawTitle;
+    const rawTitles = [xmpTitle, infoTitle].filter((t): t is string => !!t);
+    if (rawTitles.length) out.rawTitles = rawTitles;
 
     const xmpCreators = metadata?.get("dc:creator");
     let creators: Creator[] = [];

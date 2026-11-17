@@ -489,7 +489,7 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   const evidence: FileEvidence = { kind, bytes };
   // R410 b: the embedded title as found ("Front Matter", "Index" are signs of another kind of document), not the
   // import's filtered one.
-  const t = shown(raw?.rawTitle);
+  const t = shown(raw?.rawTitles?.[0]);
   if (t) evidence.embeddedTitle = t;
   const ts = shown(fullText.slice(0, FILE_CHECK_TEXT_CHARS));
   if (ts) evidence.textStart = ts;
@@ -512,7 +512,8 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   const family = firstFamily(record.creators);
   const names = new Set((Array.isArray(record.creators) ? record.creators.slice(0, 100) : []).flatMap((c) => plainWords([c.given, c.family, c.literal].filter(Boolean).join(" "))));
   const container = record.container ? plainWords(record.container) : [];
-  const embedded = raw.rawTitle ?? "";
+  /** Every embedded title as found (R410 b, R425 a): clauses 5 and 6 read them all; clause 8 reads the filtered one (R422). */
+  const embeddedAll = raw.rawTitles ?? [];
 
   /** The nearest line below (step 1) or above (step -1) line k that is not empty (R293 d). */
   const nearest = (k: number, step: 1 | -1): Line | undefined => {
@@ -564,7 +565,7 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   const kindIn = (zone: readonly string[]): boolean => {
     const zoneLines = [...zone];
     const textZoneWords = plainWords(zoneLines.join("\n"));
-    if (embedded) zoneLines.push(embedded);
+    zoneLines.push(...embeddedAll);
     // A1 (R296 e): a zone longer than the bound does not satisfy clause 5 (fail closed).
     if (zoneLines.join("\n").length > WORDS_MAX_CHARS) return true;
     const zoneWords = plainWords(zoneLines.join("\n"));
@@ -574,7 +575,7 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
         return containsRun(zoneWords, pw) && !containsRun(recAll, pw);
       }) ||
       aboutIn(textZoneWords) ||
-      (!!embedded && aboutIn(plainWords(embedded))) ||
+      embeddedAll.some((e) => aboutIn(plainWords(e))) ||
       zoneLines.some((l) => {
         const lw = plainWords(l);
         return (lw.length === 1 && OTHER_KIND_LINES.has(lw[0]!) && !recAll.includes(lw[0]!)) || addedLabels.some((al) => (al.length === 1 ? sameWords(lw, al) : startsWithRun(lw, al)));
@@ -584,11 +585,14 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
 
   // 6. No sign of another version or of a part near the block (and none in the embedded title).
   const recMarks = marksOf(recAll);
-  const ew = embedded ? plainWords(embedded) : [];
-  const ec = ew.filter((w) => !STOP_WORDS.has(w));
-  const embeddedVersion =
-    [...marksOf(ew)].some((m) => !recMarks.has(m)) ||
-    (ec.length > rec.length && rec.length > 0 && rec.every((w, i) => ec[i] === w) && ec.slice(rec.length).some((w) => numberValue(w, undefined) !== undefined && !recAll.includes(w)));
+  const embeddedVersion = embeddedAll.some((e) => {
+    const ew = plainWords(e);
+    const ec = ew.filter((w) => !STOP_WORDS.has(w));
+    return (
+      [...marksOf(ew)].some((m) => !recMarks.has(m)) ||
+      (ec.length > rec.length && rec.length > 0 && rec.every((w, i) => ec[i] === w) && ec.slice(rec.length).some((w) => numberValue(w, undefined) !== undefined && !recAll.includes(w)))
+    );
+  });
   /** A heading numbered two or more with no heading of the same word numbered one on a line before it. */
   const partHeading = (k: number): boolean => {
     const h = headingOf(lines[k]!.text);

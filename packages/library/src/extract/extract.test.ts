@@ -8,6 +8,9 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FIXTURE_DOI, FIXTURE_ISBN, buildMobi, buildPdf, buildZip, generateFixtures, type GeneratedFixtures } from "../../../../tests/fixtures/generate.mjs";
 import { docxText } from "./docx.js";
+import { extractHtml } from "./html.js";
+import { extractMobi } from "./mobi.js";
+import { extractPdf } from "./pdf.js";
 import { elements } from "./scan.js";
 import { MAX_TEXT_CHARS, UnsafeFileError, extractMetadata, mediaFromTags, shutdownExtractors } from "./index.js";
 
@@ -455,7 +458,7 @@ describe("R394: an embedded title or author is kept only when it looks like one"
     const x = await extractMetadata(f, "application/epub+zip");
     expect(x.title).toBeUndefined();
     expect(x.creators).toBeUndefined();
-    expect(x).not.toHaveProperty("rawTitle");
+    expect(x).not.toHaveProperty("rawTitles");
   });
 
   it("MOBI (R410 f): an EXTH title 'Untitled' by 'calibre' gives the PalmDB name and no author", async () => {
@@ -464,7 +467,19 @@ describe("R394: an embedded title or author is kept only when it looks like one"
     const x = await extractMetadata(f, "application/x-mobipocket-ebook");
     expect(x.title).toBe("salt_roads");
     expect(x.creators).toBeUndefined();
-    expect(x).not.toHaveProperty("rawTitle");
+    expect(x).not.toHaveProperty("rawTitles");
+  });
+
+  it("R425 a: every embedded title as found, in reading order, for the file check (PDF, MOBI, HTML)", async () => {
+    const p = join(tmp, "r425.pdf");
+    await writeFile(p, await pdfWith({ xmpTitle: "untitled", info: "Front Matter" }));
+    expect((await extractPdf(p)).rawTitles).toEqual(["untitled", "Front Matter"]);
+    const m = join(tmp, "r425.mobi");
+    await writeFile(m, buildMobi({ exth: [[503, "Untitled"]], fullName: "Front Matter" }));
+    expect((await extractMobi(m)).rawTitles).toEqual(["Untitled", "Front Matter", "salt_roads"]);
+    const h = join(tmp, "r425.html");
+    await writeFile(h, '<html><head><meta name="citation_title" content="Untitled"><title>Index</title></head><body>x</body></html>');
+    expect((await extractHtml(h)).rawTitles).toEqual(["Untitled", "Index"]);
   });
 
   it("HTML: a <title> that is a file name is dropped", async () => {

@@ -37,8 +37,9 @@ async function readAt(fh: fsp.FileHandle, pos: number, len: number): Promise<Buf
   return buf.subarray(0, bytesRead);
 }
 
-export function parseRecord0(rec0: Buffer): { title?: string; authors: string[]; isbns: string[]; date?: string; language?: string } {
-  const out: { title?: string; authors: string[]; isbns: string[]; date?: string; language?: string } = { authors: [], isbns: [] };
+/** `title`: the EXTH title, else the full name; `fullName`: the record-0 full name alone (for the file check, R425 a). */
+export function parseRecord0(rec0: Buffer): { title?: string; fullName?: string; authors: string[]; isbns: string[]; date?: string; language?: string } {
+  const out: { title?: string; fullName?: string; authors: string[]; isbns: string[]; date?: string; language?: string } = { authors: [], isbns: [] };
   if (rec0.length < 16 + 8 || rec0.toString("latin1", 16, 20) !== "MOBI") return out;
   const headerLen = rec0.readUInt32BE(20);
   const dec = decoder(rec0.length >= 32 ? rec0.readUInt32BE(28) : 65001);
@@ -46,7 +47,7 @@ export function parseRecord0(rec0: Buffer): { title?: string; authors: string[];
   if (rec0.length >= 0x5c) {
     const off = rec0.readUInt32BE(0x54);
     const len = rec0.readUInt32BE(0x58);
-    if (len > 0 && off < rec0.length && len <= rec0.length - off) out.title = clean(dec.decode(rec0.subarray(off, off + len))) || undefined;
+    if (len > 0 && off < rec0.length && len <= rec0.length - off) out.title = out.fullName = clean(dec.decode(rec0.subarray(off, off + len))) || undefined;
   }
 
   const hasExth = rec0.length >= 0x84 && (rec0.readUInt32BE(0x80) & 0x40) !== 0;
@@ -85,7 +86,7 @@ export async function extractMobi(path: string): Promise<RawExtract> {
     // R394 a: the PalmDB name and the EXTH title count only when they look like a title.
     const palmRaw = clean(head.toString("latin1", 0, nameEnd >= 0 && nameEnd < 32 ? nameEnd : 32)) || undefined;
     const palmName = embeddedTitle(palmRaw, basename(path));
-    const fallback: RawExtract = { ...(palmName ? { title: palmName } : {}), ...(palmRaw ? { rawTitle: palmRaw } : {}) };
+    const fallback: RawExtract = { ...(palmName ? { title: palmName } : {}), ...(palmRaw ? { rawTitles: [palmRaw] } : {}) };
 
     const numRecords = head.readUInt16BE(76);
     if (numRecords < 1) return fallback;
@@ -101,8 +102,9 @@ export async function extractMobi(path: string): Promise<RawExtract> {
     const out: RawExtract = {};
     const title = embeddedTitle(m.title, basename(path)) ?? palmName;
     if (title) out.title = title;
-    const rawTitle = m.title ?? palmRaw;
-    if (rawTitle) out.rawTitle = rawTitle;
+    const exthTitle = m.title !== m.fullName ? m.title : undefined;
+    const rawTitles = [exthTitle, m.fullName, palmRaw].filter((t): t is string => !!t);
+    if (rawTitles.length) out.rawTitles = rawTitles;
     const creators = keepCreators(m.authors.map((a) => parseName(a)).filter((c): c is Creator => !!c));
     if (creators.length) out.creators = creators;
     const issued = normalizeDate(m.date);
