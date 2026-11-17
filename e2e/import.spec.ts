@@ -20,6 +20,7 @@ import { buildPdf } from "../tests/fixtures/generate.mjs";
 import { buildZoteroFixture } from "../packages/library/tests/fixtures/zotero/build-fixture.mjs";
 import { APP_ORIGIN, decryptStoredFile, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR, REPO_ROOT } from "./paths.js";
+import { pressByMouse } from "./press.js";
 
 // ---------- shared ----------
 
@@ -135,7 +136,8 @@ async function importZotero(page: Page, dataDir: string): Promise<void> {
 async function acceptTheReviewItem(page: Page): Promise<void> {
   await page.getByRole("link", { name: "Open the review queue (1 item)" }).click();
   await expect(page.getByRole("list", { name: "Items waiting for review (1)" })).toBeVisible();
-  await page.getByRole("group", { name: "Decide this item" }).getByRole("button", { name: "Accept" }).click();
+  // R362 d: the panel takes a mouse press only where the pointer really moved over the control.
+  await pressByMouse(page, page.getByRole("group", { name: "Decide this item" }).getByRole("button", { name: "Accept" }));
   await expect(page.getByText("Nothing is waiting for review in this import.")).toBeVisible();
 }
 
@@ -217,7 +219,7 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     await page.getByRole("group", { name: "Decide this item" }).getByRole("button", { name: "Edit" }).click();
     const form = page.getByRole("form", { name: "Edit before accepting" });
     await form.getByRole("textbox", { name: "Title" }).fill(REVIEWED_AS);
-    await form.getByRole("button", { name: "Save and accept" }).click();
+    await pressByMouse(page, form.getByRole("button", { name: "Save and accept" }));
     await expect(page.getByRole("status").filter({ hasText: `Saved and accepted: ${REVIEWED}` })).toBeVisible();
     await expect(page.getByText("Nothing is waiting for review in this import.")).toBeVisible();
     // What the service persisted: the queue is empty and the source carries the edited title.

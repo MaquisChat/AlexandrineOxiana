@@ -62,7 +62,8 @@ test("a file attached by drag and drop that needs review: the badge leads to the
   await test.step("decide it (Accept): it leaves the queue", async () => {
     const decide = page.getByRole("group", { name: "Decide this item" });
     await expect(decide.getByRole("button", { name: "Accept" })).toBeEnabled({ timeout: 30_000 });
-    await decide.getByRole("button", { name: "Accept" }).click();
+    // R362 d: the panel takes a mouse press only where the pointer really moved over the control (as a researcher's does).
+    await pressByMouse(page, decide.getByRole("button", { name: "Accept" }));
     await expect(page.getByText("Nothing is waiting for review for this source.")).toBeVisible();
   });
 
