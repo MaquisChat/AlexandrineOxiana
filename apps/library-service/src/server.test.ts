@@ -1041,6 +1041,24 @@ describe("FR-A18 round 2 (R397 b–d): the issues are bounded, scrubbed, on one 
     expect(issues[0]!.length).toBeLessThanOrEqual(300);
     expect(issues[0]!.endsWith("…")).toBe(true);
   });
+
+  it("c: a value holding the library's folder path is scrubbed", async () => {
+    const inLib = await issuesOf(`encryption: {atRest: "${join(tmp, "Lib")}/secret-notes.txt"}\n`);
+    expect(inLib.join(" ")).not.toContain(tmp);
+    expect(inLib.join(" ")).toContain("secret-notes.txt");
+  });
+
+  it("c: an absolute path outside the library is scrubbed", async () => {
+    const outside = await issuesOf(`encryption: {atRest: "/Users/ana/private/consent.pdf"}\n`);
+    expect(outside.join(" ")).not.toContain("/Users/ana");
+    expect(outside.join(" ")).toContain("<path>");
+  });
+
+  it("c: a message with a newline in it is collapsed to one line", async () => {
+    const issues = await issuesOf(`encryption: {atRest: "first line\\nsecond line"}\n`);
+    expect(issues.some((i) => i.includes("first line second line"))).toBe(true);
+    for (const i of issues) expect(i).not.toMatch(/[\n\r]/);
+  });
 });
 
 describe("review round 1: errors, query credentials, pairing (R98, R99)", () => {
