@@ -298,6 +298,267 @@ describe("Fieldwork", () => {
   });
 });
 
+describe("one request at a time (R379, I3)", () => {
+  /** Holds every request through `paths` until `release()`; the rest pass to the handlers above. */
+  function hold() {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    return { gate, release };
+  }
+  const count = (method: string, path: RegExp) => db.calls.filter((c) => c.method === method && path.test(c.path)).length;
+  /** Re-registers a POST handler that records at once and answers only once the gate opens. */
+  const heldPost = (path: string, gate: Promise<void>, answer: (b: any) => any) =>
+    http.post(P(path), async ({ request }) => {
+      const b = (await request.json()) as any;
+      db.calls.push({ method: "POST", path, body: b });
+      await gate;
+      return HttpResponse.json(answer(b));
+    });
+  async function withParticipant() {
+    db.participants.push({ id: id(), code: "P-001", consentIds: [] });
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    await within(await screen.findByRole("region", { name: "Participants" })).findByText("P-001");
+  }
+  async function fillConsent(user: ReturnType<typeof userEvent.setup>) {
+    const c = section("Consent records");
+    await user.selectOptions(within(c).getByRole("combobox", { name: "Participant" }), "P-001");
+    await user.type(within(c).getByRole("textbox", { name: "Scope" }), "Audio");
+    fireEvent.change(within(c).getByLabelText("Consent date"), { target: { value: "2026-03-14" } });
+    return within(c).getByRole("button", { name: "Add consent record" }) as HTMLButtonElement;
+  }
+
+  it("the reviewer's probe: two submits of the consent form and two clicks on \"Add participant\" send one request each", async () => {
+    const h = hold();
+    server.use(
+      heldPost("/consents", h.gate, (b) => {
+        const c = { id: id(), ...b };
+        db.consents.push(c);
+        return c;
+      }),
+      heldPost("/participants", h.gate, () => {
+        const p = { id: id(), code: `P-00${db.participants.length + 1}`, consentIds: [] };
+        db.participants.push(p);
+        return p;
+      }),
+    );
+    await withParticipant();
+    const user = userEvent.setup();
+    const add = await fillConsent(user);
+    const form = add.closest("form")!;
+    fireEvent.submit(form);
+    fireEvent.submit(form);
+    await waitFor(() => expect(count("POST", /^\/consents$/)).toBe(1));
+    const addP = within(section("Participants")).getByRole("button", { name: "Add participant" }) as HTMLButtonElement;
+    expect(addP.disabled).toBe(true); // a request runs: nothing else starts
+    h.release();
+    await waitFor(() => expect(addP.disabled).toBe(false));
+    const h2 = hold();
+    server.use(
+      heldPost("/participants", h2.gate, () => {
+        const p = { id: id(), code: `P-00${db.participants.length + 1}`, consentIds: [] };
+        db.participants.push(p);
+        return p;
+      }),
+    );
+    await user.click(addP);
+    await user.click(addP);
+    fireEvent.click(addP);
+    h2.release();
+    await within(section("Participants")).findByText("P-002");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(count("POST", /^\/consents$/)).toBe(1);
+    expect(count("POST", /^\/participants$/)).toBe(1);
+  });
+
+  it("Enter held on \"Add participant\": one request; the button is disabled meanwhile, then back, with focus on it", async () => {
+    const h = hold();
+    server.use(
+      heldPost("/participants", h.gate, () => {
+        const p = { id: id(), code: "P-001", consentIds: [] };
+        db.participants.push(p);
+        return p;
+      }),
+    );
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    const addP = (await within(await screen.findByRole("region", { name: "Participants" })).findByRole("button", { name: "Add participant" })) as HTMLButtonElement;
+    addP.focus();
+    const user = userEvent.setup();
+    await user.keyboard("{Enter>5}{/Enter}");
+    expect(addP.disabled).toBe(true);
+    h.release();
+    await within(section("Participants")).findByText("P-001");
+    await waitFor(() => expect(addP.disabled).toBe(false));
+    expect(document.activeElement).toBe(addP);
+    expect(count("POST", /^\/participants$/)).toBe(1);
+  });
+
+  it("Enter held on \"Add consent record\": one consent record; then focus goes back to the (emptied) form", async () => {
+    const h = hold();
+    server.use(
+      heldPost("/consents", h.gate, (b) => {
+        const c = { id: id(), ...b };
+        db.consents.push(c);
+        return c;
+      }),
+    );
+    await withParticipant();
+    const user = userEvent.setup();
+    const add = await fillConsent(user);
+    add.focus();
+    await user.keyboard("{Enter>5}{/Enter}");
+    expect(add.disabled).toBe(true);
+    h.release();
+    await within(section("Consent records")).findByText("Audio");
+    expect(count("POST", /^\/consents$/)).toBe(1);
+    // The form was emptied, so its button stays disabled: focus is on the form's first field.
+    await waitFor(() => expect(document.activeElement).toBe(within(section("Consent records")).getByRole("combobox", { name: "Participant" })));
+  });
+
+  it("a failed consent request re-enables the form, shows its error as before, and focus is back on its button", async () => {
+    const h = hold();
+    server.use(http.post(P("/consents"), async ({ request }) => {
+      db.calls.push({ method: "POST", path: "/consents", body: await request.json() });
+      await h.gate;
+      return HttpResponse.json({ error: { code: "VALIDATION", message: "The consent date is in the future." } }, { status: 400 });
+    }));
+    await withParticipant();
+    const user = userEvent.setup();
+    const add = await fillConsent(user);
+    add.focus();
+    await user.keyboard("{Enter>3}{/Enter}");
+    expect(add.disabled).toBe(true);
+    h.release();
+    expect((await screen.findByRole("alert")).textContent).toBe("The consent date is in the future.");
+    await waitFor(() => expect(add.disabled).toBe(false));
+    expect(document.activeElement).toBe(add);
+    expect(count("POST", /^\/consents$/)).toBe(1);
+  });
+
+  it("\"Add session\": two submits and a held Enter send one request", async () => {
+    const h = hold();
+    server.use(
+      heldPost("/sessions", h.gate, (b) => {
+        const s = { id: id(), participantIds: [], ...b };
+        db.sessions.push(s);
+        return s;
+      }),
+    );
+    await withParticipant();
+    const s = section("Sessions");
+    fireEvent.change(within(s).getByLabelText("Date"), { target: { value: "2026-03-14" } });
+    const add = within(s).getByRole("button", { name: "Add session" }) as HTMLButtonElement;
+    fireEvent.submit(add.closest("form")!);
+    fireEvent.submit(add.closest("form")!);
+    add.focus();
+    await userEvent.setup().keyboard("{Enter>3}{/Enter}");
+    expect(add.disabled).toBe(true);
+    h.release();
+    await within(s).findByText("2026-03-14");
+    expect(count("POST", /^\/sessions$/)).toBe(1);
+  });
+
+  it("the other controls: Save session, Save consent, a dropped form, Re-attach, Delete participant, Withdraw — one request each, disabled while one runs", async () => {
+    const sid = id();
+    const cid = id();
+    db.participants.push({ id: id(), code: "P-001", consentIds: [] });
+    db.sessions.push({ id: sid, date: "2026-03-14", place: "Lima", participantIds: [] });
+    db.consents.push({ id: cid, participantId: db.participants[0].id, scope: "audio", date: "2026-03-14" });
+    let h = hold();
+    const held = (method: "patch" | "post" | "delete", path: string, answer: () => any) =>
+      http[method](P(path), async ({ request }) => {
+        const body = method === "delete" ? undefined : await request.json();
+        db.calls.push({ method: method.toUpperCase(), path: new URL(request.url).pathname.replace(`/projects/${PID}`, ""), body });
+        await h.gate;
+        return answer();
+      });
+    server.use(
+      held("patch", "/sessions/:fid", () => HttpResponse.json(db.sessions[0])),
+      held("patch", "/consents/:fid", () => HttpResponse.json(db.consents[0])),
+      held("post", "/consents/:fid/document", () => HttpResponse.json({ error: { code: "VALIDATION", message: "detached", reason: "detached-form" } }, { status: 400 })),
+      held("delete", "/participants/:fid", () => HttpResponse.json({ error: { code: "CONFLICT", message: "P-001 cannot be deleted: 1 consent record still links to it." } }, { status: 409 })),
+      held("post", "/consents/:fid/withdraw", () => HttpResponse.json({ consent: db.consents[0], flaggedSourceIds: [] })),
+    );
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    await within(await screen.findByRole("region", { name: "Participants" })).findByText("P-001");
+    const user = userEvent.setup();
+    const settle = async () => {
+      h.release();
+      await waitFor(() => expect((within(section("Participants")).getByRole("button", { name: "Add participant" }) as HTMLButtonElement).disabled).toBe(false));
+      h = hold();
+    };
+
+    // Save session: two submits of the editor.
+    await user.click(await within(section("Sessions")).findByRole("button", { name: "Edit the session of 2026-03-14" }));
+    const saveS = within(section("Sessions")).getByRole("button", { name: "Save session" });
+    const sForm = saveS.closest("form")!;
+    fireEvent.submit(sForm);
+    fireEvent.submit(sForm);
+    await waitFor(() => expect(count("PATCH", /^\/sessions\//)).toBe(1));
+    await settle();
+
+    // Save consent: two submits of the editor.
+    await user.click(within(section("Consent records")).getByRole("button", { name: "Edit consent of P-001" }));
+    const cForm = within(section("Consent records")).getByRole("button", { name: "Save consent" }).closest("form")!;
+    fireEvent.submit(cForm);
+    fireEvent.submit(cForm);
+    await waitFor(() => expect(count("PATCH", /^\/consents\//)).toBe(1));
+    expect((within(section("Consent records")).getByRole("button", { name: "Withdraw consent of P-001" }) as HTMLButtonElement).disabled).toBe(true);
+    await settle();
+
+    // A dropped form, dropped twice: one request; then the re-attach offer, pressed twice: one request.
+    const c = section("Consent records");
+    const file = Object.assign(new File(["%PDF"], "f.pdf"), { path: "/Users/ana/f.pdf" });
+    const zone = within(c).getByText(/Drop the signed consent form here/);
+    fireEvent.drop(zone, { dataTransfer: { files: [file], types: ["Files"] } });
+    fireEvent.drop(zone, { dataTransfer: { files: [file], types: ["Files"] } });
+    await waitFor(() => expect(count("POST", /\/document$/)).toBe(1));
+    expect((within(c).getByRole("textbox", { name: "Or add the form by its full path" }) as HTMLInputElement).disabled).toBe(true);
+    await settle();
+    const offer = await within(c).findByRole("group", { name: "Re-attach the signed form of P-001?" });
+    const re = within(offer).getByRole("button", { name: "Re-attach the form" });
+    fireEvent.click(re);
+    fireEvent.click(re);
+    await waitFor(() => expect(count("POST", /\/document$/)).toBe(2));
+    await settle();
+
+    // Delete participant: the dialog's confirm pressed twice.
+    await user.click(within(section("Participants")).getByRole("button", { name: "Delete P-001" }));
+    const del = within(screen.getByRole("dialog", { name: "Delete participant P-001" })).getByRole("button", { name: "Delete" });
+    fireEvent.click(del);
+    fireEvent.click(del);
+    await waitFor(() => expect(count("DELETE", /^\/participants\//)).toBe(1));
+    await settle();
+    expect((await screen.findByRole("alert")).textContent).toMatch(/cannot be deleted/);
+
+    // Withdraw: the dialog's form submitted twice.
+    await user.click(within(section("Consent records")).getByRole("button", { name: "Withdraw consent of P-001" }));
+    const wForm = within(screen.getByRole("dialog", { name: "Withdraw consent" })).getByRole("button", { name: "Withdraw consent" }).closest("form")!;
+    fireEvent.submit(wForm);
+    fireEvent.submit(wForm);
+    await waitFor(() => expect(count("POST", /\/withdraw$/)).toBe(1));
+    await settle();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(count("PATCH", /^\/sessions\//)).toBe(1);
+    expect(count("PATCH", /^\/consents\//)).toBe(1);
+    expect(count("POST", /\/document$/)).toBe(2);
+    expect(count("DELETE", /^\/participants\//)).toBe(1);
+    expect(count("POST", /\/withdraw$/)).toBe(1);
+  });
+
+  it("a failed \"Add participant\" re-enables it and shows its error as before", async () => {
+    server.use(http.post(P("/participants"), async ({ request }) => {
+      db.calls.push({ method: "POST", path: "/participants", body: await request.json() });
+      return HttpResponse.json({ error: { code: "INTERNAL", message: "The participant could not be added." } }, { status: 500 });
+    }));
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    const addP = (await within(await screen.findByRole("region", { name: "Participants" })).findByRole("button", { name: "Add participant" })) as HTMLButtonElement;
+    await userEvent.setup().click(addP);
+    expect((await screen.findByRole("alert")).textContent).toBe("The participant could not be added.");
+    await waitFor(() => expect(addP.disabled).toBe(false));
+    expect(document.activeElement).toBe(addP);
+  });
+});
+
 describe("R362 h: a consent's scope typed in an encrypted project", () => {
   const SCOPE_NOTE = "In an encrypted project this text can be read without the passphrase. Do not put a person's name in it.";
   const describedText = (el: HTMLElement) =>
