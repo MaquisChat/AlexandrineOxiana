@@ -935,8 +935,18 @@ export class ServiceState {
 
   // ---- import batches ------------------------------------------------------------------
 
+  /** R436 e: handles whose run has settled (each stays in `s.batches` until followBatch's end has run). */
+  private readonly settledHandles = new WeakSet<BatchHandle>();
+
+  /** R436 e: whether this handle's run has settled (it is then not running, though still kept for a moment). */
+  batchSettled(h: BatchHandle): boolean {
+    return this.settledHandles.has(h);
+  }
+
   /** Follows a running batch: progress and its end as `import.progress`; it leaves the registry when it ends (R99 I3). */
   followBatch(s: Session, projectId: string, h: BatchHandle): void {
+    const settled = () => void this.settledHandles.add(h);
+    h.done.then(settled, settled);
     s.batches.set(h.batchId, { projectId, handle: h });
     this.track(
       (async () => {

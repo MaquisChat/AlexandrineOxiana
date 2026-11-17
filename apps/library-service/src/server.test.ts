@@ -925,6 +925,25 @@ describe("review round 1: batches (R99 I3, I4)", () => {
     expect((await call({ url: `/jobs?projectId=${pid}` })).json.imports).toEqual([]);
   });
 
+  it("R436 e: a Resume for a batch whose run has ended, its handle still kept, starts the resume (never 200 for nothing)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(12);
+    const progressed = holdBatch((d) => d.done >= 2);
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
+    await progressed;
+    const kept = svc.state.session!.batches.get(batchId)!;
+    expect((await call({ method: "POST", url: `/imports/${batchId}/cancel` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("cancelled");
+    // The window the review found: the run has settled, but its handle is still kept (it leaves in followBatch's end).
+    svc.state.session!.batches.set(batchId, kept);
+    expect((await call({ method: "POST", url: `/imports/${batchId}/resume` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("finished");
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(12);
+  });
+
   it("lock mid-import, unlock, resume: every item imported once", async () => {
     await openNewLibrary();
     const pid = await newProject(OPEN_GOV.replace("atRest: optional", "atRest: required"), true);

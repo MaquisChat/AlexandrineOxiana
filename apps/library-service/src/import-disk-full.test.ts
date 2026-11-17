@@ -101,11 +101,14 @@ async function papers(dir: string, from: number, n: number): Promise<void> {
   }
 }
 
-/** Waits until the batch is no longer running; returns its listed state. */
+/**
+ * Waits until the batch has ended: no longer running in the listing, and its run let go by the service (R436 e: a
+ * Resume is then never sent while the ended run's handle is still kept); returns its listed state.
+ */
 async function settled(pid: string, batchId: string): Promise<string> {
   for (;;) {
     const b = ((await call({ url: `/projects/${pid}/imports` })).json.batches as Array<{ batchId: string; state: string }>).find((x) => x.batchId === batchId);
-    if (b && b.state !== "running") return b.state;
+    if (b && b.state !== "running" && !svc.state.session?.batches.has(batchId)) return b.state;
     await new Promise((r) => setTimeout(r, 100));
   }
 }
