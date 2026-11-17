@@ -222,6 +222,23 @@ describe("the file check's table (R282, R284, R292): what the file holds → mat
   });
 });
 
+/**
+ * R410 b (the review's I2): the file check reads the embedded title as it was found, not the import's filtered one, so a
+ * downloaded file whose embedded title says it is a journal's front matter, index or table of contents (the record's
+ * title and author on its first page, as such a file lists its articles) is another kind of document, not a match.
+ */
+describe("the embedded title as found is a sign of another kind of document (R410 b)", () => {
+  it.each(["Front Matter", "Index", "Back Matter", "Table of Contents", "Contents"])("embedded title %j → other-kind", async (title) => {
+    const r = await checkFileAgainstRecord(await pdf({ title, lines: [T, A, ...BODY] }), NO_DOI);
+    expect({ match: r.match, ...(r.match ? {} : { why: r.why }) }).toEqual({ match: false, why: "other-kind" });
+    expect(r.evidence.embeddedTitle).toBe(title);
+  });
+  it("an EPUB whose OPF title is 'Front Matter' → other-kind", async () => {
+    const r = await checkFileAgainstRecord(await epub({ title: "Front Matter", creator: A, body: `<h1>${T}</h1><p>${A}</p>${BODY.map((l) => `<p>${l}</p>`).join("")}` }), NO_DOI);
+    expect({ match: r.match, ...(r.match ? {} : { why: r.why }) }).toEqual({ match: false, why: "other-kind" });
+  });
+});
+
 describe("files that cannot be read", () => {
   it("a scanned PDF without text needs a check", async () => {
     const p = join(tmp, "scan.pdf");

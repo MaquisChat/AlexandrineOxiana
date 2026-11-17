@@ -51,8 +51,12 @@ export async function extractPdf(path: string): Promise<RawExtract> {
 
     // R394 a: the XMP title, else the Info Title, whichever first looks like a title.
     const name = basename(path);
-    const title = embeddedTitle(str(metadata?.get("dc:title")), name) ?? embeddedTitle(str(inf.Title), name);
+    const xmpTitle = str(metadata?.get("dc:title"));
+    const infoTitle = str(inf.Title);
+    const title = embeddedTitle(xmpTitle, name) ?? embeddedTitle(infoTitle, name);
     if (title) out.title = title;
+    const rawTitle = xmpTitle ?? infoTitle;
+    if (rawTitle) out.rawTitle = rawTitle;
 
     const xmpCreators = metadata?.get("dc:creator");
     let creators: Creator[] = [];

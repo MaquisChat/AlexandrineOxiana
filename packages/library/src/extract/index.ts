@@ -89,7 +89,8 @@ export async function extractMetadata(path: string, mime: string): Promise<Extra
   // Video: embedded and timed metadata too (-ee), e.g. a GPS track recorded with the frames (R85).
   const raw = kind === "media" && /^video\//iu.test(mime) ? await extractExif(path, { embedded: true }) : await EXTRACTORS[kind](path);
   const text = raw.text ? capText(raw.text) : undefined;
-  const { ids: _ids, text: _text, ...rest } = raw;
+  // The embedded title as found is for the file check alone (R410 b): the import reads the filtered `title`.
+  const { ids: _ids, text: _text, rawTitle: _rawTitle, ...rest } = raw;
   return { ...rest, identifiers: mergeIdentifiers(raw, text), ...(text ? { text } : {}) };
 }
 

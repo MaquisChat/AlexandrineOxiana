@@ -53,4 +53,10 @@ export interface Extracted {
  * dispatcher canonicalises them and adds those found in `text`. */
 export interface RawExtract extends Omit<Extracted, "identifiers"> {
   ids?: { dois?: string[]; isbns?: string[]; arxiv?: string[] };
+  /**
+   * The embedded title as it was found (the first one present, in the order the extractor reads them), before the
+   * R394 filter that gives `title`; only when one was found. Read by Find and acquire's file check alone, for its signs
+   * of another kind of document ("Front Matter", "Index"); the dispatcher drops it, so the import never sees it (R410 b).
+   */
+  rawTitle?: string;
 }

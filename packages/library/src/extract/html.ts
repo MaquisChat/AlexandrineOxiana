@@ -62,8 +62,11 @@ export async function extractHtml(path: string): Promise<RawExtract> {
 
   const out: RawExtract = {};
   // R394 a: the meta title, else the <title>, whichever first looks like a title.
-  const title = embeddedTitle(first("citation_title", "dc.title", "dcterms.title", "og:title"), basename(path)) ?? embeddedTitle(docTitle || undefined, basename(path));
+  const metaTitle = first("citation_title", "dc.title", "dcterms.title", "og:title");
+  const title = embeddedTitle(metaTitle, basename(path)) ?? embeddedTitle(docTitle || undefined, basename(path));
   if (title) out.title = title;
+  const rawTitle = metaTitle ?? (docTitle || undefined);
+  if (rawTitle) out.rawTitle = rawTitle;
 
   let creators = list("citation_author").map((n) => parseName(n));
   if (!creators.length) creators = list("dc.creator", "dcterms.creator").map((n) => parseName(n));

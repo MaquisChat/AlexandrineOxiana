@@ -485,7 +485,9 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   const raw = await extract(path, kind);
   const fullText = raw?.text ?? "";
   const evidence: FileEvidence = { kind, bytes };
-  const t = shown(raw?.title);
+  // R410 b: the embedded title as found ("Front Matter", "Index" are signs of another kind of document), not the
+  // import's filtered one.
+  const t = shown(raw?.rawTitle);
   if (t) evidence.embeddedTitle = t;
   const ts = shown(fullText.slice(0, FILE_CHECK_TEXT_CHARS));
   if (ts) evidence.textStart = ts;
@@ -508,7 +510,7 @@ export async function checkFileAgainstRecord(path: string, record: FileCheckReco
   const family = firstFamily(record.creators);
   const names = new Set((Array.isArray(record.creators) ? record.creators.slice(0, 100) : []).flatMap((c) => plainWords([c.given, c.family, c.literal].filter(Boolean).join(" "))));
   const container = record.container ? plainWords(record.container) : [];
-  const embedded = raw.title ?? "";
+  const embedded = raw.rawTitle ?? "";
 
   /** The nearest line below (step 1) or above (step -1) line k that is not empty (R293 d). */
   const nearest = (k: number, step: 1 | -1): Line | undefined => {

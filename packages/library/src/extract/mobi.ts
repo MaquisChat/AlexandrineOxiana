@@ -83,8 +83,9 @@ export async function extractMobi(path: string): Promise<RawExtract> {
     if (head.length < PALMDB_HEADER) return {};
     const nameEnd = head.indexOf(0);
     // R394 a: the PalmDB name and the EXTH title count only when they look like a title.
-    const palmName = embeddedTitle(clean(head.toString("latin1", 0, nameEnd >= 0 && nameEnd < 32 ? nameEnd : 32)) || undefined, basename(path));
-    const fallback: RawExtract = palmName ? { title: palmName } : {};
+    const palmRaw = clean(head.toString("latin1", 0, nameEnd >= 0 && nameEnd < 32 ? nameEnd : 32)) || undefined;
+    const palmName = embeddedTitle(palmRaw, basename(path));
+    const fallback: RawExtract = { ...(palmName ? { title: palmName } : {}), ...(palmRaw ? { rawTitle: palmRaw } : {}) };
 
     const numRecords = head.readUInt16BE(76);
     if (numRecords < 1) return fallback;
@@ -100,6 +101,8 @@ export async function extractMobi(path: string): Promise<RawExtract> {
     const out: RawExtract = {};
     const title = embeddedTitle(m.title, basename(path)) ?? palmName;
     if (title) out.title = title;
+    const rawTitle = m.title ?? palmRaw;
+    if (rawTitle) out.rawTitle = rawTitle;
     const creators = keepCreators(m.authors.map((a) => parseName(a)).filter((c): c is Creator => !!c));
     if (creators.length) out.creators = creators;
     const issued = normalizeDate(m.date);

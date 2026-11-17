@@ -53,8 +53,10 @@ export async function extractDocx(path: string): Promise<RawExtract> {
     const core = (await zip.read("docProps/core.xml", MAX_CORE_BYTES))?.toString("utf8");
     if (core) {
       // R394: a title that does not look like one ("Document1") and a stock author ("User") are dropped.
-      const title = embeddedTitle(dcValues(core, "title")[0]?.value, basename(path));
+      const rawTitle = dcValues(core, "title")[0]?.value;
+      const title = embeddedTitle(rawTitle, basename(path));
       if (title) out.title = title;
+      if (rawTitle) out.rawTitle = rawTitle;
       const creator = dcValues(core, "creator")[0]?.value;
       const creators = creator ? keepCreators(parseNameList(creator)) : [];
       if (creators.length) out.creators = creators;
