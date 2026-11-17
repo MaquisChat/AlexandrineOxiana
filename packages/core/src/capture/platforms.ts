@@ -7,6 +7,8 @@
  * No Node or DOM APIs beyond the WHATWG URL, which both have.
  */
 
+import { secretName } from "./secret-names.js";
+
 /** Longest address the service accepts (routes/capture.ts). */
 export const MAX_ADDRESS_LENGTH = 2048;
 
@@ -27,7 +29,10 @@ export type LinkKind = "video" | "short" | "post" | "reel" | "carousel" | "story
 export interface ClassifiedUrl {
   platform: Platform;
   kind: LinkKind;
-  /** The link without tracking parameters or fragment (platform links in their canonical form). */
+  /**
+   * The link as stored and printed: platform links in their canonical form; any other link without
+   * user name, password, fragment, tracking or secret-named parameters (R379).
+   */
   canonicalUrl: string;
   postId?: string;
   handle?: string;
@@ -57,13 +62,68 @@ function hostOf(u: URL): string {
   return u.hostname.toLowerCase().replace(/^(www|m|mobile|music)\./, "");
 }
 
-/** Strips tracking parameters and the fragment; everything else is kept as given. */
+/** A piece of an address decoded for judging (`+` is a space in a query), or as written when its escapes are malformed. */
+function decodePart(s: string, query: boolean): string {
+  const t = query ? s.replace(/\+/g, " ") : s;
+  try {
+    return decodeURIComponent(t);
+  } catch {
+    return t;
+  }
+}
+
+/** True when the raw `name=value` (or bare `name`) part carries a secret (`secretName`, R391) or, in a query, tracks sharing. */
+function dropPart(part: string, query: boolean): boolean {
+  const eq = part.indexOf("=");
+  const name = decodePart(eq < 0 ? part : part.slice(0, eq), query);
+  const value = eq < 0 ? "" : decodePart(part.slice(eq + 1), query);
+  return (query && TRACKING.test(name)) || secretName(name, value);
+}
+
+/**
+ * The path without its secret path parameters (R391 a): in each segment, `;name=value` parts judged by
+ * the same rule as the query and removed when secret (`/app;jsessionid=…/x` → `/app/x`); the rest of
+ * the path is kept as written.
+ */
+function cleanPath(path: string): string {
+  if (!path.includes(";")) return path;
+  return path
+    .split("/")
+    .map((seg) => {
+      if (!seg.includes(";")) return seg;
+      const [head, ...params] = seg.split(";");
+      return [head, ...params.filter((p) => !dropPart(p, false))].join(";");
+    })
+    .join("/");
+}
+
+/**
+ * The query without tracking and secret parameters (R379, R391 b): one pass over the raw `&`-separated
+ * parts; every part kept is kept byte for byte and in its order (no re-serialising).
+ */
+function cleanQuery(search: string): string {
+  if (search.length <= 1) return "";
+  const kept = search.slice(1).split("&").filter((p) => !dropPart(p, true));
+  return kept.length === 0 || (kept.length === 1 && kept[0] === "") ? "" : `?${kept.join("&")}`;
+}
+
+/**
+ * The address as stored and printed (R379, R391; R41 C1, R99 I8: no secret in a stored address):
+ * without the user name and password, the fragment, tracking parameters and secret parameters, in the
+ * query and in the path (`secretName`). The rest of the path and every other parameter stay as
+ * written, so it still leads to the page.
+ */
 function stripTracking(u: URL): string {
-  const out = new URL(u.href);
-  out.hash = "";
-  for (const k of [...out.searchParams.keys()]) if (TRACKING.test(k)) out.searchParams.delete(k);
-  out.hostname = out.hostname.toLowerCase();
-  return out.href;
+  return `${u.protocol}//${u.host.toLowerCase()}${cleanPath(u.pathname)}${cleanQuery(u.search)}`;
+}
+
+/** A handle segment decoded, or undefined when its percent escapes are malformed (R379: not a handle). */
+function decodeHandle(seg: string): string | undefined {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return undefined;
+  }
 }
 
 function youtube(u: URL, host: string): ClassifiedUrl {
@@ -90,8 +150,8 @@ function youtube(u: URL, host: string): ClassifiedUrl {
   if (seg[0] === "playlist" && list) {
     return { platform: "youtube", kind: "playlist", canonicalUrl: `https://www.youtube.com/playlist?list=${encodeURIComponent(list)}` };
   }
-  if (seg[0]?.startsWith("@") && seg[0].length > 1) {
-    const handle = decodeURIComponent(seg[0]);
+  const handle = seg[0]?.startsWith("@") && seg[0].length > 1 ? decodeHandle(seg[0]) : undefined;
+  if (handle !== undefined) {
     return { platform: "youtube", kind: "profile", canonicalUrl: `https://www.youtube.com/${seg[0]}`, handle };
   }
   if ((seg[0] === "channel" || seg[0] === "c" || seg[0] === "user") && seg[1]) {
@@ -125,7 +185,8 @@ function tiktok(u: URL, host: string): ClassifiedUrl {
   }
   const unknown: ClassifiedUrl = { platform: "tiktok", kind: "unknown", canonicalUrl: stripTracking(u) };
   if (!seg[0]?.startsWith("@") || seg[0].length < 2) return unknown;
-  const handle = decodeURIComponent(seg[0]);
+  const handle = decodeHandle(seg[0]);
+  if (handle === undefined) return unknown;
   if ((seg[1] === "video" || seg[1] === "photo") && seg[2] && /^\d+$/.test(seg[2])) {
     return {
       platform: "tiktok",
@@ -139,15 +200,59 @@ function tiktok(u: URL, host: string): ClassifiedUrl {
   return unknown;
 }
 
+/**
+ * An address safe to store, for the catch-alls (R391 f): the cleaned form of an http(s) address
+ * (`stripTracking`) when it can be made; else the address with everything from the first `?`, `#`
+ * or `;` removed and any `user:pass@` removed. Never the address as given; never throws.
+ */
+export function cleanAddress(url: string): string {
+  const raw = typeof url === "string" ? url.trim() : "";
+  try {
+    const u = new URL(raw);
+    if (u.protocol === "https:" || u.protocol === "http:") return stripTracking(u);
+  } catch {
+    // fall through to the cut-short form
+  }
+  // The user information first (a password may hold a `;`), then the cut.
+  const bare = raw.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, "$1");
+  const cut = bare.search(/[?#;]/);
+  return cut >= 0 ? bare.slice(0, cut) : bare;
+}
+
+/**
+ * The platform and kind of `url`. Never throws, for any input (R379): an input that cannot be read
+ * as an address is the generic "other / unknown" with the input as given, and an address of another
+ * scheme is that too, without its user name and password (R415 e; no caller stores one that is not
+ * http or https); anything unexpected while reading one gives `cleanAddress` (R391 f).
+ */
 export function classifyUrl(url: string): ClassifiedUrl {
   const raw = typeof url === "string" ? url.trim() : "";
+  try {
+    return classify(raw);
+  } catch {
+    return { platform: "other", kind: "unknown", canonicalUrl: cleanAddress(raw) };
+  }
+}
+
+/**
+ * An address of another scheme (`ftp:`, `sftp:` …) as given, but without its user name and password
+ * (R415 e: the command line prints it); `cleanAddress` if the URL will not drop them.
+ */
+function withoutUser(u: URL, raw: string): string {
+  if (!u.username && !u.password) return raw;
+  u.username = "";
+  u.password = "";
+  return u.username || u.password ? cleanAddress(raw) : u.href;
+}
+
+function classify(raw: string): ClassifiedUrl {
   let u: URL;
   try {
     u = new URL(raw);
   } catch {
     return { platform: "other", kind: "unknown", canonicalUrl: raw };
   }
-  if (u.protocol !== "https:" && u.protocol !== "http:") return { platform: "other", kind: "unknown", canonicalUrl: raw };
+  if (u.protocol !== "https:" && u.protocol !== "http:") return { platform: "other", kind: "unknown", canonicalUrl: withoutUser(u, raw) };
   const host = hostOf(u);
   if (host === "youtube.com" || host === "youtu.be" || host === "youtube-nocookie.com") return youtube(u, host);
   if (host === "instagram.com") return instagram(u);

@@ -2,9 +2,9 @@
  * Task 36 routes: fieldwork update, consent withdrawal and guarded delete (R97), consent and
  * protocol documents, and the retention list / raw-data destruction.
  */
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { SourceDraft } from "@ao/core";
@@ -346,5 +346,93 @@ describe("Task 46b fix round 1 (R172): consent withdrawal and the library row's 
     expect(d.status, d.body).toBe(200);
     expect(pending(sourceId).map((e) => e.kind)).toEqual(["verification"]);
     expect(await badge(sourceId)).toBe(true);
+  });
+});
+
+describe("attach takes only absolute paths (R379, WB5 M3)", () => {
+  it("a relative path or one holding a NUL is refused before anything is read; an absolute path works as before", async () => {
+    const sources = async () => JSON.stringify((await call({ url: `/projects/${pid}/sources` })).json);
+    const before = await sources();
+    // "package.json" exists in the folder the tests run from: read relative to it, it would be attached or sniffed.
+    for (const paths of [["package.json"], ["../../etc/hosts"], [`${pdf}\0.pdf`], [pdf, "form.pdf"]]) {
+      const r = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths } });
+      expect(r.status, JSON.stringify(paths)).toBe(400);
+      expect(r.json.error).toMatchObject({ code: expect.any(String), message: '"paths" must be absolute paths.' });
+      expect(r.json.items).toBeUndefined();
+    }
+    expect(await sources()).toBe(before);
+    const ok = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdf] } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(ok.json.items).toHaveLength(1);
+  });
+});
+
+describe("every route that takes a path takes only an absolute path of this computer, without a NUL (R391 g, review M7)", () => {
+  // On macOS and Linux a Windows drive path or a network path is a relative name, read from the service's folder.
+  const FOREIGN = ["C:\\Windows\\win.ini", "c:/x.pdf", "\\\\server\\share\\package.json", "package.json", "/tmp/x\0.pdf"];
+  // R415 f (review 2 M5): these requests run from the test's temporary folder, never the repository's,
+  // so that a missing guard fails here without writing anything into the repository. Each foreign name
+  // exists there as a file, so that without the guard it would be read (and the test would fail).
+  let here: string;
+  beforeEach(async () => {
+    here = process.cwd();
+    process.chdir(tmp);
+    for (const p of FOREIGN.slice(0, 4)) {
+      await mkdir(dirname(join(tmp, p)), { recursive: true });
+      await writeFile(join(tmp, p), "{}");
+    }
+  });
+  afterEach(() => {
+    process.chdir(here);
+  });
+  const refused = async (method: "POST", url: string, body: (p: string) => unknown, message: string) => {
+    for (const p of FOREIGN) {
+      const r = await call({ method, url, body: body(p) });
+      expect(r.status, `${url} ${JSON.stringify(p)}: ${r.body}`).toBe(400);
+      expect(r.json.error.message, url).toBe(message);
+    }
+  };
+
+  it("the review's probe: attach refuses a Windows drive path and a network path", async () => {
+    const sources = async () => JSON.stringify((await call({ url: `/projects/${pid}/sources` })).json);
+    const before = await sources();
+    await refused("POST", `/projects/${pid}/attach`, (p) => ({ paths: [p] }), '"paths" must be absolute paths.');
+    expect(await sources()).toBe(before);
+  });
+  it("protocol documents", async () => {
+    await refused("POST", `/projects/${pid}/protocol/documents`, (p) => ({ paths: [p] }), '"paths" must be absolute paths.');
+  });
+  it("a consent form's document", async () => {
+    await refused("POST", `/projects/${pid}/consents/nope/document`, (p) => ({ path: p }), '"path" must be an absolute path.');
+  });
+  it("an import's dry run and import: the source's path, Zotero's data folder and the approved outside folders and files", async () => {
+    for (const url of [`/projects/${pid}/import/dry-run`, `/projects/${pid}/import`]) {
+      await refused("POST", url, (p) => ({ adapter: { kind: "folder", path: p } }), "The import path must be absolute.");
+      await refused("POST", url, (p) => ({ adapter: { kind: "zotero-local", dataDir: p } }), "The import path must be absolute.");
+    }
+    const dry = `/projects/${pid}/import/dry-run`;
+    await refused("POST", dry, (p) => ({ adapter: { kind: "folder", path: tmp }, approveOutside: { folders: [p] } }), '"approveOutside" must hold absolute paths.');
+    await refused("POST", dry, (p) => ({ adapter: { kind: "folder", path: tmp }, approveOutside: { files: [p] } }), '"approveOutside" must hold absolute paths.');
+    for (const k of ["folders", "files", "rememberFolders"]) {
+      await refused("POST", `/projects/${pid}/import`, (p) => ({ adapter: { kind: "folder", path: tmp }, options: { approveOutside: { [k]: [p] } } }), '"approveOutside" must hold absolute paths.');
+    }
+  });
+  it("a device import", async () => {
+    await refused("POST", `/projects/${pid}/device-import`, (p) => ({ dir: p }), '"dir" must be an absolute path.');
+  });
+  it("a bibliography and a reference-manager export written to a file", async () => {
+    await refused("POST", "/bibliography", (p) => ({ projectId: pid, selection: { sourceIds: [] }, style: "apa", format: "text", dest: p }), '"dest" must be an absolute path.');
+    await refused("POST", "/export/refman", (p) => ({ projectId: pid, format: "ris", outputPath: p }), '"outputPath" must be an absolute path.');
+  });
+  it("a font file", async () => {
+    await refused("POST", "/settings/fonts", (p) => ({ path: p }), "The font file's path must be absolute.");
+  });
+  it("the library's own routes: create, open, reconnect, locate, move", async () => {
+    await refused("POST", "/libraries/locate", (p) => ({ libraryId: "01a1e8a5-0d25-7e36-b73e-746115174e82", roots: [p] }), '"roots" must be absolute paths.');
+    await refused("POST", "/libraries/move/plan", (p) => ({ dest: p }), '"dest" must be an absolute path.');
+    await refused("POST", "/libraries/move", (p) => ({ dest: p }), '"dest" must be an absolute path.');
+    await refused("POST", "/libraries/reconnect", (p) => ({ path: p }), '"path" must be an absolute path.');
+    await refused("POST", "/libraries/open", (p) => ({ path: p }), '"path" must be an absolute path.');
+    await refused("POST", "/libraries", (p) => ({ path: p, name: "x" }), '"path" must be an absolute path.');
   });
 });

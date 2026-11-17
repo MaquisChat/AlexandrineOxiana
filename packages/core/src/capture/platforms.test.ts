@@ -181,3 +181,223 @@ describe("the browser-session acknowledgement", () => {
     );
   });
 });
+
+describe("classifyUrl never throws (R379, WB1 I4)", () => {
+  it("a handle that cannot be decoded is the platform's unrecognised path", () => {
+    expect(classifyUrl("https://www.tiktok.com/@%ZZ")).toEqual({ platform: "tiktok", kind: "unknown", canonicalUrl: "https://www.tiktok.com/@%ZZ" });
+    expect(classifyUrl("https://www.youtube.com/@%E0%A4%A")).toEqual({ platform: "youtube", kind: "unknown", canonicalUrl: "https://www.youtube.com/@%E0%A4%A" });
+    expect(classifyUrl("https://www.tiktok.com/@%ZZ/video/123")).toEqual({ platform: "tiktok", kind: "unknown", canonicalUrl: "https://www.tiktok.com/@%ZZ/video/123" });
+  });
+
+  /** Thirty malformed strings: none throws, and each gets a classification. */
+  const MALFORMED: string[] = [
+    "%",
+    "https://www.tiktok.com/@%",
+    "https://www.youtube.com/@%",
+    "https://www.tiktok.com/@%E0%A4",
+    "https://www.youtube.com/@%E0%A4",
+    "https://www.tiktok.com/@%E0%A4/photo/7234567890",
+    "https://www.youtube.com/@%ZZ/videos",
+    "https://www.tiktok.com/@%C0%AF",
+    "https://www.youtube.com/@%ED%A0%80",
+    "https://www.tiktok.com/@%FF%FE",
+    "https://www.tiktok.com/@\u0000\u0001",
+    "https://www.youtube.com/@a\u0007b",
+    "\u0000\u0001\u0002",
+    "https://\u0000www.youtube.com/",
+    "\t\n\r",
+    `https://www.tiktok.com/@${"%".repeat(10_000)}`,
+    `https://www.youtube.com/@${"%E0".repeat(3_333)}`,
+    "x".repeat(10_000),
+    "@",
+    "https://www.tiktok.com/@",
+    "https://www.youtube.com/@@",
+    "https://",
+    "http://[",
+    "https://%%%/",
+    "::::",
+    "javascript:decodeURIComponent('%')",
+    "https://www.youtube.com/watch?v=%ZZ",
+    "https://www.instagram.com/%ZZ/",
+    "https://vm.tiktok.com/%ZZ/",
+    "\ud800",
+  ];
+
+  it("has thirty malformed strings", () => {
+    expect(MALFORMED).toHaveLength(30);
+  });
+
+  it.each(MALFORMED.map((s) => [s.length > 60 ? `${s.slice(0, 60)}… (${s.length})` : s, s]))("%j does not throw", (_label, s) => {
+    let c: ReturnType<typeof classifyUrl> | undefined;
+    expect(() => (c = classifyUrl(s))).not.toThrow();
+    expect(typeof c!.canonicalUrl).toBe("string");
+    expect(c!.kind === "unknown" || c!.platform !== "other").toBe(true);
+  });
+
+  it("a non-string input is the generic unknown address", () => {
+    for (const v of [undefined, null, 42, {}, []] as unknown[]) {
+      expect(() => classifyUrl(v as string)).not.toThrow();
+      expect(classifyUrl(v as string)).toEqual({ platform: "other", kind: "unknown", canonicalUrl: "" });
+    }
+  });
+});
+
+describe("the stored address holds no credentials and no secret parameters (R379, WB3 I1, WB1 M7; R41 C1, R99 I8)", () => {
+  const PROBE = "https://ana:hunter2@portal.example.org/case/7?access_token=SECRETTOKEN&sessionid=SESS#frag";
+
+  it("the reviewer's probe: user name, password, token and session go; the path stays", () => {
+    const c = classifyUrl(PROBE);
+    expect(c).toEqual({ platform: "other", kind: "unknown", canonicalUrl: "https://portal.example.org/case/7" });
+    for (const bad of ["ana", "hunter2", "SECRETTOKEN", "SESS", "frag"]) expect(c.canonicalUrl).not.toContain(bad);
+  });
+
+  it("ordinary parameters stay, in their order, so the address still leads to the page", () => {
+    expect(classifyUrl("https://user:pw@example.org/a/b?id=7&token=aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY&page=2&utm_source=x&lang=en#top").canonicalUrl).toBe("https://example.org/a/b?id=7&page=2&lang=en");
+  });
+
+  const SECRET_PARAMS = [
+    "Signature", "X-Amz-Signature", "X-Amz-Credential", "X-Amz-Security-Token", "sig", "token", "auth", "apikey", "api_key",
+    "sessionid", "PHPSESSID", "jsessionid", "access_token", "id_token", "refresh_token", "password", "client_secret", "AWSAccessKeyId",
+  ];
+  it.each(SECRET_PARAMS)("the parameter %s goes", (name) => {
+    const c = classifyUrl(`https://files.example.org/doc.pdf?id=7&${name}=aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY&page=2`);
+    expect(c.canonicalUrl).toBe("https://files.example.org/doc.pdf?id=7&page=2");
+  });
+
+  it("a bare `key` and a bare `code` stay (they name a record, a document or a country far more often than a secret)", () => {
+    expect(classifyUrl("https://example.org/sheet?key=abc&code=FR").canonicalUrl).toBe("https://example.org/sheet?key=abc&code=FR");
+  });
+
+  it("a user name alone goes too, on every platform's unrecognised path", () => {
+    expect(classifyUrl("https://ana@example.org/x").canonicalUrl).toBe("https://example.org/x");
+    expect(classifyUrl("https://ana:pw@www.youtube.com/feed/trending?token=aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY").canonicalUrl).toBe("https://www.youtube.com/feed/trending");
+    expect(classifyUrl("https://ana:pw@www.instagram.com/explore/?sessionid=S").canonicalUrl).toBe("https://www.instagram.com/explore/");
+    expect(classifyUrl("https://ana:pw@www.tiktok.com/t/ZTabc/?sig=aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY").canonicalUrl).toBe("https://www.tiktok.com/t/ZTabc/");
+  });
+
+  it("platform addresses are unchanged", () => {
+    expect(classifyUrl("https://ana:pw@www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123&token=T").canonicalUrl).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123");
+    expect(classifyUrl("https://www.youtube.com/playlist?list=PL123").canonicalUrl).toBe("https://www.youtube.com/playlist?list=PL123");
+    expect(classifyUrl("https://www.tiktok.com/@someone/video/7234567890").canonicalUrl).toBe("https://www.tiktok.com/@someone/video/7234567890");
+    expect(classifyUrl("https://www.instagram.com/p/Cabc123/").canonicalUrl).toBe("https://www.instagram.com/p/Cabc123/");
+    expect(classifyUrl("https://vm.tiktok.com/ZMabc/").canonicalUrl).toBe("https://vm.tiktok.com/ZMabc/");
+  });
+});
+
+describe("two classes of secret name, in the query and in path parameters (R391 a; review I1, M1)", () => {
+  const HEX32 = "5f2b8c9e0a1d4e7f9b3c6a8d2e1f0b7c";
+  const MIXED32 = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY";
+  const clean = (u: string) => classifyUrl(u).canonicalUrl;
+
+  it("the review's probes: a path session id, a phpBB sid, a Zoom passcode and a OneDrive share key go", () => {
+    expect(clean("https://forum.example.org/app;jsessionid=JSESSPATH1/viewtopic.php?t=2&sid=" + HEX32)).toBe("https://forum.example.org/app/viewtopic.php?t=2");
+    expect(clean("https://us02web.zoom.us/j/8512345678?pwd=" + MIXED32)).toBe("https://us02web.zoom.us/j/8512345678");
+    expect(clean("https://onedrive.live.com/redir?resid=ABC&authkey=!ONEDRIVEKEY1")).toBe("https://onedrive.live.com/redir?resid=ABC");
+  });
+
+  // Names that are always a secret: dropped whatever the value, in any case, in the query or as a path parameter.
+  const ALWAYS = [
+    "jsessionid", "JSESSIONID", "phpsessid", "PHPSESSID", "sessionid", "session_id", "sessionId", "SessionID",
+    "accesstoken", "access_token", "accessToken", "authtoken", "AuthToken", "sessiontoken", "session-token", "idtoken", "id_token",
+    "refresh_token", "csrftoken", "xsrf-token", "bearer_token", "authkey", "AuthKey", "apikey", "api_key", "access_key", "secret_key",
+    "private_key", "client_secret", "clientSecret", "password", "PassWord", "passwd", "secret", "bearer", "jwt", "credential",
+    "credentials", "otp", "passcode", "X-Amz-Signature", "x-amz-credential", "X-Amz-Security-Token", "Key-Pair-Id", "AWSAccessKeyId",
+    "csrf", "nonce",
+  ];
+  it.each(ALWAYS)("%s goes from the query and from the path, even with a short value", (name) => {
+    expect(clean(`https://ex.example.org/a/b?id=7&${name}=12&page=2`)).toBe("https://ex.example.org/a/b?id=7&page=2");
+    expect(clean(`https://ex.example.org/a;${name}=12/b;v=1?id=7`)).toBe("https://ex.example.org/a/b;v=1?id=7");
+  });
+
+  // Names that are also ordinary words (and the review's short forms): dropped only with a key-shaped value.
+  const ORDINARY = [
+    "token", "Token", "TOKEN", "tOkEn", "tokens", "auth", "session", "sid", "SID", "signature", "Signature", "sig", "pwd", "pass",
+    "key", "code", "hash", "ticket", "sess", "sessid", "CFID", "CFTOKEN", "apitoken", "usertoken", "sharetoken", "csrfmiddlewaretoken",
+    "oauth_verifier", "subscription-key", "form_session", "pageToken",
+  ];
+  it.each(ORDINARY)("%s goes with a key-shaped value, in the query and as a path parameter", (name) => {
+    for (const v of [HEX32, MIXED32]) {
+      expect(clean(`https://ex.example.org/a/b?id=7&${name}=${v}&page=2`)).toBe("https://ex.example.org/a/b?id=7&page=2");
+      expect(clean(`https://ex.example.org/a;${name}=${v}/b?id=7`)).toBe("https://ex.example.org/a/b?id=7");
+    }
+  });
+
+  it("the review's M1 examples stay as written", () => {
+    for (const u of [
+      "https://conf.example.org/programme.php?session=12",
+      "https://parl.example.org/bills?session=2023-24",
+      "https://conftool.example.org/index.php?page=browse&form_session=356",
+      "https://corpus.example.org/search?token=verb",
+      "https://archive.example.org/item?signature=MS-123",
+      "https://uni.example.org/course?code=CS101",
+      "https://ex.example.org/x?key=value",
+      "https://ex.example.org/x?sid=7&pwd=x&ticket=42&hash=abc",
+      "https://ex.example.org/a;v=1;page=3/b",
+    ]) expect(clean(u), u).toBe(u);
+  });
+
+  it("their twins with key-shaped values go", () => {
+    expect(clean("https://maps.example.org/api?key=AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY&q=x")).toBe("https://maps.example.org/api?q=x");
+    expect(clean("https://ex.example.org/cb?code=4/0AX4XfWhAbCdEfGhIjKlMnOpQrStUvWxYz0123456789&state=1")).toBe("https://ex.example.org/cb?state=1");
+    expect(clean("https://ex.example.org/cb?code=4%2F0AX4XfWhAbCdEfGhIjKlMnOpQrStUvWxYz0123456789&state=1")).toBe("https://ex.example.org/cb?state=1");
+    expect(clean(`https://forum.example.org/viewtopic.php?t=2&sid=${HEX32}`)).toBe("https://forum.example.org/viewtopic.php?t=2");
+    expect(clean(`https://ex.example.org/j/1?pwd=${MIXED32}`)).toBe("https://ex.example.org/j/1");
+    expect(clean(`https://conf.example.org/programme.php?session=${HEX32}`)).toBe("https://conf.example.org/programme.php");
+    expect(clean("https://cdn.example.org/f.pdf?Signature=Nql641NHEUkUaXQHZINK1FZ~SYeUSoBJMxjdgqrzIdzV2gyEXPDNv0pYdWJkfl&x=1")).toBe("https://cdn.example.org/f.pdf?x=1");
+    expect(clean("https://ex.example.org/x?Token=aB3dE5fG7hJ9kL1mN3pQ5r&TOKEN=aB3dE5fG7hJ9kL1mN3pQ5s&tOkEn=aB3dE5fG7hJ9kL1mN3pQ5t&k=1")).toBe("https://ex.example.org/x?k=1");
+  });
+
+  it("a value shaped like a signed token goes whatever its name", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl";
+    expect(clean(`https://ex.example.org/x?state=${jwt}&p=1`)).toBe("https://ex.example.org/x?p=1");
+    expect(clean(`https://ex.example.org/a;s=${jwt}/b`)).toBe("https://ex.example.org/a/b");
+    expect(clean("https://ex.example.org/x?v=eyJ.notatoken")).toBe("https://ex.example.org/x?v=eyJ.notatoken");
+  });
+
+  it("platform addresses are unchanged", () => {
+    expect(clean(`https://www.youtube.com/watch?v=dQw4w9WgXcQ&sid=${HEX32}`)).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    expect(clean("https://www.instagram.com/reel/Cabc123/?igsh=abc")).toBe("https://www.instagram.com/reel/Cabc123/");
+    expect(clean("https://www.tiktok.com/@someone/video/7234567890?is_from_webapp=1")).toBe("https://www.tiktok.com/@someone/video/7234567890");
+  });
+});
+
+describe("removing a parameter leaves the rest of the query as written (R391 b; review M2)", () => {
+  const KEY = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY";
+  it("the review's probe: the kept pairs byte for byte, in order", () => {
+    expect(classifyUrl(`https://ex.example.org/p?print&ids=1,2,3&path=/a/b&q=a%20b&t=~x&token=${KEY}`).canonicalUrl).toBe("https://ex.example.org/p?print&ids=1,2,3&path=/a/b&q=a%20b&t=~x");
+    expect(classifyUrl("https://ex.example.org/p?q=a+b&utm_source=x&empty=&print").canonicalUrl).toBe("https://ex.example.org/p?q=a+b&empty=&print");
+  });
+
+  it("10,000 parameters are cleaned (one pass: held by counting work in platforms-onepass.test.ts, R415 f)", () => {
+    const q = Array.from({ length: 10_000 }, (_, i) => (i % 2 ? `p${i}_token=${KEY}` : `utm_x${i}=1`)).join("&");
+    const c = classifyUrl(`https://ex.example.org/p?keep=1&${q}`);
+    expect(c.canonicalUrl).toBe("https://ex.example.org/p?keep=1");
+  });
+});
+
+describe("a UUID or a long lower-case id under an ordinary name is dropped from the stored address (R415 b, review 2 M1)", () => {
+  it("sid=<uuid> and session=<base32> go; code=123456, session=12, key=value, token=verb and id=<uuid> stay", () => {
+    const UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    expect(classifyUrl(`https://ex.example.org/p?a=1&sid=${UUID}`).canonicalUrl).toBe("https://ex.example.org/p?a=1");
+    expect(classifyUrl("https://ex.example.org/p?session=mfrggzdfmztwq2lknnwg23tpobyxe43u&a=1").canonicalUrl).toBe("https://ex.example.org/p?a=1");
+    expect(classifyUrl("https://ex.example.org/p?code=123456&session=12&key=value&token=verb").canonicalUrl).toBe(
+      "https://ex.example.org/p?code=123456&session=12&key=value&token=verb",
+    );
+    expect(classifyUrl(`https://ex.example.org/p?id=${UUID}`).canonicalUrl).toBe(`https://ex.example.org/p?id=${UUID}`);
+  });
+});
+
+describe("an address of another scheme loses its user information; what is no address is returned as given (R415 e, review 2 M4)", () => {
+  it.each([
+    ["ftp://user:pass@host/x", "ftp://host/x"],
+    ["ftp://ana:pw@x/?q=1", "ftp://x/?q=1"],
+    ["sftp://ana:hunter2@files.example.org/data/a.csv", "sftp://files.example.org/data/a.csv"],
+    ["ssh://ana@host/repo", "ssh://host/repo"],
+  ])("%s → %s", (input, out) => {
+    const c = classifyUrl(input);
+    expect(c).toEqual({ platform: "other", kind: "unknown", canonicalUrl: out });
+  });
+  it.each(["plain words", "mailto:ana@example.org", "not a link at all", "ftp://host/x"])("%j is returned as given", (input) => {
+    expect(classifyUrl(input).canonicalUrl).toBe(input);
+  });
+});

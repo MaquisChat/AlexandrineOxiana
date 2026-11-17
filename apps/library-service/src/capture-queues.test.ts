@@ -195,6 +195,23 @@ describe("GET /projects/:id/captures and /captures/:queueId", () => {
     await svc.state.idle();
   });
 
+  it("a link whose handle cannot be decoded is refused like any unrecognised link, never 500 (R379, WB1 I4)", async () => {
+    const worker = gatedWorker();
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project();
+    const ext = await extensionToken();
+    const send = (urls: string[]) => call({ method: "POST", url: "/capture/browser/links", noAuth: true, headers: { authorization: `Bearer ${ext}`, origin: EXT }, body: { projectId: pid, urls } });
+    const unrecognised = await send(["https://www.tiktok.com/@someone/followers"]);
+    expect(unrecognised.status).toBe(400);
+    for (const u of ["https://www.tiktok.com/@%ZZ", "https://www.youtube.com/@%E0%A4%A", "https://www.tiktok.com/@%ZZ/video/123"]) {
+      const r = await send([u]);
+      expect(r.status, u).toBe(400);
+      expect(r.json.error, u).toEqual(unrecognised.json.error);
+    }
+    expect(worker.calls).toHaveLength(0);
+  });
+
   describe("refusals", () => {
     async function running(): Promise<{ pid: string; other: string; queueId: string; worker: ReturnType<typeof gatedWorker> }> {
       const worker = gatedWorker();

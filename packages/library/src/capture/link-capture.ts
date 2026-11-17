@@ -34,7 +34,7 @@
 import { randomUUID } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { basename, extname, join } from "node:path";
-import { applyVerification, verifyDraft, type Asset, type Provenance, type SourceFile } from "@ao/core";
+import { applyVerification, nonBlank, verifyDraft, type Asset, type Provenance, type SourceFile } from "@ao/core";
 import type { IndexDb } from "../index/db.js";
 import { findSourceBy, getMeta } from "../index/db.js";
 import { activeTemp } from "../tmp-registry.js";
@@ -452,7 +452,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       );
       const policy = await projectPolicy(repo, projectId);
       identifiable = policy?.identifiability.containsIdentifiable ?? true;
-      legalBasis = opts.legalBasis?.trim() || policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]?.trim() || undefined;
+      legalBasis = nonBlank(opts.legalBasis) ?? nonBlank(policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]); // R391 c: a blank one is none
       try {
         await authorizeProcessing(
           repo,

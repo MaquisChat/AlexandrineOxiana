@@ -35,6 +35,9 @@ import type {
 } from "@ao/shared";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import { bodyAs, bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
+import { isLocalAbsolutePath } from "./local-path.js";
+
+/** A POSIX or Windows absolute path (the same test as routes/governance.ts and routes/fieldwork.ts). */
 
 /** Fields a PATCH may change (provenance, folder and ids never). */
 const EDITABLE = new Set<string>(["type", "title", "creators", "container", "publisher", "issued", "accessed", "identifiers", "caseAttributes", "availability", ...BIBLIO_FIELDS]);
@@ -288,6 +291,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const b = bodyOf(req);
     const paths = strArray(b, "paths", { max: 500 });
+    // Only paths the researcher chose: absolute, no NUL, as every other route that takes a path (R379, R96).
+    if (paths.some((p) => !isLocalAbsolutePath(p))) throw badRequest('"paths" must be absolute paths.');
     const toSourceId = optStr(b, "toSourceId", 64);
     const attach = createAttach({ repo: s.repo, http: s.http, proxies: proxyQueueFor(s.repo) });
     const items = await attach.attachFiles(projectId, paths, toSourceId ? { toSourceId } : {});

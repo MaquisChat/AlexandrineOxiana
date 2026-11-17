@@ -150,6 +150,11 @@ describe("stripSnapshot", () => {
     });
     expect(s).toEqual({ id: "x", title: "t", nested: { ok: 1, list: [{ keep: 2 }] } });
   });
+
+  it("an address in the metadata that cannot be decoded is kept without its query; the rest is stripped as usual (R379, WB1 I4)", () => {
+    const s = stripSnapshot({ uploader_url: "https://www.tiktok.com/@%ZZ?x=1", channel_url: "https://www.youtube.com/@%E0%A4%A", webpage_url: "https://www.tiktok.com/@%ZZ/video/123", title: "t" });
+    expect(s).toEqual({ uploader_url: "https://www.tiktok.com/@%ZZ", channel_url: "https://www.youtube.com/@%E0%A4%A", webpage_url: "https://www.tiktok.com/@%ZZ/video/123", title: "t" });
+  });
 });
 
 describe("captureUrl", () => {
@@ -565,6 +570,16 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
     expect(sf.source.title.variants[0]!.value).toBe("Market colours in three photos #market");
     for (const f of REQUIRED_FIELDS["social-post"]) expect([f, sf.verification[f]?.status]).toEqual([f, "verified"]);
     expect((sf.source.provenance.platformSnapshot as { author?: unknown }).author).toMatchObject({ uniqueId: "fake.dancer", nickname: "Fake Dancer" });
+  });
+
+  it("a legal basis of invisible characters is no legal basis: LEGAL_BASIS_REQUIRED, not POLICY_DENIED (R391 c)", async () => {
+    const p = await project(GDPR_GOV(), true);
+    for (const legalBasis of ["\u200b", "\u2800", "\u0301"]) {
+      const out = await capture.captureUrl(p.id, YT, { transcribe: false, legalBasis });
+      expect(out, JSON.stringify(legalBasis)).toMatchObject({ status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" });
+    }
+    expect(worker.submitted).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
   });
 
   it("I1: an identifiable GDPR project without a legal basis fails plainly before downloading; with the project default or an override it captures", async () => {

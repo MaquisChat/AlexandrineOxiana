@@ -1,3 +1,4 @@
+import { blank } from "../blank.js";
 import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
 import { ACQUIRE_METHODS, ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
@@ -167,7 +168,7 @@ function capture(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): P
   // Each family has its own list: the three ways of acquiring answer to acquireMethods only, every other name to captureMethods only.
   const list = (ACQUIRE_METHODS as readonly string[]).includes(method) ? p.acquireMethods : p.captureMethods;
   if (!(list as string[]).includes(method)) return deny(`Capture method ${method} is not enabled for this project`, warnings);
-  if (p.protocol.requireBeforeCapture && !p.protocol.number) {
+  if (p.protocol.requireBeforeCapture && blank(p.protocol.number)) {
     return deny("An approved protocol number is required before capture", warnings);
   }
   const today = localDate(req.now, req.tz ?? "UTC");
@@ -215,7 +216,7 @@ function store(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Pol
     if (!conditions.some((c) => c.type === "encrypt")) conditions.push({ type: "encrypt" });
     conditions.push({ type: "location", mode: p.sharing.locationMetadata });
   }
-  if (s.identifiable && p.consent.requireLegalBasis && !s.legalBasis) {
+  if (s.identifiable && p.consent.requireLegalBasis && blank(s.legalBasis)) {
     return deny("Record a legal basis for identifiable data before storing it", warnings);
   }
   return withConditions(conditions, warnings);
@@ -238,18 +239,18 @@ function exportData(p: GovernanceConfig, req: PolicyRequest, warnings: string[])
 function setAside(req: PolicyRequest, warnings: string[]): PolicyDecision {
   const s = need(req.setAside, "setAside");
   str(s.reason, "setAside.reason");
-  if (s.reason.trim() === "") return deny("A reason is required to set this aside", warnings);
+  if (blank(s.reason)) return deny("A reason is required to set this aside", warnings);
   return allow(warnings);
 }
 
 /**
  * Recording that a source flagged by a consent withdrawal was reviewed (R176 2, following R157):
- * allowed in every profile, but only with a reason that is not empty once trimmed.
+ * allowed in every profile, but only with a reason that is not blank (`blank`, R391 c).
  */
 function reviewWithdrawal(req: PolicyRequest, warnings: string[]): PolicyDecision {
   const s = need(req.reviewWithdrawal, "reviewWithdrawal");
   str(s.reason, "reviewWithdrawal.reason");
-  if (s.reason.trim() === "") return deny("A reason is required to record that this source was reviewed after the withdrawal", warnings);
+  if (blank(s.reason)) return deny("A reason is required to record that this source was reviewed after the withdrawal", warnings);
   return allow(warnings);
 }
 

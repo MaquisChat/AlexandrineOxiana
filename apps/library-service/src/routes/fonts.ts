@@ -14,7 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import { readFile, lstat, unlink } from "node:fs/promises";
-import { basename, extname, isAbsolute, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import type { FastifyInstance } from "fastify";
 import { ensurePrivateDir, readAppSettingStrict, setAppSettingAside, updateAppSettingStrict, writeFileAtomic } from "@ao/library";
 import {
@@ -33,6 +33,7 @@ import {
 import { ApiError, badRequest, notFound } from "../errors.js";
 import { openRegularFile, readAll } from "./safe-file.js";
 import { bodyOf, paramsOf, str, type Ctx } from "./util.js";
+import { isLocalAbsolutePath } from "./local-path.js";
 
 const INDEX = "fonts.json";
 const FORMATS = new Set<UserFontFormat>(["ttf", "otf", "woff", "woff2"]);
@@ -115,7 +116,7 @@ export function registerFonts(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     if (Object.keys(b).some((k) => k !== "path" && k !== "name")) throw badRequest('Only "path" and "name" can be sent here.');
     const path = str(b, "path", 4096);
-    if (!isAbsolute(path)) throw badRequest("The font file's path must be absolute.");
+    if (!isLocalAbsolutePath(path)) throw badRequest("The font file's path must be absolute.");
     let name: string | undefined;
     if (b.name !== undefined) {
       if (typeof b.name !== "string" || !usableName(b.name.trim()) || !b.name.trim()) {

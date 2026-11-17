@@ -24,9 +24,9 @@ import { ApiError, badRequest, notFound } from "../errors.js";
 import type { ServiceState } from "../state.js";
 import { registerZotero } from "./zotero.js";
 import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
+import { isLocalAbsolutePath } from "./local-path.js";
 
 const PATH_KINDS = new Set(["folder", "zip", "bibtex", "ris", "csl-json", "zotero-rdf", "calibre", "zotero-local"]);
-const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 
 type AdapterSpec = { web: false; adapter: ImportSourceAdapter } | { web: true; libraryType: "user" | "group"; libraryId: string; full: boolean };
 
@@ -45,7 +45,7 @@ function adapterSpec(o: Obj | undefined): AdapterSpec {
   }
   if (!PATH_KINDS.has(kind)) throw badRequest(`"${kind}" is not an import source. Use one of: ${[...PATH_KINDS, "zotero-web"].join(", ")}.`);
   const path = str(o, kind === "zotero-local" ? "dataDir" : "path", 4096);
-  if (!isAbsolute(path)) throw badRequest("The import path must be absolute.");
+  if (!isLocalAbsolutePath(path)) throw badRequest("The import path must be absolute.");
   const adapter = adapterFor(kind as Parameters<typeof adapterFor>[0], path);
   if (!adapter) throw badRequest(`"${kind}" is not an import source.`);
   return { web: false, adapter };
@@ -53,7 +53,11 @@ function adapterSpec(o: Obj | undefined): AdapterSpec {
 
 function approvals(o: Obj | undefined): { folders?: string[]; files?: string[] } {
   if (!o) return {};
-  return { folders: strArray(o, "folders", { optional: true, max: 100 }), files: strArray(o, "files", { optional: true, max: 1000 }) };
+  const folders = strArray(o, "folders", { optional: true, max: 100 });
+  const files = strArray(o, "files", { optional: true, max: 1000 });
+  // Approvals to read outside the import's folder are paths too (R391 g).
+  if ([...folders, ...files].some((p) => !isLocalAbsolutePath(p))) throw badRequest('"approveOutside" must hold absolute paths.');
+  return { folders, files };
 }
 
 /** The project a batch belongs to: one this service runs, else found among the projects' batches. */
@@ -101,6 +105,12 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const spec = adapterSpec(optObj(b, "adapter"));
     const options = (optObj(b, "options") ?? {}) as ImportOptionsInput;
+    // The approvals to read outside the import's folder are paths too (R391 g); their shape is checked by the library.
+    const outside = (options as { approveOutside?: unknown }).approveOutside;
+    if (outside && typeof outside === "object") {
+      const lists = ["folders", "files", "rememberFolders"].map((k) => (outside as Record<string, unknown>)[k]);
+      if (lists.some((l) => Array.isArray(l) && l.some((p) => !isLocalAbsolutePath(p)))) throw badRequest('"approveOutside" must hold absolute paths.');
+    }
     // One Zotero library is read by one import or sync at a time, whatever the project (A10, R250 a): claimed before
     // anything is awaited, given up when the batch ends (or at once when it cannot start).
     const release = spec.web ? claimed(s, `${spec.libraryType}:${spec.libraryId}`) : undefined;
@@ -203,7 +213,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const b = bodyOf(req);
     const dir = str(b, "dir", 4096);
-    if (!isAbsolute(dir)) throw badRequest('"dir" must be an absolute path.');
+    if (!isLocalAbsolutePath(dir)) throw badRequest('"dir" must be an absolute path.');
     const sessionId = optStr(b, "sessionId", 64);
     const participantIds = strArray(b, "participantIds", { optional: true, max: 1000, itemMax: 64 });
     const options = (optObj(b, "options") ?? {}) as ImportOptionsInput & { researcherName?: string };

@@ -195,7 +195,8 @@ describe("a consent withdrawal's entry: \"Reviewed after the withdrawal\" (R176 
   it("without a reason it is refused in plain words by the policy engine, the refusal audited, and the entry stays", async () => {
     const sid = await plain();
     const { entry } = await withdrawal(sid);
-    for (const reason of ["", "   "]) {
+    // R391 c: invisible characters and a combining mark alone are no reason either.
+    for (const reason of ["", "   ", "\u200b", "\u0301", "\u2800"]) {
       await expect(kit.repo.reviewedAfterWithdrawal(p.id, entry.id, reason)).rejects.toThrow(PolicyDeniedError);
     }
     const last = (await auditEvents(kit, p)).at(-1)!;

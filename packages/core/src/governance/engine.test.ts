@@ -29,6 +29,16 @@ describe("capture", () => {
   it("allows when a required protocol has a number", () => {
     expect(evaluate(cfg("protocol: { requireBeforeCapture: true, number: P-1 }"), cap("manual_upload")).result).toBe("allow");
   });
+  it("a blank protocol number does not satisfy requireBeforeCapture; a real one with spaces around it does (R379, WB1 M4)", () => {
+    const withNumber = (number: string): GovernanceConfig => {
+      const c = cfg("protocol: { requireBeforeCapture: true }");
+      return { ...c, protocol: { ...c.protocol, number } };
+    };
+    for (const blank of [" ", "\t\n", "\u00a0", "\u200b", " \u00a0\u200b\t"]) {
+      expect(denyReason(evaluate(withNumber(blank), cap("manual_upload"))), JSON.stringify(blank)).toBe("An approved protocol number is required before capture");
+    }
+    expect(evaluate(withNumber("  P-1\u00a0"), cap("manual_upload")).result).toBe("allow");
+  });
   const at = (now: string, tz?: string) => ({ ...cap("manual_upload"), now, ...(tz ? { tz } : {}) });
   const exp = (d: string, extra = "") => cfg(`protocol: { expires: ${d}${extra} }`);
   it("denies the day after the protocol expired", () => {
@@ -135,6 +145,19 @@ describe("store", () => {
   it("denies identifiable data without a legal basis", () => {
     const d = evaluate(cfg(), st({ identifiable: true }));
     expect(denyReason(d)).toBe("Record a legal basis for identifiable data before storing it");
+  });
+  it("a blank legal basis does not satisfy requireLegalBasis; a real one with spaces around it does (R379, WB1 M3)", () => {
+    for (const blank of [" ", "\t\n", "\u00a0", "\u200b", " \u00a0\u200b\t"]) {
+      expect(denyReason(evaluate(cfg(), st({ identifiable: true, legalBasis: blank }))), JSON.stringify(blank)).toBe("Record a legal basis for identifiable data before storing it");
+    }
+    expect(evaluate(cfg(), st({ identifiable: true, legalBasis: "  consent\u00a0" })).result).not.toBe("deny");
+  });
+  it("a legal basis or protocol number of fillers or combining marks alone satisfies nothing either (R391 c)", () => {
+    for (const blank of ["\u0301", "\u2800", "\u3164", "\u115f", "\u1160", "\uffa0"]) {
+      expect(denyReason(evaluate(cfg(), st({ identifiable: true, legalBasis: blank }))), JSON.stringify(blank)).toBe("Record a legal basis for identifiable data before storing it");
+      const c = cfg("protocol: { requireBeforeCapture: true }");
+      expect(denyReason(evaluate({ ...c, protocol: { ...c.protocol, number: blank } }, req({ action: "capture", capture: { method: "manual_upload" } }))), JSON.stringify(blank)).toBe("An approved protocol number is required before capture");
+    }
   });
   it("orders cumulative conditions: encrypt, pseudonymize-names, location", () => {
     const d = evaluate(cfg(), st({ identifiable: true, hasLocation: true, legalBasis: "consent" }));
@@ -393,6 +416,9 @@ describe("review-withdrawal (Task 67, R176 2): a source reviewed after a consent
   it.each(PROFILES)("is refused without a reason (after trimming) under %j", (yaml) => {
     for (const r of ["", "   \n\t"]) expect(denyReason(evaluate(cfg(yaml), rw(r)))).toBe("A reason is required to record that this source was reviewed after the withdrawal");
   });
+  it("is refused with a reason of invisible characters, fillers or combining marks alone (R391 c)", () => {
+    for (const r of ["\u200b", "\u0301", "\u2800", "\u3164", "\ufeff\u00ad"]) expect(denyReason(evaluate(cfg(), rw(r))), JSON.stringify(r)).toBe("A reason is required to record that this source was reviewed after the withdrawal");
+  });
   it("is refused when the payload is missing or the reason is not text", () => {
     expect(evaluate(cfg(), req({ action: "review-withdrawal" })).result).toBe("deny");
     expect(evaluate(cfg(), rw(42)).result).toBe("deny");
@@ -407,6 +433,9 @@ describe("set-aside (Task 50, R154 d)", () => {
   });
   it.each(PROFILES)("is refused without a reason (after trimming) under %j", (yaml) => {
     for (const r of ["", "   \n\t"]) expect(denyReason(evaluate(cfg(yaml), sa(r)))).toBe("A reason is required to set this aside");
+  });
+  it("is refused with a reason of invisible characters, fillers or combining marks alone (R391 c)", () => {
+    for (const r of ["\u200b", "\u0301", "\u2800", "\u3164", "\ufeff\u00ad"]) expect(denyReason(evaluate(cfg(), sa(r))), JSON.stringify(r)).toBe("A reason is required to set this aside");
   });
   it("is refused when the payload is missing or the reason is not text", () => {
     expect(evaluate(cfg(), req({ action: "set-aside" })).result).toBe("deny");

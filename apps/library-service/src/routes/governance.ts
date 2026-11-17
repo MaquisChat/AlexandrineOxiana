@@ -30,8 +30,8 @@ import {
 } from "@ao/library";
 import { badRequest } from "../errors.js";
 import { bodyOf, optBool, optStr, projectParam, str, strArray, type Ctx } from "./util.js";
+import { isLocalAbsolutePath } from "./local-path.js";
 
-const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 
 const whoAmI = (): string => {
   try {
@@ -119,7 +119,7 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const paths = strArray(bodyOf(req), "paths", { max: 50 });
-    if (paths.some((p) => !isAbsolute(p) || p.includes("\0"))) throw badRequest('"paths" must be absolute paths.');
+    if (paths.some((p) => !isLocalAbsolutePath(p))) throw badRequest('"paths" must be absolute paths.');
     // One result per file (R117 I6): a refused file does not stop the others.
     const results = (await addProtocolDocuments(s.repo, projectId, paths)).map((r) => (r.reason ? { ...r, reason: scrubPaths(r.reason, state.roots) } : r));
     return { results, documents: await listProtocolDocuments(s.repo, projectId) };
