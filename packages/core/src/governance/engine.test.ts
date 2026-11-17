@@ -29,6 +29,16 @@ describe("capture", () => {
   it("allows when a required protocol has a number", () => {
     expect(evaluate(cfg("protocol: { requireBeforeCapture: true, number: P-1 }"), cap("manual_upload")).result).toBe("allow");
   });
+  it("a blank protocol number does not satisfy requireBeforeCapture; a real one with spaces around it does (R379, WB1 M4)", () => {
+    const withNumber = (number: string): GovernanceConfig => {
+      const c = cfg("protocol: { requireBeforeCapture: true }");
+      return { ...c, protocol: { ...c.protocol, number } };
+    };
+    for (const blank of [" ", "\t\n", "\u00a0", "\u200b", " \u00a0\u200b\t"]) {
+      expect(denyReason(evaluate(withNumber(blank), cap("manual_upload"))), JSON.stringify(blank)).toBe("An approved protocol number is required before capture");
+    }
+    expect(evaluate(withNumber("  P-1\u00a0"), cap("manual_upload")).result).toBe("allow");
+  });
   const at = (now: string, tz?: string) => ({ ...cap("manual_upload"), now, ...(tz ? { tz } : {}) });
   const exp = (d: string, extra = "") => cfg(`protocol: { expires: ${d}${extra} }`);
   it("denies the day after the protocol expired", () => {
@@ -135,6 +145,12 @@ describe("store", () => {
   it("denies identifiable data without a legal basis", () => {
     const d = evaluate(cfg(), st({ identifiable: true }));
     expect(denyReason(d)).toBe("Record a legal basis for identifiable data before storing it");
+  });
+  it("a blank legal basis does not satisfy requireLegalBasis; a real one with spaces around it does (R379, WB1 M3)", () => {
+    for (const blank of [" ", "\t\n", "\u00a0", "\u200b", " \u00a0\u200b\t"]) {
+      expect(denyReason(evaluate(cfg(), st({ identifiable: true, legalBasis: blank }))), JSON.stringify(blank)).toBe("Record a legal basis for identifiable data before storing it");
+    }
+    expect(evaluate(cfg(), st({ identifiable: true, legalBasis: "  consent\u00a0" })).result).not.toBe("deny");
   });
   it("orders cumulative conditions: encrypt, pseudonymize-names, location", () => {
     const d = evaluate(cfg(), st({ identifiable: true, hasLocation: true, legalBasis: "consent" }));

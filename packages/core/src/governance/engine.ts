@@ -160,6 +160,14 @@ function datePart(d: string): string {
   return new Date(t).toISOString().slice(0, 10);
 }
 
+/**
+ * True for a value that holds nothing a reader would see: absent, or only white space and invisible
+ * format characters (a no-break or zero-width space). A required value must be more than that (R379).
+ */
+function blank(v: string | null | undefined): boolean {
+  return !v || /^[\s\p{Cf}]*$/u.test(v);
+}
+
 function capture(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const c = need(req.capture, "capture");
   const method = str(c.method, "capture.method");
@@ -167,7 +175,7 @@ function capture(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): P
   // Each family has its own list: the three ways of acquiring answer to acquireMethods only, every other name to captureMethods only.
   const list = (ACQUIRE_METHODS as readonly string[]).includes(method) ? p.acquireMethods : p.captureMethods;
   if (!(list as string[]).includes(method)) return deny(`Capture method ${method} is not enabled for this project`, warnings);
-  if (p.protocol.requireBeforeCapture && !p.protocol.number) {
+  if (p.protocol.requireBeforeCapture && blank(p.protocol.number)) {
     return deny("An approved protocol number is required before capture", warnings);
   }
   const today = localDate(req.now, req.tz ?? "UTC");
@@ -215,7 +223,7 @@ function store(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Pol
     if (!conditions.some((c) => c.type === "encrypt")) conditions.push({ type: "encrypt" });
     conditions.push({ type: "location", mode: p.sharing.locationMetadata });
   }
-  if (s.identifiable && p.consent.requireLegalBasis && !s.legalBasis) {
+  if (s.identifiable && p.consent.requireLegalBasis && blank(s.legalBasis)) {
     return deny("Record a legal basis for identifiable data before storing it", warnings);
   }
   return withConditions(conditions, warnings);
