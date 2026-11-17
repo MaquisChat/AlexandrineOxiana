@@ -10,7 +10,7 @@ import { createHash, createHmac, hkdfSync } from "node:crypto";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AuditEvent, Project } from "@ao/core";
-import { REASON_SEALED_LOCKED, REASON_SEALED_MISMATCH, REASON_SEALED_MISSING } from "@ao/shared";
+import { REASON_SEALED_LOCKED, REASON_SEALED_MISMATCH, REASON_SEALED_MISSING, REASON_SEALED_UNREADABLE } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { attachConsentDocument } from "../consent-docs.js";
 import { OPEN_GOV, PASS, makeKit, makeProject, type Kit } from "../export/test-kit.js";
@@ -196,6 +196,73 @@ describe("reading a sealed reason back", () => {
     expect(await shownOf(p, ev.seq)).toEqual({ state: "missing", message: REASON_SEALED_MISSING });
     kit.repo.lockProject(p.id);
     expect(await shownOf(p, ev.seq)).toEqual({ state: "locked", message: REASON_SEALED_LOCKED });
+  });
+});
+
+describe("a read that failed is not said as \"no longer in this project\" (R369 d)", () => {
+  it("the sentence for a failed read is the one asked for", () => {
+    expect(REASON_SEALED_UNREADABLE).toBe("A reason was given, but its text could not be read just now.");
+  });
+
+  it("the project's store of reasons: a read that fails says so; read and without the line, it is no longer there", async () => {
+    const p = await makeProject(kit, GOV, true);
+    await OPS[0]!.run(p, reasonText("store read"));
+    const ev = await lastOf(p, "attention.set-aside");
+    await rm(storePath(p));
+    await mkdir(storePath(p)); // a read of it fails (EISDIR)
+    expect(await shownOf(p, ev.seq)).toEqual({ state: "unreadable", message: REASON_SEALED_UNREADABLE });
+    await rm(storePath(p), { recursive: true });
+    await writeFile(storePath(p), "");
+    expect(await shownOf(p, ev.seq)).toEqual({ state: "missing", message: REASON_SEALED_MISSING });
+  });
+
+  it("the withdrawal review's sealed entry: a read that fails says so; read and without the entry, it is no longer there", async () => {
+    const p = await makeProject(kit, GOV, true);
+    await OPS[3]!.run(p, reasonText("review read"));
+    const ev = await lastOf(p, "review.withdrawal-reviewed");
+    const file = join(folderOf(p), "review", "pending.jsonl");
+    const kept = await readFile(file);
+    await rm(file);
+    await mkdir(file);
+    expect(await shownOf(p, ev.seq)).toEqual({ state: "unreadable", message: REASON_SEALED_UNREADABLE });
+    await rm(file, { recursive: true });
+    await writeFile(file, "");
+    expect(await shownOf(p, ev.seq)).toEqual({ state: "missing", message: REASON_SEALED_MISSING });
+    await writeFile(file, kept);
+    expect(await shownOf(p, ev.seq)).toEqual({ state: "text", text: reasonText("review read") });
+  });
+
+  it("the library's store of reasons: a read that fails says so; read and without the line, it is no longer there", async () => {
+    const { appendLibraryAuditWithReason } = await import("./library-audit.js");
+    const core = (kit.repo as unknown as { core: import("./state.js").RepoCore }).core;
+    const p = await makeProject(kit, GOV, true);
+    const text = reasonText("library read");
+    const ev = await core.serial(() =>
+      appendLibraryAuditWithReason(
+        core,
+        {
+          at: kit.clock.now.toISOString(),
+          actor: core.actor,
+          device: core.device,
+          projectId: p.id,
+          action: "set-aside",
+          entity: { type: "project", id: p.id },
+          decision: { result: "allow" },
+          details: { op: "attention.set-aside", reasonGiven: true, reasonMac: mac(p, text), mark: { kind: "test" }, projectLogNotIntact: true },
+        },
+        projectDataKey(kit.repo, p.id)!,
+        text,
+      ),
+    );
+    const shownLib = async () => (await kit.repo.readLibraryAuditPage()).events.find((e) => e.seq === ev.seq)!.reasonShown;
+    expect(await shownLib()).toEqual({ state: "text", text });
+    const path = join(kit.lib.root, LIBRARY_AUDIT_REASONS_FILE);
+    await rm(path);
+    await mkdir(path);
+    expect(await shownLib()).toEqual({ state: "unreadable", message: REASON_SEALED_UNREADABLE });
+    await rm(path, { recursive: true });
+    await writeFile(path, "");
+    expect(await shownLib()).toEqual({ state: "missing", message: REASON_SEALED_MISSING });
   });
 });
 

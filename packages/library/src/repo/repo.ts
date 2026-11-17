@@ -1613,13 +1613,15 @@ function keyOrLocked(core: RepoCore, st: ProjectState): { key: Uint8Array; keyId
 async function withProjectReasons(core: RepoCore, st: ProjectState, events: AuditEvent[]): Promise<ShownAuditEvent[]> {
   const sealed = events.filter(hasSealedReason);
   let k: { key: Uint8Array; keyId: string } | "locked" = "locked";
-  let store = new Map<string, { text: string }>();
-  let review: ReviewEntry[] = [];
+  // A read that fails is said as such (R369 d), never as a text that is no longer there.
+  let store: Map<string, { text: string }> | "unreadable" = new Map();
+  let review: ReviewEntry[] | "unreadable" = [];
   if (sealed.length && core.encrypted(st)) {
     k = keyOrLocked(core, st);
     if (k !== "locked") {
-      store = await readProjectReasons(core.abs(`${st.rel}/${AUDIT_REASONS_FILE}`), k.key, st.project.id);
-      if (sealed.some((e) => typeof e.details?.reviewEntry === "string")) review = await readReviewEntries(core, st).catch(() => []);
+      const key = k.key;
+      if (sealed.some((e) => typeof e.details?.reviewEntry !== "string")) store = await readProjectReasons(core.abs(`${st.rel}/${AUDIT_REASONS_FILE}`), key, st.project.id).catch(() => "unreadable" as const);
+      if (sealed.some((e) => typeof e.details?.reviewEntry === "string")) review = await readReviewEntries(core, st).catch(() => "unreadable" as const);
     }
   }
   return events.map((e) => {
@@ -1628,12 +1630,14 @@ async function withProjectReasons(core: RepoCore, st: ProjectState, events: Audi
       const key = k.key;
       const entry = e.details?.reviewEntry;
       if (typeof entry === "string") {
+        if (review === "unreadable") return "unreadable";
         // A restored copy gives its review entries new ids (R92) while its audit log keeps the old: then the entry
         // resolved by this decision at this entry's time, with the text whose digest the entry records.
         const byId = review.find((r) => r.id === entry);
         if (byId) return { key, text: byId.reason };
         return { key, text: review.find((r) => r.decision === "reviewed-after-withdrawal" && r.resolvedAt === e.at && typeof r.reason === "string" && reasonMatches(e.details, r.reason, key))?.reason };
       }
+      if (store === "unreadable") return "unreadable";
       return { key, text: store.get(reasonKey(e.seq, e.hash))?.text };
     });
     return shown ? { ...e, reasonShown: shown } : e;
@@ -1642,13 +1646,15 @@ async function withProjectReasons(core: RepoCore, st: ProjectState, events: Audi
 
 /** R362 b: the library's log: a sealed reason is read with the key of the project the entry names. */
 async function withLibraryReasons(core: RepoCore, events: AuditEvent[]): Promise<ShownAuditEvent[]> {
-  const lines = events.some(hasSealedReason) ? await readLibraryReasonLines(join(core.root, LIBRARY_AUDIT_REASONS_FILE)) : [];
+  // A read that fails is said as such (R369 d), never as a text that is no longer there.
+  const lines = events.some(hasSealedReason) ? await readLibraryReasonLines(join(core.root, LIBRARY_AUDIT_REASONS_FILE)).catch(() => "unreadable" as const) : [];
   return events.map((e) => {
     const shown = reasonView(e, () => {
       const st = e.projectId ? core.projects.get(e.projectId) : undefined;
       if (!st) return { key: new Uint8Array(0), text: undefined };
       const k = keyOrLocked(core, st);
       if (k === "locked") return "locked";
+      if (lines === "unreadable") return "unreadable";
       const line = lines.find((l) => l.seq === e.seq && l.hash === e.hash && l.projectId === e.projectId);
       return { key: k.key, text: line ? openLibraryReason(line.sealed, k.key, st.project.id)?.text : undefined };
     });

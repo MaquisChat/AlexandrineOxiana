@@ -21,7 +21,7 @@
  * made and never changes afterwards; entries written before this rule stay as they were (the log is append-only).
  */
 import { createHash, createHmac, hkdfSync, timingSafeEqual } from "node:crypto";
-import { REASON_SEALED_LOCKED, REASON_SEALED_MISMATCH, REASON_SEALED_MISSING, type AuditReasonView } from "@ao/shared";
+import { REASON_SEALED_LOCKED, REASON_SEALED_MISMATCH, REASON_SEALED_MISSING, REASON_SEALED_UNREADABLE, type AuditReasonView } from "@ao/shared";
 import type { AuditEvent } from "@ao/core";
 import { openLine, readMaybe, sealLine } from "./io.js";
 import { KEY_PURPOSE_AUDIT_REASON_MAC, PURPOSE_AUDIT_REASONS } from "./sealed-purposes.js";
@@ -147,16 +147,17 @@ export function hasSealedReason(e: Pick<AuditEvent, "details">): boolean {
 /**
  * What the audit screen shows for an entry's reason, or undefined when it carries none:
  *  - a reason audited as typed (a project that is not encrypted, or an entry written before R362 b): the text;
- *  - a sealed reason: `sealed()` gives `locked` when the key is not available, else the project's key and the sealed
- *    text found for the entry (undefined when it is not there); the text is shown only when it matches the entry's
- *    digest (`reasonMatches`).
+ *  - a sealed reason: `sealed()` gives `locked` when the key is not available, `unreadable` when the place its text is
+ *    kept could not be read (R369 d), else the project's key and the sealed text found for the entry (undefined when
+ *    that place was read and holds none); the text is shown only when it matches the entry's digest (`reasonMatches`).
  */
-export function reasonView(e: Pick<AuditEvent, "details">, sealed: () => "locked" | { key: Uint8Array; text: string | undefined }): AuditReasonView | undefined {
+export function reasonView(e: Pick<AuditEvent, "details">, sealed: () => "locked" | "unreadable" | { key: Uint8Array; text: string | undefined }): AuditReasonView | undefined {
   const d = e.details;
   if (!d || typeof d.op !== "string" || !REASON_OPS.includes(d.op)) return undefined;
   if (hasSealedReason(e)) {
     const t = sealed();
     if (t === "locked") return { state: "locked", message: REASON_SEALED_LOCKED };
+    if (t === "unreadable") return { state: "unreadable", message: REASON_SEALED_UNREADABLE };
     if (t.text === undefined) return { state: "missing", message: REASON_SEALED_MISSING };
     if (!reasonMatches(d, t.text, t.key)) return { state: "mismatch", message: REASON_SEALED_MISMATCH };
     return { state: "text", text: t.text };
