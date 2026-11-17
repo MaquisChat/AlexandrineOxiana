@@ -18,6 +18,7 @@ import { OcrQueue } from "./import/ocr.js";
 import { ProxyQueue } from "./import/proxies.js";
 import { openIndex } from "./index/db.js";
 import { appendJobRecords, journalPath, markLegacyJobs, readJobJournal, upgradeLegacyJobs, type JobRecord } from "./job-journal.js";
+import { createLinkCapture } from "./capture/link-capture.js";
 import { createLibrary, openLibrary, type Library } from "./library.js";
 import { editPendingProxies, projectDataKey, relinkLinkedAsset, type Repo } from "./repo/repo.js";
 import { openTestRepo } from "./repo/testing.js";
@@ -372,4 +373,41 @@ describe("R379: lines written before (absolute paths) still resume", () => {
     expect(byId.get(inside)!.job).toMatchObject({ input: sf.assets[0]!.path, output: ".tmp/w/p.jpg" });
     expect([byId.get(outside)!.status, byId.get(outside)!.error, byId.get(outside)!.job]).toEqual(["failed", "INPUT_NOT_FOUND", undefined]);
   });
+});
+
+/** A worker that writes a transcript (segments and .vtt) into the job's output folder, failing a missing input as the real one does. */
+const transcriptWorker = (seen: StubJob[] = []) =>
+  stubWorker(
+    async (job) => {
+      seen.push(job);
+      if (!existsSync(job.body.input)) return { status: "failed", error: { code: "INPUT_NOT_FOUND", message: "the input file does not exist" } };
+      await mkdir(job.body.output, { recursive: true });
+      await writeFile(join(job.body.output, "segments.json"), JSON.stringify([{ start: 0, end: 1, text: "Hi.", lang: "en", flags: [] }]));
+      await writeFile(join(job.body.output, "transcript.vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHi.\n");
+      return { status: "done", result: { output: job.body.output, meta: { model: "small", detectedLanguages: ["en"], flaggedCount: 0 } } };
+    },
+    { closers },
+  );
+
+describe("R400 (a): `ao transcribe` (link capture's transcribeSource) on a recording", () => {
+  for (const handling of ["link", "copy"] as const) {
+    it(`${handling === "link" ? "linked in place" : "stored in the library"}: the job is submitted, the journal holds no path for it, the transcript is made`, async () => {
+      const p = await makeProject(false);
+      const sf = await withOriginal(p, "talk.mp3", Buffer.alloc(64, 1), handling);
+      const media = sf.assets[0]!;
+      expect(!!media.linked).toBe(handling === "link");
+      const seen: StubJob[] = [];
+      const capture = createLinkCapture({ repo, worker: clientOf(await transcriptWorker(seen)) });
+      const r = await capture.transcribeSource(p.id, sf.source.id, { model: "small" });
+      expect(seen.map((j) => j.body.input)).toEqual([handling === "link" ? media.linked!.absolutePath : join(lib.root, ...media.path.split("/"))]);
+      expect(r.files).toHaveLength(2);
+      const after = await repo.getSource(p.id, sf.source.id);
+      expect(after.assets.filter((a) => a.kind === "transcript")).toHaveLength(2);
+      const { text, records } = await journalOf(p);
+      expect(text).not.toContain(lib.root);
+      expect(text).not.toContain(tmp);
+      if (handling === "link") expect(text).not.toContain(media.linked!.libraryRelativePath);
+      expect(records.map((x) => x.status)).toEqual(["done"]);
+    });
+  }
 });
