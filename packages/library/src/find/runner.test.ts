@@ -439,8 +439,11 @@ describe("a typed line becomes a record", () => {
     await settled(p, added[0]!.id);
     // The event is sent once the change is committed (its audit included).
     await until(() => changes.some((c) => c.entryId === added[0]!.id && c.state === "record-complete"), "the event");
+    // The record made, the copy part goes on and rests: every copy service is off in these tests' settings (R312 c).
+    await until(async () => (await entryOf(p, added[0]!.id))?.reason !== undefined, "the copy part to rest");
     const e = (await entryOf(p, added[0]!.id))!;
     expect(e.state).toBe("record-complete");
+    expect(e.reason).toEqual({ code: "switched-off", by: "settings" });
     const [sf, ...more] = await sourcesOf(p);
     expect(more).toEqual([]);
     expect(e.sourceId).toBe(sf!.source.id);
@@ -465,7 +468,9 @@ describe("a typed line becomes a record", () => {
     expect(audit).toContain('"project.find.add"');
     expect(audit).toContain('"project.find.update"');
     expect(audit).not.toMatch(/Zorblatt|Quillfeather|Habitus/u);
-    expect(changes.filter((c) => c.entryId === e.id).map((c) => c.state)).toEqual(["looking-up", "record-complete"]);
+    // One event for the record's line, one for the copy part's rest (each sent once its line is committed).
+    await until(() => changes.filter((c) => c.entryId === e.id).length >= 3, "the copy part's event");
+    expect(changes.filter((c) => c.entryId === e.id).map((c) => c.state)).toEqual(["looking-up", "record-complete", "record-complete"]);
   });
 
   it("identical normalised lines in one Add give one entry; a bad line or more than 50 lines are refused with nothing written", async () => {
@@ -4654,9 +4659,12 @@ processing:
         await saveRecord(true);
         await r.wakeSettings(p.id);
         await until(async () => (await entryOf(p, eid))?.reason?.code !== "switched-off", "the entry to go on");
-        await settled(p, eid);
+        // Its record made, the copy part goes on (OpenAlex on in the file, which offers nothing here) and rests.
+        await until(async () => (await entryOf(p, eid))?.state === "no-open-copy", "the copy part to rest");
         expect(gated.sent.length).toBeGreaterThan(0);
-        expect((await entryOf(p, eid))!.reason?.code).not.toBe("switched-off");
+        const e = (await entryOf(p, eid))!;
+        expect(e.sourceId).toBeTruthy();
+        expect(e.reason).toBeUndefined();
       });
 
       it("the record part: settings that still stop it leave the entry as it is — no service asked, no new line", async () => {
@@ -4682,7 +4690,7 @@ processing:
         // The settings still stop it: it goes back to resting, asking nothing.
         const again = await r.retry(p.id, eid);
         expect(again.state).toBe("looking-for-copy");
-        await quiet();
+        await until(async () => (await entryOf(p, eid))?.state !== "looking-for-copy", "the copy part to rest");
         expect((await entryOf(p, eid))!).toMatchObject({ state: "record-complete", reason: { code: "switched-off", by: "settings" } });
         expect(copyRequests).toEqual([]);
         // Switched on: it goes on.
