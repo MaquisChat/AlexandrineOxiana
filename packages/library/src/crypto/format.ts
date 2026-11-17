@@ -73,11 +73,12 @@ export function assertKey(key: Uint8Array): void {
 }
 
 /**
- * A key fit to seal with: 32 bytes, not all zero. A key ring zero-fills a key when the project is locked; a buffer
- * that reads as zeros is a wiped key, and anything sealed under it would open for anyone (R379). Refused here, in
- * the primitives that seal (`encryptStream`, and `sealLine` in repo/io.ts), as the last line of defence.
+ * A live key: 32 bytes, not all zero. A key ring zero-fills a key when the project is locked; a buffer that reads
+ * as zeros is a wiped key. Sealing under it would seal for anyone (R379); opening with it is a read the lock cut
+ * short, which is "locked", never "damaged" nor "another project's line" (R386 a). Refused in every primitive that
+ * seals or opens with a project key: `encryptStream`, `decryptStream`, `openDecryptedHandle`, `sealLine`, `openLine`.
  */
-export function assertSealingKey(key: Uint8Array, keyId: string): void {
+export function assertLiveKey(key: Uint8Array, keyId: string): void {
   assertKey(key);
   let any = 0;
   for (const b of key) any |= b;
@@ -203,7 +204,7 @@ function toBuffer(chunk: unknown): Buffer {
  * is zeroed when the stream ends or is destroyed.
  */
 export function encryptStream(key: Uint8Array, keyId: string): Transform {
-  assertSealingKey(key, keyId);
+  assertLiveKey(key, keyId);
   assertKeyId(keyId);
   const k = Buffer.from(key);
   const baseNonce = randomBytes(NONCE_LEN);
@@ -338,6 +339,7 @@ export function decryptStream(
     if (!(key instanceof Uint8Array) || key.length !== KEY_LEN) {
       throw new KeyNotAvailableError(parsed.keyId);
     }
+    assertLiveKey(key, parsed.keyId);
     k = Buffer.from(key);
   };
 

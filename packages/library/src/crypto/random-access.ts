@@ -18,6 +18,7 @@ import {
   KEY_LEN,
   KeyNotAvailableError,
   TAG_LEN,
+  assertLiveKey,
   chunkAad,
   chunkNonce,
   parseHeader,
@@ -54,6 +55,7 @@ export async function openDecryptedHandle(fh: fsp.FileHandle, getKey: (keyId: st
     const parsed = parseHeader(header.subarray(0, bytesRead));
     const k = getKey(parsed.keyId);
     if (!(k instanceof Uint8Array) || k.length !== KEY_LEN) throw new KeyNotAvailableError(parsed.keyId);
+    assertLiveKey(k, parsed.keyId);
     const key = Buffer.from(k);
     const body = fileSize - HEADER_LEN;
     if (body < TAG_LEN) throw new DecryptionError("encrypted file is truncated: missing final chunk");

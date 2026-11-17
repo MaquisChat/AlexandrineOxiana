@@ -18,6 +18,7 @@ import type { MergeRecord } from "./merge.js";
 import { decryptBytes, namesIn, openLine, readMaybe, sealLine } from "../../repo/io.js";
 import type { MutateRequest, Tx } from "../../repo/mutate.js";
 import { projectDataKey, repoLibrary, type Repo } from "../../repo/repo.js";
+import { KeyNotAvailableError } from "../../crypto/format.js";
 
 /** Batches running (or being undone) in this process (a `running` batch.json not listed here was interrupted, R45). */
 export const activeBatches = new Set<string>();
@@ -281,7 +282,8 @@ export async function readJournal(repo: Repo, projectId: string, dir: string): P
       const json = key ? openLine(key.key, projectId, line, JOURNAL_PURPOSE) : line;
       const e = JSON.parse(json) as JournalEntry;
       if (typeof e?.key === "string") out.push(e);
-    } catch {
+    } catch (err) {
+      if (err instanceof KeyNotAvailableError) throw err; // a wiped key: locked, not a foreign line (R386 a)
       // torn or foreign line
     }
   }

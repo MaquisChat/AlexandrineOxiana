@@ -5,6 +5,7 @@ import { projectMovedAway } from "../library.js";
 import { openLine } from "../repo/io.js";
 import { parseProjectJson, type ProjectJson } from "../repo/state.js";
 import type { KeyRing } from "../crypto/keys.js";
+import { KeyNotAvailableError } from "../crypto/format.js";
 
 /** What the index recorded about a project's change state. */
 export type Stamp = { mode: "changes"; id: string } | { mode: "manifest"; mtimeMs: number };
@@ -80,7 +81,8 @@ function newestIn(text: string, projectId: string, key: Uint8Array | null): stri
       }
       const id = (JSON.parse(json) as { id?: unknown }).id;
       if (typeof id === "string" && id > best) best = id;
-    } catch {
+    } catch (err) {
+      if (err instanceof KeyNotAvailableError) throw err; // a wiped key: locked, not an unreadable line (R386 a)
       // torn or unreadable line: ignore
     }
   }
