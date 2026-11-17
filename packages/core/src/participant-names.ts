@@ -466,11 +466,11 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
     };
     const had = seen.get(key);
     if (had) {
+      if (!f.part) had.part = false;
       // Another form that folds alike (R416): kept as a candidate, chosen at the match.
       if (!had.cands.some((c) => c.code === code && c.strict === cand.strict && c.full === cand.full && c.written === cand.written)) {
         had.cands.push(cand);
         if (code !== had.code) had.mixed = true;
-        if (!f.part) had.part = false;
       }
       return;
     }

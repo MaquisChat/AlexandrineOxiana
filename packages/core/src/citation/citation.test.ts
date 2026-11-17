@@ -1201,3 +1201,12 @@ describe("R440 (b): no run in the family-given reading", () => {
     expect(page([{ role: "author", given: "Lucía", family: "Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
   });
 });
+
+describe("R440 (e): a whole name is found even where a run of the same letters was indexed first", () => {
+  it("the map {Lucía Fernández Ruiz, Lucía Fernández} (one code): 'Fernández, Lucía' in a family field is coded", () => {
+    const map = new Map([["Lucía Fernández Ruiz", "P-005"], ["Lucía Fernández", "P-005"]]);
+    const item = toCslItem(source("webpage", mt(["es", "original", "A page"]), [{ role: "author", given: "Pedro", family: "Fernández, Lucía" }]), { ...OPTS, pseudonyms: map });
+    expect(JSON.stringify(item.author)).not.toContain("Lucía");
+    expect(JSON.stringify(item.author)).toContain("P-005");
+  });
+});
