@@ -1493,6 +1493,30 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
     });
   });
 
+  describe("R366 e: text after an entry's closing brace", () => {
+    it("an unmatched '}' inside a quoted value closes the entry with text after it: the record carries the doubt", async () => {
+      const src = '@article{a, title="a } c", doi={10.5555/a}, year={2020}}\n@book{n, title={Next}}\n';
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(["a", "n"]);
+      expect(es[0]!.doubt).toBe(BIB_DOUBTS.textAfter);
+      expect(BIB_DOUBTS.textAfter).toBe("There is text after this BibTeX entry's closing brace that belongs to no entry; some of the entry's fields may be incomplete.");
+      expect(es[1]!.doubt).toBeUndefined();
+      const items = await collect(bibtexAdapter(await writeExport("after.bib", src)));
+      expect(items[0]!.doubts).toEqual([BIB_DOUBTS.textAfter]);
+      expect(items[1]!.doubts).toBeUndefined();
+    });
+
+    it("% comment lines, blank lines and an extra '}' between entries give none; nor does the sample export", async () => {
+      const src = "@article{a, title={A}}\n\n% a comment, with words = {x}\n  % another\n@article{b, title={B}}}\n\n@article{c, title={C}} % trailing\n@article{d, title={D}}";
+      const es = entries(src);
+      expect(es.map((x) => x.key)).toEqual(["a", "b", "c", "d"]);
+      expect(es.map((x) => x.doubt)).toEqual([undefined, undefined, undefined, undefined]);
+      const items = await collect(bibtexAdapter(join(exp, "sample.bib")));
+      expect(items).toHaveLength(4);
+      expect(items.map((i) => i.doubts)).toEqual([undefined, undefined, undefined, undefined]);
+    });
+  });
+
   it("R366 f: the doubts of an unclosed entry say that its fields may also hold text from what followed it", () => {
     expect(BIB_DOUBTS.cut).toBe('The BibTeX entry was not closed, so it was cut at a line beginning with "@"; its fields may be incomplete or hold text from what followed it.');
     expect(BIB_DOUBTS.eof).toBe("The BibTeX entry was not closed before the end of the file; its fields may be incomplete or hold text from what followed it.");

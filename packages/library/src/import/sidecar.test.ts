@@ -130,6 +130,14 @@ describe("parseBibtex", () => {
       }
     });
 
+    it("R366 e: an unmatched '}' inside a quoted value closes the entry with text after it: the doubt; % lines and blank lines give none", () => {
+      const m = parseBibtex('@article{a, title="a } c", doi={10.5555/a}, year={2020}}');
+      expect(m.doubt).toBe("There is text after this BibTeX entry's closing brace that belongs to no entry; some of the entry's fields may be incomplete.");
+      const ok = parseBibtex("% exported\n@article{a, title={A}, year={2020}}\n\n% next one\n@article{b, title={B}}\n");
+      expect(ok).toMatchObject({ title: "A", issued: "2020" });
+      expect(ok.doubt).toBeUndefined();
+    });
+
     it("a sidecar's doubt reaches the resolution: the item goes to review with it", async () => {
       const dir = await mkdtemp(join(tmp, "res-"));
       const bib = join(dir, "paper.bib");

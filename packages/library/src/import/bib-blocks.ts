@@ -28,6 +28,7 @@
 export const BIB_DOUBTS = {
   cut: 'The BibTeX entry was not closed, so it was cut at a line beginning with "@"; its fields may be incomplete or hold text from what followed it.',
   eof: "The BibTeX entry was not closed before the end of the file; its fields may be incomplete or hold text from what followed it.",
+  textAfter: "There is text after this BibTeX entry's closing brace that belongs to no entry; some of the entry's fields may be incomplete.",
   innerEntry:
     'A line inside one of this BibTeX entry\'s fields begins like another entry ("@type{"); it was read as part of the field. If a closing brace is missing in the file, other entries may be inside this one.',
 } as const;
@@ -38,6 +39,8 @@ export interface BibBlock {
   state: "closed" | "cut" | "eof";
   /** Closed, with a line inside it that begins an entry (`@type{` or `@type(`). */
   innerEntry: boolean;
+  /** A `{` block closed with text after it, before the next "@", other than white space, "}" or a `%` comment (R366 e). */
+  textAfter?: boolean;
 }
 
 const isLetter = (c: string | undefined) => !!c && ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z"));
@@ -73,8 +76,26 @@ export function beginsBlockLine(src: string, at: number): boolean {
 }
 
 /** The doubt a record carries for its block, if any. */
-export function bibDoubt(b: Pick<BibBlock, "state" | "innerEntry">): string | undefined {
-  return b.state === "cut" ? BIB_DOUBTS.cut : b.state === "eof" ? BIB_DOUBTS.eof : b.innerEntry ? BIB_DOUBTS.innerEntry : undefined;
+export function bibDoubt(b: Pick<BibBlock, "state" | "innerEntry" | "textAfter">): string | undefined {
+  if (b.state === "cut") return BIB_DOUBTS.cut;
+  if (b.state === "eof") return BIB_DOUBTS.eof;
+  return b.textAfter ? BIB_DOUBTS.textAfter : b.innerEntry ? BIB_DOUBTS.innerEntry : undefined;
+}
+
+/**
+ * Whether text that belongs to no block follows a block closed at `end`, before the next "@" (or the
+ * end): anything but white space, "}" (an extra closing brace) and `%` comments (to the end of the line).
+ */
+function textAfter(src: string, end: number): boolean {
+  for (let k = end; k < src.length; k++) {
+    const c = src[k];
+    if (c === "@") return false;
+    if (c === "%") {
+      while (k < src.length && src[k] !== "\n" && src[k] !== "\r" && src[k] !== "@") k++;
+      if (src[k] === "@") return false;
+    } else if (c !== "}" && !isSpace(c)) return true;
+  }
+  return false;
 }
 
 /** More blocks are open at once (or resolved ahead of the reader) than any export can hold: see BibBlocks. */
@@ -277,7 +298,8 @@ export class BibBlocks {
     }
     // A block the shared scan passed inside another (and so did not keep): its own scan.
     r ??= new Scanner(this.src, this.maxTracked, open).runTo(open);
-    return r === undefined || r === "unclosed" ? this.unclosed(open) : r;
+    if (r === undefined || r === "unclosed") return this.unclosed(open);
+    return r.state === "closed" && this.src[open] === "{" && textAfter(this.src, r.end) ? { ...r, textAfter: true } : r;
   }
 
   /** Where a block opening at `open` that never closes ends. */
