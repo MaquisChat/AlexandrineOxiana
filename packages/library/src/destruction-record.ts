@@ -13,6 +13,7 @@ import { join } from "node:path";
 import type { AuditEvent } from "@ao/core";
 import { DESTRUCTION_CERTIFICATE } from "./repo/destroy.js";
 import { decryptBytes } from "./repo/io.js";
+import { ProjectLockedError, isLockedRefusal } from "./repo/errors.js";
 import { projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 
 /** `Backups/<file>`: how certificates, amendments and audit events name a backup. */
@@ -155,7 +156,8 @@ export async function readPlain(repo: Repo, projectId: string, rel: string): Pro
   if (!k) return "unreadable";
   try {
     return await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw);
-  } catch {
+  } catch (err) {
+    if (isLockedRefusal(err)) throw new ProjectLockedError(projectId); // locked mid-read, never "unreadable" (R404)
     return "unreadable";
   }
 }

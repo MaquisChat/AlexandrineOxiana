@@ -40,8 +40,12 @@ import { openAssetContent } from "../asset-content.js";
 import { readTranscript } from "../transcript-segments.js";
 import { TRANSCRIBE_KIND, transcriptionRecords } from "../transcription-jobs.js";
 import { ProjectLockedError } from "./errors.js";
+import { encryptBytes } from "./io.js";
+import { readPlain } from "../destruction-record.js";
 import { newAttentionId } from "./attention.js";
 import {
+  deletedHere,
+  deletedRecordsTrouble,
   heldWaitingCountIn,
   projectDataKey,
   projectPseudonymMap,
@@ -328,6 +332,14 @@ async function build(): Promise<Ctx> {
       reviewItem: { kind: "verification", fields: {}, reasons: ["Check the date."] },
     },
   );
+  // A source deleted here that stood for a Zotero item: the sealed record of deletions.
+  const gone = await kit.repo.createSource(
+    p.id,
+    { projectIds: [], type: "book", title: mt("Gone"), creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+    [],
+    { provenance: { captureMethod: "manual_upload", capturedAt: kit.clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false, externalKeys: { zoteroKey: "ABCD1234" } } },
+  );
+  await kit.repo.deleteSource(p.id, gone.source.id);
   // Fieldwork: a participant with details, a session, consents (one with its signed form, one detached with a reason).
   const part = await kit.repo.createParticipant(p.id, { details: { name: "Maria Hollis", phone: "555-0100" }, legalBasis: "consent" });
   await kit.repo.createSession(p.id, { date: "2026-03-14", place: "The market", participantIds: [part.id], notes: "Rainy", legalBasis: "consent" });
@@ -390,6 +402,10 @@ async function build(): Promise<Ctx> {
   const batch = (await bulk.listBatches(p.id))[0]!;
   const batchRec = await findBatch(kit.repo, p.id, batch.batchId);
   expect(batchRec).toBeDefined();
+  // A sealed file in the retention folder (what a destruction certificate is), read by readPlain.
+  const retention = join(kit.lib.root, kit.repo.getProject(p.id).folder, "retention");
+  await mkdir(retention, { recursive: true });
+  await writeFile(join(retention, "probe.json.enc"), await encryptBytes(key.key, key.keyId, JSON.stringify({ probe: true })));
   // A backup.
   await backupProject(kit.repo, p.id);
   // An encrypted original to relink: a copy of it in a search folder; the original is removed by the relink row.
@@ -493,6 +509,11 @@ const ROWS: Row[] = [
   },
   // ---- protocol and consent documents, attention, warnings ----
   { name: "listProtocolDocuments", where: "protocol-docs.ts:139 (readManifest :68)", run: async () => listProtocolDocuments(c.kit.repo, c.p.id) },
+  {
+    name: "deletedHere and deletedRecordsTrouble",
+    where: "repo/repo.ts:1140, :1151 → repo/tombstones.ts:62",
+    run: async () => ({ here: (await deletedHere(c.kit.repo, c.p.id))?.("ABCD1234") ?? "unreadable", other: (await deletedHere(c.kit.repo, c.p.id))?.("ZZZZ0000") ?? "unreadable", trouble: await deletedRecordsTrouble(c.kit.repo, c.p.id) }),
+  },
   { name: "listCollectionsAndTags", where: "repo/repo.ts:480", run: async () => c.kit.repo.listCollectionsAndTags(c.p.id) },
   // ---- the audit log and its sealed reasons ----
   {
@@ -501,6 +522,11 @@ const ROWS: Row[] = [
     run: async () => (await c.kit.repo.readAudit(c.p.id, { limit: 1000, beforeSeq: c.auditSeq })).events,
   },
   // ---- retention ----
+  {
+    name: "readPlain (a sealed retention file: certificates, destruction records)",
+    where: "destruction-record.ts:145 (decrypt :157); retention.ts:457, :465, :558, :972; restore-record.ts:71",
+    run: async () => readPlain(c.kit.repo, c.p.id, `${c.kit.repo.getProject(c.p.id).folder}/retention/probe.json.enc`),
+  },
   // ---- exports and backups ----
   { name: "buildExport (BibTeX)", where: "export/refman-export.ts:301", run: async () => buildExport(c.kit.repo, c.p.id, ids(), "bibtex") },
   { name: "exportRefman (RIS, audited)", where: "export/refman-export.ts:356", writes: true, run: async () => exportRefman(c.kit.repo, c.p.id, ids(), "ris") },
