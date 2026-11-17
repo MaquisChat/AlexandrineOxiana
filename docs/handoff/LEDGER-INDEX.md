@@ -303,3 +303,4 @@ R379 (2026-11-17): the whole-branch review (7 parts: 3 Critical, 18 Important) �
 R380 (2026-11-17): FR-A10 — a Hangul name of two or more syllables also matches at the start of a run of Hangul (a particle or honorific joined to it); inflected Latin-script forms are a stated limit (FR-657)
 R381 (2026-11-17): FR-A12 built — title searches only when the project's rules say it holds no identifiable data, never for audio, video or images; a sidecar's title is withheld too; the note is in the bulk report only (FR-658)
 R382 (2026-11-17): FR-A20 accepted — the image proxy carries nothing of the source but the EXIF it builds and the colour profile; numpy pinned exactly; the video proxy under 'keep' copies all metadata, left (FR-659)
+R383 (2026-11-17): FR-A10 round 2 — the Hangul start-of-run rule counts the whole name's syllables (a family name and a one-syllable given name are a full name); in review
