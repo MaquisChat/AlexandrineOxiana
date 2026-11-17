@@ -118,6 +118,7 @@ import {
   appendJournal,
   itemKeyHash,
   runListeners,
+  unsavedStops,
   batchDirs,
   countOutcomes,
   fileCounts,
@@ -145,7 +146,7 @@ import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRe
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
-import { cheapEstimate, fitSentence, freeRoom, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir } from "./space.js";
+import { DISK_FULL_NOTE, NoRoomError, cheapEstimate, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir } from "./space.js";
 import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = libraryVersion();
@@ -331,15 +332,16 @@ export function failedReason(kind: string): string {
   return `The item could not be imported: ${t.item}.${t.itemAction ? ` ${t.itemAction}` : ""}`;
 }
 
-/** R393 a: the note of a batch stopped by an error of the given kind. */
+/** R393 a: the note of a batch stopped by an error of the given kind (R413 b: a full disk has its own sentence). */
 export function stoppedNote(kind: string): string {
+  if (kind === "ENOSPC" || kind === "EDQUOT") return DISK_FULL_NOTE;
   const t = causeText(kind);
   if (!t) return `The import stopped because of an unexpected error (${kind}); resume the batch to continue.`;
   return `The import stopped because ${t.batch}; ${t.batchAction ?? "resume the batch to continue"}.`;
 }
 
 /** Every note `stoppedNote` writes (and the one written before R393): a resumed run drops them. */
-const STOPPED_NOTE = /^The import stopped because .*; .*resume the batch to continue\.$/u;
+const STOPPED_NOTE = /^The import stopped because .*(?:; .*resume the batch to continue|, then resume the import)\.$/u;
 
 /**
  * R393 b: an unexpected error for the log — its kind, code, syscall and errno, and the program's stack frames (the
@@ -705,6 +707,8 @@ interface Prepared {
   shaOf: Map<string, string>;
   /** Which files may carry a location and which get viewing proxies (R83); set by importItem. */
   plan: ProxyPlan;
+  /** R413 b: the bytes of the files that are to be copied into the library (not linked in place). */
+  copyBytes: number;
 }
 
 interface Queued {
@@ -942,6 +946,7 @@ class Run {
     // R393: a stop of an earlier run of this batch is no longer the news; this run says its own.
     this.rec.notes = this.rec.notes.filter((n) => !STOPPED_NOTE.test(n));
     delete this.rec.stopCause;
+    unsavedStops.delete(this.rec.id);
     try {
       const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, (id) => hasSource(this.repo, this.projectId, id));
       this.dedupe = dedupe;
@@ -1072,6 +1077,9 @@ class Run {
       await writeBatchReport(this.repo, this.projectId, this.rec.id);
     } catch (err) {
       this.deps.debug?.(`bulk import: the batch record could not be saved: ${errorForLog(err)}`);
+      // R413 b, c: the report still says why the batch stopped (kept in memory until the record is saved again).
+      const stop = this.rec.notes.find((n) => STOPPED_NOTE.test(n));
+      if (stop) unsavedStops.set(this.rec.id, stop);
     } finally {
       runListeners.delete(this.rec.id);
       active.delete(this.rec.id);
@@ -1133,6 +1141,9 @@ class Run {
     }
     if (err instanceof UnsafeFileError) return failed(REASONS.unsafe);
     if (err instanceof ProjectLockedError) throw err;
+    // R413 b: a full disk (or quota) is the batch's condition, not the item's: the batch stops here and the item in
+    // hand gets no line, so a resume takes it up again (its change, if one had begun, rolled itself back, R26).
+    if (isDiskFull(err)) throw err;
     if ((err as Error)?.name === "AbortError") throw err;
     // Anything else is unexpected (R393 a, b): the line keeps its kind and the report says it; the log gets the
     // kind and the program's stack, never the error's message (it may hold a path, a title or a name).
@@ -1405,7 +1416,7 @@ class Run {
   private async prepareFiles(item: ScanItem): Promise<Prepared> {
     const opts = this.rec.options;
     const fromArchive = item.key.includes("!/");
-    const out: Prepared = { inputs: [], shas: [], kept: [], names: [], mime: "", dropped: [], copiedLinks: 0, realOf: new Map(), shaOf: new Map(), plan: { located: false, proxies: [] } };
+    const out: Prepared = { inputs: [], shas: [], kept: [], names: [], mime: "", dropped: [], copiedLinks: 0, realOf: new Map(), shaOf: new Map(), plan: { located: false, proxies: [] }, copyBytes: 0 };
     for (const f of item.files) {
       const st = await fsp.stat(f.path).catch(() => null);
       if (!st?.isFile()) {
@@ -1448,8 +1459,20 @@ class Run {
       if (wantsLink && sourceLinks && opts.fileHandling !== "link" && (await this.linkRefused())) out.copiedLinks++;
       const handling = wantsLink && !(await this.linkRefused()) ? "link" : "copy";
       out.inputs.push({ path: real, noFollow: true, role: "original", handling, ext: stored.ext, mime: stored.mime, kind: stored.kind, ...(f.metadata ? { metadata: f.metadata } : {}) });
+      if (handling === "copy") out.copyBytes += st.size;
     }
+    if (out.copyBytes) await this.roomFor(out.copyBytes);
     return out;
+  }
+
+  /**
+   * R413 b: before an item's files are copied into the library, the free room on its disk must be at least their size
+   * (with the files of the items queued in the current group, not stored yet) plus FILE_MARGIN; otherwise the batch
+   * stops (NoRoomError, a full disk) before anything of the item is written. A disk that cannot tell passes.
+   */
+  private async roomFor(bytes: number): Promise<void> {
+    const queued = this.group.reduce((n, q) => n + q.prep.copyBytes, 0);
+    if ((await freeRoom(repoLibrary(this.repo).root)) < queued + bytes + fileMargin()) throw new NoRoomError();
   }
 
   /** Whether this project refuses linking in place (R24), asked once per run. */
@@ -1789,7 +1812,9 @@ class Run {
       }
       if (needOcr.length) await this.ocr(needOcr);
     } catch (err) {
-      if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError") throw err;
+      // R413 b: a full disk stops the batch; the group's items keep no line (a resume takes them up again), and are
+      // not retried one by one (each would fail the same way).
+      if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError" || isDiskFull(err)) throw err;
       if (!(err instanceof PolicyDeniedError)) this.deps.debug?.(`bulk import group store failed, storing item by item: ${errorForLog(err)}`);
       // The group as a whole was refused (e.g. the rules changed during the run) or failed: each
       // item on its own, so only the items concerned fail, each with its own audited decision.

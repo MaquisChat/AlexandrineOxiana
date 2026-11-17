@@ -22,6 +22,12 @@ import { projectDataKey, repoLibrary, type Repo } from "../../repo/repo.js";
 /** Batches running (or being undone) in this process (a `running` batch.json not listed here was interrupted, R45). */
 export const activeBatches = new Set<string>();
 
+/**
+ * R413 b, c: the stopping note of a batch whose record could not be saved when it stopped (the disk still full, or a
+ * project that refuses every write), by batch id. In memory only: the report shows it until the record is saved again.
+ */
+export const unsavedStops = new Map<string, string>();
+
 /** Runs in progress that want to hear about review decisions on their items (keeps their counts current). */
 export const runListeners = new Map<string, (line: JournalEntry) => void>();
 

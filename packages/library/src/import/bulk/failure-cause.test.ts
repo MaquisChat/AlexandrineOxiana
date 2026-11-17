@@ -151,7 +151,9 @@ describe("the kind of an unexpected error (R393 a)", () => {
     expect(failedReason("SQLITE_BUSY")).toMatch(/was busy/u);
     expect(failedReason("SQLITE_CORRUPT")).toMatch(/could not be read/u);
     expect(failedReason("TypeError")).toBe("The item could not be imported: an unexpected error (TypeError).");
-    expect(stoppedNote("ENOSPC")).toBe("The import stopped because the disk is full; free some space and resume the batch to continue.");
+    expect(stoppedNote("ENOSPC")).toBe("The import stopped because the disk is full. Free some space, then resume the import.");
+    // R413 b: a full disk (or quota) stopping the batch has its own sentence.
+    expect(stoppedNote("EDQUOT")).toBe(stoppedNote("ENOSPC"));
     expect(stoppedNote("RangeError")).toBe("The import stopped because of an unexpected error (RangeError); resume the batch to continue.");
   });
 });
@@ -217,9 +219,9 @@ describe("a batch whose run throws (R393 a, b)", () => {
     expect(res.state).toBe("failed");
     const rec = JSON.parse(await batchFile(p, "batch.json")) as { notes: string[]; stopCause?: string };
     expect(rec.stopCause).toBe("ENOSPC");
-    expect(rec.notes).toContain("The import stopped because the disk is full; free some space and resume the batch to continue.");
+    expect(rec.notes).toContain("The import stopped because the disk is full. Free some space, then resume the import.");
     const report = await bulk.batchReport(p.id, h.batchId);
-    expect(report.notes).toContain("The import stopped because the disk is full; free some space and resume the batch to continue.");
+    expect(report.notes).toContain("The import stopped because the disk is full. Free some space, then resume the import.");
     const md = await batchFile(p, "report.md");
     for (const text of [md, JSON.stringify(rec), ...notes]) {
       expect(text).not.toContain(SECRET_PATH);

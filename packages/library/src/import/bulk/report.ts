@@ -12,7 +12,7 @@
 import { appendLibraryEvent, projectReviewEntries, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
 import { createHash } from "node:crypto";
-import { BOOKKEEPING, activeBatches, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
+import { BOOKKEEPING, activeBatches, unsavedStops, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
 
 export interface ImportReport {
   batchId: string;
@@ -183,6 +183,12 @@ function markdown(r: ImportReport): string {
 }
 
 /** The batch's report as it stands, from its record, journal and the review queue. Writes nothing. */
+/** The stopping note of a batch not running whose record could not be saved (unsavedStops), unless the record has it. */
+function unsavedNote(notes: string[], batchId: string): string[] {
+  const n = unsavedStops.get(batchId);
+  return n && !activeBatches.has(batchId) && !notes.includes(n) ? [n] : [];
+}
+
 export async function batchReport(repo: Repo, projectId: string, batchId: string): Promise<ImportReport> {
   const rec = await findBatch(repo, projectId, batchId);
   if (!rec) throw new NotFoundError("Import batch", batchId);
@@ -218,7 +224,8 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     keptFields: [...latest.values()].filter((e) => e.merge?.kept?.length).map((e) => ({ item: reportLabel(e.key, rec.secret), fields: e.merge!.kept! })),
     annotationsDeletedHere: [...latest.values()].reduce((n, e) => n + (e.annotationsDeletedHere ?? 0), 0),
     governance: rec.governance,
-    notes: [...rec.notes, ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
+    // R413 b, c: a stop whose record could not be saved still says why.
+    notes: [...rec.notes, ...unsavedNote(rec.notes, batchId), ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
     created: { collectionIds: [...rec.createdCollectionIds], tagIds: [...rec.createdTagIds] },
   };
   return report;
