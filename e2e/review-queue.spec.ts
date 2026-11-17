@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
 import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR } from "./paths.js";
-import { pressByMouse } from "./press.js";
+import { pressByMouse, SCROLL_SETTLE_MS } from "./press.js";
 
 /** Types paths into the drop area ("Attach files…") and waits for the attach outcome list. */
 async function attachByTyping(page: Page, paths: string[]): Promise<void> {
@@ -245,6 +245,16 @@ test("D19 (R190): a conflict a later check finds on an existing source puts it i
  * The rhythms are what is proved, so they are timed (R173's exception, as find-copies.spec.ts's scenario 6): a press at
  * one spot every 150, 400 and 700 ms for about three seconds. The first press of each is a researcher's (`pressByMouse`:
  * the pointer moved onto the control at rest, or the control focused for a key).
+ *
+ * R371 e — what each engine proves. In WebKit the next entry's "Accept" stands 18 px HIGHER than the one decided (the
+ * panel above it is laid out shorter there; Chromium puts it at the same place), so a pointer resting at the middle of
+ * the first "Accept" rests just below the next one: the old code (before R362 d) decided ONE entry in WebKit at every
+ * rhythm pressed at the middle, and those rhythms prove the guard only in Chromium. The rhythms "near the top edge"
+ * rest the pointer 6 px below the top of "Accept", inside both places: there the old code decided EVERY entry in both
+ * engines (four of four, at 150 and at 700 ms, in WebKit and in Chromium), so they prove the guard in WebKit too. By key,
+ * the old code also decided one (its focus went to the next row's "Show"). The last step of each scenario proves that
+ * a deliberate press after a real movement IS taken (no over-refusal); the guard's every rule is also proven,
+ * engine-neutrally, by the unit tests (ReviewQueue.test.tsx).
  */
 const PANEL_TITLES = ["Salt Roads of the Upper Delta", "Ferry Songs at Low Water", "Market Days in Reed Villages", "Weirs and Their Keepers"];
 
@@ -288,6 +298,37 @@ async function steady(page: Page, at: { x: number; y: number }, ms: number): Pro
   }
 }
 
+/**
+ * As `pressByMouse` (press.ts) — the control brought into view, the page at rest (the same place on two looks more than
+ * SCROLL_SETTLE_MS apart), the pointer moved beside it and onto it, then pressed — but the
+ * pointer comes to rest `dy` px below the control's top edge (R371 e: inside the place of the next entry's "Accept" too).
+ */
+async function pressByMouseNearTop(page: Page, control: ReturnType<Page["getByRole"]>, dy = 6): Promise<{ x: number; y: number }> {
+  await control.scrollIntoViewIfNeeded();
+  await expect(control).toBeVisible();
+  let last = "";
+  await expect
+    .poll(
+      async () => {
+        const b = await control.boundingBox();
+        const at = JSON.stringify(b && [Math.round(b.x), Math.round(b.y)]);
+        const settled = b !== null && at === last;
+        last = at;
+        return settled;
+      },
+      { timeout: 60_000, intervals: [SCROLL_SETTLE_MS + 100] },
+    )
+    .toBe(true);
+  const box = (await control.boundingBox())!;
+  const x = box.x + box.width / 2;
+  const y = box.y + dy;
+  await page.mouse.move(Math.max(1, box.x - 30), y + 40);
+  await page.mouse.move(x, y, { steps: 3 });
+  await page.mouse.down();
+  await page.mouse.up();
+  return { x, y };
+}
+
 const RHYTHMS: Array<{ name: string; press(page: Page): Promise<void> }> = [
   {
     name: "a double click on Accept",
@@ -301,6 +342,9 @@ const RHYTHMS: Array<{ name: string; press(page: Page): Promise<void> }> = [
   { name: "a click every 150 ms without moving the pointer", press: async (page) => steady(page, await pressByMouse(page, accept(page)), 150) },
   { name: "a click every 400 ms without moving the pointer", press: async (page) => steady(page, await pressByMouse(page, accept(page)), 400) },
   { name: "a click every 700 ms without moving the pointer", press: async (page) => steady(page, await pressByMouse(page, accept(page)), 700) },
+  // R371 e: the pointer near Accept's top edge, where the next entry's Accept stands in WebKit too.
+  { name: "a click every 150 ms near the top edge of Accept without moving the pointer", press: async (page) => steady(page, await pressByMouseNearTop(page, accept(page)), 150) },
+  { name: "a click every 700 ms near the top edge of Accept without moving the pointer", press: async (page) => steady(page, await pressByMouseNearTop(page, accept(page)), 700) },
   {
     name: "Enter held for a second",
     press: async (page) => {
