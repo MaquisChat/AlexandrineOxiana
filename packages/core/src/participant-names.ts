@@ -424,7 +424,7 @@ function origEnd(text: string, start: number, n: number): number {
   return i;
 }
 
-interface Hit {
+export interface Hit {
   start: number;
   end: number;
   code: string;
@@ -465,7 +465,11 @@ function overrideHits(text: string, find: (t: string) => Hit[]): Hit[] {
       }
       return lo;
     };
-    for (const h of find(rev)) {
+    // Found left to right in the reversed text, so right to left in the original: added in reverse,
+    // the list stays sorted by start (mergeHits reads it in one pass, R403 d).
+    const found = find(rev);
+    for (let k = found.length - 1; k >= 0; k--) {
+      const h = found[k]!;
       const a = at(h.start);
       const b = at(h.end - 1);
       out.push({ start: Math.min(origS[a]!, origS[b]!), end: Math.max(origE[a]!, origE[b]!), code: h.code });
@@ -474,12 +478,28 @@ function overrideHits(text: string, find: (t: string) => Hit[]): Hit[] {
   return out;
 }
 
-/** Hits of `extra` that overlap none of `hits`, merged in, left to right. */
-function mergeHits(hits: Hit[], extra: Hit[]): Hit[] {
-  if (extra.length === 0) return hits;
-  const all = [...hits];
-  for (const e of extra) if (!all.some((h) => h.start < e.end && e.start < h.end)) all.push(e);
-  return all.sort((x, y) => x.start - y.start);
+/**
+ * Hits of `extra` that overlap none of `hits` (nor an extra taken before), merged in, left to right,
+ * in ONE pass over the two lists (R403 d): both are sorted by start, and `hits` do not overlap one
+ * another. Exported for its cost test.
+ */
+export function mergeHits(hits: readonly Hit[], extra: readonly Hit[]): Hit[] {
+  if (extra.length === 0) return [...hits];
+  const out: Hit[] = [];
+  let i = 0;
+  let lastEnd = -1; // the end of the last extra taken
+  for (const e of extra) {
+    const eStart = e.start;
+    const eEnd = e.end;
+    while (i < hits.length && hits[i]!.end <= eStart) out.push(hits[i++]!);
+    // hits[i] is the first that ends after e starts: e overlaps a hit only if it overlaps that one.
+    if (i < hits.length && hits[i]!.start < eEnd) continue;
+    if (eStart < lastEnd) continue;
+    out.push(e);
+    lastEnd = eEnd;
+  }
+  while (i < hits.length) out.push(hits[i++]!);
+  return out;
 }
 
 /**

@@ -9,7 +9,7 @@ import {
   sourceFolderName,
   withCollisionSuffix,
 } from "./naming.js";
-import { creatorNameTexts } from "./participant-names.js";
+import { creatorNameTexts, mergeHits, type Hit } from "./participant-names.js";
 
 const bytes = (s: string) => new TextEncoder().encode(s).length;
 
@@ -695,5 +695,53 @@ describe("R403 (c): a part of a name stands for the name only when it could be a
     const lucia = new Map([["Lucía Fernández Ruiz", "P-001"]]);
     expect(pseudonymize("Entrevista a Lucía Fernández", lucia)).toBe("Entrevista a P-001");
     expect(pseudonymize("Fernández Ruiz habla", lucia)).toBe("P-001 habla");
+  });
+});
+
+describe("R403 (d): merging the two lists of matches is one pass (M3 of the FR-A10 second review)", () => {
+  /** A hit whose `start` and `end` count every read, so the work is counted, not timed. */
+  const counted = (start: number, end: number, code: string, reads: { n: number }): Hit => ({
+    get start() {
+      reads.n++;
+      return start;
+    },
+    get end() {
+      reads.n++;
+      return end;
+    },
+    code,
+  });
+  /** The review's shape: matches inside an override ("‮airaM airaM …"), with some plain matches among them. */
+  const work = (n: number) => {
+    const reads = { n: 0 };
+    const hits: Hit[] = [];
+    const extra: Hit[] = [];
+    for (let k = 0; k < n; k++) {
+      if (k % 10 === 0) hits.push(counted(k * 6, k * 6 + 5, "P-002", reads));
+      extra.push(counted(k * 6, k * 6 + 5, "P-001", reads)); // overlaps the plain hit where there is one
+    }
+    const out = mergeHits(hits, extra);
+    return { reads: reads.n, out };
+  };
+
+  it("keeps the plain matches, adds the others, left to right", () => {
+    const { out } = work(20);
+    expect(out).toHaveLength(20);
+    expect(out.map((h) => h.code).join(" ")).toBe(Array.from({ length: 20 }, (_, k) => (k % 10 === 0 ? "P-002" : "P-001")).join(" "));
+    expect(out.every((h, k) => k === 0 || out[k - 1]!.end <= h.start)).toBe(true);
+  });
+
+  it("the work grows linearly: doubling the matches doubles the reads", () => {
+    const a = work(10_000).reads;
+    const b = work(20_000).reads;
+    const c = work(40_000).reads;
+    expect(b / a).toBeLessThan(2.2);
+    expect(c / b).toBeLessThan(2.2);
+  });
+
+  it("an override with 'airaM ' repeated: every name replaced", () => {
+    const out = pseudonymize("\u202E" + "airaM ".repeat(2_000), new Map([["Maria", "P-001"]]));
+    expect(out).not.toMatch(/aira/iu);
+    expect(out.match(/P-001/gu)).toHaveLength(2_000);
   });
 });
