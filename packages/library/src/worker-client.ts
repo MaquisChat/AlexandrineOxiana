@@ -33,6 +33,7 @@ import { createInterface } from "node:readline";
 import type { Asset, EntityType, PolicyDecision, ProcessingOp } from "@ao/core";
 import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
+import { insideFolder, insideLibrary, libraryRealRoot, realOrNearest } from "./fs/inside-library.js";
 import type { IndexDb } from "./index/db.js";
 import {
   LOCKED_CODE, UNFINISHED, appendJobRecords, appendNewJobRecord, assertNoSecrets, claimJobRecord, compactJobJournal, errorCode, fromLibraryPath, isPending,
@@ -369,6 +370,11 @@ export class WorkerClient {
             ? { path: extras.input, encrypted: extras.inputEncrypted === true, ...(extras.inputAsset ? { asset: extras.inputAsset } : {}) }
             : await this.storedInput(rec.projectId, rec.job);
         output = extras.output ?? fromLibraryPath(library.root, rec.job.output);
+        // R400 (b): a line that would read outside the library or write outside its work folder
+        // (by real path) is settled as a missing input, before anything is sent.
+        if (input && output !== undefined && !(await this.placesAllowed(rec.projectId, { type: rec.job.type, input: input.path, ...(input.asset ? { inputAsset: input.asset } : {}), output }))) {
+          input = undefined;
+        }
       } catch (error) {
         out.push({ id: rec.id, projectId: rec.projectId, error }); // left pending, as it was
         continue;
@@ -428,6 +434,7 @@ export class WorkerClient {
       if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
       assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
       stored = await this.storedJob(projectId, job); // R379: no absolute path in the record
+      if (!(await this.placesAllowed(projectId, job))) throw new TypeError("a worker job may read only inside the library and write only into its work folder");
       if (op !== null) {
         // R367: an allow is audited here, once per run of the job: when it is first submitted, not
         // when a pending job is run again (after a restart, an unlock or an interrupt it is the
@@ -537,6 +544,8 @@ export class WorkerClient {
       // Publishing, the finish step and the `done` line are one guarded write (M8, M9): a closed
       // client starts none of them (the job stays pending), and `close()` waits for all of them.
       return await this.write(async () => {
+        // R400 (b): checked again just before publishing (a link planted while the job ran).
+        if (!(await outputInWork(root, job))) throw inputNotFound();
         const files = await publish(outDir, finalBase, dataKey);
         const meta = rewritePaths(state.result?.meta ?? {}, outDir, finalBase) as Record<string, unknown>;
         const result: JobResult = { id, type: job.type, output: job.output, files, meta, encrypted: dataKey !== null };
@@ -667,6 +676,20 @@ export class WorkerClient {
       params: job.params ?? {},
       ...(job.entity ? { entity: job.entity } : {}),
     };
+  }
+
+  /**
+   * R400 (b): where a job may read and write, by real path (links followed). Its input (not a
+   * capture's URL) lies inside the library's real root, or is the current file of the linked asset
+   * it names; its output lies in the library's own work folder (see `outputInWork`).
+   */
+  private async placesAllowed(projectId: string, job: Pick<WorkerJob, "type" | "input" | "inputAsset" | "output">): Promise<boolean> {
+    const root = repoLibrary(this.repo).root;
+    if (job.type !== "capture.download") {
+      const linked = job.inputAsset !== undefined && (await this.isLinkedFile(projectId, job.inputAsset, job.input));
+      if (!linked && !(await insideLibrary(job.input, { root }))) return false;
+    }
+    return outputInWork(root, job);
   }
 
   /** Whether `path` is the file the asset is linked to (by its absolute or its library-relative path). */
@@ -841,6 +864,19 @@ async function walkFiles(dir: string): Promise<string[]> {
 }
 
 /** Moves (or encrypts) every file under `from` to the same relative path under `to`. */
+/**
+ * R400 (b): whether a job's output lies in the library's own work folder: the folder its files are
+ * published into (the output for a folder output, else the output's parent) is, by real path, a
+ * folder below `<root>/.tmp` — not `.tmp` itself, and not through a link that leads elsewhere.
+ * Every caller's output is there (proxies, text recognition, transcriptions, captures).
+ */
+async function outputInWork(root: string, job: Pick<WorkerJob, "type" | "output">): Promise<boolean> {
+  const base = DIR_OUTPUTS.has(job.type) ? job.output : dirname(job.output);
+  const work = join(await libraryRealRoot(root), ".tmp");
+  const real = await realOrNearest(base);
+  return real !== work && insideFolder(work, real);
+}
+
 async function publish(from: string, to: string, dataKey: { key: Uint8Array; keyId: string } | null): Promise<string[]> {
   const written: string[] = [];
   for (const src of await walkFiles(from)) {

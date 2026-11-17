@@ -598,7 +598,7 @@ describe("N-5: a close stops the rerun of interrupted jobs", () => {
     await mkdir(dirname(input), { recursive: true });
     await writeFile(input, "png");
     for (let i = 0; i < 8; i++) {
-      await expect(down.submit(pid, { type: "image.proxy", input, output: join(tmp, "Lib", "test-files", "out", `${i}.jpg`), params: {} })).rejects.toBeInstanceOf(WorkerUnavailableError);
+      await expect(down.submit(pid, { type: "image.proxy", input, output: join(tmp, "Lib", ".tmp", "test-files", "out", `${i}.jpg`), params: {} })).rejects.toBeInstanceOf(WorkerUnavailableError);
     }
     await svc!.close();
     worker.postDelayMs = 300;
@@ -638,7 +638,7 @@ describe("N-5: a close stops the rerun of interrupted jobs", () => {
     const input = join(tmp, "Lib", "test-files", "a.png");
     await mkdir(dirname(input), { recursive: true });
     await writeFile(input, "png");
-    await expect(down.submit(pid, { type: "image.proxy", input, output: join(tmp, "Lib", "test-files", "out", "x.jpg"), params: {} })).rejects.toBeInstanceOf(WorkerUnavailableError);
+    await expect(down.submit(pid, { type: "image.proxy", input, output: join(tmp, "Lib", ".tmp", "test-files", "out", "x.jpg"), params: {} })).rejects.toBeInstanceOf(WorkerUnavailableError);
     await svc!.close();
     await start({ worker: provider(worker), autoStartWorker: true, closeGraceMs: 200 });
     expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).status).toBe(200);

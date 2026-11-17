@@ -2593,7 +2593,7 @@ describe("worker client and the index (Task 51)", () => {
       await mkdir(dirname(input), { recursive: true });
       await writeFile(input, "png");
       expect((await call({ method: "POST", url: "/libraries/rebuild-index" })).status).toBe(200);
-      const r = await client.submit(pid, { type: "image.proxy", input, output: join(root, "test-files", "out", "a.jpg"), params: {} });
+      const r = await client.submit(pid, { type: "image.proxy", input, output: join(root, ".tmp", "test-files", "out", "a.jpg"), params: {} });
       const db = svc.state.session!.index!.db;
       expect(db.prepare("SELECT status FROM jobs WHERE id = ?").get(r.id)).toEqual({ status: "done" });
     } finally {
@@ -2666,7 +2666,7 @@ describe("worker jobs rerun at an unlock (Task 51 N-2)", () => {
     const input = join(root, "test-files", "a.png");
     await mkdir(dirname(input), { recursive: true });
     await writeFile(input, "png");
-    const err = await client.submit(pid, { type: "image.proxy", input, output: join(root, "test-files", "out", "a.jpg"), params: {} }).catch((e: unknown) => e);
+    const err = await client.submit(pid, { type: "image.proxy", input, output: join(root, ".tmp", "test-files", "out", "a.jpg"), params: {} }).catch((e: unknown) => e);
     expect((err as Error).name).toBe("ProjectLockedError");
     const folder = (await call({ url: "/projects" })).json.projects.find((p: { id: string }) => p.id === pid).folder as string;
     const journalLines = async (libRoot: string) =>

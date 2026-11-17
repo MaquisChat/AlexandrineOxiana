@@ -80,8 +80,9 @@ beforeEach(async () => {
   tmp = await mkdtemp(join(tmpdir(), "ao-worker-client-"));
   ring = new KeyRing();
   lib = await createLibrary(join(tmp, "Lib"), "Lib", deps());
-  // Job inputs and outputs live inside the library (R379: the journal stores no absolute path).
-  files = join(lib.root, "test-files");
+  // Job inputs and outputs live in the library's work folder (R379: the journal stores no absolute
+  // path; R400 b: a job writes only below `.tmp`).
+  files = join(lib.root, ".tmp", "test-files");
   await mkdir(files, { recursive: true });
   repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester" });
   db = openIndex(lib.root);

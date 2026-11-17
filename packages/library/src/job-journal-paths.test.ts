@@ -6,7 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -410,4 +410,92 @@ describe("R400 (a): `ao transcribe` (link capture's transcribeSource) on a recor
       expect(records.map((x) => x.status)).toEqual(["done"]);
     });
   }
+});
+
+/** A pending line as this code writes it (library-relative paths), written by hand. */
+const relLine = (p: Project, input: string, output: string, extra: Partial<JobRecord> = {}): JobRecord => ({
+  v: 1,
+  id: randomUUID(),
+  projectId: p.id,
+  kind: "image.proxy",
+  status: "queued",
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  job: { type: "image.proxy", input, output, params: {} },
+  ...extra,
+});
+
+/** Resumes the project's jobs with a worker that would write any output; asserts each line failed once as a missing input and nothing was sent. */
+async function expectEachRefused(p: Project, recs: JobRecord[]): Promise<void> {
+  await appendJobRecords(lib.root, p.folder, null, recs);
+  const seen: StubJob[] = [];
+  const out = await clientOf(await okWorker(seen)).resumePending(p.id);
+  expect(seen).toEqual([]);
+  expect(out).toHaveLength(recs.length);
+  for (const o of out) {
+    expect(o.error).toBeInstanceOf(WorkerJobError);
+    expect(o.error).toMatchObject({ code: "INPUT_NOT_FOUND", message: "the input file does not exist" });
+    expect((o.error as Error).message).not.toContain("/");
+  }
+  const after = (await journalOf(p)).records;
+  expect(after.map((r) => [r.status, r.error, r.job])).toEqual(recs.map(() => ["failed", "INPUT_NOT_FOUND", undefined]));
+  // Not retried at the next launch.
+  expect(await clientOf(await okWorker(seen)).resumePending(p.id)).toEqual([]);
+  expect(seen).toEqual([]);
+}
+
+describe("R400 (b): a job reads only inside the library (by real path) and writes only into its work folder", () => {
+  it("stored outputs outside `.tmp` or through a link to outside, and an input through such a link, are refused; nothing is touched or written outside", async () => {
+    const p = await makeProject(false);
+    const sf = await withOriginal(p, "photo.png", "png");
+    const input = sf.assets[0]!.path;
+    const outside = join(tmp, "outside");
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "y.png"), "png");
+    await symlink(outside, join(lib.root, "escape"));
+    await mkdir(join(lib.root, ".tmp"), { recursive: true });
+    await symlink(outside, join(lib.root, ".tmp", "esc"));
+    const libraryJson = await readFile(join(lib.root, "library.json"));
+    await writeFile(join(lib.root, p.folder, "source-overwrite.json"), "keep");
+    await expectEachRefused(p, [
+      relLine(p, input, "library.json"),
+      relLine(p, input, `${p.folder}/source-overwrite.json`),
+      relLine(p, input, "escape/x.jpg"),
+      relLine(p, input, ".tmp/esc/x.jpg"),
+      relLine(p, "escape/y.png", ".tmp/worker-proxy-a/proxy.jpg"),
+    ]);
+    expect(await readFile(join(lib.root, "library.json"))).toEqual(libraryJson);
+    expect(await readFile(join(lib.root, p.folder, "source-overwrite.json"), "utf8")).toBe("keep");
+    expect((await readdir(outside)).sort()).toEqual(["y.png"]);
+  });
+
+  it("at submit: an output outside `.tmp`, or through a link to outside, and an input through such a link are refused (TypeError, no path); nothing recorded or sent", async () => {
+    const p = await makeProject(false);
+    const sf = await withOriginal(p, "photo.png", "png");
+    const input = join(lib.root, ...sf.assets[0]!.path.split("/"));
+    const outside = join(tmp, "outside");
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "y.png"), "png");
+    await symlink(outside, join(lib.root, "escape"));
+    await mkdir(join(lib.root, ".tmp"), { recursive: true });
+    await symlink(outside, join(lib.root, ".tmp", "esc"));
+    const seen: StubJob[] = [];
+    const c = clientOf(await okWorker(seen));
+    const cases = [
+      { input, output: join(lib.root, "library.json") },
+      { input, output: join(lib.root, p.folder, "x.json") },
+      { input, output: join(lib.root, "escape", "x.jpg") },
+      { input, output: join(lib.root, ".tmp", "esc", "x.jpg") },
+      { input, output: join(lib.root, ".tmp", "x.jpg") },
+      { input: join(lib.root, "escape", "y.png"), output: join(lib.root, ".tmp", "worker-proxy-b", "proxy.jpg") },
+    ];
+    for (const job of cases) {
+      const err = await c.submit(p.id, { type: "image.proxy", ...job, params: {} }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(TypeError);
+      expect((err as Error).message).not.toContain("/");
+    }
+    expect(seen).toEqual([]);
+    expect(existsSync(journalPath(lib.root, p.folder))).toBe(false);
+    expect((await readdir(outside)).sort()).toEqual(["y.png"]);
+  });
 });

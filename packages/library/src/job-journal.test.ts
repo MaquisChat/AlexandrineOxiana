@@ -105,8 +105,9 @@ beforeEach(async () => {
   tmp = await mkdtemp(join(tmpdir(), "ao-job-journal-"));
   ring = new KeyRing();
   lib = await createLibrary(join(tmp, "Lib"), "Lib", deps());
-  // Job inputs and outputs live inside the library (R379: the journal stores no absolute path).
-  files = join(lib.root, "test-files");
+  // Job inputs and outputs live in the library's work folder (R379: the journal stores no absolute
+  // path; R400 b: a job writes only below `.tmp`).
+  files = join(lib.root, ".tmp", "test-files");
   await mkdir(files, { recursive: true });
   handle = new IndexHandle(lib.root);
   repo = await mkRepo();
@@ -368,7 +369,7 @@ describe("upgrade of a library made before the journal", () => {
     await repo.unlockProject(enc.id, "pw");
     expect(getMeta(handle.db, "jobsLegacy")).toBeUndefined();
     const ej = await readJobJournal(lib.root, enc.folder, enc.id, projectDataKey(repo, enc.id));
-    expect(ej.records.get("e-running")).toMatchObject({ status: "running", job: { output: "test-files/e.jpg", params: { label: MARKER } } });
+    expect(ej.records.get("e-running")).toMatchObject({ status: "running", job: { output: ".tmp/test-files/e.jpg", params: { label: MARKER } } });
     expect(jobRows().map((r) => r.payload_json)).toEqual(["{}", "{}", "{}"]);
 
     await dropIndex();

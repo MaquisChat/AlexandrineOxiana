@@ -180,7 +180,7 @@ describe("WorkerClient.submit with a missing tool", () => {
     tmp = await mkdtemp(join(tmpdir(), "ao-worker-tools-"));
     ring = new KeyRing();
     lib = await createLibrary(join(tmp, "Lib"), "Lib", deps());
-    files = join(lib.root, "test-files"); // job paths inside the library (R379)
+    files = join(lib.root, ".tmp", "test-files"); // job paths in the library's work folder (R379, R400 b)
     await mkdir(files, { recursive: true });
     repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester" });
     db = openIndex(lib.root);
