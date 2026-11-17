@@ -25,3 +25,12 @@ describe("StepScan: room on the library's disk (R413 a)", () => {
     expect(screen.queryByText(/needs about/)).toBeNull();
   });
 });
+
+describe("StepScan: the size (R439 2)", () => {
+  it("names the size as that of the new files (only what the import would copy, R436 b)", () => {
+    show({ ...SUMMARY, totalBytes: 2 * 1024 * 1024 });
+    const p = screen.getByText(/Size of the new files/);
+    expect(p.textContent).toMatch(/^Size of the new files 2(\.0)? MB/u);
+    expect(screen.queryByText(/Total size/)).toBeNull();
+  });
+});

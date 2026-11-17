@@ -88,7 +88,7 @@ export function StepScan({ summary, sourceName, approvals, onApprovals, device }
         </div>
       </dl>
       <p>
-        Total size {size(summary.totalBytes)}
+        Size of the new files {size(summary.totalBytes)}
         {typeEntries(summary.byType).length > 0 && (
           <>
             {" · "}
