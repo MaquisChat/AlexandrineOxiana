@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PSEUDO_GOV, addSource, makeKit, makeProject, type Kit } from "../export/test-kit.js";
 import { encryptBytes } from "./io.js";
 import type { Tx } from "./mutate.js";
-import { assignCodes } from "./pseudonyms.js";
+import { assignCodes, creatorKey } from "./pseudonyms.js";
 import { projectDataKey, pseudonymCodeFor } from "./repo.js";
 import type { ProjectJson } from "./state.js";
 
@@ -103,5 +103,26 @@ describe("R427 (d): the guards of the strict identity key each have a test (M8 o
     expect(other.codes).toEqual(["P-002"]);
     expect(other.changed).toBe(true);
     expect(other.all).toHaveLength(2);
+  });
+});
+
+describe("R438: a handle is one identity with or without its '@'; a name is never a handle", () => {
+  const h = (handle: string): Creator => ({ role: "uploader", handle });
+
+  it("the handles 'fake.dancer', '@fake.dancer' and '@@fake.dancer ' are ONE participant with one map entry", () => {
+    const map = new Map<string, string>();
+    const r = codesFor([h("fake.dancer"), h("@fake.dancer"), h("@@fake.dancer ")], map, []);
+    expect(r.codes).toEqual(["P-001", "P-001", "P-001"]);
+    expect(r.all).toHaveLength(1);
+    expect([...map.keys()]).toEqual(["@fake.dancer"]);
+    expect(creatorKey({ role: "uploader", literal: "Fake Dancer", handle: "fake.dancer" })).toBe("@fake.dancer");
+  });
+
+  it("guards: a literal is never a handle ('Ana' and '@ana' are two people; the literal 'fake.dancer' is not the handle)", () => {
+    expect(creatorKey(by("fake.dancer"))).toBe("fake.dancer");
+    const map = new Map<string, string>();
+    const r = codesFor([h("@ana"), by("Ana"), h("ana")], map, []);
+    expect(r.codes).toEqual(["P-001", "P-002", "P-001"]);
+    expect(r.all).toHaveLength(2);
   });
 });

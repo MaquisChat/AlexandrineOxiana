@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import type { AuditEvent, SourceDraft, SourceFile } from "@ao/core";
+import { toCslItem, type AuditEvent, type SourceDraft, type SourceFile } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -605,6 +605,27 @@ describe("captureProfile", { timeout: 120_000 }, () => {
       expect(r.status).toBe("completed");
       expect(await codeOfProfileSource(p.id, r.profileSourceId!)).toEqual(["P-001"]);
       expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-P-001"]);
+      expect((await repo.getFieldwork(p.id)).participants).toHaveLength(1);
+    });
+
+    it("R438: the posts (handle without '@') and the profile's own source (with '@') are ONE participant; folder, collection, citation agree", async () => {
+      const p = await project(PSEUDO_GOV, true);
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+      expect(r.status).toBe("completed");
+      const fw = await repo.getFieldwork(p.id);
+      expect(fw.participants.map((x) => x.code)).toEqual(["P-001"]);
+      expect(await codeOfProfileSource(p.id, r.profileSourceId!)).toEqual(["P-001"]);
+      expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-P-001"]);
+      const post = await byPost(p.id, ttId(1));
+      expect(post.source.creators[0]!.handle).toBe("fake.dancer");
+      expect(post.source.participantIds).toEqual([fw.participants[0]!.id]);
+      expect(post.source.folder).toContain("P-001");
+      expect(post.source.folder.toLowerCase()).not.toContain("fake");
+      // The citation, with the project's pseudonym map as stored (this project withholds identifiable exports).
+      const stored = JSON.parse(await readMaybeEncrypted(join(lib.root, p.folder, "keys", "pseudonyms.json.enc"))) as { map: Record<string, string> };
+      expect(stored.map).toEqual({ "@fake.dancer": "P-001" });
+      const item = toCslItem(post, { citationLanguage: "en", translatedTitles: "off", script: "original", pseudonyms: new Map(Object.entries(stored.map)) });
+      expect(item.author).toEqual([{ literal: "P-001" }]);
     });
   });
 

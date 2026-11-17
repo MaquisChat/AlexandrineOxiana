@@ -28,9 +28,17 @@ export async function savePseudonyms(tx: Tx, map: Map<string, string>): Promise<
   await tx.writeFile(relOf(tx.state), JSON.stringify(body), { encrypt: true, mode: 0o600 });
 }
 
-/** The identifying string for a creator: handle, else literal, else "given family". */
+/**
+ * The identifying string for a creator, under which it is looked up and recorded: its handle, else
+ * its literal, else "given family". A handle is one identity with or without its "@" (R438): the
+ * key is the handle with exactly one "@" in front ("fake.dancer", "@fake.dancer", "@@fake.dancer "
+ * are one account). A name is never a handle: the literal "Maria" stays "Maria", another person
+ * than "@maria" (R403 b). No fallback to an entry recorded earlier from a handle without its "@".
+ */
 export function creatorKey(c: Creator): string | undefined {
-  const k = c.handle?.trim() || c.literal?.trim() || [c.given, c.family].filter(Boolean).join(" ").trim();
+  const handle = c.handle?.trim().replace(/^@+/u, "").trim();
+  if (handle) return `@${handle}`.normalize("NFC");
+  const k = c.literal?.trim() || [c.given, c.family].filter(Boolean).join(" ").trim();
   return k ? k.normalize("NFC") : undefined;
 }
 
