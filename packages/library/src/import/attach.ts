@@ -4,6 +4,8 @@
  * (never moved or deleted), encrypted at rest in encrypted projects by the repository's asset APIs.
  *
  * Per dropped path:
+ *   0. a path whose real path lies inside the open library's own folder → `failed`, IN_LIBRARY_TEXT.file, before
+ *      anything is read (R362 c; a found file held for the researcher's check comes in only through the review queue);
  *   1. a folder → `failed`, "Use Bulk Import for folders" (Task 23 handles folders);
  *   2. the type is sniffed from the content with `file-type` (the extension is never trusted);
  *      only PDF, EPUB, MOBI/AZW, DOCX, images, audio and video are accepted;
@@ -46,7 +48,9 @@ import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
-import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectCollectionsAndTags, type Repo } from "../repo/repo.js";
+import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectCollectionsAndTags, repoLibrary, type Repo } from "../repo/repo.js";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { insideLibrary } from "../fs/inside-library.js";
 import type { CreateInTx } from "../repo/sources.js";
 import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
 import { pendingFor, proxyQueueFor, proxyTypeFor, type ProxyPlan, type ProxyQueue } from "./proxies.js";
@@ -366,6 +370,12 @@ export function createAttach(deps: AttachDeps): Attach {
   async function attachOne(projectId: string, path: string, opts: AttachOpts, s: Session, freshKeys = false): Promise<AttachOutcome> {
     const toSourceId = opts.toSourceId;
     if (freshKeys) s.refreshKeys();
+    // R362 c (defect D27): nothing inside the library's own folder (by real path) is attached — not a project's file,
+    // not a found file held for the researcher's check (it comes in only through "Use this file"). Before anything is
+    // read. A watched folder (`readable` given) is not asked here: its folder is refused when it is inside the library
+    // or holds it, and a link in it to anywhere else is refused, both by real path (watch.ts); and every call it makes
+    // on its folder goes through that folder's one gate, which a call made here would bypass.
+    if (!deps.readable && (await insideLibrary(path, repoLibrary(repo)))) return failed(path, IN_LIBRARY_TEXT.file);
     const st = await fsp.stat(path).catch(() => null);
     if (!st) return failed(path, REASONS.missing);
     if (st.isDirectory()) return failed(path, FOLDER_REASON);

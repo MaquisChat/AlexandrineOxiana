@@ -36,7 +36,7 @@ import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
 // Test seam of the library (same module instance as @ao/library's): makes overwriting a file fail.
 import { shredSeams } from "../../../packages/library/src/fs/shred.js";
 import * as authModule from "./auth.js";
-import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
+import { CREDENTIAL_QUERY_KEYS, IN_LIBRARY_TEXT } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
 // The library as it is, with the destruction retry observable: a test can tell whether the service
@@ -543,6 +543,29 @@ describe("appearance, fieldwork, import", () => {
     expect(undo.status, undo.body).toBe(200);
     expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(0);
     expect((await call({ method: "POST", url: `/projects/${pid}/import/dry-run`, body: { adapter: { kind: "nonsense" } } })).status).toBe(400);
+  });
+
+  it("R362 c: a file inside the library is not attached, a folder inside it (or holding it) is not imported — said in plain words", async () => {
+    const lib = await openNewLibrary();
+    const pid = await newProject();
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } });
+    const sid = att.json.items[0].sourceId as string;
+    const stored = (await svc.state.session!.repo.getSource(pid, sid)).assets.find((a) => a.role === "original")!.path;
+    const inside = join(lib, stored);
+    const other = await fixturePdf("other.pdf", "Another Paper on Deltas");
+    const again = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [other, inside], toSourceId: sid } });
+    expect(again.status, again.body).toBe(200);
+    expect(again.json.items).toEqual([
+      { path: other, outcome: "attached", sourceId: sid },
+      { path: inside, outcome: "failed", reason: IN_LIBRARY_TEXT.file },
+    ]);
+    for (const path of [lib, join(lib, "Projects"), tmp]) {
+      for (const url of [`/projects/${pid}/import/dry-run`, `/projects/${pid}/import`]) {
+        const r = await call({ method: "POST", url, body: { adapter: { kind: "folder", path }, options: {} } });
+        expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message: IN_LIBRARY_TEXT.folder }]);
+      }
+    }
+    expect((await call({ url: `/projects/${pid}/imports` })).json).toEqual({ batches: [] });
   });
 });
 

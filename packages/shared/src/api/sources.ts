@@ -102,3 +102,15 @@ export interface JobsRetryResponse {
 
 // Refusals confirming a field and rechecking a source name: the project's rules (403 POLICY_DENIED),
 // a locked project (423).
+
+/**
+ * R362 c (defect D27): a file or folder inside the open library's own folder (by real path, links followed) is never
+ * attached or imported, as watched folders already refuse such a folder (R310 h). The file's sentence is the attach
+ * route's outcome for that file (and an import's note for a file of an item that leads into the library); the folder's
+ * is the folder import's refusal (dry run, start and resume). A found file waiting for the researcher's check lives
+ * there too, so it comes in only through "Use this file" in the review queue.
+ */
+export const IN_LIBRARY_TEXT = {
+  file: "That file is inside this library's own folder. Files already in the library cannot be attached again.",
+  folder: "That folder is inside this library's own folder, or holds it. Choose a folder outside the library.",
+} as const;

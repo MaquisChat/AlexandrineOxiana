@@ -139,6 +139,8 @@ import {
 import { BatchDedupe } from "./dedupe.js";
 import { applyMerge, missingFields, type MarkRecord, type MergeRecord } from "./merge.js";
 import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./outside.js";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { insideFolder, libraryRealRoot, overlapsLibrary, realOrNearest } from "../../fs/inside-library.js";
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
@@ -160,7 +162,24 @@ export const ENGINE_FILE_NOTES = {
    * (retention; the asset entry says so): it is not downloaded and not brought back.
    */
   removedHere: "an attached file you removed here was not brought in again",
+  /** R362 c: a file whose real path is inside this library's own folder (outside this batch's work folder). */
+  inLibrary: "attached file is inside this library's own folder and was not imported",
 } as const;
+
+/** Kinds whose source is a folder the researcher chose (R362 c): never the library's own folder, inside it or holding it. */
+const FOLDER_KINDS: ReadonlySet<string> = new Set(["folder", "device", "calibre"]);
+
+/** R362 c: a folder import (dry run, start, resume) of a folder inside the library, or holding it, by real path; before anything else. */
+async function refuseLibraryFolder(repo: Repo, adapter: ImportSourceAdapter): Promise<void> {
+  if (!FOLDER_KINDS.has(adapter.kind)) return;
+  if (await overlapsLibrary(await realOrNearest(adapter.location), repoLibrary(repo))) throw new BatchRefusedError(IN_LIBRARY_TEXT.folder);
+}
+
+/** R362 c: a test of a file's real path — inside the library's own folder and not in the batch's own work folder `work`. */
+async function libraryFileTest(repo: Repo, work: string): Promise<(real: string) => boolean> {
+  const [root, own] = await Promise.all([libraryRealRoot(repoLibrary(repo).root), realOrNearest(work)]);
+  return (real) => insideFolder(root, real) && !insideFolder(own, real);
+}
 
 /** The run's note on files removed here and not brought back (Z4), counted over the batch's lines. */
 const removedNote = (n: number) => (n === 1 ? "An attached file you removed here was not brought in again." : `${n} attached files you removed here were not brought in again.`);
@@ -548,6 +567,8 @@ class Run {
   private fileNotes = new Map<string, string[]>();
   /** Files outside the adapter's roots need approval (R67); undefined when the adapter declares no roots. */
   private outside: OutsidePolicy | undefined;
+  /** R362 c: whether a real path is inside the library's own folder (and not in this run's work folder). */
+  private inLibrary: (real: string) => boolean = () => false;
   /** Real path of each file attached in this run → the item it went to (a second item gets a note). */
   private fileOwners = new Map<string, string>();
   private readonly workName: string;
@@ -755,6 +776,7 @@ class Run {
         this.rec.secret,
         this.rec.outsideApprovals ?? [],
       );
+      this.inLibrary = await libraryFileTest(this.repo, join(repoLibrary(this.repo).root, ".tmp", this.workName));
       if (this.adapter.incremental) {
         this.known = await knownVersions(this.repo, this.projectId, this.rec.source.kind, this.marks);
         await this.refreshDeleted();
@@ -1211,6 +1233,11 @@ class Run {
       // From here on the file is read through its checked real path (R70 I-2).
       const checked = this.outside ? await this.outside.check(f.path) : { real: await fsp.realpath(f.path).catch(() => resolve(f.path)), ok: true };
       const real = checked.real;
+      // R362 c: never a file of the library's own folder, whatever was approved (before it is read).
+      if (this.inLibrary(real)) {
+        out.dropped.push({ note: ENGINE_FILE_NOTES.inLibrary, reason: IN_LIBRARY_TEXT.file });
+        continue;
+      }
       if (!checked.ok) {
         out.dropped.push({ note: OUTSIDE_NOTE, reason: OUTSIDE_REASON });
         continue;
@@ -1448,7 +1475,7 @@ class Run {
     for (const f of inputs) {
       const r = await fsp.realpath(f.path).catch(() => null);
       const st = r === f.path ? await fsp.lstat(f.path).catch(() => null) : null;
-      if (st?.isFile() && (!this.outside || (await this.outside.check(f.path)).ok)) kept.push(f);
+      if (st?.isFile() && r !== null && !this.inLibrary(r) && (!this.outside || (await this.outside.check(f.path)).ok)) kept.push(f);
       else changed++;
     }
     if (!changed) return { inputs, fail: false };
@@ -2225,6 +2252,7 @@ export async function startBatch(
   const id = newId();
   active.add(id);
   try {
+    await refuseLibraryFolder(deps.repo, adapter);
     const { approveOutside, ...options } = acceptOptions(input);
     const governance = await preflight(deps.repo, projectId, adapter.kind, options);
     await preflightDeleted(deps.repo, projectId, adapter, options);
@@ -2293,6 +2321,7 @@ export async function resumeBatch(deps: BulkImportDeps, projectId: string, batch
     if (rec.source.kind === "profile-capture") throw new BatchRefusedError("Profile captures are resumed by capturing the profile again.");
     const source = adapter ?? adapterFor(rec.source.kind, rec.source.location, rec.adapterOptions);
     if (!source) throw new BatchRefusedError("The source of this import is needed to resume it.");
+    await refuseLibraryFolder(deps.repo, source);
     const governance = await preflight(deps.repo, projectId, rec.source.kind, rec.options);
     await preflightDeleted(deps.repo, projectId, source, rec.options);
     if (rec.fieldwork) {
@@ -2394,6 +2423,7 @@ export async function dryRun(
 ): Promise<ScanSummary> {
   const repo = deps.repo;
   repo.getProject(projectId);
+  await refuseLibraryFolder(repo, adapter);
   await dryRunPolicy(repo, projectId, adapter.kind);
   const dedupe = new BatchDedupe(deps.index.db, projectId, (id) => hasSource(repo, projectId, id));
   const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [], notes: [], outsideFiles: [], linkedFiles: 0 };
@@ -2421,6 +2451,7 @@ export async function dryRun(
     // The approvals the batch would be given count here too (kept in memory only, under a throwaway secret).
     const secret = randomBytes(32).toString("hex");
     const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))], secret, await approvalHashes(secret, opts.approveOutside));
+    const inLibrary = await libraryFileTest(repo, dir);
     for await (const scanned of scan) {
       let item = scanned;
       if (item.gone) continue; // gone at its source: nothing to import
@@ -2428,6 +2459,19 @@ export async function dryRun(
       if (item.unreadable) {
         summary.unreadable.push({ path: item.key, reason: item.unreadable });
         continue;
+      }
+      // R362 c: a file inside the library's own folder is left out whatever is approved, as the batch will (not read).
+      if (item.files.length) {
+        const kept: ScanItem["files"] = [];
+        for (const x of item.files) if (!inLibrary(await realOrNearest(x.path))) kept.push(x);
+        if (kept.length < item.files.length) {
+          if (!item.referenceMetadata && !kept.length) {
+            summary.unreadable.push({ path: item.key, reason: IN_LIBRARY_TEXT.file });
+            continue;
+          }
+          if (!summary.notes.includes(IN_LIBRARY_TEXT.file)) summary.notes.push(IN_LIBRARY_TEXT.file);
+          item = { ...item, files: kept };
+        }
       }
       summary.linkedFiles += item.files.filter((x) => x.link === true).length;
       if (policy && item.files.length) {
