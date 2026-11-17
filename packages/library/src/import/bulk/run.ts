@@ -140,7 +140,7 @@ import { BatchDedupe } from "./dedupe.js";
 import { applyMerge, missingFields, type MarkRecord, type MergeRecord } from "./merge.js";
 import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./outside.js";
 import { IN_LIBRARY_TEXT } from "@ao/shared";
-import { insideFolder, insideLibrary, libraryRealRoot, overlapsLibrary, realOrNearest } from "../../fs/inside-library.js";
+import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRealRoot, onFolderPath, realOrNearest } from "../../fs/inside-library.js";
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
@@ -184,7 +184,7 @@ const ZOTERO_LIBRARY_SUFFIX = /#library=\d{1,9}$/u;
 async function refuseLibrarySource(repo: Repo, adapter: ImportSourceAdapter): Promise<void> {
   if (FOLDER_KINDS.has(adapter.kind)) {
     const dir = adapter.kind === "zotero-local" ? adapter.location.replace(ZOTERO_LIBRARY_SUFFIX, "") : adapter.location;
-    if (await overlapsLibrary(await realOrNearest(dir), repoLibrary(repo))) throw new BatchRefusedError(IN_LIBRARY_TEXT.folder);
+    if (await importOverlapsLibrary(await realOrNearest(dir), repoLibrary(repo))) throw new BatchRefusedError(IN_LIBRARY_TEXT.folder);
   } else if (FILE_KINDS.has(adapter.kind)) {
     if (await insideLibrary(adapter.location, repoLibrary(repo))) throw new BatchRefusedError(IN_LIBRARY_TEXT.importFile);
   }
@@ -197,7 +197,7 @@ async function refuseLibrarySource(repo: Repo, adapter: ImportSourceAdapter): Pr
 const WORK_KINDS: ReadonlySet<string> = new Set(["zip", "folder", "zotero-web"]);
 
 /** R362 c, R368 a: whether a file (as the adapter gave it, and its real path) is one of the library's own. */
-type LibraryFileTest = (file: { path: string; link?: boolean }, real: string) => boolean;
+type LibraryFileTest = (file: { path: string; link?: boolean }, real: string) => Promise<boolean>;
 
 /**
  * R362 c: a test of a file's real path — inside the library's own folder. The batch's own work folder `work` is exempt
@@ -207,11 +207,12 @@ type LibraryFileTest = (file: { path: string; link?: boolean }, real: string) =>
  * folder is the library's like any other.
  */
 async function libraryFileTest(repo: Repo, work: string, kind: string): Promise<LibraryFileTest> {
-  const [root, own] = await Promise.all([libraryRealRoot(repoLibrary(repo).root), realOrNearest(work)]);
+  const [root, rootId, own] = await Promise.all([libraryRealRoot(repoLibrary(repo).root), folderId(repoLibrary(repo).root), realOrNearest(work)]);
   const ownAsWritten = resolve(work);
   const written = (f: { path: string; link?: boolean }, real: string) =>
     WORK_KINDS.has(kind) && f.link !== true && (insideFolder(ownAsWritten, resolve(f.path)) || insideFolder(own, resolve(f.path))) && insideFolder(own, real);
-  return (f, real) => insideFolder(root, real) && !written(f, real);
+  // By name, or by device and inode (a folder on the real path is the library's folder; R368 d).
+  return async (f, real) => !written(f, real) && (insideFolder(root, real) || (await onFolderPath(real, rootId)));
 }
 
 /** The run's note on files removed here and not brought back (Z4), counted over the batch's lines. */
@@ -601,7 +602,7 @@ class Run {
   /** Files outside the adapter's roots need approval (R67); undefined when the adapter declares no roots. */
   private outside: OutsidePolicy | undefined;
   /** R362 c: whether a real path is inside the library's own folder (and not in this run's work folder). */
-  private inLibrary: LibraryFileTest = () => false;
+  private inLibrary: LibraryFileTest = async () => false;
   /** Real path of each file attached in this run → the item it went to (a second item gets a note). */
   private fileOwners = new Map<string, string>();
   private readonly workName: string;
@@ -1267,7 +1268,7 @@ class Run {
       const checked = this.outside ? await this.outside.check(f.path) : { real: await fsp.realpath(f.path).catch(() => resolve(f.path)), ok: true };
       const real = checked.real;
       // R362 c: never a file of the library's own folder, whatever was approved (before it is read).
-      if (this.inLibrary(f, real)) {
+      if (await this.inLibrary(f, real)) {
         out.dropped.push({ note: ENGINE_FILE_NOTES.inLibrary, reason: IN_LIBRARY_TEXT.file });
         continue;
       }
@@ -1508,7 +1509,7 @@ class Run {
     for (const f of inputs) {
       const r = await fsp.realpath(f.path).catch(() => null);
       const st = r === f.path ? await fsp.lstat(f.path).catch(() => null) : null;
-      if (st?.isFile() && r !== null && !this.inLibrary({ path: f.path }, r) && (!this.outside || (await this.outside.check(f.path)).ok)) kept.push(f);
+      if (st?.isFile() && r !== null && !(await this.inLibrary({ path: f.path }, r)) && (!this.outside || (await this.outside.check(f.path)).ok)) kept.push(f);
       else changed++;
     }
     if (!changed) return { inputs, fail: false };
@@ -2496,7 +2497,7 @@ export async function dryRun(
       // R362 c: a file inside the library's own folder is left out whatever is approved, as the batch will (not read).
       if (item.files.length) {
         const kept: ScanItem["files"] = [];
-        for (const x of item.files) if (!inLibrary(x, await realOrNearest(x.path))) kept.push(x);
+        for (const x of item.files) if (!(await inLibrary(x, await realOrNearest(x.path)))) kept.push(x);
         if (kept.length < item.files.length) {
           if (!item.referenceMetadata && !kept.length) {
             summary.unreadable.push({ path: item.key, reason: IN_LIBRARY_TEXT.file });

@@ -5,7 +5,7 @@
  * before anything is read or written. A found file waiting in `find/held/` comes in only through "Use this file".
  */
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, stat as fsStat, symlink, unlink, writeFile } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { newId, type Project } from "@ao/core";
 import { IN_LIBRARY_TEXT } from "@ao/shared";
@@ -22,6 +22,7 @@ import { IndexHandle } from "../index/db.js";
 import { HttpClient } from "../lookup/index.js";
 import { holdMismatchedFile, readReviewEntries, type HeldFileFacts } from "../repo/review.js";
 import type { RepoCore } from "../repo/state.js";
+import * as insideLib from "../fs/inside-library.js";
 import { insideFolder } from "../fs/inside-library.js";
 import { createAttach } from "./attach.js";
 import { BatchRefusedError, createBulkImport, folderAdapter, zipAdapter, type BulkImport, type ImportSourceAdapter } from "./bulk/index.js";
@@ -505,5 +506,47 @@ describe("the attach checks the real path once and reads through it (R368 c)", (
     expect(JSON.stringify(sf)).not.toContain("zz-decoy-123");
     // The held file's review entry is still waiting (the new source may have its own entry for review).
     expect((await snapshot(w)).pending).toContain(w.reviewId);
+  });
+});
+
+describe("the library's folder by device and inode (R368 d)", () => {
+  // A second spelling of the library (a bind mount, macOS's /System/Volumes/Data/…, a case-insensitive volume on
+  // Linux) cannot be made in a test here: a fake stat gives a folder the library's device and inode instead.
+  const fns = insideLib as unknown as Record<string, (...a: unknown[]) => Promise<boolean>>;
+  const statWith = (alias: string, libRoot: string, failing: string[] = []) => async (p: string) => {
+    if (failing.includes(p)) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+    const st = await fsStat(p === alias ? libRoot : p, { bigint: true });
+    return { dev: st.dev, ino: st.ino };
+  };
+
+  it("a path whose folder is the library's folder by device and inode is inside, whatever its name", async () => {
+    const alias = join(kit.tmp, "Mounted", "Library-again");
+    await mkdir(join(alias, "Projects"), { recursive: true });
+    const p = join(alias, "Projects", "x.pdf");
+    const stat = statWith(alias, kit.lib.root);
+    expect(insideFolder(kit.lib.root, p)).toBe(false);
+    expect(await fns.realInsideLibrary!(p, { root: kit.lib.root }, stat)).toBe(true);
+    expect(await fns.insideLibrary!(p, { root: kit.lib.root }, stat)).toBe(true);
+    // An import's own folder by that spelling: inside it, or holding it.
+    expect(await fns.importOverlapsLibrary!(alias, { root: kit.lib.root }, stat)).toBe(true);
+    expect(await fns.importOverlapsLibrary!(join(alias, "Projects"), { root: kit.lib.root }, stat)).toBe(true);
+  });
+
+  it("a folder elsewhere is not; a stat that fails on a folder on the way is 'not that folder', never an error", async () => {
+    const other = join(kit.tmp, "Other", "deep");
+    await mkdir(other, { recursive: true });
+    const p = join(other, "x.pdf");
+    const stat = statWith("/nowhere", kit.lib.root, [other, join(kit.tmp, "Other")]);
+    expect(await fns.realInsideLibrary!(p, { root: kit.lib.root }, stat)).toBe(false);
+    expect(await fns.importOverlapsLibrary!(other, { root: kit.lib.root }, stat)).toBe(false);
+    // The walk stops at the root and asks each folder once.
+    const asked: string[] = [];
+    await fns.onFolderPath!(p, { dev: 0n, ino: 0n }, async (q: string) => {
+      asked.push(q);
+      return { dev: 1n, ino: 1n };
+    });
+    expect(asked[0]).toBe(p);
+    expect(asked.at(-1)).toBe("/");
+    expect(new Set(asked).size).toBe(asked.length);
   });
 });

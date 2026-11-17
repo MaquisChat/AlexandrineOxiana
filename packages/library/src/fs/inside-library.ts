@@ -4,6 +4,20 @@
  * (`find/held/`), the backups, the index and the caches. Compared by REAL path (links followed; a path that does not
  * exist yet by its nearest existing parent), so a link outside the library that leads into it, a path written with
  * `..`, or (on macOS and Windows, whose disks usually ignore letter case) the same path in another case, is inside.
+ *
+ * Two uses (R368 d):
+ * - The attach, the imports, the consent form's and the protocol document's drop (`realInsideLibrary`, `insideLibrary`,
+ *   `importOverlapsLibrary`) also ask the disk: a path is inside when any existing folder on its real path, from the path
+ *   up to the root, IS the library's folder by device and inode. That sees a second spelling of the same folder that no
+ *   comparison of names can: a mount or bind mount of the library, macOS's `/System/Volumes/Data/…` (a firmlink, which
+ *   realpath does not rewrite), a case-insensitive volume on Linux. A few stats per path (a path has few ancestors); a
+ *   stat that fails is "not that folder", never an error.
+ * - Watched folders (`overlapsLibrary`, watch.ts) compare names only: every call they make on their folder goes through
+ *   that folder's one gate (R208 d), so this module adds no file-system call to their check.
+ *
+ * Limit: a HARD link to a library file, made outside the library, is a second name of the same file, not of a folder:
+ * no check of paths can see it (the file's own inode would have to be compared with every file in the library). Nothing
+ * in the app makes one.
  */
 import * as fsp from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
@@ -56,7 +70,38 @@ export function insideFolder(folder: string, p: string, platform: NodeJS.Platfor
 /** The library's own folder as a real path. */
 export const libraryRealRoot = (root: string): Promise<string> => fsp.realpath(root).catch(() => resolve(root));
 
-/** Whether `dir` (a real path) is the library, inside it, or holds it. */
+/** A folder's identity on disk. */
+export interface FolderId {
+  dev: bigint;
+  ino: bigint;
+}
+/** Device and inode of a path (links followed); rejects when the path cannot be stat'ed. */
+export type StatId = (p: string) => Promise<FolderId>;
+const statId: StatId = (p) => fsp.stat(p, { bigint: true });
+
+/** The library's folder by device and inode, or null when it cannot be stat'ed. */
+export const folderId = (dir: string, stat: StatId = statId): Promise<FolderId | null> =>
+  stat(dir).then(
+    (st) => ({ dev: st.dev, ino: st.ino }),
+    () => null,
+  );
+
+/**
+ * Whether any existing folder on `real` (the path itself, then each parent up to the root) is the folder `id`, by
+ * device and inode. Bounded by the path's depth; a stat that fails on one of them counts as "not that folder".
+ */
+export async function onFolderPath(real: string, id: FolderId | null, stat: StatId = statId): Promise<boolean> {
+  if (!id) return false;
+  for (let cur = resolve(real); ; ) {
+    const st = await stat(cur).catch(() => null);
+    if (st && st.dev === id.dev && st.ino === id.ino) return true;
+    const parent = dirname(cur);
+    if (parent === cur) return false;
+    cur = parent;
+  }
+}
+
+/** Whether `dir` (a real path) is the library, inside it, or holds it — by name only (watched folders, R208 d). */
 export async function overlapsLibrary(dir: string, lib: { root: string }): Promise<boolean> {
   const root = await libraryRealRoot(lib.root);
   return insideFolder(root, dir) || insideFolder(dir, root);
@@ -67,11 +112,22 @@ export async function overlapsLibrary(dir: string, lib: { root: string }): Promi
  * and then reads it (the attach, R368 c): it resolves the real path ONCE, checks that, and reads through it, so a link
  * re-pointed after the check changes nothing.
  */
-export async function realInsideLibrary(real: string, lib: { root: string }): Promise<boolean> {
-  return insideFolder(await libraryRealRoot(lib.root), real);
+export async function realInsideLibrary(real: string, lib: { root: string }, stat: StatId = statId): Promise<boolean> {
+  if (insideFolder(await libraryRealRoot(lib.root), real)) return true;
+  return onFolderPath(real, await folderId(lib.root, stat), stat);
 }
 
 /** Whether `path`'s real path (links followed; a path not there yet, by its nearest existing parent) is inside the library. */
-export async function insideLibrary(path: string, lib: { root: string }): Promise<boolean> {
-  return realInsideLibrary(await realOrNearest(path), lib);
+export async function insideLibrary(path: string, lib: { root: string }, stat: StatId = statId): Promise<boolean> {
+  return realInsideLibrary(await realOrNearest(path), lib, stat);
+}
+
+/**
+ * An import's own folder (R362 c, R368 d): `dir` (a real path) is the library, inside it or holds it — by name, or by
+ * device and inode (a folder on `dir`'s path is the library's folder, or a folder on the library's path is `dir`).
+ */
+export async function importOverlapsLibrary(dir: string, lib: { root: string }, stat: StatId = statId): Promise<boolean> {
+  const root = await libraryRealRoot(lib.root);
+  if (insideFolder(root, dir) || insideFolder(dir, root)) return true;
+  return (await onFolderPath(dir, await folderId(lib.root, stat), stat)) || (await onFolderPath(root, await folderId(dir, stat), stat));
 }
