@@ -20,6 +20,11 @@
  *   Hangul, the rest of the run taken for a particle or honorific and kept ("김민수의" → "P-001의");
  *   for a name of several words, on its last word. Never in the middle or at the end of a run
  *   ("박김민수": a compound or another name, kept); a one-syllable name only as a run of its own.
+ * - A lone given or family name (R88, R387 c): in citations it is used alone only from two
+ *   characters in a no-space script, two syllables in Hangul, four letters otherwise ("Li" alone is
+ *   kept, so ordinary words are not blanked). Folder names have the stricter rule: a lone name of
+ *   any length is replaced there, as before (the folder stays on disk in the clear and errs toward
+ *   the code). That is the one ruled difference between the two.
  * - Limit: inflected forms in Latin script ("Marian", "Marias") are not matched (FR-657).
  * Platform-neutral: no node: imports.
  */
@@ -98,8 +103,9 @@ export function nameForms(name: string, code: string, bare = false): NameForm[] 
 
 export interface ScrubOptions {
   /**
-   * A bare single-word form shorter than this is not used ("Li" alone is kept, "Rose Li" is not).
-   * 0 uses every form.
+   * R88's floor (citations): a bare single-word form in a script written with spaces shorter than
+   * this is not used ("Li" alone is kept, "Rose Li" is not); a no-space-script one needs two
+   * characters, a Hangul one two syllables. 0 (folder names) uses every form.
    */
   bareMinLength?: number;
   /** Split a run of letters and digits where letters meet digits (addresses: "lucia2024"). */
@@ -242,6 +248,18 @@ interface Index {
   maxPrefix: number;
 }
 
+/**
+ * R88's floor for a lone given or family name, by script (R387 c): two characters in a script
+ * written without spaces ("小明", "太郎"), two syllables in Hangul ("민수"), else `min` letters
+ * ("Rose"; "Li" alone is kept).
+ */
+function standsAlone(w: string, min: number): boolean {
+  const cps = [...w];
+  if (cps.some(isNoSpace)) return cps.length >= 2;
+  if (ALL_HANGUL.test(w)) return syllables(w) >= 2;
+  return cps.length >= min;
+}
+
 /** Every form's pattern (its units), indexed by first unit, longest first. */
 function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
   const min = opts.bareMinLength ?? 0;
@@ -274,7 +292,7 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
   for (const f of forms) {
     const ws = f.words.filter(Boolean);
     if (ws.length === 0) continue;
-    if (f.bare && ws.length === 1 && [...ws[0]!].length < min) continue;
+    if (min > 0 && f.bare && !f.variant && ws.length === 1 && !standsAlone(ws[0]!, min)) continue;
     add(ws, f.code);
   }
   for (const list of index.values()) list.sort((a, b) => b.units.length - a.units.length);

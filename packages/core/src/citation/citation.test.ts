@@ -839,3 +839,28 @@ describe("R387 (b): one function makes a name's forms (I1 of the FR-A10 review)"
     expect(title("山田太郎さん", new Map([["太郎 山田", "P-003"]]))).toBe("P-003さん");
   });
 });
+
+describe("R387 (c): R88's floor for a lone name, measured by script (I2 of the FR-A10 review)", () => {
+  const cite = (t: string, creator: Creator, key: string, code: string) =>
+    toCslItem(source("interview", mt(["und", "original", t]), [{ role: "interviewee", ...creator }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: new Map([[key, code]]) });
+
+  it("a lone given name of two or more characters in a no-space script is replaced, as in the folder name", () => {
+    expect(cite("小明的故事", { family: "王", given: "小明" }, "王小明", "P-001").title).toBe("P-001的故事");
+    expect(cite("王老师和小明", { family: "王", given: "小明" }, "王小明", "P-001").title).toBe("王老师和P-001");
+    expect(cite("太郎の話", { family: "山田", given: "太郎" }, "山田太郎", "P-002").title).toBe("P-002の話");
+  });
+
+  it("a one-character Han family name alone is still not matched, inside a run or alone", () => {
+    expect(cite("王老师的课", { family: "王", given: "小明" }, "王小明", "P-001").title).toBe("王老师的课");
+  });
+
+  it("a Hangul name alone counts from two syllables", () => {
+    expect(cite("민수의 이야기", { family: "김", given: "민수" }, "김 민수", "P-004").title).toBe("P-004의 이야기");
+    expect(cite("민 이야기", { family: "박", given: "민" }, "박 민", "P-005").title).toBe("민 이야기");
+  });
+
+  it("Latin script keeps four letters: 'Li family history' is kept in the citation (as ruled)", () => {
+    expect(cite("Li family history", { family: "Li", given: "Rose" }, "Rose Li", "P-003").title).toBe("Li family history");
+    expect(cite("Rose Li family history", { family: "Li", given: "Rose" }, "Rose Li", "P-003").title).toBe("P-003 family history");
+  });
+});

@@ -528,3 +528,20 @@ describe("R387 (b): one function makes a name's forms, for folder names and cita
     expect(pseudonymize("山田太郎さん", new Map([["太郎 山田", "P-003"]]))).toBe("P-003さん");
   });
 });
+
+describe("R387 (c): the folder replaces a lone given or family name of any length (as before FR-A10)", () => {
+  // The map as sources.ts builds it for a creator: the pseudonym map, then each name form → code.
+  const creatorMap = (key: string, code: string, given: string, family: string) =>
+    new Map([[key, code], [family, code], [given, code], [`${given} ${family}`, code]]);
+
+  it("a Han or kana given name alone is replaced; a one-character family name is not taken inside a run", () => {
+    const wang = creatorMap("王小明", "P-001", "小明", "王");
+    expect(pseudonymize("小明的故事", wang)).toBe("P-001的故事");
+    expect(pseudonymize("王老师和小明", wang)).toBe("王老师和P-001");
+    expect(pseudonymize("太郎の話", creatorMap("山田太郎", "P-002", "太郎", "山田"))).toBe("P-002の話");
+  });
+
+  it("a short Latin name alone is replaced in the folder (the citation keeps it: R88's floor)", () => {
+    expect(pseudonymize("Li family history", creatorMap("Rose Li", "P-003", "Rose", "Li"))).toBe("P-003 family history");
+  });
+});

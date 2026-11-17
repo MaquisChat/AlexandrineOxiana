@@ -185,7 +185,8 @@ function codeFor(c: Creator, keys: ReadonlyMap<string, string>): string | undefi
  * (participant-names.ts: folded case, accents and width; whole words, or inside a run of a script
  * written without spaces; longer forms first). A bare given or family name of fewer than 4 letters
  * is replaced only together with the other part of the name ("Li" alone is kept, "Rose Li" and
- * "Li, Rose" are not): replacing every short name everywhere would blank common words. Longer bare
+ * "Li, Rose" are not): replacing every short name everywhere would blank common words. In a script
+ * written without spaces the floor is 2 characters, in Hangul 2 syllables (R387 c). Longer bare
  * names are always replaced, even where the word means something else ("Rose gardens"):
  * over-scrubbing a title is the fail-safe side (R88).
  */
