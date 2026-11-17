@@ -1134,6 +1134,8 @@ function AddDialog({ d, collections, live, onStart, onChooseAgain, onCancel }: {
 function DownloadDialog({ d, live, said, onConfirm, onCancel }: { d: Extract<Dialog, { kind: "download" }>; live: WatchedFolderSummary | undefined; said: Said; onConfirm: () => void; onCancel: () => void }) {
   const id = useId();
   const cancel = useRef<HTMLButtonElement>(null);
+  // First focus on the heading (R376 c): a held or repeated Enter on the opener must not agree to the download.
+  const heading = useRef<HTMLHeadingElement>(null);
   // Nothing of a known size is left to agree to (a 409 said so): only Cancel stays (M5).
   const nothing = d.bytes === 0;
   // The numbers agreed to here are the ones in the title; a change since is said, never slipped in.
@@ -1142,8 +1144,10 @@ function DownloadDialog({ d, live, said, onConfirm, onCancel }: { d: Extract<Dia
     if (nothing) cancel.current?.focus();
   }, [nothing]);
   return (
-    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog">
-      <h2 id={`${id}-t`}>{downloadTitle(d.files, d.bytes)}</h2>
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={d.busy} className="ao-watch__dialog" initialFocus={heading}>
+      <h2 id={`${id}-t`} ref={heading} tabIndex={-1}>
+        {downloadTitle(d.files, d.bytes)}
+      </h2>
       <p id={`${id}-d`}>
         Folder: <UserText>{d.label}</UserText>
       </p>

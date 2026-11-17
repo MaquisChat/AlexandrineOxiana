@@ -783,6 +783,8 @@ describe("WatchedFolders", () => {
     dialog = await screen.findByRole("dialog");
     const go = within(dialog).getByRole("button", { name: "Download and import" });
     const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    expect(document.activeElement).toBe(within(dialog).getByRole("heading", { level: 2 })); // R376 c: the heading, not the confirming button
+    await user.tab();
     expect(document.activeElement).toBe(go);
     await user.tab();
     expect(document.activeElement).toBe(cancel);
@@ -859,6 +861,35 @@ describe("WatchedFolders", () => {
       await user.keyboard("{Enter}");
       await waitFor(() => expect(screen.queryByRole("region", { name: "Fieldwork scans" })).toBeNull());
       expect(deletes).toHaveLength(1);
+    });
+
+    it("Download and import: a held or doubled key after it opens leaves it open on the heading; Tab then Enter agrees once; Shift+Tab reaches Cancel; Escape returns to the opener", async () => {
+      useService([folder({ counts: { notDownloaded: 2, notDownloadedBytes: 5000 } })]);
+      const user = userEvent.setup();
+      const { patches } = bodiesOf();
+      show();
+      const c = await screen.findByRole("region", { name: "Fieldwork scans" });
+      const opener = within(c).getByRole("radio", { name: "Download and import them" });
+      opener.focus();
+      await user.keyboard("[Space]");
+      const dialog = await screen.findByRole("dialog", { name: DL_TITLE });
+      await user.keyboard("{Enter>4}{/Enter}{Enter}");
+      expect(screen.getByRole("dialog", { name: DL_TITLE })).toBe(dialog);
+      expect(patches).toHaveLength(0);
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: DL_TITLE }));
+      await user.tab({ shift: true });
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" }));
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(document.activeElement).toBe(opener);
+      expect(patches).toHaveLength(0);
+      await user.click(opener);
+      await screen.findByRole("dialog", { name: DL_TITLE });
+      await user.tab();
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Download and import" }));
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(patches).toHaveLength(1);
     });
   });
 
@@ -1093,6 +1124,7 @@ describe("WatchedFolders", () => {
     );
     const dialog = await screen.findByRole("dialog", { name: "Download 3 files (3 MB) to this Mac and import them? They stay downloaded afterwards." });
     const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    await user.tab(); // the heading has focus on open (R376 c): the first Tab reaches the confirming button
     await user.tab();
     expect(document.activeElement).toBe(cancel);
     for (let i = 1; i <= 5; i++) {
