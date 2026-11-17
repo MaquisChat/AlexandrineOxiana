@@ -6,7 +6,10 @@
  *   sources.bib        BibTeX of the same (read back exactly by bibtexAdapter)
  *   notes.txt          what was left out and why (only when something was)
  *   Sources/<source folder name>/
- *     source.json      the source as stored (metadata, provenance, annotations …), decrypted
+ *     source.json      the source as stored (metadata, provenance, annotations …), decrypted; a file linked in
+ *                      place is recorded without where it is on the computer (R379, FR-A14): no `linked` paths,
+ *                      `linkedInPlace: true`, and `path` its place in this export (`files/<name>`), or its
+ *                      name alone when it is not in the export (see notes.txt)
  *     <name>.md        Markdown: metadata, annotations, notes — all user text escaped
  *     files/           the original files, decrypted
  *     files/derived/   derived text (transcripts, OCR, translations), decrypted, listed in the Markdown
@@ -87,6 +90,23 @@ function isDerivedText(a: Asset): boolean {
   if (a.kind === "proxy" || a.kind === "thumbnail") return false;
   const m = a.mime.toLowerCase();
   return m.startsWith("text/") || /\.(?:txt|vtt|srt|md|json)(?:\.enc)?$/iu.test(a.path);
+}
+
+/**
+ * The source record as exported (R379, FR-A14): a file linked in place loses its `linked` paths (its absolute path, and
+ * a library-relative one that may climb out with ".."), is marked `linkedInPlace`, and its `path` becomes its place in
+ * this export, or its (exported) name alone when it is not in it. The library's own record is not changed.
+ */
+function exportedRecord(sf: SourceFile, exportedAs: ReadonlyMap<string, string>, nameOf: (n: string) => string): unknown {
+  if (!sf.assets.some((a) => a.linked)) return sf;
+  return {
+    ...sf,
+    assets: sf.assets.map((a) => {
+      if (!a.linked) return a;
+      const { linked: _linked, ...rest } = a;
+      return { ...rest, path: exportedAs.get(a.id) ?? nameOf(a.path.slice(a.path.lastIndexOf("/") + 1)), linkedInPlace: true };
+    }),
+  };
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -376,9 +396,11 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
           ...(a.encrypted ? { decode: (r) => r.pipe(decryptStream(getKey)) } : {}),
         });
         if (!sub) written.push(fileName);
+        exportedAs.set(a.id, sub ? `files/${sub}/${fileName}` : `files/${fileName}`);
         filesWritten++;
         return fileName;
       };
+      const exportedAs = new Map<string, string>();
       const takenDerived = new Set<string>();
       const derivedOut: Array<{ file: string; kind: string; lang?: string }> = [];
       for (const a of sf.assets) {
@@ -426,7 +448,7 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
         const lang = typeof a.derivation?.params.lang === "string" ? a.derivation.params.lang : undefined;
         derivedOut.push({ file, kind: a.kind, ...(lang ? { lang } : {}) });
       }
-      await writeFileAtomic(join(dir, "source.json"), `${JSON.stringify(sf, null, 2)}\n`, { mode: 0o600 });
+      await writeFileAtomic(join(dir, "source.json"), `${JSON.stringify(exportedRecord(sf, exportedAs, nameOf), null, 2)}\n`, { mode: 0o600 });
       await writeFileAtomic(join(dir, `${name}.md`), markdownOf(sf, written, derivedOut), { mode: 0o600 });
     }
 
