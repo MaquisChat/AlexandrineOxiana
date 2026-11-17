@@ -116,4 +116,6 @@ export const IN_LIBRARY_TEXT = {
   file: "That file is inside this library's own folder. Files already in the library cannot be attached again.",
   folder: "That folder is inside this library's own folder, or holds it. Choose a folder outside the library.",
   importFile: "That file is inside this library's own folder. Choose a file outside the library.",
+  /** R379 (FR-A14): a reference export's destination (BibTeX, RIS, CSL-JSON) is never written inside the library. */
+  exportFile: "That place is inside this library's own folder. Choose a place outside the library.",
 } as const;

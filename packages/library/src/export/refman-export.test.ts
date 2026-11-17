@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -6,12 +6,13 @@ import { BIBLIO_FIELDS, biblioOf, type Biblio, type BiblioField, type Creator, t
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
-import { PolicyDeniedError } from "../repo/errors.js";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { InvalidInputError, PolicyDeniedError } from "../repo/errors.js";
 import type { Repo } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import type { ImportSourceAdapter, ScanItem } from "../import/bulk/scan.js";
 import { bibtexAdapter, cslJsonAdapter, parseBibtexEntries, risAdapter } from "../import/refman.js";
-import { DEIDENTIFIED_NOTE, escapeBibtex, exportRefman, risLine, writeRefmanExport, type RefmanFormat } from "./refman-export.js";
+import { DEIDENTIFIED_NOTE, EXPORT_FILE_IS_FOLDER, EXPORT_FILE_IS_LINK, escapeBibtex, exportRefman, risLine, writeRefmanExport, type RefmanFormat } from "./refman-export.js";
 
 const FAST = 2 ** 10;
 let tmp: string;
@@ -388,5 +389,100 @@ describe("governance", () => {
     const keys = (await readBack("bibtex", r.text)).map((i) => i.referenceMetadata?.citationKey);
     expect(new Set(keys).size).toBe(2);
     expect(r.notes.join(" ")).toMatch(/citation key/u);
+  });
+});
+
+describe("R379 (FR-A14, I1): the destination is never inside the library", () => {
+  const auditOf = async (p: Project) =>
+    (await Promise.all((await readdir(join(lib.root, p.folder, "audit"))).map((f) => readFile(join(lib.root, p.folder, "audit", f), "utf8")))).join("");
+
+  async function withOriginal(): Promise<{ p: Project; id: string; original: string }> {
+    const p = await project();
+    const pdf = join(tmp, "in", "paper.pdf");
+    await mkdir(join(tmp, "in"), { recursive: true });
+    await writeFile(pdf, "%PDF-1.4 the original");
+    const draft: SourceDraft = {
+      projectIds: [p.id],
+      type: "article-journal",
+      title: mt("A paper"),
+      creators: [{ family: "Smith", given: "Ann", role: "author" }],
+      identifiers: {},
+      citationKey: "smith2020paper",
+      caseAttributes: {},
+      availability: { status: "available" },
+      collectionIds: [],
+      tagIds: [],
+      participantIds: [],
+    };
+    const provenance: Provenance = {
+      captureMethod: "manual_upload",
+      capturedAt: new Date().toISOString(),
+      tool: { name: "test", version: "1" },
+      fileHashes: {},
+      legal: { status: "public", basis: "test basis" },
+      identifiable: false,
+    };
+    const sf = await repo.createSource(p.id, draft, [{ path: pdf, role: "original", handling: "copy" }], { provenance });
+    const asset = sf.assets.find((a) => a.role === "original")!;
+    return { p, id: sf.source.id, original: join(lib.root, ...asset.path.split("/")) };
+  }
+
+  const refusedInside = async (p: Project, id: string, out: string) => {
+    const before = await auditOf(p);
+    await expect(writeRefmanExport(repo, p.id, [id], "bibtex", out)).rejects.toThrow(new InvalidInputError(IN_LIBRARY_TEXT.exportFile));
+    const after = await auditOf(p);
+    expect(after).toBe(before);
+    expect(after).not.toContain('"action":"export.refman"');
+  };
+
+  it("the reviewer's probe: an original's own path and the rules file are refused, both byte-identical afterwards, nothing audited", async () => {
+    const { p, id, original } = await withOriginal();
+    const gov = join(lib.root, p.folder, "governance.yaml");
+    const [origBytes, govBytes] = [await readFile(original), await readFile(gov)];
+    for (const format of ["bibtex", "ris", "csl-json"] as const) {
+      await expect(writeRefmanExport(repo, p.id, [id], format, original)).rejects.toThrow(IN_LIBRARY_TEXT.exportFile);
+      await expect(writeRefmanExport(repo, p.id, [id], format, gov)).rejects.toThrow(IN_LIBRARY_TEXT.exportFile);
+    }
+    await refusedInside(p, id, original);
+    await refusedInside(p, id, gov);
+    expect(await readFile(original)).toEqual(origBytes);
+    expect(await readFile(gov)).toEqual(govBytes);
+  });
+
+  it("a link outside the library that leads into it, a path written with '..', and a new file in a new folder under the library are refused", async () => {
+    const { p, id } = await withOriginal();
+    await symlink(lib.root, join(tmp, "to-lib"));
+    await refusedInside(p, id, join(tmp, "to-lib", "refs.bib"));
+    await expect(stat(join(lib.root, "refs.bib"))).rejects.toThrow();
+    await symlink(join(lib.root, p.folder, "governance.yaml"), join(tmp, "gov-link.bib"));
+    await refusedInside(p, id, join(tmp, "gov-link.bib"));
+    await mkdir(join(tmp, "elsewhere"));
+    await refusedInside(p, id, `${join(tmp, "elsewhere")}/../Lib/refs.bib`);
+    await expect(stat(join(lib.root, "refs.bib"))).rejects.toThrow();
+    await refusedInside(p, id, join(lib.root, "new-folder", "deeper", "refs.bib"));
+    await expect(stat(join(lib.root, "new-folder"))).rejects.toThrow();
+  });
+
+  it("an existing folder or a symbolic link as the destination is refused in plain words; nothing is written", async () => {
+    const { p, id } = await withOriginal();
+    const folder = join(tmp, "a-folder");
+    await mkdir(folder);
+    await expect(writeRefmanExport(repo, p.id, [id], "ris", folder)).rejects.toThrow(new InvalidInputError(EXPORT_FILE_IS_FOLDER));
+    expect(await readdir(folder)).toEqual([]);
+    const target = join(tmp, "target.ris");
+    await writeFile(target, "keep me");
+    await symlink(target, join(tmp, "link.ris"));
+    await expect(writeRefmanExport(repo, p.id, [id], "ris", join(tmp, "link.ris"))).rejects.toThrow(new InvalidInputError(EXPORT_FILE_IS_LINK));
+    expect(await readFile(target, "utf8")).toBe("keep me");
+    expect((await lstat(join(tmp, "link.ris"))).isSymbolicLink()).toBe(true);
+    expect(await auditOf(p)).not.toContain('"action":"export.refman"');
+  });
+
+  it("a destination outside the library is written as before", async () => {
+    const { p, id } = await withOriginal();
+    const out = join(tmp, "outside.bib");
+    const r = await writeRefmanExport(repo, p.id, [id], "bibtex", out);
+    expect(r.exported).toBe(1);
+    expect(await readFile(out, "utf8")).toContain("@article{smith2020paper,");
   });
 });

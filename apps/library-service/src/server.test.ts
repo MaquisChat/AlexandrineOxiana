@@ -361,6 +361,22 @@ describe("governance, audit, citations", () => {
     expect(rm.status, rm.body).toBe(200);
     expect(rm.json.text).toContain("@");
   });
+
+  it("R379 (FR-A14): POST /export/refman refuses an outputPath inside the library (400, the sentence); the rules file is unchanged", async () => {
+    const libPath = await openNewLibrary();
+    const pid = await newProject();
+    const sid = (await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } })).json.items[0].sourceId;
+    const gov = join(libPath, "Projects", "Study", "governance.yaml");
+    const before = await readFile(gov);
+    const r = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: gov } });
+    expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message: IN_LIBRARY_TEXT.exportFile }]);
+    expect(await readFile(gov)).toEqual(before);
+    const rel = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: "refs.ris" } });
+    expect(rel.status).toBe(400);
+    const ok = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: join(tmp, "refs.ris") } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(await readFile(join(tmp, "refs.ris"), "utf8")).toContain("TY  - ");
+  });
 });
 
 describe("capture", () => {

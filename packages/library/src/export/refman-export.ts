@@ -25,12 +25,19 @@
  * hasLocation:false}})` (no files or locations are exported). A deny refuses the whole export
  * (PolicyDeniedError, audited, nothing written); `deidentified-only` leaves identifiable sources
  * out with a note. One `export.refman` audit event records the format and counts (never the path).
- * `writeRefmanExport` writes the file atomically (0600) to the path the user chose.
+ * `writeRefmanExport` writes the file atomically (0600) to the path the user chose — never inside the open library's
+ * own folder (R379, FR-A14: by real path, links followed, a path not there yet by its nearest existing parent; an
+ * original, the rules file or any other library file is never replaced by an export), never over a folder or a
+ * symbolic link. A refused destination is an invalid input: nothing is evaluated, written or audited.
  */
 import type { Biblio, Creator, Source, SourceType } from "@ao/core";
 import { biblioOf, primary } from "@ao/core";
+import { lstat } from "node:fs/promises";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { writeFileAtomic } from "../fs/atomic.js";
-import { appendLibraryEvent, authorizeProcessing, projectCollectionsAndTags, type Repo } from "../repo/repo.js";
+import { insideLibrary } from "../fs/inside-library.js";
+import { InvalidInputError } from "../repo/errors.js";
+import { appendLibraryEvent, authorizeProcessing, projectCollectionsAndTags, repoLibrary, type Repo } from "../repo/repo.js";
 
 export type RefmanFormat = "bibtex" | "ris" | "csl-json";
 export const REFMAN_FORMATS: readonly RefmanFormat[] = ["bibtex", "ris", "csl-json"];
@@ -46,6 +53,11 @@ export interface RefmanExportResult {
   excluded: Array<{ sourceId: string; reason: string }>;
   notes: string[];
 }
+
+/** The destination is an existing folder (R379, FR-A14). */
+export const EXPORT_FILE_IS_FOLDER = "That place is a folder. Give the name of the file to write.";
+/** The destination is a symbolic link: an export never writes through one, nor replaces it (R379, FR-A14). */
+export const EXPORT_FILE_IS_LINK = "That place is a link to another file. Give the name of a file to write, not a link.";
 
 export const DEIDENTIFIED_NOTE = "This project allows only de-identified exports, and this source holds identifiable data.";
 
@@ -374,7 +386,21 @@ function suffix(n: number): string {
   }
 }
 
-/** exportRefman, then the text written atomically (0600) to `outputPath`. Nothing is written when the export is refused. */
+/**
+ * Refuses a destination inside the open library's own folder (by real path; the check the imports and the open-format
+ * export use, R362 c, R92 I1), an existing folder and a symbolic link (R379, FR-A14). InvalidInputError, path-free.
+ */
+async function checkDestination(repo: Repo, outputPath: string): Promise<void> {
+  if (await insideLibrary(outputPath, repoLibrary(repo))) throw new InvalidInputError(IN_LIBRARY_TEXT.exportFile);
+  const st = await lstat(outputPath).catch(() => null);
+  if (st?.isSymbolicLink()) throw new InvalidInputError(EXPORT_FILE_IS_LINK);
+  if (st?.isDirectory()) throw new InvalidInputError(EXPORT_FILE_IS_FOLDER);
+}
+
+/**
+ * exportRefman, then the text written atomically (0600) to `outputPath`. Nothing is written when the export or the
+ * destination is refused (the destination is checked first, so a refused one is not even evaluated).
+ */
 export async function writeRefmanExport(
   repo: Repo,
   projectId: string,
@@ -383,6 +409,7 @@ export async function writeRefmanExport(
   outputPath: string,
   opts: RefmanExportOptions = {},
 ): Promise<RefmanExportResult> {
+  await checkDestination(repo, outputPath);
   const r = await buildExport(repo, projectId, sourceIds, format, opts);
   await writeFileAtomic(outputPath, r.text, { mode: 0o600 });
   // Audited once the file exists: a failed write is not an export.
