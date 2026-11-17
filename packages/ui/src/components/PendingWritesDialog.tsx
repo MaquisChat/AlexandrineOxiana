@@ -64,12 +64,14 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
   const [acknowledged, setAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
   const yes = useRef<HTMLButtonElement>(null);
-  const ack = useRef<HTMLInputElement>(null);
+  const question = useRef<HTMLSpanElement>(null);
   const id = useId();
   const needsAck = unsure(pw);
+  // First focus on the question (R376 c), never on the control that decides: a held or repeated Enter
+  // on "Roll it back" / "Keep it" must not answer it. Tab goes on to the acknowledgement or "Yes".
   useEffect(() => {
-    if (confirm) (needsAck ? ack.current : yes.current)?.focus();
-  }, [confirm, needsAck]);
+    if (confirm) question.current?.focus();
+  }, [confirm]);
   // A reloaded list may no longer allow the choice being confirmed: drop the confirmation.
   useEffect(() => {
     if (confirm && !allowed(pw, confirm)) setConfirm(null);
@@ -112,10 +114,10 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
         )}
         {confirm && (
           <div className="ao-inline-form">
-            <span className={needsAck ? "ao-error" : undefined}>{needsAck ? UNSURE_CONFIRM[confirm] : CONFIRM[confirm].ask}</span>
+            <span ref={question} tabIndex={-1} className={needsAck ? "ao-error" : undefined}>{needsAck ? UNSURE_CONFIRM[confirm] : CONFIRM[confirm].ask}</span>
             {needsAck && (
               <label htmlFor={`${id}-ack`}>
-                <input ref={ack} id={`${id}-ack`} type="checkbox" checked={acknowledged} disabled={busy} onChange={(e) => setAcknowledged(e.target.checked)} /> I understand
+                <input id={`${id}-ack`} type="checkbox" checked={acknowledged} disabled={busy} onChange={(e) => setAcknowledged(e.target.checked)} /> I understand
                 that this may undo or keep a change the app cannot confirm
               </label>
             )}
