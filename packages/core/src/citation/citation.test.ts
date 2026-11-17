@@ -864,7 +864,7 @@ describe("R403 (a): an invisible character is both nothing and a boundary (C1 of
 describe("R403 (c): a part of a name stands for the name only when it could be a name by itself (I2, M1 of the FR-A10 second review)", () => {
   const story = (t: string) => source("article-journal", mt(["es", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]);
   const title = (t: string, map: ReadonlyMap<string, string>) => toCslItem(story(t), { ...OPTS, pseudonyms: map }).title;
-  const own = (t: string, c: Creator, key: string) =>
+  const own = (t: string, c: Omit<Creator, "role">, key: string) =>
     toCslItem(source("interview", mt(["es", "original", t]), [{ ...c, role: "interviewee" }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: new Map([[key, "P-001"]]) }).title;
 
   it("runs of a map entry: only those with two words that stand alone", () => {
