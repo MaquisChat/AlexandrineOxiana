@@ -126,3 +126,12 @@ describe("R438: a handle is one identity with or without its '@'; a name is neve
     expect(r.all).toHaveLength(2);
   });
 });
+
+describe("R440 (c): a full-width at-sign in front of a handle is read as '@'", () => {
+  it("the handles '@x.dancer' and '\uFF20x.dancer' are ONE participant", () => {
+    const h = (handle: string): Creator => ({ role: "uploader", handle });
+    const r = codesFor([h("@x.dancer"), h("\uFF20x.dancer")], new Map(), []);
+    expect(r.codes).toEqual(["P-001", "P-001"]);
+    expect(r.all).toHaveLength(1);
+  });
+});
