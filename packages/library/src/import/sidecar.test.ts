@@ -73,6 +73,17 @@ describe("parseBibtex", () => {
     expect(performance.now() - t0).toBeLessThan(1000);
   });
 
+  describe("R374 b: free text after an entry", () => {
+    it("notes and section headers between entries give no doubt; the remains of an entry closed early do", () => {
+      const m = parseBibtex("@article{a, title={One}, year={2020}}\n\n==== Chapter 2 ====\nSome notes the exporter wrote here.\n\n@book{b, title={Two}, year={2021}}\n");
+      expect(m).toMatchObject({ title: "One", issued: "2020" });
+      expect(m.doubt).toBeUndefined();
+      expect(parseBibtex("@article{a, title={One}}\nSorted by year, descending. ==== 2020 ====\n").doubt).toBeUndefined();
+      expect(parseBibtex('@article{a, title="a } c", year=2020}\n').doubt).toBe(BIB_DOUBTS.textAfter);
+      expect(parseBibtex('@article{a, title="a } c",\ndoi = {10.1/x}}\n').doubt).toBe(BIB_DOUBTS.textAfter);
+    });
+  });
+
   describe("R362 g: a line beginning with @ inside a field's value (the same rule as the export reader)", () => {
     const later = "  doi = {10.5555/ao.thread.2021},\n  year = {2021}\n}\n";
     it("belongs to the value when the entry closes properly after it, in braces and in quotes: later fields kept, no doubt", () => {

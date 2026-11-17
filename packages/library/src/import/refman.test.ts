@@ -27,7 +27,7 @@ import { approvedFolders, rememberApprovedFolders } from "./approved-folders.js"
 import { adapterFor, createBulkImport, folderAdapter, zipAdapter, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
 import { reportLabel } from "./bulk/report.js";
 import { CALIBRE_FILE_NOTE, CALIBRE_REASONS, MAX_CALIBRE_DB_BYTES, calibreAdapter, copyCalibreDb } from "./calibre.js";
-import { BIB_DOUBTS } from "./bib-blocks.js";
+import { BIB_DOUBTS, BibBlocks } from "./bib-blocks.js";
 import { ITEM_REASONS } from "./common.js";
 import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_EXPORT_RECORDS, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, exportIdentity, parseBibtexEntries, risAdapter } from "./refman.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
@@ -1599,6 +1599,77 @@ describe("R362 g: a line beginning with @ inside a field's value", () => {
       const items = await collect(bibtexAdapter(join(exp, "sample.bib")));
       expect(items).toHaveLength(4);
       expect(items.map((i) => i.doubts)).toEqual([undefined, undefined, undefined, undefined]);
+    });
+  });
+
+  describe("R374 b: free text between entries is not a doubt; the remains of an entry's fields are", () => {
+    /** The doubt the scanner gives the first entry of `src` (its "{" is the first one). */
+    const scanDoubt = (src: string) => {
+      const b = new BibBlocks(src).block(src.indexOf("{"));
+      return b.state === "closed" && b.textAfter ? BIB_DOUBTS.textAfter : undefined;
+    };
+    const NOTES = "@article{a, title={One}, year={2020}}\n\n==== Chapter 2 ====\nSome notes the exporter wrote here.\n\n@book{b, title={Two}, year={2021}}\n";
+
+    it("section headers and notes between entries give no doubt, through both readers", async () => {
+      const es = entries(NOTES);
+      expect(es.map((x) => x.key)).toEqual(["a", "b"]);
+      expect(es.map((x) => x.doubt)).toEqual([undefined, undefined]);
+      expect(es[0]!.fields.get("year")).toBe("2020");
+      expect(es[1]!.fields.get("year")).toBe("2021");
+      const items = await collect(bibtexAdapter(await writeExport("notes.bib", NOTES)));
+      expect(items).toHaveLength(2);
+      expect(items.map((i) => i.doubts)).toEqual([undefined, undefined]);
+    });
+
+    it("a prose line with a comma and an equals sign in the middle is not an assignment", () => {
+      const src = "@article{a, title={One}}\nSorted by year, descending. ==== 2020 ====\n@book{b, title={Two}}\n";
+      expect(entries(src).map((x) => x.doubt)).toEqual([undefined, undefined]);
+      expect(scanDoubt(src)).toBeUndefined();
+    });
+
+    it("the remains of an entry closed early are a doubt, through both readers", async () => {
+      const src = '@article{a, title="a } c", year=2020}\n@book{n, title={Next}}\n';
+      expect(scanDoubt(src)).toBe(BIB_DOUBTS.textAfter);
+      expect(entries(src)[0]!.doubt).toBe(BIB_DOUBTS.textAfter);
+      const items = await collect(bibtexAdapter(await writeExport("early.bib", src)));
+      expect(items[0]!.doubts).toEqual([BIB_DOUBTS.textAfter]);
+    });
+
+    it("remains over two lines, remains ending with a comma, and remains ending with a brace after text are doubts", () => {
+      expect(scanDoubt('@article{a, title="a } c",\ndoi = {10.1/x}}\n')).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt('@article{a, title="a } c",\n')).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt('@article{a, title="a } c",')).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt("@article{a, title={A}}\nmore text}\n@book{b}")).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt("@article{a, title={A}} doi = 10\n")).toBe(BIB_DOUBTS.textAfter);
+      expect(scanDoubt('@article{a, title={A}} x = "y"\n')).toBe(BIB_DOUBTS.textAfter);
+    });
+
+    it("an extra brace alone, comments, blank lines and a trailing comment give none", () => {
+      expect(scanDoubt("@article{a, title={A}}\n}\n@book{b}")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}}}  \n  }\n")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}}\n% a comment, with = {braces}\n  % another, = {x}\n@book{b}")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}}\n\n   \n\n@book{b}")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}} % note, = {x}\n@book{b}")).toBeUndefined();
+      expect(scanDoubt("@article{a, title={A}} % note")).toBeUndefined();
+    });
+
+    it("a 2 MB line of prose after an entry is read in well under a second", () => {
+      for (const line of ["word ".repeat(400_000), "= ".repeat(1_000_000), "a ".repeat(1_000_000) + "=", "}".repeat(2_000_000), "x}".repeat(1_000_000)]) {
+        const src = `@article{a, title={A}}\n${line}\n@book{b}`;
+        const t = performance.now();
+        scanDoubt(src);
+        expect(performance.now() - t).toBeLessThan(1000);
+      }
+    });
+  });
+
+  describe("R374 c: a block resolved inside another open block is forgotten", () => {
+    it("a one-entry text with many closed pasted blocks in its value is one closed entry, not refused, with a small bound", () => {
+      const src = `@article{k, note={\n${"@a{p,}\n".repeat(100)}}, year={2020}}\n`;
+      const open = src.indexOf("{");
+      const r = new BibBlocks(src, 10).block(open);
+      expect(r.state).toBe("closed");
+      expect(r.end).toBe(src.length - 1);
     });
   });
 

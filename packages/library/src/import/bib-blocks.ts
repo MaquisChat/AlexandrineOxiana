@@ -16,7 +16,7 @@
  *     runs to the end of the text.
  *
  * A record so cut, or left unclosed at the end, carries a doubt (BIB_DOUBTS); so does one closed with
- * stray text after its closing brace (R366 e), and one closed around a block line inside a value.
+ * text after its closing brace that looks like the remains of its fields (R366 e, R374 b), and one closed around a block line inside a value.
  *
  * Linear: one forward scan shared by the reader's queries (they come in increasing order); a block
  * the scan passed inside another is scanned on its own if asked for (bounded by its extent), and all
@@ -88,18 +88,63 @@ export function bibDoubt(b: Pick<BibBlock, "state" | "innerEntry" | "textAfter">
   return b.textAfter ? BIB_DOUBTS.textAfter : b.innerEntry ? BIB_DOUBTS.innerEntry : undefined;
 }
 
+/** A character of a field name after its first letter. */
+function isNameChar(c: string | undefined): boolean {
+  return c !== undefined && (isLetter(c) || (c >= "0" && c <= "9") || c === "_" || c === ":" || c === "." || c === "+" || c === "-");
+}
+
+/** Whether `src[a, e)` (one stretch of a line, outside any `%` comment) looks like the remains of an entry's fields (R374 b). */
+function looksLikeFields(src: string, a: number, e: number): boolean {
+  let s = a;
+  while (s < e && isSpace(src[s])) s++;
+  let t = e;
+  while (t > s && isSpace(src[t - 1])) t--;
+  if (t === s) return false;
+  // (ii) ends with ","
+  if (src[t - 1] === ",") return true;
+  // (iii) ends with "}" after other text on the line
+  if (src[t - 1] === "}") {
+    for (let k = s; k < t; k++) if (src[k] !== "}" && !isSpace(src[k])) return true;
+  }
+  // (i) a field assignment: a name, optional white space, "=", optional white space, then "{", a quote, a letter or a digit
+  for (let k = s; k < t; k++) {
+    if (src[k] !== "=") continue;
+    let j = k + 1;
+    while (j < t && isSpace(src[j])) j++;
+    const v = src[j];
+    if (j >= t || !(v === "{" || v === '"' || isLetter(v) || (v! >= "0" && v! <= "9"))) continue;
+    j = k - 1;
+    while (j >= s && isSpace(src[j])) j--;
+    let letter = false;
+    while (j >= s && isNameChar(src[j])) {
+      if (isLetter(src[j])) letter = true;
+      j--;
+    }
+    if (letter) return true;
+  }
+  return false;
+}
+
 /**
- * Whether text that belongs to no block follows a block closed at `end`, before the next "@" (or the
- * end): anything but white space, "}" (an extra closing brace) and `%` comments (to the end of the line).
+ * Whether text that looks like the remains of the entry's fields follows a block closed at `end`,
+ * before the next "@" (or the end) (R374 b): outside `%` comments (to the end of the line), a line that
+ * holds a field assignment ("name = {", "name = 2020"), ends with "," or ends with "}" after other
+ * text. Free text between entries (notes, section headers) and extra closing braces are not a doubt.
+ * One pass; each line is scanned a constant number of times.
  */
 function textAfter(src: string, end: number): boolean {
-  for (let k = end; k < src.length; k++) {
-    const c = src[k];
-    if (c === "@") return false;
-    if (c === "%") {
-      while (k < src.length && src[k] !== "\n" && src[k] !== "\r" && src[k] !== "@") k++;
-      if (src[k] === "@") return false;
-    } else if (c !== "}" && !isSpace(c)) return true;
+  const n = src.length;
+  let k = end;
+  while (k < n) {
+    let e = k;
+    while (e < n && src[e] !== "\n" && src[e] !== "\r" && src[e] !== "%" && src[e] !== "@") e++;
+    if (looksLikeFields(src, k, e)) return true;
+    if (src[e] === "@") return false;
+    if (src[e] === "%") {
+      while (e < n && src[e] !== "\n" && src[e] !== "\r" && src[e] !== "@") e++;
+      if (src[e] === "@") return false;
+    }
+    k = e + 1;
   }
   return false;
 }
