@@ -190,6 +190,20 @@ describe("reading a sealed reason back", () => {
   });
 });
 
+describe("a backup of an encrypted project, restored", () => {
+  it("keeps the sealed reasons: re-sealed under the new project id, read back against the audit log copied as it was", async () => {
+    const { backupProject, restoreBackup } = await import("../export/backup.js");
+    const p = await makeProject(kit, GOV, true);
+    for (const o of OPS) await o.run(p, reasonText(o.op));
+    const r = await backupProject(kit.repo, p.id);
+    const restored = await restoreBackup(kit.repo, r.path);
+    const q = kit.repo.getProject(restored.projectId) as unknown as Project;
+    expect((await storeLines(q)).join("\n")).not.toContain(MARK);
+    const shown = (await kit.repo.readAudit(restored.projectId, { limit: 1000 })).events.filter((e) => e.reasonShown);
+    expect(Object.fromEntries(OPS.map((o) => [o.op, shown.find((e) => e.details?.op === o.op)?.reasonShown]))).toEqual(Object.fromEntries(OPS.map((o) => [o.op, { state: "text", text: reasonText(o.op) }])));
+  });
+});
+
 describe("crash safety: the sealed text and its audit entry are one change (R26)", () => {
   const RUN_MUTATION_OPS = OPS.filter((o) => o.op !== "review.withdrawal-reviewed");
   it.each(RUN_MUTATION_OPS)("$name: a crash after the sealed text, before the entry, leaves neither; after the entry, both", async ({ op, run }) => {

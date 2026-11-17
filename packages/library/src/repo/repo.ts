@@ -47,7 +47,7 @@ import {
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
-import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonView } from "./audit-reasons.js";
+import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonSha256, reasonView } from "./audit-reasons.js";
 import type { AuditReasonView } from "@ao/shared";
 import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import {
@@ -1625,7 +1625,13 @@ async function withProjectReasons(core: RepoCore, st: ProjectState, events: Audi
     const shown = reasonView(e, () => {
       if (k === "locked") return "locked";
       const entry = e.details?.reviewEntry;
-      if (typeof entry === "string") return review.find((r) => r.id === entry)?.reason;
+      if (typeof entry === "string") {
+        // A restored copy gives its review entries new ids (R92) while its audit log keeps the old: then the entry
+        // resolved by this decision at this entry's time, with the text whose SHA-256 the entry records.
+        const byId = review.find((r) => r.id === entry);
+        if (byId) return byId.reason;
+        return review.find((r) => r.decision === "reviewed-after-withdrawal" && r.resolvedAt === e.at && typeof r.reason === "string" && reasonSha256(r.reason) === e.details?.reasonSha256)?.reason;
+      }
       return store.get(reasonKey(e.seq, e.hash))?.text;
     });
     return shown ? { ...e, reasonShown: shown } : e;
