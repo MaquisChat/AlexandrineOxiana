@@ -12,9 +12,12 @@
 export interface GovernanceReadability {
   /** False when the policy engine cannot read the rules: every request in the project is then refused. */
   readable: boolean;
-  /** When not readable: one plain line per problem, each naming the key and what is wrong (no path). Empty otherwise. */
+  /**
+   * When not readable: one plain line per problem, each naming the key and what is wrong (no path). Empty otherwise.
+   * At most twenty, then a last line "and N more."; each at most 300 characters, cut with "…" (R397 b).
+   */
   issues: string[];
-  /** Notes from reading readable rules (a key in an old spelling, an exception that waives nothing). Empty when none. */
+  /** Notes from reading readable rules (a key in an old spelling, an exception that waives nothing). Empty when none. Bounded as `issues`. */
   warnings: string[];
 }
 

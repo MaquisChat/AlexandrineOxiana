@@ -73,19 +73,29 @@ export function safeYamlCheck(text: string): void {
  * warnings (a key in an old spelling, an exception that waives nothing).
  */
 export function governanceReadability(yaml: string, roots: Iterable<string>): GovernanceReadability {
-  const clean = (t: string) => scrubPaths(t, roots).replace(/\s+/g, " ").trim();
+  // One line; no path; at most MAX_LINE_CHARS (R397 b).
+  const clean = (t: string) => {
+    const line = scrubPaths(t.replace(/\s+/g, " "), roots).trim();
+    return line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS - 1)}…` : line;
+  };
   try {
     const { config, warnings } = parseGovernanceWithWarnings(yaml);
     effectivePolicy(config);
-    return { readable: true, issues: [], warnings: warnings.map(clean) };
+    return { readable: true, issues: [], warnings: capped(warnings.map(clean).filter(Boolean)) };
   } catch (err) {
     let issues: string[] = [];
     if (err instanceof GovernanceParseError && err.issues.length) issues = err.issues;
     else if (err instanceof Error) issues = [err.message.split("\n")[0]!.replace(/^governance\.yaml:\s*/, "").replace(/:\s*$/, "")];
     issues = issues.map(clean).filter(Boolean);
-    return { readable: false, issues: issues.length ? issues : ["the rules file could not be read"], warnings: [] };
+    return { readable: false, issues: issues.length ? capped(issues) : ["the rules file could not be read"], warnings: [] };
   }
 }
+
+/** At most this many issues (or warnings) are sent, then "and N more." (R397 b). */
+const MAX_LINES = 20;
+/** Each issue or warning is at most this many characters, cut with "…" (R397 b). */
+const MAX_LINE_CHARS = 300;
+const capped = (lines: string[]): string[] => (lines.length > MAX_LINES ? [...lines.slice(0, MAX_LINES), `and ${lines.length - MAX_LINES} more.`] : lines);
 
 /** The single issue when the project's rules file is missing, or is a link that leads nowhere (R397 a). */
 export const GOVERNANCE_MISSING_ISSUE = "The rules file (governance.yaml) is missing from this project's folder.";

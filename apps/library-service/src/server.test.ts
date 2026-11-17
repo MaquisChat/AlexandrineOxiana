@@ -1013,6 +1013,36 @@ describe("FR-A18 round 2 (R397 a): a missing or unreadable rules file is said, a
   });
 });
 
+describe("FR-A18 round 2 (R397 b–d): the issues are bounded, scrubbed, on one line, without hidden characters", () => {
+  beforeEach(() => start());
+
+  const folderOf = async () => (await call({ url: "/projects" })).json.projects[0].folder as string;
+  async function issuesOf(text: string): Promise<string[]> {
+    await openNewLibrary();
+    const pid = await newProject();
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), text);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status).toBe(200);
+    expect(g.json.readable).toBe(false);
+    return g.json.issues as string[];
+  }
+
+  it("b: 60 unknown keys → twenty issues, then \"and 40 more.\"", async () => {
+    const text = Array.from({ length: 60 }, (_, i) => `unknown${i}: 1`).join("\n") + "\n";
+    const issues = await issuesOf(text);
+    expect(issues).toHaveLength(21);
+    expect(issues.slice(0, 20).every((i) => /^unknown\d+: unknown key/.test(i))).toBe(true);
+    expect(issues[20]).toBe("and 40 more.");
+  });
+
+  it("b: a 100,000-character key → an issue of at most 300 characters, cut with …", async () => {
+    const issues = await issuesOf(`? ${"k".repeat(100_000)}\n: 1\n`);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]!.length).toBeLessThanOrEqual(300);
+    expect(issues[0]!.endsWith("…")).toBe(true);
+  });
+});
+
 describe("review round 1: errors, query credentials, pairing (R98, R99)", () => {
   beforeEach(() => start());
 
