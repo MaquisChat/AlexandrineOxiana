@@ -137,6 +137,48 @@ describe("Governance settings", () => {
     expect(await screen.findByText("Saved.")).toBeTruthy();
   });
 
+  describe("an exception's reason and approver are kept in the rules file, which an encrypted project does not seal (R369 a)", () => {
+    const NOTE = "In an encrypted project this reason and the approver's name are kept in the project's rules file, which can be read without the passphrase. Do not put a participant's name in them.";
+    const exceptionDialog = async (encrypted: boolean | undefined) => {
+      serve();
+      render(<GovernanceSettings api={makeApi()} projectId={PID} {...(encrypted === undefined ? {} : { encrypted })} />);
+      await loaded();
+      const user = userEvent.setup();
+      await user.click(screen.getByRole("checkbox", { name: "HIPAA" }));
+      await user.selectOptions(within(card("Encryption")).getByRole("combobox", { name: "Encryption at rest" }), "optional");
+      return screen.getByRole("dialog", { name: "Record a reason" });
+    };
+
+    it("encrypted: the dialog for an exception says so, tied to its reason and approver fields", async () => {
+      const dialog = await exceptionDialog(true);
+      const note = within(dialog).getByText(NOTE);
+      expect(note.textContent).toBe(NOTE);
+      expect(note.id).not.toBe("");
+      for (const name of ["Reason", "Approved by"]) expect(within(dialog).getByRole("textbox", { name }).getAttribute("aria-describedby")?.split(" ")).toContain(note.id);
+    });
+
+    it.each([
+      ["not encrypted", false],
+      ["encryption not known", undefined],
+    ])("%s: nothing is said", async (_what, encrypted) => {
+      const dialog = await exceptionDialog(encrypted);
+      expect(within(dialog).queryByText(NOTE)).toBeNull();
+      expect(dialog.textContent).not.toMatch(/passphrase/);
+      for (const name of ["Reason", "Approved by"]) expect(within(dialog).getByRole("textbox", { name }).getAttribute("aria-describedby")).toBeNull();
+    });
+
+    it("encrypted: a loosening that is not an exception writes no reason into the rules file, so the note is not shown", async () => {
+      serve();
+      render(<GovernanceSettings api={makeApi()} projectId={PID} encrypted />);
+      await loaded();
+      const user = userEvent.setup();
+      await user.click(within(card("Capture methods")).getByRole("checkbox", { name: CAPTURE_LABEL.browser_capture }));
+      const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+      expect(dialog.textContent).toMatch(/loosens the project's rules/);
+      expect(within(dialog).queryByText(NOTE)).toBeNull();
+    });
+  });
+
   it("cancelling the reason leaves the stricter value", async () => {
     serve({ yaml: "profiles: [hipaa]\nencryption:\n  atRest: required\n" });
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);

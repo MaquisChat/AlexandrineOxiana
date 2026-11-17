@@ -85,6 +85,27 @@ describe("governance routes (R113, R118)", () => {
     expect(screen.queryByText(/cannot be changed|Unlock it in the library/)).toBeNull();
   });
 
+  it.each([
+    ["an encrypted project", true],
+    ["a project that is not encrypted", false],
+  ])("the Governance form of %s is told so from the project list: an exception's reason dialog says what the rules file keeps only when encrypted (R369 a)", async (_what, encrypted) => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted, unlocked: true }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+      http.get(url("/projects/p1/governance"), () => HttpResponse.json({ yaml: "profiles: [hipaa]\nencryption:\n  atRest: required\n", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/projects/p1/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(url("/projects/p1/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<Host />);
+    const enc = await screen.findByRole("region", { name: "Encryption" });
+    const select = within(enc).getByRole("combobox", { name: "Encryption at rest" }) as HTMLSelectElement;
+    await waitFor(() => expect(select.disabled).toBe(false));
+    await userEvent.setup().selectOptions(select, "optional");
+    const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+    expect(/can be read without the passphrase/.test(dialog.textContent ?? "")).toBe(encrypted);
+  });
+
   it("a failed project list is shown (41b2 M2)", async () => {
     server.use(
       http.get(url("/projects"), () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "The service is not answering." } }, { status: 503 })),
