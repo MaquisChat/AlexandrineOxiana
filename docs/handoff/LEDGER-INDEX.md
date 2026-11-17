@@ -351,3 +351,4 @@ R427 (2026-11-17): FR-A10 third review not approved (rule sound; 3 Important) �
 R428 (2026-11-17): FR-A16 round 2 built — the 'no record' warning stays as ruled; the certificate says 'none known to this computer holds the destroyed data' where copies are known and hold none; the note names no screen; scoped look asked
 R429 (2026-11-17): FR-A16 approved after round 2; small round 3 — the certificate's 'none … holds' and 'may still hold (could not be looked at)'; an absent volume root is 'cannot tell'; an unattributed backup in an old place is 'cannot tell'; no second look at a place still being looked at; the banner says every sentence that applies; two tests
 R430 (2026-11-17): FR-D31 round 2 built — statfsFree for the free room accepted; a stop note that cannot be saved is shown from memory (put to the reviewer); a fresh reviewer has the whole task
+R431 (2026-11-17): FR-A21 round 2 built; a count of 0 read as no count is left (with FR-694); scoped look asked
