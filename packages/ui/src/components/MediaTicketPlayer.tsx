@@ -208,6 +208,8 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       if (pending) {
         const done = pending.seekIssued && (e.type === "seeked" || Math.abs(el.currentTime - pending.at) < SEEK_TOLERANCE_S);
         if (!done) return;
+        // R371 b: a pause or a play pressed after the metadata, before the seek landed, is what the next renewal resumes with.
+        wantPlay = pending.play;
         pending = null;
       }
       position = el.currentTime;
