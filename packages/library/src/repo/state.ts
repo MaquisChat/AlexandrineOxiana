@@ -1,5 +1,5 @@
 /** Repository state: the open library, its projects, and helpers every repo module uses. */
-import { AsyncLocalStorage } from "node:async_hooks";
+import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -146,7 +146,11 @@ export class RepoCore {
   libraryAuditLast?: AuditEvent | null;
   /** The library log's entries of its latest day, for dropping a repeated refusal (N6). */
   libraryAuditRecent?: AuditEvent[];
-  private queue: Promise<unknown> = Promise.resolve();
+  /** The write queue: turns waiting, those asked to go next (`serialNext`) ahead of the rest. */
+  private readonly waiting: Array<() => void> = [];
+  private readonly urgent: Array<() => void> = [];
+  /** A turn is running or about to start. */
+  private writing = false;
 
   constructor(
     readonly library: Library,
@@ -189,10 +193,47 @@ export class RepoCore {
 
   /** Runs write operations one at a time, so audit sequence numbers and files never interleave. */
   serial<T>(fn: () => Promise<T>): Promise<T> {
-    const turn = () => inTurn.run(this, fn);
-    const run = this.queue.then(turn, turn);
-    this.queue = run.catch(() => {});
-    return run;
+    return this.enqueue(fn, false);
+  }
+
+  /**
+   * Runs `fn` as the next turn of the write queue: after the turn in progress, ahead of the turns already waiting.
+   * Locking a project (and unlocking an unlocked one) goes here (R379): it never lands inside a change being saved,
+   * and it waits only for that change, not for the queue behind it (each change of a long import is one turn).
+   */
+  serialNext<T>(fn: () => Promise<T>): Promise<T> {
+    return this.enqueue(fn, true);
+  }
+
+  /** No turn is running or about to start. */
+  queueIdle(): boolean {
+    return !this.writing;
+  }
+
+  private enqueue<T>(fn: () => Promise<T>, next: boolean): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      // Bound to the caller's async context, as a promise reaction would be.
+      const start = AsyncResource.bind(() => {
+        let run: Promise<T>;
+        try {
+          run = Promise.resolve(inTurn.run(this, fn));
+        } catch (err) {
+          run = Promise.reject(err);
+        }
+        run.then(resolve, reject).finally(() => this.startNext());
+      });
+      (next ? this.urgent : this.waiting).push(start);
+      if (!this.writing) {
+        this.writing = true;
+        queueMicrotask(() => this.startNext());
+      }
+    });
+  }
+
+  private startNext(): void {
+    const start = this.urgent.shift() ?? this.waiting.shift();
+    this.writing = start !== undefined;
+    start?.();
   }
 
   /** True while running in a turn of this repo's write queue (`serial`): no other write is in progress. */

@@ -235,7 +235,10 @@ export async function unlockProject(core: RepoCore, projectId: string, secret: s
     key = await unwrapWithRecovery(file.recovery, secret);
   }
   try {
-    core.keyRing.add(file.keyId, key);
+    // An unlocked project's key is replaced only between turns of the write queue (R379); the same key again
+    // changes nothing (KeyRing.add keeps the buffer a change may be sealing with).
+    if (core.keyRing.has(file.keyId) && !core.queueIdle()) await core.serialNext(async () => core.keyRing.add(file.keyId, key));
+    else core.keyRing.add(file.keyId, key);
   } finally {
     key.fill(0);
   }
@@ -471,15 +474,29 @@ export async function recoveryCodeUnshown(core: RepoCore, st: ProjectState): Pro
   return core.encrypted(st) && (await readMaybe(core.abs(`${st.rel}/${UNSHOWN_FILE}`))) !== null;
 }
 
-export function lockProject(core: RepoCore, projectId: string): void {
+/**
+ * Locks the project: its in-memory index content is dropped and its key zeroed in the key ring. R379: the key is
+ * wiped only between turns of the write queue, never under a change being saved: at once when no write is running,
+ * else as the next turn (after the change in progress, ahead of those waiting, which then find the project locked).
+ */
+export function lockProject(core: RepoCore, projectId: string): Promise<void> {
   const keyId = core.state(projectId).project.encryption.keyId;
-  // Drop the project's in-memory index content first; a failure must not keep the project unlocked.
-  try {
-    core.index.purgeProject?.(projectId);
-  } catch (error) {
-    core.indexErrors.push({ op: "project.lock", error });
+  const lock = () => {
+    // Drop the project's in-memory index content first; a failure must not keep the project unlocked.
+    try {
+      core.index.purgeProject?.(projectId);
+    } catch (error) {
+      core.indexErrors.push({ op: "project.lock", error });
+    }
+    if (keyId) core.keyRing.remove(keyId);
+  };
+  // Not "in a turn" (holdsTurn): a timer or callback started inside a turn carries its context afterwards.
+  // A turn that awaited its own lock would wait forever; none does.
+  if (core.queueIdle()) {
+    lock();
+    return Promise.resolve();
   }
-  if (keyId) core.keyRing.remove(keyId);
+  return core.serialNext(async () => lock());
 }
 
 export function isUnlocked(core: RepoCore, projectId: string): boolean {

@@ -233,8 +233,8 @@ export class Repo {
   issueRecoveryCode(projectId: string, passphrase: string): Promise<{ recoveryCode: string }> {
     return issueRecoveryCode(this.core, projectId, passphrase);
   }
-  lockProject(projectId: string): void {
-    lockProject(this.core, projectId);
+  lockProject(projectId: string): Promise<void> {
+    return lockProject(this.core, projectId);
   }
   isUnlocked(projectId: string): boolean {
     return isUnlocked(this.core, projectId);
