@@ -598,4 +598,34 @@ describe("R429: old copies of a moved library and a destruction's certificate (r
     const r2 = await destroyRaw(repo, p.id, [second.id], "tester");
     expect(r2.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: NONE });
   });
+
+  it("(b) N2: a copy that could not be looked at is said to be one that may still hold the data; one looked at that holds it 'still holds'; the warning is raised for both", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    const list = JSON.parse(await readFile(listFile(), "utf8")) as { records: Array<Record<string, unknown>> };
+    // A second old copy, left by a later move, on a disk that is unplugged now.
+    list.records.push({ ...list.records[0]!, id: "second-copy", moveId: "second-move", createdAt: "2026-11-20T09:30:00.000Z", oldRoot: join(kit.tmp, "Volumes", "Unplugged", "Lib") });
+    await writeFile(listFile(), JSON.stringify(list));
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toMatchObject({ status: "pending", notDestroyed: [{ movedAt: MOVED_AT }, { movedAt: "2026-11-20T09:30:00.000Z" }] });
+    expect((r.original.oldCopies as { note: string }).note).toBe(
+      "An old copy of this library, left by the move of 2026-11-10, still holds the destroyed data and was not destroyed. " +
+        "An old copy of this library, left by the move of 2026-11-20, may still hold the destroyed data (it could not be looked at) and was not destroyed. " +
+        "Deleting them completes the destruction.",
+    );
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+  });
+
+  it("(b) N2: only copies that could not be looked at: 'may still hold'", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    const list = JSON.parse(await readFile(listFile(), "utf8")) as { records: Array<Record<string, unknown>> };
+    list.records[0]!.oldRoot = join(kit.tmp, "Volumes", "Unplugged", "Lib");
+    await writeFile(listFile(), JSON.stringify(list));
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect((r.original.oldCopies as { note: string }).note).toBe(
+      "An old copy of this library, left by the move of 2026-11-10, may still hold the destroyed data (it could not be looked at) and was not destroyed. Deleting it completes the destruction.",
+    );
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+  });
 });

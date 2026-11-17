@@ -77,8 +77,8 @@
  * the time of the move that left it, never by its path; the notice's last sentence is true because
  * the copies not covered are named) and in the change's audit event (`oldCopiesNotDestroyed`, with
  * this computer's record id). A list that cannot be read is said so (`unknown-pending`,
- * `oldCopiesUnchecked`): never taken for "none". An old folder that cannot be reached (its disk
- * unplugged: neither it nor the folder holding it is there) counts as still holding the files. The
+ * `oldCopiesUnchecked`): never taken for "none". An old folder that cannot be looked at (its disk
+ * unplugged, a look that ran out of time) is named too, as one that may still hold the files (R429 b). The
  * project shows `destruction-old-copies-pending` while any such copy is outstanding; the note behind
  * it is in `Backups/backups-state.json` (`oldCopiesUndestroyed`), rewritten from the audit log at
  * every retry pass. Each copy leaves the list as the backups do, by an amendment beside the
@@ -1342,7 +1342,7 @@ export async function pruneDeletedOldCopy(deps: { appConfigDir: string; clock: (
  * when the list cannot be read (never "none"); `known` when this computer's list names an old copy of
  * this library at all (R428 2: "none known" is said only when it names none).
  */
-async function holdingOldCopies(repo: Repo, what: DestroyedData): Promise<{ notDestroyed: Array<OldCopyRef & { id: string }>; unchecked: boolean; known: boolean }> {
+async function holdingOldCopies(repo: Repo, what: DestroyedData): Promise<{ notDestroyed: Array<OldCopyRef & { id: string; notLookedAt?: true }>; unchecked: boolean; known: boolean }> {
   const lib = repoLibrary(repo);
   let records: PendingOldCopy[];
   try {
@@ -1353,8 +1353,12 @@ async function holdingOldCopies(repo: Repo, what: DestroyedData): Promise<{ notD
   } catch {
     return { notDestroyed: [], unchecked: true, known: false };
   }
-  const out: Array<OldCopyRef & { id: string }> = [];
-  for (const r of records) if ((await oldCopyLook(lib.root, r, what)) !== "none") out.push(refOf(r));
+  // A copy that could not be looked at is named apart from one that was and holds the data (R429 b).
+  const out: Array<OldCopyRef & { id: string; notLookedAt?: true }> = [];
+  for (const r of records) {
+    const look = await oldCopyLook(lib.root, r, what);
+    if (look !== "none") out.push({ ...refOf(r), ...(look === "cannot-tell" ? { notLookedAt: true as const } : {}) });
+  }
   return { notDestroyed: out, unchecked: false, known: records.some((r) => placesOf(lib.root, r).size > 0) };
 }
 
@@ -1371,20 +1375,39 @@ export const OLD_COPIES_NONE = "Old copies of the library left by a move: none k
 /** The certificate's line when this computer's list names old copies of this library and none holds the destroyed data (R428 2). */
 export const OLD_COPIES_NONE_HOLDS = "Old copies of the library left by a move: none known to this computer holds the destroyed data.";
 
-/** The certificate's plain words about its old copies (R379); `anyKnown`: this computer's list names an old copy of this library (R428 2). */
-function oldCopiesSentence(copies: readonly OldCopyRef[], unchecked: boolean, anyKnown: boolean, tz: string | undefined): string {
+/**
+ * The certificate's plain words about its old copies (R379); `anyKnown`: this computer's list names
+ * an old copy of this library (R428 2). A copy that was looked at and holds the data "still holds"
+ * it; one that could not be looked at (`notLookedAt`) "may still hold" it (R429 b: a certificate
+ * says only what is known).
+ */
+function oldCopiesSentence(copies: ReadonlyArray<OldCopyRef & { notLookedAt?: true }>, unchecked: boolean, anyKnown: boolean, tz: string | undefined): string {
   if (unchecked) {
     return "This computer's list of old copies of this library left by a move could not be read, so whether such a copy still holds the destroyed data could not be checked. Any that does was not destroyed.";
   }
   const n = copies.length;
   if (n === 0) return anyKnown ? OLD_COPIES_NONE_HOLDS : OLD_COPIES_NONE;
+  const holding = copies.filter((c) => !c.notLookedAt);
+  const unseen = copies.filter((c) => c.notLookedAt);
+  const parts = [
+    ...(holding.length ? [oldCopiesGroup(holding, tz, holding.length === 1 ? "still holds the destroyed data and was not destroyed." : "still hold the destroyed data and were not destroyed.")] : []),
+    ...(unseen.length
+      ? [oldCopiesGroup(unseen, tz, unseen.length === 1 ? "may still hold the destroyed data (it could not be looked at) and was not destroyed." : "may still hold the destroyed data (they could not be looked at) and were not destroyed.")]
+      : []),
+  ];
+  return `${parts.join(" ")} Deleting ${n === 1 ? "it" : "them"} completes the destruction.`;
+}
+
+/** "<subject> of this library, left by <the moves>, <what is said>" for some old copies, each by the date of its move. */
+function oldCopiesGroup(copies: readonly OldCopyRef[], tz: string | undefined, said: string): string {
+  const n = copies.length;
   const known = copies.map((c) => moveDate(c.movedAt, tz));
   const dates = [...new Set(known.filter((d): d is string => d !== undefined))];
   const unknown = known.length - known.filter((d) => d !== undefined).length;
   // A copy whose date is not known is named as such (M1).
   const subject = n === 1 ? (unknown ? "An old copy (date unknown)" : "An old copy") : `${n} old copies`;
   const by = dates.length ? `the move of ${dates.join(", ")}${unknown ? ` and ${unknown === 1 ? "a move" : "moves"} of unknown date` : ""}` : unknown > 1 ? "moves of unknown date" : "a move";
-  return `${subject} of this library, left by ${by}, still ${n === 1 ? "holds" : "hold"} the destroyed data and ${n === 1 ? "was" : "were"} not destroyed. Deleting ${n === 1 ? "it" : "them"} completes the destruction.`;
+  return `${subject} of this library, left by ${by}, ${said}`;
 }
 
 function oldCopiesStatusOf(a: Audited): OldCopiesStatus {
