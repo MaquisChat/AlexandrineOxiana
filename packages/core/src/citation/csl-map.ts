@@ -236,9 +236,11 @@ function creatorWithWholeNames(c: Creator, whole: NameSet): string | undefined {
     // the given name ("Juan Carlos" of Juan Carlos Onetti) or the family name ("Fernández Ruiz" of
     // Pedro Fernández Ruiz) is another person's name. A creator of one field is one text, like a literal: runs count in it (R440 a). A whole
     // name counts anywhere (R420 a).
+    // In the second, family-given reading no run counts (R440 b): runs carry their own rotations, so
+    // swapped fields are coded by the first reading; whole names still count there.
     const across = (first: string) => (start: number, end: number) => start < first.length && end > first.length + 1;
     if (!given || !family) return tryText(given ?? family);
-    return tryText(`${given} ${family}`, across(given)) ?? tryText(`${family} ${given}`, across(family));
+    return tryText(`${given} ${family}`, across(given)) ?? tryText(`${family} ${given}`, () => false);
   }
   return tryText(c.literal) ?? (c.literal?.trim() ? undefined : tryText(c.handle));
 }

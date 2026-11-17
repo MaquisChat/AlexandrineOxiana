@@ -1184,3 +1184,20 @@ describe("R440 (a): a creator of one field is one text, like a literal", () => {
     expect(page([{ role: "author", given: "Lucía Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
   });
 });
+
+describe("R440 (b): no run in the family-given reading", () => {
+  const page = (creators: Creator[], map: ReadonlyMap<string, string>) =>
+    toCslItem(source("webpage", mt(["es", "original", "A page"]), creators), { ...OPTS, pseudonyms: map });
+  const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
+
+  it("a run that exists only in 'family given' (Fernández of Ortega Fernández + Lucía) is left as it is; the key is kept", () => {
+    const item = page([{ role: "author", given: "Lucía", family: "Ortega Fernández" }], LUCIA);
+    expect(item.author).toEqual([{ family: "Ortega Fernández", given: "Lucía" }]);
+    expect(item["citation-key"]).toBe("key");
+  });
+
+  it("guards (they hold before R440 b too): swapped fields and the plain order are coded", () => {
+    expect(page([{ role: "author", given: "Fernández", family: "Lucía" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", given: "Lucía", family: "Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+  });
+});
