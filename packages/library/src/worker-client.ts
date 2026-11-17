@@ -321,6 +321,7 @@ export class WorkerClient {
     if (db) await this.write(() => upgradeLegacyJobs(db, library.root, { get: (keyId: string) => this.keyById(keyId) })).catch(() => undefined);
     const out: Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }> = [];
     const todo: JobRecord[] = [];
+    const opened: Array<{ folder: string; id: string; key: ProjectKey }> = [];
     // R400 (c): what is returned for a job names no path (Node's own messages can quote one).
     const report = (id: string, pid: string, error: unknown) => out.push({ id, projectId: pid, error: pathless(error, library.root) });
     for (const p of this.repo.listProjects()) {
@@ -336,6 +337,7 @@ export class WorkerClient {
       }
       try {
         await this.write(() => compactJobJournal(library.root, p.folder, p.id, key));
+        opened.push({ folder: p.folder, id: p.id, key });
         const journal = await this.write(() => refreshJobRows(() => this.db(), library.root, p.folder, p.id, key));
         for (const r of journal.records.values()) if (isPending(r)) todo.push(r);
       } catch (error) {
@@ -411,6 +413,13 @@ export class WorkerClient {
         tell(extras, { claimed: took, error });
         if (took) report(rec.id, rec.projectId, error);
       }
+    }
+    // R400 (e): once the jobs are settled, a journal still holding a line with an absolute path
+    // (an old line now superseded) is compacted, so that none is left after the first resume.
+    for (const j of opened) {
+      if (this.closed) break;
+      const rewritten = await this.write(() => compactJobJournal(library.root, j.folder, j.id, j.key)).catch(() => false);
+      if (rewritten) await this.write(() => refreshJobRows(() => this.db(), library.root, j.folder, j.id, j.key)).catch(() => undefined);
     }
     return out;
   }

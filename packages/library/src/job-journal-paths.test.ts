@@ -17,7 +17,7 @@ import { OPEN_GOV, PASS, addSource, type Kit } from "./export/test-kit.js";
 import { OcrQueue } from "./import/ocr.js";
 import { ProxyQueue } from "./import/proxies.js";
 import { openIndex } from "./index/db.js";
-import { appendJobRecords, journalPath, markLegacyJobs, readJobJournal, upgradeLegacyJobs, type JobRecord } from "./job-journal.js";
+import { appendJobRecords, journalPath, markLegacyJobs, parseJobJournal, readJobJournal, upgradeLegacyJobs, type JobRecord } from "./job-journal.js";
 import { createLinkCapture } from "./capture/link-capture.js";
 import { createLibrary, openLibrary, type Library } from "./library.js";
 import { editPendingProxies, importChange, projectDataKey, relinkLinkedAsset, type Repo } from "./repo/repo.js";
@@ -573,5 +573,51 @@ describe("R400 (d): the stored paths' validation, and a destroyed linked asset",
     expect(out.map((o) => (o.error as WorkerJobError).code)).toEqual(["INPUT_NOT_FOUND"]);
     expect((await journalOf(p)).records.map((r) => [r.status, r.error])).toEqual([["failed", "INPUT_NOT_FOUND"]]);
     expect(await clientOf(await okWorker(seen)).resumePending(p.id)).toEqual([]);
+  });
+});
+
+describe("R400 (e): a journal still holding absolute paths is rewritten once, at the first resume", () => {
+  for (const encrypted of [false, true]) {
+    it(`a small journal with two old absolute lines: after one resume no absolute path is left and the jobs' states are unchanged (${encrypted ? "encrypted" : "plain"})`, async () => {
+      const p = await makeProject(encrypted);
+      const key = projectDataKey(repo, p.id);
+      const sf = await withOriginal(p, "photo.png", "png");
+      const input = join(lib.root, ...sf.assets[0]!.path.split("/"));
+      const old = (id: string, status: JobRecord["status"], withJob: boolean): JobRecord => ({
+        ...relLine(p, input, join(lib.root, ".tmp", `worker-proxy-${id.slice(0, 8)}`, "proxy.jpg"), { id, status }),
+        ...(withJob ? {} : { job: undefined }),
+      });
+      const done = randomUUID();
+      const pending = randomUUID();
+      // `done` finished long ago (its old queued line superseded); `pending` waits, its one line absolute.
+      await appendJobRecords(lib.root, p.folder, key, [old(done, "queued", true), old(pending, "queued", true)]);
+      const finished = { ...old(done, "done", false) };
+      delete finished.job;
+      await appendJobRecords(lib.root, p.folder, key, [finished]);
+      // The worker cannot be reached: the pending job stays pending.
+      const out = await clientOf(await downWorker()).resumePending(p.id);
+      expect(out.map((o) => o.error)).toEqual([expect.any(WorkerUnavailableError)]);
+      const { text, records } = await journalOf(p);
+      expect(text).not.toContain(lib.root);
+      // Every line, opened (an encrypted journal's superseded lines too).
+      const opened = text.split("\n").filter(Boolean).flatMap((l) => [...parseJobJournal(`${l}\n`, p.id, key ? key.key : null).records.values()]);
+      expect(opened.length).toBeGreaterThanOrEqual(3);
+      expect(JSON.stringify(opened)).not.toContain(lib.root);
+      expect(strings(records).filter((s) => s.startsWith("/"))).toEqual([]);
+      const byId = new Map(records.map((r) => [r.id, r]));
+      expect(byId.get(done)!.status).toBe("done");
+      expect(byId.get(pending)!.status).toBe("queued");
+      expect(byId.get(pending)!.job).toMatchObject({ input: sf.assets[0]!.path, output: `.tmp/worker-proxy-${pending.slice(0, 8)}/proxy.jpg` });
+    });
+  }
+
+  it("an old pending line outside the current root: settled as a missing input, and its absolute line is gone after that same resume", async () => {
+    const p = await makeProject(false);
+    await appendJobRecords(lib.root, p.folder, null, [relLine(p, "/Users/someone/Old Library/P/original/photo.png", "/Users/someone/Old Library/.tmp/w/proxy.jpg")]);
+    const out = await clientOf(await okWorker()).resumePending(p.id);
+    expect(out.map((o) => (o.error as WorkerJobError).code)).toEqual(["INPUT_NOT_FOUND"]);
+    const { text, records } = await journalOf(p);
+    expect(text).not.toContain("/Users/");
+    expect(records.map((r) => [r.status, r.error])).toEqual([["failed", "INPUT_NOT_FOUND"]]);
   });
 });

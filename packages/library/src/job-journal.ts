@@ -186,11 +186,17 @@ export interface ParsedJournal {
   lines: number;
   /** An incomplete last line was ignored. */
   torn: boolean;
+  /** Some readable line (superseded or not) holds an absolute path: written before R379 (R400 e). */
+  absolutePaths: boolean;
 }
+
+/** Whether a stored job names a file by an absolute path (a line written before R379). */
+const holdsAbsolutePath = (j: StoredJob | undefined): boolean =>
+  !!j && ((j.type !== "capture.download" && typeof j.input === "string" && isAbsolute(j.input)) || (typeof j.output === "string" && isAbsolute(j.output)));
 
 /** Parses a journal's text. `key` opens sealed lines (encrypted projects). */
 export function parseJobJournal(text: string, projectId: string, key: Uint8Array | null): ParsedJournal {
-  const out: ParsedJournal = { records: new Map(), latestLines: new Map(), unreadable: [], lines: 0, torn: false };
+  const out: ParsedJournal = { records: new Map(), latestLines: new Map(), unreadable: [], lines: 0, torn: false, absolutePaths: false };
   const parts = text.split("\n");
   for (const [i, line] of parts.entries()) {
     if (i === parts.length - 1) {
@@ -205,6 +211,7 @@ export function parseJobJournal(text: string, projectId: string, key: Uint8Array
       out.records.delete(o.id); // keep insertion order = order of the newest line
       out.records.set(o.id, o);
       out.latestLines.set(o.id, line);
+      if (holdsAbsolutePath(o.job)) out.absolutePaths = true;
     } catch {
       out.unreadable.push(line);
     }
@@ -356,7 +363,8 @@ function prunable(records: Map<string, JobRecord>, now: number): Set<string> {
  * the finished jobs R142 lets go (succeeded ones older than SUCCEEDED_MAX_AGE_DAYS or beyond the
  * MAX_SUCCEEDED_KEPT most recent; failed and cancelled ones beyond the MAX_FAILED_KEPT most
  * recent), plus any unreadable lines (kept verbatim). Runs when the journal has more than
- * `minLines` lines and either half of them are superseded or some record can be dropped. Returns
+ * `minLines` lines and either half of them are superseded or some record can be dropped, and
+ * whenever a line holds an absolute path (R400 e: such paths inside the root are written relative). Returns
  * true when it was rewritten. Bound: MAX_SUCCEEDED_KEPT + MAX_FAILED_KEPT lines plus the pending
  * jobs after compaction; between compactions at most three more lines per job (queued, running,
  * final). A job's result lives in its source's files: a dropped record loses only history.
@@ -377,12 +385,31 @@ export async function compactJobJournal(
     const parsed = parseJobJournal(raw.toString("utf8"), projectId, key ? key.key : null);
     const drop = prunable(parsed.records, now);
     const kept = parsed.latestLines.size - drop.size + parsed.unreadable.length;
-    if (parsed.lines <= minLines || (drop.size === 0 && kept * 2 > parsed.lines)) return false;
+    // R400 (e): a journal that still holds a line with an absolute path is compacted whatever its size.
+    if (!parsed.absolutePaths && (parsed.lines <= minLines || (drop.size === 0 && kept * 2 > parsed.lines))) return false;
     await prepare(root, projectRel);
-    const lines = [...parsed.unreadable, ...[...parsed.latestLines].filter(([id]) => !drop.has(id)).map(([, l]) => l)];
+    const lines = [
+      ...parsed.unreadable,
+      ...[...parsed.latestLines].filter(([id]) => !drop.has(id)).map(([id, l]) => relativeLine(root, parsed.records.get(id)!, key) ?? l),
+    ];
     await writeFileAtomic(path, lines.map((l) => `${l}\n`).join(""), { mode: FILE_MODE });
     return true;
   });
+}
+
+/**
+ * R400 (e): a newest line whose job names its files by absolute paths inside `root`, written again
+ * with the same record and those paths library-relative (R379). Undefined (the line is kept as it
+ * is) when it holds none, or one outside `root`: that job fails as a missing input when resumed,
+ * and the next compaction drops the superseded line.
+ */
+function relativeLine(root: string, rec: JobRecord, key: ProjectKey): string | undefined {
+  const j = rec.job;
+  if (!j || !holdsAbsolutePath(j)) return undefined;
+  const input = j.type === "capture.download" || !isAbsolute(j.input) ? j.input : toLibraryPath(root, j.input);
+  const output = isAbsolute(j.output) ? toLibraryPath(root, j.output) : j.output;
+  if (input === undefined || output === undefined) return undefined;
+  return encode({ ...rec, job: { ...j, input, output } }, key);
 }
 
 /**
