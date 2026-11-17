@@ -103,12 +103,16 @@ export interface JobInputAsset {
 
 // ---- paths (R379) ------------------------------------------------------------------------------
 
+/** A control character (C0, DEL, C1; NUL among them): never part of a path a job may use (R400 c). */
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+
 /**
  * `abs` as a journal stores it: relative to `root`, "/"-separated, no ".." (R379). Undefined when
- * `abs` is not an absolute path strictly inside `root`.
+ * `abs` is not an absolute path strictly inside `root`, or holds a control character (R400 c).
  */
 export function toLibraryPath(root: string, abs: string): string | undefined {
-  if (!isAbsolute(abs)) return undefined;
+  if (!isAbsolute(abs) || CONTROL.test(abs)) return undefined;
   const r = relative(resolve(root), resolve(abs));
   if (!r || isAbsolute(r) || r === ".." || r.startsWith(`..${sep}`)) return undefined;
   const rel = r.split(sep).join("/");
@@ -118,11 +122,12 @@ export function toLibraryPath(root: string, abs: string): string | undefined {
 /**
  * A stored path as an absolute path under the library's current root (R379). A relative path is
  * joined to `root` (undefined unless it is a plain library-relative path: no "..", no empty or "."
- * segment). An absolute path (a line written before R379) is used as it is when it lies inside
+ * segment, no control character: R400 c). An absolute path (a line written before R379) is used as it is when it lies inside
  * `root`; outside it (the library was moved or copied) it is undefined: the old place is not
  * this library's.
  */
 export function fromLibraryPath(root: string, stored: string): string | undefined {
+  if (CONTROL.test(stored)) return undefined; // R400 (c)
   if (isAbsolute(stored)) return toLibraryPath(root, stored) !== undefined ? resolve(stored) : undefined;
   if (!LibraryRelativePath.safeParse(stored).success || stored.split("/").some((s) => s === "" || s === ".")) return undefined;
   return join(root, ...stored.split("/"));

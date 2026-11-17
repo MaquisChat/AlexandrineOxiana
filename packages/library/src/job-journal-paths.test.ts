@@ -499,3 +499,32 @@ describe("R400 (b): a job reads only inside the library (by real path) and write
     expect((await readdir(outside)).sort()).toEqual(["y.png"]);
   });
 });
+
+describe("R400 (c): a stored path holding a control character is refused before anything is sent", () => {
+  it("NUL, C0 and C1 characters in a stored input or output (relative or old absolute): failed once as a missing input, no path in the error", async () => {
+    const p = await makeProject(false);
+    const sf = await withOriginal(p, "photo.png", "png");
+    const input = sf.assets[0]!.path;
+    const out = ".tmp/worker-proxy-c/proxy.jpg";
+    const recs: JobRecord[] = [];
+    for (const c of ["\u0000", "\u0001", "\u001f", "\u007f", "\u0085", "\u009f"]) {
+      recs.push(relLine(p, input, `.tmp/worker-proxy-c/a${c}/x.jpg`));
+      recs.push(relLine(p, `${input}${c}`, out));
+    }
+    recs.push(relLine(p, join(lib.root, ...input.split("/")) + "\u0000", join(lib.root, ".tmp", "w", "x.jpg")));
+    recs.push(relLine(p, join(lib.root, ...input.split("/")), join(lib.root, ".tmp", "w\u0000", "x.jpg")));
+    await expectEachRefused(p, recs);
+    expect(existsSync(join(lib.root, ".tmp", "worker-proxy-c"))).toBe(false);
+  });
+
+  it("an error Node raises while a line is resumed (it quotes the path) is returned without the path", async () => {
+    const p = await makeProject(false);
+    const sf = await withOriginal(p, "photo.png", "png");
+    await appendJobRecords(lib.root, p.folder, null, [relLine(p, sf.assets[0]!.path, ".tmp/worker-proxy-d/proxy.jpg")]);
+    const out = await clientOf(await okWorker()).resumePending(p.id, { prepare: async () => (await readFile(join(lib.root, "no-such-file")), {}) });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.error).toBeInstanceOf(Error);
+    expect(String((out[0]!.error as Error).message)).not.toContain(lib.root);
+    expect((out[0]!.error as { path?: unknown }).path).toBeUndefined();
+  });
+});

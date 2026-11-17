@@ -321,6 +321,8 @@ export class WorkerClient {
     if (db) await this.write(() => upgradeLegacyJobs(db, library.root, { get: (keyId: string) => this.keyById(keyId) })).catch(() => undefined);
     const out: Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }> = [];
     const todo: JobRecord[] = [];
+    // R400 (c): what is returned for a job names no path (Node's own messages can quote one).
+    const report = (id: string, pid: string, error: unknown) => out.push({ id, projectId: pid, error: pathless(error, library.root) });
     for (const p of this.repo.listProjects()) {
       if (projectId !== undefined && p.id !== projectId) continue;
       let key: { key: Uint8Array; keyId: string } | null;
@@ -337,7 +339,7 @@ export class WorkerClient {
         const journal = await this.write(() => refreshJobRows(() => this.db(), library.root, p.folder, p.id, key));
         for (const r of journal.records.values()) if (isPending(r)) todo.push(r);
       } catch (error) {
-        out.push({ id: "", projectId: p.id, error });
+        report("", p.id, error);
       }
     }
     todo.sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt.localeCompare(b.createdAt)));
@@ -376,7 +378,7 @@ export class WorkerClient {
           input = undefined;
         }
       } catch (error) {
-        out.push({ id: rec.id, projectId: rec.projectId, error }); // left pending, as it was
+        report(rec.id, rec.projectId, error); // left pending, as it was
         continue;
       }
       if (!input || output === undefined) {
@@ -407,7 +409,7 @@ export class WorkerClient {
       } catch (error) {
         const took = !(error instanceof NotClaimed);
         tell(extras, { claimed: took, error });
-        if (took) out.push({ id: rec.id, projectId: rec.projectId, error });
+        if (took) report(rec.id, rec.projectId, error);
       }
     }
     return out;
@@ -870,6 +872,17 @@ async function walkFiles(dir: string): Promise<string[]> {
  * folder below `<root>/.tmp` — not `.tmp` itself, and not through a link that leads elsewhere.
  * Every caller's output is there (proxies, text recognition, transcriptions, captures).
  */
+/**
+ * R400 (c): an error safe to hand back from a resubmission: one whose message or `path` names a
+ * path (Node's file-system errors quote the path they failed on) is replaced by a WorkerJobError
+ * that names none; any other error is returned as it is.
+ */
+function pathless(error: unknown, root: string): unknown {
+  if (!(error instanceof Error)) return error;
+  const quoted = typeof (error as { path?: unknown }).path === "string" || error.message.includes(root) || /(^|[\s'"(])(\/|[A-Za-z]:\\)/.test(error.message);
+  return quoted ? new WorkerJobError(error instanceof WorkerJobError ? error.code : "FAILED", "the job failed") : error;
+}
+
 async function outputInWork(root: string, job: Pick<WorkerJob, "type" | "output">): Promise<boolean> {
   const base = DIR_OUTPUTS.has(job.type) ? job.output : dirname(job.output);
   const work = join(await libraryRealRoot(root), ".tmp");
