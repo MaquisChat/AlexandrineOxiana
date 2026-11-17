@@ -38,12 +38,21 @@ const zotero = (title = ZOTERO_TITLE): Partial<SourceDraft> => ({
   container: { variants: [{ lang: "en", kind: "original", value: "Antiquity" }] },
 });
 
-async function withZotero(embedded: string) {
+async function withZotero(embedded: string, reference = ZOTERO_TITLE) {
   const path = await pdf(`${Math.random().toString(36).slice(2)}.pdf`, { title: embedded });
-  return resolveItem({ path, mime: "application/pdf", referenceMetadata: zotero(), referenceSource: { kind: "zotero" } }, ctx);
+  return resolveItem({ path, mime: "application/pdf", referenceMetadata: zotero(reference), referenceSource: { kind: "zotero" } }, ctx);
 }
 
-const titleEvidence = (r: Awaited<ReturnType<typeof resolveItem>>) => r.fieldEvidence.filter((e) => e.field === "/title");
+type Resolved = Awaited<ReturnType<typeof resolveItem>>;
+const titleEvidence = (r: Resolved) => r.fieldEvidence.filter((e) => e.field === "/title");
+
+function expectAgrees(r: Resolved, reference = ZOTERO_TITLE) {
+  expect(primary(r.draft.title)).toBe(reference);
+  expect(r.titleConflict).toBe(false);
+  expect(r.verification.fields["/title"]?.status).not.toBe("conflict");
+  expect(r.verification.overall).not.toBe("needs-review");
+  expect(r.confidence).toBeGreaterThanOrEqual(AUTO_ACCEPT_THRESHOLD);
+}
 
 describe("R394 with a Zotero record", () => {
   it("the owner's case: a production code as the embedded title is no conflict; the title is Zotero's and nothing sends it to review", async () => {
@@ -58,18 +67,57 @@ describe("R394 with a Zotero record", () => {
     expect(JSON.stringify(r)).not.toContain("S0003598X20000800jra");
   });
 
+  /** R410 a: each way of agreeing has its own example, which agrees through that way only. */
+  it("equal after folding case, accents, punctuation and white space: agrees, and is recorded as corroborating the title", async () => {
+    const r = await withZotero("SUBSISTENCE AND PERSISTENCE — Agriculture in the Céntral Plains of China through the Neolithic to Bronze Age Transition.");
+    expectAgrees(r);
+    expect(titleEvidence(r).map((e) => e.source.kind).sort()).toEqual(["embedded", "zotero"]);
+  });
+
+  it("a similarity at or above the import's threshold (0.9), not equal: agrees, and is recorded (before the record-lacks-its-subtitle way, which would not record it)", async () => {
+    // Similarity 0.94: the reference title with a short subtitle of its own.
+    const r = await withZotero(`${ZOTERO_TITLE}: A Study`);
+    expectAgrees(r);
+    expect(titleEvidence(r).map((e) => e.source.kind).sort()).toEqual(["embedded", "zotero"]);
+  });
+
   it.each([
-    ["the title without its subtitle", "Subsistence and persistence"],
-    ["a running head (the subtitle alone)", "Agriculture in the Central Plains of China"],
-    ["a title cut off by a length limit", "Subsistence and persistence: agriculture in the Central Plains of China throu"],
-    ["case, accents and punctuation", "SUBSISTENCE AND PERSISTENCE — Agriculture in the Céntral Plains of China through the Neolithic to Bronze Age Transition."],
-  ])("an embedded title that is %s agrees", async (_what, embedded) => {
-    const r = await withZotero(embedded);
-    expect(primary(r.draft.title)).toBe(ZOTERO_TITLE);
-    expect(r.titleConflict).toBe(false);
-    expect(r.verification.fields["/title"]?.status).not.toBe("conflict");
-    expect(r.verification.overall).not.toBe("needs-review");
-    expect(r.confidence).toBeGreaterThanOrEqual(AUTO_ACCEPT_THRESHOLD);
+    // The prefix ends at a word and the reference continues with its subtitle (": "): two real words only, so only this way agrees.
+    ["the title without its subtitle (':')", ZOTERO_TITLE, "Subsistence and persistence"],
+    ["the title without its subtitle (' - ')", "Rivers of Memory - Upland Villages in the Andes", "Rivers of Memory"],
+    ["the title without its subtitle ('?')", "Markets Fail? Credit in Upland Villages", "Markets Fail"],
+    // A run of whole words inside the reference title, with three or more words that are not small words.
+    ["a running head (three real words inside the title)", ZOTERO_TITLE, "Agriculture in the Central Plains of China"],
+    ["a title cut off by a length limit (at a word)", ZOTERO_TITLE, "Subsistence and persistence: agriculture in the Central Plains of China"],
+    // The record lacks the subtitle the file's title carries.
+    ["the record lacking the subtitle", "Subsistence and persistence", ZOTERO_TITLE],
+  ])("an embedded title that is %s agrees; it is not recorded (R406 a)", async (_what, reference, embedded) => {
+    const r = await withZotero(embedded, reference);
+    expectAgrees(r, reference);
+    expect(titleEvidence(r).map((e) => e.source.kind)).toEqual(["zotero"]);
+  });
+
+  /** R410 a, the review's I1 table: titles of different works stay a conflict (the wrong file may be attached). */
+  it.each([
+    ["A History of Modern Iran", "A History of Modern India"],
+    ["Capital, Volume I", "Capital, Volume II"],
+    ["Capital, Volume II", "Capital, Volume I"],
+    ["Gender and Power in Rural China", "Gender and Power in Rural India"],
+    ["Social Capital and Civic Engagement in Italy", "Social Capital and Civic Engagement in Germany"],
+    ["The Politics of Memory in Postwar Europe", "The Politics of Water in Postwar Europe"],
+    ["A Theory of Justice", "A Theory of Justice for Animals"],
+    ["A Theory of Justice for Animals", "A Theory of Justice"],
+    ["The Politics of Memory in Postwar Europe", "The Politics of"],
+    // A cut inside a word is not a run of whole words.
+    [ZOTERO_TITLE, "Subsistence and persistence: agriculture in the Central Plains of China throu"],
+    // A prefix whose rest is no subtitle, with fewer than three real words.
+    ["Markets and Memory in Lagos", "Markets and Memory"],
+  ])("reference %j, embedded %j: a conflict, the title still the reference's", async (reference, embedded) => {
+    const r = await withZotero(embedded, reference);
+    expect(primary(r.draft.title)).toBe(reference);
+    expect(r.verification.fields["/title"]?.status).toBe("conflict");
+    expect(r.verification.overall).toBe("needs-review");
+    expect(titleEvidence(r).map((e) => e.source.kind).sort()).toEqual(["embedded", "zotero"]);
   });
 
   it("an embedded title of another work stays a conflict (the wrong file may be attached): the title is still Zotero's", async () => {
