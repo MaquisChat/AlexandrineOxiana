@@ -344,9 +344,14 @@ describe("deciding entries that have no batch (Task 67)", () => {
     const r = await reviewed(pid, entry!.id, reason);
     expect(r.status, r.body).toBe(200);
     const audit = await call({ url: `/projects/${pid}/audit?limit=1000` });
-    expect(audit.body).not.toContain("Quokka");
+    // The audit record itself never holds it; since R362 b the audit screen's reading shows it while the project is
+    // unlocked (read from the sealed review entry and checked against the SHA-256), and never while it is locked.
+    const records = (audit.json.events as Array<Record<string, unknown>>).map(({ reasonShown: _shown, ...e }) => e);
+    expect(JSON.stringify(records)).not.toContain("Quokka");
+    expect((audit.json.events as Array<{ action: string; reasonShown?: unknown }>).find((e) => e.action === "review-withdrawal")?.reasonShown).toEqual({ state: "text", text: reason });
     const ev = (audit.json.events as Array<{ action: string; details?: Record<string, unknown> }>).find((e) => e.action === "review-withdrawal");
-    expect(ev?.details).toMatchObject({ reviewEntry: entry!.id, reasonGiven: true, reasonSha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(ev?.details).toMatchObject({ reviewEntry: entry!.id, reasonGiven: true, reasonMac: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(ev?.details?.reasonSha256).toBeUndefined();
     expect(ev?.details?.reason).toBeUndefined();
     expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
     for (const res of [await call({ url: `/projects/${pid}/review` }), await reviewed(pid, entry!.id, "again"), await call({ url: `/projects/${pid}/audit?limit=1000` })]) {

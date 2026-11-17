@@ -19,11 +19,11 @@ export interface GovernanceRoute {
   path: string;
   label: string;
   needsProject: boolean;
-  render(api: GovernanceApi, projectId: string, ctx: { readOnlyReason?: string | undefined }): ReactNode;
+  render(api: GovernanceApi, projectId: string, ctx: { readOnlyReason?: string | undefined; encrypted?: boolean | undefined }): ReactNode;
 }
 
 export const governanceRoutes: GovernanceRoute[] = [
-  { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid, ctx) => <GovernanceSettings key={pid} api={api} projectId={pid} readOnlyReason={ctx.readOnlyReason} /> },
+  { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid, ctx) => <GovernanceSettings key={pid} api={api} projectId={pid} readOnlyReason={ctx.readOnlyReason} encrypted={ctx.encrypted} /> },
   { path: PATHS.audit, label: "Audit log", needsProject: true, render: (api, pid) => <AuditLog key={pid} api={api} projectId={pid} /> },
   { path: PATHS.fieldwork, label: "Fieldwork", needsProject: true, render: (api, pid) => <Fieldwork key={pid} api={api} projectId={pid} /> },
   { path: PATHS.moveLibrary, label: "Move library", needsProject: false, render: (api) => <MoveLibrary api={api} /> },
@@ -117,7 +117,7 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
           The project named in the address is not in this library. Choose a project from the list.
         </p>
       )}
-      {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason }) : null}
+      {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason, encrypted: project?.encrypted }) : null}
     </div>
   );
 }

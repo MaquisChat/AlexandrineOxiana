@@ -154,6 +154,29 @@ describe("GET /projects/:id/attention and POST …/set-aside", () => {
     expect(audit.json.events[0]).toMatchObject({ action: "set-aside", details: { op: "attention.set-aside", reason: "Damaged by the disk" } });
   });
 
+  it("R362 b: in an encrypted project the reason is sealed; GET …/audit shows it while unlocked and the sentence while locked", async () => {
+    const created = await call({ method: "POST", url: "/projects", body: { name: "Sealed", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "correct horse battery staple" } } });
+    expect(created.status, created.body).toBe(200);
+    const pid = created.json.project.id as string;
+    const dir = join(tmp, "Lib", "Projects", "Sealed", "attention");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "0123456789abcdef0123456789abcdef.json"), "{ damaged");
+    const id = (await call({ url: `/projects/${pid}/attention` })).json.marks[0].id as string;
+    const reason = "Zebrafinch: at Maria Hollis's request";
+    expect((await call({ method: "POST", url: `/projects/${pid}/attention/${id}/set-aside`, body: { reason } })).status).toBe(200);
+    let bytes = "";
+    for (const f of await readdir(join(tmp, "Lib", "Projects", "Sealed", "audit"))) bytes += await readFile(join(tmp, "Lib", "Projects", "Sealed", "audit", f), "utf8");
+    expect(bytes).not.toContain("Zebrafinch");
+    const unlocked = (await call({ url: `/projects/${pid}/audit?limit=1` })).json.events[0];
+    expect(unlocked).toMatchObject({ action: "set-aside", details: { reasonGiven: true, reasonMac: expect.stringMatching(/^[0-9a-f]{64}$/) }, reasonShown: { state: "text", text: reason } });
+    expect(unlocked.details.reasonSha256).toBeUndefined();
+    expect(unlocked.details.reasonMac).not.toBe(createHash("sha256").update(reason, "utf8").digest("hex"));
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    const locked = await call({ url: `/projects/${pid}/audit?limit=1` });
+    expect(locked.json.events[0].reasonShown).toEqual({ state: "locked", message: "A reason was given. It can be read when the project is unlocked." });
+    expect(locked.body).not.toContain("Zebrafinch");
+  });
+
   it("refused for the extension token and a foreign origin", async () => {
     const { pid } = await projectWithMark();
     const name = ((await call({ url: `/projects/${pid}/attention` })).json.marks[0].id) as string;

@@ -19,7 +19,11 @@ export type CrashPoint =
   /** Activation finished, before the code is returned. */
   | "recovery-after-activate"
   /** Task 50: an audit append failed after the action, before the project is marked as needing attention. */
-  | "before-attention-mark";
+  | "before-attention-mark"
+  /** R362 b: a reason's sealed text is written (under the marker), its audit entry not yet. */
+  | "after-sealed-reason"
+  /** R362 b: the library's log: a reason's sealed text is written, the library's entry not yet. */
+  | "library-reason-before-entry";
 
 export const seams: {
   crashAt?: CrashPoint;

@@ -53,6 +53,8 @@ import "./GovernanceScreens.css";
 
 interface Pending {
   message: ReactNode;
+  /** The edit records an exception: its reason and the approver's name are written into governance.yaml. */
+  exception?: boolean;
   /** The edit to make once a reason is recorded (returns the new text). */
   apply?: (reason: string, by: string) => string;
   /** The service refused the save for want of a reason: save again with it. */
@@ -71,7 +73,16 @@ export interface GovernanceSettingsProps {
    * the rules are then shown but every control is off, with this reason.
    */
   readOnlyReason?: string | undefined;
+  /** The project is encrypted (from the project list): its governance.yaml is still readable without the passphrase. */
+  encrypted?: boolean | undefined;
 }
+
+/**
+ * R369 a: an exception's reason and its approver's name are written into governance.yaml, which an encrypted project
+ * does not seal (sealing them is the owner's decision); the "Record a reason" dialog says so, tied to its fields.
+ */
+export const EXCEPTION_READABLE_NOTE =
+  "In an encrypted project this reason and the approver's name are kept in the project's rules file, which can be read without the passphrase. Do not put a participant's name in them.";
 
 /** Today in this computer's time zone, YYYY-MM-DD (protocol dates are read in it when no project time zone is set). */
 const localToday = () => {
@@ -79,7 +90,7 @@ const localToday = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
-export function GovernanceSettings({ api, projectId, readOnlyReason }: GovernanceSettingsProps) {
+export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }: GovernanceSettingsProps) {
   const [saved, setSaved] = useState<{ yaml: string; sha256: string } | null>(null);
   const [text, setTextNow] = useState("");
   // What the cards show is parsed from `parseText`: at once for form edits, 300 ms after the last
@@ -161,6 +172,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
       return;
     }
     setPending({
+      exception: needsException,
       message: needsException
         ? `${PROFILE_LABEL[profile!]} requires ${describe(requiredBy(cfg, control).find((r) => r.profile === profile)?.req.value ?? "a value")} for ${control}. Setting it to ${describe(value)} is recorded as an exception with your reason.`
         : said
@@ -452,6 +464,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
       {pending ? (
         <ReasonDialog
           message={pending.message}
+          {...(encrypted && pending.exception ? { fieldNote: EXCEPTION_READABLE_NOTE } : {})}
           onConfirm={confirmReason}
           onCancel={() => {
             setPending(null);

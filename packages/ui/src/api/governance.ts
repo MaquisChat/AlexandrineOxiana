@@ -6,7 +6,7 @@
  * Governance edits always name the version they were made from (`baseSha256`, the sha256 GET
  * returned; R99): the service answers 409 CONFLICT when the file changed elsewhere meanwhile.
  */
-import type { AttentionMarksResponse, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
+import type { AttentionMarksResponse, AuditReasonView, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "./client";
 
 /**
@@ -100,6 +100,8 @@ export interface AuditEvent {
   entity?: { type: string; id: string };
   decision?: { result: "allow" | "deny" | "allow_with_conditions"; reason?: string };
   details?: Record<string, unknown>;
+  /** The reason the researcher typed, as the service reads it (R362 b): sealed reasons of an encrypted project included. */
+  reasonShown?: AuditReasonView;
 }
 
 export type { AttentionMarkView, AttentionMarksResponse, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";

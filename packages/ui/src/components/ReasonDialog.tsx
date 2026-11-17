@@ -66,8 +66,9 @@ export function DialogShell({ labelledBy, describedBy, onCancel, busy, className
   );
 }
 
-export function ReasonDialog({ message, onConfirm, onCancel }: { message: ReactNode; onConfirm: (reason: string, by: string) => void; onCancel: () => void }) {
+export function ReasonDialog({ message, fieldNote, onConfirm, onCancel }: { message: ReactNode; /** Said under the message and tied to both fields (R369 a). */ fieldNote?: string; onConfirm: (reason: string, by: string) => void; onCancel: () => void }) {
   const id = useId();
+  const noteId = fieldNote ? `${id}-n` : undefined;
   const [reason, setReason] = useState("");
   const [by, setBy] = useState("");
   const ok = reason.trim() !== "" && by.trim() !== "";
@@ -75,6 +76,11 @@ export function ReasonDialog({ message, onConfirm, onCancel }: { message: ReactN
     <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel}>
       <h2 id={`${id}-t`}>Record a reason</h2>
       <p id={`${id}-d`}>{message}</p>
+      {fieldNote ? (
+        <p id={noteId} className="ao-hint">
+          {fieldNote}
+        </p>
+      ) : null}
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -83,11 +89,11 @@ export function ReasonDialog({ message, onConfirm, onCancel }: { message: ReactN
       >
         <label className="ao-stack">
           Reason
-          <textarea required rows={3} value={reason} onChange={(e) => setReason(e.target.value)} />
+          <textarea required rows={3} aria-describedby={noteId} value={reason} onChange={(e) => setReason(e.target.value)} />
         </label>
         <label className="ao-stack">
           Approved by
-          <input type="text" required value={by} onChange={(e) => setBy(e.target.value)} />
+          <input type="text" required aria-describedby={noteId} value={by} onChange={(e) => setBy(e.target.value)} />
         </label>
         <div className="ao-actions">
           <button type="submit" disabled={!ok}>
