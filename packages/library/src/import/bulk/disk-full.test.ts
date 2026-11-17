@@ -13,7 +13,8 @@ import { join } from "node:path";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Project } from "@ao/core";
-import { buildPdf } from "../../../../../tests/fixtures/generate.mjs";
+import { buildPdf, buildZip } from "../../../../../tests/fixtures/generate.mjs";
+import { buildZoteroFixture } from "../../../tests/fixtures/zotero/build-fixture.mjs";
 import { KeyRing } from "../../crypto/keys.js";
 import type { Deps } from "../../deps.js";
 import { shutdownExtractors } from "../../extract/index.js";
@@ -23,6 +24,7 @@ import { createLibrary, openLibrary, type Library } from "../../library.js";
 import { HttpClient } from "../../lookup/index.js";
 import type { Repo } from "../../repo/repo.js";
 import { openTestRepo, seams } from "../../repo/testing.js";
+import { zoteroLocalAdapter } from "../zotero-local.js";
 import { createBulkImport, folderAdapter, type BatchHandle, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
 import { DISK_FULL_NOTE, RECOVERY_NOTE, bulkSpaceSeams } from "./space.js";
 
@@ -37,6 +39,14 @@ const faults = vi.hoisted(() => ({
   groupOther: 0,
   /** Any other error (not a full disk) from an item's own store, inside its change (after its writes). */
   singleOther: 0,
+  /** A full disk inside an item's own store, inside its change (after its writes): the change rolls back. */
+  singleInside: 0,
+  /** Unpacking an archive (R436 a): writes part of it into the work folder, then fails with this code. */
+  unpack: 0,
+  /** Any other error from unpacking an archive (a damaged archive). */
+  unpackOther: 0,
+  /** Copying the Zotero database (R436 a), after its own check of the room passed. */
+  dbCopy: 0,
   error(code?: string): NodeJS.ErrnoException {
     const c = code ?? this.code;
     return Object.assign(new Error(`${c}: no space left on device, write '/Users/jane/Library/x.json'`), { code: c, syscall: "write" });
@@ -60,6 +70,39 @@ vi.mock("./batch.js", async (importOriginal) => {
         throw faults.error();
       }
       return m.writeBatchRecord(...a);
+    },
+  };
+});
+
+vi.mock("../../extract/zip.js", async (importOriginal) => {
+  const m = await importOriginal<typeof import("../../extract/zip.js")>();
+  return {
+    ...m,
+    extractArchive: async (...a: Parameters<typeof m.extractArchive>) => {
+      if (faults.unpack > 0 || faults.unpackOther > 0) {
+        const other = faults.unpack === 0;
+        if (other) faults.unpackOther--;
+        else faults.unpack--;
+        // What the unpack wrote before the disk filled is left in the work folder for the caller to remove.
+        await mkdir(a[1], { recursive: true });
+        await writeFile(join(a[1], "partial.pdf"), "partial");
+        throw other ? new Error("invalid central directory file header signature") : faults.error();
+      }
+      return m.extractArchive(...a);
+    },
+  };
+});
+
+vi.mock("../sqlite-copy.js", async (importOriginal) => {
+  const m = await importOriginal<typeof import("../sqlite-copy.js")>();
+  return {
+    ...m,
+    copyDatabases: async (...a: Parameters<typeof m.copyDatabases>) => {
+      if (faults.dbCopy > 0) {
+        faults.dbCopy--;
+        throw faults.error();
+      }
+      return m.copyDatabases(...a);
     },
   };
 });
@@ -96,6 +139,11 @@ vi.mock("../../repo/repo.js", async (importOriginal) => {
         const [repo, projectId, draft, files, opts, refuse] = a;
         return m.createSourceRefusing(repo, projectId, draft, files, opts, refuse, async () => Promise.reject(Object.assign(new Error("I/O error"), { code: "EIO" })));
       }
+      if (faults.singleInside > 0) {
+        faults.singleInside--;
+        const [repo, projectId, draft, files, opts, refuse] = a;
+        return m.createSourceRefusing(repo, projectId, draft, files, opts, refuse, async () => Promise.reject(faults.error()));
+      }
       return m.createSourceRefusing(...a);
     },
   };
@@ -105,7 +153,7 @@ const GOV = `identifiability:
   containsIdentifiable: false
 encryption:
   atRest: optional
-captureMethods: [manual_upload, refman_import]
+captureMethods: [manual_upload, refman_import, zotero_import]
 processing:
   metadata_lookup: []
 `;
@@ -214,7 +262,7 @@ beforeEach(async () => {
   agent = new MockAgent();
   agent.disableNetConnect();
   notes = [];
-  Object.assign(faults, { code: "ENOSPC", journal: 0, record: 0, group: 0, single: 0, groupOther: 0, singleOther: 0 });
+  Object.assign(faults, { code: "ENOSPC", journal: 0, record: 0, group: 0, single: 0, groupOther: 0, singleOther: 0, singleInside: 0, unpack: 0, unpackOther: 0, dbCopy: 0 });
   await open(await createLibrary(join(tmp, "Lib"), "Lib", deps()));
 });
 
@@ -359,5 +407,68 @@ describe("a project that refuses every write stops the batch too (R413 c)", () =
     await lib.close();
     await open(await openLibrary(join(tmp, "Lib"), deps()));
     await resumedAll(p, h, adapter(keys.map(item)), keys);
+  });
+});
+
+describe("a full disk during the scan stops the batch too (R436 a)", () => {
+  /** A folder holding one archive of three PDFs. */
+  async function archiveFolder(): Promise<{ src: string; keys: string[] }> {
+    const src = join(tmp, "Papers");
+    await mkdir(src, { recursive: true });
+    const names = ["one.pdf", "two.pdf", "three.pdf"];
+    const entries = await Promise.all(names.map(async (name) => ({ name, data: await buildPdf({ extra: `archived ${name}` }) })));
+    await writeFile(join(src, "a.zip"), buildZip(entries));
+    return { src, keys: names.map((n) => `a.zip!/${n}`) };
+  }
+  /** The work folders the run unpacks into (removed when it stops). */
+  const leftInTmp = async () => (await readdir(join(lib.root, ".tmp"), { recursive: true }).catch(() => [] as string[])).filter((n) => n.includes("zip-"));
+
+  it("an archive whose unpacking fills the disk: stopped with the sentence, no failed line, nothing left unpacked; a resume imports its files once", async () => {
+    const p = await project();
+    const { src, keys } = await archiveFolder();
+    faults.unpack = 1;
+    const h = await bulk.startBatch(p.id, folderAdapter(src));
+    await stoppedFull(p, h);
+    expect(await journal(p)).toEqual([]);
+    expect((await record(p)).stopCause).toBe("ENOSPC");
+    expect(await leftInTmp()).toEqual([]);
+    const h2 = await bulk.resumeBatch(p.id, h.batchId);
+    expect((await h2.done).state).toBe("finished");
+    const lines = await journal(p);
+    expect(lines.map((e) => e.key).sort()).toEqual([...keys].sort());
+    expect(lines.filter((e) => e.outcome === "created" || e.outcome === "needs-review").length).toBe(3);
+    expect(repo.listSourceIds(p.id).length).toBe(3);
+  });
+
+  it("an archive that truly cannot be read is still one failed line, and the batch goes on", async () => {
+    const p = await project();
+    const { src } = await archiveFolder();
+    await writeFile(join(src, "b.pdf"), await buildPdf({ extra: "loose paper" }));
+    faults.unpackOther = 1;
+    const h = await bulk.startBatch(p.id, folderAdapter(src));
+    const res = await h.done;
+    expect(res.state).toBe("finished");
+    const lines = await journal(p);
+    expect(lines.filter((e) => e.outcome === "failed")).toEqual([{ key: "a.zip", outcome: "failed", reason: "The archive could not be read, so its files were not imported." }]);
+    expect(lines.map((e) => e.key).sort()).toEqual(["a.zip", "b.pdf"]);
+    expect(await leftInTmp()).toEqual([]);
+  });
+
+  it("the Zotero database copy failing for a full disk after its check passed: stopped with the sentence, not \"missing or damaged\"; a resume imports", async () => {
+    const p = await project();
+    const dataDir = join(tmp, "Zotero");
+    buildZoteroFixture(dataDir, { pdf: await buildPdf({ extra: "okafor" }), linkedPdf: await buildPdf({ extra: "linked" }), linkedDir: join(tmp, "Elsewhere") });
+    faults.dbCopy = 1;
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir));
+    await stoppedFull(p, h);
+    expect(await journal(p)).toEqual([]);
+    expect((await bulk.batchReport(p.id, h.batchId)).failures).toEqual([]);
+    const h2 = await bulk.resumeBatch(p.id, h.batchId);
+    const res = await h2.done;
+    expect(res.state).toBe("finished");
+    expect(res.counts.failed).toBe(0);
+    const lines = await journal(p);
+    expect(new Set(lines.map((e) => e.key)).size).toBe(lines.length);
+    expect(lines.filter((e) => e.outcome === "created" || e.outcome === "needs-review").length).toBeGreaterThan(0);
   });
 });

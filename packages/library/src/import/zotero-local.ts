@@ -51,7 +51,7 @@ import { checkFiles, referenceMetadata, text } from "./refman.js";
 import { extraCitationKey, recordFields, zoteroAnnotation, zoteroCreator, zoteroTimestamp, type ZoteroAnnotationRow } from "./zotero-common.js";
 
 export { ITEM_TYPES, zoteroAnnotation, zoteroTimestamp, type ZoteroAnnotationRow } from "./zotero-common.js";
-import { spaceMargin } from "./bulk/space.js";
+import { isDiskFull, spaceMargin } from "./bulk/space.js";
 import { CopyNoSpace, CopyTooLarge, CopyUnstable, CopyUnusual, UNUSUAL_STATE_REASON, cappedRows, columnsOf, copyDatabases, openCopy, plainTables, t64, tN } from "./sqlite-copy.js";
 
 export const ZOTERO_REASONS = {
@@ -423,6 +423,9 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
     });
   } catch (err) {
     if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
+    // R436 a: a full disk (or a quota) during the copy, after its own check of the room passed, ends the scan: the run
+    // stops the batch, resumable (copyDatabases has removed its folder). Never "missing or damaged".
+    if (isDiskFull(err)) throw err;
     yield fail(zoteroCopyReason(err));
     return;
   }
