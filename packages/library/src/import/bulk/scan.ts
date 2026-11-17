@@ -324,7 +324,10 @@ async function* walk(root: string, rel: string[], signal: AbortSignal, ctx: Scan
   }
 }
 
-/** Number of entries a ZIP archive lists (no extraction), or 1 when it cannot be read. */
+/**
+ * Number of importable entries a ZIP archive lists (no extraction): 0 for a readable archive with none (it yields
+ * nothing), 1 when it cannot be read (its one unreadable item), so the count is what the scan yields (R392 d, R426 e).
+ */
 function zipEntryCount(path: string): Promise<number> {
   return new Promise((resolve) => {
     yauzl.open(path, { lazyEntries: true, autoClose: false }, (err, zf) => {
@@ -337,7 +340,7 @@ function zipEntryCount(path: string): Promise<number> {
       });
       zf.on("end", () => {
         zf.close();
-        resolve(Math.max(1, n));
+        resolve(n);
       });
       zf.on("error", () => {
         zf.close();

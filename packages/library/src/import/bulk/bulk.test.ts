@@ -25,7 +25,7 @@ import { decryptBytes } from "../../repo/io.js";
 import type { Repo } from "../../repo/repo.js";
 import { importChange, projectCollectionsAndTags, projectDataKey } from "../../repo/repo.js";
 import { openTestRepo } from "../../repo/testing.js";
-import { BatchRefusedError, createBulkImport, folderAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
+import { BatchRefusedError, createBulkImport, folderAdapter, zipAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
 import { useMemorySecrets } from "../../secrets-testing.js";
 import { setSecret } from "../../secrets.js";
 import { ZOTERO_WEB_FILE_NOTES, resumeZoteroWebImport, startZoteroWebImport, zoteroWebAdapter, zoteroWebSince, type ZoteroWebOptions } from "../zotero-web.js";
@@ -2060,6 +2060,49 @@ describe("FR-A21 (R392): the progress tells the truth about the total", () => {
     const seen = await events(await bulk.resumeBatch(p.id, h.batchId, skipping(5, true)));
     for (const e of seen) expect(e.done).toBeLessThanOrEqual(5);
     expect(seen.at(-1)).toEqual({ done: 5, total: 5 });
+  });
+
+  const signal = () => new AbortController().signal;
+  const archives: Array<[string, Buffer]> = [
+    ["an empty ZIP", buildZip([])],
+    ["a ZIP of folders only", buildZip([{ name: "a/", data: "" }, { name: "a/b/", data: "" }])],
+  ];
+  for (const [what, zip] of archives) {
+    it(`R426 e: ${what} counts 0, as many as it yields; the dry run and the run agree`, async () => {
+      const p = await project();
+      const src = await folderWith(`r426e-${what.replace(/\W+/gu, "-")}`, { "x.zip": zip });
+      const za = zipAdapter(join(src, "x.zip"));
+      expect(await za.count!(signal())).toBe(0);
+      expect((await bulk.dryRun(p.id, za)).items).toBe(0);
+      const seen = await events(await bulk.startBatch(p.id, za));
+      expect(seen.at(-1)!.done).toBe(0);
+      for (const e of seen) if (e.total !== undefined) expect(e.total).toBe(0);
+    });
+  }
+
+  it("R426 e: a folder holding an empty ZIP ends with done equal to its total, and its dry run agrees", async () => {
+    const p = await project();
+    const src = await folderWith("r426e-folder", {
+      "one.pdf": await buildPdf({ title: "One", lines: ["One"], extra: "r426e-1" }),
+      "two.pdf": await buildPdf({ title: "Two", lines: ["Two"], extra: "r426e-2" }),
+      "empty.zip": buildZip([]),
+    });
+    expect(await folderAdapter(src).count!(signal())).toBe(2);
+    expect((await bulk.dryRun(p.id, folderAdapter(src))).items).toBe(2);
+    const seen = await events(await bulk.startBatch(p.id, folderAdapter(src)));
+    expect(seen.at(-1)).toEqual({ done: 2, total: 2 });
+  });
+
+  it("R426 e: an archive that cannot be read counts 1 and yields its one unreadable item", async () => {
+    const p = await project();
+    const src = await folderWith("r426e-unreadable", { "broken.zip": Buffer.from("not an archive at all") });
+    const za = zipAdapter(join(src, "broken.zip"));
+    expect(await za.count!(signal())).toBe(1);
+    const dry = await bulk.dryRun(p.id, za);
+    expect(dry.items).toBe(1);
+    expect(dry.unreadable).toHaveLength(1);
+    const seen = await events(await bulk.startBatch(p.id, za));
+    expect(seen.at(-1)).toEqual({ done: 1, total: 1 });
   });
 
   for (const bad of [2.5, Number.NaN, -1]) {
