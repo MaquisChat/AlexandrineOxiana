@@ -348,3 +348,21 @@ describe("Task 46b fix round 1 (R172): consent withdrawal and the library row's 
     expect(await badge(sourceId)).toBe(true);
   });
 });
+
+describe("attach takes only absolute paths (R379, WB5 M3)", () => {
+  it("a relative path or one holding a NUL is refused before anything is read; an absolute path works as before", async () => {
+    const sources = async () => JSON.stringify((await call({ url: `/projects/${pid}/sources` })).json);
+    const before = await sources();
+    // "package.json" exists in the folder the tests run from: read relative to it, it would be attached or sniffed.
+    for (const paths of [["package.json"], ["../../etc/hosts"], [`${pdf}\0.pdf`], [pdf, "form.pdf"]]) {
+      const r = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths } });
+      expect(r.status, JSON.stringify(paths)).toBe(400);
+      expect(r.json.error).toMatchObject({ code: expect.any(String), message: '"paths" must be absolute paths.' });
+      expect(r.json.items).toBeUndefined();
+    }
+    expect(await sources()).toBe(before);
+    const ok = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdf] } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(ok.json.items).toHaveLength(1);
+  });
+});
