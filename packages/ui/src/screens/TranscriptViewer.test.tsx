@@ -206,6 +206,137 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(played).toBe(before);
   });
 
+  // R362 f: a recording never starts by itself. What the researcher does while a ticket is being renewed is kept.
+  it("R362 f: playing, the ticket ends, the researcher pauses during the renewal: the renewal lands at the same place, PAUSED, and play() is not called", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4.25);
+    fireEvent(el, new Event("error"));
+    // The researcher presses pause while the new ticket is asked for.
+    fireEvent(el, new Event("pause"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    // The browser's own pause as the source changes.
+    fireEvent(el, new Event("pause"));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(4.25);
+    expect(played).toBe(before);
+  });
+
+  it("R362 f: paused, the ticket ends, the researcher presses play during the renewal: it plays when the renewal lands", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    playTo(el, 3);
+    fireEvent(el, new Event("error"));
+    fireEvent(el, new Event("play"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(3);
+    expect(played).toBe(before + 1);
+  });
+
+  it("R362 f: a seek by the researcher during the renewal keeps the place asked", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4.25);
+    fireEvent(el, new Event("error"));
+    // The researcher drags the element's own position control while the new ticket is asked for.
+    el.currentTime = 30;
+    fireEvent(el, new Event("seeking"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(30);
+    expect(played).toBe(before + 1);
+  });
+
+  // R371 b: what the researcher does between a renewal's metadata and its seek's landing is what the NEXT renewal resumes with.
+  it("R371 b: a pause pressed after the renewal's metadata and before its seek lands holds for the next renewal: play() is not called again", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4.25);
+    fireEvent(el, new Event("error"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    fireEvent(el, new Event("pause")); // the browser's own, as the source changes
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    fireEvent(el, new Event("play")); // the player's own play()
+    fireEvent(el, new Event("pause")); // the researcher's, before the seek lands
+    fireEvent(el, new Event("seeked"));
+    expect(el.currentTime).toBe(4.25);
+    // The next ticket ends while paused.
+    fireEvent(el, new Event("error"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(3));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[2]!.path}`));
+    fireEvent(el, new Event("pause"));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(4.25);
+    expect(played).toBe(before);
+  });
+
+  it("R371 b: the mirror — paused, a play pressed in that window holds for the next renewal: it plays", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    playTo(el, 3);
+    fireEvent(el, new Event("error"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    fireEvent(el, new Event("pause"));
+    const first = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(played).toBe(first); // it lands paused, as it was
+    fireEvent(el, new Event("play")); // the researcher's, before the seek lands
+    fireEvent(el, new Event("seeked"));
+    fireEvent(el, new Event("error"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(3));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[2]!.path}`));
+    fireEvent(el, new Event("pause"));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(3);
+    expect(played).toBe(before + 1);
+  });
+
+  it("R371 c: a seek made while playing, whose own read meets the expired ticket, resumes at the place asked", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4.25);
+    // The researcher seeks to 30; the seek's range read fails: the ticket had ended.
+    el.currentTime = 30;
+    fireEvent(el, new Event("seeking"));
+    fireEvent(el, new Event("error"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    fireEvent(el, new Event("pause"));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(30);
+    expect(played).toBe(before + 1);
+  });
+
   it("a project locked during playback: renewal is refused, the transcript is hidden, and Try again brings it back after unlocking", async () => {
     const onLocked = vi.fn();
     const { svc } = await open({}, { onLocked });

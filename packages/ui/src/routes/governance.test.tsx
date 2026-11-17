@@ -116,3 +116,22 @@ describe("governance routes (R113, R118)", () => {
     expect((await screen.findByRole("alert")).textContent).toMatch(/projects could not be read|could not be reached/);
   });
 });
+
+describe("R362 h: the Fieldwork screen is told whether its project is encrypted", () => {
+  const SCOPE_NOTE = "In an encrypted project this text can be read without the passphrase. Do not put a person's name in it.";
+  for (const encrypted of [true, false]) {
+    it(`${encrypted ? "encrypted: the scope field carries the note" : "not encrypted: nothing"}`, async () => {
+      server.use(
+        http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Coastal kinship", encrypted, unlocked: true }] })),
+        http.get(url("/projects/p1/participants"), () => HttpResponse.json({ participants: [], complete: true })),
+        http.get(url("/projects/p1/sessions"), () => HttpResponse.json({ sessions: [], complete: true })),
+        http.get(url("/projects/p1/consents"), () => HttpResponse.json({ consents: [], complete: true })),
+      );
+      window.history.replaceState(null, "", "/fieldwork?project=p1");
+      render(<Host />);
+      const scope = await screen.findByRole("textbox", { name: "Scope" });
+      if (encrypted) await waitFor(() => expect(scope.getAttribute("aria-describedby")).toBeTruthy());
+      await waitFor(() => expect(screen.queryAllByText(SCOPE_NOTE)).toHaveLength(encrypted ? 1 : 0));
+    });
+  }
+});

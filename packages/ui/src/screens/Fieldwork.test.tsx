@@ -280,3 +280,32 @@ describe("Fieldwork", () => {
     expect(db.calls).toHaveLength(1);
   });
 });
+
+describe("R362 h: a consent's scope typed in an encrypted project", () => {
+  const SCOPE_NOTE = "In an encrypted project this text can be read without the passphrase. Do not put a person's name in it.";
+  const describedText = (el: HTMLElement) =>
+    (el.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/u)
+      .filter(Boolean)
+      .map((x) => document.getElementById(x)?.textContent ?? "")
+      .join(" ");
+  for (const encrypted of [true, false]) {
+    it(`the new consent's Scope and an edited consent's scope — ${encrypted ? "encrypted: the note, tied to the field" : "not encrypted: nothing"}`, async () => {
+      render(<Fieldwork api={makeApi()} projectId={PID} encrypted={encrypted} />);
+      await screen.findByRole("region", { name: "Participants" });
+      const user = userEvent.setup();
+      await addParticipant(user);
+      db.consents.push({ id: id(), participantId: db.participants[0].id, scope: "audio", date: "2026-03-14" });
+      await user.click(within(section("Participants")).getByRole("button", { name: "Add participant" }));
+      const c = section("Consent records");
+      const fields = [within(c).getByRole("textbox", { name: "Scope" })];
+      await user.click(await within(c).findByRole("button", { name: "Edit consent of P-001" }));
+      fields.push(within(section("Consent records")).getByRole("textbox", { name: "Scope of this consent" }));
+      for (const f of fields) {
+        if (encrypted) expect(describedText(f)).toBe(SCOPE_NOTE);
+        else expect(f.getAttribute("aria-describedby")).toBeNull();
+      }
+      expect(within(section("Consent records")).queryAllByText(SCOPE_NOTE)).toHaveLength(encrypted ? 2 : 0);
+    });
+  }
+});

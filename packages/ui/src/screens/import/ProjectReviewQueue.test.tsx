@@ -2,16 +2,33 @@
  * The project's whole review queue (Task 67, D14, R172): every pending entry of every kind, grouped
  * so a person can tell them apart, each decided by the library's own decision for its kind.
  */
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewItem } from "../../api/import";
 import { http, HttpResponse } from "msw";
 import { BASE as SERVICE, B1, mockService, P1, P2, server, type ServiceSetup } from "../../test/importService";
-import { ReviewQueue } from "./ReviewQueue";
+import { DECIDE_SETTLE_MS, ReviewQueue } from "./ReviewQueue";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
+
+/**
+ * R362 d: the panel's deciding controls take a mouse press only where the pointer really moved over them (their client
+ * coordinates changed), and none in the panel's quiet after the list changed. user-event's own click moves to the
+ * element without new coordinates, so a press here travels: from a point on the page to a new point on the control, then
+ * the button goes down and up there (`clicks` times). `settle` lets the panel's quiet pass first (after a decision).
+ */
+let travel = 0;
+const settle = () => new Promise((r) => setTimeout(r, DECIDE_SETTLE_MS + 20));
+const pressPanel = async (user: ReturnType<typeof userEvent.setup>, el: Element, clicks = 1) => {
+  travel += 10;
+  await user.pointer([
+    { target: document.body, coords: { clientX: travel, clientY: travel } },
+    { target: el, coords: { clientX: travel + 3, clientY: travel + 2 } },
+    ...Array.from({ length: clicks }, () => ({ keys: "[MouseLeft]", target: el })),
+  ]);
+};
 
 const entry = (n: number, group: NonNullable<ReviewItem["group"]>, extra: Partial<ReviewItem> = {}): ReviewItem => ({
   id: `r${n}`,
@@ -117,7 +134,7 @@ describe("the project's whole review queue (Task 67)", () => {
     await user.click(await screen.findByRole("button", { name: "Show Entry 2" }));
     const panel = await screen.findByRole("region", { name: "Imported record" });
     await within(panel).findByText("Entry 2");
-    await user.click(within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
+    await pressPanel(user, within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
     await waitFor(() => expect(m.bodies("POST /review/r2/decide")).toEqual([{ projectId: P1, decision: { action: "accept" } }]));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Show Entry 2" })).toBeNull());
     expect(screen.queryByRole("heading", { name: "Added by hand" })).toBeNull();
@@ -127,7 +144,7 @@ describe("the project's whole review queue (Task 67)", () => {
     const { m, user } = setup();
     await within(await screen.findByRole("region", { name: "Imported record" })).findByText("Entry 1");
     const accept = within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" });
-    await user.dblClick(accept);
+    await pressPanel(user, accept, 2);
     await waitFor(() => expect(screen.queryByRole("button", { name: "Show Entry 1" })).toBeNull());
     expect(m.bodies("POST /review/r1/decide")).toHaveLength(1);
   });
@@ -149,6 +166,68 @@ describe("the project's whole review queue (Task 67)", () => {
     expect(m.calls.filter((c) => c.path.startsWith("/review/"))).toHaveLength(0);
   });
 
+  describe("R371 a: the key that opened a field's dialog never confirms the value unread (the review's probe)", () => {
+    const openEntry3 = async () => {
+      const s = setup();
+      await s.user.click(await screen.findByRole("button", { name: "Show Entry 3" }));
+      const badge = await screen.findByRole("button", { name: "Title: Conflict" });
+      badge.focus();
+      return { ...s, badge };
+    };
+    const patches = (m: ReturnType<typeof setup>["m"]) => m.bodies(`PATCH /projects/${P1}/sources/s3/fields`);
+
+    it("Enter held on the badge sends no request; the dialog is open on its heading", async () => {
+      const { m, user } = await openEntry3();
+      await user.keyboard("{Enter>4}{/Enter}");
+      const dialog = await screen.findByRole("dialog", { name: "Title: evidence" });
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Title: evidence" }));
+      await new Promise((r) => setTimeout(r, 50));
+      expect(patches(m)).toHaveLength(0);
+    });
+
+    it("Enter twice on the badge sends no request; then Tab, an arrow key, Tab and Enter send ONE", async () => {
+      const { m, user } = await openEntry3();
+      await user.keyboard("{Enter}{Enter}");
+      const dialog = await screen.findByRole("dialog", { name: "Title: evidence" });
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Title: evidence" }));
+      await new Promise((r) => setTimeout(r, 50));
+      expect(patches(m)).toHaveLength(0);
+      await user.tab();
+      expect(document.activeElement).toBe(within(dialog).getByRole("radio", { name: /recorded here/ }));
+      await user.keyboard("{ArrowDown}");
+      expect((within(dialog).getByRole("radio", { name: /Entry three, revised/ }) as HTMLInputElement).checked).toBe(true);
+      await user.tab();
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Confirm this value" }));
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(patches(m)).toEqual([{ field: "/title", value: { variants: [{ lang: "en", kind: "original", value: "Entry three, revised" }] } }]);
+    });
+
+    it("a mouse double click on the badge sends no request", async () => {
+      const { m, user, badge } = await openEntry3();
+      await user.dblClick(badge);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(patches(m)).toHaveLength(0);
+    });
+
+    it("the withdrawal's dialog needs a typed reason, so it is left as it is: Enter held on its opener sends nothing, and an empty submit is refused", async () => {
+      const { m, user } = setup();
+      await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
+      const open = await screen.findByRole("button", { name: "Reviewed after the withdrawal…" });
+      open.focus();
+      await user.keyboard("{Enter>4}{/Enter}");
+      const dialog = await screen.findByRole("dialog", { name: "Reviewed after the withdrawal" });
+      const reason = within(dialog).getByRole("textbox", { name: /Your reason/ }) as HTMLTextAreaElement;
+      // Its first focus is the reason, as before; the held Enter typed only line breaks, which are no reason.
+      expect(document.activeElement).toBe(reason);
+      const submit = within(dialog).getByRole("button", { name: "Record the decision" }) as HTMLButtonElement;
+      expect(submit.disabled).toBe(true);
+      fireEvent.submit(submit.closest("form")!);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(m.calls.filter((c) => c.path.endsWith("/reviewed-after-withdrawal"))).toHaveLength(0);
+    });
+  });
+
   it("an import entry with a conflicting field shows its badge too, confirmed through the same confirm, and is then decided as an import item", async () => {
     const s6 = { ...record(6, "Entry 3", [titleReview("conflict")]), source: { ...record(6).source, title: { variants: [{ lang: "en", kind: "original", value: "Entry 3" }] } } };
     const after = { ...record(6, "Entry three, revised", [titleReview("user-confirmed")]) };
@@ -159,7 +238,7 @@ describe("the project's whole review queue (Task 67)", () => {
     await user.click(within(dialog).getByRole("button", { name: "Confirm this value" }));
     expect(await screen.findByRole("button", { name: "Title: Confirmed by you" })).toBeTruthy();
     expect(m.bodies(`PATCH /projects/${P1}/sources/s6/fields`)).toHaveLength(1);
-    await user.click(within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
+    await pressPanel(user, within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
     await waitFor(() => expect(m.bodies("POST /review/r6/decide")).toHaveLength(1));
   });
 
@@ -195,7 +274,7 @@ describe("the project's whole review queue (Task 67)", () => {
   it("a decision refused because the project was locked meanwhile forgets every entry shown", async () => {
     const { user } = setup({ ...BASE, decideLocked: true });
     await within(await screen.findByRole("region", { name: "Imported record" })).findByText("Entry 1");
-    await user.click(within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
+    await pressPanel(user, within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
     await screen.findByLabelText(/passphrase/i);
     expect(screen.queryByText(/Entry \d/)).toBeNull();
   });
@@ -228,7 +307,8 @@ describe("the project's whole review queue (Task 67)", () => {
     await waitFor(() => expect(screen.queryByRole("heading", { name: "From captures" })).toBeNull());
     // The view asked the service which of that source's entries are left (the library resolved this one).
     expect(m.calls.filter((c) => c.path === `/projects/${P1}/review`)).toHaveLength(3);
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Show Entry 4" })));
+    // R362 d: to the next entry's heading, never to a control that decides.
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Entry 4" })));
     expect(screen.getByRole("status").textContent).toMatch(/Every field is confirmed/);
   });
 

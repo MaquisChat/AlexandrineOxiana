@@ -673,3 +673,18 @@ describe("Library screen", () => {
     await waitFor(() => expect(onClosed).toHaveBeenCalled());
   });
 });
+
+describe("R362 h: the library screen tells its collection and tag fields when the project is encrypted", () => {
+  const NAME_NOTE = "In an encrypted project this name can be read without the passphrase. Do not put a person's name in it.";
+  for (const encrypted of [true, false]) {
+    it(`${encrypted ? "an encrypted (unlocked) project: the note" : "a project that is not encrypted: nothing"} on the new collection's and the new tag's name`, async () => {
+      server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [{ ...PROJECTS.projects[0], encrypted, unlocked: true }] })), ...libraryHandlers());
+      renderLibrary();
+      const user = userEvent.setup();
+      await screen.findByRole("tree", { name: "Collections" });
+      await user.click(screen.getByRole("button", { name: "New collection" }));
+      await user.click(screen.getByRole("button", { name: "New tag" }));
+      expect(screen.queryAllByText(NAME_NOTE)).toHaveLength(encrypted ? 2 : 0);
+    });
+  }
+});

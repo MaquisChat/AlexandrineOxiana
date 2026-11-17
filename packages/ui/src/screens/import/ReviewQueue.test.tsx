@@ -8,9 +8,27 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { FilePreview } from "./FilePreview";
 import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, ReviewQueue } from "./ReviewQueue";
+import { SCROLL_SETTLE_MS } from "./pressGuard";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
+
+/**
+ * R362 d: the panel's deciding controls take a mouse press only where the pointer really moved over them (their client
+ * coordinates changed), and none in the panel's quiet after the list changed. user-event's own click moves to the
+ * element without new coordinates, so a press here travels: from a point on the page to a new point on the control, then
+ * the button goes down and up there (`clicks` times). `settle` lets the panel's quiet pass first (after a decision).
+ */
+let travel = 0;
+const settle = () => new Promise((r) => setTimeout(r, DECIDE_SETTLE_MS + 20));
+const pressPanel = async (user: ReturnType<typeof userEvent.setup>, el: Element, clicks = 1) => {
+  travel += 10;
+  await user.pointer([
+    { target: document.body, coords: { clientX: travel, clientY: travel } },
+    { target: el, coords: { clientX: travel + 3, clientY: travel + 2 } },
+    ...Array.from({ length: clicks }, () => ({ keys: "[MouseLeft]", target: el })),
+  ]);
+};
 
 const item = (n: number, extra: Partial<ReviewItem> = {}): ReviewItem => ({
   id: `r${n}`,
@@ -138,15 +156,17 @@ describe("Review queue", () => {
   it("per-item Accept, Skip and Keep both decide with the project in the body", async () => {
     const { m, user } = setup();
     await screen.findByRole("region", { name: "Imported record" });
-    await user.click(screen.getByRole("button", { name: "Accept" }));
+    await pressPanel(user, screen.getByRole("button", { name: "Accept" }));
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toEqual([{ projectId: P1, decision: { action: "accept" } }]));
     // r1 is gone; r2 is now shown.
     await waitFor(() => expect(screen.queryByRole("checkbox", { name: "Select kinship herat draft" })).toBeNull());
     await within(screen.getByRole("region", { name: "Imported record" })).findByText("Second paper");
-    await user.click(screen.getByRole("button", { name: "Skip" }));
+    await settle();
+    await pressPanel(user, screen.getByRole("button", { name: "Skip" }));
     await waitFor(() => expect(m.bodies("POST /review/r2/decide")).toEqual([{ projectId: P1, decision: { action: "skip" } }]));
     await within(screen.getByRole("region", { name: "Imported record" })).findByText("Third paper");
-    await user.click(screen.getByRole("button", { name: "Keep both" }));
+    await settle();
+    await pressPanel(user, screen.getByRole("button", { name: "Keep both" }));
     await waitFor(() => expect(m.bodies("POST /review/r3/decide")).toEqual([{ projectId: P1, decision: { action: "keep-both" } }]));
     expect(await screen.findByText(/Nothing is waiting for review/)).toBeTruthy();
     everyBodyHasProject(m);
@@ -155,7 +175,7 @@ describe("Review queue", () => {
   it("accepting a candidate sends its index", async () => {
     const { m, user } = setup();
     const candidates = await screen.findByRole("region", { name: "Candidate matches" });
-    await user.click(within(candidates).getAllByRole("button", { name: /Use this match/ })[1]!);
+    await pressPanel(user, within(candidates).getAllByRole("button", { name: /Use this match/ })[1]!);
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toEqual([{ projectId: P1, decision: { action: "accept-candidate", index: 1 } }]));
   });
 
@@ -167,7 +187,7 @@ describe("Review queue", () => {
     await user.clear(title);
     await user.type(title, "Kinship in Herat");
     await user.selectOptions(screen.getByRole("combobox", { name: "Type" }), "book");
-    await user.click(screen.getByRole("button", { name: "Save and accept" }));
+    await pressPanel(user, screen.getByRole("button", { name: "Save and accept" }));
     await waitFor(() =>
       expect(m.bodies("POST /review/r1/decide")).toEqual([
         { projectId: P1, decision: { action: "accept", draft: { type: "book", title: { variants: [{ lang: "en", kind: "original", value: "Kinship in Herat" }] } } } },
@@ -181,14 +201,14 @@ describe("Review queue", () => {
     await user.click(screen.getByRole("button", { name: "Merge" }));
     await user.type(screen.getByRole("searchbox", { name: "Find the source to merge into" }), "older");
     await user.click(screen.getByRole("button", { name: "Search" }));
-    await user.click(await screen.findByRole("button", { name: "Merge into An older edition" }));
+    await pressPanel(user, await screen.findByRole("button", { name: "Merge into An older edition" }));
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toEqual([{ projectId: P1, decision: { action: "merge", sourceId: "s-old" } }]));
   });
 
   it("offers the likely duplicate as the merge target", async () => {
     const { m, user } = setup({ ...BASE, review: [item(1, { duplicateOf: { sourceId: "s9", reason: "Same DOI" } })] });
     await screen.findByText(/Same DOI/);
-    await user.click(screen.getByRole("button", { name: "Merge into the likely duplicate" }));
+    await pressPanel(user, screen.getByRole("button", { name: "Merge into the likely duplicate" }));
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toEqual([{ projectId: P1, decision: { action: "merge", sourceId: "s9" } }]));
   });
 
@@ -297,7 +317,7 @@ describe("Review queue", () => {
     const sourceCalls = () => m.calls.filter((c) => c.method === "GET" && /\/sources\/s\d+$/.test(c.path));
     expect(sourceCalls()[0]!.path).toMatch(/\/sources\/s1$/);
     expect(sourceCalls().length).toBeLessThan(n); // not waiting for the whole queue
-    await user.click(accept);
+    await pressPanel(user, accept);
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toHaveLength(1));
     // Polled (not waitFor, which re-runs on every DOM change of a 2,000-row list).
     for (const end = Date.now() + 30000; sourceCalls().length < n && Date.now() < end; ) await new Promise((r) => setTimeout(r, 100));
@@ -324,12 +344,12 @@ describe("Review queue", () => {
     expect(m.calls.filter((c) => c.path.includes("/sources/")).length).toBe(before);
   });
 
-  it("after a decision, focus moves to the next item", async () => {
+  it("after a decision, focus moves to the next item's heading (R362 d: never to a control that decides)", async () => {
     const { user } = setup();
     await within(await screen.findByRole("region", { name: "Imported record" })).findByText("kinship herat draft");
     screen.getByRole("button", { name: "Accept" }).focus();
     await user.keyboard("{Enter}");
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Show Second paper" })));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Second paper" })));
   });
 
   it("shows hints as user text", async () => {
@@ -377,6 +397,222 @@ describe("Review queue", () => {
     screen.getByRole("button", { name: "Show Second paper" }).focus();
     await user.keyboard("{Enter}");
     await within(screen.getByRole("region", { name: "Imported record" })).findByText("Second paper");
+  });
+});
+
+describe("R362 d (D28): the panel's deciding controls are guarded as the found files' are", () => {
+  const ENTRY = {
+    moved: "Not taken. Look at the entry, then move the pointer and press again.",
+    quiet: "Not taken: the list had just changed. Look at the entry, then press again.",
+  };
+  beforeEach(() => void vi.useFakeTimers({ toFake: ["Date"] }));
+  afterEach(() => void vi.useRealTimers());
+  const passGuard = () => vi.setSystemTime(Date.now() + DECIDE_SETTLE_MS + 1);
+  const decided = (m: ReturnType<typeof mockService>) => m.calls.filter((c) => /^\/review\/r\d+\/decide$/u.test(c.path)).map((c) => c.path);
+  const accept = () => within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" });
+  /** The panel beside the list (its line of a press not taken; the polite region says the same words). */
+  const panel = () => document.querySelector<HTMLElement>(".ao-review__panel")!;
+  const pointer = { x: 1, y: 1 };
+  /** The pointer really moves onto the control (from where it was to a new point). */
+  const moveOver = (el: Element) => {
+    fireEvent.pointerMove(document.body, { pointerType: "mouse", pointerId: 1, clientX: pointer.x, clientY: pointer.y });
+    pointer.x += 3;
+    pointer.y += 2;
+    fireEvent.pointerMove(el, { pointerType: "mouse", pointerId: 1, clientX: pointer.x, clientY: pointer.y });
+  };
+  /** A mouse press where the pointer rests (no movement before it). */
+  const pressBy = (el: Element) => {
+    fireEvent.pointerDown(el, { pointerType: "mouse", button: 0 });
+    fireEvent.pointerUp(el, { pointerType: "mouse", button: 0 });
+    fireEvent.click(el);
+  };
+  const shownTitle = (t: string) => waitFor(() => within(screen.getByRole("region", { name: "Imported record" })).getByText(t));
+  const listenSaid = () => {
+    const said: string[] = [];
+    const region = screen.getAllByRole("status").find((x) => x.classList.contains("ao-visually-hidden"))!;
+    const mo = new MutationObserver((recs) => {
+      for (const r of recs) for (const n of r.addedNodes) if (n.textContent) said.push(n.textContent);
+    });
+    mo.observe(region, { childList: true, subtree: true });
+    return { said, stop: () => mo.disconnect() };
+  };
+  const ready = async () => {
+    await shownTitle("kinship herat draft");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    passGuard();
+  };
+
+  it("two presses at one spot in one moment decide ONE entry: the second falls on the next entry's Accept, which the pointer never moved over", async () => {
+    const { m } = setup();
+    await ready();
+    const first = accept();
+    moveOver(first);
+    pressBy(first);
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    pressBy(accept());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+  });
+
+  it("a second press after the next entry slid in is not taken, and says why (on the panel and in the polite region); after a movement over it, it is taken", async () => {
+    const { m } = setup();
+    await ready();
+    moveOver(accept());
+    pressBy(accept());
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    passGuard();
+    const h = listenSaid();
+    pressBy(accept());
+    await waitFor(() => expect(h.said).toContain(ENTRY.moved));
+    const note = within(panel()).getByText(ENTRY.moved);
+    expect(accept().getAttribute("aria-describedby")).toBe(note.id);
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+    moveOver(accept());
+    pressBy(accept());
+    await waitFor(() => expect(decided(m)).toEqual(["/review/r1/decide", "/review/r2/decide"]));
+    h.stop();
+  });
+
+  it("a key press inside the quiet after the list changed is not taken and says so; after the quiet it is taken", async () => {
+    const { m } = setup();
+    await ready();
+    moveOver(accept());
+    pressBy(accept());
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    const a = accept();
+    a.focus();
+    fireEvent.keyDown(a, { key: "Enter", code: "Enter" });
+    fireEvent.click(a);
+    fireEvent.keyUp(a, { key: "Enter", code: "Enter" });
+    expect(await within(panel()).findByText(ENTRY.quiet)).toBeTruthy();
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+    passGuard();
+    fireEvent.keyDown(a, { key: "Enter", code: "Enter" });
+    fireEvent.click(a);
+    fireEvent.keyUp(a, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(decided(m)).toEqual(["/review/r1/decide", "/review/r2/decide"]));
+  });
+
+  it("Enter held down on Accept decides ONE entry (the repeated keydowns and the clicks a browser makes of them)", async () => {
+    const { m } = setup();
+    await ready();
+    const a = accept();
+    a.focus();
+    fireEvent.keyDown(a, { key: "Enter", code: "Enter" });
+    fireEvent.click(a);
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    passGuard();
+    // The key is still down: its repeats reach whatever holds focus, here the next entry's Accept at the same place.
+    const b = accept();
+    for (let i = 0; i < 5; i++) {
+      fireEvent.keyDown(b, { key: "Enter", code: "Enter", repeat: true });
+      fireEvent.click(b);
+    }
+    fireEvent.keyUp(b, { key: "Enter", code: "Enter" });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+  });
+
+  // ---- R371 d (M1): guards no test held before, each shown by taking it out (see the report) ----
+  const enterOn = (el: HTMLElement) => {
+    el.focus();
+    fireEvent.keyDown(el, { key: "Enter", code: "Enter" });
+    fireEvent.click(el);
+    fireEvent.keyUp(el, { key: "Enter", code: "Enter" });
+  };
+
+  it("R371 d, R318 b: a press swallowed by the panel's quiet starts it again — a key press at 500 ms, then one at 700 ms is still not taken; 600 ms after it, one is", async () => {
+    const { m } = setup();
+    await ready();
+    moveOver(accept());
+    pressBy(accept());
+    await shownTitle("Second paper");
+    await waitFor(() => expect((accept() as HTMLButtonElement).disabled).toBe(false));
+    // The quiet started when the first entry left (the clock stands still until moved).
+    const t0 = Date.now();
+    const a = accept();
+    vi.setSystemTime(t0 + 500);
+    enterOn(a);
+    expect(await within(panel()).findByText(ENTRY.quiet)).toBeTruthy();
+    vi.setSystemTime(t0 + 700);
+    enterOn(a);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+    vi.setSystemTime(t0 + 700 + DECIDE_SETTLE_MS + 1);
+    enterOn(a);
+    await waitFor(() => expect(decided(m)).toEqual(["/review/r1/decide", "/review/r2/decide"]));
+  });
+
+  it("R371 d, R323 a: a scroll forgets the panel's places seen — a real move, a scroll, more than 250 ms, a press without a new move: not taken; after a move it is", async () => {
+    const { m } = setup();
+    await ready();
+    moveOver(accept());
+    fireEvent.scroll(window);
+    vi.setSystemTime(Date.now() + SCROLL_SETTLE_MS + 1);
+    pressBy(accept());
+    expect(await within(panel()).findByText(ENTRY.moved)).toBeTruthy();
+    expect(decided(m)).toEqual([]);
+    moveOver(accept());
+    pressBy(accept());
+    await waitFor(() => expect(decided(m)).toEqual(["/review/r1/decide"]));
+  });
+
+  it("R371 d: a click on a panel control that says it came from a mouse, with no pointer-down before it, is not taken (\"moved\")", async () => {
+    const { m } = setup();
+    await ready();
+    moveOver(accept());
+    const e = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    Object.defineProperty(e, "pointerType", { value: "mouse" });
+    fireEvent(accept(), e);
+    expect(await within(panel()).findByText(ENTRY.moved)).toBeTruthy();
+    expect(decided(m)).toEqual([]);
+    moveOver(accept());
+    pressBy(accept());
+    await waitFor(() => expect(decided(m)).toEqual(["/review/r1/decide"]));
+  });
+
+  it("R371 d: a key press on a panel control clears a stale pointer-down (the mouse went down there and was let go elsewhere): Enter is taken", async () => {
+    const { m } = setup();
+    await ready();
+    fireEvent.pointerDown(accept(), { pointerType: "mouse", button: 0 });
+    fireEvent.pointerUp(document.body, { pointerType: "mouse", button: 0 });
+    enterOn(accept());
+    await waitFor(() => expect(decided(m)).toEqual(["/review/r1/decide"]));
+  });
+
+  it("after a decision focus goes to the next entry's heading, never to a deciding control; after the last, to the message that nothing waits", async () => {
+    const { m } = setup();
+    await ready();
+    const a = accept();
+    a.focus();
+    fireEvent.keyDown(a, { key: "Enter", code: "Enter" });
+    fireEvent.click(a);
+    fireEvent.keyUp(a, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Second paper" })));
+    // One Tab at a time leads on to the controls; the heading itself decides nothing.
+    fireEvent.keyDown(document.activeElement!, { key: "Enter", code: "Enter" });
+    fireEvent.click(document.activeElement!);
+    expect(decided(m)).toEqual(["/review/r1/decide"]);
+    for (const [title, id] of [["Third paper", "r2"]] as const) {
+      passGuard();
+      const b = accept();
+      b.focus();
+      fireEvent.keyDown(b, { key: "Enter", code: "Enter" });
+      fireEvent.click(b);
+      fireEvent.keyUp(b, { key: "Enter", code: "Enter" });
+      await waitFor(() => expect(decided(m)).toContain(`/review/${id}/decide`));
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: title })));
+    }
+    passGuard();
+    const c = accept();
+    c.focus();
+    fireEvent.keyDown(c, { key: "Enter", code: "Enter" });
+    fireEvent.click(c);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByText(/Nothing is waiting for review/)));
   });
 });
 
@@ -1633,6 +1869,121 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       moveOver(u);
       pressBy(u);
       await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+    });
+
+    // ---- R371 d (M1): guards no test held before, each shown by taking it out (see the report) ----
+    /** A key press on the focused control (keydown, the click a browser makes of it, keyup). */
+    const enterOn = (el: HTMLElement) => {
+      el.focus();
+      fireEvent.keyDown(el, { key: "Enter", code: "Enter" });
+      fireEvent.click(el);
+      fireEvent.keyUp(el, { key: "Enter", code: "Enter" });
+    };
+    /** A click whose own event says it came from a mouse, with no pointer-down before it. */
+    const mouseClickOnly = (el: Element) => {
+      const e = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+      Object.defineProperty(e, "pointerType", { value: "mouse" });
+      fireEvent(el, e);
+    };
+
+    it("R371 d, R318 b: a press swallowed by the quiet starts it again — a key press at 500 ms, then one at 700 ms (past the first 600 ms) is still not taken; 600 ms after it, one is", async () => {
+      open(mixed());
+      await waitFor(() => card("Right Two"));
+      // The opening's quiet starts now (the clock stands still until moved).
+      const t0 = Date.now();
+      const u = use("Right One");
+      vi.setSystemTime(t0 + 500);
+      enterOn(u);
+      await waitFor(() => expect(note("Right One")?.textContent).toBe(QUIET_SHOWN));
+      vi.setSystemTime(t0 + 700);
+      enterOn(u);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      vi.setSystemTime(t0 + 700 + DECIDE_SETTLE_MS + 1);
+      enterOn(u);
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+    });
+
+    it("R371 d, R323 a: a scroll forgets the places seen — a real move, a scroll, more than 250 ms, a press without a new move: not taken; after a move it is", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const h = listen();
+      const u = use("Right One");
+      moveOver(u);
+      fireEvent.scroll(window);
+      vi.setSystemTime(Date.now() + SCROLL_SETTLE_MS + 1);
+      pressBy(u);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      expect(h.said).toEqual([MOVED]);
+      moveOver(u);
+      pressBy(u);
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+      h.stop();
+    });
+
+    it("R371 d: a click that says it came from a mouse, with no pointer-down before it, is not taken (check answers \"moved\"); a press with its pointer-down, after a movement, is", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const h = listen();
+      const u = use("Right One");
+      moveOver(u);
+      mouseClickOnly(u);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(heldCalls).toHaveLength(0);
+      expect(h.said).toEqual([MOVED]);
+      moveOver(u);
+      pressBy(u);
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+      h.stop();
+    });
+
+    it("R371 d: a key press clears a stale pointer-down — the mouse went down on the control and was let go elsewhere; then Enter on it is taken as a key's press", async () => {
+      open(mixed());
+      await ready("Right Two");
+      const u = use("Right One");
+      fireEvent.pointerDown(u, { pointerType: "mouse", button: 0 });
+      fireEvent.pointerUp(document.body, { pointerType: "mouse", button: 0 });
+      enterOn(u);
+      await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r8"]));
+    });
+
+    it("R371 d (panel): the panel forgets the places seen when the list is read again while the same entry stays shown — a press under the resting pointer is not taken; after a move it is", async () => {
+      const o = project();
+      o.projectReview = { [P1]: [item(1, { batchId: undefined, title: "Dropped file" }), rightItem(8, "Right One")] };
+      o.sources = { s1: source(1, "Dropped file"), s8: source(8, "Right One") };
+      o.extra = [http.post(`${SERVICE}/review/:itemId/held-file`, () => new Promise<Response>(() => {}))];
+      const { m } = open(o);
+      await ready("Right One");
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      await waitFor(() => expect((accept as HTMLButtonElement).disabled).toBe(false));
+      moveOver(accept);
+      const reads = () => m.calls.filter((c) => c.method === "GET" && c.path.startsWith(`/projects/${P1}/review`)).length;
+      const readsBefore = reads();
+      refake(["setTimeout", "clearTimeout", "Date"]);
+      try {
+        // A found file's decision with no answer is given up, and the queue is read again (R313 e).
+        enterOn(use("Right One"));
+        await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+      } finally {
+        vi.useRealTimers();
+        vi.useFakeTimers({ toFake: ["Date"] });
+      }
+      await waitFor(() => expect(reads()).toBeGreaterThan(readsBefore));
+      // The same entry is shown, its Accept where it stood.
+      await waitFor(() => expect(within(screen.getByRole("region", { name: "Imported record" })).getByText("Dropped file")).toBeTruthy());
+      const again = screen.getByRole("button", { name: "Accept" });
+      await waitFor(() => expect((again as HTMLButtonElement).disabled).toBe(false));
+      passGuard();
+      const h = listen();
+      pressBy(again);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(m.calls.filter((c) => c.path === "/review/r1/decide")).toHaveLength(0);
+      expect(h.said).toEqual(["Not taken. Look at the entry, then move the pointer and press again."]);
+      moveOver(again);
+      pressBy(again);
+      await waitFor(() => expect(m.calls.filter((c) => c.path === "/review/r1/decide")).toHaveLength(1));
+      h.stop();
     });
 
     const MOVED_SHOWN = MOVED;

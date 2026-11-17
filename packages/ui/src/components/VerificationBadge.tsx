@@ -85,13 +85,34 @@ export interface FieldCheckProps {
   onConfirm: (field: string, value: unknown) => Promise<void>;
 }
 
-/** The badge and, while open, its evidence popover. */
+/**
+ * The badge and, while open, its evidence popover. The keys down on the badge when it opens the
+ * popover (Enter opens it on its keydown) are handed to it, so they count there only once released
+ * (R371 a).
+ */
 export function FieldCheck({ review, label, value, readOnly, onConfirm }: FieldCheckProps) {
   const [open, setOpen] = useState(false);
   const badge = useRef<HTMLButtonElement>(null);
+  const down = useRef(new Set<string>());
+  const [heldAtOpen, setHeldAtOpen] = useState<string[]>([]);
   return (
-    <span className="ao-verify-wrap">
-      <VerificationBadge review={review} label={label} expanded={open} onOpen={() => setOpen((o) => !o)} buttonRef={badge} />
+    <span
+      className="ao-verify-wrap"
+      onKeyDown={(e) => {
+        if (e.target === badge.current) down.current.add(e.key);
+      }}
+      onKeyUp={(e) => {
+        down.current.delete(e.key);
+      }}
+      onBlur={(e) => {
+        // A key released elsewhere is not seen here: what was down is forgotten when the badge loses focus.
+        if (e.target === badge.current) down.current.clear();
+      }}
+    >
+      <VerificationBadge review={review} label={label} expanded={open} onOpen={() => {
+          setHeldAtOpen([...down.current]);
+          setOpen((o) => !o);
+        }} buttonRef={badge} />
       {open && (
         <FieldEvidencePopover
           review={review}
@@ -99,6 +120,7 @@ export function FieldCheck({ review, label, value, readOnly, onConfirm }: FieldC
           value={value}
           readOnly={readOnly}
           onConfirm={onConfirm}
+          heldAtOpen={heldAtOpen}
           onClose={() => {
             setOpen(false);
             // After the popover is gone (its own focus restore runs first).

@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
 import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR } from "./paths.js";
+import { pressByMouse, SCROLL_SETTLE_MS } from "./press.js";
 
 /** Types paths into the drop area ("Attach files…") and waits for the attach outcome list. */
 async function attachByTyping(page: Page, paths: string[]): Promise<void> {
@@ -61,7 +62,8 @@ test("a file attached by drag and drop that needs review: the badge leads to the
   await test.step("decide it (Accept): it leaves the queue", async () => {
     const decide = page.getByRole("group", { name: "Decide this item" });
     await expect(decide.getByRole("button", { name: "Accept" })).toBeEnabled({ timeout: 30_000 });
-    await decide.getByRole("button", { name: "Accept" }).click();
+    // R362 d: the panel takes a mouse press only where the pointer really moved over the control (as a researcher's does).
+    await pressByMouse(page, decide.getByRole("button", { name: "Accept" }));
     await expect(page.getByText("Nothing is waiting for review for this source.")).toBeVisible();
   });
 
@@ -231,3 +233,169 @@ test("D19 (R190): a conflict a later check finds on an existing source puts it i
     await expect(page.getByRole("button", { name: "Title: Conflict" })).toBeVisible();
   });
 });
+
+/**
+ * D28 (R362 d; R313, R318, R319, R322): in the queue's panel for its other kinds of entry, a decision never lands on an
+ * entry the researcher has not seen. After a decision the next entry is shown in the place of the one decided, so its
+ * "Accept" stands where the last one stood: a second press at the same spot — a double click, a steady rhythm without
+ * moving the pointer, a held Enter, Enter pressed again quickly — must not decide it. Each rhythm runs on its own queue
+ * of four entries attached by hand (each needs review in a project without lookups); after the rhythm exactly ONE entry
+ * is decided — the one shown when the first press came — and the other three still wait, read from the service.
+ *
+ * The rhythms are what is proved, so they are timed (R173's exception, as find-copies.spec.ts's scenario 6): a press at
+ * one spot every 150, 400 and 700 ms for about three seconds. The first press of each is a researcher's (`pressByMouse`:
+ * the pointer moved onto the control at rest, or the control focused for a key).
+ *
+ * R371 e — what each engine proves. In WebKit the next entry's "Accept" stands 18 px HIGHER than the one decided (the
+ * panel above it is laid out shorter there; Chromium puts it at the same place), so a pointer resting at the middle of
+ * the first "Accept" rests just below the next one: the old code (before R362 d) decided ONE entry in WebKit at every
+ * rhythm pressed at the middle, and those rhythms prove the guard only in Chromium. The rhythms "near the top edge"
+ * rest the pointer 6 px below the top of "Accept", inside both places: there the old code decided EVERY entry in both
+ * engines (four of four, at 150 and at 700 ms, in WebKit and in Chromium), so they prove the guard in WebKit too. By key,
+ * the old code also decided one (its focus went to the next row's "Show"). The last step of each scenario proves that
+ * a deliberate press after a real movement IS taken (no over-refusal); the guard's every rule is also proven,
+ * engine-neutrally, by the unit tests (ReviewQueue.test.tsx).
+ */
+const PANEL_TITLES = ["Salt Roads of the Upper Delta", "Ferry Songs at Low Water", "Market Days in Reed Villages", "Weirs and Their Keepers"];
+
+/** Four entries waiting, attached by hand through the service; the queue opened. Returns the project and the entries' ids in queue order. */
+async function fourWaiting(page: Page, app: AppHarness, library: string): Promise<{ projectId: string; ids: string[] }> {
+  const { projectId } = await libraryWithProject(app, page, { library, project: "Delta study" });
+  mkdirSync(join(app.root, "sources"), { recursive: true });
+  const paths: string[] = [];
+  for (const [k, title] of PANEL_TITLES.entries()) {
+    const p = join(app.root, "sources", `panel-${k}.pdf`);
+    writeFileSync(p, await buildPdf({ title, author: "Ana Souza", lines: [`${title}.`] }));
+    paths.push(p);
+  }
+  const attached = await app.api("POST", `/projects/${encodeURIComponent(projectId)}/attach`, { paths });
+  expect(attached.status, JSON.stringify(attached.body)).toBe(200);
+  const ids = await waitingIds(app, projectId);
+  expect(ids).toHaveLength(4);
+  await page.goto(`${APP_ORIGIN}/import/review?project=${encodeURIComponent(projectId)}`);
+  await expect(page.getByRole("heading", { level: 1, name: "Review queue" })).toBeVisible();
+  await expect(page.getByText("4 entries are waiting in this project.")).toBeVisible({ timeout: 60_000 });
+  await expect(accept(page)).toBeEnabled({ timeout: 60_000 });
+  return { projectId, ids };
+}
+
+/** The ids of the entries the service lists as waiting, in its order. */
+async function waitingIds(app: AppHarness, projectId: string): Promise<string[]> {
+  const r = await app.api<{ items: Array<{ id: string }> }>("GET", `/projects/${encodeURIComponent(projectId)}/review?limit=50`);
+  expect(r.status).toBe(200);
+  return r.body.items.map((i) => i.id);
+}
+
+const accept = (page: Page) => page.getByRole("group", { name: "Decide this item" }).getByRole("button", { name: "Accept" });
+
+/** Presses at one spot, without moving the pointer, every `ms` for about three seconds. */
+async function steady(page: Page, at: { x: number; y: number }, ms: number): Promise<void> {
+  const n = Math.max(4, Math.round(3000 / ms));
+  for (let i = 0; i < n; i++) {
+    await page.waitForTimeout(ms); // the rhythm is what is proved
+    await page.mouse.down();
+    await page.mouse.up();
+  }
+}
+
+/**
+ * As `pressByMouse` (press.ts) — the control brought into view, the page at rest (the same place on two looks more than
+ * SCROLL_SETTLE_MS apart), the pointer moved beside it and onto it, then pressed — but the
+ * pointer comes to rest `dy` px below the control's top edge (R371 e: inside the place of the next entry's "Accept" too).
+ */
+async function pressByMouseNearTop(page: Page, control: ReturnType<Page["getByRole"]>, dy = 6): Promise<{ x: number; y: number }> {
+  await control.scrollIntoViewIfNeeded();
+  await expect(control).toBeVisible();
+  let last = "";
+  await expect
+    .poll(
+      async () => {
+        const b = await control.boundingBox();
+        const at = JSON.stringify(b && [Math.round(b.x), Math.round(b.y)]);
+        const settled = b !== null && at === last;
+        last = at;
+        return settled;
+      },
+      { timeout: 60_000, intervals: [SCROLL_SETTLE_MS + 100] },
+    )
+    .toBe(true);
+  const box = (await control.boundingBox())!;
+  const x = box.x + box.width / 2;
+  const y = box.y + dy;
+  await page.mouse.move(Math.max(1, box.x - 30), y + 40);
+  await page.mouse.move(x, y, { steps: 3 });
+  await page.mouse.down();
+  await page.mouse.up();
+  return { x, y };
+}
+
+const RHYTHMS: Array<{ name: string; press(page: Page): Promise<void> }> = [
+  {
+    name: "a double click on Accept",
+    press: async (page) => {
+      await pressByMouse(page, accept(page));
+      // The second press of a double click, at once, at the same place.
+      await page.mouse.down({ clickCount: 2 });
+      await page.mouse.up({ clickCount: 2 });
+    },
+  },
+  { name: "a click every 150 ms without moving the pointer", press: async (page) => steady(page, await pressByMouse(page, accept(page)), 150) },
+  { name: "a click every 400 ms without moving the pointer", press: async (page) => steady(page, await pressByMouse(page, accept(page)), 400) },
+  { name: "a click every 700 ms without moving the pointer", press: async (page) => steady(page, await pressByMouse(page, accept(page)), 700) },
+  // R371 e: the pointer near Accept's top edge, where the next entry's Accept stands in WebKit too.
+  { name: "a click every 150 ms near the top edge of Accept without moving the pointer", press: async (page) => steady(page, await pressByMouseNearTop(page, accept(page)), 150) },
+  { name: "a click every 700 ms near the top edge of Accept without moving the pointer", press: async (page) => steady(page, await pressByMouseNearTop(page, accept(page)), 700) },
+  {
+    name: "Enter held for a second",
+    press: async (page) => {
+      await accept(page).focus();
+      await expect(accept(page)).toBeFocused();
+      await page.keyboard.down("Enter");
+      // Held: the key repeats (keydown with repeat set) about thirty times a second.
+      for (let i = 0; i < 30; i++) {
+        await page.waitForTimeout(33);
+        await page.keyboard.down("Enter");
+      }
+      await page.keyboard.up("Enter");
+    },
+  },
+  {
+    name: "Enter pressed three times quickly",
+    press: async (page) => {
+      await accept(page).focus();
+      await expect(accept(page)).toBeFocused();
+      for (let i = 0; i < 3; i++) await page.keyboard.press("Enter");
+    },
+  },
+];
+
+for (const [k, rhythm] of RHYTHMS.entries()) {
+  test(`D28 (R362 d): in the queue's panel, ${rhythm.name} decides exactly ONE entry; the others still wait`, async ({ page, app }) => {
+    test.setTimeout(180_000);
+    let projectId = "";
+    let ids: string[] = [];
+    await test.step("set-up: four entries attached by hand wait in the queue; the panel shows the first", async () => {
+      ({ projectId, ids } = await fourWaiting(page, app, `Panel library ${k + 1}`));
+    });
+
+    await test.step(rhythm.name, async () => {
+      await rhythm.press(page);
+      // The screen has shown the decision (the next entry in the panel), then any press still in flight has landed.
+      await expect(page.getByText("4 entries are waiting in this project.")).toHaveCount(0, { timeout: 60_000 });
+      await page.waitForTimeout(1500);
+    });
+
+    await test.step("exactly one entry is decided — the one shown at the first press — and the other three still wait (the service's state)", async () => {
+      expect(await waitingIds(app, projectId)).toEqual(ids.slice(1));
+      await expect(page.getByText("3 entries are waiting in this project.")).toBeVisible();
+      // By key, focus went to the next entry's heading, never to a control that decides (R313 a).
+      if (rhythm.name.startsWith("Enter")) await expect(page.locator(".ao-review__panel h3.ao-review__title")).toBeFocused();
+    });
+
+    await test.step("the pointer moved onto the next entry's Accept and pressed (the quiet long past): that entry is decided", async () => {
+      await pressByMouse(page, accept(page));
+      await expect(page.getByText("2 entries are waiting in this project.")).toBeVisible({ timeout: 60_000 });
+      expect(await waitingIds(app, projectId)).toEqual(ids.slice(2));
+    });
+  });
+}
