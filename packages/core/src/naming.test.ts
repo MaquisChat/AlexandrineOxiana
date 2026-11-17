@@ -466,3 +466,56 @@ describe("pseudonymize: linear with Hangul names (R380)", () => {
     expect(out).toContain(" P-999씨와의 대화");
   });
 });
+
+describe("R387 (a): a name with an invisible character inside it (C1 of the FR-A10 review)", () => {
+  // The map as sources.ts builds it for the creator Lucía Fernández.
+  const lucia = new Map([
+    ["Lucía", "P-002"],
+    ["Fernández", "P-002"],
+    ["Lucía Fernández", "P-002"],
+  ]);
+  const folder = (title: string, map: ReadonlyMap<string, string>) =>
+    sourceFolderName({ dateOrYear: "2026", primaryCreator: "P-002", shortTitle: pseudonymize(title, map), shortId: "ab12" });
+
+  it("bidi embeddings and isolates inside the name: the folder holds the code and no part of the name", () => {
+    const t = "Entrevista a Lu‪cía Fer⁦nández";
+    expect(pseudonymize(t, lucia)).toBe("Entrevista a P-002");
+    const f = folder(t, lucia);
+    expect(f).toBe("2026 P-002 - Entrevista a P-002 [ab12]");
+    expect(f).not.toContain("Luc");
+    expect(f).not.toContain("Fern");
+  });
+
+  it("a left-to-right mark and a soft hyphen inside the name", () => {
+    for (const t of ["Entrevista a Luc‎ía Fernández", "Entrevista a Luc­ía Fernández"]) {
+      expect(pseudonymize(t, lucia), JSON.stringify(t)).toBe("Entrevista a P-002");
+      const f = folder(t, lucia);
+      expect(f).not.toContain("Luc");
+      expect(f).not.toContain("Fern");
+    }
+  });
+
+  it("a zero-width space, joiner, word joiner or mark inside 'Maria'; an RLO-reversed 'airaM'", () => {
+    const map = new Map([["Maria", "P-001"]]);
+    for (const m of ["Ma­ria", "Ma​ria", "Ma‍ria", "Ma⁠ria", "Mar‎ia", "Ma﻿ria", "Ma᠎ria"]) {
+      expect(pseudonymize(`Interview with ${m} today`, map), JSON.stringify(m)).toBe("Interview with P-001 today");
+      expect(folder(`Interview with ${m}`, map)).not.toMatch(/ria/u);
+    }
+    const reversed = pseudonymize("Interview with ‮airaM‬ today", map);
+    expect(reversed).not.toMatch(/aira/iu);
+    expect(folder("Interview with ‮airaM‬", map)).not.toMatch(/aira/iu);
+  });
+
+  it("a Devanagari conjunct with a ZWJ, a Persian name with a ZWNJ, a bidi-wrapped handle", () => {
+    expect(pseudonymize("क्‍षमा का साक्षात्कार", new Map([["क्षमा", "P-003"]]))).toBe("P-003 का साक्षात्कार");
+    expect(pseudonymize("گفتگو با علی‌رضا", new Map([["علیرضا", "P-004"]]))).toBe("گفتگو با P-004");
+    expect(pseudonymize("گفتگو با علیرضا", new Map([["علی‌رضا", "P-004"]]))).toBe("گفتگو با P-004");
+    expect(pseudonymize("Video by ⁨@maria.cocina⁩", new Map([["@maria.cocina", "P-005"]]))).toBe("Video by P-005");
+  });
+
+  it("the Hangul filler and the halfwidth filler inside a Hangul name fold away too", () => {
+    const map = new Map([["김민수", "P-006"]]);
+    expect(pseudonymize("김ㅤ민수의 인터뷰", map)).toBe("P-006의 인터뷰");
+    expect(pseudonymize("김ﾠ민수 인터뷰", map)).toBe("P-006 인터뷰");
+  });
+});

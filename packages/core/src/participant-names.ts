@@ -25,15 +25,29 @@
  */
 import { NO_SPACE_SCRIPT } from "./verify/evidence.js";
 
+const IGNORABLE_ONE = /^\p{Default_Ignorable_Code_Point}$/u;
 const isNoSpace = (ch: string | undefined): boolean => ch !== undefined && NO_SPACE_SCRIPT.test(ch);
 
 /** Letters NFKD leaves whole, spelled the way names are commonly written without them (R89). */
 const TRANSLIT: Readonly<Record<string, string>> = {
   ł: "l", Ł: "L", ø: "o", Ø: "O", đ: "d", Đ: "D", ß: "ss", ẞ: "SS", æ: "ae", Æ: "AE", œ: "oe", Œ: "OE", þ: "th", Þ: "TH", ı: "i",
 };
-/** Name comparison key: those letters transliterated, then NFKD, combining marks removed, lowercase. */
+/**
+ * Characters Unicode marks "default ignorable" (R387 a): invisible when shown — the soft hyphen,
+ * U+200B–U+200F, U+202A–U+202E, U+2060–U+206F, U+FEFF, the Mongolian vowel separator, variation
+ * selectors, the Hangul fillers. They fold to nothing, so a name with one inside it is one word
+ * again. The Hangul fillers (U+115F, U+1160, U+3164, U+FFA0) go too: NFKD of a written syllable
+ * never gives one, so the Korean rule (R380), which reads syllables from NFKD, never needs them,
+ * and a filler typed inside a name ("김\u3164민수") must not split it.
+ */
+const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+/**
+ * Name comparison key: default-ignorable characters removed, ł ø đ ß æ œ þ ı transliterated, then
+ * NFKD, combining marks removed, lowercase.
+ */
 export const fold = (s: string): string =>
   s
+    .replace(IGNORABLE, "")
     .replace(/[łŁøØđĐßẞæÆœŒþÞı]/gu, (c) => TRANSLIT[c] ?? c)
     .normalize("NFKD")
     .replace(/\p{M}+/gu, "")
@@ -275,8 +289,66 @@ interface Hit {
   code: string;
 }
 
+/** A bidi override (LRO, RLO) and where its effect ends (PDF, a new line, the end of the text). */
+const OVERRIDE = /[\u202D\u202E]([^\u202C\n\r]*)/gu;
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/**
+ * Text inside a bidi override is shown in the order the override forces, so "\u202EairaM" shows as
+ * "Maria" (R387 a). Each override's content is also read reversed (by grapheme), and a name found
+ * there is replaced over the original characters it covers. Reversing a region whose content was
+ * already in reading order only yields text that is not a name, or that is one reversed (the safe side).
+ */
+function overrideHits(text: string, find: (t: string) => Hit[]): Hit[] {
+  const out: Hit[] = [];
+  for (const m of text.matchAll(OVERRIDE)) {
+    const base = m.index + 1;
+    const segs = [...graphemes.segment(m[1]!)].reverse();
+    let rev = "";
+    const starts: number[] = []; // per reversed grapheme: [start in rev, original start, original end]
+    const origS: number[] = [];
+    const origE: number[] = [];
+    for (const g of segs) {
+      starts.push(rev.length);
+      origS.push(base + g.index);
+      origE.push(base + g.index + g.segment.length);
+      rev += g.segment;
+    }
+    const at = (i: number): number => {
+      let lo = 0;
+      let hi = starts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (starts[mid]! <= i) lo = mid;
+        else hi = mid - 1;
+      }
+      return lo;
+    };
+    for (const h of find(rev)) {
+      const a = at(h.start);
+      const b = at(h.end - 1);
+      out.push({ start: Math.min(origS[a]!, origS[b]!), end: Math.max(origE[a]!, origE[b]!), code: h.code });
+    }
+  }
+  return out;
+}
+
+/** Hits of `extra` that overlap none of `hits`, merged in, left to right. */
+function mergeHits(hits: Hit[], extra: Hit[]): Hit[] {
+  if (extra.length === 0) return hits;
+  const all = [...hits];
+  for (const e of extra) if (!all.some((h) => h.start < e.end && e.start < h.end)) all.push(e);
+  return all.sort((x, y) => x.start - y.start);
+}
+
 /** The non-overlapping matches, left to right, longest first at each position. Linear in the text. */
 function findAll(text: string, forms: readonly NameForm[], opts: ScrubOptions, firstOnly: boolean): Hit[] {
+  const hits = findPlain(text, forms, opts, firstOnly);
+  if ((firstOnly && hits.length) || !/[\u202D\u202E]/u.test(text)) return hits;
+  return mergeHits(hits, overrideHits(text, (t) => findPlain(t, forms, opts, firstOnly)));
+}
+
+function findPlain(text: string, forms: readonly NameForm[], opts: ScrubOptions, firstOnly: boolean): Hit[] {
   if (forms.length === 0) return [];
   const { byFirst, prefixes, maxPrefix } = patterns(forms, opts);
   if (byFirst.size === 0) return [];
@@ -341,7 +413,8 @@ export function scrubNames(text: string, forms: readonly NameForm[], opts: Scrub
   let pos = 0;
   for (const h of hits) {
     let start = h.start;
-    while (start > pos && text[start - 1] === "@") start--;
+    // An "@" in front goes with the name, and so do invisible characters around it (a bidi isolate).
+    while (start > pos && (text[start - 1] === "@" || IGNORABLE_ONE.test(text[start - 1]!))) start--;
     out += text.slice(pos, start) + h.code;
     pos = h.end;
   }

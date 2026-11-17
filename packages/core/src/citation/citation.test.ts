@@ -794,3 +794,36 @@ describe("toCslItem: linear in the title (FR-A10)", () => {
     expect(item.URL).toBeDefined();
   });
 });
+
+describe("R387 (a): a name with an invisible character inside it (C1 of the FR-A10 review)", () => {
+  const LUCIA = new Map([["Lucía", "P-002"], ["Fernández", "P-002"], ["Lucía Fernández", "P-002"]]);
+  const story = (title: string, url?: string) =>
+    source("article-journal", mt(["es", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }], url ? { identifiers: { url } } : {});
+  const title = (t: string, map: ReadonlyMap<string, string>) => toCslItem(story(t), { ...OPTS, pseudonyms: map }).title;
+
+  it("bidi controls, a mark and a soft hyphen inside the name, in the title", () => {
+    expect(title("Entrevista a Lu‪cía Fer⁦nández", LUCIA)).toBe("Entrevista a P-002");
+    expect(title("Entrevista a Luc‎ía Fernández", LUCIA)).toBe("Entrevista a P-002");
+    expect(title("Entrevista a Luc­ía Fernández", LUCIA)).toBe("Entrevista a P-002");
+    const map = new Map([["Maria", "P-001"]]);
+    for (const m of ["Ma­ria", "Ma​ria", "Ma‍ria", "Ma⁠ria", "Mar‎ia"]) expect(title(`Interview with ${m} today`, map), JSON.stringify(m)).toBe("Interview with P-001 today");
+    expect(title("Interview with ‮airaM‬ today", map)).not.toMatch(/aira/iu);
+  });
+
+  it("a creator whose name holds an invisible character is coded, and the title too", () => {
+    const sf = source("interview", mt(["es", "original", "Entrevista a Luc­ía Fernández"]), [{ role: "interviewee", given: "Luc­ía", family: "Fernández" }], { participantIds: [PARTICIPANT.id] });
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: new Map([["Lucía Fernández", "P-002"]]) });
+    expect(item.author).toEqual([{ literal: "P-002" }]);
+    expect(item.title).toBe("Entrevista a P-002");
+  });
+
+  it("the address with a soft hyphen (Ma%C2%ADria-Lopez) is dropped", () => {
+    expect(toCslItem(story("A story", "https://news.example/Ma%C2%ADria-Lopez"), { ...OPTS, pseudonyms: new Map([["Maria Lopez", "P-003"]]) }).URL).toBeUndefined();
+  });
+
+  it("Devanagari with a ZWJ, Persian with a ZWNJ against the entry without it, a bidi-wrapped handle", () => {
+    expect(title("क्‍षमा का साक्षात्कार", new Map([["क्षमा", "P-003"]]))).toBe("P-003 का साक्षात्कार");
+    expect(title("گفتگو با علی‌رضا", new Map([["علیرضا", "P-004"]]))).toBe("گفتگو با P-004");
+    expect(title("Video by ⁨@maria.cocina⁩", new Map([["@maria.cocina", "P-005"]]))).toBe("Video by P-005");
+  });
+});
