@@ -68,8 +68,14 @@ export function fitSentence(copyBytes: number, dbBytes: number, freeBytes: numbe
 
 /** R413 b: the note of a batch stopped by a full disk (or a quota). */
 export const DISK_FULL_NOTE = "The import stopped because the disk is full. Free some space, then resume the import.";
-/** R413 c: the note of a batch stopped because the project refuses every write (an earlier change could not be undone). */
-export const RECOVERY_NOTE = "The import stopped because an earlier change in this project could not be undone. Open the project's notices, settle it, then resume the import.";
+/**
+ * R436 d (correcting R413 c): the note of a batch that stopped with its project refusing every write because a change
+ * could not be undone, whatever error stopped it. Reopening the library finishes that undo.
+ */
+export const RECOVERY_NOTE = "The import stopped because an earlier change in this project could not be undone. Close and reopen the library, then resume the import.";
+/** R436 d: the same after a full disk (or a quota): the change the full disk stopped is the one that could not be undone. */
+export const DISK_FULL_UNDONE_NOTE =
+  "The import stopped because the disk is full, and its last change could not be undone. Free some space, close and reopen the library, then resume the import.";
 
 /** R413 b: no room for an item's files (FILE_MARGIN kept): the batch stops as for a full disk, before anything of the item is written. */
 export class NoRoomError extends Error {

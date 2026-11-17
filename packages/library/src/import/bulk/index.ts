@@ -60,4 +60,4 @@ export type { UndoKept, UndoResult } from "./undo.js";
 export { adapterFor, folderAdapter, zipAdapter } from "./scan.js";
 export type { ImportSourceAdapter, ScanContext, ScanFile, ScanItem } from "./scan.js";
 export { PATTERN_BUDGET_MS } from "./patterns.js";
-export { DISK_FULL_NOTE, RECOVERY_NOTE, bulkSpaceSeams } from "./space.js";
+export { DISK_FULL_NOTE, DISK_FULL_UNDONE_NOTE, RECOVERY_NOTE, bulkSpaceSeams } from "./space.js";

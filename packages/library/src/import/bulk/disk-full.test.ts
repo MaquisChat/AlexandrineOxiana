@@ -472,3 +472,59 @@ describe("a full disk during the scan stops the batch too (R436 a)", () => {
     expect(lines.filter((e) => e.outcome === "created" || e.outcome === "needs-review").length).toBeGreaterThan(0);
   });
 });
+
+describe("the stop sentences name what exists when a change could not be undone (R436 d)", () => {
+  const FULL_UNDONE = "The import stopped because the disk is full, and its last change could not be undone. Free some space, close and reopen the library, then resume the import.";
+  const REFUSING = "The import stopped because an earlier change in this project could not be undone. Close and reopen the library, then resume the import.";
+
+  /** Closes and reopens the library (the open finishes the rollback the session could not). */
+  async function reopen(): Promise<void> {
+    delete seams.failUndo;
+    handle.close();
+    await lib.close();
+    await open(await openLibrary(join(tmp, "Lib"), deps()));
+  }
+
+  it("a full disk whose change cannot be undone: the sentence says to close and reopen; reopened, a resume imports every item once (the review's P4)", async () => {
+    const p = await project();
+    const keys = KEYS.map((k) => `x.zip!/${k}`);
+    const h = await bulk.startBatch(
+      p.id,
+      adapter(keys.map(item), (n) => {
+        if (n === 1) {
+          faults.singleInside = 1; // the second item's change fails for a full disk…
+          seams.failUndo = "dir"; // …and its undo cannot write either
+        }
+      }),
+    );
+    const res = await h.done;
+    expect(res.state).toBe("failed");
+    expect(res.counts.failed).toBe(0);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.notes).toContain(FULL_UNDONE);
+    expect(report.notes).not.toContain(DISK_FULL_NOTE);
+    expect(report.failures).toEqual([]);
+    // What the sentence says is what works: the library closed and reopened, the import resumed.
+    await reopen();
+    await resumedAll(p, h, adapter(keys.map(item)), keys);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).not.toContain(FULL_UNDONE);
+  });
+
+  it("a project that refuses writes from the batch's first item: the other sentence; reopened, a resume imports every item once", async () => {
+    const p = await project();
+    // The first group's change fails (not for room) and its undo cannot write: from then on the project refuses
+    // every write, and the first item, taken again on its own, meets that refusal.
+    faults.groupOther = 1;
+    seams.failUndo = "dir";
+    const h = await bulk.startBatch(p.id, adapter(KEYS.map(item)));
+    const res = await h.done;
+    expect(res.state).toBe("failed");
+    expect(res.counts.failed).toBe(0);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.notes).toContain(REFUSING);
+    expect(report.failures).toEqual([]);
+    await reopen();
+    await resumedAll(p, h, adapter(KEYS.map(item)), KEYS);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).not.toContain(REFUSING);
+  });
+});

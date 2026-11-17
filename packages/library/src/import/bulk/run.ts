@@ -101,6 +101,7 @@ import {
   type Repo,
   projectDateZone,
   repoClock,
+  recoveryPendingProjects,
 } from "../../repo/repo.js";
 import { activeTemp } from "../../tmp-registry.js";
 import { acceptedType } from "../attach.js";
@@ -146,7 +147,7 @@ import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRe
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
-import { DISK_FULL_NOTE, NoRoomError, RECOVERY_NOTE, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir, type ScanApprovals } from "./space.js";
+import { DISK_FULL_NOTE, DISK_FULL_UNDONE_NOTE, NoRoomError, RECOVERY_NOTE, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir, type ScanApprovals } from "./space.js";
 import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = libraryVersion();
@@ -1039,8 +1040,15 @@ class Run {
       if (this.cancelled && (err as Error)?.name === "AbortError") state = "cancelled";
       else {
         state = "failed";
+        // R436 d: a project left refusing every write (a change could not be undone) is what must be settled first,
+        // whatever stopped the run: the note says so, and how (closing and reopening the library finishes the undo).
+        const refusing = recoveryPendingProjects(this.repo).includes(this.projectId);
         this.note(
-          err instanceof ProjectLockedError
+          refusing
+            ? isDiskFull(err)
+              ? DISK_FULL_UNDONE_NOTE
+              : RECOVERY_NOTE
+            : err instanceof ProjectLockedError
             ? "The project was locked during the import; unlock it and resume the batch."
             : err instanceof BatchRefusedError || err instanceof PolicyDeniedError
               ? err.reason
