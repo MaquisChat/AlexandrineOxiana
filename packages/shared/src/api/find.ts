@@ -89,6 +89,9 @@ export const FIND_REASON_CODES = [
   // record was removed from the library ("no-open-copy", removal only); the rules' STORE part (or a missing legal
   // basis) refused the file (the entry stays "record-complete", woken when the rules are saved, and "Try again").
   "copy-some-unreachable",
+  // R379 (FR-A17): offers were found but none could be downloaded, at least one for a passing reason (a time-out, the
+  // network, a 429 or a 5xx): tried again by itself like an unreachable lookup, then "no-open-copy" with "Try again".
+  "copy-not-downloaded",
   "record-removed",
   "copy-store-not-allowed",
   "copy-no-legal-basis",
@@ -129,6 +132,7 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "file-other-kind": "The file looks like another kind of document (a review, a reply, a correction or a supplement), not the work itself.",
   "file-looks-right": "This looks like the right file. Check it, then use it.",
   "copy-some-unreachable": "Some services could not be reached, so a free copy may still exist. “Try again” looks again.",
+  "copy-not-downloaded": "A free copy was found, but it could not be downloaded just now. Try again later, or open one of the links.",
   "record-removed": "The record was removed from the library.",
   "copy-store-not-allowed": "This project's rules do not allow storing the file found for this record.",
   "copy-no-legal-basis": "This project's rules need a legal basis to store the file found for this record, and the record has none.",

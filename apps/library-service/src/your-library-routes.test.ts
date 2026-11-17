@@ -409,6 +409,26 @@ describe("the queue's view: Where to get it, and whether a start is offered (R32
     // The library's address is never in the view.
     errorBodies.push(JSON.stringify(await queue(pid)).replaceAll(DOI, "<doi>"));
   });
+
+  it("R379 (FR-A17): a copy found but not downloaded: the view carries its reason (its own sentence) and its links, a start is offered, and Try again is accepted", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const free = { label: "A free copy may be at" as const, url: "https://repository.example.org/a.pdf", host: "repository.example.org" };
+    const e = await resting(pid, { state: "no-open-copy", reason: { code: "copy-not-downloaded" }, offers: [free] });
+    const plain = await resting(pid, { state: "no-open-copy", offers: [free] });
+    await setLibrary();
+    const v = await view(pid, e.id);
+    expect(v).toMatchObject({ state: "no-open-copy", reason: { code: "copy-not-downloaded" }, library: { canStart: true } });
+    expect(v.offers!.map((o) => o.label)).toContain("A free copy may be at");
+    expect(FIND_REASON_TEXT[v.reason!.code]).toBe("A free copy was found, but it could not be downloaded just now. Try again later, or open one of the links.");
+    const r = await call({ method: "POST", url: `/projects/${pid}/find/${e.id}/retry` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toMatchObject({ id: e.id, state: "looking-for-copy" });
+    expect(r.json.reason).toBeUndefined();
+    // A plain "no open copy" (every offer refused for good) is still not tried again.
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${plain.id}/retry` })).status).toBe(409);
+  });
 });
 
 describe("R328 e: the queue's read reads a record only when it changed", () => {

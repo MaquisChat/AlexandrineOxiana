@@ -80,7 +80,7 @@ import type { AcquiredFrom, SourceFile } from "@ao/core";
 import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
 import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, sourceHasFile, type HeldFileFacts } from "../repo/review.js";
 import type { WorkCandidate } from "./candidates.js";
-import { FETCH_FILE_DEADLINE_MS, FetchFileError, fetchFile, fileTypeByBytes, holdFindTemp } from "./fetch-file.js";
+import { FETCH_FILE_DEADLINE_MS, FetchFileError, downloadFailurePasses, fetchFile, fileTypeByBytes, holdFindTemp } from "./fetch-file.js";
 import { checkFileAgainstRecord, type FileCheckResult } from "./file-check.js";
 import { FREE_COPY_ELSEWHERE_MAX, FREE_COPY_MAX_BYTES, FREE_COPY_SOURCES, findFreeCopies, type CopyOffer, type FreeCopySource } from "./free-copy.js";
 import { FIND_CHOOSE_WORKS_MAX, FindPeopleError, authorOfferProbe, childTyped, fetchWork, fitAuthorEntry, fitPeople, hasInitial, isPersonId, isWorkId, peopleSearchWanted, sameWork, searchPeople, titleCovered, worksOf, type PersonDecision } from "./people.js";
@@ -1567,13 +1567,14 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
     /**
      * No answer this time: tried again after the next delay, then "failed" with `code`. `patch` is what was decided
-     * before the failure and is kept for the next try (F8: the one person found, whose works did not come).
+     * before the failure and is kept for the next try (F8: the one person found, whose works did not come). `rest`, when
+     * given, is where the entry rests instead of "failed" once the delays are spent (R379: a copy found, not downloaded).
      */
-    const tryLater = async (code: FindReasonCode, patch: Partial<FindEntry> = {}) => {
+    const tryLater = async (code: FindReasonCode, patch: Partial<FindEntry> = {}, rest: Partial<FindEntry> = {}) => {
       const attempts = at0.attempts + 1;
       const delay = FIND_RETRY_DELAYS_MS[attempts - 1];
       if (delay === undefined) {
-        await finish({ ...patch, state: "failed", attempts, reason: { code } }, ["nextTryAt"]);
+        await finish({ ...patch, state: "failed", attempts, reason: { code }, ...rest }, ["nextTryAt"]);
         return;
       }
       const at = new Date(now().getTime() + delay).toISOString();
@@ -1617,7 +1618,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     r: Run,
     live: () => boolean,
     finish: (patch: Partial<FindEntry>, drop?: Array<keyof FindEntry>) => Promise<FindEntry | null>,
-    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>) => Promise<void>,
+    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>, rest?: Partial<FindEntry>) => Promise<void>,
   ): Promise<void> {
     /**
      * OpenAlex's daily allowance is used up: the entry waits for the pause's end (never less than the first retry
@@ -2017,7 +2018,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    *                                                    ──► in-library    (R305 c: the source gained a readable file
    *                                                                       meanwhile: refused inside the hold's change,
    *                                                                       nothing held, the file dropped)
-   *                                                    ──► no-open-copy  (no offer could be downloaded: its links kept)
+   *                                                    ──► no-open-copy  (no offer could be downloaded, each refused
+   *                                                                       for good: its links kept)
+   *                                                    ──► looking-for-copy, waiting (R379: none downloaded, one at least
+   *                                                                       for a passing reason; the delays of an
+   *                                                                       unreachable lookup, then no-open-copy /
+   *                                                                       copy-not-downloaded, its links kept, "Try again")
    *   record-complete / held-full (R296 d): FIND_HELD_MAX files already wait — looked at BEFORE any free-copy service
    *   is asked or any file downloaded; the entry waits, asking nothing, until a waiting file goes — a decision on it,
    *   the removal of its entry, the deletion of its record (`wakeHeldFull`, R305 b, R310 a: only such entries) — or
@@ -2035,7 +2041,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     r: Run,
     live: () => boolean,
     finish: (patch: Partial<FindEntry>, drop?: Array<keyof FindEntry>) => Promise<FindEntry | null>,
-    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>) => Promise<void>,
+    tryLater: (code: FindReasonCode, patch?: Partial<FindEntry>, rest?: Partial<FindEntry>) => Promise<void>,
     version: { get(): FindEntry; set(e: FindEntry): void },
   ): Promise<void> {
     const sid = entry.sourceId!;
@@ -2151,6 +2157,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     look();
     const removedRecord = () => finish({ state: "no-open-copy", reason: RECORD_REMOVED }, ["nextTryAt", "offers"]);
     let held: { path: string; offer: CopyOffer; check: FileCheckResult } | undefined;
+    /** R379 (FR-A17): some offer failed for a reason that may pass (a time-out, the network, a 429, a 5xx…). */
+    let passing = false;
     try {
       let n = 0;
       for (const offer of found.offers) {
@@ -2165,7 +2173,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
             if (gone) await removedRecord();
             return;
           }
-          // Refused or failed (its sentence names no address): the next offer is tried.
+          // Refused or failed (its sentence names no address): the next offer is tried. Whether it may pass is kept (R379).
+          if (downloadFailurePasses(err)) passing = true;
           debug(`find: a free copy could not be downloaded (${err instanceof FetchFileError ? err.code : errName(err)})`);
           continue;
         }
@@ -2199,8 +2208,17 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         await holdOne(pid, eid, r, live, version, sid, sf.source.provenance, held);
         return;
       }
-      // Nothing could be downloaded: no open copy here; the addresses stay as links for the researcher.
+      // Nothing could be downloaded; the addresses stay as links for the researcher.
       const links = linksOf(found.elsewhere, found.offers);
+      if (passing) {
+        // R379 (FR-A17): a copy WAS found, and at least one download may pass: not "no open copy" — the entry waits and
+        // is tried again (services asked again) like an unreachable free-copy lookup (R282 e), on the same delays; once
+        // they are spent it rests "no-open-copy" / "copy-not-downloaded", with its links, and "Try again" is accepted.
+        debug("find: no free copy could be downloaded this time");
+        await tryLater("copy-not-downloaded", { state: "looking-for-copy" }, { state: "no-open-copy", ...(links?.length ? { offers: links } : {}) });
+        return;
+      }
+      // Every offer refused for good: no open copy here.
       await finish({ state: "no-open-copy", ...(links?.length ? { offers: links } : {}) }, ["nextTryAt", "reason", "offers"]);
     } finally {
       timers.clearTimeout(watch);
@@ -2397,12 +2415,13 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       const cur = await current(projectId, entryId);
       if (!cur) throw new NotFoundError("Queue entry", entryId);
       const waiting = (cur.state === "looking-up" || cur.state === "looking-for-copy") && !!cur.nextTryAt;
-      // R282 e, f: "no open copy" because some services could not be reached, and an entry the rules stopped (their
+      // R282 e, f: "no open copy" because some services could not be reached (R379: or a copy found could not be
+      // downloaded, its retries spent), and an entry the rules stopped (their
       // free-copy or store part: the rules are evaluated again), look for a copy again; so does (R296 d) an entry
       // waiting because FIND_HELD_MAX files wait (the limit is looked at again, before anything is asked).
       const copyAgain =
         !!cur.sourceId &&
-        ((cur.state === "no-open-copy" && cur.reason?.code === "copy-some-unreachable") ||
+        ((cur.state === "no-open-copy" && (cur.reason?.code === "copy-some-unreachable" || cur.reason?.code === "copy-not-downloaded")) ||
           (cur.state === "record-complete" && (STOPPED_BY_RULES.has(cur.reason?.code ?? "") || cur.reason?.code === HELD_FULL.code)) ||
           copyRestsSwitchedOff(cur));
       // R283 a: a "choose" made while people of the name could not be looked up: Try again looks again (afresh).

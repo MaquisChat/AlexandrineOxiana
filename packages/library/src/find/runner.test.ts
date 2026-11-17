@@ -3187,6 +3187,8 @@ describe("F11: the free copy of a record the queue completed", () => {
   let saved: Dispatcher;
   /** R282 e: OpenAlex's free-copy answers fail (503). */
   let oaDown: boolean;
+  /** R379 (FR-A17): file addresses that answer with this status (and headers) instead of their file. */
+  let fileStatus: Map<string, { status: number; headers?: Record<string, string> }>;
 
   const COPY_ONLY_OPENALEX = (): SearchSettings => ({ ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" })) });
   /** Ordinary text of a first page, so that a made-up file has readable text (the file check asks for 200 characters, R282). */
@@ -3249,6 +3251,8 @@ describe("F11: the free copy of a record the queue completed", () => {
         .get(origin)
         .intercept({ path: () => true, method: "GET" })
         .reply((o) => {
+          const st = fileStatus.get(`${origin}${String(o.path)}`);
+          if (st) return { statusCode: st.status, data: "", responseOptions: { headers: st.headers ?? {} } };
           const body = files.get(`${origin}${String(o.path)}`);
           return body ? { statusCode: 200, data: body } : { statusCode: 404, data: "" };
         })
@@ -3266,6 +3270,7 @@ describe("F11: the free copy of a record the queue completed", () => {
     fileRequests = [];
     copyRequests = [];
     oaDown = false;
+    fileStatus = new Map();
     settings = COPY_ONLY_OPENALEX();
     mockCopies();
   });
@@ -3992,9 +3997,114 @@ describe("F11: the free copy of a record the queue completed", () => {
     expect(FIND_DOWNLOAD_TIMEOUT_MS).toBe(240_000);
     timers.advance(FIND_DOWNLOAD_TIMEOUT_MS);
     await until(() => heldFiles[0]!.aborted, "the download to be aborted");
-    await copyDone(p, eid);
-    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", offers: [{ host: "arxiv.org" }] });
+    // R379 (FR-A17): a copy was found but not fetched this time — not "no open copy": the entry waits to be tried again.
+    await waitsToRetry(p, eid, 1);
     expect(await exists(folderOf(eid))).toBe(false);
+  });
+
+  /** The entry waits, its retry timer set and its download folder gone (R379: like an unreachable free-copy lookup). */
+  const waitsToRetry = async (p: Project, eid: string, attempts: number) => {
+    await until(async () => (await entryOf(p, eid))?.attempts === attempts && !!(await entryOf(p, eid))?.nextTryAt, `attempt ${attempts} waiting`);
+    await until(async () => !activeTemp.has(`find-${eid}`) && !(await exists(folderOf(eid))), "its folder to go");
+    await until(() => timers.pending.size > 0, "the retry's timer");
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "looking-for-copy", attempts });
+    expect(e.reason).toBeUndefined();
+    expect(e.nextTryAt).toBe(new Date(timers.now + FIND_RETRY_DELAYS_MS[attempts - 1]!).toISOString());
+  };
+  /** Every retry's delay waited out (`each` after each retry started), until the entry rests. */
+  const retriesRunOut = async (p: Project, eid: string, each: (i: number) => Promise<void> = async () => {}) => {
+    for (const [i, d] of FIND_RETRY_DELAYS_MS.entries()) {
+      const before = fileRequests.length;
+      timers.advance(d - 1);
+      await new Promise((res) => setTimeout(res, 30));
+      expect(fileRequests.length, "nothing downloaded before the delay").toBe(before);
+      timers.advance(1);
+      await until(() => fileRequests.length > before, `try ${i + 2}`);
+      await each(i);
+      if (i < FIND_RETRY_DELAYS_MS.length - 1) await waitsToRetry(p, eid, i + 2);
+    }
+    await copyDone(p, eid);
+  };
+
+  it("R379 (FR-A17): every download timed out: tried again like an unreachable lookup, then 'no open copy' saying a copy was found, with Try again; a later file is held for the researcher", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    holdFiles.add(A);
+    const { p, r, eid, sid } = await recordMade();
+    await until(() => heldFiles.length === 1, "the download to start");
+    timers.advance(FIND_DOWNLOAD_TIMEOUT_MS);
+    await waitsToRetry(p, eid, 1);
+    await retriesRunOut(p, eid, async (i) => {
+      await until(() => heldFiles.length === i + 2, `download ${i + 2} to start`);
+      timers.advance(FIND_DOWNLOAD_TIMEOUT_MS);
+    });
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "no-open-copy", attempts: FIND_RETRY_DELAYS_MS.length + 1, reason: { code: "copy-not-downloaded" }, offers: [{ host: "arxiv.org" }] });
+    expect(e.nextTryAt).toBeUndefined();
+    expect(timers.pending.size).toBe(0);
+    // Try again: the copy is looked for again; the file comes now and is HELD for the researcher's check, nothing attached.
+    holdFiles.clear();
+    files.set(A, await good());
+    expect(await r.retry(p.id, eid)).toMatchObject({ state: "looking-for-copy", attempts: 0 });
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    expect(await pendingReviews(p)).toHaveLength(1);
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(0);
+  });
+
+  it("R379 (FR-A17): one offer 503 and another 404: a copy was found but not fetched (one may pass) — the same waits, then Try again", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    const B = "https://arxiv.org/pdf/2101.00002";
+    oaCopies.set(ZORBLATT.doi!, [A, B]);
+    fileStatus.set(A, { status: 503 });
+    const { p, r, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+    await retriesRunOut(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "no-open-copy", reason: { code: "copy-not-downloaded" }, offers: [{ host: "arxiv.org" }, { host: "arxiv.org" }] });
+    expect(await r.retry(p.id, eid)).toMatchObject({ state: "looking-for-copy" });
+  });
+
+  it("R379 (FR-A17): a second attempt that gets the file holds it for the researcher's check exactly as a first would", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 502 });
+    const { p, eid, sid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+    fileStatus.clear();
+    files.set(A, await good());
+    timers.advance(FIND_RETRY_DELAYS_MS[0]!);
+    await copyDone(p, eid);
+    expect((await entryOf(p, eid))!).toMatchObject({ state: "needs-check", reason: { code: "file-looks-right" } });
+    const [rev] = await pendingReviews(p);
+    expect(rev).toBeDefined();
+    expect((await repo.getSource(p.id, sid)).assets).toHaveLength(0);
+  });
+
+  it("R379 (FR-A17): a 429 with a Retry-After waits as an unreachable lookup waits (the runner's delays), never sooner", async () => {
+    const A = "https://arxiv.org/pdf/2101.00001";
+    oaCopies.set(ZORBLATT.doi!, [A]);
+    fileStatus.set(A, { status: 429, headers: { "retry-after": "30" } });
+    const { p, eid } = await recordMade();
+    await waitsToRetry(p, eid, 1);
+    expect(Date.parse((await entryOf(p, eid))!.nextTryAt!) - timers.now).toBeGreaterThanOrEqual(30_000);
+    const n = fileRequests.length;
+    timers.advance(FIND_RETRY_DELAYS_MS[0]! - 1);
+    await new Promise((res) => setTimeout(res, 30));
+    expect(fileRequests.length).toBe(n);
+  });
+
+  it("R379 (FR-A17): every offer refused for good (404): no open copy as before, its links kept, nothing tried again", async () => {
+    oaCopies.set(ZORBLATT.doi!, ["https://arxiv.org/pdf/2101.00001", "https://arxiv.org/pdf/2101.00002"]);
+    fileStatus.set("https://arxiv.org/pdf/2101.00002", { status: 410 });
+    const { p, r, eid } = await recordMade();
+    await copyDone(p, eid);
+    const e = (await entryOf(p, eid))!;
+    expect(e).toMatchObject({ state: "no-open-copy", offers: [{ host: "arxiv.org" }, { host: "arxiv.org" }] });
+    expect(e.reason).toBeUndefined();
+    expect(e.nextTryAt).toBeUndefined();
+    expect(timers.pending.size).toBe(0);
+    await expect(r.retry(p.id, eid)).rejects.toBeInstanceOf(FindEntryStateError);
   });
 
   // ------------------------------------------------------------------------------------------------------------
