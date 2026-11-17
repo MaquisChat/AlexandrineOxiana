@@ -1059,7 +1059,11 @@ async function* scanWeb(
   for (const it of tree.byKey.values()) {
     if (tree.parentOf(it) || (tops && !tops.has(it.key) && !passedTops.has(it.key))) continue;
     const type = str(it.data.itemType);
-    if (type !== "note" && type !== "annotation") told++;
+    if (type === "note" || type === "annotation") continue;
+    told++;
+    // R433: asked here, before the total is told, so that the engine has counted what it passes by and the event
+    // the total sends carries it (a resumed batch sends no opening event of its own). Nothing is fetched.
+    skip(`zotero:${it.key}`);
   }
   ctx.total?.(told);
 

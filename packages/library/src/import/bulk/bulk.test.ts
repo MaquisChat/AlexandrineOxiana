@@ -1782,6 +1782,25 @@ processing:
     expect(JSON.parse(await readFile(batchJson(p, 1), "utf8")).total).toBe(6);
   });
 
+  it("R433 (1): a resumed Web batch sends no opening event: no event of the resumed run is below what the first part finished", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three", "Four", "Five", "Six"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, web());
+    for await (const e of h.progress) {
+      if (e.done >= 3) {
+        h.cancel();
+        break;
+      }
+    }
+    const first = await h.done;
+    expect(first.counts.items).toBeGreaterThanOrEqual(3);
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, h.batchId));
+    expect(r.state).toBe("finished");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const [d] of seen) expect(d).toBeGreaterThanOrEqual(first.counts.items);
+    expectWholeBatch(seen, 6);
+  });
+
   it("R426 a: a resumed incremental Web batch counts the whole batch (the changed items passed by included)", async () => {
     const { p, batchId } = await cancelledIncremental();
     expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).total).toBe(4);
@@ -2018,8 +2037,9 @@ describe("FR-A21 (R392): the progress tells the truth about the total", () => {
     const reopen = async () => writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
     await reopen();
     const kept = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(3)));
-    expect(kept.length).toBeGreaterThan(0);
+    // R433: a resume sends no opening event, and this one tells no total and has no new item: it may send none.
     expect(kept.every((e) => e.total === 3)).toBe(true);
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(3);
     await reopen();
     const told = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(4, { at: 0, total: 4 })));
     expect(told.at(-1)).toEqual({ done: 4, total: 4 });
@@ -2103,6 +2123,53 @@ describe("FR-A21 (R392): the progress tells the truth about the total", () => {
     expect(dry.unreadable).toHaveLength(1);
     const seen = await events(await bulk.startBatch(p.id, za));
     expect(seen.at(-1)).toEqual({ done: 1, total: 1 });
+  });
+
+  /** An adapter that says when its scan starts and yields its items only once `open` is called. */
+  const gated = (n: number) => {
+    let started!: () => void;
+    let open!: () => void;
+    const scanStarted = new Promise<void>((r) => (started = r));
+    const gate = new Promise<void>((r) => (open = r));
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(): AsyncGenerator<ScanItem> {
+        started();
+        await gate;
+        for (let i = 0; i < n; i++) yield meta(`k${i}`);
+      },
+    };
+    return { adapter, scanStarted, open };
+  };
+  /** The event already sent when the scan starts, or "none". */
+  const opening = async (h: Awaited<ReturnType<BulkImport["startBatch"]>>, scanStarted: Promise<void>) => {
+    await scanStarted;
+    const it = h.progress[Symbol.asyncIterator]();
+    return Promise.race([it.next().then((x) => (x.done ? "none" : x.value)), new Promise<"none">((r) => setTimeout(() => r("none"), 100))]);
+  };
+
+  it("R433 (1): a first run opens with its event before the scan yields anything", async () => {
+    const p = await project();
+    const g = gated(2);
+    const h = await bulk.startBatch(p.id, g.adapter);
+    expect(await opening(h, g.scanStarted)).toEqual({ done: 0 });
+    g.open();
+    expect((await h.done).state).toBe("finished");
+  });
+
+  it("R433 (1): a resumed batch sends no opening event; its first event carries what the journal holds", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(2));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const g = gated(4);
+    const r = await bulk.resumeBatch(p.id, h.batchId, g.adapter);
+    expect(await opening(r, g.scanStarted)).toBe("none");
+    g.open();
+    const seen = await events(r);
+    for (const e of seen) expect(e.done).toBeGreaterThanOrEqual(2);
+    expect(seen.at(-1)!.done).toBe(4);
   });
 
   for (const bad of [2.5, Number.NaN, -1]) {

@@ -840,7 +840,10 @@ class Run {
         if (total !== undefined) this.rec.total = total;
         return { done, ...(total !== undefined ? { total } : {}), ...(current !== undefined ? { current } : {}) };
       };
-      this.feed.emit(progress());
+      // R433: a resumed batch (its journal holds entries) sends no opening event: it would say "0 of y" until the
+      // source reaches the items it passes by. Its first event is the one sent when the total is told, or its first
+      // item's, so the screen says "Starting…" meanwhile. A batch that is not a resume opens with this event.
+      if (this.latest.size === 0) this.feed.emit(progress());
       let knownIds: ReadonlySet<string> | undefined;
       const scan = this.adapter.scan(this.abort.signal, {
         workDir: () => this.ensureWorkDir(),
