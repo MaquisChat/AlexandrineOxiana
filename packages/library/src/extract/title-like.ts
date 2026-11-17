@@ -9,8 +9,11 @@
  */
 import type { Creator } from "@ao/core";
 
-/** Scripts written without spaces: a word of two characters counts (as in core's title similarity). */
-const NO_SPACE_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+/**
+ * Scripts written without spaces, and Hangul (whose words are often two syllables, R410 d): a word of two characters
+ * counts.
+ */
+const NO_SPACE_SCRIPT = /[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
 
 /**
  * Texts programs leave in the title field, matched as the whole title (lower case), alone or followed by a number
@@ -140,9 +143,12 @@ function hasWord(s: string): boolean {
   return false;
 }
 
-/** More than half of the characters other than spaces are digits, punctuation or symbols. */
+/**
+ * More than half of the characters other than spaces are digits, punctuation or symbols; a run of digits counts as
+ * one character (R410 d: "ISO 9001:2015" and "RFC 2616" are titles).
+ */
 function mostlyDigitsAndPunctuation(s: string): boolean {
-  const chars = Array.from(s.replace(/\s+/gu, ""));
+  const chars = Array.from(s.replace(/\s+/gu, "").replace(/\p{Nd}+/gu, "0"));
   const other = chars.filter((c) => /[\p{N}\p{P}\p{S}]/u.test(c)).length;
   return other * 2 > chars.length;
 }

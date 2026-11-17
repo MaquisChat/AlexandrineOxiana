@@ -151,6 +151,14 @@ const TITLES: Array<[string, boolean, string?]> = [
   ["Running Heads and Page Design", true],
   ["Downloaded Culture", true],
   ["May Day in Lagos, 1968", true],
+  // R410 d: two Hangul syllables are a word; a run of digits counts once in the share of digits and punctuation.
+  ["토지", true],
+  ["광장", true],
+  ["ISO 9001:2015", true],
+  ["RFC 2616", true],
+  ["900..915", false],
+  ["12345", false],
+  ["토", false],
   // More than half digits and punctuation.
   ["Vol. 12, No. 3, pp. 45-67 (2019)", false],
   ["pp 1-20 / 2019 / ed 2", false],
