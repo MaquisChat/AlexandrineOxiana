@@ -4,7 +4,7 @@
  * service's entry point.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1010,6 +1010,45 @@ describe("FR-A18 round 2 (R397 a): a missing or unreadable rules file is said, a
     const pid = await newProject();
     await writeFile(await govFile(), "encryption: {atRest: optional}\nresidencey: {allowed: [local]}\n");
     await repairs(pid, (i) => expect(i.some((x) => x.includes("residencey"))).toBe(true), { rulesFile: "unreadable" });
+  });
+});
+
+describe("FR-A18 round 2 (R397 e): a rules file that cannot be opened is said, never a 500", () => {
+  beforeEach(() => start());
+
+  const OPENED = "The rules file could not be opened.";
+  const folderOf = async () => (await call({ url: "/projects" })).json.projects[0].folder as string;
+  const govFile = async () => join(tmp, "Lib", await folderOf(), "governance.yaml");
+
+  it("a folder in the rules file's place: readable false with one issue; a save over it is refused in plain words", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    await rm(f);
+    await mkdir(f);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status, g.body).toBe(200);
+    expect(g.json).toMatchObject({ yaml: "", readable: false, issues: [OPENED], warnings: [] });
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "back (Ana)" } });
+    expect(put.status, put.body).toBe(400);
+    expect(put.json.error.message).toMatch(/could not be opened/);
+    expect(put.body).not.toContain(tmp);
+    expect(put.body).not.toMatch(/EISDIR/);
+    expect((await call({ url: `/projects/${pid}/retention` })).status).toBe(200);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("a rules file that cannot be opened (no permission): readable false with one issue", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    await chmod(f, 0o000);
+    try {
+      const g = await call({ url: `/projects/${pid}/governance` });
+      expect(g.status, g.body).toBe(200);
+      expect(g.json).toMatchObject({ readable: false, issues: [OPENED] });
+    } finally {
+      await chmod(f, 0o644);
+    }
   });
 });
 

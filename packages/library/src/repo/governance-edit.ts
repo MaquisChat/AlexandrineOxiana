@@ -68,15 +68,51 @@ export interface GovernanceEditResult {
 
 export const sha256Of = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
 
-/** The rules file as read: there, or missing (no file, or a link that leads nowhere; R397 a). */
-export type GovernanceFileState = "present" | "missing";
+/**
+ * The rules file as read: there, missing (no file, or a link that leads nowhere; R397 a), or
+ * something that cannot be opened in its place (a folder, a file without permission; R397 e).
+ */
+export type GovernanceFileState = "present" | "missing" | "unopenable";
 
-/** The file as written (the empty text when there is none), its SHA-256, and whether it is there at all. */
-export async function readGovernance(core: RepoCore, projectId: string): Promise<{ yaml: string; sha256: string; file: GovernanceFileState }> {
+/** Why a save cannot replace what is in the rules file's place (R397 e). */
+export const GOVERNANCE_UNOPENABLE_SAVE =
+  "The rules file could not be opened (something other than a readable file, such as a folder, is in its place), so it cannot be replaced from here. Remove it from the project's folder, then save the rules again.";
+
+/**
+ * The file as written (the empty text when there is none), its SHA-256, and whether it is there at
+ * all. Throws when something that cannot be opened is in its place (callers fail closed on that).
+ */
+export async function readGovernance(core: RepoCore, projectId: string): Promise<{ yaml: string; sha256: string; file: "present" | "missing" }> {
   const st = core.state(projectId);
   const buf = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
   const raw = buf ?? Buffer.alloc(0);
   return { yaml: raw.toString("utf8"), sha256: sha256Of(raw), file: buf ? "present" : "missing" };
+}
+
+/**
+ * As `readGovernance`, but something that cannot be opened in the file's place is answered as
+ * `file: "unopenable"` with the empty text, never thrown (R397 e: the rules' screen says so).
+ */
+export async function readGovernanceFile(core: RepoCore, projectId: string): Promise<{ yaml: string; sha256: string; file: GovernanceFileState }> {
+  try {
+    return await readGovernance(core, projectId);
+  } catch (err) {
+    if (!isFsError(err)) throw err;
+    return { yaml: "", sha256: sha256Of(Buffer.alloc(0)), file: "unopenable" };
+  }
+}
+
+/** A file-system error (EISDIR, EACCES, ELOOP, …), not a project that is unknown or locked. */
+const isFsError = (err: unknown): boolean => typeof (err as NodeJS.ErrnoException | null)?.code === "string" && /^E[A-Z]+$/.test((err as NodeJS.ErrnoException).code!);
+
+/** The rules file's bytes for the edit; something that cannot be opened in its place refuses the save (R397 e). */
+async function readForEdit(path: string): Promise<Buffer | null> {
+  try {
+    return await readMaybe(path);
+  } catch (err) {
+    if (isFsError(err)) throw new InvalidInputError(GOVERNANCE_UNOPENABLE_SAVE);
+    throw err;
+  }
 }
 
 const key = (v: Violation) => `${v.profile}\u0000${v.control}`;
@@ -102,7 +138,8 @@ export async function setGovernance(core: RepoCore, projectId: string, yamlText:
     }
   }
   // Is the current file there and readable? (Decides the policy the write itself is evaluated under.)
-  const pre = await readGovernance(core, projectId);
+  const pre = await readGovernanceFile(core, projectId);
+  if (pre.file === "unopenable") throw new InvalidInputError(GOVERNANCE_UNOPENABLE_SAVE);
   let repairing = pre.file === "missing";
   try {
     if (pre.yaml) parseGovernance(pre.yaml);
@@ -116,7 +153,7 @@ export async function setGovernance(core: RepoCore, projectId: string, yamlText:
     { action: "store", store: { identifiable: false, hasLocation: false } },
     async (tx) => {
       // Under the serial lock: the file as it is now, and the decision made against it.
-      const buf = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
+      const buf = await readForEdit(core.abs(`${st.rel}/governance.yaml`));
       const raw = buf ?? Buffer.alloc(0);
       if (sha256Of(raw) !== opts.baseSha256) throw new GovernanceConflictError();
       let cur: GovernanceConfig | undefined;

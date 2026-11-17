@@ -107,6 +107,8 @@ const capped = (lines: string[]): string[] => (lines.length > MAX_LINES ? [...li
 
 /** The single issue when the project's rules file is missing, or is a link that leads nowhere (R397 a). */
 export const GOVERNANCE_MISSING_ISSUE = "The rules file (governance.yaml) is missing from this project's folder.";
+/** The single issue when something that cannot be opened is in the rules file's place: a folder, a file without permission (R397 e). */
+export const GOVERNANCE_UNOPENABLE_ISSUE = "The rules file could not be opened.";
 
 export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
@@ -123,8 +125,13 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     } catch {
       // unreadable rules: every request is denied; the text is still shown for fixing
     }
-    // R397 a: no file is not an empty file: the engine refuses everything until rules are put back.
-    const readability: GovernanceReadability = file === "missing" ? { readable: false, issues: [GOVERNANCE_MISSING_ISSUE], warnings: [] } : governanceReadability(yaml, state.roots);
+    // R397 a, e: no file (or one that cannot be opened) is not an empty file: the engine refuses everything until rules are put back.
+    const readability: GovernanceReadability =
+      file === "missing"
+        ? { readable: false, issues: [GOVERNANCE_MISSING_ISSUE], warnings: [] }
+        : file === "unopenable"
+          ? { readable: false, issues: [GOVERNANCE_UNOPENABLE_ISSUE], warnings: [] }
+          : governanceReadability(yaml, state.roots);
     return { yaml, sha256, violations, ...readability };
   });
 
