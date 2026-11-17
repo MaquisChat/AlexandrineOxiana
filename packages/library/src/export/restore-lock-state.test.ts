@@ -321,3 +321,64 @@ async function rewriteAudit(p: Project, change: (events: AuditEvent[]) => AuditE
   });
   await writeFile(join(dir, names[0]!), `${lines.join("\n")}\n`);
 }
+
+describe("R435 b: a lock during a restore of a sealed backup is told apart from damage", () => {
+  const restoreRefusals = async () => (await kit.repo.libraryAudit()).events.filter((e) => e.action === "restore");
+
+  it("a lock at each opening of the restore: the locked answer and no audit entry, or restored; never 'damaged'", async () => {
+    const { openingSeam } = await import("../repo/testing.js");
+    const p = await makeProject(kit, PSEUDO_GOV, true, "Locked Midway");
+    await addSource(kit, p, { title: "inside" });
+    const b = await backupProject(kit.repo, p.id, { locationEnv: onDisk() });
+    // The openings a whole restore makes (the copy is removed again).
+    let k = 0;
+    openingSeam.onOpen = () => void k++;
+    const made = await restore(b.path, { locationEnv: onDisk() }).finally(() => (openingSeam.onOpen = undefined));
+    void made;
+    expect(k).toBeGreaterThan(2);
+    const outcomes: string[] = [];
+    for (let n = 1; n <= k; n++) {
+      if (!kit.repo.isUnlocked(p.id)) await kit.repo.unlockProject(p.id, PASS);
+      const before = (await restoreRefusals()).length;
+      let seen = 0;
+      let lock: Promise<void> | undefined;
+      openingSeam.onOpen = () => {
+        if (++seen === n) {
+          lock = kit.repo.lockProject(p.id);
+          lock.catch(() => {});
+        }
+      };
+      const r = await restore(b.path, { locationEnv: onDisk() }).then(
+        () => "restored",
+        (e: unknown) => `${(e as Error).name}: ${(e as Error).message}`,
+      ).finally(() => (openingSeam.onOpen = undefined));
+      await lock;
+      outcomes.push(`@${n}: ${r}`);
+      if (r !== "restored") {
+        expect(r, `@${n}`).toBe("RestoreError: This backup is encrypted: unlock its project, or give the project's passphrase");
+        expect((await restoreRefusals()).length, `@${n}: no audit entry`).toBe(before);
+      }
+    }
+    expect(outcomes.some((o) => o.includes("RestoreError"))).toBe(true);
+  });
+
+  it("a truly damaged sealed backup (truncated, a flipped byte) is still refused as damaged, and audited", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true, "Damaged");
+    await addSource(kit, p, { title: "inside" });
+    const b = await backupProject(kit.repo, p.id, { locationEnv: onDisk() });
+    const raw = await readFile(b.path);
+    const truncated = join(kit.tmp, `t-${basename(b.path)}`);
+    await writeFile(truncated, raw.subarray(0, 40));
+    const flipped = join(kit.tmp, `f-${basename(b.path)}`);
+    const f = Buffer.from(raw);
+    f[f.length - 30]! ^= 0xff;
+    await writeFile(flipped, f);
+    for (const file of [truncated, flipped]) {
+      const err = (await restore(file, { locationEnv: onDisk() }).catch((e: unknown) => e)) as Error;
+      expect(err.name, basename(file)).toBe("UnreadableBackupError");
+      expect(err.message).toMatch(/damaged/u);
+      expect((await restoreRefusals()).some((e) => detailsOf(e).file === basename(file)), basename(file)).toBe(true);
+    }
+    expect(kit.repo.isUnlocked(p.id)).toBe(true);
+  });
+});

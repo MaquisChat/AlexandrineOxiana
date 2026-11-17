@@ -82,7 +82,7 @@ import { UnsafeFileError } from "../../extract/errors.js";
 import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
 import { lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
-import { NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "../../repo/errors.js";
+import { NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError, isLockedRefusal } from "../../repo/errors.js";
 import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
 import {
@@ -2655,7 +2655,8 @@ export async function listBatches(repo: Repo, projectId: string): Promise<BatchS
         ...(r.origin === "zotero-sync" ? { origin: r.origin } : {}),
         ...(r.source.kind === "zotero-web" && typeof r.source.location === "string" ? { ref: r.source.location } : {}),
       });
-    } catch {
+    } catch (err) {
+      if (isLockedRefusal(err)) throw err; // locked, not a shorter list (R404)
       // unreadable record: not listed
     }
   }

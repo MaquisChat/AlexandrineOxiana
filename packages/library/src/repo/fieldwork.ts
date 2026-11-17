@@ -1,6 +1,6 @@
 /** Fieldwork entities (spec 3.6): participants, sessions, consent records, source links. */
 import { ConsentRecord, Participant, Session, newId, type SourceFile } from "@ao/core";
-import { FieldworkInUseError, InvalidInputError, NotFoundError } from "./errors.js";
+import { FieldworkInUseError, InvalidInputError, NotFoundError, ProjectLockedError } from "./errors.js";
 import { runMutation, type MutateRequest } from "./mutate.js";
 import { appendReviewEntry } from "./review.js";
 import { isUnlocked, readFullData, writeProjectData } from "./projects.js";
@@ -161,8 +161,13 @@ export async function getFieldwork(
   projectId: string,
 ): Promise<{ participants: Participant[]; sessions: Session[]; consents: ConsentRecord[]; complete: boolean }> {
   const st = core.state(projectId);
+  const was = isUnlocked(core, projectId);
   const data = await readFullData(core, st, true);
-  return { participants: data.participants, sessions: data.sessions, consents: data.consents, complete: isUnlocked(core, projectId) };
+  const complete = isUnlocked(core, projectId);
+  // Locked (or being locked) while the identifying fields were read: refused as locked, never those fields handed
+  // out after the lock under "incomplete" (R435 e).
+  if (was && !complete) throw new ProjectLockedError(projectId);
+  return { participants: data.participants, sessions: data.sessions, consents: data.consents, complete };
 }
 
 /** Every code given in this project: participants', retired ones, and the pseudonym map's (R117 C1). */

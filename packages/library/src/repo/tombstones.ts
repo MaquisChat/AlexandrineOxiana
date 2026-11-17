@@ -17,6 +17,7 @@
  */
 import { createHmac, randomBytes } from "node:crypto";
 import type { SourceFile } from "@ao/core";
+import { isLockedRefusal } from "./errors.js";
 import { decryptBytes, readMaybe } from "./io.js";
 import type { Tx } from "./mutate.js";
 import type { ProjectState, RepoCore } from "./state.js";
@@ -74,7 +75,8 @@ export async function readTombstones(core: RepoCore, st: ProjectState): Promise<
       }
     }
     return { status: "ok", t: { secret: t.secret, zotero: t.zotero, counts } };
-  } catch {
+  } catch (err) {
+    if (isLockedRefusal(err)) throw err; // a key a lock wiped mid-read: locked, never "unreadable" (R404)
     return { status: "unreadable" };
   }
 }

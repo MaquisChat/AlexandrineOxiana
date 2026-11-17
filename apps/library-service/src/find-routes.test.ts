@@ -786,7 +786,7 @@ describe("the runner's life in the service", () => {
     const lockProject = s.repo.lockProject.bind(s.repo);
     s.repo.lockProject = (id: string) => {
       order.push("lock");
-      lockProject(id);
+      return lockProject(id);
     };
     expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
     expect(order).toEqual(["stop:true", "lock"]);

@@ -149,8 +149,12 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
   app.post("/projects/:id/unlock", async (req) => {
     const s = state.requireSession();
     const id = projectParam(ctx, req);
+    // R443 a: the count of locks is noted as the request arrives, before it waits its turn behind another attempt,
+    // so a lock asked while it waits overtakes it too.
+    const lockAsks = s.repo.lockAsksOf(id);
     const secret = str(bodyOf(req), "secret", 1024);
-    await limit.guard(id, () => s.repo.unlockProject(id, secret));
+    // An unlock a lock overtakes rejects as locked (R435 a): 423, and nothing below is resumed.
+    await limit.guard(id, () => s.repo.unlockProject(id, secret, lockAsks));
     // Work that waited for the key: viewing proxies, OCR and worker jobs of this project (R142), and its daily backup (R99 I7).
     state.resumeProject(s, id, { workerJobs: true });
     state.resumeFind(s, id); // Find and acquire (Task F5): its queue goes on (the runner waits for the index itself)
@@ -166,7 +170,9 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const id = projectParam(ctx, req);
     // Find and acquire (Task F5) stops for an encrypted project BEFORE its key is dropped: nothing more is written.
     if (s.repo.getProject(id).encryption.enabled) state.stopFind(s, id);
-    s.repo.lockProject(id);
+    // R386 b: the project counts as locked for every read and every new change from here on (the list says so
+    // too); the key itself is wiped when the change being saved, if any, ends (R379): the answer does not wait.
+    s.repo.lockProject(id).catch(() => {});
     // Its recordings stop playing: media tickets end with the key (R135 2).
     state.media.revokeProject(id);
     // Nothing looked up for an encrypted project stays in memory once it is locked (R30, R50),

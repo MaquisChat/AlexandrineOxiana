@@ -9,6 +9,7 @@ import {
 } from "./db.js";
 import { readExtractedText, readSource, withAnnotations } from "./load.js";
 import { JOBS_FILE, refreshJobRows, upgradeLegacyJobs } from "../job-journal.js";
+import { isLockedRefusal } from "../repo/errors.js";
 
 /**
  * (Re)loads an unlocked encrypted project's content into the in-memory TEMP schema: every source
@@ -51,12 +52,15 @@ export async function indexUnlockedProject(
       indexSource(db, sf, text, { protected: true });
       out.indexed++;
     } catch (err) {
+      if (isLockedRefusal(err)) break; // locked meanwhile (R404): see below
       out.errors.push({ folder, message: err instanceof Error ? err.message : String(err) });
     }
   }
   if (!still()) {
-    purgeProject(db, projectId); // locked during the load: nothing may stay in memory
-    return out;
+    // Locked during the load: nothing may stay in memory, and the answer is the one a locked project gets (nothing
+    // loaded, no error): what was read before the lock is not reported as loaded, nor the lock as errors (R404).
+    purgeProject(db, projectId);
+    return { indexed: 0, errors: [] };
   }
   // Job rows (R31): legacy rows of this project are written into its journal now that its key is
   // here, and the rows are made to match the journal (rows hold no payload: persistent is fine, R30).
@@ -64,7 +68,15 @@ export async function indexUnlockedProject(
     out.errors.push(...(await upgradeLegacyJobs(db, root, keyRing)).errors);
     await refreshJobRows(() => db, root, entry.rel, projectId, k);
   } catch (err) {
+    if (isLockedRefusal(err)) {
+      purgeProject(db, projectId); // locked meanwhile: as above (the job rows are not touched, R386 a)
+      return { indexed: 0, errors: [] };
+    }
     out.errors.push({ folder: `${entry.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
+  }
+  if (!still()) {
+    purgeProject(db, projectId); // locked just after the last read (R435 e): as above
+    return { indexed: 0, errors: [] };
   }
   return out;
 }

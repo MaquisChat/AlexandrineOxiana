@@ -60,6 +60,13 @@ export class KeyNotAvailableError extends Error {
   }
 }
 
+/**
+ * The key a reader holds was wiped (zero-filled) by a lock: the project was locked mid-read. A KeyNotAvailableError
+ * (the same name, so every caller that maps that to "locked" still does), told apart from a key that is unknown
+ * (a file sealed under another key id), which is damage, not a lock (R404).
+ */
+export class KeyWipedError extends KeyNotAvailableError {}
+
 export function assertKeyId(keyId: string): void {
   if (typeof keyId !== "string" || !UUID_PATTERN.test(keyId)) {
     throw new TypeError(`keyId must be a lowercase UUID string, got ${JSON.stringify(keyId)}`);
@@ -70,6 +77,30 @@ export function assertKey(key: Uint8Array): void {
   if (!(key instanceof Uint8Array) || key.length !== KEY_LEN) {
     throw new TypeError(`key must be ${KEY_LEN} bytes`);
   }
+}
+
+/**
+ * Test seam (R404; reached from tests through `repo/testing.ts`): `onOpen` runs as each opening with a project key is
+ * about to happen — in `decryptStream` and `openDecryptedHandle` before the key is asked for, in `openLine` before
+ * it is checked — so a test can lock the project at the Nth opening. Honoured only when NODE_ENV is "test" (R47).
+ */
+export const openingSeam: { onOpen?: (keyId: string) => void } = {};
+
+export function noteOpening(keyId: string): void {
+  if (openingSeam.onOpen && process.env.NODE_ENV === "test") openingSeam.onOpen(keyId);
+}
+
+/**
+ * A live key: 32 bytes, not all zero. A key ring zero-fills a key when the project is locked; a buffer that reads
+ * as zeros is a wiped key. Sealing under it would seal for anyone (R379); opening with it is a read the lock cut
+ * short, which is "locked", never "damaged" nor "another project's line" (R386 a). Refused in every primitive that
+ * seals or opens with a project key: `encryptStream`, `decryptStream`, `openDecryptedHandle`, `sealLine`, `openLine`.
+ */
+export function assertLiveKey(key: Uint8Array, keyId: string): void {
+  assertKey(key);
+  let any = 0;
+  for (const b of key) any |= b;
+  if (any === 0) throw new KeyWipedError(keyId);
 }
 
 function keyIdToBytes(keyId: string): Buffer {
@@ -191,7 +222,7 @@ function toBuffer(chunk: unknown): Buffer {
  * is zeroed when the stream ends or is destroyed.
  */
 export function encryptStream(key: Uint8Array, keyId: string): Transform {
-  assertKey(key);
+  assertLiveKey(key, keyId);
   assertKeyId(keyId);
   const k = Buffer.from(key);
   const baseNonce = randomBytes(NONCE_LEN);
@@ -317,6 +348,7 @@ export function decryptStream(
   const readHeader = () => {
     header = queue.take(HEADER_LEN);
     parsed = parseHeader(header);
+    noteOpening(parsed.keyId);
     let key: Uint8Array | undefined;
     try {
       key = getKey(parsed.keyId);
@@ -326,6 +358,7 @@ export function decryptStream(
     if (!(key instanceof Uint8Array) || key.length !== KEY_LEN) {
       throw new KeyNotAvailableError(parsed.keyId);
     }
+    assertLiveKey(key, parsed.keyId);
     k = Buffer.from(key);
   };
 

@@ -26,7 +26,7 @@ import { extractMetadata } from "../extract/index.js";
 import { checkProxyLocation } from "../extract/exif.js";
 import { copyFileAtomic } from "../fs/atomic.js";
 import { stricterLocation } from "../repo/assets.js";
-import { PolicyDeniedError, ProjectLockedError, ProxyRecordRefusedError } from "../repo/errors.js";
+import { PolicyDeniedError, ProxyRecordRefusedError, isLockedRefusal } from "../repo/errors.js";
 import { addProxyAsset, currentProjectLocationMode, editPendingProxies, projectDataKey, repoLibrary, type Repo } from "../repo/repo.js";
 import type { Library } from "../library.js";
 import { activeTemp } from "../tmp-registry.js";
@@ -363,8 +363,9 @@ export class ProxyQueue {
       );
       return { ...base, ok: true, assetId: added.id };
     } catch (err) {
-      // No worker reachable, or the project locked: the job stays pending and runs later.
-      if (err instanceof WorkerUnavailableError || err instanceof ProjectLockedError) return { ...base, ok: false, code: "PENDING" };
+      // No worker reachable, or the project locked (also while its check was read, R386 a): the job stays pending.
+      // Only a lock (R435 d): a check sealed under another key id is damage, and the job fails.
+      if (err instanceof WorkerUnavailableError || isLockedRefusal(err)) return { ...base, ok: false, code: "PENDING" };
       if (err instanceof ProxyRecordRefusedError) {
         // RULE_CHANGED: stays pending and is made again under the stricter rule; ALREADY_RECORDED: another run did it.
         if (err.code === "ORIGINAL_GONE") await editPendingProxies(this.repo, projectId, sourceId, (list) => list.filter((j) => j.id !== job.id)).catch(() => {});

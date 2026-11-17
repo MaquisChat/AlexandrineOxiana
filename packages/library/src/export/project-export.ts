@@ -50,7 +50,7 @@ import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.j
 import { shredPath } from "../fs/shred.js";
 import { LOCATED_MEDIA, mayHaveLocation } from "../import/resolve.js";
 import { stricterLocation, type LocationMode } from "../repo/assets.js";
-import { PolicyDeniedError } from "../repo/errors.js";
+import { PolicyDeniedError, isLockedRefusal } from "../repo/errors.js";
 import { foldName, namesIn } from "../repo/io.js";
 import {
   appendLibraryEvent,
@@ -262,14 +262,16 @@ const inside = (child: string, parent: string) => child === parent || child.star
 
 /**
  * Exports the project in open formats into a new folder in `dest` (outside the library). Errors
- * other than the plain refusals (destination, governance) become ExportFailedError, whose message
- * names no path (R94).
+ * other than the plain refusals (destination, governance) and "locked" become ExportFailedError, whose message
+ * names no path (R94). An export a lock cuts short is "locked" (R386 a), never a failure or a damaged file.
  */
 export async function exportProjectOpenFormats(repo: Repo, projectId: string, dest: string): Promise<ProjectExportResult> {
   try {
     return await exportInner(repo, projectId, dest);
   } catch (err) {
     if (err instanceof ExportDestinationError || err instanceof PolicyDeniedError || err instanceof ExportFailedError) throw err;
+    // Only a lock is "locked" (R435 d): a file sealed under another key id is damage, an ExportFailedError.
+    if (isLockedRefusal(err)) throw err;
     const code = (err as NodeJS.ErrnoException)?.code;
     throw new ExportFailedError(typeof code === "string" && /^[A-Z_]{2,32}$/u.test(code) ? code : undefined);
   }

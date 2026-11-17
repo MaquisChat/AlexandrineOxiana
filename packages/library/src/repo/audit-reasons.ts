@@ -26,6 +26,7 @@ import type { AuditEvent } from "@ao/core";
 import { openLine, readMaybe, sealLine } from "./io.js";
 import { KEY_PURPOSE_AUDIT_REASON_MAC, PURPOSE_AUDIT_REASONS } from "./sealed-purposes.js";
 import type { ProjectState, RepoCore } from "./state.js";
+import { KeyNotAvailableError } from "../crypto/format.js";
 
 /** The project's sealed store of reasons (relative to the project folder). */
 export const AUDIT_REASONS_FILE = "audit-reasons/reasons.jsonl";
@@ -106,7 +107,8 @@ export async function readProjectReasons(path: string, key: Uint8Array, projectI
     try {
       const r = JSON.parse(openLine(key, projectId, line, PURPOSE_AUDIT_REASONS)) as SealedReason;
       out.set(at(r.seq, r.hash), r);
-    } catch {
+    } catch (err) {
+      if (err instanceof KeyNotAvailableError) throw err; // a wiped key: locked, not absent (R386 a)
       // damaged, or not this project's: as if absent
     }
   }

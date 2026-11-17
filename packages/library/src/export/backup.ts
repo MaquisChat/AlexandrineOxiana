@@ -84,7 +84,7 @@ import { Writable, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import yazl from "yazl";
 import { datedFileName, formatModified, newId, withCollisionSuffix, type PolicyRequest, type Project } from "@ao/core";
-import { encryptStream, readKeyId } from "../crypto/format.js";
+import { KeyNotAvailableError, encryptStream, readKeyId } from "../crypto/format.js";
 import { unwrapKey, unwrapWithRecovery, WrongPassphraseError } from "../crypto/keys.js";
 import { openSealedZip } from "../crypto/random-access.js";
 import { UnsafeFileError } from "../extract/errors.js";
@@ -304,6 +304,7 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
   // project has been unlocked since.
   if (m.unresolved?.length) {
     const still: string[] = [];
+    const added: BackupEntry[] = [];
     let moved = false;
     for (const f of m.unresolved) {
       if (!(await fsp.stat(join(dir, f)).then((x) => x.isFile(), () => false))) {
@@ -313,10 +314,16 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
       const e = await readEntry(repo, f);
       if (e && !m.backups.some((b) => b.file === f)) {
         m.backups.push(e);
+        added.push(e);
         moved = true;
       } else if (e) moved = true;
       else still.push(f);
     }
+    // Read before a lock that came meanwhile: unreadable now, as the rest (R435 e).
+    const back: string[] = [];
+    await asLockedNow(repo, dir, added, back);
+    if (back.length) m.backups = m.backups.filter((b) => !back.includes(b.file));
+    still.push(...back);
     if (moved) {
       if (still.length) m.unresolved = still;
       else delete m.unresolved;
@@ -537,7 +544,24 @@ async function rebuildManifest(repo: Repo): Promise<BackupManifest> {
     if (e) m.backups.push(e);
     else m.unresolved!.push(file);
   }
+  await asLockedNow(repo, dir, m.backups, m.unresolved!);
   return m;
+}
+
+/**
+ * R435 e: a project locked (or being locked) while the manifest was being read: its sealed backups read before the
+ * lock count as unreadable now, as all of them would had it been locked from the start, so the listing is never a
+ * part of its backups (they are read again at the next load, as every unresolved file is). Moves them from
+ * `entries` to `unresolved`.
+ */
+async function asLockedNow(repo: Repo, dir: string, entries: BackupEntry[], unresolved: string[]): Promise<void> {
+  for (const e of [...entries]) {
+    if (!e.encrypted) continue;
+    const keyId = await readKeyId(join(dir, e.file)).catch(() => undefined);
+    if (keyId === undefined || keyFromRing(repo, keyId)) continue;
+    entries.splice(entries.indexOf(e), 1);
+    unresolved.push(e.file);
+  }
 }
 
 /** A backup's manifest entry, read back from its own backup.json (undefined: unreadable now). */
@@ -1672,6 +1696,20 @@ const PROJECT_JSON_MAX = 256 * 1024 * 1024;
 /** How a restore finds the key a sealed backup needs: from the key ring, or the one derived for this restore alone. */
 type KeyOf = (keyId: string) => Uint8Array | undefined;
 
+/** The answer for a sealed backup whose project is locked and no passphrase was given (as from the start). */
+const lockedBackup = () => new RestoreError("This backup is encrypted: unlock its project, or give the project's passphrase");
+
+/**
+ * R435 b: a sealed backup refused for want of its key because ITS project (a project of this library with that key
+ * id) was locked, or is being locked, while it was being read: a lock, never damage. Not the answer for a key id no
+ * project here has, nor for any other failure (truncated, a flipped byte), which stay `UnreadableBackupError`.
+ */
+async function lockedMeanwhile(repo: Repo, abs: string, err: unknown, keyOf: KeyOf): Promise<boolean> {
+  if (!(err instanceof KeyNotAvailableError)) return false;
+  const keyId = await readKeyId(abs).catch(() => undefined);
+  return keyId !== undefined && keyOf(keyId) === undefined && repo.listProjects().some((p) => p.encryption.keyId === keyId);
+}
+
 /** A backup file opened for reading single entries: as it is, or through the project key when sealed. */
 async function openBackup(repo: Repo, abs: string, keyOf: KeyOf = (id) => keyFromRing(repo, id)): Promise<{ src: ZipSource; failure: () => unknown; close: () => Promise<void> }> {
   if (!abs.endsWith(".enc")) return { src: abs, failure: () => undefined, close: async () => {} };
@@ -1694,7 +1732,10 @@ async function projectIdIn(repo: Repo, abs: string): Promise<string | undefined>
     const pj = await readArchiveEntry(z.src, "project.json", PROJECT_JSON_MAX);
     const own = pj ? (JSON.parse(pj.toString("utf8")) as { project?: { id?: unknown } }).project?.id : undefined;
     return typeof own === "string" ? own : undefined;
-  } catch {
+  } catch (err) {
+    // Locked meanwhile (R435 b): answered as for a project locked from the start, not run without its maintenance lock.
+    // Defensive (R443 d, no test): without it the restore's key check answers locked too, but an unlock before that check would restore without the maintenance lock.
+    if (await lockedMeanwhile(repo, abs, err, (id) => keyFromRing(repo, id))) throw lockedBackup();
     return undefined;
   } finally {
     await z?.close().catch(() => {});
@@ -1708,8 +1749,8 @@ async function projectIdIn(repo: Repo, abs: string): Promise<string | undefined>
  */
 async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: Pick<RestoreRequest, "destinations" | "backupSha256" | "file">, keyOf: KeyOf): Promise<RestoreRequest> {
   const undecryptable = () => new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
-  const z = await openBackup(repo, abs, keyOf).catch(() => {
-    throw undecryptable();
+  const z = await openBackup(repo, abs, keyOf).catch(async (err: unknown) => {
+    throw (await lockedMeanwhile(repo, abs, err, keyOf)) ? lockedBackup() : undecryptable();
   });
   try {
     const raw = await readArchiveEntry(z.src, "project.json", PROJECT_JSON_MAX);
@@ -1843,7 +1884,7 @@ async function restoreHashed(repo: Repo, abs: string, backupSha256: string, opts
       });
       if (!keyFromRing(repo, keyId)) {
         const kf = entry?.keyFile;
-        if (!opts.passphrase || !kf || kf.keyId !== keyId) throw new RestoreError("This backup is encrypted: unlock its project, or give the project's passphrase");
+        if (!opts.passphrase || !kf || kf.keyId !== keyId) throw lockedBackup();
         let key: Uint8Array;
         try {
           key = await unwrapKey(kf.passphrase, opts.passphrase);
@@ -1876,7 +1917,8 @@ async function restoreOpened(
   let close: (() => Promise<void>) | undefined;
   let decryptFailure: (() => unknown) | undefined;
   if (sealed) {
-    const z = await openSealedZip(abs, keyOf).catch(() => {
+    const z = await openSealedZip(abs, keyOf).catch(async (err: unknown) => {
+      if (await lockedMeanwhile(repo, abs, err, keyOf)) throw lockedBackup(); // R435 b: locked, not audited as damage
       throw new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
     });
     source = { reader: z.reader, size: z.size };

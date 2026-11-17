@@ -16,6 +16,7 @@ import { InvalidInputError, NotFoundError, ReviewEntryDecidedError } from "./err
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
 import { readSourceFile, storeRequest } from "./sources.js";
 import type { ProjectState, RepoCore } from "./state.js";
+import { KeyNotAvailableError } from "../crypto/format.js";
 
 export const REVIEW_FILE = "review/pending.jsonl";
 const PURPOSE = "ao-review";
@@ -468,7 +469,8 @@ export function parseReviewFile(text: string, projectId: string, key: Uint8Array
       const e = JSON.parse(json) as ReviewEntry;
       if (typeof e?.id !== "string" || e.projectId !== projectId) throw new Error("not a review entry of this project");
       byId.set(e.id, e);
-    } catch {
+    } catch (err) {
+      if (err instanceof KeyNotAvailableError) throw err; // a wiped key: locked, not a skipped line (R386 a)
       skipped++;
     }
   }

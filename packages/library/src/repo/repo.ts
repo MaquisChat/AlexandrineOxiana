@@ -5,6 +5,7 @@ import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
 import type { Annotation, Asset, Collection, DateRule, ConsentRecord, EntityType, GovernanceConfig, PolicyDecision, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, Source, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import { KeyNotAvailableError } from "../crypto/format.js";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
@@ -57,6 +58,7 @@ import {
   createProject,
   isUnlocked,
   issueRecoveryCode,
+  lockAsksOf,
   lockProject,
   readFullData,
   recoveryCodeUnshown,
@@ -91,7 +93,7 @@ import { RepoCore, loadProjects, type ProjectState, type RepoOptions } from "./s
 import { loadPseudonyms, participantCodeOf } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
-import { InvalidInputError, NotFoundError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
+import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
 import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import {
@@ -221,8 +223,9 @@ export class Repo {
   createProject(input: CreateProjectInput): Promise<{ project: Project; recoveryCode?: string }> {
     return createProject(this.core, input);
   }
-  async unlockProject(projectId: string, passphraseOrRecovery: string): Promise<void> {
-    await unlockProject(this.core, projectId, passphraseOrRecovery);
+  /** `lockAsksAtRequest` (R443 a): the count `lockAsksOf` gave when the request arrived; every later lock overtakes this unlock. */
+  async unlockProject(projectId: string, passphraseOrRecovery: string, lockAsksAtRequest?: number): Promise<void> {
+    await unlockProject(this.core, projectId, passphraseOrRecovery, lockAsksAtRequest);
     // Work that waited for the key (e.g. sealed backups the backups manifest could not read, R94).
     for (const h of unlockHooks) await h(this, projectId).catch(() => {});
   }
@@ -234,11 +237,15 @@ export class Repo {
   issueRecoveryCode(projectId: string, passphrase: string): Promise<{ recoveryCode: string }> {
     return issueRecoveryCode(this.core, projectId, passphrase);
   }
-  lockProject(projectId: string): void {
-    lockProject(this.core, projectId);
+  lockProject(projectId: string): Promise<void> {
+    return lockProject(this.core, projectId);
   }
   isUnlocked(projectId: string): boolean {
     return isUnlocked(this.core, projectId);
+  }
+  /** The project's count of locks asked so far (read-only): noted by an unlock when its request arrives (R443 a). */
+  lockAsksOf(projectId: string): number {
+    return lockAsksOf(this.core, projectId);
   }
 
   /** The governed write path; see mutate.ts for the ordering guarantees. */
@@ -1642,8 +1649,15 @@ async function withProjectReasons(core: RepoCore, st: ProjectState, events: Audi
     k = keyOrLocked(core, st);
     if (k !== "locked") {
       const key = k.key;
-      if (sealed.some((e) => typeof e.details?.reviewEntry !== "string")) store = await readProjectReasons(core.abs(`${st.rel}/${AUDIT_REASONS_FILE}`), key, st.project.id).catch(() => "unreadable" as const);
-      if (sealed.some((e) => typeof e.details?.reviewEntry === "string")) review = await readReviewEntries(core, st).catch(() => "unreadable" as const);
+      // A read a lock cut short (a wiped key) is "locked", never "unreadable" (R386 a).
+      const failed = (e: unknown): "unreadable" => {
+        if (e instanceof KeyNotAvailableError || e instanceof ProjectLockedError) throw new ProjectLockedError(st.project.id);
+        return "unreadable";
+      };
+      if (sealed.some((e) => typeof e.details?.reviewEntry !== "string")) store = await readProjectReasons(core.abs(`${st.rel}/${AUDIT_REASONS_FILE}`), key, st.project.id).catch(failed);
+      if (sealed.some((e) => typeof e.details?.reviewEntry === "string")) review = await readReviewEntries(core, st).catch(failed);
+      // The digests below are checked with this key: wiped meanwhile, the read is refused as locked.
+      if (key.every((b) => b === 0)) throw new ProjectLockedError(st.project.id);
     }
   }
   return events.map((e) => {

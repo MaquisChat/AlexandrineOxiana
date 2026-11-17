@@ -28,6 +28,7 @@ import type { KeyRing } from "./crypto/keys.js";
 import { getMeta, setMeta, type IndexDb } from "./index/db.js";
 import { listProjectEntries, projectKey } from "./index/changes.js";
 import { appendDurable, assertContained, decryptBytes, incompleteTail, openLine, readMaybe, sealLine, truncateDurable } from "./repo/io.js";
+import { KeyNotAvailableError } from "./crypto/format.js";
 
 export const JOBS_FILE = "jobs/journal.jsonl";
 const PURPOSE = "ao-jobs";
@@ -212,7 +213,9 @@ export function parseJobJournal(text: string, projectId: string, key: Uint8Array
       out.records.set(o.id, o);
       out.latestLines.set(o.id, line);
       if (holdsAbsolutePath(o.job)) out.absolutePaths = true;
-    } catch {
+    } catch (err) {
+      // A wiped key: the read was cut short by a lock; nothing is decided (or rewritten) from it (R386 a).
+      if (err instanceof KeyNotAvailableError) throw err;
       out.unreadable.push(line);
     }
   }

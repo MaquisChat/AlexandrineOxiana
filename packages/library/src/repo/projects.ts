@@ -28,11 +28,11 @@ import {
 import { AuditStore } from "./audit-store.js";
 import { appendLibraryRefusal } from "./library-audit.js";
 import { appendChanges } from "./changelog-store.js";
-import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
+import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
-import type { Manifest, ProjectJson, ProjectState, RepoCore } from "./state.js";
+import { lockPurges, type Manifest, type ProjectJson, type ProjectState, type RepoCore } from "./state.js";
 
 export interface CreateProjectInput {
   name: string;
@@ -215,10 +215,33 @@ async function readKeyFile(core: RepoCore, st: ProjectState): Promise<ProjectKey
   return JSON.parse(raw.toString("utf8")) as ProjectKeyFile;
 }
 
-/** Unlocks with the passphrase or, failing that, the recovery code. */
-export async function unlockProject(core: RepoCore, projectId: string, secret: string): Promise<void> {
+/**
+ * Unlocks with the passphrase or, failing that, the recovery code. While it runs it is the project's pending unlock.
+ * R435 a: a lock asked meanwhile takes effect at once and OVERTAKES this unlock: the unlock then rejects with
+ * `ProjectLockedError` (its caller is told the project is locked and resumes nothing), its key is not added, its
+ * index reload is not run, and the project ends locked. An unlock asked after a lock waits for it and wins.
+ * R443 a: `lockAsksAtRequest`, when given, is the project's count of locks asked (`lockAsksOf`) noted when the
+ * unlock's request arrived, before it waited its turn: every lock asked after that overtakes this unlock.
+ */
+export function unlockProject(core: RepoCore, projectId: string, secret: string, lockAsksAtRequest?: number): Promise<void> {
+  const run = unlockNow(core, projectId, secret, lockAsksAtRequest);
+  const mark = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  core.pendingUnlocks.set(projectId, mark);
+  void mark.then(() => {
+    if (core.pendingUnlocks.get(projectId) === mark) core.pendingUnlocks.delete(projectId);
+  });
+  return run;
+}
+
+async function unlockNow(core: RepoCore, projectId: string, secret: string, lockAsksAtRequest?: number): Promise<void> {
   const st = core.state(projectId);
   if (!core.encrypted(st)) return;
+  // A lock asked from here on (R435 a), or since the request arrived when its count is given (R443 a), overtakes this unlock.
+  const asked = lockAsksAtRequest ?? core.lockAsks.get(projectId) ?? 0;
+  const overtaken = () => (core.lockAsks.get(projectId) ?? 0) !== asked;
   // Unlocking is audited; that append must wait until the interrupted write is resolved.
   if (st.recoveryPending && core.library.mode === "read-write") throw new RecoveryPendingError(projectId);
   const file = await readKeyFile(core, st);
@@ -234,22 +257,44 @@ export async function unlockProject(core: RepoCore, projectId: string, secret: s
     }
     key = await unwrapWithRecovery(file.recovery, secret);
   }
-  try {
+  let added = false;
+  /** When the key entered the ring: told in the `key.unlock` entry of an unlock a lock overtakes after it (R445). */
+  let addedAt = "";
+  // Checked in the same step as the add: a lock asked before it means the key never enters the ring (R435 a).
+  const add = () => {
+    if (overtaken()) return;
     core.keyRing.add(file.keyId, key);
+    addedAt = core.clock().toISOString();
+    added = true;
+  };
+  try {
+    // A lock asked before this unlock is done first: then the key is added again (R386 b).
+    if (!overtaken()) for (let p = core.pendingLocks.get(projectId); p; p = core.pendingLocks.get(projectId)) await p.catch(() => {});
+    // An unlocked project's key is replaced only between turns of the write queue (R379); the same key again
+    // changes nothing (KeyRing.add keeps the buffer a change may be sealing with).
+    if (core.keyRing.has(file.keyId) && !core.queueIdle()) await core.serialNext(async () => add());
+    else add();
   } finally {
     key.fill(0);
   }
+  if (!added) throw new ProjectLockedError(projectId);
+  // The unlock took effect (the key was in the ring), so it is audited even when a lock overtakes it now.
   if (core.library.mode === "read-write") {
     await core.serial(async () => {
+      // Timed when written, as every entry (R445); one a lock overtook says so, and when its key entered the ring.
       const at = core.clock().toISOString();
-      await core.auditNow(st, { ...core.auditBase(st, at), action: "key.unlock", entity: { type: "project", id: projectId } });
+      const late = overtaken() ? { details: { overtakenByLock: true, keyAddedAt: addedAt } } : {};
+      await core.auditNow(st, { ...core.auditBase(st, at), action: "key.unlock", entity: { type: "project", id: projectId }, ...late });
     });
   }
+  // Overtaken by a lock: no reload (a reload a lock cuts short ends as a locked project's, R404), and locked.
+  if (overtaken()) throw new ProjectLockedError(projectId);
   try {
     await core.index.projectUnlocked?.(projectId);
   } catch (error) {
     core.indexErrors.push({ op: "project.unlock", error });
   }
+  if (overtaken()) throw new ProjectLockedError(projectId);
 }
 
 /** The staged key file of a new recovery code (R141), beside the active one until it is activated. */
@@ -471,15 +516,67 @@ export async function recoveryCodeUnshown(core: RepoCore, st: ProjectState): Pro
   return core.encrypted(st) && (await readMaybe(core.abs(`${st.rel}/${UNSHOWN_FILE}`))) !== null;
 }
 
-export function lockProject(core: RepoCore, projectId: string): void {
-  const keyId = core.state(projectId).project.encryption.keyId;
-  // Drop the project's in-memory index content first; a failure must not keep the project unlocked.
+/**
+ * Locks the project: its in-memory content (index, kept registers and queues) is dropped and its key zeroed in the
+ * key ring. R379: the key is wiped only between turns of the write queue, never under a change being saved: at once
+ * when no write is running, else as the next turn (after the change in progress, ahead of those waiting, which then
+ * find the project locked). R386 b: locking is immediate for everyone but that change: before this returns, the
+ * project counts as locked for every read and every new change (the key ring answers only the turn running now);
+ * the returned promise settles when the key is wiped. An unknown project is a rejected promise, never a throw.
+ */
+export function lockProject(core: RepoCore, projectId: string): Promise<void> {
+  let st: ProjectState;
   try {
-    core.index.purgeProject?.(projectId);
-  } catch (error) {
-    core.indexErrors.push({ op: "project.lock", error });
+    st = core.state(projectId);
+  } catch (err) {
+    return Promise.reject(err);
   }
-  if (keyId) core.keyRing.remove(keyId);
+  // R435 a: a lock takes effect at once, an unlock in flight included: that unlock is overtaken (it adds no key and
+  // ends as locked), and the returned promise settles once it has ended and the key is wiped.
+  core.lockAsks.set(projectId, (core.lockAsks.get(projectId) ?? 0) + 1);
+  const unlocking = core.pendingUnlocks.get(projectId);
+  const done = lockAtOnce(core, projectId, st);
+  return unlocking ? unlocking.then(() => done) : done;
+}
+
+function lockAtOnce(core: RepoCore, projectId: string, st: ProjectState): Promise<void> {
+  const pending = core.pendingLocks.get(projectId);
+  if (pending) return pending;
+  const keyId = st.project.encryption.keyId;
+  const purge = () => {
+    // A failure must not keep the project unlocked.
+    try {
+      core.index.purgeProject?.(projectId);
+    } catch (error) {
+      core.indexErrors.push({ op: "project.lock", error });
+    }
+    for (const p of lockPurges) {
+      try {
+        p(core, st);
+      } catch (error) {
+        core.indexErrors.push({ op: "project.lock", error });
+      }
+    }
+  };
+  const lock = () => {
+    purge();
+    if (keyId) core.keyRing.remove(keyId);
+  };
+  if (core.queueIdle()) {
+    lock();
+    return Promise.resolve();
+  }
+  // Locked for everyone at once but the turn running now, which may still be sealing with the key.
+  if (keyId) core.keyRing.markLocking(keyId, core.admitsOnlyRunningTurn());
+  purge();
+  const done = core.serialNext(async () => lock()).finally(() => core.pendingLocks.delete(projectId));
+  core.pendingLocks.set(projectId, done);
+  return done;
+}
+
+/** The project's count of locks asked so far (R443 a): read-only, for an unlock to note when its request arrives. */
+export function lockAsksOf(core: RepoCore, projectId: string): number {
+  return core.lockAsks.get(projectId) ?? 0;
 }
 
 export function isUnlocked(core: RepoCore, projectId: string): boolean {

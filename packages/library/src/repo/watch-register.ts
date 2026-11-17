@@ -22,11 +22,12 @@ import { statSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { isId } from "@ao/core";
-import { InvalidInputError } from "./errors.js";
+import { InvalidInputError, ProjectLockedError } from "./errors.js";
 import { openLine, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation } from "./mutate.js";
 import { PURPOSE_WATCH_REGISTER } from "./sealed-purposes.js";
-import type { RepoCore } from "./state.js";
+import { lockPurges, type RepoCore } from "./state.js";
+import { KeyNotAvailableError } from "../crypto/format.js";
 
 /** What the register says about a file of the folder. */
 export type WatchedFileState = "in-library" | "changed" | "may-have-changed" | "gone" | "settled";
@@ -131,7 +132,8 @@ function fold(map: Map<string, WatchRegisterEntry>, line: string, projectId: str
     if (!isRegisterEntry(e)) return false;
     apply(map, e);
     return true;
-  } catch {
+  } catch (err) {
+    if (err instanceof KeyNotAvailableError) throw err; // a wiped key: the read was cut short by a lock (R386 a)
     return false;
   }
 }
@@ -172,6 +174,18 @@ function cacheOf(core: RepoCore): Map<string, { sig: string; map: Map<string, Wa
   let c = caches.get(core);
   if (!c) caches.set(core, (c = new Map()));
   return c;
+}
+
+/** At lock (R386 a): the project's kept registers are dropped; no decrypted entry stays behind the lock. */
+lockPurges.push((core, st) => {
+  const dir = core.abs(`${st.rel}/${DIR}/`);
+  const c = caches.get(core);
+  if (c) for (const abs of [...c.keys()]) if (abs.startsWith(dir)) c.delete(abs);
+});
+
+/** Test seam: how many registers are kept for this repository. */
+export function watchCacheSize(repo: object): number {
+  return caches.get((repo as { core: RepoCore }).core)?.size ?? 0;
 }
 
 /**
@@ -222,11 +236,19 @@ export async function readWatchRegister(core: RepoCore, projectId: string, watch
       held = line;
     }
     if (held !== null && held.trim() && endsWithNewline) fold(map, held, st.project.id, key);
-  } catch {
+  } catch (err) {
+    // Locked while it was read: refused as locked, and nothing is kept (R386 a).
+    if (err instanceof KeyNotAvailableError) throw new ProjectLockedError(projectId);
     throw new WatchRegisterUnreadableError();
   } finally {
     lines.close();
     stream.destroy();
+  }
+  // R435 c: locked (key wiped) or being locked since the last line was opened: nothing decrypted is kept, nor handed
+  // out after the lock: refused as locked.
+  if (key && (!key.some((b) => b !== 0) || !core.keyRing.has(st.project.encryption.keyId ?? ""))) {
+    cache.delete(abs);
+    throw new ProjectLockedError(projectId);
   }
   cache.set(abs, { sig, map });
   return new Map(map);

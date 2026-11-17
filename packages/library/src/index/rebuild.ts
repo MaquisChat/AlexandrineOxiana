@@ -5,7 +5,7 @@ import { newId } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import { renameWithRetry } from "../fs/atomic.js";
 import type { Library } from "../library.js";
-import { ReadOnlyLibraryError } from "../repo/errors.js";
+import { ReadOnlyLibraryError, isLockedRefusal } from "../repo/errors.js";
 import { readMaybe } from "../repo/io.js";
 import { REVIEW_FILE, parseReviewFile, reviewRow, type ReviewItemRow } from "../repo/review.js";
 import type { Manifest } from "../repo/state.js";
@@ -88,6 +88,24 @@ export async function rebuildIndex(
   opts: RebuildOptions = {},
 ): Promise<RebuildResult> {
   if (library.mode !== "read-write") throw new ReadOnlyLibraryError(library.readOnlyReason);
+  // An encrypted project locked while the new index is built (its key wiped mid-read) is never left with part of
+  // its rows (R404): the half-built index is dropped (the old one is untouched) and the build starts again, that
+  // project now indexed as a locked project is (manifest-level rows). Retries are bounded; then the refusal stands.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await rebuildOnce(handle, keyRing, onProgress, opts);
+    } catch (err) {
+      if (!isLockedRefusal(err) || attempt >= 3) throw err;
+    }
+  }
+}
+
+async function rebuildOnce(
+  handle: IndexHandle,
+  keyRing: KeyRing,
+  onProgress: ((done: number, total: number) => void) | undefined,
+  opts: RebuildOptions,
+): Promise<RebuildResult> {
   const root = handle.root;
   // Leftovers of an earlier crashed rebuild (the library lock makes us the only writer).
   for (const f of await fsp.readdir(root)) {
@@ -136,6 +154,11 @@ export async function rebuildIndex(
     await renameWithRetry(tmp, dest);
     handle.reopen();
     result.errors.push(...(await reloadUnlocked(handle, root, keyRing, opts.reloadProject)));
+    // A project locked during the reload holds manifest-level rows only, as a locked project does: reported as one.
+    for (const e of await listProjectEntries(root).catch(() => [])) {
+      const d = e.data;
+      if (d?.project.encryption.enabled && projectKey(d, keyRing) === undefined && !result.lockedProjects.includes(d.project.id)) result.lockedProjects.push(d.project.id);
+    }
     return result;
   } catch (err) {
     try {
@@ -249,6 +272,7 @@ async function populate(
         if (skipped) result.errors.push({ folder: `${e.rel}/${REVIEW_FILE}`, message: `${skipped} unreadable line(s) skipped` });
       }
     } catch (err) {
+      if (isLockedRefusal(err)) throw err; // locked meanwhile: the build starts again (see rebuildIndex)
       result.errors.push({ folder: `${e.rel}/${REVIEW_FILE}`, message: err instanceof Error ? err.message : String(err) });
     }
     // So is its job journal (R31): the jobs table is filled from it alone.
@@ -257,6 +281,7 @@ async function populate(
       jobRecords.push(...journal.records.values());
       if (journal.unreadable.length) result.errors.push({ folder: `${e.rel}/${JOBS_FILE}`, message: `${journal.unreadable.length} unreadable line(s) skipped` });
     } catch (err) {
+      if (isLockedRefusal(err)) throw err;
       result.errors.push({ folder: `${e.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
     }
     // Plain projects are indexed fully here. An unlocked encrypted project gets manifest-level rows
@@ -281,6 +306,7 @@ async function populate(
           else indexSource(db, sf, await readExtractedText(root, sf, null));
           result.indexed++;
         } catch (err) {
+          if (isLockedRefusal(err)) throw err;
           result.errors.push({ folder, message: err instanceof Error ? err.message : String(err) });
         }
       });
