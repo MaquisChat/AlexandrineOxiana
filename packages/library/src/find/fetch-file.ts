@@ -81,15 +81,20 @@ export type FetchFileErrorCode =
 /** A download refused or failed; `message` is a plain sentence for the researcher (no address, no host). */
 export class FetchFileError extends Error {
   override name = "FetchFileError";
+  /**
+   * For "status": the answer's raw Retry-After (at most 100 characters), for the runner's next try (R411 b). Not
+   * enumerable, as on `LookupHttpError`: a host's words never show when the error is serialised, spread or inspected.
+   */
+  declare readonly retryAfter?: string;
   constructor(
     readonly code: FetchFileErrorCode,
     message: string,
     /** For "status": the answer's HTTP status (R379, FR-A17: it decides whether the failure may pass). */
     readonly status?: number,
-    /** For "status": the answer's raw Retry-After (at most 100 characters), for the runner's next try (R411 b). */
-    readonly retryAfter?: string,
+    retryAfter?: string,
   ) {
     super(message);
+    if (retryAfter !== undefined) Object.defineProperty(this, "retryAfter", { value: retryAfter.slice(0, 100), enumerable: false });
   }
 }
 

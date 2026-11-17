@@ -320,6 +320,16 @@ describe("fetchFile: refusals leave the folder empty", () => {
     await empty();
   });
 
+  it("R411 b (review 2, M1): a refusal's Retry-After is kept but never enumerable (no serialising shows it)", async () => {
+    const e = new FetchFileError("status", "x", 429, "3600");
+    expect(e.retryAfter).toBe("3600");
+    expect(Object.keys(e)).not.toContain("retryAfter");
+    expect(JSON.stringify(e)).not.toContain("3600");
+    expect({ ...e }).not.toHaveProperty("retryAfter");
+    expect(new FetchFileError("status", "x", 503, "y".repeat(500)).retryAfter).toHaveLength(100);
+    expect(new FetchFileError("status", "x", 503).retryAfter).toBeUndefined();
+  });
+
   it("a service that cannot be reached is a refusal in plain words", async () => {
     agent.get("https://arxiv.org").intercept({ path: "/e", method: "GET" }).replyWithError(new Error("socket hang up at https://arxiv.org/e"));
     const e = await refusal(get("https://arxiv.org/e"));
