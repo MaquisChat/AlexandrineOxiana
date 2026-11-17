@@ -26,7 +26,7 @@ import {
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { ndjsonWriter, sseWriter } from "../streams.js";
-import { bodyOf, queryOf, str, strArray, type Ctx } from "./util.js";
+import { bodyOf, optStr, queryOf, str, strArray, type Ctx } from "./util.js";
 import { isLocalAbsolutePath } from "./local-path.js";
 
 function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
@@ -182,13 +182,80 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   // the new copy. Nothing writes to the library meanwhile (R99 I5): imports are paused (the move is
   // refused if one cannot be), watches, queues and the backup scheduler stopped; afterwards they
   // start on the library now open, and the paused imports resume there.
-  app.post("/libraries/move", async (req: FastifyRequest, reply: FastifyReply) => {
+  //
+  // A move is marked as ASKED FOR at the earliest point of its request (R399 b): this route's own
+  // onRequest hook, which runs right after the global one (host, origin and token checks: nothing
+  // that has not passed them may change what move/status says) and before the body is read or
+  // anything waits. Fastify has no earlier per-route point. The mark ends when the handler ends
+  // (the move ran or was refused); a request refused before its handler (its body unreadable, the
+  // global 409) ends it when its answer is sent or the connection closes.
+  const asked = new Map<FastifyRequest, { handling: boolean }>();
+  const endAsked = (req: FastifyRequest) => {
+    if (asked.delete(req)) state.movesAsked--;
+  };
+  /** The destination and the screen's attempt id of a move request, when its body carries both. */
+  const askedFor = (req: FastifyRequest): { dest: string; attempt: string } | undefined => {
+    const b = req.body as Record<string, unknown> | null | undefined;
+    if (!b || typeof b !== "object" || typeof b.dest !== "string" || typeof b.attempt !== "string") return undefined;
+    if (!b.attempt || b.attempt.length > 64) return undefined;
+    return { dest: b.dest, attempt: b.attempt };
+  };
+  /** A move refused after it was marked keeps its reason under its attempt, as executeMove's failures are (R399 c). */
+  const recordRefusal = (req: FastifyRequest, error: { code: string; message: string; reason?: string }) => {
+    const a = askedFor(req);
+    if (a) state.recordMoveFailure({ newRoot: a.dest, attempt: a.attempt, error });
+  };
+  app.post(
+    "/libraries/move",
+    {
+      onRequest: async (req: FastifyRequest, reply: FastifyReply) => {
+        const mark = { handling: false };
+        asked.set(req, mark);
+        state.movesAsked++;
+        reply.raw.once("close", () => {
+          if (!mark.handling) endAsked(req);
+        });
+      },
+      // A refusal answered before the handler ran (the global 409 while another move runs, a body
+      // that could not be read): recorded before its answer goes out, so the mark never ends first.
+      onSend: async (req: FastifyRequest, reply: FastifyReply, payload: unknown) => {
+        if (asked.get(req)?.handling === false && reply.statusCode >= 400 && typeof payload === "string") {
+          try {
+            const body = JSON.parse(payload) as { error?: { code: string; message: string; reason?: string } };
+            if (body.error) recordRefusal(req, body.error);
+          } catch {
+            // not an error body: nothing to keep
+          }
+        }
+        return payload;
+      },
+    },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const mark = asked.get(req);
+      if (mark) mark.handling = true;
+      let finished = false;
+      try {
+        await runMove(req, reply, () => (finished = true));
+      } catch (err) {
+        // Refused or failed before the move finished: its reason is kept before the mark ends.
+        if (!finished) recordRefusal(req, errorBody(toApiError(err), state.roots).error);
+        throw err;
+      } finally {
+        endAsked(req);
+      }
+    },
+  );
+  const runMove = async (req: FastifyRequest, reply: FastifyReply, onFinished: () => void) => {
     if (state.moving) throw new ApiError(409, "CONFLICT", "A move of this library is already running.");
     const s = state.requireWritable();
     const b = bodyOf(req);
     const dest = absPath(b, "dest");
     const excludeProjectIds = strArray(b, "excludeProjectIds", { optional: true, max: 10_000, itemMax: 64 });
+    // The screen's own id for this request: a failure is kept under it, so that a screen that lost
+    // its connection can tell its own move's failure from an earlier one (R379).
+    const attempt = optStr(b, "attempt", 64) ?? null;
     // From here every change is refused (503 MOVE_IN_PROGRESS) and background work waits (R102 N2).
+    // An earlier failure is kept until this move has its own outcome (R399 c).
     state.moving = true;
     try {
       // Changes already being made finish first (this request is one of the in-flight ones, R106 I1).
@@ -221,12 +288,17 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
           state.resumeBatches(paused);
           state.restartStoppedWork();
         }
-        await write(ndjsonError(ctx, err));
+        const body = ndjsonError(ctx, err);
+        state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
+        await write(body);
         reply.raw.end();
         return;
       }
       const r = moved;
-      const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken });
+      const warnings = r.warnings.map((w) => scrubPaths(w, state.roots));
+      const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken, warnings });
+      state.forgetMoveFailure();
+      onFinished();
       // The library now lives at the destination (the move closed the old copy): open it there, retrying once.
       // If it still cannot be opened, what was paused resumes once it is (R106).
       state.resumeWhenOpened(r.newRoot, paused, oldRoot);
@@ -253,18 +325,21 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       await state.adopt(lib);
       await write({
         done: true,
-        result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) },
+        result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings },
       });
       reply.raw.end();
     } finally {
       state.moving = false;
     }
-  });
+  };
 
-  // The last move's token (single use, 15 minutes), e.g. after the move's stream was cut off.
+  // What is true of the moves, for a screen whose connection to its move was lost (R379): whether
+  // one is running now (or was asked for and has not yet ended or been refused, R399 b); the last finished move's token (single use, 15 minutes); the last move that
+  // stopped with an error (15 minutes, or until the next move starts).
   app.get("/libraries/move/status", async () => {
     const m = state.pendingMove();
-    return { pending: m ?? null };
+    const f = state.failedMove();
+    return { pending: m ?? null, running: state.moving || state.movesAsked > 0, failed: f ? { newRoot: f.newRoot, attempt: f.attempt, error: f.error } : null };
   });
 
   app.post("/libraries/move/delete-old", async (req) => {

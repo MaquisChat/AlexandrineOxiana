@@ -187,6 +187,18 @@ export interface PendingMove {
   newRoot: string;
   confirmToken: string;
   expiresAt: string;
+  /** The finished move's own warnings (R379, I2); absent from an older service. */
+  warnings?: string[];
+}
+
+/**
+ * GET /libraries/move/status (R379): whether a move runs now; the last finished move (its token);
+ * the last move that stopped with an error, under the `attempt` id its screen sent.
+ */
+export interface MoveStatus {
+  pending: PendingMove | null;
+  running?: boolean;
+  failed?: { newRoot: string; attempt: string | null; error: { code: string; message: string; reason?: string } } | null;
 }
 
 export interface RelinkResult {
@@ -284,9 +296,10 @@ export function governanceApi(client: ApiClient) {
     movePlan: (dest: string) => r<MovePlan>("POST", "/libraries/move/plan", { body: { dest } }),
     /** Streams the move's progress; ends with `done` (verified and switched) or `error`. */
     /** `onOpen`: the service accepted the move (its answer's headers arrived); from then on a broken stream is not "not started". */
-    move: (dest: string, excludeProjectIds: string[], signal?: AbortSignal, onOpen?: () => void) =>
-      client.ndjson<MoveLine>("POST", "/libraries/move", { body: { dest, excludeProjectIds }, ...(signal ? { signal } : {}), ...(onOpen ? { onOpen } : {}) }),
-    moveStatus: () => r<{ pending: PendingMove | null }>("GET", "/libraries/move/status"),
+    /** `attempt`: the screen's own id for this request; a failure is kept under it in move/status (R379). */
+    move: (dest: string, excludeProjectIds: string[], signal?: AbortSignal, onOpen?: () => void, attempt?: string) =>
+      client.ndjson<MoveLine>("POST", "/libraries/move", { body: { dest, excludeProjectIds, ...(attempt ? { attempt } : {}) }, ...(signal ? { signal } : {}), ...(onOpen ? { onOpen } : {}) }),
+    moveStatus: () => r<MoveStatus>("GET", "/libraries/move/status"),
     deleteOldCopy: (token: string) => r<{ warnings: string[]; [k: string]: unknown }>("POST", "/libraries/move/delete-old", { body: { token } }),
 
     integrity: () => r<IntegrityAnswer>("GET", "/libraries/integrity"),

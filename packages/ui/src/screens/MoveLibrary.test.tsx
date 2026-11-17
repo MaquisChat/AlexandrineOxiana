@@ -58,7 +58,7 @@ describe("Move library", () => {
     expect(within(plan).queryByRole("button", { name: "Move library" })).toBeNull();
     expect(within(plan).getByRole("button", { name: "Cancel" })).toBeTruthy();
     await user.click(within(plan).getByRole("button", { name: "Move the other projects only" }));
-    await waitFor(() => expect(body).toEqual({ dest: DEST, excludeProjectIds: ["p2"] }));
+    await waitFor(() => expect(body).toEqual({ dest: DEST, excludeProjectIds: ["p2"], attempt: expect.any(String) }));
     s.end();
   });
 
@@ -181,20 +181,332 @@ describe("Move library", () => {
     expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
   });
 
-  it("a move the service could not be reached for is \"could not be started\", not a cut-off stream", async () => {
-    const user = userEvent.setup();
-    let polled = false;
-    server.use(
-      http.post(url("/libraries/move"), () => HttpResponse.error()),
-      http.get(url("/libraries/move/status"), () => {
-        polled = true;
-        return HttpResponse.json({ pending: null });
-      }),
-    );
-    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
-    await user.click(within(plan).getByRole("button", { name: "Move library" }));
-    expect((await screen.findByRole("alert")).textContent).toMatch(/The move could not be started/);
-    expect(polled).toBe(false);
+  describe("a move request that failed before the service answered asks move/status before saying anything (R379, I5)", () => {
+    const LOST = "The connection to the app's service was lost. The move may still be running. This screen will show what happened as soon as the service answers.";
+    /** The move request fails as the network does (status 0, UNAVAILABLE); its body is kept. */
+    const lostMove = (seen: { body?: any }) =>
+      http.post(url("/libraries/move"), async ({ request }) => {
+        seen.body = await request.json();
+        return HttpResponse.error();
+      });
+    async function start(user: ReturnType<typeof userEvent.setup>) {
+      server.use(http.post(url("/libraries/move/plan"), () => HttpResponse.json({ ...PLAN, perProject: [PLAN.perProject[0]!] })));
+      render(<MoveLibrary api={makeApi()} pollMs={5} maxPolls={200} />);
+      await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+      await user.click(screen.getByRole("button", { name: "Check destination" }));
+      await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+    }
+
+    it("the reviewer's probe: move/status IS asked, and while it says a move is running the false sentence is never shown; then the result", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          return HttpResponse.json(polls < 4 ? { pending: null, running: true, failed: null } : { pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-lost", expiresAt: "2026-11-11T10:15:00.000Z" }, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect(await screen.findByText("Waiting for the move to finish…")).toBeTruthy();
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
+      expect((await screen.findByRole("status", { name: "Verification" })).textContent).toMatch(/finished and was verified/);
+      expect(polls).toBeGreaterThanOrEqual(4);
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(false);
+      expect(typeof seen.body.attempt).toBe("string");
+    });
+
+    it("no move running and none made: only then \"could not be started … Nothing was copied or changed\", back to the plan", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          // An earlier move's failure (another attempt) is not this one's.
+          return HttpResponse.json({ pending: null, running: false, failed: { newRoot: DEST, attempt: "an-earlier-attempt", error: { code: "CONFLICT", message: "Old failure." } } });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert")).textContent).toMatch(/^The move could not be started: .*Nothing was copied or changed\.$/);
+      expect(screen.queryByText(/Old failure/)).toBeNull();
+      expect(polls).toBeGreaterThan(0);
+      expect(screen.getByRole("region", { name: "Move plan" })).toBeTruthy();
+    });
+
+    it("a move that finished with an error (this attempt's): its error, never \"nothing was copied\"", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () =>
+          HttpResponse.json({ pending: null, running: false, failed: { newRoot: DEST, attempt: seen.body?.attempt, error: { code: "CONFLICT", message: "A copied file did not match its original." } } }),
+        ),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert")).textContent).toMatch(/did not match its original\. The move stopped; nothing was deleted, and the library stays where it was\./);
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it("the service cannot be reached: a sentence that claims nothing about the files, and it keeps asking", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          return HttpResponse.error();
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert")).textContent).toBe(LOST);
+      const seenPolls = polls;
+      await waitFor(() => expect(polls).toBeGreaterThan(seenPolls + 2));
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
+    });
+
+    it("the status request failing twice and then answering: the lost-connection sentence, then what the service says", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      let sawLost = false;
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          if (polls <= 2) return HttpResponse.error();
+          sawLost ||= screen.queryByText(LOST) !== null;
+          return HttpResponse.json({ pending: null, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert", {}, { timeout: 3000 })).textContent).toBeTruthy();
+      await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/The move could not be started/));
+      expect(sawLost).toBe(true);
+      // "Not started" needs two successive answers that agree (R399 b): the third and the fourth.
+      expect(polls).toBe(4);
+    });
+
+    it("a move seen running, then the service restarted (empty answers): never \"not started\"; it ends as the cut-off path does (R399 a)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      const alerts: string[] = [];
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          const a = screen.queryByRole("alert")?.textContent;
+          if (a) alerts.push(a);
+          if (polls <= 2) return HttpResponse.json({ pending: null, running: true, failed: null });
+          if (polls <= 4) return HttpResponse.error();
+          return HttpResponse.json({ pending: null, running: false, failed: null });
+        }),
+      );
+      server.use(http.post(url("/libraries/move/plan"), () => HttpResponse.json({ ...PLAN, perProject: [PLAN.perProject[0]!] })));
+      render(<MoveLibrary api={makeApi()} pollMs={5} maxPolls={12} />);
+      await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+      await user.click(screen.getByRole("button", { name: "Check destination" }));
+      await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+      await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("No finished move was found. Open the library to check where it is before trying again."), { timeout: 5000 });
+      expect(polls).toBe(12);
+      expect(alerts.some((a) => /Nothing was copied or changed/.test(a))).toBe(false);
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
+    });
+
+    it("the lost-connection sentence goes as soon as any status answer arrives, and comes back only when the service is lost again (second review, M-a)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      const shown: Array<{ alert: string | null; waiting: boolean }> = [];
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          shown.push({ alert: screen.queryByRole("alert")?.textContent ?? null, waiting: screen.queryByText("Waiting for the move to finish…") !== null });
+          if (polls === 1 || polls === 3) return HttpResponse.error();
+          if (polls === 2) return HttpResponse.json({ pending: null, running: true, failed: null });
+          if (polls <= 6) return HttpResponse.json({ pending: null, running: false, failed: null });
+          return HttpResponse.json({ pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-back", expiresAt: "2026-11-11T10:15:00.000Z" }, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("status", { name: "Verification" }, { timeout: 3000 })).textContent).toMatch(/finished and was verified/);
+      // shown[k] is what the screen showed after answer k (polls are 1-based, shown is 0-based).
+      expect(shown[1]).toEqual({ alert: LOST, waiting: false }); // lost
+      expect(shown[2]).toEqual({ alert: null, waiting: true }); // a move is running: the sentence is gone
+      expect(shown[3]).toEqual({ alert: LOST, waiting: true }); // lost again: it is back
+      expect(shown[4]).toEqual({ alert: null, waiting: true }); // an empty answer after "running": gone, still waiting
+      expect(shown[5]).toEqual({ alert: null, waiting: true });
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("the first status question waits one polling interval (R399 b)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let failedAt = 0;
+      let askedAt = 0;
+      server.use(
+        http.post(url("/libraries/move"), async ({ request }) => {
+          seen.body = await request.json();
+          failedAt = Date.now();
+          return HttpResponse.error();
+        }),
+        http.get(url("/libraries/move/status"), () => {
+          askedAt ||= Date.now();
+          return HttpResponse.json({ pending: null, running: false, failed: null });
+        }),
+      );
+      server.use(http.post(url("/libraries/move/plan"), () => HttpResponse.json({ ...PLAN, perProject: [PLAN.perProject[0]!] })));
+      render(<MoveLibrary api={makeApi()} pollMs={150} maxPolls={20} />);
+      await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+      await user.click(screen.getByRole("button", { name: "Check destination" }));
+      await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+      await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/The move could not be started/), { timeout: 5000 });
+      expect(askedAt - failedAt).toBeGreaterThanOrEqual(140);
+    });
+
+    it("one empty answer followed by \"running\" does not conclude \"not started\" (R399 b)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      const alerts: string[] = [];
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          const a = screen.queryByRole("alert")?.textContent;
+          if (a) alerts.push(a);
+          if (polls === 1) return HttpResponse.json({ pending: null, running: false, failed: null });
+          if (polls <= 3) return HttpResponse.json({ pending: null, running: true, failed: null });
+          return HttpResponse.json({ pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-late", expiresAt: "2026-11-11T10:15:00.000Z" }, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("status", { name: "Verification" }, { timeout: 3000 })).textContent).toMatch(/finished and was verified/);
+      expect(alerts.some((a) => /could not be started/.test(a))).toBe(false);
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+    });
+
+    it("a move refused after it was marked (background work that could not be paused): that reason, not \"could not be reached\" (R399 c)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () =>
+          HttpResponse.json({
+            pending: null,
+            running: false,
+            failed: { newRoot: DEST, attempt: seen.body?.attempt, error: { code: "CONFLICT", message: "Some background work could not be paused in time, so the library was not moved; try again in a moment." } },
+          }),
+        ),
+      );
+      await start(user);
+      const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
+      await waitFor(() => expect(alert.textContent).toMatch(/^Some background work could not be paused in time/));
+      expect(alert.textContent).not.toMatch(/could not be reached/);
+    });
+
+    it("until the first status answer the screen says \"Checking what became of the move…\" in a status region, not an alert (R399 d)", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let answer!: () => void;
+      const held = new Promise<void>((r) => (answer = r));
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), async () => {
+          await held;
+          return HttpResponse.json({ pending: null, running: true, failed: null });
+        }),
+      );
+      await start(user);
+      const checking = await screen.findByText("Checking what became of the move…");
+      expect(checking.getAttribute("role")).toBe("status");
+      expect(within(screen.getByRole("region", { name: "Progress" })).getByText("Checking what became of the move…")).toBe(checking);
+      expect(screen.queryByRole("alert")).toBeNull();
+      answer();
+      expect(await screen.findByText("Waiting for the move to finish…")).toBeTruthy();
+      expect(screen.queryByText("Checking what became of the move…")).toBeNull();
+    });
+
+    it("a plain refusal from the service (4xx with a reason) is shown as it is; move/status is not asked", async () => {
+      const user = userEvent.setup();
+      let polled = false;
+      server.use(
+        http.post(url("/libraries/move"), () => HttpResponse.json({ error: { code: "CONFLICT", message: "Some changes are still being made. Try the move again in a moment." } }, { status: 409 })),
+        http.get(url("/libraries/move/status"), () => {
+          polled = true;
+          return HttpResponse.json({ pending: null, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert")).textContent).toMatch(/The move could not be started: Some changes are still being made.*Nothing was copied or changed/);
+      expect(polled).toBe(false);
+    });
+  });
+
+  describe("the move's own warnings are shown (R379, I2)", () => {
+    const W1 = "The library.move audit event could not be recorded for project p1; it could not be kept for later either (disk full)";
+    const W2 = "The library.move audit event could not be recorded for project p3; the project is marked as needing attention and the event is recorded when the library is next opened";
+    const HEAD = "The move finished, with these warnings:";
+
+    it("a done line with two warnings shows both under the heading, after the summary", async () => {
+      const user = userEvent.setup();
+      const s = controlledStream();
+      server.use(http.post(url("/libraries/move"), () => s.response()));
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      s.line({ done: true, result: { ...RESULT, warnings: [W1, W2] } });
+      s.end();
+      const ok = await screen.findByRole("status", { name: "Verification" });
+      expect(ok.textContent).toMatch(/^All 120 files were copied and verified\./);
+      const head = await screen.findByText(HEAD);
+      const list = screen.getByRole("list", { name: HEAD });
+      expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual([W1, W2]);
+      expect(head.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(ok.compareDocumentPosition(head) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it("no warnings: no heading", async () => {
+      const user = userEvent.setup();
+      const s = controlledStream();
+      server.use(http.post(url("/libraries/move"), () => s.response()));
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      s.line({ done: true, result: RESULT });
+      s.end();
+      await screen.findByRole("status", { name: "Verification" });
+      expect(screen.queryByText(HEAD)).toBeNull();
+    });
+
+    it("the cut-off path gets them from move/status", async () => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(url("/libraries/move"), () => new HttpResponse("", { headers: { "content-type": "application/x-ndjson" } })),
+        http.get(url("/libraries/move/status"), () => HttpResponse.json({ pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-w", expiresAt: "2026-11-11T10:15:00.000Z", warnings: [W2] }, running: false, failed: null })),
+      );
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      await screen.findByRole("status", { name: "Verification" });
+      expect(within(screen.getByRole("list", { name: HEAD })).getAllByRole("listitem").map((li) => li.textContent)).toEqual([W2]);
+    });
+
+    it("a plan shows each project's decision warnings beside that project", async () => {
+      const user = userEvent.setup();
+      const warned = { ...PLAN.perProject[0]!, decision: { result: "allow_with_conditions", warnings: ["This destination is removable: keep the drive encrypted."] } };
+      const plan = await planFor(user, { ...PLAN, perProject: [warned, PLAN.perProject[1]!] } as unknown as typeof PLAN);
+      const row = within(plan).getByRole("row", { name: /Coastal kinship/ });
+      expect(row.textContent).toMatch(/This destination is removable: keep the drive encrypted\./);
+      expect(within(plan).getByRole("row", { name: /Clinic interviews/ }).textContent).not.toMatch(/removable/);
+    });
   });
 
   it("matches the finished move by its destination the way the service compares paths (Windows separators and case)", async () => {

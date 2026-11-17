@@ -6,7 +6,7 @@
  * nothing is deleted. A participant or session can be deleted only when nothing links to it (asked
  * first); otherwise the service says what still does.
  */
-import { useCallback, useEffect, useId, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { ConsentRecord, GovernanceApi, Participant, Session } from "../api/governance";
 import { ApiClientError } from "../api/client";
 import { FileDrop } from "../components/FileDrop";
@@ -16,11 +16,14 @@ import { UserText } from "../components/UserText";
 import { inAppLink, PATHS } from "../navigation";
 import "./GovernanceScreens.css";
 
-function Section({ title, children }: { title: string; children: ReactNode }) {
+/** `headingRef`: the heading can take focus (tabIndex -1), e.g. after what had it was deleted. */
+function Section({ title, children, headingRef }: { title: string; children: ReactNode; headingRef?: RefObject<HTMLHeadingElement | null> }) {
   const id = useId();
   return (
     <section className="ao-card" aria-labelledby={id}>
-      <h2 id={id}>{title}</h2>
+      <h2 id={id} ref={headingRef} tabIndex={headingRef ? -1 : undefined}>
+        {title}
+      </h2>
       {children}
     </section>
   );
@@ -36,7 +39,7 @@ function Field({ label, value, onChange, type = "text", required, describedBy }:
   );
 }
 
-function SessionEditor({ s, onSave, onCancel }: { s: Session; onSave: (patch: { date: string; place: string | null; notes: string | null }) => void; onCancel: () => void }) {
+function SessionEditor({ s, onSave, onCancel, busy }: { s: Session; onSave: (patch: { date: string; place: string | null; notes: string | null }) => void; onCancel: () => void; busy: boolean }) {
   const [v, setV] = useState({ date: s.date, place: s.place ?? "", notes: s.notes ?? "" });
   return (
     <form
@@ -49,7 +52,7 @@ function SessionEditor({ s, onSave, onCancel }: { s: Session; onSave: (patch: { 
       <Field type="date" label="Date of this session" required value={v.date} onChange={(date) => setV({ ...v, date })} />
       <Field label="Place of this session" value={v.place} onChange={(place) => setV({ ...v, place })} />
       <Field label="Notes on this session" value={v.notes} onChange={(notes) => setV({ ...v, notes })} />
-      <button type="submit" disabled={!v.date}>
+      <button type="submit" disabled={busy || !v.date}>
         Save session
       </button>
       <button type="button" onClick={onCancel}>
@@ -59,7 +62,7 @@ function SessionEditor({ s, onSave, onCancel }: { s: Session; onSave: (patch: { 
   );
 }
 
-function ConsentEditor({ c, onSave, onCancel, encrypted }: { c: ConsentRecord; onSave: (patch: { scope: string; date: string; expires: string | null }) => void; onCancel: () => void; encrypted?: boolean | undefined }) {
+function ConsentEditor({ c, onSave, onCancel, encrypted, busy }: { c: ConsentRecord; onSave: (patch: { scope: string; date: string; expires: string | null }) => void; onCancel: () => void; encrypted?: boolean | undefined; busy: boolean }) {
   const [v, setV] = useState({ scope: c.scope, date: c.date, expires: c.expires ?? "" });
   // R362 h: in an encrypted project the scope is kept where it can be read without the passphrase.
   const readable = useReadableNote(encrypted, READABLE_SCOPE_TEXT);
@@ -75,7 +78,7 @@ function ConsentEditor({ c, onSave, onCancel, encrypted }: { c: ConsentRecord; o
       {readable.note}
       <Field type="date" label="Date of this consent" required value={v.date} onChange={(date) => setV({ ...v, date })} />
       <Field type="date" label="Expiry of this consent" value={v.expires} onChange={(expires) => setV({ ...v, expires })} />
-      <button type="submit" disabled={!v.scope.trim() || !v.date}>
+      <button type="submit" disabled={busy || !v.scope.trim() || !v.date}>
         Save consent
       </button>
       <button type="button" onClick={onCancel}>
@@ -96,6 +99,14 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
   const [result, setResult] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Participant | null>(null);
+  /** The session whose deletion is asked about (R379, I4: never deleted at one press). */
+  const [deletingSession, setDeletingSession] = useState<Session | null>(null);
+  const sessionsHeading = useRef<HTMLHeadingElement>(null);
+  /** Bumped after a session was deleted: focus goes to the Sessions heading (its button is gone). */
+  const [sessionGone, setSessionGone] = useState(0);
+  useEffect(() => {
+    if (sessionGone) sessionsHeading.current?.focus();
+  }, [sessionGone]);
   const [busy, setBusy] = useState(false);
   const [withdrawing, setWithdrawing] = useState<ConsentRecord | null>(null);
   /** A dropped form the service refused because it was detached from this record before (R119): offered for an explicit re-attach. */
@@ -121,8 +132,20 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
     void load();
   }, [load]);
 
-  /** Runs a change, shows its error (if any) and reloads the records. */
+  /** A request of this screen is running (R379, I3): a second press, a doubled submit or a held key is not taken. */
+  const busyRef = useRef(false);
+  /** Where focus was when the request started: it goes back there once the controls are enabled again. */
+  const focusBack = useRef<HTMLElement | null>(null);
+
+  /**
+   * Runs a change, shows its error (if any) and reloads the records — one at a time (R379, I3): a
+   * call while one runs is ignored (a consent record can never be deleted, a participant's code is
+   * used up for good), and every control that starts a request is disabled meanwhile.
+   */
   const run = async (fn: () => Promise<string | void>) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    focusBack.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
     setError(null);
     setResult(null);
     setFlagged(false);
@@ -133,10 +156,29 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
     } catch (err) {
       setError(err instanceof Error ? err.message : "That could not be done.");
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
     await load();
   };
+
+  // The request ended and the controls are back: focus returns to where it was (disabling a focused
+  // button drops focus in the browsers). A control still disabled (an emptied form) hands it to its
+  // form's first field; one that is gone (a dialog closed meanwhile) is left to the dialog.
+  useEffect(() => {
+    if (busy) return;
+    const el = focusBack.current;
+    focusBack.current = null;
+    if (!el || !el.isConnected) return;
+    const lost = document.activeElement === null || document.activeElement === document.body || document.activeElement === el;
+    if (!lost) return;
+    if (!(el as HTMLButtonElement).disabled) {
+      if (document.activeElement !== el) el.focus();
+      return;
+    }
+    const first = el.closest("form")?.querySelector<HTMLElement>("input:not([disabled]), select:not([disabled]), textarea:not([disabled])");
+    first?.focus();
+  }, [busy]);
 
   const codeOf = (id: string) => participants?.find((p) => p.id === id)?.code ?? "(removed participant)";
 
@@ -183,25 +225,26 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
             <li key={p.id} className="ao-field">
               <UserText>{p.code}</UserText>
               <span className="ao-hint">{p.consentIds.length === 1 ? "1 consent record" : `${p.consentIds.length} consent records`}</span>
-              <button type="button" aria-label={`Delete ${p.code}`} onClick={() => setDeleting(p)}>
+              <button type="button" aria-label={`Delete ${p.code}`} disabled={busy} onClick={() => setDeleting(p)}>
                 Delete
               </button>
             </li>
           ))}
         </ul>
-        <button type="button" onClick={() => void run(async () => void (await api.createParticipant(projectId, {})))}>
+        <button type="button" disabled={busy} onClick={() => void run(async () => void (await api.createParticipant(projectId, {})))}>
           Add participant
         </button>
         <p className="ao-hint">Each participant gets the next code (P-001, P-002, …). A code is never changed or given to anyone else; identifying details stay out of citations and file names.</p>
       </Section>
 
-      <Section title="Sessions">
+      <Section title="Sessions" headingRef={sessionsHeading}>
         <ul className="ao-list">
           {sessions.map((s) =>
             editing === s.id ? (
               <li key={s.id}>
                 <SessionEditor
                   s={s}
+                  busy={busy}
                   onCancel={() => setEditing(null)}
                   onSave={(patch) => {
                     setEditing(null);
@@ -221,7 +264,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
                 <button type="button" aria-label={`Edit the session of ${s.date}`} onClick={() => setEditing(s.id)}>
                   Edit
                 </button>
-                <button type="button" aria-label={`Delete the session of ${s.date}`} onClick={() => void run(async () => void (await api.deleteSession(projectId, s.id)))}>
+                <button type="button" aria-label={`Delete the session of ${s.date}`} disabled={busy} onClick={() => setDeletingSession(s)}>
                   Delete
                 </button>
               </li>
@@ -270,7 +313,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
             Notes
             <textarea rows={2} value={session.notes} onChange={(e) => setSession({ ...session, notes: e.target.value })} />
           </label>
-          <button type="submit" disabled={!session.date}>
+          <button type="submit" disabled={busy || !session.date}>
             Add session
           </button>
         </form>
@@ -282,6 +325,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
             <li key={c.id}>
               {editing === c.id ? (
                 <ConsentEditor
+                  busy={busy}
                   encrypted={encrypted}
                   c={c}
                   onCancel={() => setEditing(null)}
@@ -309,7 +353,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
                       <button type="button" aria-label={`Edit consent of ${codeOf(c.participantId)}`} onClick={() => setEditing(c.id)}>
                         Edit
                       </button>
-                      <button type="button" className="ao-danger" aria-label={`Withdraw consent of ${codeOf(c.participantId)}`} onClick={() => setWithdrawing(c)}>
+                      <button type="button" className="ao-danger" aria-label={`Withdraw consent of ${codeOf(c.participantId)}`} disabled={busy} onClick={() => setWithdrawing(c)}>
                         Withdraw
                       </button>
                     </>
@@ -323,6 +367,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
                   prompt="Drop the signed consent form here (a PDF or an image, up to 100 MB)."
                   fieldLabel="Or add the form by its full path"
                   single={{ message: "Drop one signed form at a time: each consent record holds one form. Nothing was added." }}
+                  disabled={busy}
                   onPaths={(paths) =>
                     void run(async () => {
                       setReattach(null);
@@ -397,7 +442,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
             <label htmlFor={`${ids}-ce`}>Expires</label>
             <input id={`${ids}-ce`} type="date" value={consent.expires} onChange={(e) => setConsent({ ...consent, expires: e.target.value })} />
           </div>
-          <button type="submit" disabled={!consent.participantId || !consent.scope.trim() || !consent.date}>
+          <button type="submit" disabled={busy || !consent.participantId || !consent.scope.trim() || !consent.date}>
             Add consent record
           </button>
         </form>
@@ -419,6 +464,47 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
           <p>
             <UserText>{deleting.code}</UserText> will be deleted. Its code is retired and never given to anyone else. A participant that consent records, sessions, sources or the
             pseudonym map refer to cannot be deleted; withdraw their consent instead.
+          </p>
+        </ChoiceDialog>
+      ) : null}
+
+      {deletingSession ? (
+        <ChoiceDialog
+          title={
+            // The place is the researcher's text: isolated, so that its direction marks cannot reorder the heading (R399 e).
+            <>
+              Delete the session of {deletingSession.date}
+              {deletingSession.place ? (
+                <>
+                  , <UserText>{deletingSession.place}</UserText>
+                </>
+              ) : null}
+            </>
+          }
+          action="Delete session"
+          busy={busy}
+          onCancel={() => setDeletingSession(null)}
+          onConfirm={() => {
+            const s = deletingSession;
+            let gone = false;
+            void run(async () => {
+              await api.deleteSession(projectId, s.id);
+              gone = true;
+            }).finally(() => {
+              setDeletingSession(null);
+              if (gone) setSessionGone((n) => n + 1);
+            });
+          }}
+        >
+          <p>
+            The session of <UserText>{deletingSession.date}</UserText>
+            {deletingSession.place ? (
+              <>
+                {" "}
+                in <UserText>{deletingSession.place}</UserText>
+              </>
+            ) : null}{" "}
+            will be deleted, with its date, place and notes. A session that sources refer to cannot be deleted.
           </p>
         </ChoiceDialog>
       ) : null}

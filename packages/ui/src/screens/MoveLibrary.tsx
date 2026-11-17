@@ -8,12 +8,14 @@
  * again from GET /libraries/move/status — only for the move this screen started (same destination,
  * R117 I8). Once the service has answered the move request (its headers arrived), any broken
  * stream is treated so, even before a first line: the move may be running there, so it is never
- * reported as "nothing was copied". A move started elsewhere (MOVE_IN_PROGRESS) is reported, never taken over. Closing the
+ * reported as "nothing was copied". A move request that failed without the service's answer (the
+ * network, before its headers) is not "not started" either until move/status says so (R379): no
+ * move running and none made under this screen's attempt id. A move started elsewhere (MOVE_IN_PROGRESS) is reported, never taken over. Closing the
  * screen stops reading the stream (the move itself carries on in the service).
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../api/client";
-import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type MoveProgress } from "../api/governance";
+import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type MoveProgress, type MoveStatus } from "../api/governance";
 import { ConfirmDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import { PathField } from "../components/PathField";
@@ -30,15 +32,20 @@ const isMoveInProgress = (err: unknown) =>
 
 const sameRoot = (a: string, b: string) => normaliseRoot(a) === normaliseRoot(b);
 
+/** Said while the service does not answer after a move request failed before its answer (R379): nothing about the files. */
+const LOST = "The connection to the app's service was lost. The move may still be running. This screen will show what happened as soon as the service answers.";
+
 export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: GovernanceApi; pollMs?: number; maxPolls?: number }) {
   const ids = useId();
   const [dest, setDest] = useState("");
   const [stage, setStage] = useState<Stage>("pick");
   const [plan, setPlan] = useState<MovePlan | null>(null);
   const [progress, setProgress] = useState<MoveProgress | null>(null);
-  const [verified, setVerified] = useState<{ token: string; newRoot: string; message: string } | null>(null);
+  const [verified, setVerified] = useState<{ token: string; newRoot: string; message: string; warnings: string[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [waiting, setWaiting] = useState(false);
+  /** From the failure of a move request until the first status answer (R399 d). */
+  const [checking, setChecking] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deletedNote, setDeletedNote] = useState<string | null>(null);
@@ -53,28 +60,70 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
   }, []);
 
   /**
-   * Asks the service for the token of the move this screen started (to `target`), repeatedly until
-   * it is there (the move runs to its end on the service). Another move's token is never taken.
+   * Asks the service what became of the move this screen started (to `target`, under `attempt`),
+   * repeatedly, until it is known (the move runs to its end on the service): finished → its token
+   * (another move's is never taken); stopped with an error → that error. `notStarted` is given when
+   * the move request failed before the service answered (R379): then, and only then, no move running
+   * and none made means it was not started; until the service answers at all, nothing is claimed
+   * about the files. In that mode (R399): the first question waits one interval (the service marks
+   * the move as asked for at the start of its request); "not started" needs TWO successive answers
+   * that agree; and once any answer said a move is running it is never concluded (the service keeps
+   * the move's state in memory only, so an empty answer after it may be a restart): the asking then
+   * ends as the cut-off path ends.
    */
-  const pickUp = async (target: string, note: string) => {
-    setWaiting(true);
+  const follow = async (target: string, attempt: string, note: string, notStarted?: string) => {
+    if (notStarted === undefined) setWaiting(true);
+    else {
+      setChecking(true);
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+    let seenRunning = false;
+    let empty = 0;
     for (let i = 0; i < maxPolls && alive.current; i++) {
+      let st: MoveStatus | undefined;
       try {
-        const { pending } = await api.moveStatus();
+        st = await api.moveStatus();
+      } catch {
+        // the service may be restarting with the new library: keep asking
+        if (alive.current && notStarted !== undefined) setError(LOST);
+      }
+      if (!alive.current) return;
+      if (st) {
+        // The service answered: the lost-connection sentence goes; what this answer says is shown below.
+        setChecking(false);
+        setError(null);
+        const { pending, failed } = st;
         if (pending && sameRoot(pending.newRoot, target)) {
-          if (!alive.current) return;
+          setError(null);
           setWaiting(false);
-          setVerified({ token: pending.confirmToken, newRoot: pending.newRoot, message: note });
+          setVerified({ token: pending.confirmToken, newRoot: pending.newRoot, message: note, warnings: pending.warnings ?? [] });
           setStage("verified");
           return;
         }
-      } catch {
-        // the service may be restarting with the new library: keep asking
+        if (failed && failed.attempt === attempt && sameRoot(failed.newRoot, target)) {
+          setWaiting(false);
+          setError(`${failed.error.message} The move stopped; nothing was deleted, and the library stays where it was.`);
+          setStage("failed");
+          return;
+        }
+        if (notStarted !== undefined) {
+          if (st.running) {
+            seenRunning = true;
+            setError(null);
+            setWaiting(true);
+          } else if (!seenRunning && ++empty >= 2) {
+            setWaiting(false);
+            setError(`The move could not be started: ${notStarted} Nothing was copied or changed.`);
+            setStage(plan ? "plan" : "pick");
+            return;
+          }
+        }
       }
       await new Promise((r) => setTimeout(r, pollMs));
     }
     if (alive.current) {
       setWaiting(false);
+      setChecking(false);
       setError("No finished move was found. Open the library to check where it is before trying again.");
       setStage("failed");
     }
@@ -101,15 +150,18 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
   const move = async (exclude: string[]) => {
     setError(null);
     setProgress(null);
+    setChecking(false);
     setStage("moving");
     const target = dest.trim();
     const ac = new AbortController();
     stream.current = ac;
+    const attempt = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    const cutOff = "The move finished and was verified (the connection to it was interrupted).";
     let started = false;
     /** The service answered: the move may be running there even if no line arrives. */
     let reached = false;
     try {
-      for await (const line of api.move(target, exclude, ac.signal, () => (reached = true))) {
+      for await (const line of api.move(target, exclude, ac.signal, () => (reached = true), attempt)) {
         started = true;
         if ("progress" in line) setProgress(line.progress);
         else if ("error" in line) {
@@ -118,22 +170,29 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
           return;
         } else if ("done" in line) {
           const r = line.result;
-          setVerified({ token: r.confirmToken, newRoot: r.newRoot, message: `All ${r.fileCount.toLocaleString("en-US")} files were copied and verified.` });
+          setVerified({ token: r.confirmToken, newRoot: r.newRoot, message: `All ${r.fileCount.toLocaleString("en-US")} files were copied and verified.`, warnings: r.warnings ?? [] });
           setStage("verified");
           return;
         }
       }
       if (ac.signal.aborted || !alive.current) return; // the screen was closed
       // Ended without an answer: the move carries on in the service; ask it.
-      await pickUp(target, "The move finished and was verified (the connection to it was interrupted).");
+      await follow(target, attempt, cutOff);
     } catch (err) {
       if (!alive.current) return;
       if (isMoveInProgress(err)) return inProgress();
       if (reached || isStreamCutOff(err, started)) {
-        await pickUp(target, "The move finished and was verified (the connection to it was interrupted).");
+        await follow(target, attempt, cutOff);
         return;
       }
-      setError(`The move could not be started: ${err instanceof Error ? err.message : "the library service did not answer"} Nothing was copied or changed.`);
+      const why = err instanceof Error ? err.message : "the library service did not answer";
+      // No answer from the service (status 0: the network, a time-out): the move may be running
+      // there, so the service is asked before anything is said (R379). A refusal is shown as it is.
+      if (!(err instanceof ApiClientError) || err.status === 0) {
+        await follow(target, attempt, cutOff, why);
+        return;
+      }
+      setError(`The move could not be started: ${why} Nothing was copied or changed.`);
       setStage(plan ? "plan" : "pick");
     }
   };
@@ -216,7 +275,19 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
                   <td>
                     <UserText>{p.name}</UserText>
                   </td>
-                  <td className={p.decision.result === "deny" ? "ao-deny" : undefined}>{p.decision.result === "deny" ? `Not allowed: ${p.decision.reason ?? ""}` : "Allowed"}</td>
+                  <td className={p.decision.result === "deny" ? "ao-deny" : undefined}>
+                    {p.decision.result === "deny" ? <>Not allowed: <UserText>{p.decision.reason ?? ""}</UserText></> : "Allowed"}
+                    {/* The project's own decision warnings, beside it (R379, I2). */}
+                    {p.decision.warnings?.length ? (
+                      <ul className="ao-warning">
+                        {p.decision.warnings.map((w, i) => (
+                          <li key={i}>
+                            <UserText>{w}</UserText>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -250,11 +321,29 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
               </p>
             </>
           ) : null}
+          {checking ? (
+            <p role="status" className="ao-hint">
+              Checking what became of the move…
+            </p>
+          ) : null}
           {waiting ? <p className="ao-hint">Waiting for the move to finish…</p> : null}
           {verified ? (
             <p role="status" aria-label="Verification" className="ao-ok">
               {verified.message} The library now opens from <UserText>{verified.newRoot}</UserText>.
             </p>
+          ) : null}
+          {/* The move's own warnings (an audit event not recorded among them), never dropped (R379, I2). */}
+          {verified?.warnings.length ? (
+            <div className="ao-warning">
+              <p id={`${ids}-warn`}>The move finished, with these warnings:</p>
+              <ul aria-labelledby={`${ids}-warn`}>
+                {verified.warnings.map((w, i) => (
+                  <li key={i}>
+                    <UserText>{w}</UserText>
+                  </li>
+                ))}
+              </ul>
+            </div>
           ) : null}
           {deletedNote ? <p role="status">{deletedNote}</p> : null}
           {stage !== "deleted" ? (

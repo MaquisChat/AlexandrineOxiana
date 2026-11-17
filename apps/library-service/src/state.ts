@@ -193,14 +193,31 @@ export interface StateOptions {
 /** How long GET /libraries waits, once, for the reopen at start (D5, I1). */
 export const STARTUP_WAIT_MS = 30_000;
 
-/** A finished move whose old copy may still be deleted: its single-use token, for 15 minutes (R99). */
+/**
+ * A finished move whose old copy may still be deleted: its single-use token, for 15 minutes (R99),
+ * or until the old copy is deleted; with the move's own warnings (scrubbed), so that a screen that
+ * lost the move's stream shows them too (R379, I2).
+ */
 export interface PendingMove {
   oldRoot: string;
   newRoot: string;
   confirmToken: string;
   expiresAt: string;
+  warnings: string[];
 }
 export const MOVE_TOKEN_TTL_MS = 15 * 60_000;
+/**
+ * The last move that stopped with an error, for the screen that lost its connection to it (R379):
+ * kept for MOVE_TOKEN_TTL_MS or until a later move finishes or fails (a refused request without an
+ * attempt of its own never erases it, R399 c). `attempt` is the screen's own id for the request, so
+ * an earlier failure is never taken for this one; the message is scrubbed.
+ */
+export interface FailedMove {
+  newRoot: string;
+  attempt: string | null;
+  error: { code: string; message: string; reason?: string };
+  expiresAt: string;
+}
 /** How long a running batch may take to reach a safe point when it is paused for shutdown or a move. */
 export const SUSPEND_TIMEOUT_MS = 60_000;
 
@@ -259,8 +276,14 @@ export class ServiceState {
   readonly roots = new Set<string>();
   readonly tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   private move: PendingMove | undefined;
+  private moveFailure: FailedMove | undefined;
   /** A library move is running: every change is refused (503 MOVE_IN_PROGRESS), background work waits (R102 N2). */
   moving = false;
+  /**
+   * Move requests asked for (marked in the move route's own onRequest hook) and not yet ended or
+   * refused: move/status says `running` from the earliest point of the request (R399 b).
+   */
+  movesAsked = 0;
   /** Shutdown has started: no library may be opened or adopted any more (R101 M7). */
   shuttingDown = false;
 
@@ -1078,6 +1101,20 @@ export class ServiceState {
 
   forgetMove(): void {
     this.move = undefined;
+  }
+
+  recordMoveFailure(m: Omit<FailedMove, "expiresAt">): void {
+    this.moveFailure = { ...m, expiresAt: new Date(this.opts.now().getTime() + MOVE_TOKEN_TTL_MS).toISOString() };
+  }
+
+  /** The last move that stopped with an error, while it is kept (R379). */
+  failedMove(): FailedMove | undefined {
+    if (this.moveFailure && Date.parse(this.moveFailure.expiresAt) <= this.opts.now().getTime()) this.moveFailure = undefined;
+    return this.moveFailure;
+  }
+
+  forgetMoveFailure(): void {
+    this.moveFailure = undefined;
   }
 
   /** Closes the open library: running batches cancelled, watches stopped, queues disposed of, lock released. */

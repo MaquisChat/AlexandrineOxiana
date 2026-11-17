@@ -35,7 +35,9 @@ import { existsSync } from "node:fs";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
 // Test seam of the library (same module instance as @ao/library's): makes overwriting a file fail.
 import { shredSeams } from "../../../packages/library/src/fs/shred.js";
+import { seams as repoSeams } from "../../../packages/library/src/repo/seams.js";
 import * as authModule from "./auth.js";
+import { ApiError } from "./errors.js";
 import { CREDENTIAL_QUERY_KEYS, IN_LIBRARY_TEXT } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 // The service has no undici of its own: the library's (the one its lookup client uses) sets the global dispatcher.
@@ -3101,5 +3103,124 @@ describe("R379 (FR-A12): a dropped recording's name never leaves the device", ()
       setGlobalDispatcher(previous);
       await agent.close();
     }
+  });
+});
+
+describe("move/status says what is true after a lost connection (R379, FR-A19)", () => {
+  it("while a move runs, move/status says so; afterwards it does not", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inMove = new Promise<void>((r) => (entered = r));
+    await start({ beforeExecuteMove: async () => (entered(), gate) });
+    await openNewLibrary();
+    await newProject();
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ pending: null, running: false, failed: null });
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "a-1" } });
+    await inMove;
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ pending: null, running: true });
+    release();
+    expect((await moving).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, pending: { newRoot: join(tmp, "Moved") } });
+  });
+
+  it("a move that failed is kept with its attempt and destination, for 15 minutes or until the next move starts", async () => {
+    const clock = { now: new Date("2026-11-10T10:00:00Z") };
+    let fail = true;
+    await start({
+      now: () => clock.now,
+      beforeExecuteMove: async () => {
+        if (fail) throw new Error("the copy failed");
+      },
+    });
+    await openNewLibrary();
+    await newProject();
+    const dest = join(tmp, "Moved");
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-1" } })).body).toContain("error");
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st).toMatchObject({ running: false, pending: null, failed: { newRoot: dest, attempt: "a-1", error: { code: expect.any(String), message: expect.any(String) } } });
+    expect(JSON.stringify(st.failed)).not.toContain(join(tmp, "Lib"));
+    clock.now = new Date(clock.now.getTime() + 16 * 60_000);
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toBeNull();
+    // A new failure, then a new move: the failure is forgotten as the new move starts.
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-2" } })).body).toContain("error");
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toMatchObject({ attempt: "a-2" });
+    fail = false;
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-3" } })).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toBeNull();
+  });
+
+  it("a status asked in the same tick as the move request already says running (R399 b)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await start({ beforeExecuteMove: async () => gate });
+    await openNewLibrary();
+    await newProject();
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "a-1" } });
+    const st = call({ url: "/libraries/move/status" });
+    try {
+      expect((await st).json).toMatchObject({ pending: null, running: true });
+    } finally {
+      release();
+    }
+    expect((await moving).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json.running).toBe(false);
+  });
+
+  it("a move refused after it was asked for (background work that could not be paused) keeps its reason under its attempt (R399 c)", async () => {
+    let fail = true;
+    await start({
+      beforeExecuteMove: async () => {
+        if (fail) throw new Error("the copy failed");
+      },
+    });
+    await openNewLibrary();
+    await newProject();
+    const dest = join(tmp, "Moved");
+    // An earlier failure, kept.
+    await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-1" } });
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toMatchObject({ attempt: "a-1" });
+    // A request refused with no attempt of its own does not erase it.
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: 7 } })).status).toBe(400);
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, failed: { attempt: "a-1" } });
+    // Background work that could not be paused: the 409 before the stream, kept with its reason.
+    fail = false;
+    const quiesce = svc.state.quiesce.bind(svc.state);
+    svc.state.quiesce = async () => {
+      throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
+    };
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-2" } });
+    expect(r.status).toBe(409);
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st).toMatchObject({ running: false, pending: null, failed: { newRoot: dest, attempt: "a-2", error: { code: "CONFLICT", message: expect.stringMatching(/^Some background work could not be paused/) } } });
+    svc.state.quiesce = quiesce;
+  });
+
+  it("an attempt that is not a short plain string is refused before anything starts", async () => {
+    await start();
+    await openNewLibrary();
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "x".repeat(200) } });
+    expect(r.status).toBe(400);
+    expect((await call({ url: "/libraries/move/status" })).json.running).toBe(false);
+  });
+
+  it("a finished move's warnings are kept with its status, as long as its token (R379, I2)", async () => {
+    let pid = "";
+    await start({ beforeExecuteMove: async () => void (repoSeams.failAuditAppendFor = pid) });
+    await openNewLibrary();
+    pid = await newProject();
+    const dest = join(tmp, "Moved");
+    let moved;
+    try {
+      moved = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    } finally {
+      repoSeams.failAuditAppendFor = undefined;
+    }
+    const done = JSON.parse(moved.body.trim().split("\n").at(-1)!);
+    expect(done.done, moved.body).toBe(true);
+    expect(done.result.warnings.join(" ")).toMatch(/library\.move audit event could not be recorded/);
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st.pending).toMatchObject({ newRoot: dest, confirmToken: done.result.confirmToken, warnings: done.result.warnings });
+    expect(JSON.stringify(st.pending.warnings)).not.toContain(tmp);
   });
 });
