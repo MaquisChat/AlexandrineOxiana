@@ -28,6 +28,8 @@ test("the first-use question is a banner on the open library: nothing interrupts
   await folderField.pressSequentially(folder);
   await expect(folderField).toBeFocused();
   await expect(folderField).toHaveValue(folder);
+  // R447 b: the free room on the disk under the typed folder (it does not exist yet: the nearest folder above it).
+  await expect(page.getByRole("status").filter({ hasText: /^Free space on that disk: \d[\d.]* (GB|MB|kB|bytes)\.( That is little room: an import copies its files into the library\.)?$/ })).toBeVisible();
   await page.getByRole("textbox", { name: "New library name" }).fill(LIBRARY_NAME);
   await expect(page.getByText(QUESTION)).toHaveCount(0);
   await expect(page.getByRole("dialog")).toHaveCount(0);
