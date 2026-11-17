@@ -611,6 +611,45 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
     await once(YT, { transcribe: false }, "failed");
   });
 
+  it("I2 per path (FR-101): needs review, incomplete (partial and no media) and a missing legal basis each leave exactly one audited capture decision", async () => {
+    const p = await project();
+    let before = 0;
+    const once = async (projectId: string, folder: string, url: string, status: string, errorCode?: string) => {
+      const out = await capture.captureUrl(projectId, url, { transcribe: false });
+      expect([url, out.status, out.errorCode]).toEqual([url, status, errorCode]);
+      const evs = await captureEvents(folder);
+      expect([status, errorCode, evs.length - before]).toEqual([status, errorCode, 1]);
+      before = evs.length;
+      const last = evs.at(-1)!;
+      expect(last.decision?.result).toBe("allow");
+      expect(last.details).toMatchObject({ op: "capture.link", platform: "youtube", cookies: false });
+      return out;
+    };
+    // Needs review: the source is stored with its review entry; still one capture decision.
+    const review = await once(p.id, p.folder, YT_CONFLICT, "needs-review");
+    expect((await repo.getSource(p.id, review.sourceId!)).verification["/issued"]!.status).toBe("conflict");
+    // Incomplete: media saved, then an error.
+    process.env.FAKE_TOOL_MODE = "partial";
+    const partial = await once(p.id, p.folder, YT, "incomplete", "RATE_LIMITED");
+    expect((await repo.getSource(p.id, partial.sourceId!)).source.availability.status).toBe("incomplete");
+    // Incomplete: the post's data without any media file.
+    await repo.deleteSource(p.id, partial.sourceId!);
+    process.env.FAKE_TOOL_MODE = "infoonly";
+    const noMedia = await once(p.id, p.folder, YT, "incomplete", "NO_MEDIA");
+    expect((await repo.getSource(p.id, noMedia.sourceId!)).source.availability.status).toBe("incomplete");
+    delete process.env.FAKE_TOOL_MODE;
+    // A missing legal basis: the capture decision (allowed) is audited once, the store's refusal once, and nothing is
+    // downloaded or stored.
+    const q = await project(GDPR_GOV(), true);
+    before = 0;
+    const submitted = worker.submitted.length;
+    await once(q.id, q.folder, YT, "failed", "LEGAL_BASIS_REQUIRED");
+    const denies = (await auditEvents(q.folder)).filter((e) => e.decision?.result === "deny");
+    expect(denies.map((e) => [e.action, e.details?.op])).toEqual([["store", "capture.link"]]);
+    expect(worker.submitted.length).toBe(submitted);
+    expect(repo.listSourceIds(q.id)).toEqual([]);
+  });
+
   it("I3: capture jobs are never resumed, leftovers are swept, and the work folder is private", async () => {
     const p = await project();
     // a capture.download job left running by a crash (its journal record, R31; the row was never written)
