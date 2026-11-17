@@ -9,7 +9,7 @@ import {
   sourceFolderName,
   withCollisionSuffix,
 } from "./naming.js";
-import { creatorNameTexts, mergeHits, type Hit } from "./participant-names.js";
+import { creatorNameTexts, mergeHits, scrubNames, type Hit } from "./participant-names.js";
 
 const bytes = (s: string) => new TextEncoder().encode(s).length;
 
@@ -790,5 +790,13 @@ describe("R416: where names fold alike, the participant whose name is exactly wh
 
   it("a single participant 'Lucía Fernández' still replaces 'Lucia Fernandez' (no exact candidate: the folded match)", () => {
     expect(pseudonymize("Entrevista a Lucia Fernandez", new Map([["Lucía Fernández", "P-005"]]))).toBe("Entrevista a P-005");
+  });
+});
+
+describe("R440 (f): guards of the run filter", () => {
+  it("inside a bidi override the run filter is not asked: a reversed run is still coded", () => {
+    const text = "\u202Eaícul zednánref\u202C";
+    const out = scrubNames(text, { map: new Map([["Lucía Fernández Ruiz", "P-005"]]) }, { runSpan: () => false });
+    expect(out).toContain("P-005");
   });
 });
