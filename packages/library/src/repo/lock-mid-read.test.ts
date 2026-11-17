@@ -249,6 +249,18 @@ function holdOther(): { release: () => void; done: Promise<void>; inside: Promis
 
 const keptCopies = () => findCacheSize(c.kit.repo) + watchCacheSize(c.kit.repo);
 
+/** Which of a row's four mark points a point is (R443 c): the first, a middle or the last opening, or after the last. */
+function markPointOf(pt: Point, k: number): MarkPoint {
+  return pt.after ? "after last" : pt.n === k ? "last" : pt.n === 1 ? "first" : "middle";
+}
+type MarkPoint = "first" | "middle" | "last" | "after last";
+
+/**
+ * R443 c: every mark point of every row must lock through the mark (the key not wiped at once). A point that truly
+ * cannot is named here, by row, with the reason; nothing else is let pass.
+ */
+const MARK_EXEMPT: Record<string, MarkPoint[]> = {};
+
 async function exercise(row: Row): Promise<void> {
   const base = await cold(row);
   if ("err" in base.outcome) throw new Error(`${row.name}: the unlocked reading failed: ${String((base.outcome as { err: unknown }).err)}`);
@@ -272,8 +284,8 @@ async function exercise(row: Row): Promise<void> {
   const rowsWant = indexRows();
   const otherFolder = `Projects/${c.kit.repo.getProject(c.other.id).folder.split("/").pop()}/`;
   const problems: string[] = [];
-  let marked = 0;
   for (const pt of pointsOf(base.openings)) {
+    let marked = false;
     const n = pt.n;
     await relock();
     await row.prepare?.(c);
@@ -282,7 +294,6 @@ async function exercise(row: Row): Promise<void> {
     const eventsBefore = (await auditEvents(c.kit, c.p)).length;
     const helds: Array<ReturnType<typeof holdOther>> = [];
     let holding = false;
-    let rehold = false;
     const releaseAll = () => {
       holding = false;
       for (const h of helds) h.release();
@@ -300,29 +311,27 @@ async function exercise(row: Row): Promise<void> {
       lock.catch(() => {});
       // The mark path: the key is not wiped at once (it is answered only to the change in progress, which for a
       // reading made inside its own turn is that reading).
-      if (pt.mark && c.kit.ring.size === size) marked++;
+      if (pt.mark && c.kit.ring.size === size) marked = true;
       if (pt.mark) setTimeout(releaseAll, 300);
     };
     // A reading that waits for a turn of its own before (or between) its openings would wait for the held change for
     // ever: when no opening has come for a while and the lock is not yet asked, the held change is let go, and another
-    // is held from the reading's next opening (before the lock point), so that the lock still finds the queue busy.
+    // is held at once; it queues behind the turn the reading is waiting for, so the lock still finds the queue busy.
     let seen = -1;
     const stall = pt.mark
       ? setInterval(() => {
           if (!lock && holding && openings === seen) {
             releaseAll();
-            rehold = true;
+            // R443 c: held again at once, behind the turn the reading waits for, so that a lock point right after the
+            // stall (the next opening, or after the last) still finds the queue busy.
+            holding = true;
+            helds.push(holdOther());
           }
           seen = openings;
         }, 500)
       : undefined;
     openingSeam.onOpen = () => {
       openings++;
-      if (rehold && !lock && openings < n) {
-        rehold = false;
-        holding = true;
-        helds.push(holdOther());
-      }
       if (openings === n) {
         if (pt.after) queueMicrotask(ask);
         else ask();
@@ -342,6 +351,9 @@ async function exercise(row: Row): Promise<void> {
     await Promise.all(helds.map((h) => h.done));
     await lock?.catch(() => {});
     const tag = `${row.name} @${pt.after ? "after " : ""}${n}/${base.openings}${pt.mark ? " (mark)" : ""}`;
+    if (pt.mark && !marked && !MARK_EXEMPT[row.name]?.includes(markPointOf(pt, base.openings))) {
+      problems.push(`${tag}: the mark path was not taken at the ${markPointOf(pt, base.openings)} point (${lock ? "the key was wiped at once" : "no lock was asked"})`);
+    }
     if (lock && keptCopies() !== 0) problems.push(`${tag}: a decrypted copy kept behind the lock (find ${findCacheSize(c.kit.repo)}, watch ${watchCacheSize(c.kit.repo)})`);
     let succeeded = false;
     let asLocked = false;
@@ -377,7 +389,6 @@ async function exercise(row: Row): Promise<void> {
     await relock();
     if (JSON.stringify(indexRows()) !== JSON.stringify(rowsWant)) problems.push(`${tag}: the index's rows changed: ${JSON.stringify(indexRows()).slice(0, 400)}`);
   }
-  if (!marked) problems.push(`${row.name}: the mark path was never taken (no lock landed while the key was still in the ring)`);
   if (problems.length) throw new Error(`${row.name}: ${problems.length} problem(s):\n${problems.join("\n")}`);
 }
 
