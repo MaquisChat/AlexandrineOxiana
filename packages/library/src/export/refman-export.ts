@@ -74,6 +74,11 @@ export const EXPORT_FILE_IS_LINK = "That place is a link to another file. Give t
 export const DEIDENTIFIED_NOTE = "This project allows only de-identified exports, and this source holds identifiable data.";
 /** A source that fails closed under the participant rules (R88 I2, R379 FR-A14). */
 export const PARTICIPANT_CODE_MISSING_NOTE = "A participant in this source has no participant code yet, so it cannot be exported.";
+/**
+ * A source linked to a participant in a project that keeps no list of participants' names (it is not encrypted): the
+ * app cannot tell which names to replace, so it fails closed as the bibliography does (R390 d).
+ */
+export const PARTICIPANT_NO_LIST_NOTE = "This source involves a participant, and this project keeps no list of participants' names, so it cannot be exported.";
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 const EXPORT_NOTES = {
@@ -82,6 +87,8 @@ const EXPORT_NOTES = {
   keyChanged: (n: number) => `${plural(n, "citation key was", "citation keys were")} changed to be valid or unique in this export.`,
   codeMissing: (n: number) =>
     `${plural(n, "source was", "sources were")} left out because a participant in ${n === 1 ? "it has" : "them has"} no participant code yet.`,
+  noList: (n: number) =>
+    `${plural(n, "source was", "sources were")} left out because ${n === 1 ? "it involves" : "they involve"} a participant and this project keeps no list of participants' names (it is not encrypted), so the app cannot tell which names to replace. Cite them by hand, or keep such sources in an encrypted project.`,
   keyWithheld: (n: number) =>
     `${plural(n, "citation key was", "citation keys were")} not exported because the source involves a participant (a key is often made from a name); a plain key was used instead.`,
 };
@@ -425,6 +432,7 @@ export async function buildExport(
   let changedKeys = 0;
   let withheldKeys = 0;
   let codeMissing = 0;
+  let noList = 0;
   // The bibliography's participant rules (R88 I2), read once per export.
   const rules = await participantRules(repo, projectId);
   const project = repo.getProject(projectId);
@@ -452,8 +460,14 @@ export async function buildExport(
     const ref = refOf(s, tagNames, opts.includeTags === true);
     const ruled = underParticipantRules(sf, cslOptions(sf), ref);
     if (ruled === "code-missing") {
-      excluded.push({ sourceId: id, reason: PARTICIPANT_CODE_MISSING_NOTE });
-      codeMissing++;
+      // No list of names to replace (an unencrypted project) is told apart from a participant really without a code.
+      if (!rules.keepsNameList && s.participantIds.length > 0) {
+        excluded.push({ sourceId: id, reason: PARTICIPANT_NO_LIST_NOTE });
+        noList++;
+      } else {
+        excluded.push({ sourceId: id, reason: PARTICIPANT_CODE_MISSING_NOTE });
+        codeMissing++;
+      }
       continue;
     }
     const coded = ruled.coded;
@@ -473,8 +487,9 @@ export async function buildExport(
   }
   const text = format === "bibtex" ? toBibtex(refs) : format === "ris" ? toRis(refs) : toCslJson(refs);
   const notes: string[] = [];
-  if (excluded.length > codeMissing) notes.push(EXPORT_NOTES.deidentified(excluded.length - codeMissing));
+  if (excluded.length > codeMissing + noList) notes.push(EXPORT_NOTES.deidentified(excluded.length - codeMissing - noList));
   if (codeMissing) notes.push(EXPORT_NOTES.codeMissing(codeMissing));
+  if (noList) notes.push(EXPORT_NOTES.noList(noList));
   if (changedKeys) notes.push(EXPORT_NOTES.keyChanged(changedKeys));
   if (withheldKeys) notes.push(EXPORT_NOTES.keyWithheld(withheldKeys));
   return { text, exported: refs.length, excluded, notes };

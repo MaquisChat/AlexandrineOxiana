@@ -65,7 +65,7 @@ import {
 } from "../repo/repo.js";
 import { activeTemp } from "../tmp-registry.js";
 import { WITHHELD_NOTE } from "./bibliography.js";
-import { PARTICIPANT_CODE_MISSING_NOTE, buildExport } from "./refman-export.js";
+import { PARTICIPANT_CODE_MISSING_NOTE, PARTICIPANT_NO_LIST_NOTE, buildExport } from "./refman-export.js";
 
 /** The export destination is inside the library (or not a folder). */
 export class ExportDestinationError extends Error {
@@ -465,6 +465,13 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
     if (codeMissing) {
       notes.push(
         `${plural(codeMissing, "source is", "sources are")} not in sources.bib and sources.csl.json because a participant in ${codeMissing === 1 ? "it has" : "them has"} no participant code yet.`,
+      );
+    }
+    // No list of participants' names (an unencrypted project): the true reason and what can be done (R390 d).
+    const noList = csl.excluded.filter((e) => e.reason === PARTICIPANT_NO_LIST_NOTE).length;
+    if (noList) {
+      notes.push(
+        `${plural(noList, "source is", "sources are")} not in sources.bib and sources.csl.json because ${noList === 1 ? "it involves" : "they involve"} a participant and this project keeps no list of participants' names (it is not encrypted), so the app cannot tell which names to replace. Cite them by hand, or keep such sources in an encrypted project.`,
       );
     }
     if (omittedLocated) {

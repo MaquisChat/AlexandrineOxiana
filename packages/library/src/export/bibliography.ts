@@ -50,6 +50,7 @@ import {
   authorizeProcessing,
   lookupPolicyInfo,
   projectCollectionsAndTags,
+  projectEncrypted,
   projectPseudonymMap,
   pseudonymizesIdentifiable,
   repoLibrary,
@@ -92,9 +93,14 @@ const NAME_KEY = /name|handle|user|alias|account/iu;
 
 /**
  * The participant rules from the project's governance (R88 I2): the pseudonym map plus the
- * participants' identifying names, and whether identifiable sources must cite codes only.
+ * participants' identifying names, whether identifiable sources must cite codes only, and whether the
+ * project can keep a list of participants' names at all (`keepsNameList`: only an encrypted one does;
+ * R390 d tells "no list" apart from "a participant without a code" by it).
  */
-export async function participantRules(repo: Repo, projectId: string): Promise<{ pseudonyms: Map<string, string>; requireCodes: boolean }> {
+export async function participantRules(
+  repo: Repo,
+  projectId: string,
+): Promise<{ pseudonyms: Map<string, string>; requireCodes: boolean; keepsNameList: boolean }> {
   // The engine's own condition decides (unreadable governance: the strictest reading).
   const requireCodes = await pseudonymizesIdentifiable(repo, projectId);
   const pseudonyms = await projectPseudonymMap(repo, projectId);
@@ -102,7 +108,7 @@ export async function participantRules(repo: Repo, projectId: string): Promise<{
   for (const p of fw.participants) {
     for (const [k, v] of Object.entries(p.details ?? {})) if (NAME_KEY.test(k) && v.trim().length >= 2 && !pseudonyms.has(v.trim())) pseudonyms.set(v.trim(), p.code);
   }
-  return { pseudonyms, requireCodes };
+  return { pseudonyms, requireCodes, keepsNameList: projectEncrypted(repo, projectId) };
 }
 
 interface Prepared {

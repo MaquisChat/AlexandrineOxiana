@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project } from "@ao/core";
 import { exportBibliography } from "./bibliography.js";
 import { exportProjectOpenFormats } from "./project-export.js";
-import { PARTICIPANT_CODE_MISSING_NOTE, exportRefman, type RefmanFormat } from "./refman-export.js";
+import { PARTICIPANT_CODE_MISSING_NOTE, PARTICIPANT_NO_LIST_NOTE, exportRefman, type RefmanFormat } from "./refman-export.js";
 import { OPEN_GOV, PSEUDO_GOV, addSource, makeKit, makeProject, type Kit } from "./test-kit.js";
 
 let kit: Kit;
@@ -269,5 +269,36 @@ describe("R390 (b): with includeTags, each tag's name goes through the name rule
     expect(ris.match(/^KW {2}- P-001 interviews$/gmu)).toHaveLength(3);
     // The untouched source keeps its own key.
     expect(ris).toContain("ID  - lee");
+  });
+});
+
+describe("R390 (d): a source involving a participant in a project that keeps no list of names is left out, with the true reason", () => {
+  it("the reviewer's probe: OPEN_GOV, unencrypted, P-001 (a code, no details) linked to an interview → left out with the new sentences", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const part = await kit.repo.createParticipant(p.id, {});
+    const interview = (await addSource(kit, p, { type: "interview", title: "Interview 1", creators: [{ family: "Doe", given: "Ira", role: "interviewer" }], citationKey: "int1" })).source.id;
+    await kit.repo.linkSourceToFieldwork(p.id, interview, { participantIds: [part.id] });
+    const lit = (await addSource(kit, p, { type: "book", title: "A book", creators: [{ family: "Adams", given: "Ann", role: "author" }], citationKey: "adams" })).source.id;
+    expect(PARTICIPANT_NO_LIST_NOTE).toBe("This source involves a participant, and this project keeps no list of participants' names, so it cannot be exported.");
+    for (const format of FORMATS) {
+      const r = await exportRefman(kit.repo, p.id, [interview, lit], format);
+      expect(r.exported, format).toBe(1);
+      expect(r.excluded, format).toEqual([{ sourceId: interview, reason: PARTICIPANT_NO_LIST_NOTE }]);
+      expect(r.notes, format).toContain(
+        "1 source was left out because it involves a participant and this project keeps no list of participants' names (it is not encrypted), so the app cannot tell which names to replace. Cite them by hand, or keep such sources in an encrypted project.",
+      );
+      expect(r.notes.join(" "), format).not.toContain("no participant code");
+    }
+    const second = (await addSource(kit, p, { type: "interview", title: "Interview 2", creators: [{ family: "Doe", given: "Ira", role: "interviewer" }] })).source.id;
+    await kit.repo.linkSourceToFieldwork(p.id, second, { participantIds: [part.id] });
+    const two = await exportRefman(kit.repo, p.id, [interview, second, lit], "ris");
+    expect(two.notes).toContain(
+      "2 sources were left out because they involve a participant and this project keeps no list of participants' names (it is not encrypted), so the app cannot tell which names to replace. Cite them by hand, or keep such sources in an encrypted project.",
+    );
+    const dest = join(kit.tmp, "out");
+    await mkdir(dest, { recursive: true });
+    const open = await exportProjectOpenFormats(kit.repo, p.id, dest);
+    expect(open.notes.join(" ")).toMatch(/2 sources are not in sources\.bib and sources\.csl\.json because they involve a participant and this project keeps no list of participants' names/u);
+    expect(open.notes.join(" ")).not.toContain("no participant code");
   });
 });
