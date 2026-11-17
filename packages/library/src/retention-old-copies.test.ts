@@ -14,11 +14,11 @@ import { DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "@ao/shared";
 import { buildHeader, CHUNK_SIZE } from "./crypto/format.js";
 import type { Deps } from "./deps.js";
 import { backupProject, restoreBackup } from "./export/backup.js";
-import { addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
+import { addSource, makeKit, makeProject, PASS, scratchFile, type Kit } from "./export/test-kit.js";
 import { openLibrary, type Library } from "./library.js";
 import type { LocationEnv } from "./location.js";
 import { deleteOldCopy, executeMove } from "./move.js";
-import { addPendingOldCopy, markPendingComplete, type PendingOldCopy } from "./old-copies.js";
+import { addPendingOldCopy, listPendingOldCopies, markPendingComplete, markPendingDeleted, type PendingOldCopy } from "./old-copies.js";
 import { projectWarnings, type Repo } from "./repo/index.js";
 import { openTestRepo } from "./repo/testing.js";
 import {
@@ -757,5 +757,50 @@ describe("R429: old copies of a moved library and a destruction's certificate (r
     // The list unreadable now: no place.
     await writeFile(listFile(), "{ damaged");
     expect((await oldCopiesBehindWarning(repo, p.id)).oldCopies[0]).not.toHaveProperty("place");
+  });
+
+  const records = async () => (JSON.parse(await readFile(listFile(), "utf8")) as { records: Array<{ id: string; deleted?: { at: string; remains: boolean } }> }).records;
+
+  it("(g) N1, Q1: the app's deletion of an old copy with no destination library open keeps the record (a destruction names it); the next pass records the deletion and drops it", async () => {
+    kit.clock.now = DUE;
+    const { p, res, repo, asset } = await movedLibrary();
+    kit.clock.now = new Date(DUE.getTime() + 3600_000);
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    await deleteOldCopy(kit.lib.root, res.confirmToken, { deps: deps() }); // the service has another library open
+    expect(existsSync(kit.lib.root)).toBe(false);
+    expect(await records()).toEqual([expect.objectContaining({ deleted: { at: kit.clock.now.toISOString(), remains: false } })]);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).certificate!.oldCopies).toMatchObject({ status: "deleted", removed: [{ movedAt: DUE.toISOString() }] });
+    expect(await records()).toEqual([]);
+  });
+
+  it("(g) N1: the app's deletion of an old copy while the project is locked keeps the record; once unlocked, the next pass records the deletion and drops it", async () => {
+    kit.clock.now = DUE;
+    const p = await makeProject(kit, GOV, true, "Interviews");
+    const asset = (await rawSource(p)).assets[0]!;
+    const dest = join(kit.tmp, "Moved");
+    const res = await executeMove(kit.lib, dest, { deps: deps(), env: env(), sourceRepo: kit.repo });
+    const repo = await openAt(dest);
+    if (!repo.isUnlocked(p.id)) await repo.unlockProject(p.id, PASS);
+    kit.clock.now = new Date(DUE.getTime() + 3600_000);
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    repo.lockProject(p.id);
+    await deleteOldCopy(kit.lib.root, res.confirmToken, { deps: deps(), destRepo: repo });
+    expect(existsSync(kit.lib.root)).toBe(false);
+    expect(await records()).toEqual([expect.objectContaining({ deleted: { at: kit.clock.now.toISOString(), remains: false } })]);
+    await repo.unlockProject(p.id, PASS);
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).certificate!.oldCopies).toMatchObject({ status: "deleted" });
+    expect(await records()).toEqual([]);
+  });
+
+  it("(g) N1: a record the app deleted is not offered again by listPendingOldCopies", async () => {
+    await movedLibrary();
+    expect((await listPendingOldCopies(deps())).map((x) => x.id)).toEqual([(await records())[0]!.id]);
+    await markPendingDeleted(deps(), (await records())[0]!.id, true);
+    expect(await listPendingOldCopies(deps())).toEqual([]);
   });
 });
