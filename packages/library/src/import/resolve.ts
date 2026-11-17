@@ -311,10 +311,16 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     }
   };
   const searched = new Set<string>();
+  /**
+   * R379 (i): an audio, video or image file is never searched for by title (steps 5 and 6): its
+   * name and embedded title may name a participant, and a bibliographic search means nothing for
+   * it. Decided by the sniffed type; an item with no file (mime "") is not a media file.
+   */
+  const titleSearch = !!lookup && !LOCATED_MEDIA.test(mime);
   /** Title search; returns the best result and its similarity (results kept as candidates, best first). */
   const search = async (title: string, creator: string | undefined): Promise<{ best?: LookupResult; sim: number }> => {
     const q = `${title}\u0000${creator ?? ""}`.toLowerCase();
-    if (!lookup || searched.has(q)) return { sim: 0 };
+    if (!lookup || !titleSearch || searched.has(q)) return { sim: 0 };
     searched.add(q);
     const rs = await ask(() => searchTitle(title, creator, lookup), [] as LookupResult[]);
     const ranked = rs.map((r) => ({ r, sim: titleSimilarity(title, r.title) })).sort((a, b) => b.sim - a.sim);
