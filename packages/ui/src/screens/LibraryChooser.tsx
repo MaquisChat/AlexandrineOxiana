@@ -196,10 +196,13 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
       <div className="ao-library-place">
         {suggested && (
           <p>
-            Suggested: <UserText className="ao-path">{suggested}</UserText>{" "}
+            {/* R448: the button is named by its own words; this line is its description. */}
+            <span id={`${id}-suggested`}>
+              Suggested: <UserText className="ao-path">{suggested}</UserText>
+            </span>{" "}
             <button
               type="button"
-              aria-label="Use the suggested folder"
+              aria-describedby={`${id}-suggested`}
               disabled={busy}
               onClick={() => {
                 setPath(suggested);

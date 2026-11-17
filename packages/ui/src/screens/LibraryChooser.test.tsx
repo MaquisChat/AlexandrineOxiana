@@ -93,8 +93,11 @@ describe("LibraryChooser", () => {
     );
     const user = userEvent.setup();
     render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
-    const use = await screen.findByRole("button", { name: "Use the suggested folder" });
+    // R448: the button is named by its visible words; the suggested folder is its description.
+    const use = await screen.findByRole("button", { name: "Use this folder", description: `Suggested: ${SUGGESTED}` });
     expect(use.textContent).toBe("Use this folder");
+    expect(use.hasAttribute("aria-label")).toBe(false);
+    expect(screen.getAllByRole("button", { name: "Use this folder" })).toHaveLength(1);
     const offer = use.closest("p") as HTMLElement;
     expect(offer.textContent).toBe(`Suggested: ${SUGGESTED} Use this folder`);
     const shown = within(offer).getByText(SUGGESTED);
@@ -122,7 +125,7 @@ describe("LibraryChooser", () => {
       const { unmount } = render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
       await screen.findByRole("button", { name: "Open Grant 2025" });
       await new Promise((r) => setTimeout(r, 50));
-      expect(screen.queryByRole("button", { name: "Use the suggested folder" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Use this folder" })).toBeNull();
       expect(screen.queryByText(/Suggested:/)).toBeNull();
       expect(screen.queryByRole("alert")).toBeNull();
       unmount();
@@ -223,7 +226,7 @@ describe("LibraryChooser", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("R447: by keyboard, in order — the box, Open library, the suggestion's button (Enter fills the box), the new library's name", async () => {
+  it("R447: by keyboard, in order — the box, Open library, “Use this folder” (Enter fills the box), the new library's name", async () => {
     server.use(
       http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })),
       http.get(url("/libraries/suggested-folder"), () => HttpResponse.json({ folder: SUGGESTED })),
@@ -231,12 +234,12 @@ describe("LibraryChooser", () => {
     );
     const user = userEvent.setup();
     render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
-    await screen.findByRole("button", { name: "Use the suggested folder" });
+    await screen.findByRole("button", { name: "Use this folder" });
     folderBox().focus();
     await user.tab();
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Open library" }));
     await user.tab();
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Use the suggested folder" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Use this folder" }));
     await user.keyboard("{Enter}");
     expect(folderBox().value).toBe(SUGGESTED);
     expect(await screen.findByText("Free space on that disk: 212 GB.")).toBeTruthy();
