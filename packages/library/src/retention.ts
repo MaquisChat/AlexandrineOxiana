@@ -114,7 +114,7 @@ import {
   type Audited,
   type OldCopyRef,
 } from "./destruction-record.js";
-import { oldCopiesOfLibrary, type PendingOldCopy } from "./old-copies.js";
+import { oldCopiesOfLibrary, removePendingOldCopy, type PendingOldCopy } from "./old-copies.js";
 import {
   backupCrashPoint,
   backupFailureReason,
@@ -126,6 +126,7 @@ import {
   listBackups,
   noteDestruction,
   oldCopiesNotes,
+  oldCopyNotedIn,
   plainErrorText,
   pruneBackupsHeld,
   removeHoldingBackups,
@@ -1086,49 +1087,141 @@ const exists = (p: string): Promise<"yes" | "no" | "cannot-tell"> =>
   );
 
 /**
- * Whether the old copy at `oldRoot` still holds any of `paths` (library-relative files of the project
- * `projectId`): looked for at the same place, and in any `Projects/<n>` of the old copy whose
- * project.json names the project (a folder renamed since the move). An old folder that is not
- * there while the folder holding it is not there either (a disk unplugged) is taken to hold them;
- * anything that cannot be told counts as holding (fail towards the warning). The library's own
- * folder is never an old copy of itself.
+ * What a look at an old place found (R409 a): `holds` — some of what was looked for is there;
+ * `none` — the place was looked at and holds none of it; `cannot-tell` — it could not be looked at
+ * (not reachable, an error other than "not there"). A destruction names a copy unless the look
+ * says `none`; a retry pass records a copy as gone only when it says `none`.
  */
-async function oldCopyHolds(currentRoot: string, oldRoot: string, projectId: string, paths: readonly string[]): Promise<boolean> {
-  const root = resolve(oldRoot);
-  if (root === resolve(currentRoot)) return false;
+export type OldPlaceLook = "holds" | "none" | "cannot-tell";
+
+/** The old folder itself: there, gone (its parent is there: it was deleted), or cannot tell (a disk unplugged: neither is there). */
+async function oldRootThere(root: string): Promise<"yes" | "gone" | "cannot-tell"> {
   const here = await exists(root);
-  if (here === "cannot-tell") return true;
-  if (here === "no") return (await exists(dirname(root))) !== "yes";
+  if (here === "yes") return "yes";
+  if (here === "cannot-tell") return "cannot-tell";
+  return (await exists(dirname(root))) === "yes" ? "gone" : "cannot-tell";
+}
+
+/** What a look for one destruction's files searches (R379, R409). */
+interface DestroyedData {
+  /** The project the destruction was made in (as its audit events name it). */
+  projectId: string;
+  /** Library-relative paths of the destroyed files. */
+  paths: readonly string[];
+}
+
+/**
+ * Whether the old copy at `root` still holds any of the destroyed files: each looked for at the same
+ * place, and in any `Projects/<n>` of the old copy whose project.json names the project (a folder
+ * renamed since the move).
+ */
+async function lookAtPlace(root: string, what: DestroyedData): Promise<OldPlaceLook> {
+  const there = await oldRootThere(root);
+  if (there !== "yes") return there === "gone" ? "none" : "cannot-tell";
+  let unsure = false;
   // `Projects/<n>` folders the paths are in, and those of the old copy that hold this project now.
-  const split = paths.flatMap((p) => {
+  const split = what.paths.flatMap((p) => {
     const parts = p.split("/");
     return parts.length > 2 && parts[0] === "Projects" ? [{ folder: `${parts[0]}/${parts[1]}`, rest: parts.slice(2) }] : [];
   });
   const folders = new Set(split.map((x) => x.folder));
-  const names = await fsp.readdir(join(root, "Projects")).catch(() => [] as string[]);
+  let names: string[] = [];
+  try {
+    names = await fsp.readdir(join(root, "Projects"));
+  } catch (e) {
+    if (!ENOENT_LIKE.has((e as NodeJS.ErrnoException).code ?? "")) unsure = true;
+  }
   for (const n of names) {
     if (folders.has(`Projects/${n}`)) continue;
-    const raw = await fsp.readFile(join(root, "Projects", n, "project.json"), "utf8").catch(() => null);
+    const raw = await fsp.readFile(join(root, "Projects", n, "project.json"), "utf8").catch((e: NodeJS.ErrnoException) => {
+      if (!ENOENT_LIKE.has(e.code ?? "")) unsure = true;
+      return null;
+    });
     const id = raw === null ? undefined : (parseObject(Buffer.from(raw))?.project as { id?: unknown } | undefined)?.id;
-    if (id === projectId) folders.add(`Projects/${n}`);
+    if (id === what.projectId) folders.add(`Projects/${n}`);
   }
   for (const folder of folders) {
-    for (const x of split) if ((await exists(join(root, ...folder.split("/"), ...x.rest))) !== "no") return true;
+    for (const x of split) {
+      const e = await exists(join(root, ...folder.split("/"), ...x.rest));
+      if (e === "yes") return "holds";
+      if (e === "cannot-tell") unsure = true;
+    }
   }
-  return false;
+  return unsure ? "cannot-tell" : "none";
 }
 
-/** The listed old copies of this library that hold any of `paths`; `unchecked` when the list cannot be read (never "none"). */
+/**
+ * A look at the old copy a record names, for one destruction's data. The library's own folder is
+ * never an old copy of itself (a move A→B→A): `none`.
+ */
+async function oldCopyLook(currentRoot: string, rec: PendingOldCopy, what: DestroyedData): Promise<OldPlaceLook> {
+  const root = resolve(rec.oldRoot);
+  if (root === resolve(currentRoot)) return "none";
+  return lookAtPlace(root, what);
+}
+
+/**
+ * Whether the old place of a record the app deleted still holds anything of the library (R409 a):
+ * a file in any of the folders the old copy shared with the move (the whole `Projects/` of a
+ * whole-library copy, except folders moved away earlier; a split copy's moved `Projects/<n>`
+ * folders), other than the move's own marker. `none` only when the place was looked at and holds
+ * nothing of them, or is gone.
+ */
+export async function oldPlaceLook(rec: PendingOldCopy): Promise<OldPlaceLook> {
+  const root = resolve(rec.oldRoot);
+  const there = await oldRootThere(root);
+  if (there !== "yes") return there === "gone" ? "none" : "cannot-tell";
+  const scope = rec.split ? rec.movedFolders : ["Projects"];
+  const skip = new Set((rec.split ? [] : (rec.movedAway ?? [])).map((f) => join(root, ...f.split("/"))));
+  let unsure = false;
+  const walk = async (p: string): Promise<boolean> => {
+    if (skip.has(p)) return false;
+    const st = await fsp.lstat(p).catch((e: NodeJS.ErrnoException) => {
+      if (!ENOENT_LIKE.has(e.code ?? "")) unsure = true;
+      return null;
+    });
+    if (!st) return false;
+    if (!st.isDirectory()) return basename(p) !== "MOVED.json";
+    let names: string[];
+    try {
+      names = await fsp.readdir(p);
+    } catch {
+      unsure = true;
+      return false;
+    }
+    for (const n of names) if (await walk(join(p, n))) return true;
+    return false;
+  };
+  for (const f of scope) if (await walk(join(root, ...f.split("/")))) return "holds";
+  return unsure ? "cannot-tell" : "none";
+}
+
+/**
+ * Package-internal (move.ts, and every retry pass): drops this computer's record `id` of an old copy
+ * the app deleted, once its place holds nothing of the library (oldPlaceLook says `none`) and no
+ * destruction of the library still names it (the notes in `backupsDir`, any project). Otherwise it
+ * stays, and passes go on looking (R409 a). Nothing is dropped from a list that is damaged.
+ */
+export async function pruneDeletedOldCopy(deps: { appConfigDir: string; clock: () => Date }, libraryId: string, id: string, backupsDir: string): Promise<void> {
+  const { records, damaged } = await oldCopiesOfLibrary(deps, libraryId);
+  const r = records.find((x) => x.id === id);
+  if (damaged || !r?.deleted) return;
+  if ((await oldPlaceLook(r)) !== "none") return;
+  if (await oldCopyNotedIn(backupsDir, id)) return;
+  await removePendingOldCopy(deps, id);
+}
+
+/** The listed old copies of this library that hold any of `paths`, or cannot be looked at; `unchecked` when the list cannot be read (never "none"). */
 async function holdingOldCopies(repo: Repo, projectId: string, paths: readonly string[]): Promise<{ notDestroyed: Array<OldCopyRef & { id: string }>; unchecked: boolean }> {
   const lib = repoLibrary(repo);
   let records: PendingOldCopy[];
   try {
-    records = await oldCopiesOfLibrary({ appConfigDir: lib.appConfigDir, clock: repoClock(repo) }, lib.id);
+    records = (await oldCopiesOfLibrary({ appConfigDir: lib.appConfigDir, clock: repoClock(repo) }, lib.id)).records;
   } catch {
     return { notDestroyed: [], unchecked: true };
   }
   const out: Array<OldCopyRef & { id: string }> = [];
-  for (const r of records) if (await oldCopyHolds(lib.root, r.oldRoot, projectId, paths)) out.push({ id: r.id, movedAt: r.createdAt, moveId: r.moveId });
+  for (const r of records) if ((await oldCopyLook(lib.root, r, { projectId, paths })) !== "none") out.push({ id: r.id, movedAt: r.createdAt, moveId: r.moveId });
   return { notDestroyed: out, unchecked: false };
 }
 
@@ -1183,42 +1276,48 @@ function destroyedPaths(certificate: Record<string, unknown> | undefined): strin
 /**
  * One look at a destruction's old copies (R379), on the list the audit log holds for it (`a`,
  * brought up to date with what is recorded here): a list not read at the destruction is read and
- * checked; each listed copy that the app has just deleted (`deleted`) and no longer holds the files
- * is recorded as removed; one no longer on this computer's list, or holding none of the files any
- * more, as no longer holding them. What changed is an amendment beside the certificate (governed,
- * its audit event carrying the same facts) and a `retention.old-copies` report. A list that cannot
- * be read, or a certificate that does not verify, records nothing (the warning stays).
+ * checked; each listed copy whose place was looked at and holds none of the destroyed files is
+ * recorded — as removed when the app deleted it (just now, `justDeleted`, or earlier with nothing
+ * left behind), otherwise as no longer holding them. A copy this computer's list has no record of
+ * (the library opened on another computer, a restored copy in another library, a list that lost it)
+ * is "cannot tell", and so is a place that could not be looked at: nothing is recorded for it, and
+ * the warning stays (R409 a, as R147 has it for backups). What changed is an amendment beside the
+ * certificate (governed, its audit event carrying the same facts) and a `retention.old-copies`
+ * report. A list that is damaged or cannot be read, or a certificate that does not verify, records
+ * nothing (the warning stays).
  */
 async function settleOldCopies(
   repo: Repo,
   projectId: string,
   a: Audited,
-  opts: { certificate?: Record<string, unknown>; deleted?: { id: string; oldRoot: string }; mayRecord: () => Promise<boolean> },
+  opts: { certificate?: Record<string, unknown>; justDeleted?: string; mayRecord: () => Promise<boolean> },
 ): Promise<void> {
   const left = oldCopiesOutstandingOf(a);
   const needCheck = a.oldCopiesUnchecked && a.oldCopiesCheckedAt === undefined;
   if (!left.length && !needCheck) return;
   const paths = destroyedPaths(opts.certificate);
   if (!paths.length) return; // nothing to look for: cannot tell, so nothing is recorded
+  const what: DestroyedData = { projectId: a.projectId, paths };
   const lib = repoLibrary(repo);
   let records: PendingOldCopy[];
   try {
-    records = await oldCopiesOfLibrary({ appConfigDir: lib.appConfigDir, clock: repoClock(repo) }, lib.id);
+    const list = await oldCopiesOfLibrary({ appConfigDir: lib.appConfigDir, clock: repoClock(repo) }, lib.id);
+    if (list.damaged) return; // cannot tell (R409 a)
+    records = list.records;
   } catch {
     return;
   }
   const found: Array<OldCopyRef & { id: string }> = [];
-  if (needCheck) for (const r of records) if (await oldCopyHolds(lib.root, r.oldRoot, a.projectId, paths)) found.push({ id: r.id, movedAt: r.createdAt, moveId: r.moveId });
+  if (needCheck) for (const r of records) if ((await oldCopyLook(lib.root, r, what)) !== "none") found.push({ id: r.id, movedAt: r.createdAt, moveId: r.moveId });
   const removed: string[] = [];
   const gone: string[] = [];
   for (const id of left) {
-    if (opts.deleted?.id === id) {
-      // Deleted through the app just now: removed, once none of the files is left in it.
-      if (!(await oldCopyHolds(lib.root, opts.deleted.oldRoot, a.projectId, paths))) removed.push(id);
-      continue;
-    }
     const r = records.find((x) => x.id === id);
-    if (!r || !(await oldCopyHolds(lib.root, r.oldRoot, a.projectId, paths))) gone.push(id);
+    if (!r) continue; // no record on this computer: cannot tell (R409 a)
+    if ((await oldCopyLook(lib.root, r, what)) !== "none") continue;
+    // Removed by the app only when the app deleted it and left nothing (or this is that deletion's own look, R147).
+    if (r.deleted && (opts.justDeleted === id || !r.deleted.remains)) removed.push(id);
+    else gone.push(id);
   }
   if (!needCheck && !removed.length && !gone.length) return;
   if (!(await opts.mayRecord())) return;
@@ -1287,7 +1386,7 @@ async function syncOldCopies(
   list: readonly Audited[],
   headMatches: boolean,
   logHolds: () => Promise<boolean>,
-  deleted?: { id: string; oldRoot: string },
+  justDeleted?: string,
 ): Promise<unknown> {
   const dirRel = `${repo.getProject(projectId).folder}/retention`;
   const notes: Record<string, OldCopiesNote> = {};
@@ -1300,7 +1399,7 @@ async function syncOldCopies(
         const buf = await readPlain(repo, projectId, rel);
         // Only a certificate that is the one the audit log recorded is believed for what was destroyed.
         if (Buffer.isBuffer(buf) && sha256(buf) === a.certificateSha256) {
-          await settleOldCopies(repo, projectId, a, { certificate: parseObject(buf), mayRecord: logHolds, ...(deleted ? { deleted } : {}) });
+          await settleOldCopies(repo, projectId, a, { certificate: parseObject(buf), mayRecord: logHolds, ...(justDeleted ? { justDeleted } : {}) });
         }
       }
     } catch (err) {
@@ -1315,24 +1414,29 @@ async function syncOldCopies(
     for (const [rel, n] of leaving) notes[rel] = { copies: [...(notes[rel]?.copies ?? []), ...n.copies.filter((c) => !notes[rel]?.copies.some((x) => x.id === c.id))], ...(n.unchecked || notes[rel]?.unchecked ? { unchecked: true as const } : {}) };
   }
   await setOldCopiesNotes(repo, projectId, notes).catch(() => {});
+  // Records of old copies the app deleted, kept to be looked at (R409 a): dropped once nothing of the library is left there and no destruction names them.
+  const lib = repoLibrary(repo);
+  const cfg = { appConfigDir: lib.appConfigDir, clock: repoClock(repo) };
+  const kept = await oldCopiesOfLibrary(cfg, lib.id).catch(() => ({ records: [] as PendingOldCopy[], damaged: true }));
+  if (!kept.damaged) for (const r of kept.records) if (r.deleted) await pruneDeletedOldCopy(cfg, lib.id, r.id, join(lib.root, "Backups")).catch(() => {});
   return firstError;
 }
 
 /**
- * Package-internal (move.ts, deleteOldCopy): the old copy `id`, at `oldRoot`, was just deleted
- * through the app. Each destruction of the project that lists it records it as removed (an
- * amendment and a report, R147 as for backups) once none of the destroyed files is left in it, and
- * the warning follows. Nothing is done in a read-only library or a locked project: the next retry
- * pass there finds it no longer listed.
+ * Package-internal (move.ts, deleteOldCopy): the old copy `id` was just deleted through the app (its
+ * record is marked deleted, R409 a). Each destruction of the project that lists it records it as
+ * removed (an amendment and a report, R147 as for backups) once none of the destroyed files is left
+ * in it, and the warning follows. Nothing is done in a read-only library or a locked project: the
+ * record stays, and the next retry pass there looks at the place.
  */
-export function recordOldCopyDeleted(repo: Repo, projectId: string, id: string, oldRoot: string): Promise<void> {
+export function recordOldCopyDeleted(repo: Repo, projectId: string, id: string): Promise<void> {
   return withProjectMaintenance(repo, projectId, async () => {
     if (repoLibrary(repo).mode !== "read-write" || !repo.isUnlocked(projectId)) return;
     const view = await scan(repo, projectId);
     if (!view.list.some((a) => a.oldCopies.has(id))) return;
     let holds: boolean | undefined;
     const logHolds = async () => (holds ??= view.headMatches && (await verifiedAuditEvents(repo, projectId)).ok);
-    const err = await syncOldCopies(repo, projectId, view.list, view.headMatches, logHolds, { id, oldRoot: resolve(oldRoot) });
+    const err = await syncOldCopies(repo, projectId, view.list, view.headMatches, logHolds, id);
     if (err !== undefined) throw err;
   });
 }

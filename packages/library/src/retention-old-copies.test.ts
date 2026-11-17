@@ -50,14 +50,15 @@ afterEach(async () => {
   await kit.close();
 });
 
-function deps(): Deps {
+/** This computer's deps; `computer: "B"` is another computer (its own device id and configuration folder). */
+function deps(computer: "A" | "B" = "A"): Deps {
   return {
     clock: () => kit.clock.now,
-    deviceId: "dev-A",
-    hostname: "host-A",
+    deviceId: `dev-${computer}`,
+    hostname: `host-${computer}`,
     pid: process.pid,
     isPidAlive: () => true,
-    appConfigDir: kit.lib.appConfigDir,
+    appConfigDir: computer === "A" ? kit.lib.appConfigDir : join(kit.tmp, "config-B"),
     settleMs: 0,
     setInterval: () => ({}),
     clearInterval: () => {},
@@ -70,8 +71,8 @@ async function rawSource(p: Project, content = "RAW interview audio bytes"): Pro
   return addSource(kit, p, { type: "interview", title: "Interview one", identifiable: true, files: [{ path: f, role: "original", handling: "copy" }] });
 }
 
-async function openAt(root: string): Promise<Repo> {
-  const lib = await openLibrary(root, deps());
+async function openAt(root: string, computer: "A" | "B" = "A"): Promise<Repo> {
+  const lib = await openLibrary(root, deps(computer));
   opened.push(lib);
   return openTestRepo(lib, kit.ring, { clock: () => kit.clock.now, tz: "UTC", actor: "tester", scryptN: 2 ** 10 });
 }
@@ -263,5 +264,80 @@ describe("FR-A16: old copies of the library left by a move, at a destruction", (
     expect(Object.keys(ev.details!).filter((k) => k.startsWith("oldCopies"))).toEqual([]);
     expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
     expect(await oldCopiesAwaitingDeletion(kit.repo, p.id)).toEqual([]);
+  });
+});
+
+describe("R409 (a): a copy leaves the warning only when its place was looked at and holds none of the destroyed data", () => {
+  const listFile = () => join(kit.lib.appConfigDir, "pending-old-copies.json");
+  const closeAll = async () => {
+    for (const l of opened.splice(0)) await l.close();
+  };
+
+  it("P1: the library opened on another computer, whose list has no record of the old copy: the warning stays and nothing is recorded; back on the first computer, the place emptied, the amendment is written", async () => {
+    const { p, dest, repo, asset } = await movedLibrary();
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    await closeAll();
+    const onB = await openAt(dest, "B");
+    await resumeDestruction(onB, p.id);
+    expect(await projectWarnings(onB, p.id)).toContain(WARNING);
+    expect((await readDestruction(onB, p.id, r.certificatePath)).amendments).toHaveLength(0);
+    expect((await readDestruction(onB, p.id, r.certificatePath)).certificate!.oldCopies).toMatchObject({ status: "pending" });
+    await closeAll();
+    // On the computer that moved it, once the old copy is really gone.
+    await rm(kit.lib.root, { recursive: true, force: true });
+    const onA = await openAt(dest);
+    await resumeDestruction(onA, p.id);
+    expect(await projectWarnings(onA, p.id)).not.toContain(WARNING);
+    expect((await readDestruction(onA, p.id, r.certificatePath)).certificate!.oldCopies).toMatchObject({ status: "no-longer-present" });
+  });
+
+  it("P3: a list damaged after the destruction is 'cannot tell': the warning stays and nothing is recorded; the list readable again and the place emptied, the amendment is written", async () => {
+    const { p, repo, asset } = await movedLibrary();
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    const good = await readFile(listFile(), "utf8");
+    await writeFile(listFile(), "{ damaged");
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+    // A list whose record of this copy has no usable place is damaged too.
+    const bad = JSON.parse(good) as { records: Array<Record<string, unknown>> };
+    delete bad.records[0]!.oldRoot;
+    await writeFile(listFile(), JSON.stringify(bad));
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+    await writeFile(listFile(), good);
+    await rm(kit.lib.root, { recursive: true, force: true });
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).certificate!.oldCopies).toMatchObject({ status: "no-longer-present" });
+  });
+
+  it("P4: the app's deletion keeps a destroyed file: the record stays, marked deleted with remains, the warning stays at later passes; once the file is gone, the amendment is written and the record dropped", async () => {
+    kit.clock.now = DUE;
+    const { p, res, repo, asset } = await movedLibrary();
+    kit.clock.now = new Date(DUE.getTime() + 3600_000);
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    const keptFile = join(kit.lib.root, ...asset.path.split("/"));
+    await writeFile(keptFile, "RAW interview audio bytes, changed since the move");
+    const out = await deleteOldCopy(kit.lib.root, res.confirmToken, { deps: deps(), destRepo: repo });
+    expect(out.kept).toEqual([asset.path]);
+    expect(existsSync(keptFile)).toBe(true);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    const list = JSON.parse(await readFile(listFile(), "utf8")) as { records: Array<{ deleted?: { at: string; remains: boolean } }> };
+    expect(list.records).toHaveLength(1);
+    expect(list.records[0]!.deleted).toEqual({ at: kit.clock.now.toISOString(), remains: true });
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).toContain(WARNING);
+    expect((await readDestruction(repo, p.id, r.certificatePath)).amendments).toHaveLength(0);
+    // The researcher removes what was left by hand.
+    await rm(kit.lib.root, { recursive: true, force: true });
+    await resumeDestruction(repo, p.id);
+    expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
+    const rec = await readDestruction(repo, p.id, r.certificatePath);
+    expect(rec.certificate!.oldCopies).toMatchObject({ status: "no-longer-present" });
+    expect((JSON.parse(await readFile(listFile(), "utf8")) as { records: unknown[] }).records).toEqual([]);
   });
 });

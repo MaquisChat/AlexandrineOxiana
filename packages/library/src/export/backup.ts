@@ -1518,6 +1518,30 @@ export async function setOldCopiesNotes(repo: Repo, projectId: string, notes: Re
   await withState(repo, (s) => setOrDrop(s.oldCopiesUndestroyed, projectId, wanted));
 }
 
+/**
+ * Package-internal (move, retention, R409 a): whether the notes in the Backups folder `dir` (any
+ * project of that library) still name the old copy `id` as holding destroyed files. A note file
+ * that is missing names none; one that cannot be read or parsed counts as naming it (the record of
+ * the old copy is then kept: the warning errs toward staying, R147).
+ */
+export async function oldCopyNotedIn(dir: string, id: string): Promise<boolean> {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(join(dir, BACKUPS_STATE), "utf8");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+  let s: unknown;
+  try {
+    s = JSON.parse(raw);
+  } catch {
+    return true;
+  }
+  if (!isObject(s)) return true;
+  const notes = oldCopiesNotesOf(s.oldCopiesUndestroyed);
+  return Object.values(notes).some((per) => Object.values(per).some((n) => n.copies.some((c) => c.id === id)));
+}
+
 /** Package-internal: every backup of the project still to be removed for a destruction (all certificates). */
 export async function holdingNotRemoved(repo: Repo, projectId: string): Promise<string[]> {
   const u = (await readState(backupsDir(repo))).undestroyed;
