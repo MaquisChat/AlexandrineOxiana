@@ -80,13 +80,17 @@ const isoUtc = z
   .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/, "must be an ISO 8601 UTC timestamp, e.g. 2026-01-01T09:30:00Z")
   .refine((x) => !Number.isNaN(Date.parse(x)), "not a real timestamp");
 
-/** `value` is the exact looser value being approved; it must be present (it may be null). */
+/**
+ * `value` is the exact looser value being approved; it must be present (it may be null). `reason` and
+ * `by` must be there; a blank one (`blank()`) is read like any other text, and the exception then
+ * waives nothing (`effectivePolicy`): one outcome for a blank reason and a blank approver (R391 c, R415 d).
+ */
 const ExceptionSchema = z
   .object({
     control: z.string().min(1),
     value: z.unknown(),
     reason: z.string(),
-    by: z.string().refine((x) => x.trim() !== "", "approver name must not be blank"),
+    by: z.string(),
     at: isoUtc,
   })
   .strict()

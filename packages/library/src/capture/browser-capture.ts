@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { cleanAddress, recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
+import { cleanAddress, nonBlank, recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
 import { InvalidInputError } from "../repo/errors.js";
 import { addCapturedOriginal, projectPolicy, repoLibrary, updateSourceRechecked, type Repo } from "../repo/repo.js";
 import { htmlStripWorkerUrl } from "../resources.js";
@@ -181,7 +181,8 @@ export async function captureBrowserPage(
     const c = classifyUrl(url.href);
     const policy = await projectPolicy(repo, projectId);
     const identifiable = policy?.identifiability.containsIdentifiable ?? true;
-    const legalBasis = text(input.legalBasis, 2000) ?? policy?.consent.defaultLegalBasis?.["social-media"]?.trim() ?? undefined;
+    // A blank basis (invisible characters only) is none: core's one `blank()` (R391 c, R415 d).
+    const legalBasis = nonBlank(input.legalBasis)?.slice(0, 2000) ?? nonBlank(policy?.consent.defaultLegalBasis?.["social-media"]);
     const social = c.platform !== "other";
     // The title (and so the folder name) from the CLEANED address: a `;jsessionid=…` in the path never reaches it (R391 a).
     const shown = URL.canParse(c.canonicalUrl) ? new URL(c.canonicalUrl) : undefined;

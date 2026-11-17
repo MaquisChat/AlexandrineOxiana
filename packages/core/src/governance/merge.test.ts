@@ -303,9 +303,14 @@ describe("exception shape", () => {
     expect(() => cfg(e('reason: r, by: pi, at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.value/);
     expect(() => cfg(e('value: null, reason: r, by: pi, at: "2026-01-01T00:00:00Z"'))).not.toThrow();
   });
-  it("by must be non-blank", () => {
-    expect(() => cfg(e('value: false, reason: r, by: "  ", at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.by/);
+  it("by is required; a blank one is read and waives nothing, as a blank reason (R415 d, review 2 M3)", () => {
     expect(() => cfg(e('value: false, reason: r, at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.by/);
+    for (const by of ["", "  ", "\\u00a0", "\\u3000", "\\ufeff", "\\u200b", "\\u3164"]) {
+      const y = `exceptions:\n  - { control: "encryption.atRest", value: optional, reason: "IRB amendment 3", by: "${by}", at: "2026-01-01T09:30:00Z" }\n`;
+      const { policy, violations } = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + y));
+      expect(violations, JSON.stringify(by)).toHaveLength(1);
+      expect(policy.encryption.atRest, JSON.stringify(by)).toBe("required");
+    }
   });
   it("at must be ISO 8601 UTC", () => {
     expect(() => cfg(e("value: false, reason: r, by: pi, at: \"2026-01-01\""))).toThrow(/exceptions\.0\.at/);
