@@ -317,6 +317,26 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(played).toBe(before + 1);
   });
 
+  it("R371 c: a seek made while playing, whose own read meets the expired ticket, resumes at the place asked", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4.25);
+    // The researcher seeks to 30; the seek's range read fails: the ticket had ended.
+    el.currentTime = 30;
+    fireEvent(el, new Event("seeking"));
+    fireEvent(el, new Event("error"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    fireEvent(el, new Event("pause"));
+    const before = played;
+    el.currentTime = 0;
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(30);
+    expect(played).toBe(before + 1);
+  });
+
   it("a project locked during playback: renewal is refused, the transcript is hidden, and Try again brings it back after unlocking", async () => {
     const onLocked = vi.fn();
     const { svc } = await open({}, { onLocked });

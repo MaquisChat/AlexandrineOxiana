@@ -233,8 +233,14 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       else if (!pending.srcSet || pending.playedSince) pending.play = false;
     };
     const onSeeking = () => {
+      if (halted) return;
+      // R371 c: a seek's target is recorded when it is asked, so a ticket that ends before it lands resumes there.
+      if (!pending) {
+        position = el.currentTime;
+        return;
+      }
       // R362 f: a seek by the researcher while the new ticket is asked for: the renewal resumes there.
-      if (halted || !pending || pending.srcSet) return;
+      if (pending.srcSet) return;
       pending.at = el.currentTime;
       position = pending.at;
       timeRef.current?.(position);
