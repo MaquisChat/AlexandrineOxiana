@@ -358,7 +358,8 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
       break;
     case "no-open-copy":
       if (recordRemoved(e)) break;
-      if (e.reason?.code === "copy-some-unreachable") out.push("retry");
+      // R282 e: some services could not be reached; R379 (FR-A17): a copy found could not be downloaded.
+      if (e.reason?.code === "copy-some-unreachable" || e.reason?.code === "copy-not-downloaded") out.push("retry");
       if (e.sourceId) out.push("open");
       break;
     case "waiting-sign-in":
