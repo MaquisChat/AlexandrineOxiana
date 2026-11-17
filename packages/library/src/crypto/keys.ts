@@ -11,6 +11,7 @@ import {
   createDecipheriv,
   randomBytes,
   scrypt as scryptCb,
+  timingSafeEqual,
   type ScryptOptions,
 } from "node:crypto";
 import { newId } from "@ao/core";
@@ -268,7 +269,10 @@ export class KeyRing {
   add(keyId: string, key: Uint8Array): void {
     assertKeyId(keyId);
     assertKey(key);
-    this.keys.get(keyId)?.fill(0);
+    const held = this.keys.get(keyId);
+    // The same key again (an unlock of an unlocked project) keeps the buffer: a change may be sealing with it (R379).
+    if (held && timingSafeEqual(held, key)) return;
+    held?.fill(0);
     this.keys.set(keyId, Buffer.from(key));
   }
 
