@@ -145,6 +145,7 @@ import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRe
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
+import { cheapEstimate, fitSentence, freeRoom, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir } from "./space.js";
 import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = libraryVersion();
@@ -485,6 +486,14 @@ export interface ScanSummary {
    * offers to keep them as links only when there are some (R136).
    */
   linkedFiles: number;
+  /**
+   * R413 a: the bytes a batch with the default options (copy; files the source links in place kept as links, where
+   * the project allows) would copy into the library, and the free room on the library's disk (absent when it cannot
+   * tell); `spaceWarning`, the sentence a start would be refused with, when they do not fit.
+   */
+  copyBytes?: number;
+  freeBytes?: number;
+  spaceWarning?: string;
 }
 
 export interface BatchSummary {
@@ -604,6 +613,31 @@ async function preflightDeleted(repo: Repo, projectId: string, adapter: { increm
   if (!options.resetDeletedRecords) throw new BatchRefusedError(REASONS.deletedRecordsUnreadable);
   await importChange(repo, projectId, BOOKKEEPING, (ops) => ops.resetDeletions(), { op: "import.reset-deleted-records" });
   await appendLibraryEvent(repo, projectId, "import.reset-deleted-records", {});
+}
+
+/** Kinds whose files can never be left where they are (R413 a): a ZIP's are unpacked from it, Zotero Web's downloaded. */
+const COPY_ONLY_KINDS: ReadonlySet<string> = new Set(["zip", "zotero-web"]);
+
+/**
+ * R413 a: before a batch that copies files starts, whether they fit. The bytes to be copied are what the dry run of
+ * the same source found (else the source's own cheap total, space.ts; neither: no check, the run's per-file check
+ * still protects), less the files the source links in place when they stay links; with the margin (10%, at least
+ * 500 MB) and, for a Zotero local import, its database copy, they must fit in the free room on the library's disk, or
+ * the start is refused (BatchRefusedError, nothing written). Returns the room the scan's own temporary copies must
+ * leave free beyond themselves (ScanContext.reserveBytes): the files and the margin.
+ */
+async function preflightSpace(repo: Repo, projectId: string, adapter: ImportSourceAdapter, options: ImportOptions): Promise<number> {
+  if (options.fileHandling === "link") return spaceMargin(0);
+  const est = rememberedScan(projectId, adapter) ?? (await cheapEstimate(adapter).catch(() => undefined));
+  if (!est) return spaceMargin(0);
+  const linkRefused = await preflightLink(repo, projectId);
+  const copy = Math.max(0, est.totalBytes - (options.linkedFiles === "link" && !linkRefused ? est.linkedBytes : 0));
+  const reserve = copy + spaceMargin(copy);
+  if (!copy) return reserve;
+  const db = adapter.kind === "zotero-local" ? await zoteroCopyBytes(zoteroDataDir(adapter.location)) : 0;
+  const free = await freeRoom(repoLibrary(repo).root);
+  if (Number.isFinite(free) && reserve + db > free) throw new BatchRefusedError(fitSentence(copy, free, !linkRefused && !COPY_ONLY_KINDS.has(adapter.kind)));
+  return reserve;
 }
 
 /** Policy and option checks a batch must pass before it starts (or resumes). */
@@ -764,6 +798,8 @@ class Run {
     journal: JournalEntry[],
     /** Resume guard: item-key hash → source of this batch found without a journal line. */
     private readonly recovered: Map<string, string> = new Map(),
+    /** R413 d: the room the scan's own temporary copies (the Zotero database) must leave free (preflightSpace). */
+    private readonly reserve: number = spaceMargin(0),
   ) {
     this.latest = latestByKey(journal);
     this.createdIds = new Set(rec.createdSourceIds);
@@ -935,6 +971,7 @@ class Run {
       let knownIds: ReadonlySet<string> | undefined;
       const scan = this.adapter.scan(this.abort.signal, {
         workDir: () => this.ensureWorkDir(),
+        reserveBytes: this.reserve,
         note: (t) => this.note(t),
         // An item already in this batch's journal is passed by below: the adapter need not fetch it (Z2).
         skip: (key) => this.latest.has(key),
@@ -2412,6 +2449,9 @@ export async function startBatch(
   try {
     await refuseLibrarySource(deps.repo, adapter);
     const { approveOutside, ...options } = acceptOptions(input);
+    deps.repo.getProject(projectId); // NotFoundError for an unknown project, before its disk is asked
+    // R413 a: before anything is evaluated or written (a refusal leaves nothing, not even an audited decision).
+    const reserve = await preflightSpace(deps.repo, projectId, adapter, options);
     const governance = await preflight(deps.repo, projectId, adapter.kind, options);
     await preflightDeleted(deps.repo, projectId, adapter, options);
     const number = await allocateBatchNumber(deps.repo, projectId);
@@ -2454,7 +2494,7 @@ export async function startBatch(
         participants: rec.fieldwork.participantIds?.length ?? 0,
       });
     }
-    const run = new Run(deps, projectId, rec, adapter, []);
+    const run = new Run(deps, projectId, rec, adapter, [], new Map(), reserve);
     run.start();
     return run.handle();
   } catch (err) {
@@ -2569,6 +2609,23 @@ async function dryRunPolicy(repo: Repo, projectId: string, kind: ImportBatch["so
 }
 
 /**
+ * R413 a: what the dry run says of the room: the bytes a batch with the default options would copy, the free room on
+ * the library's disk and, when they do not fit (with the margin and a Zotero local import's database copy), the
+ * sentence the start would be refused with. The scan's numbers are remembered for a start from the same source.
+ */
+async function spaceOfScan(repo: Repo, projectId: string, adapter: ImportSourceAdapter, summary: ScanSummary, linkedBytes: number): Promise<void> {
+  rememberScan(projectId, adapter, { totalBytes: summary.totalBytes, linkedBytes });
+  const linkRefused = await preflightLink(repo, projectId);
+  const copy = Math.max(0, summary.totalBytes - (linkRefused ? 0 : linkedBytes));
+  summary.copyBytes = copy;
+  const free = await freeRoom(repoLibrary(repo).root);
+  if (!Number.isFinite(free)) return;
+  summary.freeBytes = free;
+  const db = adapter.kind === "zotero-local" ? await zoteroCopyBytes(zoteroDataDir(adapter.location)) : 0;
+  if (copy && copy + spaceMargin(copy) + db > free) summary.spaceWarning = fitSentence(copy, free, !linkRefused && !COPY_ONLY_KINDS.has(adapter.kind));
+}
+
+/**
  * Dry run (wizard step 2): what a batch from `adapter` would find. Nothing is written to the
  * library: archives are unpacked into a private work folder that is removed before this returns;
  * nothing is looked up online and no audit event is written.
@@ -2590,6 +2647,7 @@ export async function dryRun(
   let made = false;
   const seenSha = new Set<string>();
   const seenIds = new Set<string>();
+  let linkedBytes = 0;
   const ac = new AbortController();
   try {
     const scan = adapter.scan(ac.signal, {
@@ -2605,6 +2663,7 @@ export async function dryRun(
         if (!summary.notes.includes(t)) summary.notes.push(t);
       },
       dryRun: true,
+      reserveBytes: spaceMargin(0),
     });
     // The approvals the batch would be given count here too (kept in memory only, under a throwaway secret).
     const secret = randomBytes(32).toString("hex");
@@ -2655,7 +2714,11 @@ export async function dryRun(
         continue;
       }
       let bytes = 0;
-      for (const x of item.files) bytes += (await fsp.stat(x.path).catch(() => null))?.size ?? x.bytes;
+      for (const x of item.files) {
+        const b = (await fsp.stat(x.path).catch(() => null))?.size ?? x.bytes;
+        bytes += b;
+        if (x.link === true) linkedBytes += b;
+      }
       summary.totalBytes += bytes;
       const type = await fileTypeFromFile(f.path).catch(() => undefined);
       const stored = type ? acceptedType(type) : undefined;
@@ -2672,6 +2735,7 @@ export async function dryRun(
       else if (seenSha.has(sha)) summary.likelyDuplicates++;
       seenSha.add(sha);
     }
+    await spaceOfScan(repo, projectId, adapter, summary, linkedBytes);
   } finally {
     if (made) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     activeTemp.delete(name);

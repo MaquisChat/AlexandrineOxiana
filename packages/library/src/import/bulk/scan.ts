@@ -160,6 +160,11 @@ export interface ScanContext {
   /** The scan is for a dry run (nothing is imported): adapters that download files skip the downloads. */
   dryRun?: boolean;
   /**
+   * R413 d: the room the scan's own temporary copies (the Zotero database) must leave free on the library's disk beyond
+   * themselves: the files the batch will copy and the import's margin (bulk/space.ts). Absent: the margin alone.
+   */
+  reserveBytes?: number;
+  /**
    * True when the engine will pass this item by anyway (e.g. it is already in a resumed batch's
    * journal): an adapter that downloads may then fetch nothing for it and yield nothing. Optional:
    * an adapter that ignores it is still correct (the engine keeps its own journal check). The adapter
