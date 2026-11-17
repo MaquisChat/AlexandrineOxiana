@@ -102,3 +102,67 @@ Commit 4d571dd, one commit; the branch head is now 4d571dd.
   - `pnpm -r typecheck`: exit 0.
   - `lint:css`: exit 0.
   - `lint:colours`: "ok: no hard-coded colours".
+
+## Round 3 (R449)
+The branch head is now **b32595e**. There is one commit per point, plus one small commit for the end-to-end assertion. `git status` is empty.
+
+- **(a) The suggestion is in the home folder: 27ff8ee.** It answers `<home>/Alexandrine Oxiana`, then " 2" … " 9".
+  - Nothing under Documents is looked at. The Documents branch, the `realpath` look and `PlaceLooks.realpath` are removed.
+  - There is no suggestion when the home folder is unknown, or when its own path is cloud-synced by `classifyLocation`. That is decided from the path and the environment alone, with no look.
+  - Tests in `library-place.test.ts`:
+    - "the home folder known": no path asked contains "Documents"; the only path asked is `<home>/Alexandrine Oxiana`.
+    - "home in a cloud place": uses a OneDrive variable that covers the home folder; nothing is looked at.
+    - "no home": no suggestion.
+    - Both failed first.
+  - **Tests removed:** "Documents there and not kept in step…", "Documents kept in step by iCloud…", "Documents whose real path is in a cloud folder…", "no Documents folder (or Documents is a file)".
+  - **Tests rewritten for the home folder:** "exists and is empty", "' 2' / ' 3'", and the real-file-system test. The last now puts a non-empty Documents in the home folder and expects it to be ignored.
+  - **Service test changed:** the routes test's first case in `library-place-routes.test.ts` now expects the home folder's name even when Documents has files.
+- **(b) Taken names: f9bdb48.** `realFolderState` now uses `lstat`. A link (to somewhere or to nowhere), a file, a folder with something in it, or something unreadable is taken.
+  - The test is probe P4, run on real folders: a link to nowhere, a link to an empty folder, and a file. The suggestion is "… 4", and `createLibrary` at that folder succeeds.
+  - It failed first: the suggestion was the dangling link.
+- **(c) One look at a time: 8eb89b8.** This replaces the per-path set.
+  - **The room:** a single flag (`roomLookRunning`) is held until the look's promise settles. While it is held, every `freeRoomFor` call answers `undefined` at once and starts nothing.
+  - **The suggestion:** it is now bounded to 2 s through the shared `withinBound`. A second request returns the same promise until the look settles. After the bound has passed, that promise has already answered "none".
+  - **Tests:**
+    - Thirty paths under a hung look start ONE look; the other 29 answer `undefined` at once.
+    - After the bound, a call for a healthy disk still starts nothing. Once the hung look settles, the next call looks again.
+    - The same path twice gives one look (M1).
+    - The suggestion's hung look gives "none" at 2 s; a second request is the same promise; a third starts nothing.
+    - They failed first: the thirty-path test timed out with thirty looks running, and the second suggestion was a new promise.
+  - **Test changed:** "a look that never answers" now uses hung looks that are released at the end. The module-wide guard would otherwise stay set for the rest of the file.
+- **(d) The figure: 2fef73b.** `roomSentence` is exported from `LibraryChooser.tsx`. It rounds DOWN:
+  - TB with one decimal from 1e12 (a trailing ".0" is dropped, so 1e12 reads "1 TB");
+  - whole GB from 10e9;
+  - GB with one decimal from 1e9;
+  - whole MB from 1e6;
+  - "less than 1 MB" below that.
+  - The little-room sentence still appears under 10e9. `formatSize` is unchanged.
+  - The test checks the review's rows plus four more (212.9e9, 999.99e9, 1e12, 1.5e9). It failed first because the function did not exist.
+  - The e2e assertion's pattern now accepts TB and "less than 1 MB" (b32595e). It was not run.
+- **(e) The room's line: 51ddb90.**
+  - The room is asked 600 ms after the last change.
+  - The line is a `roomWords` string. It keeps its words while a newer answer is awaited, and the answer replaces them. An answer with no number, or an error, empties the line.
+  - It is emptied at once only when the box no longer holds a full path. Stale answers are still dropped by the counter.
+  - `.ao-library-room` gets `min-height: calc(var(--line-spacing) * 1em)`, so it keeps one line's height empty or not. The earlier `p:empty { margin: 0 }` rule is removed.
+  - **New tests:**
+    - the line is always in the page;
+    - a second path keeps the first figure until its own answer;
+    - an answer with no number empties the line, and a non-full path empties it at once;
+    - the same words cause zero DOM mutations (MutationObserver);
+    - U3: 12 characters at 350 ms a key make at most 2 requests.
+  - The three behavioural tests failed first: the line was emptied, the same words caused mutations, and U3 made 12 requests.
+  - The earlier room and stale-answer tests pass unchanged.
+- **(f) The guide: 0f237ee.** Step 1 now says "When it can" for the suggestion, which is in your home folder (example `/Users/yourname/Alexandrine Oxiana`). It also says "when it can" for the free-space line, and uses the screen's words.
+
+**Runs:**
+- `library-place.test.ts`: 19 passed.
+- `library-place-routes.test.ts` and `server.test.ts`: 155 passed | 1 skipped.
+- The chooser's three files: 25 passed.
+- `pnpm -r typecheck`: 0.
+- `lint:css`: 0.
+- `lint:colours`: ok.
+- e2e: not run, as instructed.
+
+**For a ruling:**
+- The room guard is process-wide. Because it is held until the look settles, one hung share keeps every room answer at "cannot tell", even for a healthy disk, until that share answers. That is what R449 b asks for; I am naming the consequence.
+- The suggestion's "join" also joins calls with different environments. Only the service calls it, always with this machine's environment.
