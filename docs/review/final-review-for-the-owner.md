@@ -302,4 +302,32 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 **For your checklist (part 4):** open "Stop watching" and "Delete participant" with the keyboard and see that the box's title is highlighted when it opens. <sub>(FR-633)</sub>
 
+## 7. Added later on 17 November: the fixes, what you found, and what name matching cannot do
+
+**Where the last round stands.** You said to carry on, so all eleven fixes of part 6 are being built, plus the three things you found yourself. Each is built, read by an independent reviewer who tries to break it, and corrected. Five are finished; the others are in their last small corrections. When all are finished they are tested together once, on a quiet machine, and only then merged on the working branch. Nothing goes to the approved version (`main`) without your word.
+
+**What you found with the app on your Mac — thank you, these are exactly the things only a real library shows.**
+
+- **"97 of 98 items" during a Zotero import of thousands.** The second number counted only what the app had looked at so far, not the whole. Being fixed: it shows the real total as soon as the app knows it, and until then says "N items so far" instead of a made-up total.
+- **The import that stopped with 213 failures.** I reproduced it here: the most likely cause is that **the disk holding the library filled up**. The app first copies the Zotero database into the library and then the files; when no room is left every item fails ("could not be imported") and the import stops. I cannot prove this is what happened on your Mac without three things from you: **how much free space the disk holding the library has, how big your Zotero folder is, and what the "Notes" line of the report said.** The fix: before an import starts the app checks that the files will fit and says so plainly if they will not; a disk that fills on the way stops the import at once, with a plain sentence, and it can be resumed once there is room; and the report groups failures by their cause instead of 213 identical lines. **Please do not undo that import yet.** Once the fix is in your app, the clean path is to undo it and import again.
+- **"Two sources disagree about the title": the real title against "S0003598X20000800jra 900..915".** That second "title" is a production code a publisher left inside the PDF. Being fixed: a title that is plainly a file code, not words, is ignored, so it raises no conflict for you to settle.
+
+**One more decision**
+
+26. **A log file for the Mac app**
+   **What it is:** When something fails in the built app, as with your import, the app keeps no record of what went wrong; I had to guess and reproduce. A log file kept only on your Mac, limited in size, with the same messages the service already writes when a developer runs it (no passwords, no keys, no contents of files), would let you send me the few lines around a failure.
+   **Your options:** (a) Build it (small). (b) Leave the app without one.
+   **My recommendation:** (a).
+   <sub>(FR-686)</sub>
+
+**What the app can and cannot recognise as a participant's name.** After this round one rule decides it everywhere (citations, bibliographies, reference exports, folder names, web addresses). You should know its limits before you share anything.
+
+- **It recognises** the name as you recorded it and the participant's handle; the name in either order ("Maria Lopez", "Lopez, Maria"); typed without its accents or in other capitals; in scripts written without spaces (Chinese, Japanese, Thai); with invisible characters inside it; a family name or a given name standing alone when it has four letters or more (so "Rose gardens" becomes "P-001 gardens" if a participant is called Rose: too much is replaced sooner than too little); and the whole name inside another name ("Friends of Maria Lopez").
+- **It does not recognise** initials ("M. Lopez"); a short name standing alone ("Li" by itself); a nickname or short form you did not record ("Mari" for "Maria"); a misspelling; a name whose ending changes with grammar, as in Slavic languages or Finnish ("Marii", "Lopezovi"); or letters borrowed from another alphabet that only look the same.
+- **Two people whose names differ only by an accent** ("Peña", "Pena") are kept as two participants, each with their own code and consent. If they are one person, merge them yourself.
+- **So:** the app says how many names it replaced, but it cannot promise that none is left. Read a bibliography or an export once before it leaves your hands.
+   <sub>(FR-664, FR-677; Rulings R403, R416, R420)</sub>
+
+<!-- coverage, part 7: FR-664, FR-677, FR-686; defect D31; tasks FR-A21, FR-D31, FR-A22 -->
+
 <!-- coverage: FR-591, FR-138, FR-238, FR-197, FR-198, FR-199, FR-369, FR-403, FR-171, FR-356, FR-372, FR-388, FR-575, FR-595, FR-436, FR-506, FR-520, FR-511, FR-522, FR-532, FR-536, FR-551, FR-458, FR-568, FR-607, FR-609, FR-610, FR-446, FR-447, FR-299, FR-326, FR-288, FR-324, FR-289, FR-320, FR-543, FR-236, FR-343, FR-272, FR-334, FR-344, FR-345, FR-346, FR-347, FR-302, FR-310, FR-323, FR-237, FR-353, FR-354, FR-437, FR-455, FR-471, FR-438, FR-439, FR-441, FR-448, FR-479, FR-481, FR-487, FR-444, FR-450, FR-470, FR-480, FR-501, FR-516, FR-608, FR-478, FR-502, FR-505, FR-482, FR-483, FR-492, FR-533, FR-538, FR-541, FR-559, FR-589, FR-590, FR-535, FR-569, FR-585, FR-597 (plus FR-053 from the problems list, in decision 2). FR-543 is a test-set-up choice of the coordinator's and is not on the page. -->
