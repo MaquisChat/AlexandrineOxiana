@@ -20,8 +20,8 @@
    <sub>(FR-591, FR-138)</sub>
 
 2. **Names inside an encrypted project**
-   **What it is:** The names of an encrypted project's collections and tags, and the text describing what a consent covers, are stored in the readable part of the project — anyone who gets a copy of the folder can read them without your passphrase. I am adding a note that says so wherever you type such a name. Sealing these names as well is possible but is a larger change (it affects what the app can show while a project is locked).
-   **Your options:** Seal them as well, or keep the note and leave them readable.
+   **What it is:** The names of an encrypted project's collections and tags, and the text describing what a consent covers, are stored in the readable part of the project — anyone who gets a copy of the folder can read them without your passphrase. The same holds for the reason you record when you make an exception to the project's rules, and the approver's name you give with it: they are kept in the project's rules file. I am adding a note that says so wherever you type such a name or reason. Sealing them as well is possible but is a larger change (it affects what the app can show while a project is locked, and the form of the rules file).
+   **Your options:** Seal them as well (all of them, or only the exceptions' reasons and approvers), or keep the notes and leave them readable.
    **My recommendation:** Decide after you have used an encrypted project for real; the note is there meanwhile.
    <sub>(FR-053)</sub>
 
