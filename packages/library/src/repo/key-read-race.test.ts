@@ -565,22 +565,28 @@ describe("R443 a: an unlock is overtaken by every lock asked after its REQUEST a
   });
 });
 
-describe("R443 b: an overtaken unlock's audit entry is timed when its key was added", () => {
-  it("the key added at T1, the lock at T2 while the entry waits its turn: one key.unlock entry, at T1", async () => {
-    const a = await makeProject(kit, GOV, true, "A");
-    const b = await makeProject(kit, GOV, false, "B");
-    await kit.repo.lockProject(a.id);
-    const before = (await auditEvents(kit, a)).filter((e) => e.action === "key.unlock").length;
-    // Another project's change is held: the unlock's audit entry waits behind it.
+describe("R445 m1: an overtaken unlock's audit entry is timed when written and says when its key was added", () => {
+  function holdB(b: Project) {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     let entered!: () => void;
     const inside = new Promise<void>((r) => (entered = r));
-    const held = importChange(kit.repo, b.id, STORE, async () => {
+    const done = importChange(kit.repo, b.id, STORE, async () => {
       entered();
       await gate;
     }, { op: "test.held" });
-    await inside;
+    return { done, inside, release };
+  }
+
+  it("overtaken after the key was added at T1, the entry written at T2: at T2, details { overtakenByLock, keyAddedAt: T1 }; an ordinary unlock's entry is as before", async () => {
+    const a = await makeProject(kit, GOV, true, "A");
+    const b = await makeProject(kit, GOV, false, "B");
+    await kit.repo.lockProject(a.id);
+    const unlocksOf = async () => (await auditEvents(kit, a)).filter((e) => e.action === "key.unlock");
+    const before = (await unlocksOf()).length;
+    // Another project's change is held: the unlock's audit entry waits behind it.
+    const h = holdB(b);
+    await h.inside;
     const t1 = new Date("2026-11-10T10:00:00.000Z");
     const t2 = new Date("2026-11-10T10:05:00.000Z");
     kit.clock.now = t1;
@@ -589,12 +595,30 @@ describe("R443 b: an overtaken unlock's audit entry is timed when its key was ad
     while (!kit.repo.isUnlocked(a.id)) await ticks(1); // the key is in (at T1); its entry waits for its turn
     kit.clock.now = t2;
     const lock = kit.repo.lockProject(a.id);
-    release();
-    await held;
+    h.release();
+    await h.done;
     await expect(unlock).rejects.toBeInstanceOf(ProjectLockedError);
     await lock;
-    const unlocks = (await auditEvents(kit, a)).filter((e) => e.action === "key.unlock");
+    let unlocks = await unlocksOf();
     expect(unlocks.length).toBe(before + 1);
-    expect(unlocks.at(-1)!.at).toBe(t1.toISOString());
+    expect(unlocks.at(-1)!.at).toBe(t2.toISOString());
+    expect(unlocks.at(-1)!.details).toEqual({ overtakenByLock: true, keyAddedAt: t1.toISOString() });
+
+    // An ordinary unlock whose entry also waits: timed when written, with no details.
+    const h2 = holdB(b);
+    await h2.inside;
+    const t3 = new Date("2026-11-10T11:00:00.000Z");
+    const t4 = new Date("2026-11-10T11:05:00.000Z");
+    kit.clock.now = t3;
+    const ordinary = kit.repo.unlockProject(a.id, PASS);
+    while (!kit.repo.isUnlocked(a.id)) await ticks(1);
+    kit.clock.now = t4;
+    h2.release();
+    await h2.done;
+    await ordinary;
+    unlocks = await unlocksOf();
+    expect(unlocks.length).toBe(before + 2);
+    expect(unlocks.at(-1)!.at).toBe(t4.toISOString());
+    expect(unlocks.at(-1)!.details).toBeUndefined();
   });
 });
