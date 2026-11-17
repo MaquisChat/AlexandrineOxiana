@@ -10,7 +10,8 @@ import { newId, type Project } from "@ao/core";
 import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { MockAgent } from "undici";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
+import { buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
+import { backupProject } from "../export/backup.js";
 import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
 import { appendFindEntries } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
@@ -20,7 +21,10 @@ import { holdMismatchedFile, readReviewEntries, type HeldFileFacts } from "../re
 import type { RepoCore } from "../repo/state.js";
 import { insideFolder } from "../fs/inside-library.js";
 import { createAttach } from "./attach.js";
-import { BatchRefusedError, createBulkImport, folderAdapter, type BulkImport } from "./bulk/index.js";
+import { BatchRefusedError, createBulkImport, folderAdapter, zipAdapter, type BulkImport, type ImportSourceAdapter } from "./bulk/index.js";
+import { bibtexAdapter, cslJsonAdapter, risAdapter } from "./refman.js";
+import { zoteroLocalAdapter } from "./zotero-local.js";
+import { zoteroRdfAdapter } from "./zotero-rdf.js";
 
 const GOV = `${OPEN_GOV}processing:
   metadata_lookup: []
@@ -260,5 +264,121 @@ describe("the folder import refuses a folder inside the library or holding it (R
     const c = (await h.done).counts;
     expect(c).toMatchObject({ items: 1, failed: 0 });
     expect(c.created + c.needsReview).toBe(1);
+  });
+});
+
+describe("an import whose own file or folder lies inside the library is refused whole (R368 a)", () => {
+  /** Refused at the dry run and the start with `text`, before anything is read: no batch, no source, nothing changed. */
+  const refusedWhole = async (w: World, adapter: () => ImportSourceAdapter, text: string) => {
+    const ids = kit.repo.listSourceIds(w.p.id);
+    const before = await snapshot(w);
+    const folder = await readdir(join(kit.lib.root, kit.repo.getProject(w.p.id).folder));
+    await expect(bulk.dryRun(w.p.id, adapter())).rejects.toThrow(new BatchRefusedError(text));
+    await expect(bulk.startBatch(w.p.id, adapter())).rejects.toThrow(new BatchRefusedError(text));
+    await expect(bulk.startBatch(w.p.id, adapter())).rejects.toMatchObject({ kind: "invalid", denied: false });
+    expect(await bulk.listBatches(w.p.id)).toEqual([]);
+    expect(kit.repo.listSourceIds(w.p.id)).toEqual(ids);
+    expect(await snapshot(w)).toEqual(before);
+    expect(await readdir(join(kit.lib.root, kit.repo.getProject(w.p.id).folder))).toEqual(folder);
+  };
+
+  it("a ZIP import of this project's own backup (it holds the held file): refused, the held file and its review entry untouched", async () => {
+    const w = await world();
+    const backup = await backupProject(kit.repo, w.p.id);
+    expect(relative(kit.lib.root, backup.path).startsWith("Backups")).toBe(true);
+    await refusedWhole(w, () => zipAdapter(backup.path), IN_LIBRARY_TEXT.importFile);
+    expect((await snapshot(w)).pending).toEqual([w.reviewId]);
+  });
+
+  it("a ZIP inside the library reached through a link outside it", async () => {
+    const w = await world();
+    const backup = await backupProject(kit.repo, w.p.id);
+    await mkdir(join(kit.tmp, "elsewhere"), { recursive: true });
+    const link = join(kit.tmp, "elsewhere", "papers.zip");
+    await symlink(backup.path, link);
+    await refusedWhole(w, () => zipAdapter(link), IN_LIBRARY_TEXT.importFile);
+  });
+
+  it("a BibTeX, RIS, CSL-JSON or Zotero RDF export file inside the library", async () => {
+    const w = await world();
+    const dir = join(kit.lib.root, "Exports");
+    await mkdir(dir, { recursive: true });
+    const files = {
+      bib: `@article{a, title = {Held}, file = {${w.held}}}\n`,
+      ris: `TY  - JOUR\nTI  - Held\nL1  - ${w.held}\nER  - \n`,
+      json: JSON.stringify([{ id: "a", type: "article-journal", title: "Held", file: w.held }]),
+      rdf: "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"></rdf:RDF>",
+    };
+    for (const [ext, text] of Object.entries(files)) await writeFile(join(dir, `refs.${ext}`), text);
+    await refusedWhole(w, () => bibtexAdapter(join(dir, "refs.bib")), IN_LIBRARY_TEXT.importFile);
+    await refusedWhole(w, () => risAdapter(join(dir, "refs.ris")), IN_LIBRARY_TEXT.importFile);
+    await refusedWhole(w, () => cslJsonAdapter(join(dir, "refs.json")), IN_LIBRARY_TEXT.importFile);
+    await refusedWhole(w, () => zoteroRdfAdapter(join(dir, "refs.rdf")), IN_LIBRARY_TEXT.importFile);
+  });
+
+  it("a Zotero data folder inside the library (also as another of its libraries), or holding it: the folder's sentence", async () => {
+    const w = await world();
+    const z = join(kit.lib.root, "Exports", "Zotero");
+    await mkdir(join(z, "storage"), { recursive: true });
+    await refusedWhole(w, () => zoteroLocalAdapter(z), IN_LIBRARY_TEXT.folder);
+    await refusedWhole(w, () => zoteroLocalAdapter(`${z}#library=2`), IN_LIBRARY_TEXT.folder);
+    await refusedWhole(w, () => zoteroLocalAdapter(kit.tmp), IN_LIBRARY_TEXT.folder);
+  });
+
+  it("a paused ZIP batch resumed with its file now inside the library is refused, nothing changed", async () => {
+    const w = await world();
+    const pdfs = await Promise.all(["one", "two", "three"].map(async (n) => ({ name: `${n}.pdf`, data: await readFile(await outsidePdf(`${n}.pdf`)) })));
+    const zip = join(kit.tmp, "papers.zip");
+    await writeFile(zip, buildZip(pdfs));
+    const h = await bulk.startBatch(w.p.id, zipAdapter(zip));
+    expect((await h.suspend()).state).toBe("paused");
+    const rec = (await bulk.listBatches(w.p.id))[0]!;
+    const backup = await backupProject(kit.repo, w.p.id);
+    const before = await snapshot(w);
+    await expect(bulk.resumeBatch(w.p.id, rec.batchId, zipAdapter(backup.path))).rejects.toThrow(new BatchRefusedError(IN_LIBRARY_TEXT.importFile));
+    expect(await snapshot(w)).toEqual(before);
+  });
+
+  it("the same ZIP and export file outside the library import as before", async () => {
+    const w = await world();
+    const zip = join(kit.tmp, "Lib-zips", "papers.zip");
+    await mkdir(join(kit.tmp, "Lib-zips"), { recursive: true });
+    await writeFile(zip, buildZip([{ name: "one.pdf", data: await readFile(await outsidePdf("one.pdf")) }]));
+    const c = (await (await bulk.startBatch(w.p.id, zipAdapter(zip))).done).counts;
+    expect(c).toMatchObject({ items: 1, failed: 0 });
+    expect(c.created + c.needsReview).toBe(1);
+    const bib = join(kit.tmp, "Lib-zips", "refs.bib");
+    await writeFile(bib, "@book{b, title = {Street Food and the State}, author = {Adebayo, Tunde}, year = {2019}}\n");
+    expect((await bulk.dryRun(w.p.id, bibtexAdapter(bib))).items).toBe(1);
+  });
+});
+
+describe("the batch's own work folder is exempt only for the files the run itself wrote there (R368 a)", () => {
+  it("an export's file field naming this batch's work folder (a held file's copy put there by hand) is not imported on resume", async () => {
+    const w = await world();
+    const dir = join(kit.tmp, "refs");
+    await mkdir(dir, { recursive: true });
+    const bib = join(dir, "refs.bib");
+    const entry = (k: string, file?: string) => `@book{${k}, title = {Street Food ${k}}, author = {Adebayo, Tunde}, year = {2019}${file ? `, file = {${file}}` : ""}}\n`;
+    await writeFile(bib, ["a", "b", "c", "d"].map((k) => entry(k)).join(""));
+    const h = await bulk.startBatch(w.p.id, bibtexAdapter(bib));
+    expect((await h.suspend()).state).toBe("paused");
+    const rec = (await bulk.listBatches(w.p.id))[0]!;
+    const work = join(kit.lib.root, ".tmp", `batch-${rec.batchId}`);
+    await mkdir(work, { recursive: true });
+    const planted = join(work, "planted.pdf");
+    await copyFile(w.held, planted);
+    await writeFile(bib, ["a", "b", "c", "d"].map((k) => entry(k)).join("") + entry("planted", planted));
+    const before = await snapshot(w);
+    const done = await (await bulk.resumeBatch(w.p.id, rec.batchId)).done;
+    expect(done.state).toBe("finished");
+    const report = await bulk.batchReport(w.p.id, rec.batchId);
+    expect(report.fileNotes).toEqual(expect.arrayContaining([expect.objectContaining({ note: expect.stringContaining("inside this library's own folder") })]));
+    // No source of this batch holds the held file's bytes.
+    const sha = (await kit.repo.getSource(w.p.id, w.sourceId)).assets.length;
+    expect(sha).toBe(JSON.parse(before.assets).length);
+    for (const id of kit.repo.listSourceIds(w.p.id)) {
+      expect((await kit.repo.getSource(w.p.id, id)).assets.filter((a) => a.role === "original")).toEqual([]);
+    }
   });
 });

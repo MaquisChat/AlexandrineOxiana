@@ -108,9 +108,12 @@ export interface JobsRetryResponse {
  * attached or imported, as watched folders already refuse such a folder (R310 h). The file's sentence is the attach
  * route's outcome for that file (and an import's note for a file of an item that leads into the library); the folder's
  * is the folder import's refusal (dry run, start and resume). A found file waiting for the researcher's check lives
- * there too, so it comes in only through "Use this file" in the review queue.
+ * there too, so it comes in only through "Use this file" in the review queue. The import file's sentence (R368 a) is the
+ * refusal of an import whose OWN file (a ZIP, a BibTeX, RIS, CSL-JSON or Zotero RDF export) lies inside the library —
+ * a backup above all, which holds the held files too (a backup is brought back by the restore, not by an import).
  */
 export const IN_LIBRARY_TEXT = {
   file: "That file is inside this library's own folder. Files already in the library cannot be attached again.",
   folder: "That folder is inside this library's own folder, or holds it. Choose a folder outside the library.",
+  importFile: "That file is inside this library's own folder. Choose a file outside the library.",
 } as const;

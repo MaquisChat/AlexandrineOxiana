@@ -549,6 +549,23 @@ describe("import, export, secrets and maintenance", () => {
     expect(await readdir(join(lib, "Projects", "Imp"))).not.toContain("imports");
   }, 120_000);
 
+  it("R368 a: a ZIP inside the library (a backup) and an export file inside it are refused whole, nothing imported", async () => {
+    const zip = join(lib, "Backups", "Imp - backup.zip");
+    const bib = join(lib, "Exports", "refs.bib");
+    await writeFile(zip, "not read");
+    await writeFile(bib, "@book{a, title = {Not read}}\n");
+    for (const file of [zip, bib]) {
+      for (const extra of [["--dry-run"], []]) {
+        const r = await run(["import", file, "--project", "Imp", ...extra]);
+        expect([r.code, r.stderr.includes(IN_LIBRARY_TEXT.importFile)], r.stderr).toEqual([1, true]);
+      }
+    }
+    expect(json(await run(["--json", "list", "--project", "Imp"])).sources).toEqual([]);
+    expect(await readdir(join(lib, "Projects", "Imp"))).not.toContain("imports");
+    await rm(zip);
+    await rm(bib);
+  }, 120_000);
+
   it("imports a folder, then the same folder again finds the duplicates", async () => {
     const r = await run(["--json", "import", papers, "--project", "Imp", "--structure", "tags", "--duplicates", "skip"]);
     expect(r.code, r.stderr).toBe(0);

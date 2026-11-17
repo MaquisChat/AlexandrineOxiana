@@ -567,6 +567,27 @@ describe("appearance, fieldwork, import", () => {
     }
     expect((await call({ url: `/projects/${pid}/imports` })).json).toEqual({ batches: [] });
   });
+
+  it("R368 a: an import whose own file (a ZIP, an export) or Zotero folder lies inside the library is refused whole — said in plain words", async () => {
+    const lib = await openNewLibrary();
+    const pid = await newProject();
+    const zip = join(lib, "Backups", "copy.zip");
+    const bib = join(lib, "refs.bib");
+    await writeFile(zip, "not read");
+    await writeFile(bib, "@book{a, title = {Not read}}\n");
+    const cases: Array<[Record<string, string>, string]> = [
+      [{ kind: "zip", path: zip }, IN_LIBRARY_TEXT.importFile],
+      [{ kind: "bibtex", path: bib }, IN_LIBRARY_TEXT.importFile],
+      [{ kind: "zotero-local", dataDir: join(lib, "Projects") }, IN_LIBRARY_TEXT.folder],
+    ];
+    for (const [adapter, message] of cases) {
+      for (const url of [`/projects/${pid}/import/dry-run`, `/projects/${pid}/import`]) {
+        const r = await call({ method: "POST", url, body: { adapter, options: {} } });
+        expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message }]);
+      }
+    }
+    expect((await call({ url: `/projects/${pid}/imports` })).json).toEqual({ batches: [] });
+  });
 });
 
 describe("browser extension pairing (R96)", () => {
