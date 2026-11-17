@@ -3,12 +3,14 @@
  *
  * An encrypted project's audit log stays readable without its key (so its chain can be checked while it is locked).
  * A reason typed into such a project is therefore never written to an audit log as typed: the entry records that a
- * reason was given and the SHA-256 of its text (`auditedReason`, R177 b's form, defined here only), and the text is
- * kept sealed with the project:
+ * reason was given and a keyed digest of its text (`auditedReason`, defined here only): `reasonMac`, an HMAC-SHA-256
+ * under a key derived from the project's data key for this purpose alone (R369 b), so that only who can unlock the
+ * project can test a text against it. Entries written before R369 b carry R177 b's unkeyed `reasonSha256` instead; they
+ * are read and checked by it as before. The text is kept sealed with the project:
  *  - "Reviewed after the withdrawal": in its sealed review entry (R177 b), as before;
  *  - every other reason an audit entry carries: in ONE sealed store of reasons, `<Project>/audit-reasons/reasons.jsonl`, one
  *    line per entry, sealed under the project key (purpose `ao-audit-reasons`), holding the entry's sequence number
- *    and hash, the SHA-256 and the text. It is written in the same governed change as its entry, under the write-ahead
+ *    and hash, the keyed digest and the text. It is written in the same governed change as its entry, under the write-ahead
  *    marker (R26), before the entry: a crash before the entry leaves the marker uncommitted and the line is undone
  *    with it; after the entry, both stand (mutate.ts);
  *  - a mark set aside while the project's own log cannot take it is recorded in the LIBRARY's log (R154 d): its text
@@ -18,11 +20,12 @@
  * A project that is not encrypted is unchanged: the reason is audited as typed. Encryption is chosen when a project is
  * made and never changes afterwards; entries written before this rule stay as they were (the log is append-only).
  */
-import { createHash } from "node:crypto";
+import { createHash, createHmac, hkdfSync, timingSafeEqual } from "node:crypto";
 import { REASON_SEALED_LOCKED, REASON_SEALED_MISMATCH, REASON_SEALED_MISSING, type AuditReasonView } from "@ao/shared";
 import type { AuditEvent } from "@ao/core";
 import { openLine, readMaybe, sealLine } from "./io.js";
-import { PURPOSE_AUDIT_REASONS } from "./sealed-purposes.js";
+import { KEY_PURPOSE_AUDIT_REASON_MAC, PURPOSE_AUDIT_REASONS } from "./sealed-purposes.js";
+import type { ProjectState, RepoCore } from "./state.js";
 
 /** The project's sealed store of reasons (relative to the project folder). */
 export const AUDIT_REASONS_FILE = "audit-reasons/reasons.jsonl";
@@ -32,24 +35,58 @@ export const LIBRARY_AUDIT_REASONS_FILE = "audit-reasons.jsonl";
 /** The operations whose audit entry carries a reason the researcher typed. */
 export const REASON_OPS: readonly string[] = ["attention.set-aside", "project.governance", "consent.document-detach", "review.withdrawal-reviewed"];
 
+/** R177 b's unkeyed digest: only to read entries written before R369 b. */
 export const reasonSha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
-/** What an audit entry records of a reason the researcher typed (R177 b's form, for every reason, R362 b). */
-export function auditedReason(encrypted: boolean, reason: string): { reason: string } | { reasonGiven: true; reasonSha256: string } {
-  return encrypted ? { reasonGiven: true, reasonSha256: reasonSha256(reason) } : { reason };
+/**
+ * R369 b: the keyed digest of a reason: HMAC-SHA-256 of its exact text (UTF-8), hex, under a key derived from the
+ * project's data key by HKDF-SHA-256 (no salt; info: KEY_PURPOSE_AUDIT_REASON_MAC) for this purpose alone, never the data
+ * key itself. The derived key is wiped after use.
+ */
+export function reasonMac(projectKey: Uint8Array, text: string): string {
+  const k = Buffer.from(hkdfSync("sha256", projectKey, Buffer.alloc(0), KEY_PURPOSE_AUDIT_REASON_MAC, 32));
+  try {
+    return createHmac("sha256", k).update(text, "utf8").digest("hex");
+  } finally {
+    k.fill(0);
+  }
 }
 
-/** One reason as it is kept sealed. */
+/** What an audit entry records of a reason the researcher typed: as typed (`projectKey` undefined: not encrypted), or that one was given and its keyed digest. */
+export function auditedReason(projectKey: Uint8Array | undefined, reason: string): { reason: string } | { reasonGiven: true; reasonMac: string } {
+  return projectKey ? { reasonGiven: true, reasonMac: reasonMac(projectKey, reason) } : { reason };
+}
+
+/** `auditedReason` for a project: keyed with its key when it is encrypted (throws when it is locked). */
+export function auditedReasonIn(core: RepoCore, st: ProjectState, reason: string): { reason: string } | { reasonGiven: true; reasonMac: string } {
+  return auditedReason(core.encrypted(st) ? core.key(st).key : undefined, reason);
+}
+
+/**
+ * Whether `text` is the reason an entry's details record by digest: by its keyed digest (compared in constant time), or,
+ * for an entry written before R369 b, by its SHA-256.
+ */
+export function reasonMatches(details: Record<string, unknown> | undefined, text: string, projectKey: Uint8Array): boolean {
+  const recorded = typeof details?.reasonMac === "string" ? details.reasonMac : typeof details?.reasonSha256 === "string" ? details.reasonSha256 : undefined;
+  if (recorded === undefined) return false;
+  const got = Buffer.from(typeof details?.reasonMac === "string" ? reasonMac(projectKey, text) : reasonSha256(text), "utf8");
+  const want = Buffer.from(recorded, "utf8");
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
+/** One reason as it is kept sealed: the keyed digest its entry records (`reasonSha256` in lines written before R369 b). */
 export interface SealedReason {
   seq: number;
   hash: string;
-  reasonSha256: string;
+  reasonMac?: string;
+  reasonSha256?: string;
   text: string;
 }
 
 /** One line of a project's store: the record sealed under the project key. */
 export function sealedReasonLine(key: Uint8Array, keyId: string, projectId: string, r: SealedReason): string {
-  return sealLine(key, keyId, projectId, JSON.stringify({ seq: r.seq, hash: r.hash, reasonSha256: r.reasonSha256, text: r.text }), PURPOSE_AUDIT_REASONS);
+  const digest = r.reasonMac !== undefined ? { reasonMac: r.reasonMac } : { reasonSha256: r.reasonSha256 };
+  return sealLine(key, keyId, projectId, JSON.stringify({ seq: r.seq, hash: r.hash, ...digest, text: r.text }), PURPOSE_AUDIT_REASONS);
 }
 
 /** One line of the library's store: which entry, in the clear (so an orphan can be found without a key), and the record sealed. */
@@ -102,26 +139,27 @@ export function openLibraryReason(sealed: string, key: Uint8Array, projectId: st
   }
 }
 
-/** True when the entry records a sealed reason (R177 b's form). */
+/** True when the entry records a sealed reason: by its keyed digest (R369 b), or by its SHA-256 (R177 b's form, earlier entries). */
 export function hasSealedReason(e: Pick<AuditEvent, "details">): boolean {
-  return e.details?.reasonGiven === true && typeof e.details.reasonSha256 === "string";
+  return e.details?.reasonGiven === true && (typeof e.details.reasonMac === "string" || typeof e.details.reasonSha256 === "string");
 }
 
 /**
  * What the audit screen shows for an entry's reason, or undefined when it carries none:
  *  - a reason audited as typed (a project that is not encrypted, or an entry written before R362 b): the text;
- *  - a sealed reason: `text(entry)` gives the sealed text found for it (`locked` when the key is not available,
- *    undefined when it is not there); it is shown only when its SHA-256 is the entry's.
+ *  - a sealed reason: `sealed()` gives `locked` when the key is not available, else the project's key and the sealed
+ *    text found for the entry (undefined when it is not there); the text is shown only when it matches the entry's
+ *    digest (`reasonMatches`).
  */
-export function reasonView(e: Pick<AuditEvent, "details">, sealedText: () => string | undefined | "locked"): AuditReasonView | undefined {
+export function reasonView(e: Pick<AuditEvent, "details">, sealed: () => "locked" | { key: Uint8Array; text: string | undefined }): AuditReasonView | undefined {
   const d = e.details;
   if (!d || typeof d.op !== "string" || !REASON_OPS.includes(d.op)) return undefined;
   if (hasSealedReason(e)) {
-    const t = sealedText();
+    const t = sealed();
     if (t === "locked") return { state: "locked", message: REASON_SEALED_LOCKED };
-    if (t === undefined) return { state: "missing", message: REASON_SEALED_MISSING };
-    if (reasonSha256(t) !== d.reasonSha256) return { state: "mismatch", message: REASON_SEALED_MISMATCH };
-    return { state: "text", text: t };
+    if (t.text === undefined) return { state: "missing", message: REASON_SEALED_MISSING };
+    if (!reasonMatches(d, t.text, t.key)) return { state: "mismatch", message: REASON_SEALED_MISMATCH };
+    return { state: "text", text: t.text };
   }
   return typeof d.reason === "string" ? { state: "text", text: d.reason } : undefined;
 }

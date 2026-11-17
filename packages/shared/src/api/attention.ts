@@ -13,9 +13,10 @@ export interface AuditEventView {
   details?: Record<string, unknown>;
   /**
    * The reason the researcher typed, for the operations that take one (R362 b): as typed in a project that is not
-   * encrypted; in an encrypted project the audit entry holds only that a reason was given and its SHA-256, and the
-   * text is read from where it is kept sealed: shown while the project is unlocked and the text matches the entry's
-   * SHA-256, otherwise one of the sentences below.
+   * encrypted; in an encrypted project the audit entry holds only that a reason was given and its keyed digest
+   * (`reasonMac`, R369 b; `reasonSha256` in entries written before it), and the text is read from where it is kept
+   * sealed: shown while the project is unlocked and the text matches the entry's digest, otherwise one of the
+   * sentences below.
    */
   reasonShown?: AuditReasonView;
 }
@@ -27,7 +28,7 @@ export type AuditReasonView = { state: "text"; text: string } | { state: "locked
 export const REASON_SEALED_LOCKED = "A reason was given. It can be read when the project is unlocked.";
 /** Unlocked, but the sealed text is not there (removed or damaged outside the app). */
 export const REASON_SEALED_MISSING = "A reason was given, but its text is no longer in this project.";
-/** Unlocked, but the sealed text does not match the SHA-256 the audit entry recorded: never shown as the reason. */
+/** Unlocked, but the sealed text does not match the digest the audit entry recorded: never shown as the reason. */
 export const REASON_SEALED_MISMATCH = "A reason was given, but the text kept for it does not match what the audit log recorded, so it is not shown.";
 
 /** `GET /libraries/audit`: a page of the library's audit log, newest first. */

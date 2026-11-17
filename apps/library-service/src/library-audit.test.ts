@@ -168,7 +168,9 @@ describe("GET /projects/:id/attention and POST …/set-aside", () => {
     for (const f of await readdir(join(tmp, "Lib", "Projects", "Sealed", "audit"))) bytes += await readFile(join(tmp, "Lib", "Projects", "Sealed", "audit", f), "utf8");
     expect(bytes).not.toContain("Zebrafinch");
     const unlocked = (await call({ url: `/projects/${pid}/audit?limit=1` })).json.events[0];
-    expect(unlocked).toMatchObject({ action: "set-aside", details: { reasonGiven: true, reasonSha256: createHash("sha256").update(reason, "utf8").digest("hex") }, reasonShown: { state: "text", text: reason } });
+    expect(unlocked).toMatchObject({ action: "set-aside", details: { reasonGiven: true, reasonMac: expect.stringMatching(/^[0-9a-f]{64}$/) }, reasonShown: { state: "text", text: reason } });
+    expect(unlocked.details.reasonSha256).toBeUndefined();
+    expect(unlocked.details.reasonMac).not.toBe(createHash("sha256").update(reason, "utf8").digest("hex"));
     expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
     const locked = await call({ url: `/projects/${pid}/audit?limit=1` });
     expect(locked.json.events[0].reasonShown).toEqual({ state: "locked", message: "A reason was given. It can be read when the project is unlocked." });

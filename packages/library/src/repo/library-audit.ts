@@ -24,7 +24,7 @@ import { verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
 import { AuditStore, checkAnchor, type AuditInput, type Head } from "./audit-store.js";
 import type { IncompleteLine } from "./incomplete-lines.js";
 import type { RepoCore } from "./state.js";
-import { LIBRARY_AUDIT_REASONS_FILE, libraryReasonLine, reasonSha256 } from "./audit-reasons.js";
+import { LIBRARY_AUDIT_REASONS_FILE, libraryReasonLine, reasonMac } from "./audit-reasons.js";
 import { appendDurable, assertContained, readMaybe, truncateDurable, undoAppend } from "./io.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
 
@@ -66,19 +66,20 @@ export async function appendLibraryAudit(core: RepoCore, input: AuditInput): Pro
 type Shown = Pick<AuditEvent, "at" | "actor" | "device" | "action" | "decision" | "details" | "projectId">;
 
 /**
- * R362 b: appends an entry about an encrypted project whose details record a reason by its SHA-256 only, after
+ * R362 b: appends an entry about an encrypted project whose details record a reason by its keyed digest only (R369 b), after
  * sealing the text under the project's key into `<Library>/audit-reasons.jsonl` (the entry's seq and hash in the
  * clear). The line is written first, durably: a crash before the entry leaves it as the store's last line, with a
  * seq past the log's head, and `trimOrphanReasons` removes it at the next writable open; after the entry, both stand.
  */
 export async function appendLibraryAuditWithReason(core: RepoCore, input: AuditInput, k: { key: Uint8Array; keyId: string }, text: string): Promise<AuditEvent> {
   const s = await store(core);
-  const sha = (input.details as Record<string, unknown> | undefined)?.reasonSha256;
-  if (sha !== reasonSha256(text) || input.projectId === undefined) throw new Error("a sealed reason needs an audit entry that records only its SHA-256");
+  const d = input.details as Record<string, unknown> | undefined;
+  const mac = d?.reasonMac;
+  if (mac !== reasonMac(k.key, text) || d?.reason !== undefined || d?.reasonSha256 !== undefined || input.projectId === undefined) throw new Error("a sealed reason needs an audit entry that records only its keyed digest");
   const next = s.peek(input);
   const path = join(core.root, LIBRARY_AUDIT_REASONS_FILE);
   await assertContained(core.root, path);
-  const u = await appendDurable(path, `${libraryReasonLine(k.key, k.keyId, input.projectId, { seq: next.seq, hash: next.hash, reasonSha256: sha, text })}\n`, 0o600);
+  const u = await appendDurable(path, `${libraryReasonLine(k.key, k.keyId, input.projectId, { seq: next.seq, hash: next.hash, reasonMac: mac, text })}\n`, 0o600);
   try {
     maybeCrash("library-reason-before-entry");
     return await appendLibraryAudit(core, input);

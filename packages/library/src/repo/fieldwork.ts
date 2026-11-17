@@ -12,7 +12,7 @@ import { encName } from "@ao/core";
 import type { ProjectJson } from "./state.js";
 import { editSource, readSourceFile, storeRequest } from "./sources.js";
 import type { ProjectState, RepoCore } from "./state.js";
-import { auditedReason } from "./audit-reasons.js";
+import { auditedReasonIn } from "./audit-reasons.js";
 
 export interface ParticipantInput {
   /** Defaults to the next `P-NNN` code. */
@@ -341,10 +341,10 @@ export async function updateConsent(core: RepoCore, projectId: string, id: strin
     {
       op: detaching ? "consent.document-detach" : "consent.update",
       entity: { type: "consent", id },
-      // R362 b: in an encrypted project the audit entry holds the reason's SHA-256, its text is sealed in this change.
+      // R362 b: in an encrypted project the audit entry holds the reason's keyed digest (R369 b), its text is sealed in this change.
       ...(detaching
         ? {
-            auditDetails: auditedReason(core.encrypted(core.state(projectId)), patch.detachReason!.trim()),
+            auditDetails: () => auditedReasonIn(core, core.state(projectId), patch.detachReason!.trim()),
             sealedReason: patch.detachReason!.trim(),
           }
         : {}),

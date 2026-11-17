@@ -21,5 +21,12 @@ export const PURPOSE_FIND_QUEUE = "ao-find-queue";
 /** The sealed store of reasons the audit log names only by SHA-256 (`audit-reasons.jsonl`, R362 b). */
 export const PURPOSE_AUDIT_REASONS = "ao-audit-reasons";
 
+/**
+ * Not a sealed line's purpose: the purpose a key is derived for (HKDF-SHA-256 from the project's data key). The key
+ * of the keyed digest an audit entry records of a reason typed into an encrypted project (R369 b): only who can
+ * unlock the project can test a text against it. Not `PURPOSE_*`: a restore has no line of it to re-seal.
+ */
+export const KEY_PURPOSE_AUDIT_REASON_MAC = "ao-audit-reason-mac";
+
 /** Every purpose a line of a project's files can be sealed with: what a restore tries on a sealed line. */
 export const SEALED_LINE_PURPOSES: readonly string[] = [PURPOSE_CHANGES, PURPOSE_REVIEW, PURPOSE_IMPORT_JOURNAL, PURPOSE_WATCH_REGISTER, PURPOSE_FIND_QUEUE, PURPOSE_AUDIT_REASONS];

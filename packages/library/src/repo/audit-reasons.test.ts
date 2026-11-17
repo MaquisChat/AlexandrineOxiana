@@ -6,7 +6,7 @@
  * not encrypted is unchanged: the reason is audited as typed. The audit screen's reading: the sealed text while the
  * project is unlocked (checked against the SHA-256), a sentence while it is locked or the text is not there.
  */
-import { createHash } from "node:crypto";
+import { createHash, createHmac, hkdfSync } from "node:crypto";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AuditEvent, Project } from "@ao/core";
@@ -14,7 +14,7 @@ import { REASON_SEALED_LOCKED, REASON_SEALED_MISMATCH, REASON_SEALED_MISSING } f
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { attachConsentDocument } from "../consent-docs.js";
 import { OPEN_GOV, PASS, makeKit, makeProject, type Kit } from "../export/test-kit.js";
-import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, sealedReasonLine } from "./audit-reasons.js";
+import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, libraryReasonLine, sealedReasonLine } from "./audit-reasons.js";
 import { newAttentionId } from "./attention.js";
 import { openLine } from "./io.js";
 import { projectDataKey, projectReviewEntries } from "./repo.js";
@@ -25,6 +25,10 @@ import { SimulatedCrash, seams } from "./testing.js";
 const MARK = "Zebrafinch";
 const reasonText = (what: string) => `${MARK} ${what}: at Maria Hollis's request`;
 const sha = (t: string) => createHash("sha256").update(t, "utf8").digest("hex");
+/** R369 b: the keyed digest: HMAC-SHA-256 under a key derived (HKDF-SHA-256) from the project's data key for this purpose alone. */
+const macKeyOf = (dataKey: Uint8Array) => Buffer.from(hkdfSync("sha256", dataKey, Buffer.alloc(0), "ao-audit-reason-mac", 32));
+const macWith = (dataKey: Uint8Array, t: string) => createHmac("sha256", macKeyOf(dataKey)).update(t, "utf8").digest("hex");
+const mac = (p: Project, t: string) => macWith(projectDataKey(kit.repo, p.id)!.key, t);
 
 let kit: Kit;
 beforeEach(async () => {
@@ -134,22 +138,26 @@ const lastOf = async (p: Project, op: string) => (await auditLines(p)).filter((e
 const shownOf = async (p: Project, seq: number) => (await kit.repo.readAudit(p.id, { limit: 1000 })).events.find((e) => e.seq === seq)!.reasonShown;
 
 describe.each(OPS)("$name", ({ op, run }) => {
-  it("encrypted: the audit line on disk holds no word of the reason, only that one was given and its SHA-256; the text is sealed and read back while unlocked", async () => {
+  it("encrypted: the audit line on disk holds no word of the reason, only that one was given and its keyed digest; the text is sealed and read back while unlocked", async () => {
     const p = await makeProject(kit, GOV, true);
     const reason = reasonText(op);
     await run(p, reason);
     const bytes = await auditBytes(p);
     for (const w of [MARK, "Maria", "Hollis", "request"]) expect(bytes).not.toContain(w);
     const ev = await lastOf(p, op);
-    expect(ev.details).toMatchObject({ reasonGiven: true, reasonSha256: sha(reason) });
+    expect(ev.details).toMatchObject({ reasonGiven: true, reasonMac: mac(p, reason) });
     expect(ev.details).not.toHaveProperty("reason");
+    // R369 b: no unkeyed digest a guess could be confirmed against; nor one keyed with the data key itself.
+    expect(ev.details).not.toHaveProperty("reasonSha256");
+    expect(ev.details!.reasonMac).not.toBe(sha(reason));
+    expect(ev.details!.reasonMac).not.toBe(createHmac("sha256", projectDataKey(kit.repo, p.id)!.key).update(reason, "utf8").digest("hex"));
     // Readable only with the key: no plain word in the store either (the review entry is sealed already).
     if (op !== "review.withdrawal-reviewed") {
       const lines = await storeLines(p);
       expect(lines.join("\n")).not.toContain(MARK);
       const { key } = projectDataKey(kit.repo, p.id)!;
-      const opened = lines.map((l) => JSON.parse(openLine(key, p.id, l, PURPOSE_AUDIT_REASONS)) as { seq: number; hash: string; text: string; reasonSha256: string });
-      expect(opened).toContainEqual({ seq: ev.seq, hash: ev.hash, reasonSha256: sha(reason), text: reason });
+      const opened = lines.map((l) => JSON.parse(openLine(key, p.id, l, PURPOSE_AUDIT_REASONS)) as { seq: number; hash: string; text: string; reasonMac: string });
+      expect(opened).toContainEqual({ seq: ev.seq, hash: ev.hash, reasonMac: mac(p, reason), text: reason });
     }
     expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
     expect(await shownOf(p, ev.seq)).toEqual({ state: "text", text: reason });
@@ -167,6 +175,7 @@ describe.each(OPS)("$name", ({ op, run }) => {
     const ev = await lastOf(p, op);
     expect(ev.details).toMatchObject({ reason });
     expect(ev.details).not.toHaveProperty("reasonGiven");
+    expect(ev.details).not.toHaveProperty("reasonMac");
     expect(await stat(storePath(p)).catch(() => null)).toBeNull();
     expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
     expect(await shownOf(p, ev.seq)).toEqual({ state: "text", text: reason });
@@ -174,19 +183,92 @@ describe.each(OPS)("$name", ({ op, run }) => {
 });
 
 describe("reading a sealed reason back", () => {
-  it("a sealed text that does not match the entry's SHA-256 is said, not shown; a missing one is said", async () => {
+  it("a sealed text that does not match the entry's keyed digest is said, not shown; a missing one is said", async () => {
     const p = await makeProject(kit, GOV, true);
     const id = await unreadableMark(p);
     await kit.repo.setAsideMark(p.id, id, reasonText("set aside"));
     const ev = await lastOf(p, "attention.set-aside");
     const { key, keyId } = projectDataKey(kit.repo, p.id)!;
     // A line sealed with the right key for this entry, holding another text.
-    await writeFile(storePath(p), `${sealedReasonLine(key, keyId, p.id, { seq: ev.seq, hash: ev.hash, reasonSha256: sha(reasonText("set aside")), text: "another text" })}\n`);
+    await writeFile(storePath(p), `${sealedReasonLine(key, keyId, p.id, { seq: ev.seq, hash: ev.hash, reasonMac: mac(p, reasonText("set aside")), text: "another text" })}\n`);
     expect(await shownOf(p, ev.seq)).toEqual({ state: "mismatch", message: REASON_SEALED_MISMATCH });
     await rm(storePath(p));
     expect(await shownOf(p, ev.seq)).toEqual({ state: "missing", message: REASON_SEALED_MISSING });
     kit.repo.lockProject(p.id);
     expect(await shownOf(p, ev.seq)).toEqual({ state: "locked", message: REASON_SEALED_LOCKED });
+  });
+});
+
+describe("the keyed digest (R369 b)", () => {
+  it("differs between two projects for the same text, and is neither the text's SHA-256 nor reproducible without the project's key", async () => {
+    const a = await makeProject(kit, GOV, true);
+    const b = await makeProject(kit, GOV, true);
+    const reason = reasonText("two projects");
+    for (const p of [a, b]) await OPS[0]!.run(p, reason);
+    const ma = (await lastOf(a, "attention.set-aside")).details!.reasonMac as string;
+    const mb = (await lastOf(b, "attention.set-aside")).details!.reasonMac as string;
+    expect(ma).toMatch(/^[0-9a-f]{64}$/);
+    expect(mb).toMatch(/^[0-9a-f]{64}$/);
+    expect(ma).not.toBe(mb);
+    expect([ma, mb]).not.toContain(sha(reason));
+    // Another key (as anyone without the passphrase would have to guess one) gives another digest.
+    expect(macWith(new Uint8Array(32), reason)).not.toBe(ma);
+    expect(ma).toBe(mac(a, reason));
+    expect((await kit.repo.verifyAudit(a.id)).ok).toBe(true);
+    expect((await kit.repo.verifyAudit(b.id)).ok).toBe(true);
+  });
+
+  it("an entry written before R369 b, with the reason's SHA-256, is still read and checked by its SHA-256; the chain verifies with both forms", async () => {
+    const { runMutation } = await import("./mutate.js");
+    const core = (kit.repo as unknown as { core: import("./state.js").RepoCore }).core;
+    const p = await makeProject(kit, GOV, true);
+    const old = reasonText("written by an earlier build");
+    // An entry in R177 b's form, as an earlier build wrote it, and its sealed line.
+    await runMutation(core, p.id, { action: "set-aside", setAside: { reason: old } }, async () => undefined, {
+      op: "attention.set-aside",
+      entity: { type: "project", id: p.id },
+      auditDetails: { reasonGiven: true, reasonSha256: sha(old), mark: { kind: "earlier" } },
+    });
+    const legacy = await lastOf(p, "attention.set-aside");
+    expect(legacy.details).not.toHaveProperty("reasonMac");
+    const { key, keyId } = projectDataKey(kit.repo, p.id)!;
+    await mkdir(join(folderOf(p), "audit-reasons"), { recursive: true });
+    await writeFile(storePath(p), `${sealedReasonLine(key, keyId, p.id, { seq: legacy.seq, hash: legacy.hash, reasonSha256: sha(old), text: old })}\n`, { flag: "a" });
+    // And a new one, keyed.
+    const now = reasonText("written now");
+    await OPS[0]!.run(p, now);
+    const fresh = await lastOf(p, "attention.set-aside");
+    expect(fresh.details).toMatchObject({ reasonMac: mac(p, now) });
+    expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
+    expect(await shownOf(p, legacy.seq)).toEqual({ state: "text", text: old });
+    expect(await shownOf(p, fresh.seq)).toEqual({ state: "text", text: now });
+    // The legacy entry is checked by its SHA-256: another text sealed for it is a mismatch.
+    await writeFile(storePath(p), `${sealedReasonLine(key, keyId, p.id, { seq: legacy.seq, hash: legacy.hash, reasonSha256: sha(old), text: "another text" })}\n`);
+    expect(await shownOf(p, legacy.seq)).toEqual({ state: "mismatch", message: REASON_SEALED_MISMATCH });
+    kit.repo.lockProject(p.id);
+    expect(await shownOf(p, legacy.seq)).toEqual({ state: "locked", message: REASON_SEALED_LOCKED });
+  });
+
+  it("the library's log: an entry written before R369 b, with the SHA-256, is still read", async () => {
+    const { appendLibraryAudit } = await import("./library-audit.js");
+    const core = (kit.repo as unknown as { core: import("./state.js").RepoCore }).core;
+    const p = await makeProject(kit, GOV, true);
+    const old = reasonText("library, earlier build");
+    const ev = await core.serial(() =>
+      appendLibraryAudit(core, {
+        at: kit.clock.now.toISOString(),
+        actor: core.actor,
+        device: core.device,
+        projectId: p.id,
+        action: "set-aside",
+        entity: { type: "project", id: p.id },
+        decision: { result: "allow" },
+        details: { op: "attention.set-aside", reasonGiven: true, reasonSha256: sha(old), mark: { kind: "earlier" }, projectLogNotIntact: true },
+      }),
+    );
+    const { key, keyId } = projectDataKey(kit.repo, p.id)!;
+    await writeFile(join(kit.lib.root, LIBRARY_AUDIT_REASONS_FILE), `${libraryReasonLine(key, keyId, p.id, { seq: ev.seq, hash: ev.hash, reasonSha256: sha(old), text: old })}\n`, { flag: "a" });
+    expect((await kit.repo.readLibraryAuditPage()).events.find((e) => e.seq === ev.seq)!.reasonShown).toEqual({ state: "text", text: old });
   });
 });
 
@@ -224,7 +306,7 @@ describe("crash safety: the sealed text and its audit entry are one change (R26)
     await kit.reopen();
     await kit.repo.unlockProject(p.id, PASS).catch(() => {});
     const ev = await lastOf(p, op);
-    expect(ev.details).toMatchObject({ reasonGiven: true, reasonSha256: sha(reasonText("crash two")) });
+    expect(ev.details).toMatchObject({ reasonGiven: true, reasonMac: mac(p, reasonText("crash two")) });
     expect(await shownOf(p, ev.seq)).toEqual({ state: "text", text: reasonText("crash two") });
     expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
   });
@@ -250,7 +332,7 @@ describe("a mark set aside while the project's own log cannot take it (the libra
   };
   const libraryStore = async () => (await readFile(join(kit.lib.root, LIBRARY_AUDIT_REASONS_FILE), "utf8").catch(() => "")).split("\n").filter((l) => l.trim());
 
-  it("encrypted: the library's log holds the mark and the SHA-256 only; the text is sealed with the project's key and read back while unlocked", async () => {
+  it("encrypted: the library's log holds the mark and the keyed digest only; the text is sealed with the project's key and read back while unlocked", async () => {
     const { p, id } = await brokenLogProject();
     const reason = reasonText("library log");
     expect(await kit.repo.setAsideMark(p.id, id, reason)).toEqual({ recordedIn: "library" });
@@ -259,8 +341,9 @@ describe("a mark set aside while the project's own log cannot take it (the libra
     expect((await libraryStore()).join("\n")).not.toContain(MARK);
     const page = await kit.repo.readLibraryAuditPage();
     const ev = page.events.find((e) => e.details?.op === "attention.set-aside")!;
-    expect(ev.details).toMatchObject({ reasonGiven: true, reasonSha256: sha(reason), projectLogNotIntact: true });
+    expect(ev.details).toMatchObject({ reasonGiven: true, reasonMac: mac(p, reason), projectLogNotIntact: true });
     expect(ev.details).not.toHaveProperty("reason");
+    expect(ev.details).not.toHaveProperty("reasonSha256");
     expect(ev.reasonShown).toEqual({ state: "text", text: reason });
     expect((await kit.repo.verifyLibraryAudit()).events).toBeGreaterThan(0);
     kit.repo.lockProject(p.id);

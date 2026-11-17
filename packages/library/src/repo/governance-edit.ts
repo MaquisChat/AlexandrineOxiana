@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { DEFAULT_GOVERNANCE, effectivePolicy, loosenedControls, parseGovernance, type GovernanceConfig, type Violation } from "@ao/core";
 import { GovernanceViolationError, InvalidInputError } from "./errors.js";
 import { readMaybe } from "./io.js";
-import { auditedReason } from "./audit-reasons.js";
+import { auditedReasonIn } from "./audit-reasons.js";
 import { runMutation } from "./mutate.js";
 import type { RepoCore } from "./state.js";
 
@@ -132,8 +132,8 @@ export async function setGovernance(core: RepoCore, projectId: string, yamlText:
       ...(result.loosened.length ? { loosened: result.loosened } : {}),
       ...(result.fresh.length ? { violations: result.fresh.map((v) => ({ control: v.control, profile: v.profile })) } : {}),
       ...(result.repaired ? { repairedUnreadable: true } : {}),
-      // R362 b: in an encrypted project only that a reason was given and its SHA-256; the text is sealed in this change.
-      ...(reason ? auditedReason(core.encrypted(st), reason) : {}),
+      // R362 b: in an encrypted project only that a reason was given and its keyed digest (R369 b); the text is sealed in this change.
+      ...(reason ? auditedReasonIn(core, st, reason) : {}),
     };
   }
   return { violations: effective.violations, loosened: result!.loosened, sha256: sha256Of(yamlText) };

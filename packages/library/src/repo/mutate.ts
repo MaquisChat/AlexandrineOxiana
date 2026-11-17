@@ -49,7 +49,7 @@ import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
-import { AUDIT_REASONS_FILE, reasonSha256, sealedReasonLine } from "./audit-reasons.js";
+import { AUDIT_REASONS_FILE, reasonMac, sealedReasonLine } from "./audit-reasons.js";
 import { TxnLog } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
 
@@ -90,7 +90,7 @@ export interface InternalMutateOptions extends MutateOptions {
   auditDetails?: Record<string, unknown> | (() => Record<string, unknown>);
   /**
    * R362 b: the reason the researcher typed, whose audit details (`auditedReason`) record only that it was given and
-   * its SHA-256 in an encrypted project. There its text is sealed into `<Project>/audit-reasons/reasons.jsonl`, keyed by the
+   * its keyed digest (`reasonMac`, R369 b) in an encrypted project. There its text is sealed into `<Project>/audit-reasons/reasons.jsonl`, keyed by the
    * entry's seq and hash, in this change, under the write-ahead marker and before the entry (the commit point): a
    * crash before the entry undoes the line with the change, a crash after it keeps both. Ignored in a project that is
    * not encrypted (the details carry the reason as typed) and when empty.
@@ -507,12 +507,13 @@ export async function runMutation<T>(
           details: { op, ...(typeof opts.auditDetails === "function" ? opts.auditDetails() : opts.auditDetails), txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
         };
         if (sealedReason !== undefined) {
-          // Only for an entry that records the reason by its SHA-256 (R177 b's form); never beside one that has it as typed.
-          const sha = (input.details as Record<string, unknown>).reasonSha256;
-          if (sha !== reasonSha256(sealedReason) || (input.details as Record<string, unknown>).reason !== undefined) throw new Error("a sealed reason needs an audit entry that records only its SHA-256");
-          const next = st.audit.peek(input);
+          // Only for an entry that records the reason by its keyed digest (R369 b); never beside the text or an unkeyed digest.
           const { key, keyId } = core.key(st);
-          await tx.appendLine(`${st.rel}/${AUDIT_REASONS_FILE}`, sealedReasonLine(key, keyId, projectId, { seq: next.seq, hash: next.hash, reasonSha256: sha, text: sealedReason }));
+          const d = input.details as Record<string, unknown>;
+          const mac = d.reasonMac;
+          if (mac !== reasonMac(key, sealedReason) || d.reason !== undefined || d.reasonSha256 !== undefined) throw new Error("a sealed reason needs an audit entry that records only its keyed digest");
+          const next = st.audit.peek(input);
+          await tx.appendLine(`${st.rel}/${AUDIT_REASONS_FILE}`, sealedReasonLine(key, keyId, projectId, { seq: next.seq, hash: next.hash, reasonMac: mac, text: sealedReason }));
           maybeCrash("after-sealed-reason");
         }
         await st.audit.append(input, onPlan);

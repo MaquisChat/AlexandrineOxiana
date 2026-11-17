@@ -90,11 +90,12 @@ describe("R2: the researcher's own text is recorded exactly as typed", () => {
     await repo
       .setGovernance(p.id, `profiles: [hipaa]\nencryption:\n  atRest: optional\n`, { baseSha256: base, reason })
       .catch(() => undefined);
-    // The project is encrypted: since R362 b its log holds the SHA-256 of the reason exactly as typed, and the text,
-    // sealed, reads back exactly as typed (no scrubbing either way).
+    // The project is encrypted: since R362 b its log holds a digest of the reason exactly as typed (keyed, R369 b), and
+    // the text, sealed, reads back exactly as typed (no scrubbing either way).
     const withReason = (await events(p.folder)).filter((e) => e.details?.reasonGiven === true);
     expect(withReason.length).toBeGreaterThanOrEqual(1);
-    expect(withReason.at(-1)!.details!.reasonSha256).toBe(createHash("sha256").update(reason, "utf8").digest("hex"));
+    expect(withReason.at(-1)!.details!.reasonMac).toMatch(/^[0-9a-f]{64}$/);
+    expect(withReason.at(-1)!.details!.reasonSha256).toBeUndefined();
     const shown = (await repo.readAudit(p.id)).events.find((e) => e.seq === withReason.at(-1)!.seq)!;
     expect(shown.reasonShown).toEqual({ state: "text", text: reason });
     expect(JSON.stringify(await events(p.folder))).not.toContain("<path>");

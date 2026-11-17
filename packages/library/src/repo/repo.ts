@@ -47,7 +47,7 @@ import {
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
-import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonSha256, reasonView } from "./audit-reasons.js";
+import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, auditedReasonIn, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonMatches, reasonView } from "./audit-reasons.js";
 import type { AuditReasonView } from "@ao/shared";
 import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import {
@@ -1607,7 +1607,8 @@ function keyOrLocked(core: RepoCore, st: ProjectState): { key: Uint8Array; keyId
 /**
  * R362 b: each event of a project's log with the reason it carries: as typed; or, sealed, read with the project key
  * (from the review entry for "Reviewed after the withdrawal", R177 b; else from the store of reasons, by the entry's
- * seq and hash), shown only when its SHA-256 is the entry's. Locked: the sentence; nothing is read without the key.
+ * seq and hash), shown only when it matches the entry's digest (keyed, R369 b; or SHA-256 in earlier entries). Locked:
+ * the sentence; nothing is read without the key.
  */
 async function withProjectReasons(core: RepoCore, st: ProjectState, events: AuditEvent[]): Promise<ShownAuditEvent[]> {
   const sealed = events.filter(hasSealedReason);
@@ -1624,15 +1625,16 @@ async function withProjectReasons(core: RepoCore, st: ProjectState, events: Audi
   return events.map((e) => {
     const shown = reasonView(e, () => {
       if (k === "locked") return "locked";
+      const key = k.key;
       const entry = e.details?.reviewEntry;
       if (typeof entry === "string") {
         // A restored copy gives its review entries new ids (R92) while its audit log keeps the old: then the entry
-        // resolved by this decision at this entry's time, with the text whose SHA-256 the entry records.
+        // resolved by this decision at this entry's time, with the text whose digest the entry records.
         const byId = review.find((r) => r.id === entry);
-        if (byId) return byId.reason;
-        return review.find((r) => r.decision === "reviewed-after-withdrawal" && r.resolvedAt === e.at && typeof r.reason === "string" && reasonSha256(r.reason) === e.details?.reasonSha256)?.reason;
+        if (byId) return { key, text: byId.reason };
+        return { key, text: review.find((r) => r.decision === "reviewed-after-withdrawal" && r.resolvedAt === e.at && typeof r.reason === "string" && reasonMatches(e.details, r.reason, key))?.reason };
       }
-      return store.get(reasonKey(e.seq, e.hash))?.text;
+      return { key, text: store.get(reasonKey(e.seq, e.hash))?.text };
     });
     return shown ? { ...e, reasonShown: shown } : e;
   });
@@ -1644,11 +1646,11 @@ async function withLibraryReasons(core: RepoCore, events: AuditEvent[]): Promise
   return events.map((e) => {
     const shown = reasonView(e, () => {
       const st = e.projectId ? core.projects.get(e.projectId) : undefined;
-      if (!st) return undefined;
+      if (!st) return { key: new Uint8Array(0), text: undefined };
       const k = keyOrLocked(core, st);
       if (k === "locked") return "locked";
       const line = lines.find((l) => l.seq === e.seq && l.hash === e.hash && l.projectId === e.projectId);
-      return line ? openLibraryReason(line.sealed, k.key, st.project.id)?.text : undefined;
+      return { key: k.key, text: line ? openLibraryReason(line.sealed, k.key, st.project.id)?.text : undefined };
     });
     return shown ? { ...e, reasonShown: shown } : e;
   });
@@ -1671,7 +1673,8 @@ async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string,
       await runMutation(core, projectId, { action: "set-aside", setAside: { reason: why } }, async () => undefined, {
         op: SET_ASIDE_OP,
         entity: { type: "project", id: projectId },
-        auditDetails: { ...auditedReason(true, why), mark: m.summary },
+        // Keyed with the project's key, known once the change runs (a locked project is refused there).
+        auditDetails: () => ({ ...auditedReasonIn(core, st, why), mark: m.summary }),
         sealedReason: why,
       });
     } else {
@@ -1712,7 +1715,7 @@ async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string,
       action: "set-aside",
       entity: { type: "project" as const, id: projectId },
       decision,
-      details: { op: SET_ASIDE_OP, ...(encrypted && why === "" ? {} : auditedReason(encrypted, why)), mark: m.summary, projectLogNotIntact: true },
+      details: { op: SET_ASIDE_OP, ...(encrypted && why === "" ? {} : auditedReason(encrypted ? core.key(st).key : undefined, why)), mark: m.summary, projectLogNotIntact: true },
     };
     if (encrypted && why !== "") await appendLibraryAuditWithReason(core, input, core.key(st), why);
     else await appendLibraryAudit(core, input);

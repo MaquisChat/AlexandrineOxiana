@@ -5,7 +5,7 @@
  * reasons, which quote titles and names, never sit in plaintext. The index's `review_items` table
  * is a cache of this file; for encrypted projects it holds only field names and statuses.
  */
-import { auditedReason } from "./audit-reasons.js";
+import { auditedReasonIn } from "./audit-reasons.js";
 import { REQUIRED_FIELDS, newId, type AcquiredFrom, type Asset } from "@ao/core";
 import { FIND_HELD_MAX as SHARED_FIND_HELD_MAX, FIND_REASON_TEXT, HELD_FILE_REVIEW_TEXT, heldFileReviewText } from "@ao/shared";
 import { appendFindLinesInTx, findStateCounts, readFindQueue } from "../find/queue-store.js";
@@ -297,8 +297,8 @@ export async function reviewedAfterWithdrawal(core: RepoCore, projectId: string,
       op: WITHDRAWAL_REVIEWED_OP,
       entity: { type: "source", id: first.sourceId! },
       // In an encrypted project the reason's text stays in the sealed review line only: the audit log
-      // (plain lines) records that a reason was given and its SHA-256 (R177 b; the one form, R362 b).
-      auditDetails: { reviewEntry: entryId, ...auditedReason(core.encrypted(st), reason) },
+      // (plain lines) records that a reason was given and its keyed digest (R177 b; the one form, R362 b; keyed, R369 b).
+      auditDetails: () => ({ reviewEntry: entryId, ...auditedReasonIn(core, st, reason) }),
     },
   );
 }
