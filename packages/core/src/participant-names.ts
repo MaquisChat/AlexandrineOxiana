@@ -68,6 +68,32 @@ export interface NameForm {
   words: string[];
   code: string;
   bare: boolean;
+  /** Not the name as written but another order or the words joined (an exact form wins over it). */
+  variant?: boolean;
+}
+
+/**
+ * The forms of one name (R387 b): the ONE place a map entry becomes the forms the matcher looks
+ * for, used by citations (csl-map.ts) and folder names (naming.ts) alike. The name as written, then
+ * for a name of two or more words every rotation ("Family, Given": "Lopez, Maria", "Fernández Ruiz,
+ * Lucía") and the full reverse, and each order with its words joined ("marialopez"). Rotations are
+ * made from the words as written ("山田 太郎" gives "太郎山田"), before words of a no-space script
+ * are joined into one run.
+ */
+export function nameForms(name: string, code: string, bare = false): NameForm[] {
+  const ws = words(name);
+  if (ws.length === 0) return [];
+  const out: NameForm[] = [{ words: ws, code, bare }];
+  if (ws.length === 1) return out;
+  const orders: string[][] = [ws];
+  for (let k = 1; k < ws.length; k++) orders.push([...ws.slice(k), ...ws.slice(0, k)]);
+  orders.push([...ws].reverse());
+  orders.forEach((o, i) => {
+    if (i > 0) out.push({ words: o, code, bare, variant: true });
+    // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
+    out.push({ words: [o.join("")], code, bare, variant: true });
+  });
+  return out;
 }
 
 export interface ScrubOptions {
@@ -216,7 +242,7 @@ interface Index {
   maxPrefix: number;
 }
 
-/** Every form's patterns (its order variants and joined forms), indexed by first unit, longest first. */
+/** Every form's pattern (its units), indexed by first unit, longest first. */
 function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
   const min = opts.bareMinLength ?? 0;
   const split = opts.splitDigits ?? false;
@@ -249,17 +275,7 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
     const ws = f.words.filter(Boolean);
     if (ws.length === 0) continue;
     if (f.bare && ws.length === 1 && [...ws[0]!].length < min) continue;
-    const orders: string[][] = [ws];
-    if (ws.length > 1) {
-      // Any rotation ("Family, Given": "Lopez, Maria", "Fernández Ruiz, Lucía") and the full reverse.
-      for (let k = 1; k < ws.length; k++) orders.push([...ws.slice(k), ...ws.slice(0, k)]);
-      orders.push([...ws].reverse());
-    }
-    for (const o of orders) {
-      add(o, f.code);
-      // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
-      if (o.length > 1) add([o.join("")], f.code);
-    }
+    add(ws, f.code);
   }
   for (const list of index.values()) list.sort((a, b) => b.units.length - a.units.length);
   return { byFirst: index, prefixes, maxPrefix };

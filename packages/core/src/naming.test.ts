@@ -519,3 +519,12 @@ describe("R387 (a): a name with an invisible character inside it (C1 of the FR-A
     expect(pseudonymize("김ﾠ민수 인터뷰", map)).toBe("P-006 인터뷰");
   });
 });
+
+describe("R387 (b): one function makes a name's forms, for folder names and citations alike (I1 of the FR-A10 review)", () => {
+  it("a map entry written apart in a no-space script matches in either order, written together or apart", () => {
+    expect(pseudonymize("太郎山田さん", new Map([["山田 太郎", "P-001"]]))).toBe("P-001さん");
+    expect(pseudonymize("山田太郎さん", new Map([["山田 太郎", "P-001"]]))).toBe("P-001さん");
+    expect(pseudonymize("小明王的故事", new Map([["王 小明", "P-002"]]))).toBe("P-002的故事");
+    expect(pseudonymize("山田太郎さん", new Map([["太郎 山田", "P-003"]]))).toBe("P-003さん");
+  });
+});

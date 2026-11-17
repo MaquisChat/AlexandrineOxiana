@@ -827,3 +827,15 @@ describe("R387 (a): a name with an invisible character inside it (C1 of the FR-A
     expect(title("Video by ⁨@maria.cocina⁩", new Map([["@maria.cocina", "P-005"]]))).toBe("Video by P-005");
   });
 });
+
+describe("R387 (b): one function makes a name's forms (I1 of the FR-A10 review)", () => {
+  const title = (t: string, map: ReadonlyMap<string, string>) =>
+    toCslItem(source("article-journal", mt(["ja", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;
+
+  it("a map entry written apart in a no-space script matches in either order, as the folder name does", () => {
+    expect(title("太郎山田さん", new Map([["山田 太郎", "P-001"]]))).toBe("P-001さん");
+    expect(title("山田太郎さん", new Map([["山田 太郎", "P-001"]]))).toBe("P-001さん");
+    expect(title("小明王的故事", new Map([["王 小明", "P-002"]]))).toBe("P-002的故事");
+    expect(title("山田太郎さん", new Map([["太郎 山田", "P-003"]]))).toBe("P-003さん");
+  });
+});

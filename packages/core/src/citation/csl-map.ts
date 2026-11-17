@@ -34,7 +34,7 @@
 import type { Anchor } from "../model/anchor.js";
 import type { BiblioField, Creator, SourceFile, SourceType } from "../model/source.js";
 import type { MultiText } from "../model/text.js";
-import { normName, scrubNames, urlNamesAny, type NameForm } from "../participant-names.js";
+import { nameForms, normName, scrubNames, urlNamesAny, type NameForm } from "../participant-names.js";
 
 export interface CslName {
   family?: string;
@@ -270,7 +270,7 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
     const n = normName(k);
     if (!n) continue;
     if (!keys.has(n)) keys.set(n, code);
-    forms.push({ words: n.split(" "), code, bare: false });
+    forms.push(...nameForms(k, code));
   }
   // Sources linked to participants fail closed: every creator but the interviewer needs a code (R88 I2).
   const requireCodes = opts.requireParticipantCodes === true || s.participantIds.length > 0;
@@ -283,7 +283,7 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
     if (code) {
       anyCoded = true;
       name = { literal: code };
-      for (const f of creatorForms(c)) forms.push({ words: normName(f.text).split(" ").filter(Boolean), code, bare: f.bare });
+      for (const f of creatorForms(c)) forms.push(...nameForms(f.text, code, f.bare));
     } else {
       if (requireCodes && c.role !== "interviewer" && creatorForms(c).length > 0) throw new ParticipantCodeMissingError();
       name = cslName(c);
