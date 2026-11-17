@@ -203,7 +203,11 @@ describe("transcription as a job", () => {
  */
 describe("R367: an allowed transcription is audited once, where it runs", () => {
   const isProcess = (e: { action: string }) => e.action === "process";
-  const isStore = (e: { action: string; decision?: { result?: string } }) => e.action === "store" && e.decision?.result !== "deny";
+  /** A store of the job's output: a derived asset (not, say, the governance edit a test makes). */
+  const isDerive = (e: { action: string; details?: Record<string, unknown> }) => e.action === "store" && e.details?.op === "asset.derive";
+  const isStore = (e: { action: string; decision?: { result?: string }; details?: Record<string, unknown> }) => isDerive(e) && e.decision?.result !== "deny";
+  /** The entries of the processing and of its storing, in order. */
+  const ofJob = <E extends { action: string; details?: Record<string, unknown> }>(events: E[]) => events.filter((e) => isProcess(e) || isDerive(e));
 
   it("allowed and stored: one `process` allow entry naming the job, the recording and the tool, before the two `store` entries; the chain verifies", async () => {
     const p = await makeProject(kit);
@@ -245,11 +249,11 @@ describe("R367: an allowed transcription is audited once, where it runs", () => 
       if (how === "lock") await repo.unlockProject(p.id, "correct horse battery staple");
       let events = (await auditEvents(kit, p)).slice(before);
       expect(events.filter(isProcess)).toHaveLength(1);
-      expect(events.filter((e) => e.action === "store")).toEqual([]);
+      expect(events.filter(isDerive)).toEqual([]);
       const out = await (await client()).resumePending(p.id, { prepare: (rec) => transcriptionRerun(repo, rec) });
       expect(out.map((x) => x.error)).toEqual([undefined]);
       events = (await auditEvents(kit, p)).slice(before);
-      expect(events.map((e) => e.action)).toEqual(["process", "store", "store"]);
+      expect(ofJob(events).map((e) => e.action)).toEqual(["process", "store", "store"]);
       expect((await repo.verifyAudit(p.id)).ok).toBe(true);
     });
   }
@@ -277,7 +281,7 @@ describe("R367: an allowed transcription is audited once, where it runs", () => 
       return transcribe(j);
     });
     await expect(c.submit(p.id, job)).rejects.toBeInstanceOf(PolicyDeniedError);
-    const events = (await auditEvents(kit, p)).slice(before).filter((e) => e.action === "process" || e.action === "store");
+    const events = ofJob((await auditEvents(kit, p)).slice(before));
     expect(events.filter(isProcess)).toEqual([expect.objectContaining({ decision: { result: "allow" }, entity: { type: "asset", id: sf.assets[0]!.id } })]);
     expect(events.filter(isStore)).toEqual([]);
     expect(events.map((e) => [e.action, e.decision?.result])).toEqual([["process", "allow"], ["store", "deny"]]);
@@ -300,7 +304,7 @@ describe("R367: an allowed transcription is audited once, where it runs", () => 
     ]);
     expect([...a, ...b].filter((x) => x.error === undefined)).toHaveLength(1);
     const events = (await auditEvents(kit, p)).slice(before);
-    expect(events.map((e) => e.action)).toEqual(["process", "store", "store"]);
+    expect(ofJob(events).map((e) => e.action)).toEqual(["process", "store", "store"]);
   });
 
   it("denied: as before, one deny (at the start), no allow entry, no job", async () => {

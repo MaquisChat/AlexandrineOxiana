@@ -55,7 +55,8 @@ export async function transcriptionJob(
   if (!media) throw new NoMediaError(sourceId);
   // Refused at the start (fix 1, I1): the same decision the run makes, so a forbidden transcription
   // is never recorded as a job. A deny is audited and thrown (PolicyDeniedError); an allow is not
-  // audited here (the run audits its own decision). Checked again when the job runs.
+  // audited here: it is evaluated again when the job runs, and the run audits the allow, once
+  // (worker-client.ts, R367).
   await authorizeProcessing(repo, projectId, { action: "process", process: { op: "transcription", provider: "local" } }, { op: `worker.${TRANSCRIBE_KIND}`, entity: { type: "asset", id: media.id } });
   const p = workerParams(params);
   const triggeredBy = opts.triggeredBy ?? "user";
