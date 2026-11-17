@@ -135,3 +135,16 @@ describe("R440 (c): a full-width at-sign in front of a handle is read as '@'", (
     expect(r.all).toHaveLength(1);
   });
 });
+
+describe("R440 (d): a handle with nothing visible in it is no handle", () => {
+  it("it falls through to the literal, else to the names, else to nothing", () => {
+    expect(creatorKey({ handle: "\u200B", literal: "Ana", role: "uploader" })).toBe("Ana");
+    expect(creatorKey({ handle: "\u200B", role: "uploader" })).toBeUndefined();
+  });
+
+  it("two creators whose only handles are invisible characters get no participant", () => {
+    const r = codesFor([{ role: "uploader", handle: "\u200B" }, { role: "uploader", handle: "\u2060" }], new Map(), []);
+    expect(r.codes).toEqual([undefined, undefined]);
+    expect(r.all).toHaveLength(0);
+  });
+});

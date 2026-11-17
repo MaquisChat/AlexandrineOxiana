@@ -37,7 +37,7 @@ export async function savePseudonyms(tx: Tx, map: Map<string, string>): Promise<
  */
 export function creatorKey(c: Creator): string | undefined {
   const handle = c.handle?.trim().replace(/^[@\uFF20]+/u, "").trim();
-  if (handle) return `@${handle}`.normalize("NFC");
+  if (handle && identityKey(handle)) return `@${handle}`.normalize("NFC");
   const k = c.literal?.trim() || [c.given, c.family].filter(Boolean).join(" ").trim();
   return k ? k.normalize("NFC") : undefined;
 }
