@@ -54,6 +54,15 @@ export function sizeWords(bytes: number): string {
   return b === 0 ? "nothing" : `${b} bytes`;
 }
 
+/** `sizeWords` for a room that is needed: the same steps (0.1 GB, 1 MB, 1 kB), but rounded up, never down (R441 c). */
+export function sizeWordsUp(bytes: number): string {
+  const b = Math.max(0, Number.isFinite(bytes) ? bytes : 0);
+  if (b >= 1e9) return `${(Math.ceil(b / 1e8) / 10).toFixed(1).replace(/\.0$/u, "")} GB`;
+  if (b >= 1e6) return `${Math.ceil(b / 1e6)} MB`;
+  if (b >= 1e3) return `${Math.ceil(b / 1e3)} kB`;
+  return b === 0 ? "nothing" : `${b} bytes`;
+}
+
 /**
  * R436 c (correcting R413 a): why a batch that copies `copyBytes` (and, for a Zotero local import, a working copy of
  * its database of `dbBytes`) does not fit in `freeBytes`: the room it needs is the files, the database copy and the
@@ -62,7 +71,7 @@ export function sizeWords(bytes: number): string {
 export function fitSentence(copyBytes: number, dbBytes: number, freeBytes: number, canLink: boolean): string {
   const need = copyBytes + dbBytes + spaceMargin(copyBytes);
   const parts = dbBytes > 0 ? `${sizeWords(copyBytes)} of files to copy, a working copy of the Zotero database, and room the library keeps free to work` : `${sizeWords(copyBytes)} of files to copy, and room the library keeps free to work`;
-  const start = `This import needs about ${sizeWords(need)} free on the library's disk (${parts}), but only ${sizeWords(freeBytes)} is free.`;
+  const start = `This import needs about ${sizeWordsUp(need)} free on the library's disk (${parts}), but only ${sizeWords(freeBytes)} is free.`;
   return canLink ? `${start} Free some space, or choose to leave the files where they are, and start again.` : `${start} Free some space and start again.`;
 }
 

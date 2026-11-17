@@ -135,6 +135,12 @@ describe("the sentence (R436 c)", () => {
     );
   });
 
+  it("writes the room needed rounded up, so it never reads the same as the room that is free (R441 c)", () => {
+    const s = fitSentence(9.04e9, 0, 9.86e9, true);
+    expect(s).toContain("needs about 10 GB free");
+    expect(s).toContain("only 9.9 GB is free");
+  });
+
   it("names the Zotero database's working copy when the source has one", () => {
     expect(fitSentence(2e9, 300e6, 2.1e9, true)).toBe(
       "This import needs about 2.8 GB free on the library's disk (2 GB of files to copy, a working copy of the Zotero database, and room the library keeps free to work), but only 2.1 GB is free. Free some space, or choose to leave the files where they are, and start again.",
