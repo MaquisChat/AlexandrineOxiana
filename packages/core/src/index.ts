@@ -30,7 +30,7 @@ export {
   withCollisionSuffix,
 } from "./naming.js";
 export type { NamingTemplates } from "./naming.js";
-export { creatorNameTexts, nameForms } from "./participant-names.js";
+export { creatorNameTexts, identityKey, nameForms } from "./participant-names.js";
 export type { CreatorName, NameForm } from "./participant-names.js";
 
 export { GENESIS_HASH, sealEvent, verifyChain } from "./audit.js";

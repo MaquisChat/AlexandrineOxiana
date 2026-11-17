@@ -302,3 +302,24 @@ describe.skipIf(!HAVE_BUNDLE)("R403 (c): a single word of a compound family name
     expect(bib.content).toContain(want);
   });
 });
+
+describe.skipIf(!HAVE_BUNDLE)("R416: two participants whose names fold alike each carry their own code", () => {
+  it("Ana Peña and Ana Pena: each folder name and each bibliography entry carries its OWN code", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const a = await addSource(kit, p, { type: "book", title: "Entrevista a Ana Peña", creators: [{ given: "Ana", family: "Peña", role: "interviewee" }], issued: "2025", identifiable: true });
+    const b = await addSource(kit, p, { type: "book", title: "Entrevista a Ana Pena", creators: [{ given: "Ana", family: "Pena", role: "interviewee" }], issued: "2025", identifiable: true });
+    const fw = await kit.repo.getFieldwork(p.id);
+    const codeOf = (pid: string) => fw.participants.find((x) => x.id === pid)!.code;
+    const ca = codeOf(a.source.participantIds[0]!);
+    const cb = codeOf(b.source.participantIds[0]!);
+    expect(ca).not.toBe(cb);
+    expect(a.source.folder).toContain(`${ca} - Entrevista a ${ca}`);
+    expect(b.source.folder).toContain(`${cb} - Entrevista a ${cb}`);
+    const bibA = await exportBibliography(kit.repo, p.id, { sourceIds: [a.source.id] }, "apa", "text");
+    const bibB = await exportBibliography(kit.repo, p.id, { sourceIds: [b.source.id] }, "apa", "text");
+    expect(bibA.content).toContain(`Entrevista a ${ca}`);
+    expect(bibA.content).not.toContain(cb);
+    expect(bibB.content).toContain(`Entrevista a ${cb}`);
+    expect(bibB.content).not.toContain(ca);
+  });
+});

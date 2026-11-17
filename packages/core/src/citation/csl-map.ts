@@ -34,7 +34,7 @@
 import type { Anchor } from "../model/anchor.js";
 import type { BiblioField, Creator, SourceFile, SourceType } from "../model/source.js";
 import type { MultiText } from "../model/text.js";
-import { mapKeys, nameForms, normName, scrubNames, urlNamesAny, type NameForm, type NameSet } from "../participant-names.js";
+import { mapCode, mapKeys, nameForms, normName, scrubNames, urlNamesAny, type NameForm, type NameSet } from "../participant-names.js";
 
 export interface CslName {
   family?: string;
@@ -175,9 +175,14 @@ function creatorForms(c: Creator): Array<{ text: string; bare: boolean }> {
   return out;
 }
 
-function codeFor(c: Creator, keys: ReadonlyMap<string, string>): string | undefined {
+/**
+ * A creator's code: for each of its forms in turn, the map entry whose name is exactly that form by
+ * the strict key, else the first whose folded name is (R416: "Ana Pena" is not "Ana Peña"'s code
+ * when both are participants).
+ */
+function codeFor(c: Creator, map: ReadonlyMap<string, string>): string | undefined {
   for (const f of creatorForms(c)) {
-    const hit = keys.get(normName(f.text));
+    const hit = mapCode(map, f.text);
     if (hit) return hit;
   }
   return undefined;
@@ -278,7 +283,7 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   if (s.participantIds.length > 0 && keys.size === 0) throw new ParticipantCodeMissingError();
   let anyCoded = false;
   for (const c of s.creators) {
-    const code = codeFor(c, keys);
+    const code = codeFor(c, map);
     let name: CslName | undefined;
     if (code) {
       anyCoded = true;

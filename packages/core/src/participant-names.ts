@@ -90,6 +90,33 @@ const joinsWithout = (a: string | undefined, b: string | undefined): boolean =>
 export const normName = (s: string): string =>
   words(s).reduce((acc, w) => (acc === "" ? w : acc + (joinsWithout(acc.at(-1), w[0]) ? "" : " ") + w), "");
 
+/** Scripts whose words are joined without a space in a name's strict key. */
+const joinsStrict = (a: string, b: string): boolean => (isNoSpace(a) && isNoSpace(b)) || (HANGUL.test(a) && HANGUL.test(b));
+
+/**
+ * A name's STRICT key (R403 b): compatibility forms (NFKC) and case folded, invisible
+ * (default-ignorable) characters removed, white space collapsed and trimmed, and a space between two
+ * characters of a script written without spaces, or between two Hangul characters, removed
+ * ("김 민수" = "김민수"). Accents, voicing marks, "@" and punctuation are KEPT. It decides WHO a
+ * person is (the library's `assignCodes`) and, among participants whose names fold alike, whose
+ * name a text says exactly (R416). It is deliberately not `fold`: over-matching is the safe side
+ * for replacing a name, the unsafe side for deciding who a person is.
+ */
+export function identityKey(s: string): string {
+  return s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(IGNORABLE, "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/(.) (?=(.))/gsu, (m, a: string, b: string) => (joinsStrict(a, b) ? a : m));
+}
+/** The strict words of a name (NFKC, lowercase, invisible characters removed; accents kept), aligned with `words`. */
+const strictWords = (s: string): string[] =>
+  s.normalize("NFKC").toLowerCase().replace(IGNORABLE, "").split(/[^\p{L}\p{N}\p{M}]+/u).filter(Boolean);
+/** A span's strict letters: its strict words run together (R416: compared among names that fold alike). */
+const strictLetters = (s: string): string => strictWords(s).join("");
+
 /** A name to look for: its folded words, the code that replaces it; `bare`: a lone given or family name. */
 export interface NameForm {
   words: string[];
@@ -97,6 +124,10 @@ export interface NameForm {
   bare: boolean;
   /** Not the name as written but another order or the words joined (an exact form wins over it). */
   variant?: boolean;
+  /** R416: the form's strict letters (its strict words in the form's order, run together). */
+  strict?: string;
+  /** R416: the strict key of the name as written (the form as written only). */
+  full?: string;
 }
 
 /** The longest name whose runs of words are made into forms (R387 e); longer names get none. */
@@ -104,17 +135,23 @@ const MAX_RUN_WORDS = 10;
 /** The Latin-script floor of R88 (4 letters), used to tell a run of particles from a name. */
 const LATIN_FLOOR = 4;
 
-/** `ws` in every rotation and reversed, each order also with its words joined. */
-function ordersOf(ws: readonly string[], code: string, bare: boolean, variant: boolean, join = true): NameForm[] {
-  const out: NameForm[] = [{ words: [...ws], code, bare, ...(variant ? { variant } : {}) }];
+/**
+ * `ws` in every rotation and reversed, each order also with its words joined. `ss`: the same words'
+ * strict forms (R416), permuted alike; left out when they do not line up with `ws`.
+ */
+function ordersOf(ws: readonly string[], code: string, bare: boolean, variant: boolean, join = true, ss?: readonly string[], full?: string): NameForm[] {
+  const st = (o: readonly number[]) => (ss ? { strict: o.map((k) => ss[k]!).join("") } : {});
+  const idx = ws.map((_, k) => k);
+  const out: NameForm[] = [{ words: [...ws], code, bare, ...(variant ? { variant } : {}), ...st(idx), ...(full !== undefined ? { full } : {}) }];
   if (ws.length === 1) return out;
-  const orders: string[][] = [[...ws]];
-  for (let k = 1; k < ws.length; k++) orders.push([...ws.slice(k), ...ws.slice(0, k)]);
-  if (ws.length > 2) orders.push([...ws].reverse()); // of two words, the reverse is the rotation
+  const orders: number[][] = [idx];
+  for (let k = 1; k < ws.length; k++) orders.push([...idx.slice(k), ...idx.slice(0, k)]);
+  if (ws.length > 2) orders.push([...idx].reverse()); // of two words, the reverse is the rotation
   orders.forEach((o, i) => {
-    if (i > 0) out.push({ words: o, code, bare, variant: true });
+    const wo = o.map((k) => ws[k]!);
+    if (i > 0) out.push({ words: wo, code, bare, variant: true, ...st(o) });
     // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
-    if (join) out.push({ words: [o.join("")], code, bare, variant: true });
+    if (join) out.push({ words: [wo.join("")], code, bare, variant: true, ...st(o) });
   });
   return out;
 }
@@ -136,12 +173,21 @@ export function nameForms(name: string | CreatorName, code: string, bare = false
   if (typeof name !== "string") return creatorNameTexts(name).flatMap((t) => nameForms(t.text, code, t.bare));
   const ws = words(name);
   if (ws.length === 0) return [];
-  const out = ordersOf(ws, code, bare, false);
+  // The strict words, for choosing among names that fold alike (R416); unused if they do not line up.
+  const sw = strictWords(name);
+  const ss = sw.length === ws.length ? sw : undefined;
+  const out = ordersOf(ws, code, bare, false, true, ss, identityKey(name));
   // A Hangul name written together is the same name written apart at any syllable (R387 M6:
   // "김민수" = "김 민수" = "민수 김").
   if (ws.length === 1 && !bare && ALL_HANGUL.test(ws[0]!)) {
     const w = ws[0]!;
-    for (let k = 1; k < w.length; k++) if (CHOSEONG.test(w[k]!)) out.push(...ordersOf([w.slice(0, k), w.slice(k)], code, bare, true, false));
+    const sCps = ss ? [...ss[0]!] : undefined;
+    for (let k = 1; k < w.length; k++) {
+      if (!CHOSEONG.test(w[k]!)) continue;
+      const n = syllables(w.slice(0, k));
+      const split = sCps && sCps.length === syllables(w) ? [sCps.slice(0, n).join(""), sCps.slice(n).join("")] : undefined;
+      out.push(...ordersOf([w.slice(0, k), w.slice(k)], code, bare, true, false, split));
+    }
   }
   if (ws.length >= 3 && ws.length <= MAX_RUN_WORDS) {
     for (let len = ws.length - 1; len >= 2; len--) {
@@ -149,7 +195,7 @@ export function nameForms(name: string | CreatorName, code: string, bare = false
         const run = ws.slice(at, at + len);
         // A run is the name only when at least TWO of its words could be a name by themselves
         // (R403 c): "Lucía Fernández", "Fernández Ruiz" — not "Maria de", "la Cruz", "der Berg".
-        if (run.filter((w) => standsAlone(w, LATIN_FLOOR)).length >= 2) out.push(...ordersOf(run, code, bare, true));
+        if (run.filter((w) => standsAlone(w, LATIN_FLOOR)).length >= 2) out.push(...ordersOf(run, code, bare, true, true, ss?.slice(at, at + len)));
       }
     }
   }
@@ -323,9 +369,23 @@ function tokenize(text: string, splitDigits: boolean): Token[] {
   return tokens;
 }
 
+/** A participant a pattern may stand for (R416): its code and its form's strict letters and key. */
+interface Candidate {
+  code: string;
+  strict?: string;
+  full?: string;
+}
+
 interface Pattern {
   units: string[];
   code: string;
+  /**
+   * R416: every form with these folded units, in order (the first gives `code`). Where there are
+   * several, the one whose name is exactly the span (by the strict key) gives the code.
+   */
+  cands: Candidate[];
+  /** The candidates have more than one code (only then is the span compared). */
+  mixed: boolean;
   /** One no-space-script character: matched only as a run of its own. */
   single: boolean;
   /** A Hangul name of two or more syllables: its last word may begin a longer run of Hangul (R380). */
@@ -368,18 +428,28 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
   const prefixes = new Map<string, Pattern[]>();
   let maxPrefix = 0;
   let maxFirst = 0;
-  const seen = new Set<string>();
-  const add = (ws: readonly string[], code: string) => {
+  const seen = new Map<string, Pattern>();
+  const add = (ws: readonly string[], f: NameForm) => {
+    const code = f.code;
     const us = ws.flatMap((w) => units(w, split));
     if (us.length === 0) return;
     const key = us.join("\u0000");
-    if (seen.has(key)) return;
-    seen.add(key);
+    const cand: Candidate = { code, ...(f.strict !== undefined ? { strict: f.strict } : {}), ...(f.full !== undefined ? { full: f.full } : {}) };
+    const had = seen.get(key);
+    if (had) {
+      // Another form that folds alike (R416): kept as a candidate, chosen at the match.
+      if (!had.cands.some((c) => c.code === code && c.strict === cand.strict && c.full === cand.full)) {
+        had.cands.push(cand);
+        if (code !== had.code) had.mixed = true;
+      }
+      return;
+    }
     const single = us.length === 1 && [...us[0]!].length === 1 && isNoSpace(us[0]);
     // A Hangul name of one syllable stays whole-run only, like a one-character no-space name.
     const last = us[us.length - 1]!;
     const prefix = ALL_HANGUL.test(last) && syllables(us.join("")) >= 2;
-    const pat: Pattern = { units: us, code, single, prefix };
+    const pat: Pattern = { units: us, code, cands: [cand], mixed: false, single, prefix };
+    seen.set(key, pat);
     const list = index.get(us[0]!) ?? [];
     list.push(pat);
     index.set(us[0]!, list);
@@ -399,11 +469,26 @@ function patterns(forms: readonly NameForm[], opts: ScrubOptions): Index {
       const ws = f.words.filter(Boolean);
       if (ws.length === 0) continue;
       if (min > 0 && f.bare && !f.variant && ws.length === 1 && !standsAlone(ws[0]!, min)) continue;
-      add(ws, f.code);
+      add(ws, f);
     }
   }
   for (const list of index.values()) list.sort((a, b) => b.units.length - a.units.length);
   return { byFirst: index, prefixes, maxPrefix, maxFirst };
+}
+
+/**
+ * R416: of the participants whose forms fold to the matched span, the one whose name is exactly what
+ * the text says by the strict key: the name as written (with an "@" in front, as the span takes it)
+ * first, then a form's strict words in its order (a rotation "Pena, Ana"); when none is exact, the
+ * first candidate (the folded match, by the map's order, as before).
+ */
+function exactCode(text: string, p: Pattern, start: number, end: number): string {
+  const span = text.slice(start, end);
+  const full = identityKey((start > 0 && text[start - 1] === "@" ? "@" : "") + span);
+  const byFull = p.cands.find((c) => c.full !== undefined && c.full === full);
+  if (byFull) return byFull.code;
+  const letters = strictLetters(span);
+  return p.cands.find((c) => c.strict !== undefined && c.strict === letters)?.code ?? p.code;
 }
 
 /** The original-text index where the first `n` folded characters of a token starting at `start` end. */
@@ -519,6 +604,7 @@ interface MapCache {
   forms: NameForm[];
   indexes: Map<string, Index>;
   keys?: Map<string, string>;
+  strictKeys?: Map<string, string>;
 }
 const mapCache = new WeakMap<ReadonlyMap<string, string>, MapCache>();
 function cacheOf(map: ReadonlyMap<string, string>): MapCache {
@@ -552,6 +638,23 @@ export function mapKeys(map: ReadonlyMap<string, string>): ReadonlyMap<string, s
     }
   }
   return c.keys;
+}
+
+/**
+ * The code of the map entry `text` names (R416): the entry whose STRICT key (`identityKey`) is the
+ * text's, else the first entry whose folded name (`normName`) is the text's, as before. Both key
+ * maps are built once per map.
+ */
+export function mapCode(map: ReadonlyMap<string, string>, text: string): string | undefined {
+  const c = cacheOf(map);
+  if (!c.strictKeys) {
+    c.strictKeys = new Map();
+    for (const [k, code] of c.entries) {
+      const n = identityKey(k);
+      if (n && !c.strictKeys.has(n)) c.strictKeys.set(n, code);
+    }
+  }
+  return c.strictKeys.get(identityKey(text)) ?? mapKeys(map).get(normName(text));
 }
 
 function indexesOf(names: Names, opts: ScrubOptions): Index[] {
@@ -685,7 +788,7 @@ function findPlain(text: string, indexes: readonly Index[], opts: ScrubOptions, 
       i++;
       continue;
     }
-    hits.push({ start: tokens[i]!.start, end: best.end, code: best.p.code });
+    hits.push({ start: tokens[i]!.start, end: best.end, code: best.p.mixed ? exactCode(text, best.p, tokens[i]!.start, best.end) : best.p.code });
     if (firstOnly) break;
     while (i < n && tokens[i]!.start < best.end) i++;
   }
@@ -730,7 +833,8 @@ function safeDecode(s: string): string {
 }
 
 /**
- * Whether an address names any of the forms: decoded safely (a malformed escape never throws; up to
+ * Whether an address names any of the forms (it is only tested, never rewritten, so which of two
+ * participants whose names fold alike it names does not matter here, R416): decoded safely (a malformed escape never throws; up to
  * three times, for an address encoded more than once), "+" read as a space, then matched by the rule
  * above, so every separator is alike (space, "+", "-", ".", "_", "/", none) in either word order.
  * No length floor: every form counts. Letters and digits are split ("lopezmaria2024").

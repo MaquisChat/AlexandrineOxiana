@@ -745,3 +745,36 @@ describe("R403 (d): merging the two lists of matches is one pass (M3 of the FR-A
     expect(out.match(/P-001/gu)).toHaveLength(2_000);
   });
 });
+
+describe("R416: where names fold alike, the participant whose name is exactly what the text says gives the code", () => {
+  const pena = new Map([["Ana Peña", "P-001"], ["Ana Pena", "P-002"]]);
+  const penaRev = new Map([["Ana Pena", "P-002"], ["Ana Peña", "P-001"]]);
+
+  it("Ana Peña / Ana Pena: each span takes its own participant's code, in either order of the map", () => {
+    for (const map of [pena, penaRev]) {
+      expect(pseudonymize("Entrevista a Ana Pena", map)).toBe("Entrevista a P-002");
+      expect(pseudonymize("Entrevista a Ana Peña", map)).toBe("Entrevista a P-001");
+      expect(pseudonymize("Ana Peña y Ana Pena", map)).toBe("P-001 y P-002");
+      expect(pseudonymize("ANA PEÑA habla", map)).toBe("P-001 habla"); // case is folded by the strict key
+      expect(pseudonymize("Ana Pe­na habla", map)).toBe("P-002 habla"); // invisible characters are removed by it
+      expect(pseudonymize("Pena, Ana habla", map)).toBe("P-002 habla"); // a rotation: the rotated words' strict forms
+      expect(pseudonymize("Peña, Ana habla", map)).toBe("P-001 habla");
+    }
+    // No candidate exact (other accents than either): the folded match, the first by the map's order.
+    expect(pseudonymize("Ana Pêna habla", pena)).toBe("P-001 habla");
+    expect(pseudonymize("Ana Pêna habla", penaRev)).toBe("P-002 habla");
+  });
+
+  it("Hương / Hường and ハナコ / バナコ", () => {
+    const viet = new Map([["Lê Thị Hương", "P-001"], ["Lê Thị Hường", "P-002"]]);
+    expect(pseudonymize("Phỏng vấn Lê Thị Hường", viet)).toBe("Phỏng vấn P-002");
+    expect(pseudonymize("Phỏng vấn Lê Thị Hương", viet)).toBe("Phỏng vấn P-001");
+    const kana = new Map([["ハナコ", "P-003"], ["バナコ", "P-004"]]);
+    expect(pseudonymize("バナコの話", kana)).toBe("P-004の話");
+    expect(pseudonymize("ハナコの話", kana)).toBe("P-003の話");
+  });
+
+  it("a single participant 'Lucía Fernández' still replaces 'Lucia Fernandez' (no exact candidate: the folded match)", () => {
+    expect(pseudonymize("Entrevista a Lucia Fernandez", new Map([["Lucía Fernández", "P-005"]]))).toBe("Entrevista a P-005");
+  });
+});

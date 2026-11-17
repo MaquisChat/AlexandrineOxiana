@@ -889,6 +889,36 @@ describe("R403 (c): a part of a name stands for the name only when it could be a
   });
 });
 
+describe("R416: where names fold alike, the participant whose name is exactly what the text says gives the code", () => {
+  const pena = new Map([["Ana Peña", "P-001"], ["Ana Pena", "P-002"]]);
+  const penaRev = new Map([["Ana Pena", "P-002"], ["Ana Peña", "P-001"]]);
+  const both = (t: string, map: ReadonlyMap<string, string>) =>
+    toCslItem(
+      source("interview", mt(["es", "original", t]), [{ role: "interviewee", given: "Ana", family: "Peña" }, { role: "interviewee", given: "Ana", family: "Pena" }], { participantIds: [PARTICIPANT.id] }),
+      { ...OPTS, pseudonyms: map },
+    );
+
+  it("both creators and both names in one title: each its own code, in either order of the map", () => {
+    for (const map of [pena, penaRev]) {
+      const item = both("Ana Peña y Ana Pena; ANA PEÑA; Ana Pe\u00ADna; Pena, Ana", map);
+      expect(item.author).toEqual([{ literal: "P-001" }, { literal: "P-002" }]);
+      expect(item.title).toBe("P-001 y P-002; P-001; P-002; P-002");
+    }
+  });
+
+  it("a creator alone gets its own code; a story's title takes the exact participant's code", () => {
+    const one = (c: { given: string; family: string }, map: ReadonlyMap<string, string>) =>
+      toCslItem(source("interview", mt(["es", "original", "x"]), [{ role: "interviewee", ...c }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: map }).author;
+    expect(one({ given: "Ana", family: "Pena" }, pena)).toEqual([{ literal: "P-002" }]);
+    expect(one({ given: "Ana", family: "Peña" }, penaRev)).toEqual([{ literal: "P-001" }]);
+    const story = (t: string, map: ReadonlyMap<string, string>) =>
+      toCslItem(source("article-journal", mt(["vi", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;
+    expect(story("Phỏng vấn Lê Thị Hường", new Map([["Lê Thị Hương", "P-001"], ["Lê Thị Hường", "P-002"]]))).toBe("Phỏng vấn P-002");
+    expect(story("バナコの話", new Map([["ハナコ", "P-003"], ["バナコ", "P-004"]]))).toBe("P-004の話");
+    expect(story("Entrevista a Lucia Fernandez", new Map([["Lucía Fernández", "P-005"]]))).toBe("Entrevista a P-005");
+  });
+});
+
 describe("R387 (b): one function makes a name's forms (I1 of the FR-A10 review)", () => {
   const title = (t: string, map: ReadonlyMap<string, string>) =>
     toCslItem(source("article-journal", mt(["ja", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;
