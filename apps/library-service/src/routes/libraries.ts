@@ -27,6 +27,7 @@ import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { ndjsonWriter, sseWriter } from "../streams.js";
 import { bodyOf, queryOf, str, strArray, type Ctx } from "./util.js";
+import { isLocalAbsolutePath } from "./local-path.js";
 
 function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
   const s = ctx.state.session;
@@ -59,10 +60,9 @@ function ndjson(reply: FastifyReply): (value: unknown) => Promise<void> {
 
 const ndjsonError = (ctx: Ctx, err: unknown) => errorBody(toApiError(err), ctx.state.roots);
 
-const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 function absPath(o: Record<string, unknown>, key: string): string {
   const p = str(o, key, 4096);
-  if (!isAbsolute(p) || p.includes("\0")) throw badRequest(`"${key}" must be an absolute path.`);
+  if (!isLocalAbsolutePath(p)) throw badRequest(`"${key}" must be an absolute path.`);
   return p;
 }
 
@@ -128,7 +128,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   app.post("/libraries/locate", async (req: FastifyRequest, reply: FastifyReply) => {
     const b = bodyOf(req);
     const libraryId = str(b, "libraryId", 64);
-    const given = b.roots === undefined ? undefined : strArray(b, "roots", { max: 50 }).map((r) => (isAbsolute(r) ? r : (() => { throw badRequest('"roots" must be absolute paths.'); })()));
+    const given = b.roots === undefined ? undefined : strArray(b, "roots", { max: 50 }).map((r) => (isLocalAbsolutePath(r) ? r : (() => { throw badRequest('"roots" must be absolute paths.'); })()));
     let roots = given;
     if (!roots) {
       const known = (await listLibraries(state.deps).catch(() => [])).find((e) => e.libraryId === libraryId);
