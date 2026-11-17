@@ -26,7 +26,7 @@ import {
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { ndjsonWriter, sseWriter } from "../streams.js";
-import { bodyOf, queryOf, str, strArray, type Ctx } from "./util.js";
+import { bodyOf, optStr, queryOf, str, strArray, type Ctx } from "./util.js";
 
 function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
   const s = ctx.state.session;
@@ -188,8 +188,12 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const dest = absPath(b, "dest");
     const excludeProjectIds = strArray(b, "excludeProjectIds", { optional: true, max: 10_000, itemMax: 64 });
+    // The screen's own id for this request: a failure is kept under it, so that a screen that lost
+    // its connection can tell its own move's failure from an earlier one (R379).
+    const attempt = optStr(b, "attempt", 64) ?? null;
     // From here every change is refused (503 MOVE_IN_PROGRESS) and background work waits (R102 N2).
     state.moving = true;
+    state.forgetMoveFailure();
     try {
       // Changes already being made finish first (this request is one of the in-flight ones, R106 I1).
       for (let waited = 0; state.inFlightMutating() > 1; waited += 25) {
@@ -221,7 +225,9 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
           state.resumeBatches(paused);
           state.restartStoppedWork();
         }
-        await write(ndjsonError(ctx, err));
+        const body = ndjsonError(ctx, err);
+        state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
+        await write(body);
         reply.raw.end();
         return;
       }
@@ -261,10 +267,13 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     }
   });
 
-  // The last move's token (single use, 15 minutes), e.g. after the move's stream was cut off.
+  // What is true of the moves, for a screen whose connection to its move was lost (R379): whether
+  // one is running now; the last finished move's token (single use, 15 minutes); the last move that
+  // stopped with an error (15 minutes, or until the next move starts).
   app.get("/libraries/move/status", async () => {
     const m = state.pendingMove();
-    return { pending: m ?? null };
+    const f = state.failedMove();
+    return { pending: m ?? null, running: state.moving, failed: f ? { newRoot: f.newRoot, attempt: f.attempt, error: f.error } : null };
   });
 
   app.post("/libraries/move/delete-old", async (req) => {

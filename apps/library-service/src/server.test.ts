@@ -2723,3 +2723,56 @@ describe("worker jobs rerun at an unlock (Task 51 N-2)", () => {
     expect(stub!.runs).toHaveLength(1);
   });
 });
+
+describe("move/status says what is true after a lost connection (R379, FR-A19)", () => {
+  it("while a move runs, move/status says so; afterwards it does not", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inMove = new Promise<void>((r) => (entered = r));
+    await start({ beforeExecuteMove: async () => (entered(), gate) });
+    await openNewLibrary();
+    await newProject();
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ pending: null, running: false, failed: null });
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "a-1" } });
+    await inMove;
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ pending: null, running: true });
+    release();
+    expect((await moving).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, pending: { newRoot: join(tmp, "Moved") } });
+  });
+
+  it("a move that failed is kept with its attempt and destination, for 15 minutes or until the next move starts", async () => {
+    const clock = { now: new Date("2026-11-10T10:00:00Z") };
+    let fail = true;
+    await start({
+      now: () => clock.now,
+      beforeExecuteMove: async () => {
+        if (fail) throw new Error("the copy failed");
+      },
+    });
+    await openNewLibrary();
+    await newProject();
+    const dest = join(tmp, "Moved");
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-1" } })).body).toContain("error");
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st).toMatchObject({ running: false, pending: null, failed: { newRoot: dest, attempt: "a-1", error: { code: expect.any(String), message: expect.any(String) } } });
+    expect(JSON.stringify(st.failed)).not.toContain(join(tmp, "Lib"));
+    clock.now = new Date(clock.now.getTime() + 16 * 60_000);
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toBeNull();
+    // A new failure, then a new move: the failure is forgotten as the new move starts.
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-2" } })).body).toContain("error");
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toMatchObject({ attempt: "a-2" });
+    fail = false;
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-3" } })).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toBeNull();
+  });
+
+  it("an attempt that is not a short plain string is refused before anything starts", async () => {
+    await start();
+    await openNewLibrary();
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "x".repeat(200) } });
+    expect(r.status).toBe(400);
+    expect((await call({ url: "/libraries/move/status" })).json.running).toBe(false);
+  });
+});

@@ -58,7 +58,7 @@ describe("Move library", () => {
     expect(within(plan).queryByRole("button", { name: "Move library" })).toBeNull();
     expect(within(plan).getByRole("button", { name: "Cancel" })).toBeTruthy();
     await user.click(within(plan).getByRole("button", { name: "Move the other projects only" }));
-    await waitFor(() => expect(body).toEqual({ dest: DEST, excludeProjectIds: ["p2"] }));
+    await waitFor(() => expect(body).toEqual({ dest: DEST, excludeProjectIds: ["p2"], attempt: expect.any(String) }));
     s.end();
   });
 
@@ -181,20 +181,132 @@ describe("Move library", () => {
     expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
   });
 
-  it("a move the service could not be reached for is \"could not be started\", not a cut-off stream", async () => {
-    const user = userEvent.setup();
-    let polled = false;
-    server.use(
-      http.post(url("/libraries/move"), () => HttpResponse.error()),
-      http.get(url("/libraries/move/status"), () => {
-        polled = true;
-        return HttpResponse.json({ pending: null });
-      }),
-    );
-    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
-    await user.click(within(plan).getByRole("button", { name: "Move library" }));
-    expect((await screen.findByRole("alert")).textContent).toMatch(/The move could not be started/);
-    expect(polled).toBe(false);
+  describe("a move request that failed before the service answered asks move/status before saying anything (R379, I5)", () => {
+    const LOST = "The connection to the app's service was lost. The move may still be running. This screen will show what happened as soon as the service answers.";
+    /** The move request fails as the network does (status 0, UNAVAILABLE); its body is kept. */
+    const lostMove = (seen: { body?: any }) =>
+      http.post(url("/libraries/move"), async ({ request }) => {
+        seen.body = await request.json();
+        return HttpResponse.error();
+      });
+    async function start(user: ReturnType<typeof userEvent.setup>) {
+      server.use(http.post(url("/libraries/move/plan"), () => HttpResponse.json({ ...PLAN, perProject: [PLAN.perProject[0]!] })));
+      render(<MoveLibrary api={makeApi()} pollMs={5} maxPolls={200} />);
+      await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+      await user.click(screen.getByRole("button", { name: "Check destination" }));
+      await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+    }
+
+    it("the reviewer's probe: move/status IS asked, and while it says a move is running the false sentence is never shown; then the result", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          return HttpResponse.json(polls < 4 ? { pending: null, running: true, failed: null } : { pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-lost", expiresAt: "2026-11-11T10:15:00.000Z" }, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect(await screen.findByText("Waiting for the move to finish…")).toBeTruthy();
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
+      expect((await screen.findByRole("status", { name: "Verification" })).textContent).toMatch(/finished and was verified/);
+      expect(polls).toBeGreaterThanOrEqual(4);
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(false);
+      expect(typeof seen.body.attempt).toBe("string");
+    });
+
+    it("no move running and none made: only then \"could not be started … Nothing was copied or changed\", back to the plan", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          // An earlier move's failure (another attempt) is not this one's.
+          return HttpResponse.json({ pending: null, running: false, failed: { newRoot: DEST, attempt: "an-earlier-attempt", error: { code: "CONFLICT", message: "Old failure." } } });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert")).textContent).toMatch(/^The move could not be started: .*Nothing was copied or changed\.$/);
+      expect(screen.queryByText(/Old failure/)).toBeNull();
+      expect(polls).toBeGreaterThan(0);
+      expect(screen.getByRole("region", { name: "Move plan" })).toBeTruthy();
+    });
+
+    it("a move that finished with an error (this attempt's): its error, never \"nothing was copied\"", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () =>
+          HttpResponse.json({ pending: null, running: false, failed: { newRoot: DEST, attempt: seen.body?.attempt, error: { code: "CONFLICT", message: "A copied file did not match its original." } } }),
+        ),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert")).textContent).toMatch(/did not match its original\. The move stopped; nothing was deleted, and the library stays where it was\./);
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it("the service cannot be reached: a sentence that claims nothing about the files, and it keeps asking", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          return HttpResponse.error();
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert")).textContent).toBe(LOST);
+      const seenPolls = polls;
+      await waitFor(() => expect(polls).toBeGreaterThan(seenPolls + 2));
+      expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+      expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
+    });
+
+    it("the status request failing twice and then answering: the lost-connection sentence, then what the service says", async () => {
+      const user = userEvent.setup();
+      const seen: { body?: any } = {};
+      let polls = 0;
+      let sawLost = false;
+      server.use(
+        lostMove(seen),
+        http.get(url("/libraries/move/status"), () => {
+          polls++;
+          if (polls <= 2) return HttpResponse.error();
+          sawLost ||= screen.queryByText(LOST) !== null;
+          return HttpResponse.json({ pending: null, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert", {}, { timeout: 3000 })).textContent).toBeTruthy();
+      await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/The move could not be started/));
+      expect(sawLost).toBe(true);
+      expect(polls).toBe(3);
+    });
+
+    it("a plain refusal from the service (4xx with a reason) is shown as it is; move/status is not asked", async () => {
+      const user = userEvent.setup();
+      let polled = false;
+      server.use(
+        http.post(url("/libraries/move"), () => HttpResponse.json({ error: { code: "CONFLICT", message: "Some changes are still being made. Try the move again in a moment." } }, { status: 409 })),
+        http.get(url("/libraries/move/status"), () => {
+          polled = true;
+          return HttpResponse.json({ pending: null, running: false, failed: null });
+        }),
+      );
+      await start(user);
+      expect((await screen.findByRole("alert")).textContent).toMatch(/The move could not be started: Some changes are still being made.*Nothing was copied or changed/);
+      expect(polled).toBe(false);
+    });
   });
 
   it("matches the finished move by its destination the way the service compares paths (Windows separators and case)", async () => {
