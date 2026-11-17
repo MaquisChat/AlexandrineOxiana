@@ -62,6 +62,7 @@ import {
   ProjectLockedError,
   ReadOnlyLibraryError,
   RecoveryPendingError,
+  isDiskFull,
   ResourceMissingError,
   WorkerJobError,
   WorkerToolError,
@@ -192,6 +193,9 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return new ApiError(409, "TOOL_NOT_INSTALLED", "A tool this needs is not installed on this computer. The Optional tools screen shows how to get it.", err.tool);
   if (err instanceof WorkerJobError && err.code.startsWith("TOOL_")) return new ApiError(502, "TOOL_FAILED", "The tool could not be installed or updated. Nothing was left half-installed; try again later.", err.code);
   if (err instanceof WorkerJobError) return new ApiError(502, "INTERNAL", "The media helper could not finish the job.", err.code);
+  // R439 (1): a full disk (or a quota), by its code or one it wraps, in plain words on every route: a condition the
+  // researcher can mend and then retry (503, as the file's other "not available now" answers), no path or system text.
+  if (isDiskFull(err)) return new ApiError(503, "UNAVAILABLE", "The library's disk is full. Free some space and try again.");
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   if (code === "ENOENT" || code === "ENOTDIR") return new ApiError(404, "NOT_FOUND", "That file or folder could not be found.");
   if (code === "EACCES" || code === "EPERM") return new ApiError(409, "READ_ONLY", "That file or folder cannot be written to.");

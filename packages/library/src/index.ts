@@ -156,7 +156,7 @@ export { DEVICE_EXTENSIONS, DEVICE_RESEARCHER_NOTE, RAW_JPEG_WINDOW_MS, deviceAd
 export type { DeviceAdapterOptions, DeviceFile, DeviceGroup, DeviceImportOptions } from "./import/device.js";
 export { PROXY_ATTEMPTS, ProxyQueue, disposeProxyQueue, planProxies, proxyQueueFor, proxyTypeFor } from "./import/proxies.js";
 export type { ProxyFailure, ProxyPlan, ProxyQueueOptions, ProxyResult } from "./import/proxies.js";
-export { BULK_REASONS, BatchRefusedError, DISK_FULL_NOTE, DISK_FULL_UNDONE_NOTE, PATTERN_BUDGET_MS, RECOVERY_NOTE, adapterFor, bulkSpaceSeams, createBulkImport, folderAdapter, zipAdapter } from "./import/bulk/index.js";
+export { BULK_REASONS, BatchRefusedError, DISK_FULL_NOTE, DISK_FULL_UNDONE_NOTE, PATTERN_BUDGET_MS, RECOVERY_NOTE, adapterFor, bulkSpaceSeams, isDiskFull, createBulkImport, folderAdapter, zipAdapter } from "./import/bulk/index.js";
 export type {
   BatchCounts,
   BatchHandle,
