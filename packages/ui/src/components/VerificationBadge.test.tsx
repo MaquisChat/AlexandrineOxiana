@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FieldReview } from "@ao/shared";
 import { describe, expect, it, vi } from "vitest";
@@ -301,17 +301,22 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     expect(document.querySelector("[inert]")).toBeNull();
   });
 
-  it("focus (R145): moves in on open, Tab and Shift+Tab stay inside and wrap, and Close returns it to the badge", async () => {
+  it("focus (R145, R371 a): moves in on open to the dialog's heading (never to a control that confirms), Tab and Shift+Tab stay inside and wrap, and Close returns it to the badge", async () => {
     const user = userEvent.setup();
     render(<FieldCheck review={FIELD_ISSUED_CONFLICT} label="Date" value="2019" readOnly={false} onConfirm={noop} />);
     const badge = screen.getByRole("button", { name: "Date: Conflict" });
     await user.click(badge);
     const pop = screen.getByRole("dialog");
+    const heading = within(pop).getByRole("heading", { name: "Date: evidence" });
     const first = within(pop).getByRole("radio", { name: /2019/ });
     const close = within(pop).getByRole("button", { name: "Close" });
-    expect(document.activeElement).toBe(first);
+    expect(document.activeElement).toBe(heading);
+    expect(heading.getAttribute("tabindex")).toBe("-1");
     await user.tab({ shift: true });
     expect(document.activeElement).toBe(close);
+    await user.tab();
+    expect(document.activeElement).toBe(first);
+    heading.focus();
     await user.tab();
     expect(document.activeElement).toBe(first);
     for (let i = 0; i < 5; i++) {
@@ -341,6 +346,115 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     const pop = screen.getByRole("dialog");
     expect(pop.textContent).not.toContain("{");
     expect(pop.textContent).toContain("a value that cannot be shown as text");
+  });
+
+  describe("R371 a: the key that opened the dialog never confirms in it", () => {
+    const openConflict = () => {
+      const onConfirm = vi.fn(noop);
+      const user = userEvent.setup();
+      render(<FieldCheck review={FIELD_ISSUED_CONFLICT} label="Date" value="2019" readOnly={false} onConfirm={onConfirm} />);
+      const badge = screen.getByRole("button", { name: "Date: Conflict" });
+      badge.focus();
+      return { onConfirm, user, badge };
+    };
+
+    it("Enter held on the badge opens the dialog and confirms nothing; focus is on the heading", async () => {
+      const { onConfirm, user } = openConflict();
+      await user.keyboard("{Enter>4}{/Enter}");
+      const pop = screen.getByRole("dialog", { name: "Date: evidence" });
+      expect(document.activeElement).toBe(within(pop).getByRole("heading", { name: "Date: evidence" }));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(onConfirm).not.toHaveBeenCalled();
+    });
+
+    it("Enter twice on the badge confirms nothing (the second lands on the heading)", async () => {
+      const { onConfirm, user } = openConflict();
+      await user.keyboard("{Enter}{Enter}");
+      const pop = screen.getByRole("dialog", { name: "Date: evidence" });
+      expect(document.activeElement).toBe(within(pop).getByRole("heading", { name: "Date: evidence" }));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(onConfirm).not.toHaveBeenCalled();
+    });
+
+    it("a keyboard user loses nothing: Tab to the value, an arrow key to choose, Tab to Confirm, Enter — one confirmation", async () => {
+      const { onConfirm, user } = openConflict();
+      await user.keyboard("{Enter}");
+      const pop = screen.getByRole("dialog", { name: "Date: evidence" });
+      await user.tab();
+      expect(document.activeElement).toBe(within(pop).getByRole("radio", { name: /2019/ }));
+      await user.keyboard("{ArrowDown}");
+      const other = within(pop).getByRole("radio", { name: /2018/ }) as HTMLInputElement;
+      expect(other.checked).toBe(true);
+      await user.tab();
+      expect(document.activeElement).toBe(within(pop).getByRole("button", { name: "Confirm this value" }));
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+      expect(onConfirm).toHaveBeenCalledWith("/issued", "2018");
+    });
+
+    it("Space chooses a value as well, and Enter on the chosen value confirms it once", async () => {
+      const { onConfirm, user } = openConflict();
+      await user.keyboard("{Enter}");
+      const pop = screen.getByRole("dialog", { name: "Date: evidence" });
+      await user.tab();
+      const other = within(pop).getByRole("radio", { name: /2018/ }) as HTMLInputElement;
+      other.focus();
+      await user.keyboard(" ");
+      expect(other.checked).toBe(true);
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+      expect(onConfirm).toHaveBeenCalledWith("/issued", "2018");
+    });
+
+    it("a repeated keydown inside the dialog never submits (its default is prevented on a value and on Confirm)", async () => {
+      const { onConfirm, user } = openConflict();
+      await user.click(screen.getByRole("button", { name: "Date: Conflict" }));
+      const pop = screen.getByRole("dialog", { name: "Date: evidence" });
+      const radio = within(pop).getByRole("radio", { name: /2019/ });
+      const confirm = within(pop).getByRole("button", { name: "Confirm this value" });
+      expect(fireEvent.keyDown(radio, { key: "Enter", code: "Enter", repeat: true })).toBe(false);
+      expect(fireEvent.keyDown(confirm, { key: "Enter", code: "Enter", repeat: true })).toBe(false);
+      expect(fireEvent.keyDown(confirm, { key: " ", code: "Space", repeat: true })).toBe(false);
+      expect(onConfirm).not.toHaveBeenCalled();
+      // A fresh press is taken.
+      radio.focus();
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+    });
+
+    it("a key already down when the dialog opened does not count until it has been released", async () => {
+      const { onConfirm, user } = openConflict();
+      await user.keyboard("{Enter>}");
+      const pop = screen.getByRole("dialog", { name: "Date: evidence" });
+      const radio = within(pop).getByRole("radio", { name: /2019/ });
+      radio.focus();
+      // The same key, still down (a platform that does not mark its repeat): not taken.
+      expect(fireEvent.keyDown(radio, { key: "Enter", code: "Enter" })).toBe(false);
+      expect(onConfirm).not.toHaveBeenCalled();
+      // Released, then pressed: taken, once.
+      await user.keyboard("{/Enter}");
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      expect(onConfirm).toHaveBeenCalledWith("/issued", "2019");
+    });
+
+    it("a mouse double click on the badge confirms nothing", async () => {
+      const { onConfirm, user, badge } = openConflict();
+      await user.dblClick(badge);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(onConfirm).not.toHaveBeenCalled();
+    });
+
+    it("Escape closes it from the heading and focus returns to the badge", async () => {
+      const { onConfirm, user, badge } = openConflict();
+      await user.keyboard("{Enter}");
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      await waitFor(() => expect(document.activeElement).toBe(badge));
+      expect(onConfirm).not.toHaveBeenCalled();
+    });
   });
 
   it("identifiers are confirmable one at a time, never as the whole object (re-review N3, R149)", () => {

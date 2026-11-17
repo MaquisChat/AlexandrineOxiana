@@ -12,9 +12,15 @@
  * while it is open, focus moves in, Tab and Shift+Tab stay inside, Escape closes (not while saving)
  * and focus returns to the badge. A failed save leaves it open with the choice and the typed text,
  * and says why.
+ *
+ * The key that opened it never confirms in it (R371 a; R313 b's held key): focus starts on its
+ * heading, not on the first value (Enter on a value submits the form); inside it a repeated keydown
+ * of Enter or Space never acts, and a key that was already down when it opened (`heldAtOpen`, from
+ * the badge) does not count until it has been released. So a held Enter, or Enter pressed twice on
+ * the badge, reads nothing as a choice; Tab, then Space or the arrow keys, then Confirm, decides.
  */
 import { CONFIRMABLE_IDENTIFIER_KEYS, type FieldReview } from "@ao/shared";
-import { useId, useState, type FormEvent } from "react";
+import { useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
 import { statusWords } from "./VerificationBadge";
@@ -110,12 +116,34 @@ export interface FieldEvidencePopoverProps {
   /** Posts `review.field` unchanged with the chosen value; throws with a plain-language message when not saved. */
   onConfirm: (field: string, value: unknown) => Promise<void>;
   onClose: () => void;
+  /** Keys (KeyboardEvent.key) that were down when the dialog opened: none of them counts until released. */
+  heldAtOpen?: readonly string[];
 }
+
+/** Enter submits from any control; Space presses a button or a value (in a text field it types). */
+const acts = (e: KeyboardEvent): boolean => e.key === "Enter" || (e.key === " " && !(e.target instanceof HTMLInputElement && e.target.type !== "radio" && e.target.type !== "checkbox"));
 
 type Choice = { key: string; text: string; from: string; value: unknown };
 
-export function FieldEvidencePopover({ review, label, value, readOnly, onConfirm, onClose }: FieldEvidencePopoverProps) {
+export function FieldEvidencePopover({ review, label, value, readOnly, onConfirm, onClose, heldAtOpen = [] }: FieldEvidencePopoverProps) {
   const id = useId();
+  const heading = useRef<HTMLHeadingElement>(null);
+  // Keys down since before the dialog opened, and keys pressed down inside it (R371 a).
+  const held = useRef(new Set(heldAtOpen));
+  const pressed = useRef(new Set<string>());
+  const onKeyDownCapture = (e: KeyboardEvent) => {
+    if (e.repeat || held.current.has(e.key) || pressed.current.has(e.key)) {
+      if (acts(e)) e.preventDefault();
+      return;
+    }
+    pressed.current.add(e.key);
+  };
+  const onKeyUpCapture = (e: KeyboardEvent) => {
+    // A key whose press this dialog never took (it went down before it opened) is not a press here.
+    if (!pressed.current.has(e.key) && acts(e)) e.preventDefault();
+    pressed.current.delete(e.key);
+    held.current.delete(e.key);
+  };
   const field = review.field;
   const confirmable = isConfirmable(field);
   const typable = confirmable && TYPABLE.has(field);
@@ -163,9 +191,9 @@ export function FieldEvidencePopover({ review, label, value, readOnly, onConfirm
   const listed = competing.filter((c) => !(asChoices && choices.includes(c)));
 
   return (
-    <DialogShell labelledBy={`${id}-t`} onCancel={onClose} busy={saving}>
-      <div className="ao-evidence">
-        <h2 id={`${id}-t`} className="ao-evidence__title">
+    <DialogShell labelledBy={`${id}-t`} onCancel={onClose} busy={saving} initialFocus={heading}>
+      <div className="ao-evidence" onKeyDownCapture={onKeyDownCapture} onKeyUpCapture={onKeyUpCapture}>
+        <h2 id={`${id}-t`} ref={heading} tabIndex={-1} className="ao-evidence__title">
           <UserText>{label}</UserText>: evidence
         </h2>
         <p>

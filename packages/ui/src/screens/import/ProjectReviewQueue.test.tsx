@@ -2,7 +2,7 @@
  * The project's whole review queue (Task 67, D14, R172): every pending entry of every kind, grouped
  * so a person can tell them apart, each decided by the library's own decision for its kind.
  */
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewItem } from "../../api/import";
@@ -164,6 +164,68 @@ describe("the project's whole review queue (Task 67)", () => {
     const done = await screen.findByRole("button", { name: "Title: Confirmed by you" });
     await waitFor(() => expect(document.activeElement).toBe(done));
     expect(m.calls.filter((c) => c.path.startsWith("/review/"))).toHaveLength(0);
+  });
+
+  describe("R371 a: the key that opened a field's dialog never confirms the value unread (the review's probe)", () => {
+    const openEntry3 = async () => {
+      const s = setup();
+      await s.user.click(await screen.findByRole("button", { name: "Show Entry 3" }));
+      const badge = await screen.findByRole("button", { name: "Title: Conflict" });
+      badge.focus();
+      return { ...s, badge };
+    };
+    const patches = (m: ReturnType<typeof setup>["m"]) => m.bodies(`PATCH /projects/${P1}/sources/s3/fields`);
+
+    it("Enter held on the badge sends no request; the dialog is open on its heading", async () => {
+      const { m, user } = await openEntry3();
+      await user.keyboard("{Enter>4}{/Enter}");
+      const dialog = await screen.findByRole("dialog", { name: "Title: evidence" });
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Title: evidence" }));
+      await new Promise((r) => setTimeout(r, 50));
+      expect(patches(m)).toHaveLength(0);
+    });
+
+    it("Enter twice on the badge sends no request; then Tab, an arrow key, Tab and Enter send ONE", async () => {
+      const { m, user } = await openEntry3();
+      await user.keyboard("{Enter}{Enter}");
+      const dialog = await screen.findByRole("dialog", { name: "Title: evidence" });
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Title: evidence" }));
+      await new Promise((r) => setTimeout(r, 50));
+      expect(patches(m)).toHaveLength(0);
+      await user.tab();
+      expect(document.activeElement).toBe(within(dialog).getByRole("radio", { name: /recorded here/ }));
+      await user.keyboard("{ArrowDown}");
+      expect((within(dialog).getByRole("radio", { name: /Entry three, revised/ }) as HTMLInputElement).checked).toBe(true);
+      await user.tab();
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Confirm this value" }));
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(patches(m)).toEqual([{ field: "/title", value: { variants: [{ lang: "en", kind: "original", value: "Entry three, revised" }] } }]);
+    });
+
+    it("a mouse double click on the badge sends no request", async () => {
+      const { m, user, badge } = await openEntry3();
+      await user.dblClick(badge);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(patches(m)).toHaveLength(0);
+    });
+
+    it("the withdrawal's dialog needs a typed reason, so it is left as it is: Enter held on its opener sends nothing, and an empty submit is refused", async () => {
+      const { m, user } = setup();
+      await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
+      const open = await screen.findByRole("button", { name: "Reviewed after the withdrawal…" });
+      open.focus();
+      await user.keyboard("{Enter>4}{/Enter}");
+      const dialog = await screen.findByRole("dialog", { name: "Reviewed after the withdrawal" });
+      const reason = within(dialog).getByRole("textbox", { name: /Your reason/ }) as HTMLTextAreaElement;
+      // Its first focus is the reason, as before; the held Enter typed only line breaks, which are no reason.
+      expect(document.activeElement).toBe(reason);
+      const submit = within(dialog).getByRole("button", { name: "Record the decision" }) as HTMLButtonElement;
+      expect(submit.disabled).toBe(true);
+      fireEvent.submit(submit.closest("form")!);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(m.calls.filter((c) => c.path.endsWith("/reviewed-after-withdrawal"))).toHaveLength(0);
+    });
   });
 
   it("an import entry with a conflicting field shows its badge too, confirmed through the same confirm, and is then decided as an import item", async () => {

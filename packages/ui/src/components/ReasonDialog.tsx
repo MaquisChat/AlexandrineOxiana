@@ -5,16 +5,21 @@
  * cancels (not while the action runs), Tab stays inside and skips disabled controls. The dialog is
  * rendered on <body> and everything else is made inert while it is open (R117).
  */
-import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 
 const FOCUSABLE = "textarea:not([disabled]), input:not([disabled]), select:not([disabled]), button:not([disabled])";
 
-export function useTrap(onCancel: () => void, busy = false) {
+/**
+ * `initialFocus` (R371 a): an element of the dialog to focus on open instead of its first field —
+ * its heading (tabIndex -1) for a dialog whose first control would decide on Enter. Shift+Tab from
+ * that element goes to the dialog's last control; Tab goes on to the first in the page's order.
+ */
+export function useTrap(onCancel: () => void, busy = false, initialFocus?: RefObject<HTMLElement | null>) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const before = document.activeElement as HTMLElement | null;
-    ref.current?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+    (initialFocus?.current ?? ref.current?.querySelector<HTMLElement>(FOCUSABLE))?.focus();
     return () => before?.focus?.();
   }, []);
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -31,7 +36,10 @@ export function useTrap(onCancel: () => void, busy = false) {
     }
     const first = items[0]!;
     const last = items[items.length - 1]!;
-    if (e.shiftKey && document.activeElement === first) {
+    if (e.shiftKey && initialFocus?.current && document.activeElement === initialFocus.current) {
+      e.preventDefault();
+      last.focus();
+    } else if (e.shiftKey && document.activeElement === first) {
       e.preventDefault();
       last.focus();
     } else if (!e.shiftKey && document.activeElement === last) {
@@ -43,8 +51,8 @@ export function useTrap(onCancel: () => void, busy = false) {
 }
 
 /** Renders on <body>; every other child of <body> is inert while the dialog is open. */
-export function DialogShell({ labelledBy, describedBy, onCancel, busy, className, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; className?: string; children: ReactNode }) {
-  const { ref, onKeyDown } = useTrap(onCancel, busy);
+export function DialogShell({ labelledBy, describedBy, onCancel, busy, className, initialFocus, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; className?: string; initialFocus?: RefObject<HTMLElement | null>; children: ReactNode }) {
+  const { ref, onKeyDown } = useTrap(onCancel, busy, initialFocus);
   const [host] = useState(() => document.createElement("div"));
   // A layout effect: the host must be in the document before useTrap's effect moves focus into the dialog.
   useLayoutEffect(() => {
