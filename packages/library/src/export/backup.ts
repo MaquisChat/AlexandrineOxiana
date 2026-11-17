@@ -1646,6 +1646,7 @@ async function projectIdIn(repo: Repo, abs: string): Promise<string | undefined>
     return typeof own === "string" ? own : undefined;
   } catch (err) {
     // Locked meanwhile (R435 b): answered as for a project locked from the start, not run without its maintenance lock.
+    // Defensive (R443 d, no test): without it the restore's key check answers locked too, but an unlock before that check would restore without the maintenance lock.
     if (await lockedMeanwhile(repo, abs, err, (id) => keyFromRing(repo, id))) throw lockedBackup();
     return undefined;
   } finally {
