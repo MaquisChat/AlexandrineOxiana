@@ -413,11 +413,12 @@ async function destroyRawLocked(repo: Repo, hold: MaintenanceHold, projectId: st
       })),
       trashedCopies: strays.map((p) => toRel(root, p)),
       backups: { status: initialStatus, containing, deleted: [] } satisfies CertificateBackups,
-      // Always said (R409 b): "none known to this computer" when this computer's list names none that holds them.
+      // Always said (R409 b): "none known to this computer" when this computer's list names no old copy of
+      // this library, "none known to this computer holds the destroyed data" when it names some and none does (R428 2).
       oldCopies: {
         status: copies.unchecked ? "unknown-pending" : copiesSaid ? "pending" : "none",
         notDestroyed: copies.notDestroyed.map((c) => ({ movedAt: c.movedAt, moveId: c.moveId })),
-        note: oldCopiesSentence(copies.notDestroyed, copies.unchecked, tz),
+        note: oldCopiesSentence(copies.notDestroyed, copies.unchecked, copies.known, tz),
       },
       notice: DESTRUCTION_NOTICE,
     }),
@@ -1250,6 +1251,12 @@ function bounded(root: string, look: () => Promise<OldPlaceLook>): Promise<OldPl
   return Promise.race([run, limit]).finally(() => clearTimeout(timer));
 }
 
+/** The places a record names that hold an old copy: its old root, and an unfinished move's destination; never the current library's own folder. */
+function placesOf(currentRoot: string, rec: PendingOldCopy): Set<string> {
+  const here = resolve(currentRoot);
+  return new Set([rec.oldRoot, ...(!rec.complete && typeof rec.newRoot === "string" ? [rec.newRoot] : [])].map((x) => resolve(x)).filter((x) => x !== here));
+}
+
 /**
  * A look at the old copy a record names, for one destruction's data, each place bounded in time.
  * The library's own folder is never an old copy of itself (a move A→B→A). For a move that has not
@@ -1257,10 +1264,8 @@ function bounded(root: string, look: () => Promise<OldPlaceLook>): Promise<OldPl
  * copy too and is looked at (R409 e, M3).
  */
 async function oldCopyLook(currentRoot: string, rec: PendingOldCopy, what: DestroyedData): Promise<OldPlaceLook> {
-  const here = resolve(currentRoot);
-  const places = [rec.oldRoot, ...(!rec.complete && typeof rec.newRoot === "string" ? [rec.newRoot] : [])].map((x) => resolve(x)).filter((x) => x !== here);
   let unsure = false;
-  for (const root of new Set(places)) {
+  for (const root of placesOf(currentRoot, rec)) {
     const look = await bounded(root, () => lookAtPlace(root, what));
     if (look === "holds") return "holds";
     if (look === "cannot-tell") unsure = true;
@@ -1332,21 +1337,25 @@ export async function pruneDeletedOldCopy(deps: { appConfigDir: string; clock: (
   await removePendingOldCopy(deps, id);
 }
 
-/** The listed old copies of this library that hold any of `paths`, or cannot be looked at; `unchecked` when the list cannot be read (never "none"). */
-async function holdingOldCopies(repo: Repo, what: DestroyedData): Promise<{ notDestroyed: Array<OldCopyRef & { id: string }>; unchecked: boolean }> {
+/**
+ * The listed old copies of this library that hold any of `paths`, or cannot be looked at; `unchecked`
+ * when the list cannot be read (never "none"); `known` when this computer's list names an old copy of
+ * this library at all (R428 2: "none known" is said only when it names none).
+ */
+async function holdingOldCopies(repo: Repo, what: DestroyedData): Promise<{ notDestroyed: Array<OldCopyRef & { id: string }>; unchecked: boolean; known: boolean }> {
   const lib = repoLibrary(repo);
   let records: PendingOldCopy[];
   try {
     const list = await oldCopiesOfLibrary({ appConfigDir: lib.appConfigDir, clock: repoClock(repo) }, lib.id);
     // A damaged list (or a record without a usable place) is not "none" either (R409 b).
-    if (list.damaged) return { notDestroyed: [], unchecked: true };
+    if (list.damaged) return { notDestroyed: [], unchecked: true, known: false };
     records = list.records;
   } catch {
-    return { notDestroyed: [], unchecked: true };
+    return { notDestroyed: [], unchecked: true, known: false };
   }
   const out: Array<OldCopyRef & { id: string }> = [];
   for (const r of records) if ((await oldCopyLook(lib.root, r, what)) !== "none") out.push(refOf(r));
-  return { notDestroyed: out, unchecked: false };
+  return { notDestroyed: out, unchecked: false, known: records.some((r) => placesOf(lib.root, r).size > 0) };
 }
 
 /** How a destruction records an old copy: a record with no date or a bad one (damaged by hand) gives "" (R409 e, M1). */
@@ -1356,16 +1365,19 @@ const refOf = (r: PendingOldCopy): OldCopyRef & { id: string } => ({ id: r.id, m
 const moveDate = (movedAt: string, tz: string | undefined): string | undefined =>
   Number.isNaN(Date.parse(movedAt)) ? undefined : formatModified(new Date(movedAt), tz).slice(0, 10);
 
-/** The certificate's line when this computer's list names no old copy that holds the destroyed data (R409 b). */
+/** The certificate's line when this computer's list names no old copy of this library (R409 b). */
 export const OLD_COPIES_NONE = "Old copies of the library left by a move: none known to this computer.";
 
-/** The certificate's plain words about its old copies (R379). */
-function oldCopiesSentence(copies: readonly OldCopyRef[], unchecked: boolean, tz: string | undefined): string {
+/** The certificate's line when this computer's list names old copies of this library and none holds the destroyed data (R428 2). */
+export const OLD_COPIES_NONE_HOLDS = "Old copies of the library left by a move: none known to this computer holds the destroyed data.";
+
+/** The certificate's plain words about its old copies (R379); `anyKnown`: this computer's list names an old copy of this library (R428 2). */
+function oldCopiesSentence(copies: readonly OldCopyRef[], unchecked: boolean, anyKnown: boolean, tz: string | undefined): string {
   if (unchecked) {
     return "This computer's list of old copies of this library left by a move could not be read, so whether such a copy still holds the destroyed data could not be checked. Any that does was not destroyed.";
   }
   const n = copies.length;
-  if (n === 0) return OLD_COPIES_NONE;
+  if (n === 0) return anyKnown ? OLD_COPIES_NONE_HOLDS : OLD_COPIES_NONE;
   const known = copies.map((c) => moveDate(c.movedAt, tz));
   const dates = [...new Set(known.filter((d): d is string => d !== undefined))];
   const unknown = known.length - known.filter((d) => d !== undefined).length;

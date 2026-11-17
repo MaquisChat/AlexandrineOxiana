@@ -183,7 +183,8 @@ describe("FR-A16: old copies of the library left by a move, at a destruction", (
     await rm(join(kit.lib.root, ...repo.getProject(p.id).folder.split("/")), { recursive: true, force: true });
     kit.clock.now = DUE;
     const r = await destroyRaw(repo, p.id, [asset.id], "tester");
-    expect(r.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: "Old copies of the library left by a move: none known to this computer." }); // the line every certificate has (R409 b)
+    // An old copy is known to this computer, and none holds the data (R428 2).
+    expect(r.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: "Old copies of the library left by a move: none known to this computer holds the destroyed data." }); // the line every certificate has (R409 b)
     expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
   });
 
@@ -572,4 +573,29 @@ describe("R409 (e): the minor points", () => {
       oldCopyLookSeams.hang = undefined;
     }
   }, 60_000);
+});
+
+describe("R429: old copies of a moved library and a destruction's certificate (round 3)", () => {
+  const listFile = () => join(kit.lib.appConfigDir, "pending-old-copies.json");
+  const NONE = "Old copies of the library left by a move: none known to this computer.";
+  const NONE_HOLDS = "Old copies of the library left by a move: none known to this computer holds the destroyed data.";
+
+  it("(a) R428 2: old copies known to this computer, none holding the data: the line says none known holds it; no copy known: 'none known'", async () => {
+    const p = await makeProject(kit, GOV, false, "Interviews");
+    const asset = (await rawSource(p)).assets[0]!;
+    const second = (await addSource(kit, p, { type: "interview", title: "Interview two", identifiable: true, files: [{ path: await scratchFile(kit, "two.mp3", "second raw"), role: "original", handling: "copy" }] })).assets[0]!;
+    const dest = join(kit.tmp, "Moved");
+    await executeMove(kit.lib, dest, { deps: deps(), env: env(), sourceRepo: kit.repo });
+    const repo = await openAt(dest);
+    await rm(join(kit.lib.root, ...repo.getProject(p.id).folder.split("/")), { recursive: true, force: true });
+    kit.clock.now = DUE;
+    const r = await destroyRaw(repo, p.id, [asset.id], "tester");
+    expect(r.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: NONE_HOLDS });
+    expect(await readFile(r.certificatePath, "utf8")).toContain(NONE_HOLDS);
+    expect(await projectWarnings(repo, p.id)).not.toContain(WARNING);
+    // This computer's list emptied: no old copy known, the first sentence.
+    await writeFile(listFile(), JSON.stringify({ records: [] }));
+    const r2 = await destroyRaw(repo, p.id, [second.id], "tester");
+    expect(r2.original.oldCopies).toEqual({ status: "none", notDestroyed: [], note: NONE });
+  });
 });
