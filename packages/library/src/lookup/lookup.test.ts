@@ -541,5 +541,15 @@ describe("lookupContextFor", () => {
     expect(a).toMatchObject({ projectId: plain.project.id, actor: "tester", sensitive: false });
     expect(a.policy?.processing.metadata_lookup).toEqual(["openalex"]);
     expect(b.sensitive).toBe(true);
+    // R379: title searches only where the project's rules say it holds no identifiable data.
+    expect(a.titleSearchAllowed).toBe(true);
+    const def = await repo.createProject({ name: "Default", governanceYaml: "", encryption: { enabled: true, passphrase: "pw" } });
+    const ident = await repo.createProject({
+      name: "Identifiable",
+      governanceYaml: "identifiability:\n  containsIdentifiable: true\n  pseudonymizeFileNames: false\nencryption:\n  atRest: optional\n",
+      encryption: { enabled: false },
+    });
+    expect((await lookupContextFor(repo, def.project.id, http)).titleSearchAllowed).toBe(false);
+    expect((await lookupContextFor(repo, ident.project.id, http)).titleSearchAllowed).toBe(false);
   });
 });

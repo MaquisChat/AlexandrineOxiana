@@ -39,7 +39,9 @@
  * metadata or a sidecar file are trusted as given.
  *
  * Lookups run only through the LookupContext the caller built with `lookupContextFor` (policy per
- * provider, sensitive for encrypted projects); `null` means no lookups at all.
+ * provider, sensitive for encrypted projects); `null` means no lookups at all. Title searches (steps
+ * 5 and 6) are made only when the context allows them (`titleSearchAllowed`: the project holds no
+ * identifiable data) and never for an audio, video or image file (R379).
  */
 import { basename, extname } from "node:path";
 import {
@@ -315,8 +317,10 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
    * R379 (i): an audio, video or image file is never searched for by title (steps 5 and 6): its
    * name and embedded title may name a participant, and a bibliographic search means nothing for
    * it. Decided by the sniffed type; an item with no file (mime "") is not a media file.
+   * R379 (ii): nor is any item searched for by title unless the lookup context allows it (the
+   * project's rules say it holds no identifiable data). Identifier look-ups (step 3) stay.
    */
-  const titleSearch = !!lookup && !LOCATED_MEDIA.test(mime);
+  const titleSearch = lookup?.titleSearchAllowed === true && !LOCATED_MEDIA.test(mime);
   /** Title search; returns the best result and its similarity (results kept as candidates, best first). */
   const search = async (title: string, creator: string | undefined): Promise<{ best?: LookupResult; sim: number }> => {
     const q = `${title}\u0000${creator ?? ""}`.toLowerCase();
