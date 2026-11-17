@@ -42,8 +42,12 @@ const TITLES: Array<[string, boolean, string?]> = [
   ["slides.pptx", false],
   ["C:\\Users\\jane\\Documents\\draft", false],
   ["/Users/jane/Documents/draft", false],
-  ["Okafor Lagos Markets", false, "okafor lagos markets.pdf"],
-  ["LAGOS-MARKETS", false, "lagos-markets.pdf"],
+  // R446: only a title equal to the file's name character for character is no title; one that differs in its capitals is kept.
+  ["Okafor Lagos Markets", true, "okafor lagos markets.pdf"],
+  ["LAGOS-MARKETS", true, "lagos-markets.pdf"],
+  ["Weir Accounts", true, "Weir accounts.pdf"], // differs from the file's name in its capitals: someone's spelling of the title (R446)
+  ["Weir accounts", false, "Weir accounts.pdf"], // the file's name itself
+  ["WEIR ACCOUNTS", true, "weir accounts.PDF"], // capitals differ again: kept (R446)
   // Stock texts programs leave there.
   ["Untitled", false],
   ["untitled", false],
@@ -206,8 +210,9 @@ describe("looksLikeTitle (R394 a)", () => {
   it.each(TITLES)("%j → kept: %s", (title, kept, fileName) => {
     expect(looksLikeTitle(title, fileName)).toBe(kept);
   });
-  it("the file's own name is compared without its extension and without regard to case", () => {
-    expect(looksLikeTitle("Field Notes", "FIELD NOTES.PDF")).toBe(false);
+  it("the file's own name is compared without its extension, character for character (R446)", () => {
+    expect(looksLikeTitle("Field Notes", "FIELD NOTES.PDF")).toBe(true);
+    expect(looksLikeTitle("FIELD NOTES", "FIELD NOTES.PDF")).toBe(false);
     expect(looksLikeTitle("Field Notes", "field notes on market days.pdf")).toBe(true);
     expect(looksLikeTitle("Field Notes")).toBe(true);
   });

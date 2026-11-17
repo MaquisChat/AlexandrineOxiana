@@ -167,7 +167,8 @@ const MAX_IDENTIFIER_CHARS = 200;
 
 /**
  * Whether an embedded title looks like a title (R394 a). `fileName`: the file's own name, compared (without its
- * extension and without regard to case) with the title. A title of digits only ("1984") is dropped too: as an
+ * extension) with the title: a title that IS the file's name, character for character after the folding, is not a
+ * title; one that differs, even only in its capitals, is kept (R446). A title of digits only ("1984") is dropped too: as an
  * embedded title it cannot be told from a code, and the reference manager or the file name will name such a work.
  */
 export function looksLikeTitle(raw: string, fileName?: string): boolean {
@@ -179,7 +180,7 @@ export function looksLikeTitle(raw: string, fileName?: string): boolean {
   if (fileName) {
     const base = fileName.replace(/^.*[\\/]/u, "");
     const stem = fold(base.includes(".") ? base.slice(0, base.lastIndexOf(".")) : base);
-    if (stem && stem.toLowerCase() === s.toLowerCase()) return false;
+    if (stem && stem === s) return false;
   }
   if (STOCK_TITLE.test(bare(s)) || STOCK_PREFIX.test(s) || WEB_OR_MAIL.test(s) || DATE_ONLY.test(s) || SCANNER_STAMP.test(s)) return false;
   if (mostlyDigitsAndPunctuation(s)) return false;
