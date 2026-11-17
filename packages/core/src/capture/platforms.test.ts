@@ -368,11 +368,9 @@ describe("removing a parameter leaves the rest of the query as written (R391 b; 
     expect(classifyUrl("https://ex.example.org/p?q=a+b&utm_source=x&empty=&print").canonicalUrl).toBe("https://ex.example.org/p?q=a+b&empty=&print");
   });
 
-  it("10,000 parameters are cleaned in one pass, well under a second", () => {
+  it("10,000 parameters are cleaned (one pass: held by counting work in platforms-onepass.test.ts, R415 f)", () => {
     const q = Array.from({ length: 10_000 }, (_, i) => (i % 2 ? `p${i}_token=${KEY}` : `utm_x${i}=1`)).join("&");
-    const t0 = performance.now();
     const c = classifyUrl(`https://ex.example.org/p?keep=1&${q}`);
-    expect(performance.now() - t0).toBeLessThan(1000);
     expect(c.canonicalUrl).toBe("https://ex.example.org/p?keep=1");
   });
 });
