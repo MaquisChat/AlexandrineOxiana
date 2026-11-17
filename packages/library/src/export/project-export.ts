@@ -41,13 +41,13 @@ import {
   type Creator,
   type SourceFile,
 } from "@ao/core";
-import { KeyNotAvailableError, decryptStream } from "../crypto/format.js";
+import { decryptStream } from "../crypto/format.js";
 import { extractMetadata } from "../extract/index.js";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
 import { LOCATED_MEDIA, mayHaveLocation } from "../import/resolve.js";
 import { stricterLocation, type LocationMode } from "../repo/assets.js";
-import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
+import { PolicyDeniedError, isLockedRefusal } from "../repo/errors.js";
 import { foldName, namesIn } from "../repo/io.js";
 import {
   appendLibraryEvent,
@@ -250,7 +250,8 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
     return await exportInner(repo, projectId, dest);
   } catch (err) {
     if (err instanceof ExportDestinationError || err instanceof PolicyDeniedError || err instanceof ExportFailedError) throw err;
-    if (err instanceof KeyNotAvailableError || err instanceof ProjectLockedError) throw err;
+    // Only a lock is "locked" (R435 d): a file sealed under another key id is damage, an ExportFailedError.
+    if (isLockedRefusal(err)) throw err;
     const code = (err as NodeJS.ErrnoException)?.code;
     throw new ExportFailedError(typeof code === "string" && /^[A-Z_]{2,32}$/u.test(code) ? code : undefined);
   }

@@ -6,7 +6,7 @@
  * - the audit screen maps a refusal met while reading sealed reasons to "locked" (repo/repo.ts, `withProjectReasons`'s
  *   `failed`), also when the key is not yet wiped (a lock pending while a change is held);
  * - the viewing-proxy runner keeps a job pending when its check is read under a wiped key (import/proxies.ts, the
- *   `KeyNotAvailableError` in `runJob`'s catch);
+ *   `isLockedRefusal` in `runJob`'s catch; a check under another key id fails the job, R435 d);
  * - the turn identity: while a lock is pending only the running turn gets the key; a callback started by an earlier
  *   turn does not (repo/state.ts, `admitsOnlyRunningTurn`).
  * The review queue's and the batch journal's rethrows are held by the harness (lock-mid-read.test.ts, the rows
@@ -183,5 +183,43 @@ describe("R404 (d): the guards of R386 have tests", () => {
     await h.done;
     await lock;
     expect(fromEarlier).toBeInstanceOf(ProjectLockedError);
+  });
+});
+
+describe("R435 d: only a lock is 'locked': a file sealed under another key id is damage", () => {
+  const FOREIGN_ID = "0b1c2d3e-4f50-4a61-8b72-93a4b5c6d7e8";
+  const foreignKey = Buffer.alloc(32, 9);
+
+  it("the export: one stored original rewritten under a foreign key fails as damaged, not locked", async () => {
+    const { exportProjectOpenFormats, ExportFailedError } = await import("../export/project-export.js");
+    const p = await makeProject(kit, GOV, true);
+    const f = await scratchFile(kit, "doc.pdf", "%PDF-1.4\nbody\n%%EOF\n");
+    const sf = await addSource(kit, p, { title: "S", files: [{ path: f, role: "original", handling: "copy" }] });
+    const abs = join(kit.lib.root, ...sf.assets[0]!.path.split("/"));
+    await writeFile(abs, await encryptBytes(foreignKey, FOREIGN_ID, Buffer.from("%PDF-1.4\nother\n%%EOF\n")));
+    const out = await scratchFile(kit, "out/.keep", "");
+    const err = await exportProjectOpenFormats(kit.repo, p.id, join(out, "..", "export")).then(() => "done", (e: unknown) => e);
+    expect(err).toBeInstanceOf(ExportFailedError);
+    expect(kit.repo.isUnlocked(p.id)).toBe(true);
+  });
+
+  it("the viewing-proxy runner: a check sealed under a foreign key fails the job, it does not stay pending", async () => {
+    const p = await makeProject(kit, GOV, true);
+    const jpg = await scratchFile(kit, "photo.jpg", Buffer.from([0xff, 0xd8, 0xff, 0xe0, ...Buffer.alloc(64, 1), 0xff, 0xd9]));
+    const sf = await addSource(kit, p, { type: "image", title: "Photo", files: [{ path: jpg, role: "original", handling: "copy" }] });
+    const job = { id: newId(), type: "image.proxy" as const, assetId: sf.assets[0]!.id, location: "keep" as const, queuedAt: "2026-11-10T09:30:00.000Z" };
+    await editPendingProxies(kit.repo, p.id, sf.source.id, () => [job]);
+    const worker = {
+      async submit(_projectId: string, w: { output: string }) {
+        await mkdir(join(w.output, ".."), { recursive: true });
+        await writeFile(w.output, await encryptBytes(foreignKey, FOREIGN_ID, Buffer.alloc(64, 2)));
+        return { files: [w.output], encrypted: true };
+      },
+    } as unknown as WorkerClient;
+    const q = new ProxyQueue({ repo: kit.repo, worker, sleep: async () => {} });
+    const results = await q.resumePending(p.id);
+    expect(results.map((r) => r.code)).not.toContain("PENDING");
+    expect(results.map((r) => r.ok)).toEqual([false]);
+    await q.dispose();
   });
 });
