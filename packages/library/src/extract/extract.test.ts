@@ -419,7 +419,7 @@ describe("R394: an embedded title or author is kept only when it looks like one"
 
   it("an embedded title that is the file's own name is dropped", async () => {
     const p = join(tmp, "Field Notes Draft.pdf");
-    await writeFile(p, await pdfWith({ info: "field notes draft" }));
+    await writeFile(p, await pdfWith({ info: "Field Notes Draft" }));
     expect((await extractMetadata(p, "application/pdf")).title).toBeUndefined();
   });
 
