@@ -73,23 +73,30 @@ const ROW_MS = 30 * 60_000;
  * hang, reported at once with its row and opening — the row's own limit (ROW_MS) is for a slow machine, not a hang.
  */
 const READ_MS = 120_000;
+/** R455 M3: and each whole reading with a lock point must end within this long from its start (a hang before its lock). */
+const WHOLE_MS = 300_000;
 class ReadingHung extends Error {}
 
 /**
  * A limit on one reading: armed (once), it rejects `race` READ_MS later with "<what> within 120 s<when>: a hang"
  * (e.g. "<row>: the reading did not end within 120 s after the lock landed at opening 3: a hang").
  */
-function hangLimit(): { arm(what: string, when?: string): void; race<T>(p: Promise<T>): Promise<T>; clear(): void } {
+function hangLimit(whole?: () => string): { arm(what: string, when?: string): void; race<T>(p: Promise<T>): Promise<T>; clear(): void } {
   let fail!: (e: Error) => void;
   const hung = new Promise<never>((_r, j) => (fail = j));
   hung.catch(() => {});
   let t: NodeJS.Timeout | undefined;
+  // With `whole`: "<whole()> within 300 s (the lock had not landed yet | the lock landed at opening N): a hang".
+  const w = whole ? setTimeout(() => fail(new ReadingHung(`${whole()}: a hang`)), WHOLE_MS) : undefined;
   return {
     arm(what, when = "") {
       t ??= setTimeout(() => fail(new ReadingHung(`${what} within ${READ_MS / 1000} s${when}: a hang`)), READ_MS);
     },
     race: (p) => Promise.race([p, hung]),
-    clear: () => clearTimeout(t),
+    clear: () => {
+      clearTimeout(t);
+      clearTimeout(w);
+    },
   };
 }
 
@@ -215,7 +222,9 @@ async function cold(row: Row, lockAt?: number): Promise<{ outcome: { ok: unknown
   await row.prepare?.(c);
   let openings = 0;
   let lock: Promise<void> | undefined;
-  const limit = hangLimit();
+  const limit = hangLimit(
+    lockAt === undefined ? undefined : () => `${row.name}: the reading did not end within ${WHOLE_MS / 1000} s (${lock ? `the lock landed at opening ${lockAt}` : "the lock had not landed yet"})`,
+  );
   if (lockAt === undefined) limit.arm(`${row.name}: the reading did not end`);
   openingSeam.onOpen = () => {
     openings++;
@@ -340,7 +349,10 @@ async function exercise(row: Row): Promise<void> {
     }
     let openings = 0;
     let lock: Promise<void> | undefined;
-    const limit = hangLimit();
+    const limit = hangLimit(
+      () =>
+        `${row.name}: the reading did not end within ${WHOLE_MS / 1000} s (${lock ? `the lock landed at opening ${n}${pt.after ? " (a microtask after it)" : ""}${pt.mark ? " (mark)" : ""}` : "the lock had not landed yet"})`,
+    );
     const ask = () => {
       limit.arm(`${row.name}: the reading did not end`, ` after the lock landed at opening ${n}${pt.after ? " (a microtask after it)" : ""}${pt.mark ? " (mark)" : ""}`);
       const size = c.kit.ring.size;
