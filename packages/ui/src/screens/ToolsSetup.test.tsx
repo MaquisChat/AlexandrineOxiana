@@ -206,7 +206,8 @@ describe("the optional tools screen", () => {
     await waitFor(() => expect(within(c()).getByText(/It finished before the stop took effect\. Image downloader is installed\./)).toBeTruthy());
     expect(within(c()).getByText("Installed")).toBeTruthy();
     expect(within(c()).getByRole("button", { name: "Remove Image downloader" })).toBeTruthy();
-    expect(screen.getByRole("status", { name: "Tool progress" }).textContent).toMatch(/finished before the stop took effect/);
+    // The live region is written by an effect, one render after the card's own sentence: wait for it.
+    await waitFor(() => expect(screen.getByRole("status", { name: "Tool progress" }).textContent).toMatch(/finished before the stop took effect/));
   });
 
   it("a stop the media helper did not confirm is said plainly, with what the catalogue shows, and nothing is retried", async () => {
