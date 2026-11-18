@@ -354,6 +354,29 @@ describe("copyFileAtomic: a source that fails at once (R454)", () => {
     await nothingLeft([]);
   });
 
+  it("a missing source with a decode that throws when called: rejects with decode's error, nothing uncaught (R455 M1)", async () => {
+    const p = copyFileAtomic(join(dir, "missing"), join(dir, "dest"), {
+      mode: 0o600,
+      decode: () => {
+        throw new Error("decode boom");
+      },
+    });
+    const r = await Promise.race([p.then(() => "copied", (e: unknown) => e), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    expect(r).toMatchObject({ message: "decode boom" });
+    for (let i = 0; i < 5; i++) await new Promise((res) => setImmediate(res)); // the source's own failure comes later
+    await new Promise((res) => setTimeout(res, 50));
+    expect(await readdir(dir)).toEqual([]);
+    expect(seen, "an uncaught exception or unhandled rejection").toEqual([]);
+  });
+
+  it("a missing source with a decode: the raw stream's own failure ends the copy, with ENOENT (R455 M2)", async () => {
+    const { PassThrough } = await import("node:stream");
+    const p = copyFileAtomic(join(dir, "missing"), join(dir, "dest"), { mode: 0o600, decode: (r) => r.pipe(new PassThrough()) });
+    const r = await Promise.race([p.then(() => "copied", (e: unknown) => e), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    expect(r).toMatchObject({ code: "ENOENT" });
+    await nothingLeft([]);
+  });
+
   it("a transform that fails at once: rejects with its error", async () => {
     const src = join(dir, "src");
     await writeFile(src, "data");

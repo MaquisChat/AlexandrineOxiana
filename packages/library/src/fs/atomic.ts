@@ -225,11 +225,12 @@ export async function copyFileAtomic(
     // From here to the `for await`, nothing awaits (R454).
     const r = srcFh ? srcFh.createReadStream() : createReadStream(src);
     raw = r;
+    // `raw` has its listener before `decode` is called (R455), so even a `decode` that throws leaves nothing
+    // uncaught. `pipe` does not forward errors; this does: to the decoded stream once there is one, else the hasher.
+    r.on("error", (err: Error) => (source !== undefined && source !== r ? source : hasher).destroy(err));
     const s = opts.decode ? opts.decode(r) : r;
     source = s;
-    // `pipe` does not forward errors; do it by hand so the output fails too. `raw` always has a listener.
-    if (s !== r) r.on("error", (err: Error) => s.destroy(err));
-    s.on("error", (err: Error) => hasher.destroy(err));
+    if (s !== r) s.on("error", (err: Error) => hasher.destroy(err));
     const hashed = s.pipe(hasher);
     out = opts.transform ? opts.transform(hashed) : hashed;
     if (out !== hashed) hashed.on("error", (err) => out.destroy(err));
