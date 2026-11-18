@@ -38,20 +38,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: System tools for the media worker (proxies, OCR)
-        # When the runner cannot reach the package mirror, apt retries each file for 20 s; fail fast instead.
-        timeout-minutes: 4
+        # scripts/ci-apt-install.sh downloads with a time limit and, if the runner's mirror is slow, down or
+        # unresolvable, retries once from mirrors.edge.kernel.org (two tries must fit in the step's limit).
+        timeout-minutes: 10
         run: |
-          # If Ubuntu's own mirrors do not resolve (seen on 2026-11-11: every *.ubuntu.com name failed on the
-          # runner while other hosts worked), use a full mirror under another name for this run. Packages are
-          # still verified against Ubuntu's signing keys, so the mirror cannot substitute anything.
-          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
-            echo "::warning::Ubuntu's package mirrors do not resolve on this runner; using mirrors.edge.kernel.org for this run."
-            for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-              [ -f "$f" ] && sudo sed -i -E 's#https?://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu/?#https://mirrors.edge.kernel.org/ubuntu/#g' "$f"
-            done
-          fi
-          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20
-          sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=20 tesseract-ocr ghostscript ffmpeg
+          bash scripts/ci-apt-install.sh tesseract-ocr ghostscript ffmpeg
       - run: pnpm install --frozen-lockfile
       - name: Media worker venv
         run: pnpm setup:py
@@ -196,19 +187,11 @@ jobs:
         with:
           python-version: "3.13"
       - name: System packages (web view libraries, WebKitWebDriver, Xvfb, xdotool, ffmpeg)
-        timeout-minutes: 8
+        timeout-minutes: 10
         run: |
-          # Same fallback as the test job when Ubuntu's own mirrors do not resolve on the runner.
-          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
-            echo "::warning::Ubuntu's package mirrors do not resolve on this runner; using mirrors.edge.kernel.org for this run."
-            for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-              [ -f "$f" ] && sudo sed -i -E 's#https?://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu/?#https://mirrors.edge.kernel.org/ubuntu/#g' "$f"
-            done
-          fi
-          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20
           # With their recommended packages (the web view's GL and portal pieces). GStreamer's plugins play
           # the launch check's audio and H.264 video in the web view; ffmpeg makes those files.
-          sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+          bash scripts/ci-apt-install.sh \
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev build-essential pkg-config libssl-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
@@ -320,17 +303,9 @@ jobs:
         with:
           python-version: "3.13"
       - name: Tools the smoke test hands to the worker (no ghostscript, as on a Mac)
-        timeout-minutes: 4
+        timeout-minutes: 10
         run: |
-          # Same fallback as the test job when Ubuntu's own mirrors do not resolve on the runner.
-          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
-            echo "::warning::Ubuntu's package mirrors do not resolve on this runner; using mirrors.edge.kernel.org for this run."
-            for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-              [ -f "$f" ] && sudo sed -i -E 's#https?://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu/?#https://mirrors.edge.kernel.org/ubuntu/#g' "$f"
-            done
-          fi
-          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20
-          sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=20 --no-install-recommends tesseract-ocr ffmpeg
+          bash scripts/ci-apt-install.sh --no-install-recommends tesseract-ocr ffmpeg
       - name: Pinned test fixtures
         run: node scripts/fetch-fixtures.mjs
       - name: The tiny speech model for the smoke test (outside the bundle)

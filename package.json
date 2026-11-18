@@ -10,7 +10,7 @@
     "typecheck": "pnpm -r typecheck",
     "test": "vitest run --passWithNoTests --reporter=default --reporter=json --outputFile.json=reports/vitest.json",
     "test:scale": "vitest run --config packages/library/vitest.scale.config.ts && vitest run --config packages/library/vitest.zotero-scale.config.ts",
-    "test:scripts": "node --test scripts/test-report.test.mjs scripts/e2e-args.test.mjs scripts/build-sidecars.test.mjs scripts/notices/licence-texts.test.mjs scripts/licence.test.mjs scripts/test-nonroot.test.mjs apps/browser-extension/scripts/package.test.mjs",
+    "test:scripts": "node --test scripts/test-report.test.mjs scripts/e2e-args.test.mjs scripts/build-sidecars.test.mjs scripts/notices/licence-texts.test.mjs scripts/licence.test.mjs scripts/test-nonroot.test.mjs scripts/ci-apt-install.test.mjs apps/browser-extension/scripts/package.test.mjs",
     "test:nonroot": "node scripts/test-nonroot.mjs",
     "test:py": "node scripts/run-pytest.mjs",
     "e2e": "node scripts/run-e2e.mjs",
