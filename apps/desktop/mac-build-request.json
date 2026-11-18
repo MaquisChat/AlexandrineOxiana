@@ -1,5 +1,5 @@
 {
-  "request": 7,
+  "request": 8,
   "architectures": "apple-silicon",
-  "note": "Build 5's content with the start-up crash mended (Ruling R457: WebKit is started on the main thread before the sign-in window's stores are listed or removed). Build 5 and the diagnostic build 6 failed at the launch check: the app crashed at start-up inside WebKit (fetchAllDataStoreIdentifiers before any web view existed). If this run's launch checks pass, this is the owner's build: the first with the PDF reader, Zotero account sync, cloud folders, Find and acquire and every fix since build 4."
+  "note": "Build 7's content (build 5's, with the start-up crash mended: R457) plus the launch check's evidence and fallback for the sign-in window's probe (R458): build 7 started and passed every check but that one, whose probe had no page to run in on a Mac. If every check passes, this is the owner's build: the first with the PDF reader, Zotero account sync, cloud folders, Find and acquire and every fix since build 4."
 }
