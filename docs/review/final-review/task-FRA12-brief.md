@@ -1,0 +1,26 @@
+# Task FR-A12 — a title search never carries what may be a participant's data (CRITICAL; Ruling R379)
+
+Worktree: `/home/user/AlexandrineOxiana/.claude/worktrees/agent-a7f301291240d4274`, branch `fr-a12-title-search`. Report: `task-FRA12-report.md`. Common brief first: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task54-fix-common.md`.
+
+## What is wrong (review: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task54-wb3-review.md`, finding C1 — read it, with its probe)
+When a file comes into the library (dropped onto it, a bulk import, a watched folder), `resolveItem` in `packages/library/src/import/resolve.ts` works out what it is, in steps. Step 5 parses the FILE NAME (`Author - Year - Title`, …) and, if a title came out, sends the title AND the creator to an online service (OpenAlex) as a search; step 6 sends the best title known so far (an embedded title, a reference manager's title) the same way. The only gate is the project's list of allowed look-up services, which the default rules allow. The project's owner approved those services on the ground that they "receive only bibliographic identifiers/titles, not personal data" (Ruling R14). But a fieldwork recording named `Gonzalez 2024 Interview about her eviction.m4a` was sent as `search=Interview+about+her+eviction+Gonzalez` under the default rules — a participant's name and circumstances, to a third party.
+
+## What to build (Ruling R379, FR-A12 — read it in full)
+1. **Audio, video and image files: no title search, ever** — neither step 5's search nor step 6's — whatever the project's rules. (A bibliographic title search is meaningless for them.) Decide by the file's sniffed type as `resolveItem` already knows it (`mime`); say how an item with no file (a reference-only record from an export) is treated: it is not a media file.
+2. **In a project whose rules say it holds identifiable data, no title search from a file name, an embedded title or a reference manager's title** — steps 5's search and step 6 are not made. Find the right existing signal and say which you used and why: the project's governance has `project.containsIdentifiable` (true in the default rules, `packages/core/src/governance/schema.ts`); the look-up context is built by `lookupContextFor` (find it: `grep -rn "lookupContextFor" packages/library/src`) from the project's policy — that is where this belongs, so that `resolveItem` is simply told "no title searches" and every caller (attach, bulk import, watched folders, Zotero, the reference-manager imports) gets it without its own code. The context's existing field `sensitive` means "encrypted project: keep answers out of the disk cache" — do not reuse it for this; add one clearly named field.
+3. **Look-ups by identifier stay** (DOI, ISBN, arXiv id found in the file or its record — steps before 5): unchanged, tested unchanged.
+4. **The name parsed from a file still fills the record on the device** (step 5's local fields: title, creator, year, with their confidence and evidence `filename`): unchanged.
+5. **Find and acquire is not this task:** there the researcher types a reference to have it looked up — unchanged. Check that nothing in `packages/library/src/find` goes through the changed gate by accident, and say so.
+6. **What the researcher is told.** If the import's report or dry run has an existing place for notes about the whole import (read `import/bulk/report.ts` and how `fileNotes`/notes are shown), add ONE note when title searches were withheld for this reason, exactly: "Titles were not looked up online, because this project holds identifiable data. Identifiers (DOI, ISBN) were still looked up." If there is no such place that costs under ~20 lines, add nothing and say so in your report (it is then listed for later).
+
+## Tests first (each seen to fail first; the test double for the network that `resolve.test.ts` and the lookup tests already use — it records every request)
+- The reviewer's probe: `Gonzalez 2024 Interview about her eviction.m4a` (`audio/mp4`), default rules → NO request to any search endpoint; the record still gets the file name's title/creator/year locally.
+- The same name as `.pdf` (no identifier inside) in a default project (holds identifiable data) → no search request. In a project whose rules say it holds NO identifiable data → the search is made as today (existing tests of step 5 and 6 must keep passing there: if they run under default rules, give them such a project and say so).
+- A PDF with a DOI in a default project → the DOI look-up IS made.
+- A video and an image in a project with NO identifiable data → still no title search (point 1).
+- An embedded title (step 6) and a reference manager's title in a default project → no search.
+- Through the real entry points, one each: the attach (`import/attach.ts`), the bulk engine (`import/bulk/run.ts`), a watched folder — the recording's name never leaves (assert on the recorded requests).
+- The service: one test in `apps/library-service` that a dropped recording in a default project makes no search request (use the service tests' existing network double).
+
+## Verify
+The library's and the service's whole suites, the type-check; if you changed a shared text or a screen, the UI's suite and lints (see the common brief).
