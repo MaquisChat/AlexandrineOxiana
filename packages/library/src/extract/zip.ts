@@ -282,9 +282,18 @@ export async function extractArchive(
       if (rel.startsWith("..") || rel.split(sep).includes("..")) throw new UnsafeFileError("zip-path", PATH_REASON);
       await fsp.mkdir(dirname(target), { recursive: true, mode: 0o700 });
       let bytes = 0;
-      const stream = await new Promise<NodeJS.ReadableStream>((res, rej) =>
-        zf.openReadStream(e, (err, s) => (err || !s ? rej(new UnsafeFileError("zip-invalid", "A file inside the archive could not be read")) : res(s))),
-      );
+      // R454: the entry's stream reads (yauzl pipes it into the inflater) as soon as it is opened, so nothing is awaited
+      // between opening it and handing it to `pipeline`, or its error has no listener: the sparse target first.
+      const sparse = opts.sparse ? await sparseWriter(target) : undefined;
+      let stream: NodeJS.ReadableStream;
+      try {
+        stream = await new Promise<NodeJS.ReadableStream>((res, rej) =>
+          zf.openReadStream(e, (err, s) => (err || !s ? rej(new UnsafeFileError("zip-invalid", "A file inside the archive could not be read")) : res(s))),
+        );
+      } catch (err) {
+        sparse?.destroy();
+        throw err;
+      }
       const declaredSize = e.uncompressedSize;
       const counter = new Transform({
         transform(chunk: Buffer, _enc, cb) {
@@ -298,7 +307,7 @@ export async function extractArchive(
         },
       });
       try {
-        await pipeline(stream, counter, opts.sparse ? await sparseWriter(target) : createWriteStream(target, { flags: "wx", mode: 0o600 }));
+        await pipeline(stream, counter, sparse ?? createWriteStream(target, { flags: "wx", mode: 0o600 }));
       } catch (err) {
         if (err instanceof UnsafeFileError) throw err;
         // yauzl checks inflated sizes against the declared ones: more bytes than declared is a bomb.

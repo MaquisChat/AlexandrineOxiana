@@ -751,26 +751,28 @@ const DOS_EPOCH = new Date("1980-01-02T00:00:00Z");
 
 /** Streams the zip of the snapshot (backup.json first) through the encryption (if any) into `tmp`. */
 async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unknown>): Promise<{ sha256: string; bytes: number }> {
-  const zip = new yazl.ZipFile();
-  zip.addBuffer(Buffer.from(JSON.stringify(header, null, 2)), "backup.json", { mtime: new Date(snap.at), compress: true });
-  for (const f of snap.files) {
-    const mtime = new Date(Math.max(f.mtimeMs, DOS_EPOCH.getTime()));
-    if (f.size === 0) {
-      zip.addBuffer(Buffer.alloc(0), f.rel, { mtime });
-      continue;
-    }
-    // `size` makes yazl fail when the file holds other than the snapshot's bytes; logs are cut at it.
-    zip.addReadStreamLazy(f.rel, { mtime, size: f.size, compress: !f.rel.endsWith(".enc") }, (cb) => {
-      const s = createReadStream(f.abs, f.appendOnly ? { start: 0, end: f.size - 1 } : {});
-      s.once("open", () => cb(null, s));
-      s.once("error", (err) => cb(err, s));
-    });
-  }
-  zip.end();
+  // R454: the zip starts reading its files as soon as they are added, so nothing is awaited from here on until its
+  // errors are listened to and its output consumed: the temp file is opened first.
   const hash = createHash("sha256");
   let bytes = 0;
   const fh = await fsp.open(tmp, "wx", 0o600);
   try {
+    const zip = new yazl.ZipFile();
+    zip.addBuffer(Buffer.from(JSON.stringify(header, null, 2)), "backup.json", { mtime: new Date(snap.at), compress: true });
+    for (const f of snap.files) {
+      const mtime = new Date(Math.max(f.mtimeMs, DOS_EPOCH.getTime()));
+      if (f.size === 0) {
+        zip.addBuffer(Buffer.alloc(0), f.rel, { mtime });
+        continue;
+      }
+      // `size` makes yazl fail when the file holds other than the snapshot's bytes; logs are cut at it.
+      zip.addReadStreamLazy(f.rel, { mtime, size: f.size, compress: !f.rel.endsWith(".enc") }, (cb) => {
+        const s = createReadStream(f.abs, f.appendOnly ? { start: 0, end: f.size - 1 } : {});
+        s.once("open", () => cb(null, s));
+        s.once("error", (err) => cb(err, s));
+      });
+    }
+    zip.end();
     const sink = new Writable({
       async write(chunk: Buffer, _enc, cb) {
         try {
