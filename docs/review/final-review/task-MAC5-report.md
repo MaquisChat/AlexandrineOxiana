@@ -83,3 +83,47 @@ Order of start-up: `run()` sets up `tauri::Builder`. Tauri runs `setup` at the e
 3. **Newly linked Security.framework / security-framework 3.7.0** (via reqwest native-tls). This is the only other Mac-specific change that is present at start-up, but nothing calls it before the service starts, so it is far less likely.
 
 The lldb backtrace or the crash report from the next build should settle which, if any, of these it is.
+
+## The fix (R457)
+
+Commit `1df473b`, on top of 35e6e35. One commit; the crash diagnostics are unchanged.
+
+### What changed
+- **library_window.rs, the Mac `remove_data_stores` (:2197).** It now calls a new `start_webkit(app)` first. If that returns false, it returns false without touching WebKit, which is the existing failure path.
+- **The new `start_webkit` (:2231, `cfg(target_os = "macos")`):**
+  - It checks a static `AtomicBool` ("once"), then posts a closure with `app.run_on_main_thread`.
+  - On the main thread the closure takes `objc2::MainThreadMarker::new()` and calls `unsafe { objc2_web_kit::WKWebsiteDataStore::defaultDataStore(mtm) }`. The retained store is released on the same thread.
+  - The launch thread waits at most 10 s (`recv_timeout`). The flag is set only after a success.
+  - The comment at that place gives the crash's stack and why the order matters.
+  - `library_window::Config::main_thread` is only a `ThreadId` and cannot run a closure, so Tauri's `run_on_main_thread` is used with a channel for the wait. The callers never run on the main thread: `TauriHost::remove_data_stores` already refuses the main thread.
+- **Order:** unchanged. `at_start` still empties the store before `token`/`service::start` (lib.rs:154).
+- **Cargo.toml:** new `[target.'cfg(target_os = "macos")'.dependencies]` with `objc2 = "=0.6.5"` and `objc2-web-kit = { "=0.3.2", default-features = false, features = ["std", "WKWebsiteDataStore"] }`. Both crates are already resolved through wry, with the same versions and a superset of these features (checked with `cargo metadata --locked --filter-platform aarch64-apple-darwin`).
+  - **Cargo.lock:** only the two names `"objc2"` and `"objc2-web-kit"` are added to ao-desktop's own dependency list. No new package and no version change, and the `--locked` metadata passes.
+
+### Paths to the class methods
+The only caller of `fetch_data_store_identifiers`/`remove_data_store` is the Mac `remove_data_stores` (:2197), so the guard there covers all three paths into it:
+- `Library::at_start` → `renew` → `renew_closed` (start-up, lib.rs:154);
+- `Library::at_quit` → `renew` (quit, lib.rs:458);
+- `Library::sign_out` → `renew_closed` (the `sign_out_of_library` command, lib.rs:322).
+
+`renew_closed` (:1804) calls `host.remove_data_stores()` → `TauriHost::remove_data_stores` (:2101) → the Mac `remove_data_stores`.
+
+### Declarations read (registry sources, exact lock versions)
+- `objc2-web-kit-0.3.2/src/generated/WKWebsiteDataStore.rs:36-38`: `pub unsafe fn defaultDataStore(mtm: MainThreadMarker) -> Retained<WKWebsiteDataStore>`. It has no extra `cfg`. The module is behind feature `WKWebsiteDataStore` (`generated/mod.rs:584-586`, re-exported at `:2069-2070`) and reaches the crate root through `pub use self::generated::*` (`src/lib.rs:23`).
+- `objc2-0.6.5/src/main_thread_marker.rs:230`: `pub fn new() -> Option<Self>`. It is re-exported as `objc2::MainThreadMarker` (`src/lib.rs:143`).
+- `tauri-2.12.5/src/app.rs:496`: `AppHandle::run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> crate::Result<()>`.
+- For the cause: `wry-0.57.2/src/wkwebview/mod.rs:1384-1440` (fetch and remove need the main thread and a running loop) and `tauri-2.12.5/src/app.rs:433-480`.
+
+### (b) When the emptying fails or does not answer
+- **Failure.** `renew_closed` still makes a new store id (`new_store_id`), writes the device file and sets it in memory. It returns `removed && written`, so false, and `at_start`'s result is ignored at lib.rs:154. Start-up then goes on and the service starts. The old stores stay on disk, but nothing uses them, because the next sign-in window is built with the new id (`open`, :1502-1503, `create_window` → `window_store` → `data_store_identifier(new id)`): a new, empty store.
+- **No device state.** If `new_store_id` fails, the device state stays `None` and `open` refuses (:1502). So no sign-in window can open on a store that was not emptied, or at least not on one that was not replaced; the old store is not reachable through the window.
+- **No answer.** There is no existing time bound on the answers. `block_on(fetch_data_store_identifiers())` and `remove_data_store(id)` await their oneshot without a timeout; only the in-use error is retried, 5 × 300 ms. If WebKit never answers, the launch thread waits for ever and the service never starts (the launch check would time out at 120 s). I flag this for a ruling and did NOT change it. The new step itself is bounded (10 s, then false, and WebKit is not asked).
+
+### (c) Tests and what cannot be checked here
+- `pnpm --filter @ao/desktop test`: node 107 pass, vitest 78 pass, cargo 124 pass. The Linux build compiles; the new code is macOS-only and is not compiled here.
+- CI runs no clippy or `cargo check` for the shell.
+- I did not try `cargo check --target aarch64-apple-darwin`, as asked. The Rust target is installed, but there is no Apple SDK here.
+- Only the Mac can show:
+  - that it compiles;
+  - that `+defaultDataStore` really initialises WebKit's main run loop, as R457 assumes;
+  - the Linux desktop scenarios (the sign-in window's ten), which I did not run here.
