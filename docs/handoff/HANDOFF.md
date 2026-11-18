@@ -6,6 +6,7 @@
 
 Read this block first; the rest of this file is the 2026-11-11 morning snapshot.
 
+- **Two standing instructions of the owner (18 November 2026, 04:15 UTC):** (1) **HALT ON ANY USAGE WARNING** — start nothing new, leave these files true, tell the owner, wait for the owner's word; (2) **times told to the owner are in US Central time** (November: UTC−6); the files keep UTC.
 - **Where the work is:** the documents (this file, the ledger, the plan, the owner's pages) on branch `claude/amanuensis-handoff-0x6u5m`; the code on the reader branch `claude/pdf-reader-highlights` (Ruling R204); both pushed after every completed task. `main` is the owner-approved state (at `17670b5`: `0ad6506` plus the licence, put there by the owner's explicit word; no other work has been merged to it, and none is without the owner's approval).
 - **What to do next:** `docs/PLAN.md` section 8 is the task table (status and commit per task); section 9 lists what waits for the owner. The tail of `docs/handoff/LEDGER.md` (from "Checkpoint 2026-11-11") is the running record: every dispatch, review result, ruling (R120 onward, now to R155) and deferred minor.
 - **Merged and verified (in order):** Milestone I (Tasks 38–42), 43, 60, 52, 37e, 45, 34a, 44, 34e, 61, 37d, 34c, 34b, 37b, 37a, 50, 48a, 48b, 37c, 58, 37h, 48c, 37j, 37f (the Mac workflow, written but never run).
