@@ -469,6 +469,20 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
     assert.match(wf.slice(at("name: Upload the disk image"), at("uses: actions/upload-artifact")), /if: \$\{\{ !cancelled\(\) && steps\.build\.outcome == 'success' \}\}/);
   });
 
+  it("keeps the system's crash reports after the launch checks, also when one failed (Task MAC5)", () => {
+    const at = (s) => wf.indexOf(s);
+    const start = at("name: Upload the crash reports");
+    assert.ok(start > at("name: Launch check R"), "after both launch checks");
+    const block = wf.slice(start, wf.indexOf("\n      - ", start));
+    assert.match(block, /if: \$\{\{ !cancelled\(\) \}\}/);
+    assert.match(block, /uses: actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\.6\.2/);
+    assert.match(block, /name: mac-crash-reports\n/);
+    assert.match(block, /path: ~\/Library\/Logs\/DiagnosticReports\/\*\n/);
+    assert.match(block, /if-no-files-found: ignore/);
+    // Both launch checks run after a failed one (each needs only the build).
+    for (const name of ["Launch check A-D", "Launch check R"]) assert.match(wf.slice(at(`name: ${name}`), wf.indexOf("run:", at(`name: ${name}`))), /if: \$\{\{ !cancelled\(\) && steps\.build\.outcome == 'success' \}\}/, name);
+  });
+
   it("saves the caches even when a later step failed", () => {
     for (const name of ["Save the Rust build cache", "Save the build caches"]) {
       const block = wf.slice(wf.indexOf(`name: ${name}`), wf.indexOf("uses:", wf.indexOf(`name: ${name}`)));
