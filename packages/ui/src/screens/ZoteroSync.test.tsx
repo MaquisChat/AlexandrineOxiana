@@ -689,7 +689,9 @@ describe("ZoteroSync", () => {
   });
 
   it("back-off: disabled with its reason, enabled when the time passes (one timer, no polling)", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], shouldAdvanceTime: true });
+    // The clock is set to midday: ten minutes on is the same day, so the sentence names the time alone. (With the real
+    // clock this test failed in the last ten minutes of a day, when the sentence rightly names the day too.)
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], shouldAdvanceTime: true, now: new Date(2026, 10, 12, 12, 0, 0) });
     const until = new Date(Date.now() + 10 * 60_000).toISOString();
     const svc = useSvc({ links: [{ ref: "user:42", projectId: P1 }], backoffUntil: until });
     await show(svc);
